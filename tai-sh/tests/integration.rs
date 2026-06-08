@@ -1,5 +1,6 @@
-use tai_proto::ClientMessage;
-use tai_sh::{parse_input_line, ShellCommand};
+use std::io;
+use tai_proto::{ClientMessage, ImageMetadata};
+use tai_sh::{ImageAssembler, parse_input_line, ShellCommand};
 
 #[test]
 fn shell_parser_handles_full_command_flow() {
@@ -26,4 +27,25 @@ fn shell_parser_handles_full_command_flow() {
         ShellCommand::InvalidCancel("nope".to_string())
     );
     assert_eq!(next_request_id, 2);
+}
+
+#[test]
+fn image_assembler_rejects_oversized_chunks() {
+    let mut assembler = ImageAssembler::new();
+    assembler
+        .start(
+            1,
+            ImageMetadata {
+                image_id: 3,
+                mime_type: "image/png".to_string(),
+                width: 1,
+                height: 1,
+                byte_len: 2,
+                alt: None,
+            },
+        )
+        .expect("start");
+
+    let error = assembler.push_chunk(1, 3, &[1, 2, 3]).expect_err("should fail");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }

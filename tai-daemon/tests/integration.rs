@@ -46,6 +46,9 @@ async fn daemon_handler_supports_multiple_in_flight_requests() {
                     saw_req2 = true;
                 }
             }
+            DaemonMessage::ImageStart { .. }
+            | DaemonMessage::ImageChunk { .. }
+            | DaemonMessage::ImageEnd { .. } => {}
             DaemonMessage::Done { request_id } => {
                 done.insert(request_id);
             }

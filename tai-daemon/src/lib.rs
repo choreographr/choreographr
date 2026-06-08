@@ -1,5 +1,8 @@
 use std::{collections::HashMap, io, path::Path, sync::Arc, time::Duration};
-use tai_proto::{read_message, write_message, ClientMessage, DaemonMessage, OutputStream};
+use tai_proto::{
+    ClientMessage, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
+    read_message, write_message,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
@@ -86,6 +89,14 @@ pub async fn handle_client(stream: UnixStream) -> io::Result<()> {
                                     warn!(request_id, "client disconnected before output could be delivered");
                                     return;
                                 }
+
+                                if word.eq_ignore_ascii_case("image") || word.eq_ignore_ascii_case("img") {
+                                    if emit_demo_image(&tx_clone, request_id, (index + 1) as u32).await.is_err() {
+                                        warn!(request_id, image_id = (index + 1) as u32, "client disconnected before image could be delivered");
+                                        return;
+                                    }
+                                }
+
                                 sleep(Duration::from_millis(150)).await;
                             }
 
@@ -155,6 +166,35 @@ pub async fn handle_client(stream: UnixStream) -> io::Result<()> {
     Ok(())
 }
 
+const DEMO_PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+    0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+    0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+    0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99,
+    0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+async fn emit_demo_image(tx: &mpsc::Sender<DaemonMessage>, request_id: u32, image_id: u32) -> Result<(), mpsc::error::SendError<DaemonMessage>> {
+    let metadata = ImageMetadata {
+        image_id,
+        mime_type: "image/png".to_string(),
+        width: 1,
+        height: 1,
+        byte_len: DEMO_PNG_1X1.len() as u64,
+        alt: Some("demo image".to_string()),
+    };
+    tx.send(DaemonMessage::ImageStart { request_id, metadata }).await?;
+    for data in DEMO_PNG_1X1.chunks(MAX_IMAGE_CHUNK_SIZE) {
+        tx.send(DaemonMessage::ImageChunk {
+            request_id,
+            image_id,
+            data: data.to_vec(),
+        })
+        .await?;
+    }
+    tx.send(DaemonMessage::ImageEnd { request_id, image_id }).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +250,9 @@ mod tests {
                 DaemonMessage::OutputChunk { request_id, data, .. } => {
                     chunks.push((request_id, String::from_utf8_lossy(&data).to_string()));
                 }
+                DaemonMessage::ImageStart { .. }
+                | DaemonMessage::ImageChunk { .. }
+                | DaemonMessage::ImageEnd { .. } => {}
                 DaemonMessage::Done { request_id } => {
                     done.insert(request_id);
                 }
@@ -271,7 +314,10 @@ mod tests {
         loop {
             match recv(&mut client).await {
                 DaemonMessage::Started { request_id } if request_id == 9 => break,
-                DaemonMessage::OutputChunk { .. } => {}
+                DaemonMessage::OutputChunk { .. }
+                | DaemonMessage::ImageStart { .. }
+                | DaemonMessage::ImageChunk { .. }
+                | DaemonMessage::ImageEnd { .. } => {}
                 other => panic!("unexpected before started: {other:?}"),
             }
         }
@@ -286,12 +332,158 @@ mod tests {
                     assert_eq!(request_id, 9);
                     break;
                 }
-                DaemonMessage::OutputChunk { .. } => {}
+                DaemonMessage::OutputChunk { .. }
+                | DaemonMessage::ImageStart { .. }
+                | DaemonMessage::ImageChunk { .. }
+                | DaemonMessage::ImageEnd { .. } => {}
                 other => panic!("unexpected after cancel: {other:?}"),
             }
         }
 
         drop(client);
         server_task.await.expect("join").expect("server ok");
+    }
+
+    #[tokio::test]
+    async fn image_keyword_emits_image_messages() {
+        let (server, mut client) = UnixStream::pair().expect("pair");
+        let server_task = tokio::spawn(handle_client(server));
+
+        write_message(
+            &mut client,
+            &ClientMessage::RunInput { request_id: 12, input: b"show image please".to_vec() },
+        )
+        .await
+        .expect("write request");
+
+        let mut saw_start = false;
+        let mut saw_chunk = false;
+        let mut saw_end = false;
+
+        loop {
+            match recv(&mut client).await {
+                DaemonMessage::ImageStart { request_id, metadata } => {
+                    assert_eq!(request_id, 12);
+                    assert_eq!(metadata.mime_type, "image/png");
+                    saw_start = true;
+                }
+                DaemonMessage::ImageChunk { request_id, image_id, data } => {
+                    assert_eq!(request_id, 12);
+                    assert_eq!(image_id, 2);
+                    assert!(!data.is_empty());
+                    saw_chunk = true;
+                }
+                DaemonMessage::ImageEnd { request_id, image_id } => {
+                    assert_eq!(request_id, 12);
+                    assert_eq!(image_id, 2);
+                    saw_end = true;
+                }
+                DaemonMessage::Done { request_id } => {
+                    assert_eq!(request_id, 12);
+                    break;
+                }
+                DaemonMessage::Started { .. } | DaemonMessage::OutputChunk { .. } => {}
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+
+        assert!(saw_start && saw_chunk && saw_end);
+
+        drop(client);
+        server_task.await.expect("join").expect("server ok");
+    }
+
+    #[tokio::test]
+    async fn empty_input_fails_request() {
+        let (server, mut client) = UnixStream::pair().expect("pair");
+        let server_task = tokio::spawn(handle_client(server));
+
+        write_message(
+            &mut client,
+            &ClientMessage::RunInput { request_id: 15, input: b"   ".to_vec() },
+        )
+        .await
+        .expect("write request");
+
+        let mut saw_started = false;
+        loop {
+            match recv(&mut client).await {
+                DaemonMessage::Started { request_id } => {
+                    assert_eq!(request_id, 15);
+                    saw_started = true;
+                }
+                DaemonMessage::Failed { request_id, error } => {
+                    assert_eq!(request_id, 15);
+                    assert!(error.contains("empty input"));
+                    break;
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+
+        assert!(saw_started);
+        drop(client);
+        server_task.await.expect("join").expect("server ok");
+    }
+
+    #[tokio::test]
+    async fn cancel_inactive_request_fails() {
+        let (server, mut client) = UnixStream::pair().expect("pair");
+        let server_task = tokio::spawn(handle_client(server));
+
+        write_message(&mut client, &ClientMessage::Cancel { request_id: 99 })
+            .await
+            .expect("write cancel");
+
+        match recv(&mut client).await {
+            DaemonMessage::Failed { request_id, error } => {
+                assert_eq!(request_id, 99);
+                assert!(error.contains("not active"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        drop(client);
+        server_task.await.expect("join").expect("server ok");
+    }
+
+    #[tokio::test]
+    async fn emit_demo_image_sends_complete_sequence() {
+        let (tx, mut rx) = mpsc::channel(8);
+
+        emit_demo_image(&tx, 21, 4).await.expect("emit image");
+        drop(tx);
+
+        let first = rx.recv().await.expect("image start");
+        let second = rx.recv().await.expect("image chunk");
+        let third = rx.recv().await.expect("image end");
+
+        match first {
+            DaemonMessage::ImageStart { request_id, metadata } => {
+                assert_eq!(request_id, 21);
+                assert_eq!(metadata.image_id, 4);
+                assert_eq!(metadata.byte_len, DEMO_PNG_1X1.len() as u64);
+            }
+            other => panic!("unexpected first message: {other:?}"),
+        }
+
+        match second {
+            DaemonMessage::ImageChunk { request_id, image_id, data } => {
+                assert_eq!(request_id, 21);
+                assert_eq!(image_id, 4);
+                assert_eq!(data, DEMO_PNG_1X1);
+            }
+            other => panic!("unexpected second message: {other:?}"),
+        }
+
+        match third {
+            DaemonMessage::ImageEnd { request_id, image_id } => {
+                assert_eq!(request_id, 21);
+                assert_eq!(image_id, 4);
+            }
+            other => panic!("unexpected third message: {other:?}"),
+        }
+
+        assert!(rx.recv().await.is_none());
     }
 }

@@ -6,6 +6,7 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/tai.sock";
 pub const SOCKET_PATH_ENV: &str = "TAI_SOCKET_PATH";
+pub const MAX_IMAGE_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClientMessage {
@@ -21,12 +22,35 @@ pub enum OutputStream {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageMetadata {
+    pub image_id: u32,
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub byte_len: u64,
+    pub alt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonMessage {
     Started { request_id: u32 },
     OutputChunk {
         request_id: u32,
         stream: OutputStream,
         data: Vec<u8>,
+    },
+    ImageStart {
+        request_id: u32,
+        metadata: ImageMetadata,
+    },
+    ImageChunk {
+        request_id: u32,
+        image_id: u32,
+        data: Vec<u8>,
+    },
+    ImageEnd {
+        request_id: u32,
+        image_id: u32,
     },
     Done { request_id: u32 },
     Failed { request_id: u32, error: String },
@@ -159,10 +183,16 @@ mod tests {
     #[tokio::test]
     async fn async_read_write_round_trip() {
         let (mut writer, mut reader) = duplex(1024);
-        let expected = DaemonMessage::OutputChunk {
+        let expected = DaemonMessage::ImageStart {
             request_id: 5,
-            stream: OutputStream::Stdout,
-            data: b"chunk".to_vec(),
+            metadata: ImageMetadata {
+                image_id: 1,
+                mime_type: "image/png".to_string(),
+                width: 1,
+                height: 1,
+                byte_len: 4,
+                alt: Some("chunk".to_string()),
+            },
         };
 
         let expected_for_writer = expected.clone();
@@ -185,6 +215,27 @@ mod tests {
 
         let err = read_payload(&mut reader).await.expect_err("should fail");
         write_task.await.expect("join");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn socket_path_uses_env_override() {
+        unsafe {
+            std::env::set_var(SOCKET_PATH_ENV, "/tmp/custom-tai.sock");
+        }
+        assert_eq!(socket_path(), "/tmp/custom-tai.sock");
+        unsafe {
+            std::env::remove_var(SOCKET_PATH_ENV);
+        }
+    }
+
+    #[test]
+    fn encode_rejects_oversized_message() {
+        let message = ClientMessage::RunInput {
+            request_id: 1,
+            input: vec![0; MAX_FRAME_SIZE],
+        };
+        let err = encode_frame(&message).expect_err("should fail");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
