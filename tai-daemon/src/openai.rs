@@ -4,7 +4,7 @@ use std::{fs, io, path::PathBuf};
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const DEFAULT_MODEL_LIST_PATH: &str = "/v1/models";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
     pub api_key: String,
     #[serde(default = "default_base_url")]

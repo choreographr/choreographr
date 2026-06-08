@@ -12,6 +12,10 @@ fn shell_parser_handles_full_command_flow() {
         ShellCommand::Send(ClientMessage::Ping)
     );
     assert_eq!(
+        parse_input_line("/models", &mut next_request_id),
+        ShellCommand::Send(ClientMessage::ListModels)
+    );
+    assert_eq!(
         parse_input_line("run this", &mut next_request_id),
         ShellCommand::Send(ClientMessage::RunInput {
             request_id: 1,

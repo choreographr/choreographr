@@ -1,5 +1,6 @@
 pub mod openai;
 
+use crate::openai::AuthConfig;
 use std::{collections::HashMap, io, path::Path, sync::Arc, time::Duration};
 use tai_proto::{
     ClientMessage, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
@@ -14,7 +15,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-pub async fn run_server(socket_path: &str) -> io::Result<()> {
+pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Result<()> {
     if Path::new(socket_path).exists() {
         info!(%socket_path, "removing stale socket");
         std::fs::remove_file(socket_path)?;
@@ -28,8 +29,9 @@ pub async fn run_server(socket_path: &str) -> io::Result<()> {
             accept_result = listener.accept() => {
                 let (stream, _) = accept_result?;
                 debug!("accepted client connection");
+                let auth_config = auth_config.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream).await {
+                    if let Err(error) = handle_client(stream, auth_config).await {
                         error!(error = %error, "client error");
                     }
                 });
@@ -50,7 +52,7 @@ pub async fn run_server(socket_path: &str) -> io::Result<()> {
     result
 }
 
-pub async fn handle_client(stream: UnixStream) -> io::Result<()> {
+pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<DaemonMessage>(128);
     let requests = Arc::new(Mutex::new(HashMap::<u32, JoinHandle<()>>::new()));
@@ -153,6 +155,22 @@ pub async fn handle_client(stream: UnixStream) -> io::Result<()> {
                         debug!("responding to ping");
                         let _ = tx.send(DaemonMessage::Pong).await;
                     }
+                    ClientMessage::ListModels => {
+                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, "listing configured models");
+                        match openai::validate_and_list_models(&auth_config).await {
+                            Ok(models) => {
+                                let _ = tx.send(DaemonMessage::Models { models }).await;
+                            }
+                            Err(error) => {
+                                let _ = tx
+                                    .send(DaemonMessage::Failed {
+                                        request_id: 0,
+                                        error: format!("failed to list models: {error}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
                 }
             }
             Err(error)
@@ -216,6 +234,14 @@ mod tests {
     use tai_proto::{read_message, write_message};
     use tokio::{net::UnixStream, time::{timeout, Duration}};
 
+    fn test_auth_config() -> AuthConfig {
+        AuthConfig {
+            api_key: "test-key".to_string(),
+            base_url: "https://example.com".to_string(),
+            model_list_path: "/v1/models".to_string(),
+        }
+    }
+
     async fn recv(client: &mut UnixStream) -> DaemonMessage {
         timeout(Duration::from_secs(2), read_message::<_, DaemonMessage>(client))
             .await
@@ -226,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn ping_round_trip() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server));
+        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
 
         write_message(&mut client, &ClientMessage::Ping).await.expect("write ping");
         assert!(matches!(recv(&mut client).await, DaemonMessage::Pong));
@@ -238,7 +264,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_requests_complete_independently() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server));
+        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
 
         write_message(
             &mut client,
@@ -286,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_request_id_is_rejected() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server));
+        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
 
         write_message(
             &mut client,
@@ -317,7 +343,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_stops_active_request() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server));
+        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
 
         write_message(
             &mut client,
@@ -362,7 +388,7 @@ mod tests {
     #[tokio::test]
     async fn image_keyword_emits_image_messages() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server));
+        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
 
         write_message(
             &mut client,
@@ -411,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn empty_input_fails_request() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server));
+        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
 
         write_message(
             &mut client,
@@ -444,7 +470,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_inactive_request_fails() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server));
+        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
 
         write_message(&mut client, &ClientMessage::Cancel { request_id: 99 })
             .await
@@ -454,6 +480,32 @@ mod tests {
             DaemonMessage::Failed { request_id, error } => {
                 assert_eq!(request_id, 99);
                 assert!(error.contains("not active"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        drop(client);
+        server_task.await.expect("join").expect("server ok");
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_failure_when_provider_unreachable() {
+        let (server, mut client) = UnixStream::pair().expect("pair");
+        let auth_config = AuthConfig {
+            api_key: "test-key".to_string(),
+            base_url: "http://127.0.0.1:9".to_string(),
+            model_list_path: "/v1/models".to_string(),
+        };
+        let server_task = tokio::spawn(handle_client(server, auth_config));
+
+        write_message(&mut client, &ClientMessage::ListModels)
+            .await
+            .expect("write list-models");
+
+        match recv(&mut client).await {
+            DaemonMessage::Failed { request_id, error } => {
+                assert_eq!(request_id, 0);
+                assert!(error.contains("failed to list models"));
             }
             other => panic!("unexpected message: {other:?}"),
         }

@@ -1,6 +1,14 @@
-use tai_daemon::handle_client;
+use tai_daemon::{handle_client, openai::AuthConfig};
 use tai_proto::{read_message, write_message, ClientMessage, DaemonMessage};
 use tokio::{net::UnixStream, time::{timeout, Duration}};
+
+fn test_auth_config() -> AuthConfig {
+    AuthConfig {
+        api_key: "test-key".to_string(),
+        base_url: "https://example.com".to_string(),
+        model_list_path: "/v1/models".to_string(),
+    }
+}
 
 async fn recv(client: &mut UnixStream) -> DaemonMessage {
     timeout(Duration::from_secs(3), read_message::<_, DaemonMessage>(client))
@@ -12,7 +20,7 @@ async fn recv(client: &mut UnixStream) -> DaemonMessage {
 #[tokio::test]
 async fn daemon_handler_supports_multiple_in_flight_requests() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(server));
+    let server_task = tokio::spawn(handle_client(server, test_auth_config()));
 
     write_message(
         &mut client,

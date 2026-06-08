@@ -298,6 +298,16 @@ async fn handle_daemon_message(
             app.drop_request(request_id);
         }
         DaemonMessage::Pong => app.push_text("[daemon] pong".to_string()),
+        DaemonMessage::Models { models } => {
+            if models.is_empty() {
+                app.push_text("[daemon] no models available".to_string());
+            } else {
+                app.push_text(format!("[daemon] supported models ({})", models.len()));
+                for model in models {
+                    app.push_text(format!("- {model}"));
+                }
+            }
+        }
     }
     Ok(())
 }

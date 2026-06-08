@@ -28,6 +28,10 @@ pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> ShellCommand {
         return ShellCommand::Send(ClientMessage::Ping);
     }
 
+    if line == "/models" {
+        return ShellCommand::Send(ClientMessage::ListModels);
+    }
+
     let request_id = *next_request_id;
     *next_request_id = next_request_id.wrapping_add(1);
     ShellCommand::Send(ClientMessage::RunInput {
@@ -189,6 +193,16 @@ mod tests {
             ShellCommand::InvalidCancel("nope".to_string())
         );
         assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn parses_models_command() {
+        let mut next = 10;
+        assert_eq!(
+            parse_input_line("/models", &mut next),
+            ShellCommand::Send(ClientMessage::ListModels)
+        );
+        assert_eq!(next, 10);
     }
 
     #[test]

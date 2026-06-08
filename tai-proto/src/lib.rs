@@ -13,6 +13,7 @@ pub enum ClientMessage {
     RunInput { request_id: u32, input: Vec<u8> },
     Cancel { request_id: u32 },
     Ping,
+    ListModels,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,6 +57,7 @@ pub enum DaemonMessage {
     Failed { request_id: u32, error: String },
     Cancelled { request_id: u32 },
     Pong,
+    Models { models: Vec<String> },
 }
 
 pub fn encode_frame<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
