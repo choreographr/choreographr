@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "tai-daemon",
+    "tai-proto",
     "tai-sh",
 ]
 resolver = "3"
