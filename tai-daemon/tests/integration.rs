@@ -72,3 +72,34 @@ async fn daemon_handler_supports_multiple_in_flight_requests() {
     server_task.await.expect("join").expect("server ok");
 }
 
+#[tokio::test]
+async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
+    let (server, mut client) = UnixStream::pair().expect("pair");
+    let auth_config = AuthConfig {
+        api_key: "test-key".to_string(),
+        base_url: "http://127.0.0.1:9".to_string(),
+        model_list_path: "/v1/models".to_string(),
+    };
+    let server_task = tokio::spawn(handle_client(server, auth_config));
+
+    write_message(
+        &mut client,
+        &ClientMessage::SetModel {
+            model: "gpt-5.4-nano".to_string(),
+        },
+    )
+    .await
+    .expect("write set-model");
+
+    match recv(&mut client).await {
+        DaemonMessage::Failed { request_id, error } => {
+            assert_eq!(request_id, 0);
+            assert!(error.contains("failed to list models"));
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    drop(client);
+    server_task.await.expect("join").expect("server ok");
+}
+

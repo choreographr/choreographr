@@ -16,6 +16,12 @@ fn shell_parser_handles_full_command_flow() {
         ShellCommand::Send(ClientMessage::ListModels)
     );
     assert_eq!(
+        parse_input_line("/models gpt-5.4-nano", &mut next_request_id),
+        ShellCommand::Send(ClientMessage::SetModel {
+            model: "gpt-5.4-nano".to_string(),
+        })
+    );
+    assert_eq!(
         parse_input_line("run this", &mut next_request_id),
         ShellCommand::Send(ClientMessage::RunInput {
             request_id: 1,

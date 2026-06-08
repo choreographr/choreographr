@@ -28,8 +28,14 @@ pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> ShellCommand {
         return ShellCommand::Send(ClientMessage::Ping);
     }
 
-    if line == "/models" {
-        return ShellCommand::Send(ClientMessage::ListModels);
+    if let Some(rest) = line.strip_prefix("/models") {
+        let model = rest.trim();
+        if model.is_empty() {
+            return ShellCommand::Send(ClientMessage::ListModels);
+        }
+        return ShellCommand::Send(ClientMessage::SetModel {
+            model: model.to_string(),
+        });
     }
 
     let request_id = *next_request_id;
@@ -201,6 +207,18 @@ mod tests {
         assert_eq!(
             parse_input_line("/models", &mut next),
             ShellCommand::Send(ClientMessage::ListModels)
+        );
+        assert_eq!(next, 10);
+    }
+
+    #[test]
+    fn parses_set_model_command() {
+        let mut next = 10;
+        assert_eq!(
+            parse_input_line("/models gpt-5.4-nano", &mut next),
+            ShellCommand::Send(ClientMessage::SetModel {
+                model: "gpt-5.4-nano".to_string(),
+            })
         );
         assert_eq!(next, 10);
     }

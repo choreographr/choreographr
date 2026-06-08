@@ -317,15 +317,26 @@ async fn handle_daemon_message(
             app.drop_request(request_id);
         }
         DaemonMessage::Pong => app.push_text("[daemon] pong".to_string()),
-        DaemonMessage::Models { models } => {
+        DaemonMessage::Models {
+            models,
+            selected_model,
+        } => {
             if models.is_empty() {
                 app.push_text("[daemon] no models available".to_string());
             } else {
                 app.push_text(format!("[daemon] supported models ({})", models.len()));
                 for model in models {
-                    app.push_text(format!("- {model}"));
+                    let prefix = if selected_model.as_deref() == Some(model.as_str()) {
+                        "*"
+                    } else {
+                        "-"
+                    };
+                    app.push_text(format!("{prefix} {model}"));
                 }
             }
+        }
+        DaemonMessage::ModelSelected { model } => {
+            app.push_text(format!("[daemon] selected model: {model}"));
         }
     }
     Ok(())

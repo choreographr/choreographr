@@ -56,6 +56,7 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<DaemonMessage>(128);
     let requests = Arc::new(Mutex::new(HashMap::<u32, JoinHandle<()>>::new()));
+    let mut selected_model: Option<String> = None;
 
     debug!("starting client handler");
 
@@ -159,7 +160,38 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                         debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, "listing configured models");
                         match openai::validate_and_list_models(&auth_config).await {
                             Ok(models) => {
-                                let _ = tx.send(DaemonMessage::Models { models }).await;
+                                let _ = tx
+                                    .send(DaemonMessage::Models {
+                                        models,
+                                        selected_model: selected_model.clone(),
+                                    })
+                                    .await;
+                            }
+                            Err(error) => {
+                                let _ = tx
+                                    .send(DaemonMessage::Failed {
+                                        request_id: 0,
+                                        error: format!("failed to list models: {error}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    ClientMessage::SetModel { model } => {
+                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, requested_model = %model, "setting selected model");
+                        match openai::validate_and_list_models(&auth_config).await {
+                            Ok(models) => {
+                                if models.iter().any(|candidate| candidate == &model) {
+                                    selected_model = Some(model.clone());
+                                    let _ = tx.send(DaemonMessage::ModelSelected { model }).await;
+                                } else {
+                                    let _ = tx
+                                        .send(DaemonMessage::Failed {
+                                            request_id: 0,
+                                            error: format!("unknown model: {model}"),
+                                        })
+                                        .await;
+                                }
                             }
                             Err(error) => {
                                 let _ = tx
@@ -501,6 +533,37 @@ mod tests {
         write_message(&mut client, &ClientMessage::ListModels)
             .await
             .expect("write list-models");
+
+        match recv(&mut client).await {
+            DaemonMessage::Failed { request_id, error } => {
+                assert_eq!(request_id, 0);
+                assert!(error.contains("failed to list models"));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        drop(client);
+        server_task.await.expect("join").expect("server ok");
+    }
+
+    #[tokio::test]
+    async fn set_model_reports_failure_when_provider_unreachable() {
+        let (server, mut client) = UnixStream::pair().expect("pair");
+        let auth_config = AuthConfig {
+            api_key: "test-key".to_string(),
+            base_url: "http://127.0.0.1:9".to_string(),
+            model_list_path: "/v1/models".to_string(),
+        };
+        let server_task = tokio::spawn(handle_client(server, auth_config));
+
+        write_message(
+            &mut client,
+            &ClientMessage::SetModel {
+                model: "gpt-5.4-nano".to_string(),
+            },
+        )
+        .await
+        .expect("write set-model");
 
         match recv(&mut client).await {
             DaemonMessage::Failed { request_id, error } => {
