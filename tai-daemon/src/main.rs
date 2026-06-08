@@ -11,7 +11,7 @@ async fn main() -> io::Result<()> {
         .init();
 
     let auth_config = tai_daemon::openai::load_auth_config()?;
-    info!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, "validating OpenAI credentials on startup");
+    info!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, chat_completions_path = %auth_config.chat_completions_path, "validating OpenAI credentials on startup");
     let models = tai_daemon::openai::validate_and_list_models(&auth_config).await?;
     if models.is_empty() {
         warn!("startup validation succeeded but provider returned no models");

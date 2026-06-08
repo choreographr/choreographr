@@ -1,8 +1,9 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{fs, io, path::PathBuf};
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com";
-const DEFAULT_MODEL_LIST_PATH: &str = "/v1/models";
+const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_MODEL_LIST_PATH: &str = "/models";
+const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
@@ -11,6 +12,8 @@ pub struct AuthConfig {
     pub base_url: String,
     #[serde(default = "default_model_list_path")]
     pub model_list_path: String,
+    #[serde(default = "default_chat_completions_path")]
+    pub chat_completions_path: String,
 }
 
 fn default_base_url() -> String {
@@ -21,6 +24,10 @@ fn default_model_list_path() -> String {
     DEFAULT_MODEL_LIST_PATH.to_string()
 }
 
+fn default_chat_completions_path() -> String {
+    DEFAULT_CHAT_COMPLETIONS_PATH.to_string()
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelListResponse {
     data: Vec<ModelInfo>,
@@ -29,6 +36,33 @@ struct ModelListResponse {
 #[derive(Debug, Deserialize)]
 struct ModelInfo {
     id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionsRequest<'a> {
+    model: &'a str,
+    messages: Vec<ChatMessage<'a>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatCompletionsResponse {
+    choices: Vec<Choice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Choice {
+    message: AssistantMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssistantMessage {
+    content: String,
 }
 
 pub fn auth_config_path() -> io::Result<PathBuf> {
@@ -67,29 +101,21 @@ pub fn load_auth_config() -> io::Result<AuthConfig> {
     Ok(config)
 }
 
-pub async fn validate_and_list_models(config: &AuthConfig) -> io::Result<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(io::Error::other)?;
-
-    let base = config.base_url.trim_end_matches('/');
-    let path = if config.model_list_path.starts_with('/') {
-        config.model_list_path.as_str()
-    } else {
+fn endpoint_url(base_url: &str, path: &str) -> io::Result<String> {
+    if !path.starts_with('/') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "model_list_path must start with '/'",
+            "path must start with '/'",
         ));
-    };
-    let url = format!("{base}{path}");
+    }
+    Ok(format!("{}{}", base_url.trim_end_matches('/'), path))
+}
 
-    let response = client
-        .get(&url)
-        .bearer_auth(config.api_key.trim())
-        .send()
-        .await
-        .map_err(io::Error::other)?;
-
+async fn send_request<R>(request: reqwest::RequestBuilder) -> io::Result<R>
+where
+    R: for<'de> Deserialize<'de>,
+{
+    let response = request.send().await.map_err(io::Error::other)?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
@@ -102,6 +128,55 @@ pub async fn validate_and_list_models(config: &AuthConfig) -> io::Result<Vec<Str
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, detail));
     }
 
-    let payload: ModelListResponse = response.json().await.map_err(io::Error::other)?;
+    response.json().await.map_err(io::Error::other)
+}
+
+pub async fn validate_and_list_models(config: &AuthConfig) -> io::Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(io::Error::other)?;
+    let url = endpoint_url(&config.base_url, &config.model_list_path)?;
+    let payload: ModelListResponse = send_request(
+        client.get(&url).bearer_auth(config.api_key.trim()),
+    )
+    .await?;
     Ok(payload.data.into_iter().map(|model| model.id).collect())
+}
+
+pub async fn chat_completion(config: &AuthConfig, model: &str, prompt: &str) -> io::Result<String> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(io::Error::other)?;
+    let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
+    let payload: ChatCompletionsResponse = send_request(
+        client
+            .post(&url)
+            .bearer_auth(config.api_key.trim())
+            .json(&ChatCompletionsRequest {
+                model,
+                messages: vec![ChatMessage {
+                    role: "user",
+                    content: prompt,
+                }],
+            }),
+    )
+    .await?;
+
+    let content = payload
+        .choices
+        .into_iter()
+        .next()
+        .map(|choice| choice.message.content)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if content.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider returned an empty response",
+        ));
+    }
+
+    Ok(content)
 }

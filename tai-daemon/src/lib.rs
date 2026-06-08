@@ -1,17 +1,15 @@
 pub mod openai;
 
 use crate::openai::AuthConfig;
-use std::{collections::HashMap, io, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, io, path::Path, sync::Arc};
 use tai_proto::{
-    ClientMessage, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
-    read_message, write_message,
+    ClientMessage, DaemonMessage, OutputStream, read_message, write_message,
 };
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
     sync::{mpsc, Mutex},
     task::JoinHandle,
-    time::sleep,
 };
 use tracing::{debug, error, info, warn};
 
@@ -87,51 +85,73 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                             continue;
                         }
 
-                        info!(request_id, input_len = input.len(), "starting request");
-                        let tx_clone = tx.clone();
-                        let requests_clone = Arc::clone(&requests);
-                        let handle = tokio::spawn(async move {
-                            let _ = tx_clone.send(DaemonMessage::Started { request_id }).await;
-                            let text = String::from_utf8_lossy(&input).trim().to_string();
-
-                            for (index, word) in text.split_whitespace().enumerate() {
-                                let chunk = format!("[{request_id}:{index}] {}\n", word.to_uppercase())
-                                    .into_bytes();
-                                debug!(request_id, chunk_index = index, word, "emitting output chunk");
-                                if tx_clone
-                                    .send(DaemonMessage::OutputChunk {
-                                        request_id,
-                                        stream: OutputStream::Stdout,
-                                        data: chunk,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    warn!(request_id, "client disconnected before output could be delivered");
-                                    return;
-                                }
-
-                                if word.eq_ignore_ascii_case("image") || word.eq_ignore_ascii_case("img") {
-                                    if emit_demo_image(&tx_clone, request_id, (index + 1) as u32).await.is_err() {
-                                        warn!(request_id, image_id = (index + 1) as u32, "client disconnected before image could be delivered");
-                                        return;
-                                    }
-                                }
-
-                                sleep(Duration::from_millis(150)).await;
-                            }
-
-                            let final_msg = if text.is_empty() {
-                                warn!(request_id, "request failed: empty input");
-                                DaemonMessage::Failed {
+                        let text = String::from_utf8_lossy(&input).trim().to_string();
+                        if text.is_empty() {
+                            warn!(request_id, "request failed: empty input");
+                            let _ = tx
+                                .send(DaemonMessage::Started { request_id })
+                                .await;
+                            let _ = tx
+                                .send(DaemonMessage::Failed {
                                     request_id,
                                     error: "empty input".to_string(),
+                                })
+                                .await;
+                            continue;
+                        }
+
+                        let Some(model) = selected_model.clone() else {
+                            warn!(request_id, "request failed: no model selected");
+                            let _ = tx
+                                .send(DaemonMessage::Started { request_id })
+                                .await;
+                            let _ = tx
+                                .send(DaemonMessage::Failed {
+                                    request_id,
+                                    error: "no model selected".to_string(),
+                                })
+                                .await;
+                            continue;
+                        };
+
+                        info!(request_id, input_len = input.len(), selected_model = %model, "starting request");
+                        let tx_clone = tx.clone();
+                        let requests_clone = Arc::clone(&requests);
+                        let auth_config = auth_config.clone();
+                        let handle = tokio::spawn(async move {
+                            let _ = tx_clone.send(DaemonMessage::Started { request_id }).await;
+                            match openai::chat_completion(&auth_config, &model, &text).await {
+                                Ok(response) => {
+                                    debug!(request_id, response_len = response.len(), "emitting provider response");
+                                    let mut data = response.into_bytes();
+                                    if !data.ends_with(b"\n") {
+                                        data.push(b'\n');
+                                    }
+                                    if tx_clone
+                                        .send(DaemonMessage::OutputChunk {
+                                            request_id,
+                                            stream: OutputStream::Stdout,
+                                            data,
+                                        })
+                                        .await
+                                        .is_ok()
+                                    {
+                                        info!(request_id, "request completed");
+                                        let _ = tx_clone.send(DaemonMessage::Done { request_id }).await;
+                                    } else {
+                                        warn!(request_id, "client disconnected before output could be delivered");
+                                    }
                                 }
-                            } else {
-                                info!(request_id, "request completed");
-                                DaemonMessage::Done { request_id }
-                            };
-                            let _ = tx_clone.send(final_msg).await;
+                                Err(error) => {
+                                    warn!(request_id, error = %error, "request failed");
+                                    let _ = tx_clone
+                                        .send(DaemonMessage::Failed {
+                                            request_id,
+                                            error: format!("model request failed: {error}"),
+                                        })
+                                        .await;
+                                }
+                            }
                             requests_clone.lock().await.remove(&request_id);
                         });
 
@@ -157,7 +177,7 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                         let _ = tx.send(DaemonMessage::Pong).await;
                     }
                     ClientMessage::ListModels => {
-                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, "listing configured models");
+                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, chat_completions_path = %auth_config.chat_completions_path, "listing configured models");
                         match openai::validate_and_list_models(&auth_config).await {
                             Ok(models) => {
                                 let _ = tx
@@ -178,7 +198,7 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                         }
                     }
                     ClientMessage::SetModel { model } => {
-                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, requested_model = %model, "setting selected model");
+                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, chat_completions_path = %auth_config.chat_completions_path, requested_model = %model, "setting selected model");
                         match openai::validate_and_list_models(&auth_config).await {
                             Ok(models) => {
                                 if models.iter().any(|candidate| candidate == &model) {
@@ -234,44 +254,96 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
     Ok(())
 }
 
-const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
-const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
-const REQUEST_IMAGE_WIDTH: u32 = 640;
-const REQUEST_IMAGE_HEIGHT: u32 = 640;
-
-async fn emit_demo_image(tx: &mpsc::Sender<DaemonMessage>, request_id: u32, image_id: u32) -> Result<(), mpsc::error::SendError<DaemonMessage>> {
-    let metadata = ImageMetadata {
-        image_id,
-        mime_type: REQUEST_IMAGE_MIME_TYPE.to_string(),
-        width: REQUEST_IMAGE_WIDTH,
-        height: REQUEST_IMAGE_HEIGHT,
-        byte_len: REQUEST_IMAGE_BYTES.len() as u64,
-        alt: Some("dua".to_string()),
-    };
-    tx.send(DaemonMessage::ImageStart { request_id, metadata }).await?;
-    for data in REQUEST_IMAGE_BYTES.chunks(MAX_IMAGE_CHUNK_SIZE) {
-        tx.send(DaemonMessage::ImageChunk {
-            request_id,
-            image_id,
-            data: data.to_vec(),
-        })
-        .await?;
-    }
-    tx.send(DaemonMessage::ImageEnd { request_id, image_id }).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tai_proto::{read_message, write_message};
-    use tokio::{net::UnixStream, time::{timeout, Duration}};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, UnixStream},
+        time::{timeout, Duration},
+    };
 
     fn test_auth_config() -> AuthConfig {
         AuthConfig {
             api_key: "test-key".to_string(),
-            base_url: "https://example.com".to_string(),
-            model_list_path: "/v1/models".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            model_list_path: "/models".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
         }
+    }
+
+    async fn spawn_mock_openai_server(chat_response: Option<&'static str>) -> (AuthConfig, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
+        let addr = listener.local_addr().expect("mock local addr");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let chat_response = chat_response;
+                tokio::spawn(async move {
+                    let mut buffer = vec![0_u8; 8192];
+                    let Ok(read_len) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read_len == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buffer[..read_len]);
+                    let first_line = request.lines().next().unwrap_or_default();
+                    let (status, body) = if first_line.starts_with("GET /v1/models ") || first_line.starts_with("GET /models ") {
+                        (
+                            "200 OK",
+                            r#"{"data":[{"id":"gpt-5.4-nano"}]}"#.to_string(),
+                        )
+                    } else if first_line.starts_with("POST /v1/chat/completions ") || first_line.starts_with("POST /chat/completions ") {
+                        match chat_response {
+                            Some(content) => (
+                                "200 OK",
+                                format!(
+                                    "{{\"choices\":[{{\"message\":{{\"content\":\"{}\"}}}}]}}",
+                                    content
+                                ),
+                            ),
+                            None => {
+                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                return;
+                            }
+                        }
+                    } else {
+                        ("404 Not Found", r#"{"error":"not found"}"#.to_string())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (
+            AuthConfig {
+                api_key: "test-key".to_string(),
+                base_url: format!("http://{}/v1", addr),
+                model_list_path: "/models".to_string(),
+                chat_completions_path: "/chat/completions".to_string(),
+            },
+            handle,
+        )
+    }
+
+    async fn set_selected_model(client: &mut UnixStream, model: &str) {
+        write_message(
+            client,
+            &ClientMessage::SetModel {
+                model: model.to_string(),
+            },
+        )
+        .await
+        .expect("write set-model");
     }
 
     async fn recv(client: &mut UnixStream) -> DaemonMessage {
@@ -295,8 +367,12 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_requests_complete_independently() {
+        let (auth_config, mock_server) = spawn_mock_openai_server(Some("mock completion")).await;
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
+        let server_task = tokio::spawn(handle_client(server, auth_config));
+
+        set_selected_model(&mut client, "gpt-5.4-nano").await;
+        assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
 
         write_message(
             &mut client,
@@ -323,9 +399,6 @@ mod tests {
                 DaemonMessage::OutputChunk { request_id, data, .. } => {
                     chunks.push((request_id, String::from_utf8_lossy(&data).to_string()));
                 }
-                DaemonMessage::ImageStart { .. }
-                | DaemonMessage::ImageChunk { .. }
-                | DaemonMessage::ImageEnd { .. } => {}
                 DaemonMessage::Done { request_id } => {
                     done.insert(request_id);
                 }
@@ -334,17 +407,22 @@ mod tests {
         }
 
         assert_eq!(started.len(), 2);
-        assert!(chunks.iter().any(|(id, chunk)| *id == 1 && chunk.contains("ALPHA")));
-        assert!(chunks.iter().any(|(id, chunk)| *id == 2 && chunk.contains("GAMMA")));
+        assert!(chunks.iter().any(|(id, chunk)| *id == 1 && chunk.contains("mock completion")));
+        assert!(chunks.iter().any(|(id, chunk)| *id == 2 && chunk.contains("mock completion")));
 
         drop(client);
         server_task.await.expect("join").expect("server ok");
+        mock_server.abort();
     }
 
     #[tokio::test]
     async fn duplicate_request_id_is_rejected() {
+        let (auth_config, mock_server) = spawn_mock_openai_server(None).await;
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
+        let server_task = tokio::spawn(handle_client(server, auth_config));
+
+        set_selected_model(&mut client, "gpt-5.4-nano").await;
+        assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
 
         write_message(
             &mut client,
@@ -361,21 +439,30 @@ mod tests {
 
         let mut saw_failure = false;
         while !saw_failure {
-            if let DaemonMessage::Failed { request_id, error } = recv(&mut client).await {
-                assert_eq!(request_id, 7);
-                assert!(error.contains("already active"));
-                saw_failure = true;
+            match recv(&mut client).await {
+                DaemonMessage::Started { request_id } => assert_eq!(request_id, 7),
+                DaemonMessage::Failed { request_id, error } => {
+                    assert_eq!(request_id, 7);
+                    assert!(error.contains("already active"));
+                    saw_failure = true;
+                }
+                other => panic!("unexpected message: {other:?}"),
             }
         }
 
         drop(client);
         server_task.await.expect("join").expect("server ok");
+        mock_server.abort();
     }
 
     #[tokio::test]
     async fn cancel_stops_active_request() {
+        let (auth_config, mock_server) = spawn_mock_openai_server(None).await;
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
+        let server_task = tokio::spawn(handle_client(server, auth_config));
+
+        set_selected_model(&mut client, "gpt-5.4-nano").await;
+        assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
 
         write_message(
             &mut client,
@@ -387,10 +474,6 @@ mod tests {
         loop {
             match recv(&mut client).await {
                 DaemonMessage::Started { request_id } if request_id == 9 => break,
-                DaemonMessage::OutputChunk { .. }
-                | DaemonMessage::ImageStart { .. }
-                | DaemonMessage::ImageChunk { .. }
-                | DaemonMessage::ImageEnd { .. } => {}
                 other => panic!("unexpected before started: {other:?}"),
             }
         }
@@ -399,26 +482,18 @@ mod tests {
             .await
             .expect("write cancel");
 
-        loop {
-            match recv(&mut client).await {
-                DaemonMessage::Cancelled { request_id } => {
-                    assert_eq!(request_id, 9);
-                    break;
-                }
-                DaemonMessage::OutputChunk { .. }
-                | DaemonMessage::ImageStart { .. }
-                | DaemonMessage::ImageChunk { .. }
-                | DaemonMessage::ImageEnd { .. } => {}
-                other => panic!("unexpected after cancel: {other:?}"),
-            }
+        match recv(&mut client).await {
+            DaemonMessage::Cancelled { request_id } => assert_eq!(request_id, 9),
+            other => panic!("unexpected after cancel: {other:?}"),
         }
 
         drop(client);
         server_task.await.expect("join").expect("server ok");
+        mock_server.abort();
     }
 
     #[tokio::test]
-    async fn image_keyword_emits_image_messages() {
+    async fn run_input_fails_when_no_model_selected() {
         let (server, mut client) = UnixStream::pair().expect("pair");
         let server_task = tokio::spawn(handle_client(server, test_auth_config()));
 
@@ -429,38 +504,23 @@ mod tests {
         .await
         .expect("write request");
 
-        let mut saw_start = false;
-        let mut saw_chunk = false;
-        let mut saw_end = false;
-
+        let mut saw_started = false;
         loop {
             match recv(&mut client).await {
-                DaemonMessage::ImageStart { request_id, metadata } => {
+                DaemonMessage::Started { request_id } => {
                     assert_eq!(request_id, 12);
-                    assert_eq!(metadata.mime_type, REQUEST_IMAGE_MIME_TYPE);
-                    saw_start = true;
+                    saw_started = true;
                 }
-                DaemonMessage::ImageChunk { request_id, image_id, data } => {
+                DaemonMessage::Failed { request_id, error } => {
                     assert_eq!(request_id, 12);
-                    assert_eq!(image_id, 2);
-                    assert!(!data.is_empty());
-                    saw_chunk = true;
-                }
-                DaemonMessage::ImageEnd { request_id, image_id } => {
-                    assert_eq!(request_id, 12);
-                    assert_eq!(image_id, 2);
-                    saw_end = true;
-                }
-                DaemonMessage::Done { request_id } => {
-                    assert_eq!(request_id, 12);
+                    assert!(error.contains("no model selected"));
                     break;
                 }
-                DaemonMessage::Started { .. } | DaemonMessage::OutputChunk { .. } => {}
                 other => panic!("unexpected message: {other:?}"),
             }
         }
 
-        assert!(saw_start && saw_chunk && saw_end);
+        assert!(saw_started);
 
         drop(client);
         server_task.await.expect("join").expect("server ok");
@@ -525,8 +585,9 @@ mod tests {
         let (server, mut client) = UnixStream::pair().expect("pair");
         let auth_config = AuthConfig {
             api_key: "test-key".to_string(),
-            base_url: "http://127.0.0.1:9".to_string(),
-            model_list_path: "/v1/models".to_string(),
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            model_list_path: "/models".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
         };
         let server_task = tokio::spawn(handle_client(server, auth_config));
 
@@ -551,8 +612,9 @@ mod tests {
         let (server, mut client) = UnixStream::pair().expect("pair");
         let auth_config = AuthConfig {
             api_key: "test-key".to_string(),
-            base_url: "http://127.0.0.1:9".to_string(),
-            model_list_path: "/v1/models".to_string(),
+            base_url: "http://127.0.0.1:9/v1".to_string(),
+            model_list_path: "/models".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
         };
         let server_task = tokio::spawn(handle_client(server, auth_config));
 
@@ -577,43 +639,4 @@ mod tests {
         server_task.await.expect("join").expect("server ok");
     }
 
-    #[tokio::test]
-    async fn emit_demo_image_sends_complete_sequence() {
-        let (tx, mut rx) = mpsc::channel(8);
-
-        emit_demo_image(&tx, 21, 4).await.expect("emit image");
-        drop(tx);
-
-        let first = rx.recv().await.expect("image start");
-        let second = rx.recv().await.expect("image chunk");
-        let third = rx.recv().await.expect("image end");
-
-        match first {
-            DaemonMessage::ImageStart { request_id, metadata } => {
-                assert_eq!(request_id, 21);
-                assert_eq!(metadata.image_id, 4);
-                assert_eq!(metadata.byte_len, REQUEST_IMAGE_BYTES.len() as u64);
-            }
-            other => panic!("unexpected first message: {other:?}"),
-        }
-
-        match second {
-            DaemonMessage::ImageChunk { request_id, image_id, data } => {
-                assert_eq!(request_id, 21);
-                assert_eq!(image_id, 4);
-                assert_eq!(data, REQUEST_IMAGE_BYTES);
-            }
-            other => panic!("unexpected second message: {other:?}"),
-        }
-
-        match third {
-            DaemonMessage::ImageEnd { request_id, image_id } => {
-                assert_eq!(request_id, 21);
-                assert_eq!(image_id, 4);
-            }
-            other => panic!("unexpected third message: {other:?}"),
-        }
-
-        assert!(rx.recv().await.is_none());
-    }
 }

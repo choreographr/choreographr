@@ -5,8 +5,9 @@ use tokio::{net::UnixStream, time::{timeout, Duration}};
 fn test_auth_config() -> AuthConfig {
     AuthConfig {
         api_key: "test-key".to_string(),
-        base_url: "https://example.com".to_string(),
-        model_list_path: "/v1/models".to_string(),
+        base_url: "https://example.com/v1".to_string(),
+        model_list_path: "/models".to_string(),
+        chat_completions_path: "/chat/completions".to_string(),
     }
 }
 
@@ -18,7 +19,7 @@ async fn recv(client: &mut UnixStream) -> DaemonMessage {
 }
 
 #[tokio::test]
-async fn daemon_handler_supports_multiple_in_flight_requests() {
+async fn daemon_handler_run_input_requires_selected_model() {
     let (server, mut client) = UnixStream::pair().expect("pair");
     let server_task = tokio::spawn(handle_client(server, test_auth_config()));
 
@@ -28,45 +29,24 @@ async fn daemon_handler_supports_multiple_in_flight_requests() {
     )
     .await
     .expect("write req1");
-    write_message(
-        &mut client,
-        &ClientMessage::RunInput { request_id: 2, input: b"gamma delta".to_vec() },
-    )
-    .await
-    .expect("write req2");
 
-    let mut started = std::collections::HashSet::new();
-    let mut done = std::collections::HashSet::new();
-    let mut saw_req1 = false;
-    let mut saw_req2 = false;
-
-    while done.len() < 2 {
+    let mut saw_started = false;
+    loop {
         match recv(&mut client).await {
             DaemonMessage::Started { request_id } => {
-                started.insert(request_id);
+                assert_eq!(request_id, 1);
+                saw_started = true;
             }
-            DaemonMessage::OutputChunk { request_id, data, .. } => {
-                let text = String::from_utf8_lossy(&data);
-                if request_id == 1 && text.contains("ALPHA") {
-                    saw_req1 = true;
-                }
-                if request_id == 2 && text.contains("GAMMA") {
-                    saw_req2 = true;
-                }
-            }
-            DaemonMessage::ImageStart { .. }
-            | DaemonMessage::ImageChunk { .. }
-            | DaemonMessage::ImageEnd { .. } => {}
-            DaemonMessage::Done { request_id } => {
-                done.insert(request_id);
+            DaemonMessage::Failed { request_id, error } => {
+                assert_eq!(request_id, 1);
+                assert!(error.contains("no model selected"));
+                break;
             }
             other => panic!("unexpected message: {other:?}"),
         }
     }
 
-    assert_eq!(started.len(), 2);
-    assert!(saw_req1);
-    assert!(saw_req2);
+    assert!(saw_started);
 
     drop(client);
     server_task.await.expect("join").expect("server ok");
@@ -77,8 +57,9 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
     let (server, mut client) = UnixStream::pair().expect("pair");
     let auth_config = AuthConfig {
         api_key: "test-key".to_string(),
-        base_url: "http://127.0.0.1:9".to_string(),
-        model_list_path: "/v1/models".to_string(),
+        base_url: "http://127.0.0.1:9/v1".to_string(),
+        model_list_path: "/models".to_string(),
+        chat_completions_path: "/chat/completions".to_string(),
     };
     let server_task = tokio::spawn(handle_client(server, auth_config));
 
