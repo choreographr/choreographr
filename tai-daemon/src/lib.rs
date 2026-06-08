@@ -182,25 +182,22 @@ pub async fn handle_client(stream: UnixStream) -> io::Result<()> {
     Ok(())
 }
 
-const DEMO_PNG_1X1: &[u8] = &[
-    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-    0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-    0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
-    0x9C, 0x63, 0xF8, 0xCF, 0xC0, 0xF0, 0x1F, 0x00, 0x05, 0x00, 0x01, 0xFF, 0x89, 0x99,
-    0x3D, 0x1D, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-];
+const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
+const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
+const REQUEST_IMAGE_WIDTH: u32 = 640;
+const REQUEST_IMAGE_HEIGHT: u32 = 640;
 
 async fn emit_demo_image(tx: &mpsc::Sender<DaemonMessage>, request_id: u32, image_id: u32) -> Result<(), mpsc::error::SendError<DaemonMessage>> {
     let metadata = ImageMetadata {
         image_id,
-        mime_type: "image/png".to_string(),
-        width: 1,
-        height: 1,
-        byte_len: DEMO_PNG_1X1.len() as u64,
-        alt: Some("demo image".to_string()),
+        mime_type: REQUEST_IMAGE_MIME_TYPE.to_string(),
+        width: REQUEST_IMAGE_WIDTH,
+        height: REQUEST_IMAGE_HEIGHT,
+        byte_len: REQUEST_IMAGE_BYTES.len() as u64,
+        alt: Some("dua".to_string()),
     };
     tx.send(DaemonMessage::ImageStart { request_id, metadata }).await?;
-    for data in DEMO_PNG_1X1.chunks(MAX_IMAGE_CHUNK_SIZE) {
+    for data in REQUEST_IMAGE_BYTES.chunks(MAX_IMAGE_CHUNK_SIZE) {
         tx.send(DaemonMessage::ImageChunk {
             request_id,
             image_id,
@@ -380,7 +377,7 @@ mod tests {
             match recv(&mut client).await {
                 DaemonMessage::ImageStart { request_id, metadata } => {
                     assert_eq!(request_id, 12);
-                    assert_eq!(metadata.mime_type, "image/png");
+                    assert_eq!(metadata.mime_type, REQUEST_IMAGE_MIME_TYPE);
                     saw_start = true;
                 }
                 DaemonMessage::ImageChunk { request_id, image_id, data } => {
@@ -478,7 +475,7 @@ mod tests {
             DaemonMessage::ImageStart { request_id, metadata } => {
                 assert_eq!(request_id, 21);
                 assert_eq!(metadata.image_id, 4);
-                assert_eq!(metadata.byte_len, DEMO_PNG_1X1.len() as u64);
+                assert_eq!(metadata.byte_len, REQUEST_IMAGE_BYTES.len() as u64);
             }
             other => panic!("unexpected first message: {other:?}"),
         }
@@ -487,7 +484,7 @@ mod tests {
             DaemonMessage::ImageChunk { request_id, image_id, data } => {
                 assert_eq!(request_id, 21);
                 assert_eq!(image_id, 4);
-                assert_eq!(data, DEMO_PNG_1X1);
+                assert_eq!(data, REQUEST_IMAGE_BYTES);
             }
             other => panic!("unexpected second message: {other:?}"),
         }
