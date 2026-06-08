@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 tai-proto = { path = "../tai-proto" }
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

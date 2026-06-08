@@ -7,20 +7,23 @@ use tokio::{
     task::JoinHandle,
     time::sleep,
 };
+use tracing::{debug, error, info, warn};
 
 pub async fn run_server(socket_path: &str) -> io::Result<()> {
     if Path::new(socket_path).exists() {
+        info!(%socket_path, "removing stale socket");
         std::fs::remove_file(socket_path)?;
     }
 
     let listener = UnixListener::bind(socket_path)?;
-    println!("tai-daemon listening on {socket_path}");
+    info!(%socket_path, "tai-daemon listening");
 
     loop {
         let (stream, _) = listener.accept().await?;
+        debug!("accepted client connection");
         tokio::spawn(async move {
             if let Err(error) = handle_client(stream).await {
-                eprintln!("client error: {error}");
+                error!(error = %error, "client error");
             }
         });
     }
@@ -31,100 +34,124 @@ pub async fn handle_client(stream: UnixStream) -> io::Result<()> {
     let (tx, mut rx) = mpsc::channel::<DaemonMessage>(128);
     let requests = Arc::new(Mutex::new(HashMap::<u32, JoinHandle<()>>::new()));
 
+    debug!("starting client handler");
+
     let writer_task = tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
+            debug!(?message, "sending daemon message");
             write_message(&mut writer, &message).await?;
         }
+        debug!("writer task shutting down");
         writer.shutdown().await
     });
 
     loop {
         match read_message::<_, ClientMessage>(&mut reader).await {
-            Ok(message) => match message {
-                ClientMessage::RunInput { request_id, input } => {
-                    let mut guard = requests.lock().await;
-                    if guard.contains_key(&request_id) {
-                        let _ = tx
-                            .send(DaemonMessage::Failed {
-                                request_id,
-                                error: "request id already active".to_string(),
-                            })
-                            .await;
-                        continue;
-                    }
-
-                    let tx_clone = tx.clone();
-                    let requests_clone = Arc::clone(&requests);
-                    let handle = tokio::spawn(async move {
-                        let _ = tx_clone.send(DaemonMessage::Started { request_id }).await;
-                        let text = String::from_utf8_lossy(&input).trim().to_string();
-
-                        for (index, word) in text.split_whitespace().enumerate() {
-                            let chunk =
-                                format!("[{request_id}:{index}] {}\n", word.to_uppercase()).into_bytes();
-                            if tx_clone
-                                .send(DaemonMessage::OutputChunk {
+            Ok(message) => {
+                debug!(?message, "received client message");
+                match message {
+                    ClientMessage::RunInput { request_id, input } => {
+                        let mut guard = requests.lock().await;
+                        if guard.contains_key(&request_id) {
+                            warn!(request_id, "duplicate request id rejected");
+                            let _ = tx
+                                .send(DaemonMessage::Failed {
                                     request_id,
-                                    stream: OutputStream::Stdout,
-                                    data: chunk,
+                                    error: "request id already active".to_string(),
                                 })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            sleep(Duration::from_millis(150)).await;
+                                .await;
+                            continue;
                         }
 
-                        let final_msg = if text.is_empty() {
-                            DaemonMessage::Failed {
-                                request_id,
-                                error: "empty input".to_string(),
-                            }
-                        } else {
-                            DaemonMessage::Done { request_id }
-                        };
-                        let _ = tx_clone.send(final_msg).await;
-                        requests_clone.lock().await.remove(&request_id);
-                    });
+                        info!(request_id, input_len = input.len(), "starting request");
+                        let tx_clone = tx.clone();
+                        let requests_clone = Arc::clone(&requests);
+                        let handle = tokio::spawn(async move {
+                            let _ = tx_clone.send(DaemonMessage::Started { request_id }).await;
+                            let text = String::from_utf8_lossy(&input).trim().to_string();
 
-                    guard.insert(request_id, handle);
-                }
-                ClientMessage::Cancel { request_id } => {
-                    if let Some(handle) = requests.lock().await.remove(&request_id) {
-                        handle.abort();
-                        let _ = tx.send(DaemonMessage::Cancelled { request_id }).await;
-                    } else {
-                        let _ = tx
-                            .send(DaemonMessage::Failed {
-                                request_id,
-                                error: "request id not active".to_string(),
-                            })
-                            .await;
+                            for (index, word) in text.split_whitespace().enumerate() {
+                                let chunk = format!("[{request_id}:{index}] {}\n", word.to_uppercase())
+                                    .into_bytes();
+                                debug!(request_id, chunk_index = index, word, "emitting output chunk");
+                                if tx_clone
+                                    .send(DaemonMessage::OutputChunk {
+                                        request_id,
+                                        stream: OutputStream::Stdout,
+                                        data: chunk,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    warn!(request_id, "client disconnected before output could be delivered");
+                                    return;
+                                }
+                                sleep(Duration::from_millis(150)).await;
+                            }
+
+                            let final_msg = if text.is_empty() {
+                                warn!(request_id, "request failed: empty input");
+                                DaemonMessage::Failed {
+                                    request_id,
+                                    error: "empty input".to_string(),
+                                }
+                            } else {
+                                info!(request_id, "request completed");
+                                DaemonMessage::Done { request_id }
+                            };
+                            let _ = tx_clone.send(final_msg).await;
+                            requests_clone.lock().await.remove(&request_id);
+                        });
+
+                        guard.insert(request_id, handle);
+                    }
+                    ClientMessage::Cancel { request_id } => {
+                        if let Some(handle) = requests.lock().await.remove(&request_id) {
+                            info!(request_id, "cancelling active request");
+                            handle.abort();
+                            let _ = tx.send(DaemonMessage::Cancelled { request_id }).await;
+                        } else {
+                            warn!(request_id, "cancel requested for inactive request");
+                            let _ = tx
+                                .send(DaemonMessage::Failed {
+                                    request_id,
+                                    error: "request id not active".to_string(),
+                                })
+                                .await;
+                        }
+                    }
+                    ClientMessage::Ping => {
+                        debug!("responding to ping");
+                        let _ = tx.send(DaemonMessage::Pong).await;
                     }
                 }
-                ClientMessage::Ping => {
-                    let _ = tx.send(DaemonMessage::Pong).await;
-                }
-            },
+            }
             Err(error)
                 if matches!(
                     error.kind(),
                     io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
                 ) =>
             {
+                debug!(error = %error, "client disconnected");
                 break;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                error!(error = %error, "failed to read client message");
+                return Err(error);
+            }
         }
     }
 
     let handles: Vec<_> = requests.lock().await.drain().map(|(_, handle)| handle).collect();
+    if !handles.is_empty() {
+        debug!(count = handles.len(), "aborting remaining request tasks");
+    }
     for handle in handles {
         handle.abort();
     }
     drop(tx);
     writer_task.await.map_err(io::Error::other)??;
+    debug!("client handler finished");
     Ok(())
 }
 
