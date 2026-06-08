@@ -1,3 +1,5 @@
+pub mod openai;
+
 use std::{collections::HashMap, io, path::Path, sync::Arc, time::Duration};
 use tai_proto::{
     ClientMessage, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
