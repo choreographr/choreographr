@@ -3,5 +3,9 @@
 version = 4
 
 [[package]]
-name = "tai"
+name = "tai-daemon"
+version = "0.1.0"
+
+[[package]]
+name = "tai-sh"
 version = "0.1.0"
