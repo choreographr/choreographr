@@ -1,5 +1,8 @@
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -129,7 +132,7 @@ async fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -139,7 +142,7 @@ async fn main() -> io::Result<()> {
     let result = run_ui_loop(&mut terminal, &mut app, &picker, &mut assembler, &client_tx, &mut ui_rx, &active).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
 
     drop(client_tx);
@@ -209,45 +212,61 @@ async fn handle_terminal_event(
     app: &mut App,
     client_tx: &mpsc::Sender<ClientMessage>,
 ) -> io::Result<()> {
-    if let Event::Key(key) = event {
-        if key.kind != KeyEventKind::Press {
-            return Ok(());
-        }
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
-                app.should_quit = true;
+    match event {
+        Event::Key(key) => {
+            if key.kind != KeyEventKind::Press {
+                return Ok(());
             }
-            KeyCode::Char('q') if app.input.is_empty() => app.should_quit = true,
-            KeyCode::Esc => app.should_quit = true,
-            KeyCode::Enter => {
-                let line = app.input.trim().to_string();
-                app.input.clear();
-                match parse_input_line(&line, &mut app.next_request_id) {
-                    ShellCommand::Empty => {}
-                    ShellCommand::InvalidCancel(value) => app.push_text(format!("invalid request id: {value}")),
-                    ShellCommand::Send(message) => {
-                        if let ClientMessage::RunInput { request_id, input } = &message {
-                            app.active.insert(*request_id);
-                            app.push_text(format!("> {}", String::from_utf8_lossy(input)));
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                    app.should_quit = true;
+                }
+                KeyCode::Char('q') if app.input.is_empty() => app.should_quit = true,
+                KeyCode::Esc => app.should_quit = true,
+                KeyCode::Enter => {
+                    let line = app.input.trim().to_string();
+                    app.input.clear();
+                    match parse_input_line(&line, &mut app.next_request_id) {
+                        ShellCommand::Empty => {}
+                        ShellCommand::InvalidCancel(value) => app.push_text(format!("invalid request id: {value}")),
+                        ShellCommand::Send(message) => {
+                            if let ClientMessage::RunInput { request_id, input } = &message {
+                                app.active.insert(*request_id);
+                                app.push_text(format!("> {}", String::from_utf8_lossy(input)));
+                            }
+                            client_tx.send(message).await.map_err(channel_closed)?;
                         }
-                        client_tx.send(message).await.map_err(channel_closed)?;
                     }
                 }
+                KeyCode::Backspace => {
+                    app.input.pop();
+                }
+                KeyCode::Char(c) => {
+                    app.input.push(c);
+                }
+                KeyCode::PageUp => {
+                    app.scroll = app.scroll.saturating_add(3);
+                }
+                KeyCode::PageDown => {
+                    app.scroll = app.scroll.saturating_sub(3);
+                }
+                _ => {}
             }
-            KeyCode::Backspace => {
-                app.input.pop();
-            }
-            KeyCode::Char(c) => {
-                app.input.push(c);
-            }
-            KeyCode::PageUp => {
-                app.scroll = app.scroll.saturating_add(3);
-            }
-            KeyCode::PageDown => {
-                app.scroll = app.scroll.saturating_sub(3);
-            }
-            _ => {}
         }
+        Event::Mouse(mouse) => {
+            if mouse_in_history_box(mouse.column, mouse.row) {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        app.scroll = app.scroll.saturating_add(1);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        app.scroll = app.scroll.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -310,6 +329,20 @@ async fn handle_daemon_message(
         }
     }
     Ok(())
+}
+
+fn mouse_in_history_box(column: u16, row: u16) -> bool {
+    let Ok((width, height)) = crossterm::terminal::size() else {
+        return false;
+    };
+
+    if width == 0 || height == 0 || height <= 3 {
+        return false;
+    }
+
+    let input_height = 3;
+    let history_height = height.saturating_sub(input_height);
+    column < width && row < history_height
 }
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -407,7 +440,7 @@ fn image_history_height(rows_remaining: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyEvent, KeyModifiers, MouseEvent};
 
     #[test]
     fn app_push_text_trims_history_to_limit() {
@@ -534,5 +567,29 @@ mod tests {
         .expect("handle ctrl+c");
 
         assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn mouse_scroll_outside_history_box_does_not_change_scroll() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+        app.scroll = 5;
+
+        let (_, height) = crossterm::terminal::size().expect("terminal size");
+        let row = height.saturating_sub(1);
+        handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &tx,
+        )
+        .await
+        .expect("handle mouse");
+
+        assert_eq!(app.scroll, 5);
     }
 }
