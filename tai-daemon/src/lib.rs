@@ -21,15 +21,31 @@ pub async fn run_server(socket_path: &str) -> io::Result<()> {
     let listener = UnixListener::bind(socket_path)?;
     info!(%socket_path, "tai-daemon listening");
 
-    loop {
-        let (stream, _) = listener.accept().await?;
-        debug!("accepted client connection");
-        tokio::spawn(async move {
-            if let Err(error) = handle_client(stream).await {
-                error!(error = %error, "client error");
+    let result = loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _) = accept_result?;
+                debug!("accepted client connection");
+                tokio::spawn(async move {
+                    if let Err(error) = handle_client(stream).await {
+                        error!(error = %error, "client error");
+                    }
+                });
             }
-        });
+            ctrl_c_result = tokio::signal::ctrl_c() => {
+                ctrl_c_result.map_err(io::Error::other)?;
+                info!("received ctrl+c, shutting down tai-daemon");
+                break Ok(());
+            }
+        }
+    };
+
+    if Path::new(socket_path).exists() {
+        info!(%socket_path, "removing socket");
+        std::fs::remove_file(socket_path)?;
     }
+
+    result
 }
 
 pub async fn handle_client(stream: UnixStream) -> io::Result<()> {

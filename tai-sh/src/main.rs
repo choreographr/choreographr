@@ -74,6 +74,7 @@ impl App {
 enum UiEvent {
     Daemon(DaemonMessage),
     ReaderClosed,
+    Interrupt,
 }
 
 #[tokio::main]
@@ -119,6 +120,13 @@ async fn main() -> io::Result<()> {
         Ok::<(), io::Error>(())
     });
 
+    let signal_ui_tx = ui_tx.clone();
+    let signal_task = tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.map_err(io::Error::other)?;
+        let _ = signal_ui_tx.send(UiEvent::Interrupt).await;
+        Ok::<(), io::Error>(())
+    });
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -136,6 +144,14 @@ async fn main() -> io::Result<()> {
 
     drop(client_tx);
     writer_task.await.map_err(io::Error::other)??;
+    signal_task.abort();
+    match signal_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error),
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => return Err(io::Error::other(error)),
+    }
+
     match reader_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(error),
@@ -171,6 +187,10 @@ async fn run_ui_loop(
                     app.push_text("daemon connection closed");
                     app.should_quit = true;
                 }
+                UiEvent::Interrupt => {
+                    app.push_text("interrupt received");
+                    app.should_quit = true;
+                }
             }
         }
 
@@ -194,6 +214,9 @@ async fn handle_terminal_event(
             return Ok(());
         }
         match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                app.should_quit = true;
+            }
             KeyCode::Char('q') if app.input.is_empty() => app.should_quit = true,
             KeyCode::Esc => app.should_quit = true,
             KeyCode::Enter => {
@@ -485,5 +508,21 @@ mod tests {
         .expect("handle q");
         assert!(!app.should_quit);
         assert_eq!(app.input, "qq");
+    }
+
+    #[tokio::test]
+    async fn terminal_event_ctrl_c_quits() {
+        let (tx, _rx) = mpsc::channel(1);
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            &mut app,
+            &tx,
+        )
+        .await
+        .expect("handle ctrl+c");
+
+        assert!(app.should_quit);
     }
 }
