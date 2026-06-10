@@ -1,9 +1,17 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::PathBuf};
+use std::{collections::HashMap, fs, io, path::PathBuf};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL_LIST_PATH: &str = "/models";
+const DEFAULT_RESPONSES_PATH: &str = "/responses";
 const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestFormat {
+    Responses,
+    ChatCompletions,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig {
@@ -12,8 +20,14 @@ pub struct AuthConfig {
     pub base_url: String,
     #[serde(default = "default_model_list_path")]
     pub model_list_path: String,
+    #[serde(default = "default_responses_path")]
+    pub responses_path: String,
     #[serde(default = "default_chat_completions_path")]
     pub chat_completions_path: String,
+    #[serde(default = "default_request_format")]
+    pub default_request_format: RequestFormat,
+    #[serde(default)]
+    pub model_request_formats: HashMap<String, RequestFormat>,
 }
 
 fn default_base_url() -> String {
@@ -24,8 +38,16 @@ fn default_model_list_path() -> String {
     DEFAULT_MODEL_LIST_PATH.to_string()
 }
 
+fn default_responses_path() -> String {
+    DEFAULT_RESPONSES_PATH.to_string()
+}
+
 fn default_chat_completions_path() -> String {
     DEFAULT_CHAT_COMPLETIONS_PATH.to_string()
+}
+
+fn default_request_format() -> RequestFormat {
+    RequestFormat::ChatCompletions
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,6 +58,28 @@ struct ModelListResponse {
 #[derive(Debug, Deserialize)]
 struct ModelInfo {
     id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesRequest<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesResponse {
+    output: Vec<OutputItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OutputItem {
+    #[serde(default)]
+    content: Vec<ContentItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContentItem {
+    text: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,10 +187,48 @@ pub async fn validate_and_list_models(config: &AuthConfig) -> io::Result<Vec<Str
     Ok(payload.data.into_iter().map(|model| model.id).collect())
 }
 
-pub async fn chat_completion(config: &AuthConfig, model: &str, prompt: &str) -> io::Result<String> {
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(io::Error::other)?;
+impl AuthConfig {
+    pub fn request_format_for_model(&self, model: &str) -> RequestFormat {
+        self.model_request_formats
+            .get(model)
+            .copied()
+            .unwrap_or(self.default_request_format)
+    }
+}
+
+async fn responses_request(client: &reqwest::Client, config: &AuthConfig, model: &str, prompt: &str) -> io::Result<String> {
+    let url = endpoint_url(&config.base_url, &config.responses_path)?;
+    let payload: ResponsesResponse = send_request(
+        client
+            .post(&url)
+            .bearer_auth(config.api_key.trim())
+            .json(&ResponsesRequest {
+                model,
+                input: prompt,
+            }),
+    )
+    .await?;
+
+    let content = payload
+        .output
+        .into_iter()
+        .flat_map(|item| item.content.into_iter())
+        .filter_map(|item| item.text)
+        .map(|text| text.trim().to_string())
+        .find(|text| !text.is_empty())
+        .unwrap_or_default();
+
+    if content.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider returned an empty response",
+        ));
+    }
+
+    Ok(content)
+}
+
+async fn chat_completions_request(client: &reqwest::Client, config: &AuthConfig, model: &str, prompt: &str) -> io::Result<String> {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let payload: ChatCompletionsResponse = send_request(
         client
@@ -179,4 +261,15 @@ pub async fn chat_completion(config: &AuthConfig, model: &str, prompt: &str) -> 
     }
 
     Ok(content)
+}
+
+pub async fn completion(config: &AuthConfig, model: &str, prompt: &str) -> io::Result<String> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(io::Error::other)?;
+
+    match config.request_format_for_model(model) {
+        RequestFormat::Responses => responses_request(&client, config, model, prompt).await,
+        RequestFormat::ChatCompletions => chat_completions_request(&client, config, model, prompt).await,
+    }
 }

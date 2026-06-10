@@ -1,4 +1,4 @@
-use tai_daemon::{handle_client, openai::AuthConfig};
+use tai_daemon::{handle_client, openai::{AuthConfig, RequestFormat}};
 use tai_proto::{read_message, write_message, ClientMessage, DaemonMessage};
 use tokio::{net::UnixStream, time::{timeout, Duration}};
 
@@ -7,7 +7,10 @@ fn test_auth_config() -> AuthConfig {
         api_key: "test-key".to_string(),
         base_url: "https://example.com/v1".to_string(),
         model_list_path: "/models".to_string(),
+        responses_path: "/responses".to_string(),
         chat_completions_path: "/chat/completions".to_string(),
+        default_request_format: RequestFormat::ChatCompletions,
+        model_request_formats: std::collections::HashMap::new(),
     }
 }
 
@@ -59,7 +62,10 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
         api_key: "test-key".to_string(),
         base_url: "http://127.0.0.1:9/v1".to_string(),
         model_list_path: "/models".to_string(),
+        responses_path: "/responses".to_string(),
         chat_completions_path: "/chat/completions".to_string(),
+        default_request_format: RequestFormat::ChatCompletions,
+        model_request_formats: std::collections::HashMap::new(),
     };
     let server_task = tokio::spawn(handle_client(server, auth_config));
 

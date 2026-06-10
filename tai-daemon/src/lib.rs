@@ -120,7 +120,7 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                         let auth_config = auth_config.clone();
                         let handle = tokio::spawn(async move {
                             let _ = tx_clone.send(DaemonMessage::Started { request_id }).await;
-                            match openai::chat_completion(&auth_config, &model, &text).await {
+                            match openai::completion(&auth_config, &model, &text).await {
                                 Ok(response) => {
                                     debug!(request_id, response_len = response.len(), "emitting provider response");
                                     let mut data = response.into_bytes();
@@ -177,7 +177,7 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                         let _ = tx.send(DaemonMessage::Pong).await;
                     }
                     ClientMessage::ListModels => {
-                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, chat_completions_path = %auth_config.chat_completions_path, "listing configured models");
+                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, responses_path = %auth_config.responses_path, "listing configured models");
                         match openai::validate_and_list_models(&auth_config).await {
                             Ok(models) => {
                                 let _ = tx
@@ -198,7 +198,7 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                         }
                     }
                     ClientMessage::SetModel { model } => {
-                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, chat_completions_path = %auth_config.chat_completions_path, requested_model = %model, "setting selected model");
+                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, responses_path = %auth_config.responses_path, requested_model = %model, "setting selected model");
                         match openai::validate_and_list_models(&auth_config).await {
                             Ok(models) => {
                                 if models.iter().any(|candidate| candidate == &model) {
@@ -269,7 +269,10 @@ mod tests {
             api_key: "test-key".to_string(),
             base_url: "https://example.com/v1".to_string(),
             model_list_path: "/models".to_string(),
+            responses_path: "/responses".to_string(),
             chat_completions_path: "/chat/completions".to_string(),
+            default_request_format: openai::RequestFormat::ChatCompletions,
+            model_request_formats: std::collections::HashMap::new(),
         }
     }
 
@@ -329,7 +332,10 @@ mod tests {
                 api_key: "test-key".to_string(),
                 base_url: format!("http://{}/v1", addr),
                 model_list_path: "/models".to_string(),
+                responses_path: "/responses".to_string(),
                 chat_completions_path: "/chat/completions".to_string(),
+                default_request_format: openai::RequestFormat::ChatCompletions,
+                model_request_formats: std::collections::HashMap::new(),
             },
             handle,
         )
@@ -587,7 +593,10 @@ mod tests {
             api_key: "test-key".to_string(),
             base_url: "http://127.0.0.1:9/v1".to_string(),
             model_list_path: "/models".to_string(),
+            responses_path: "/responses".to_string(),
             chat_completions_path: "/chat/completions".to_string(),
+            default_request_format: openai::RequestFormat::ChatCompletions,
+            model_request_formats: std::collections::HashMap::new(),
         };
         let server_task = tokio::spawn(handle_client(server, auth_config));
 
@@ -614,7 +623,10 @@ mod tests {
             api_key: "test-key".to_string(),
             base_url: "http://127.0.0.1:9/v1".to_string(),
             model_list_path: "/models".to_string(),
+            responses_path: "/responses".to_string(),
             chat_completions_path: "/chat/completions".to_string(),
+            default_request_format: openai::RequestFormat::ChatCompletions,
+            model_request_formats: std::collections::HashMap::new(),
         };
         let server_task = tokio::spawn(handle_client(server, auth_config));
 

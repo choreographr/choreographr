@@ -71,17 +71,42 @@ Example:
 api_key = "sk-..."
 base_url = "https://api.openai.com/v1"
 model_list_path = "/models"
+responses_path = "/responses"
 chat_completions_path = "/chat/completions"
+default_request_format = "chat_completions"
+
+[model_request_formats]
+gpt-5 = "responses"
+gpt-5-mini = "responses"
+legacy-model = "chat_completions"
 ```
 
 Only `api_key` is required if you want the default OpenAI endpoints.
+
+### Migration note
+
+If you already have a `~/.config/tai-daemon/auth.toml`, you can now configure both request formats and choose a default:
+
+```toml
+responses_path = "/responses"
+chat_completions_path = "/chat/completions"
+default_request_format = "chat_completions"
+
+[model_request_formats]
+gpt-5 = "responses"
+```
+
+Supported request format values are `"chat_completions"` and `"responses"`.
 
 ### Config fields
 
 - `api_key` — bearer token sent to the provider
 - `base_url` — base URL for the OpenAI-compatible API
 - `model_list_path` — path used for model listing
-- `chat_completions_path` — path used for chat completions
+- `responses_path` — path used for Responses API requests
+- `chat_completions_path` — path used for chat completions requests
+- `default_request_format` — default request format for models not explicitly overridden
+- `model_request_formats` — per-model request format overrides
 
 ## Socket path
 
@@ -193,7 +218,8 @@ This workspace includes unit and integration tests for:
 ## Notes and current limitations
 
 - The shell and protocol support image messages, but the current daemon implementation only emits text completions.
-- The daemon uses the chat completions endpoint, not the newer responses API.
+- The daemon supports both chat completions and Responses API requests.
+- Request format is selected by `default_request_format`, with optional per-model overrides in `model_request_formats`.
 - Model selection is per client connection, not global.
 - `tai-sh` currently targets a local daemon over Unix sockets; there is no Windows named-pipe transport.
 - The protocol caps frame sizes at 1 MiB.
