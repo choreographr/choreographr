@@ -598,8 +598,14 @@ async fn handle_daemon_message(
                 }
             }
         }
+        DaemonMessage::ModelsFailed { error } => {
+            app.push_text(format!("[daemon] models failed: {error}"));
+        }
         DaemonMessage::ModelSelected { model } => {
             app.push_text(format!("[daemon] selected model: {model}"));
+        }
+        DaemonMessage::ModelSelectionFailed { model, error } => {
+            app.push_text(format!("[daemon] failed to select model {model}: {error}"));
         }
     }
     Ok(())

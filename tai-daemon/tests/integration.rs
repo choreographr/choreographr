@@ -86,8 +86,8 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
     .expect("write set-model");
 
     match recv(&mut client).await {
-        DaemonMessage::Failed { request_id, error } => {
-            assert_eq!(request_id, 0);
+        DaemonMessage::ModelSelectionFailed { model, error } => {
+            assert_eq!(model, "gpt-5.4-nano");
             assert!(error.contains("failed to list models"));
         }
         other => panic!("unexpected message: {other:?}"),

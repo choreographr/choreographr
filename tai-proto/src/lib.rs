@@ -62,7 +62,9 @@ pub enum DaemonMessage {
         models: Vec<String>,
         selected_model: Option<String>,
     },
+    ModelsFailed { error: String },
     ModelSelected { model: String },
+    ModelSelectionFailed { model: String, error: String },
 }
 
 pub fn encode_frame<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {

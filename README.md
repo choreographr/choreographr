@@ -212,7 +212,9 @@ Current protocol version:
 - `Cancelled { request_id }`
 - `Pong`
 - `Models { models, selected_model }`
+- `ModelsFailed { error }`
 - `ModelSelected { model }`
+- `ModelSelectionFailed { model, error }`
 
 ## Testing
 

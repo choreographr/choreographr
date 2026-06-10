@@ -196,8 +196,7 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
                             }
                             Err(error) => {
                                 let _ = tx
-                                    .send(DaemonMessage::Failed {
-                                        request_id: 0,
+                                    .send(DaemonMessage::ModelsFailed {
                                         error: format!("failed to list models: {error}"),
                                     })
                                     .await;
@@ -214,8 +213,8 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
                                     let _ = tx.send(DaemonMessage::ModelSelected { model }).await;
                                 } else {
                                     let _ = tx
-                                        .send(DaemonMessage::Failed {
-                                            request_id: 0,
+                                        .send(DaemonMessage::ModelSelectionFailed {
+                                            model: model.clone(),
                                             error: format!("unknown model: {model}"),
                                         })
                                         .await;
@@ -223,8 +222,8 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
                             }
                             Err(error) => {
                                 let _ = tx
-                                    .send(DaemonMessage::Failed {
-                                        request_id: 0,
+                                    .send(DaemonMessage::ModelSelectionFailed {
+                                        model,
                                         error: format!("failed to list models: {error}"),
                                     })
                                     .await;
@@ -650,8 +649,7 @@ mod tests {
             .expect("write list-models");
 
         match recv(&mut client).await {
-            DaemonMessage::Failed { request_id, error } => {
-                assert_eq!(request_id, 0);
+            DaemonMessage::ModelsFailed { error } => {
                 assert!(error.contains("failed to list models"));
             }
             other => panic!("unexpected message: {other:?}"),
@@ -688,8 +686,8 @@ mod tests {
         .expect("write set-model");
 
         match recv(&mut client).await {
-            DaemonMessage::Failed { request_id, error } => {
-                assert_eq!(request_id, 0);
+            DaemonMessage::ModelSelectionFailed { model, error } => {
+                assert_eq!(model, "gpt-5.4-nano");
                 assert!(error.contains("failed to list models"));
             }
             other => panic!("unexpected message: {other:?}"),
