@@ -19,8 +19,8 @@ pub enum ClientMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OutputStream {
-    Stdout,
-    Stderr,
+    Answer,
+    Reasoning,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

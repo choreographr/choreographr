@@ -154,6 +154,12 @@ struct StreamDelta {
     reasoning_text: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionChunkKind {
+    Answer,
+    Reasoning,
+}
+
 #[derive(Clone)]
 pub struct OpenAiClient {
     config: AuthConfig,
@@ -291,13 +297,13 @@ impl OpenAiClient {
 
     pub async fn completion_stream<F, Fut>(&self, model: &str, prompt: &str, mut on_chunk: F) -> io::Result<()>
     where
-        F: FnMut(String) -> Fut,
+        F: FnMut(CompletionChunkKind, String) -> Fut,
         Fut: Future<Output = io::Result<()>>,
     {
         if !self.config.streaming {
             let content = self.completion(model, prompt).await?;
             if !content.is_empty() {
-                on_chunk(content).await?;
+                on_chunk(CompletionChunkKind::Answer, content).await?;
             }
             return Ok(());
         }
@@ -399,7 +405,7 @@ async fn chat_completions_request_streaming<F, Fut>(
     on_chunk: &mut F,
 ) -> io::Result<()>
 where
-    F: FnMut(String) -> Fut,
+    F: FnMut(CompletionChunkKind, String) -> Fut,
     Fut: Future<Output = io::Result<()>>,
 {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
@@ -430,33 +436,23 @@ where
     let mut saw_text = false;
     while let Some(data) = reader.next_event().await? {
         let payload: ChatCompletionsStreamResponse = serde_json::from_str(&data).map_err(io::Error::other)?;
-        for content in payload
-            .choices
-            .into_iter()
-            .flat_map(|choice| {
-                let Some(delta) = choice.delta else {
-                    return Vec::new();
-                };
+        for choice in payload.choices {
+            let Some(delta) = choice.delta else {
+                continue;
+            };
 
-                let mut parts = Vec::new();
-                if let Some(content) = delta.content {
-                    parts.push(content);
-                }
-                if let Some(reasoning_content) = delta.reasoning_content {
-                    parts.push(reasoning_content);
-                }
-                if let Some(reasoning) = delta.reasoning {
-                    parts.push(reasoning);
-                }
-                if let Some(reasoning_text) = delta.reasoning_text {
-                    parts.push(reasoning_text);
-                }
-                parts
-            })
-            .filter(|content| !content.is_empty())
-        {
-            saw_text = true;
-            on_chunk(content).await?;
+            if let Some(content) = delta.content.filter(|content| !content.is_empty()) {
+                saw_text = true;
+                on_chunk(CompletionChunkKind::Answer, content).await?;
+            }
+            for reasoning in [delta.reasoning_content, delta.reasoning, delta.reasoning_text]
+                .into_iter()
+                .flatten()
+                .filter(|content| !content.is_empty())
+            {
+                saw_text = true;
+                on_chunk(CompletionChunkKind::Reasoning, reasoning).await?;
+            }
         }
     }
 
@@ -478,7 +474,7 @@ async fn responses_request_streaming<F, Fut>(
     on_chunk: &mut F,
 ) -> io::Result<()>
 where
-    F: FnMut(String) -> Fut,
+    F: FnMut(CompletionChunkKind, String) -> Fut,
     Fut: Future<Output = io::Result<()>>,
 {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
@@ -501,7 +497,7 @@ where
             && !delta.is_empty()
         {
             saw_text = true;
-            on_chunk(delta).await?;
+            on_chunk(CompletionChunkKind::Answer, delta).await?;
         }
     }
 
@@ -673,5 +669,17 @@ mod tests {
             .expect("extract")
             .expect("delta");
         assert_eq!(delta, "hello");
+    }
+
+    #[test]
+    fn chat_completions_stream_delta_keeps_reasoning_separate() {
+        let payload: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"content":"answer","reasoning_text":"think"}}]}"#,
+        )
+        .expect("parse");
+
+        let delta = payload.choices.into_iter().next().expect("choice").delta.expect("delta");
+        assert_eq!(delta.content.as_deref(), Some("answer"));
+        assert_eq!(delta.reasoning_text.as_deref(), Some("think"));
     }
 }

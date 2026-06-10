@@ -10,11 +10,15 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
 use std::{collections::{HashMap, HashSet}, io, sync::Arc, time::Duration};
-use tai_proto::{read_message, socket_path, write_message, ClientMessage, DaemonMessage};
+use tai_proto::{
+    ClientMessage, DaemonMessage, OutputStream, read_message, socket_path, write_message,
+};
 use tai_sh::{
     ImageAssembler, RenderedImage, ShellCommand, build_picker, build_rendered_image,
     channel_closed, parse_input_line,
@@ -37,8 +41,14 @@ struct App {
 
 enum HistoryItem {
     Text(String),
-    StreamingText(String),
+    StreamingText(StreamingTextItem),
     Image(RenderedImage),
+}
+
+struct StreamingTextItem {
+    request_id: u32,
+    reasoning: String,
+    answer: String,
 }
 
 impl App {
@@ -74,21 +84,27 @@ impl App {
             return;
         }
         let index = self.history.len();
-        self.history
-            .push(HistoryItem::StreamingText(format!("[{request_id}] ")));
+        self.history.push(HistoryItem::StreamingText(StreamingTextItem {
+            request_id,
+            reasoning: String::new(),
+            answer: String::new(),
+        }));
         self.in_progress.insert(request_id, index);
         self.scroll = 0;
         self.trim_history();
     }
 
-    fn append_stream_text(&mut self, request_id: u32, chunk: &str) {
+    fn append_stream_text(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
         if !self.in_progress.contains_key(&request_id) {
             self.begin_stream(request_id);
         }
         if let Some(&index) = self.in_progress.get(&request_id)
             && let Some(HistoryItem::StreamingText(text)) = self.history.get_mut(index)
         {
-            text.push_str(chunk);
+            match stream {
+                OutputStream::Answer => text.answer.push_str(chunk),
+                OutputStream::Reasoning => text.reasoning.push_str(chunk),
+            }
         }
         self.scroll = 0;
     }
@@ -323,10 +339,14 @@ async fn handle_daemon_message(
         DaemonMessage::Started { request_id } => {
             app.begin_stream(request_id);
         }
-        DaemonMessage::OutputChunk { request_id, data, .. } => {
+        DaemonMessage::OutputChunk {
+            request_id,
+            stream,
+            data,
+        } => {
             let text = String::from_utf8(data)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            app.append_stream_text(request_id, &text);
+            app.append_stream_text(request_id, stream, &text);
         }
         DaemonMessage::ImageStart { request_id, metadata } => {
             assembler.start(request_id, metadata)?;
@@ -433,7 +453,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         }
 
         match item {
-            HistoryItem::Text(text) | HistoryItem::StreamingText(text) => {
+            HistoryItem::Text(text) => {
                 let wrapped = history_text_height(text, area.width).max(1);
                 if rows_to_skip >= wrapped {
                     rows_to_skip -= wrapped;
@@ -457,6 +477,38 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 };
                 frame.render_widget(
                     Paragraph::new(text.as_str())
+                        .wrap(Wrap { trim: false })
+                        .scroll((top_line as u16, 0)),
+                    rect,
+                );
+                rows_remaining -= visible_height;
+                rows_to_skip = 0;
+            }
+            HistoryItem::StreamingText(text) => {
+                let lines = streaming_text_lines(text);
+                let wrapped = lines_height(&lines, area.width).max(1);
+                if rows_to_skip >= wrapped {
+                    rows_to_skip -= wrapped;
+                    continue;
+                }
+
+                let visible_height = wrapped.min(rows_remaining);
+                if visible_height == 0 {
+                    break;
+                }
+
+                let bottom_line = wrapped.saturating_sub(rows_to_skip);
+                let top_line = bottom_line.saturating_sub(visible_height);
+
+                y = y.saturating_sub(visible_height as u16);
+                let rect = Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: visible_height as u16,
+                };
+                frame.render_widget(
+                    Paragraph::new(lines)
                         .wrap(Wrap { trim: false })
                         .scroll((top_line as u16, 0)),
                     rect,
@@ -500,19 +552,70 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 }
 
 fn history_text_height(text: &str, width: u16) -> usize {
+    let lines: Vec<Line<'_>> = if text.is_empty() {
+        vec![Line::from("")]
+    } else {
+        text.split('\n').map(Line::from).collect()
+    };
+    lines_height(&lines, width)
+}
+
+fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
     let width = width as usize;
     if width == 0 {
         return 0;
     }
 
-    if text.is_empty() {
+    let text = lines
+        .iter()
+        .map(Line::width)
+        .sum::<usize>();
+    if text == 0 && lines.len() <= 1 {
         return 1;
     }
 
-    text.split('\n')
-        .map(|line| wrapped_line_height(line, width))
+    lines
+        .iter()
+        .map(|line| wrapped_line_height(&line.to_string(), width))
         .sum::<usize>()
         .max(1)
+}
+
+fn streaming_text_lines(text: &StreamingTextItem) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(format!("[{}]", text.request_id))];
+
+    if !text.reasoning.is_empty() {
+        append_labeled_lines(
+            &mut lines,
+            "reasoning: ",
+            &text.reasoning,
+            Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+        );
+    }
+
+    if !text.answer.is_empty() {
+        append_labeled_lines(&mut lines, "answer: ", &text.answer, Style::default());
+    }
+
+    if text.reasoning.is_empty() && text.answer.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    lines
+}
+
+fn append_labeled_lines(lines: &mut Vec<Line<'static>>, label: &'static str, text: &str, style: Style) {
+    let mut split = text.split('\n');
+    if let Some(first) = split.next() {
+        lines.push(Line::from(vec![
+            Span::styled(label, style),
+            Span::styled(first.to_string(), style),
+        ]));
+    }
+
+    for line in split {
+        lines.push(Line::from(Span::styled(line.to_string(), style)));
+    }
 }
 
 fn wrapped_line_height(line: &str, width: usize) -> usize {
@@ -564,13 +667,16 @@ mod tests {
     fn append_stream_text_updates_mutable_history_entry() {
         let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
         app.begin_stream(7);
-        app.append_stream_text(7, "hello");
-        app.append_stream_text(7, " world");
+        app.append_stream_text(7, OutputStream::Reasoning, "thinking");
+        app.append_stream_text(7, OutputStream::Answer, "hello");
+        app.append_stream_text(7, OutputStream::Answer, " world");
 
         let index = app.in_progress[&7];
         match &app.history[index] {
             HistoryItem::StreamingText(text) => {
-                assert_eq!(text, "[7] hello world");
+                assert_eq!(text.request_id, 7);
+                assert_eq!(text.reasoning, "thinking");
+                assert_eq!(text.answer, "hello world");
             }
             _ => panic!("expected streaming text item"),
         }
@@ -583,6 +689,34 @@ mod tests {
         assert_eq!(history_text_height("a\nb\n", 10), 3);
         assert_eq!(history_text_height("", 10), 1);
         assert_eq!(history_text_height("\n", 10), 2);
+    }
+
+    #[test]
+    fn streaming_text_lines_include_reasoning_and_answer() {
+        let lines = streaming_text_lines(&StreamingTextItem {
+            request_id: 9,
+            reasoning: "step by step".to_string(),
+            answer: "final".to_string(),
+        });
+
+        assert_eq!(lines[0].to_string(), "[9]");
+        assert_eq!(lines[1].to_string(), "reasoning: step by step");
+        assert_eq!(lines[2].to_string(), "answer: final");
+    }
+
+    #[test]
+    fn streaming_text_lines_preserve_newlines() {
+        let lines = streaming_text_lines(&StreamingTextItem {
+            request_id: 3,
+            reasoning: "line one\nline two".to_string(),
+            answer: "final one\nfinal two".to_string(),
+        });
+
+        assert_eq!(lines[0].to_string(), "[3]");
+        assert_eq!(lines[1].to_string(), "reasoning: line one");
+        assert_eq!(lines[2].to_string(), "line two");
+        assert_eq!(lines[3].to_string(), "answer: final one");
+        assert_eq!(lines[4].to_string(), "final two");
     }
 
     #[test]

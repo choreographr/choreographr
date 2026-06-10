@@ -1,6 +1,6 @@
 pub mod openai;
 
-use crate::openai::{AuthConfig, OpenAiClient};
+use crate::openai::{AuthConfig, CompletionChunkKind, OpenAiClient};
 use std::{collections::HashMap, io, path::Path, sync::Arc};
 use tai_proto::{
     ClientMessage, DaemonMessage, OutputStream, read_message, write_message,
@@ -118,12 +118,15 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
                         let handle = tokio::spawn(async move {
                             let _ = tx_clone.send(DaemonMessage::Started { request_id }).await;
                             let completion = client_clone
-                                .completion_stream(&model, &text, |chunk| {
+                                .completion_stream(&model, &text, |kind, chunk| {
                                     let tx = tx_clone.clone();
                                     async move {
                                         tx.send(DaemonMessage::OutputChunk {
                                             request_id,
-                                            stream: OutputStream::Stdout,
+                                            stream: match kind {
+                                                CompletionChunkKind::Answer => OutputStream::Answer,
+                                                CompletionChunkKind::Reasoning => OutputStream::Reasoning,
+                                            },
                                             data: chunk.into_bytes(),
                                         })
                                         .await
