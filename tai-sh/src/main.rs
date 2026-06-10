@@ -439,18 +439,29 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     rows_to_skip -= wrapped;
                     continue;
                 }
-                if wrapped > rows_remaining {
+
+                let visible_height = wrapped.min(rows_remaining);
+                if visible_height == 0 {
                     break;
                 }
-                y = y.saturating_sub(wrapped as u16);
+
+                let bottom_line = wrapped.saturating_sub(rows_to_skip);
+                let top_line = bottom_line.saturating_sub(visible_height);
+
+                y = y.saturating_sub(visible_height as u16);
                 let rect = Rect {
                     x: area.x,
                     y,
                     width: area.width,
-                    height: wrapped as u16,
+                    height: visible_height as u16,
                 };
-                frame.render_widget(Paragraph::new(text.as_str()).wrap(Wrap { trim: false }), rect);
-                rows_remaining -= wrapped;
+                frame.render_widget(
+                    Paragraph::new(text.as_str())
+                        .wrap(Wrap { trim: false })
+                        .scroll((top_line as u16, 0)),
+                    rect,
+                );
+                rows_remaining -= visible_height;
                 rows_to_skip = 0;
             }
             HistoryItem::Image(image) => {
@@ -572,6 +583,19 @@ mod tests {
         assert_eq!(history_text_height("a\nb\n", 10), 3);
         assert_eq!(history_text_height("", 10), 1);
         assert_eq!(history_text_height("\n", 10), 2);
+    }
+
+    #[test]
+    fn oversized_history_item_keeps_visible_tail() {
+        let wrapped = history_text_height("123456789", 3);
+        assert_eq!(wrapped, 3);
+
+        let rows_remaining = 2;
+        let rows_to_skip = 0;
+        let bottom_line = wrapped.saturating_sub(rows_to_skip);
+        let top_line = bottom_line.saturating_sub(rows_remaining);
+
+        assert_eq!(top_line, 1);
     }
 
     #[test]
