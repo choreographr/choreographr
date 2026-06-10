@@ -278,6 +278,8 @@ mod tests {
             chat_completions_path: "/chat/completions".to_string(),
             default_request_format: openai::RequestFormat::ChatCompletions,
             model_request_formats: std::collections::HashMap::new(),
+            chat_completions_max_tokens: None,
+            model_max_tokens: std::collections::HashMap::new(),
             streaming: true,
         }
     }
@@ -369,6 +371,8 @@ mod tests {
             chat_completions_path: "/chat/completions".to_string(),
             default_request_format: openai::RequestFormat::ChatCompletions,
             model_request_formats: std::collections::HashMap::new(),
+            chat_completions_max_tokens: None,
+            model_max_tokens: std::collections::HashMap::new(),
             streaming: true,
         };
         (Arc::new(OpenAiClient::new(config).expect("client")), handle)
@@ -632,6 +636,8 @@ mod tests {
             chat_completions_path: "/chat/completions".to_string(),
             default_request_format: openai::RequestFormat::ChatCompletions,
             model_request_formats: std::collections::HashMap::new(),
+            chat_completions_max_tokens: None,
+            model_max_tokens: std::collections::HashMap::new(),
             streaming: true,
         };
         let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(auth_config).expect("client"))));
@@ -663,6 +669,8 @@ mod tests {
             chat_completions_path: "/chat/completions".to_string(),
             default_request_format: openai::RequestFormat::ChatCompletions,
             model_request_formats: std::collections::HashMap::new(),
+            chat_completions_max_tokens: None,
+            model_max_tokens: std::collections::HashMap::new(),
             streaming: true,
         };
         let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(auth_config).expect("client"))));

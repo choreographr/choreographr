@@ -77,12 +77,16 @@ model_list_path = "/models"
 responses_path = "/responses"
 chat_completions_path = "/chat/completions"
 default_request_format = "chat_completions"
+chat_completions_max_tokens = 4096
 streaming = true
 
 [model_request_formats]
 gpt-5 = "responses"
 gpt-5-mini = "responses"
 legacy-model = "chat_completions"
+
+[model_max_tokens]
+big-pickle = 4096
 ```
 
 Only `api_key` is required if you want the default OpenAI endpoints.
@@ -95,10 +99,14 @@ If you already have a `~/.config/tai-daemon/auth.toml`, you can now configure bo
 responses_path = "/responses"
 chat_completions_path = "/chat/completions"
 default_request_format = "chat_completions"
+chat_completions_max_tokens = 4096
 streaming = true
 
 [model_request_formats]
 gpt-5 = "responses"
+
+[model_max_tokens]
+big-pickle = 4096
 ```
 
 Supported request format values are `"chat_completions"` and `"responses"`.
@@ -112,6 +120,8 @@ Supported request format values are `"chat_completions"` and `"responses"`.
 - `chat_completions_path` — path used for chat completions requests
 - `default_request_format` — default request format for models not explicitly overridden
 - `model_request_formats` — per-model request format overrides
+- `chat_completions_max_tokens` — default max token cap sent on chat completions requests
+- `model_max_tokens` — per-model max token caps for chat completions requests
 - `streaming` — enable streaming completions via SSE when the provider supports it; falls back to one-shot requests when false
 
 ## Socket path

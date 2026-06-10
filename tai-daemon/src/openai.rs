@@ -30,6 +30,10 @@ pub struct AuthConfig {
     pub default_request_format: RequestFormat,
     #[serde(default)]
     pub model_request_formats: HashMap<String, RequestFormat>,
+    #[serde(default)]
+    pub chat_completions_max_tokens: Option<u32>,
+    #[serde(default)]
+    pub model_max_tokens: HashMap<String, u32>,
     #[serde(default = "default_streaming")]
     pub streaming: bool,
 }
@@ -98,6 +102,17 @@ struct ChatCompletionsRequest<'a> {
     messages: Vec<ChatMessage<'a>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ChatCompletionsStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatCompletionsStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -134,6 +149,9 @@ struct StreamChoice {
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
     content: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_text: Option<String>,
 }
 
 #[derive(Clone)]
@@ -219,6 +237,27 @@ impl AuthConfig {
             .get(model)
             .copied()
             .unwrap_or(self.default_request_format)
+    }
+
+    pub fn max_tokens_for_model(&self, model: &str) -> Option<u32> {
+        self.model_max_tokens
+            .get(model)
+            .copied()
+            .or(self.chat_completions_max_tokens)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MaxTokensField {
+    MaxTokens,
+    MaxCompletionTokens,
+}
+
+fn chat_completions_max_tokens_field(config: &AuthConfig, model: &str) -> MaxTokensField {
+    if config.base_url.contains("opencode.ai") || model == "big-pickle" {
+        MaxTokensField::MaxTokens
+    } else {
+        MaxTokensField::MaxCompletionTokens
     }
 }
 
@@ -310,6 +349,11 @@ async fn responses_request(client: &reqwest::Client, config: &AuthConfig, model:
 
 async fn chat_completions_request(client: &reqwest::Client, config: &AuthConfig, model: &str, prompt: &str) -> io::Result<String> {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
+    let max_tokens = config.max_tokens_for_model(model);
+    let (max_tokens_field, max_completion_tokens_field) = match chat_completions_max_tokens_field(config, model) {
+        MaxTokensField::MaxTokens => (max_tokens, None),
+        MaxTokensField::MaxCompletionTokens => (None, max_tokens),
+    };
     let payload: ChatCompletionsResponse = send_request(
         client
             .post(&url)
@@ -321,6 +365,9 @@ async fn chat_completions_request(client: &reqwest::Client, config: &AuthConfig,
                     content: prompt,
                 }],
                 stream: false,
+                stream_options: None,
+                max_tokens: max_tokens_field,
+                max_completion_tokens: max_completion_tokens_field,
             }),
     )
     .await?;
@@ -356,6 +403,11 @@ where
     Fut: Future<Output = io::Result<()>>,
 {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
+    let max_tokens = config.max_tokens_for_model(model);
+    let (max_tokens_field, max_completion_tokens_field) = match chat_completions_max_tokens_field(config, model) {
+        MaxTokensField::MaxTokens => (max_tokens, None),
+        MaxTokensField::MaxCompletionTokens => (None, max_tokens),
+    };
     let response = send_request_raw(
         client
             .post(&url)
@@ -367,6 +419,9 @@ where
                     content: prompt,
                 }],
                 stream: true,
+                stream_options: Some(ChatCompletionsStreamOptions { include_usage: true }),
+                max_tokens: max_tokens_field,
+                max_completion_tokens: max_completion_tokens_field,
             }),
     )
     .await?;
@@ -378,7 +433,26 @@ where
         for content in payload
             .choices
             .into_iter()
-            .filter_map(|choice| choice.delta.and_then(|delta| delta.content))
+            .flat_map(|choice| {
+                let Some(delta) = choice.delta else {
+                    return Vec::new();
+                };
+
+                let mut parts = Vec::new();
+                if let Some(content) = delta.content {
+                    parts.push(content);
+                }
+                if let Some(reasoning_content) = delta.reasoning_content {
+                    parts.push(reasoning_content);
+                }
+                if let Some(reasoning) = delta.reasoning {
+                    parts.push(reasoning);
+                }
+                if let Some(reasoning_text) = delta.reasoning_text {
+                    parts.push(reasoning_text);
+                }
+                parts
+            })
             .filter(|content| !content.is_empty())
         {
             saw_text = true;

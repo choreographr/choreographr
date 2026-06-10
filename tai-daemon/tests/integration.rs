@@ -12,6 +12,8 @@ fn test_auth_config() -> AuthConfig {
         chat_completions_path: "/chat/completions".to_string(),
         default_request_format: RequestFormat::ChatCompletions,
         model_request_formats: std::collections::HashMap::new(),
+        chat_completions_max_tokens: None,
+        model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     }
 }
@@ -68,6 +70,8 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
         chat_completions_path: "/chat/completions".to_string(),
         default_request_format: RequestFormat::ChatCompletions,
         model_request_formats: std::collections::HashMap::new(),
+        chat_completions_max_tokens: None,
+        model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
     let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(auth_config).expect("client"))));
