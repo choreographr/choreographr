@@ -10,7 +10,6 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    text::Line,
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
@@ -381,21 +380,20 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let mut rows_remaining = area.height as usize;
     let mut y = area.y + area.height;
-    let skip = app.scroll;
-    let mut seen = 0usize;
+    let mut rows_to_skip = app.scroll;
 
     for item in app.history.iter_mut().rev() {
-        if seen < skip {
-            seen += 1;
-            continue;
-        }
         if rows_remaining == 0 {
             break;
         }
 
         match item {
             HistoryItem::Text(text) => {
-                let wrapped = history_text_height(text).max(1);
+                let wrapped = history_text_height(text, area.width).max(1);
+                if rows_to_skip >= wrapped {
+                    rows_to_skip -= wrapped;
+                    continue;
+                }
                 if wrapped > rows_remaining {
                     break;
                 }
@@ -406,10 +404,17 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     width: area.width,
                     height: wrapped as u16,
                 };
-                frame.render_widget(Paragraph::new(Line::from(text.as_str())).wrap(Wrap { trim: false }), rect);
+                frame.render_widget(Paragraph::new(text.as_str()).wrap(Wrap { trim: false }), rect);
                 rows_remaining -= wrapped;
+                rows_to_skip = 0;
             }
             HistoryItem::Image(image) => {
+                let full_height = image_history_height(area.height as usize);
+                if rows_to_skip >= full_height {
+                    rows_to_skip -= full_height;
+                    continue;
+                }
+
                 let height = image_history_height(rows_remaining) as u16;
                 if height == 0 {
                     break;
@@ -432,13 +437,39 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 frame.render_widget(block, rect);
                 frame.render_stateful_widget(StatefulImage::default(), inner, &mut image.protocol);
                 rows_remaining = rows_remaining.saturating_sub(height as usize);
+                rows_to_skip = 0;
             }
         }
     }
 }
 
-fn history_text_height(text: &str) -> usize {
-    text.lines().count().max(1)
+fn history_text_height(text: &str, width: u16) -> usize {
+    let width = width as usize;
+    if width == 0 {
+        return 0;
+    }
+
+    if text.is_empty() {
+        return 1;
+    }
+
+    text.split('\n')
+        .map(|line| wrapped_line_height(line, width))
+        .sum::<usize>()
+        .max(1)
+}
+
+fn wrapped_line_height(line: &str, width: usize) -> usize {
+    if width == 0 {
+        return 0;
+    }
+
+    let line_width = line.chars().count();
+    if line_width == 0 {
+        1
+    } else {
+        line_width.div_ceil(width)
+    }
 }
 
 fn image_history_height(rows_remaining: usize) -> usize {
@@ -472,10 +503,12 @@ mod tests {
     }
 
     #[test]
-    fn history_text_height_counts_non_empty_lines() {
-        assert_eq!(history_text_height("hello"), 1);
-        assert_eq!(history_text_height("a\nb\n"), 2);
-        assert_eq!(history_text_height(""), 1);
+    fn history_text_height_accounts_for_wrapping_and_blank_lines() {
+        assert_eq!(history_text_height("hello", 10), 1);
+        assert_eq!(history_text_height("hello world", 5), 3);
+        assert_eq!(history_text_height("a\nb\n", 10), 3);
+        assert_eq!(history_text_height("", 10), 1);
+        assert_eq!(history_text_height("\n", 10), 2);
     }
 
     #[test]
