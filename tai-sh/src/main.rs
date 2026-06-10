@@ -36,7 +36,16 @@ struct App {
     history: Vec<HistoryItem>,
     in_progress: HashMap<u32, usize>,
     scroll: usize,
+    scroll_compensation: usize,
+    follow_output: bool,
+    history_viewport: HistoryViewport,
     should_quit: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HistoryViewport {
+    width: u16,
+    height: u16,
 }
 
 enum HistoryItem {
@@ -51,6 +60,31 @@ struct StreamingTextItem {
     answer: String,
 }
 
+impl HistoryViewport {
+    fn new() -> Self {
+        Self {
+            width: 80,
+            height: 24,
+        }
+    }
+
+    fn update(&mut self, area: Rect) {
+        self.width = area.width.max(1);
+        self.height = area.height;
+    }
+
+    fn item_height(&self, item: &HistoryItem) -> usize {
+        match item {
+            HistoryItem::Text(text) => history_text_height(text, self.width).max(1),
+            HistoryItem::StreamingText(text) => {
+                let lines = streaming_text_lines(text);
+                lines_height(&lines, self.width).max(1)
+            }
+            HistoryItem::Image(_) => image_block_height(self.height as usize),
+        }
+    }
+}
+
 impl App {
     fn new(socket_path: String, picker_protocol: String) -> Self {
         Self {
@@ -63,20 +97,84 @@ impl App {
             ],
             in_progress: HashMap::new(),
             scroll: 0,
+            scroll_compensation: 0,
+            follow_output: true,
+            history_viewport: HistoryViewport::new(),
             should_quit: false,
         }
     }
 
+    fn total_history_height(&self) -> usize {
+        self.history
+            .iter()
+            .map(|item| self.history_viewport.item_height(item))
+            .sum()
+    }
+
+    fn max_scroll_offset(&self) -> usize {
+        let viewport_height = self.history_viewport.height as usize;
+        let total_height = self.total_history_height();
+        total_height.saturating_sub(viewport_height)
+    }
+
+    fn clamp_scroll_state(&mut self) {
+        let max_scroll = self.max_scroll_offset();
+        let effective = self.scroll.saturating_add(self.scroll_compensation);
+        if effective <= max_scroll {
+            return;
+        }
+
+        let overflow = effective - max_scroll;
+        let compensation_reduction = self.scroll_compensation.min(overflow);
+        self.scroll_compensation -= compensation_reduction;
+        let remaining = overflow - compensation_reduction;
+        self.scroll = self.scroll.saturating_sub(remaining);
+        if self.scroll == 0 && self.scroll_compensation == 0 {
+            self.follow_output = true;
+        }
+    }
+
+    fn effective_scroll(&self) -> usize {
+        self.scroll
+            .saturating_add(self.scroll_compensation)
+            .min(self.max_scroll_offset())
+    }
+
+    fn preserve_scroll_for_growth(&mut self, old_height: usize, new_height: usize) {
+        if !self.follow_output && new_height > old_height {
+            self.scroll_compensation = self
+                .scroll_compensation
+                .saturating_add(new_height - old_height);
+            self.clamp_scroll_state();
+        }
+    }
+
     fn push_text(&mut self, line: impl Into<String>) {
-        self.history.push(HistoryItem::Text(line.into()));
-        self.scroll = 0;
+        let item = HistoryItem::Text(line.into());
+        let added_height = self.history_viewport.item_height(&item);
+        self.history.push(item);
+        if self.follow_output {
+            self.scroll = 0;
+            self.scroll_compensation = 0;
+        } else {
+            self.scroll_compensation = self.scroll_compensation.saturating_add(added_height);
+        }
         self.trim_history();
+        self.clamp_scroll_state();
     }
 
     fn push_image(&mut self, image: RenderedImage) {
-        self.history.push(HistoryItem::Image(image));
-        self.scroll = 0;
+        let item = HistoryItem::Image(image);
+        let added_height = self.history_viewport.item_height(&item);
+        self.history.push(item);
+        if self.follow_output {
+            self.scroll = 0;
+            self.scroll_compensation = 0;
+        } else {
+            self.scroll_compensation = self.scroll_compensation.saturating_add(added_height);
+        }
         self.trim_history();
+        self.clamp_scroll_state();
     }
 
     fn begin_stream(&mut self, request_id: u32) {
@@ -84,33 +182,70 @@ impl App {
             return;
         }
         let index = self.history.len();
-        self.history.push(HistoryItem::StreamingText(StreamingTextItem {
+        let item = HistoryItem::StreamingText(StreamingTextItem {
             request_id,
             reasoning: String::new(),
             answer: String::new(),
-        }));
+        });
+        let added_height = self.history_viewport.item_height(&item);
+        self.history.push(item);
         self.in_progress.insert(request_id, index);
-        self.scroll = 0;
+        if self.follow_output {
+            self.scroll = 0;
+            self.scroll_compensation = 0;
+        } else {
+            self.scroll_compensation = self.scroll_compensation.saturating_add(added_height);
+        }
         self.trim_history();
+        self.clamp_scroll_state();
     }
 
     fn append_stream_text(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
         if !self.in_progress.contains_key(&request_id) {
             self.begin_stream(request_id);
         }
-        if let Some(&index) = self.in_progress.get(&request_id)
-            && let Some(HistoryItem::StreamingText(text)) = self.history.get_mut(index)
-        {
-            match stream {
-                OutputStream::Answer => text.answer.push_str(chunk),
-                OutputStream::Reasoning => text.reasoning.push_str(chunk),
+        if let Some(&index) = self.in_progress.get(&request_id) {
+            let old_height = self
+                .history
+                .get(index)
+                .map(|item| self.history_viewport.item_height(item))
+                .unwrap_or(0);
+            if let Some(HistoryItem::StreamingText(text)) = self.history.get_mut(index) {
+                match stream {
+                    OutputStream::Answer => text.answer.push_str(chunk),
+                    OutputStream::Reasoning => text.reasoning.push_str(chunk),
+                }
             }
+            let new_height = self
+                .history
+                .get(index)
+                .map(|item| self.history_viewport.item_height(item))
+                .unwrap_or(old_height);
+            self.preserve_scroll_for_growth(old_height, new_height);
         }
-        self.scroll = 0;
     }
 
     fn finalize_stream(&mut self, request_id: u32) {
         self.in_progress.remove(&request_id);
+    }
+
+    fn scroll_up(&mut self, amount: usize) {
+        self.scroll = self.scroll.saturating_add(amount);
+        if self.scroll > 0 {
+            self.follow_output = false;
+        }
+        self.clamp_scroll_state();
+    }
+
+    fn scroll_down(&mut self, amount: usize) {
+        let compensation_reduction = self.scroll_compensation.min(amount);
+        self.scroll_compensation -= compensation_reduction;
+        let remaining = amount.saturating_sub(compensation_reduction);
+        self.scroll = self.scroll.saturating_sub(remaining);
+        if self.scroll == 0 && self.scroll_compensation == 0 {
+            self.follow_output = true;
+        }
+        self.clamp_scroll_state();
     }
 
     fn drop_request(&mut self, request_id: u32) {
@@ -123,11 +258,22 @@ impl App {
             return;
         }
         let excess = self.history.len() - 500;
+        let trimmed_height = if self.follow_output {
+            0
+        } else {
+            self.history
+                .iter()
+                .take(excess)
+                .map(|item| self.history_viewport.item_height(item))
+                .sum::<usize>()
+        };
         self.history.drain(0..excess);
+        self.scroll_compensation = self.scroll_compensation.saturating_sub(trimmed_height);
         for index in self.in_progress.values_mut() {
             *index = index.saturating_sub(excess);
         }
         self.in_progress.retain(|_, index| *index < self.history.len());
+        self.clamp_scroll_state();
     }
 }
 
@@ -302,10 +448,10 @@ async fn handle_terminal_event(
                     app.input.push(c);
                 }
                 KeyCode::PageUp => {
-                    app.scroll = app.scroll.saturating_add(3);
+                    app.scroll_up(3);
                 }
                 KeyCode::PageDown => {
-                    app.scroll = app.scroll.saturating_sub(3);
+                    app.scroll_down(3);
                 }
                 _ => {}
             }
@@ -314,10 +460,10 @@ async fn handle_terminal_event(
             if mouse_in_history_box(mouse.column, mouse.row) {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
-                        app.scroll = app.scroll.saturating_add(1);
+                        app.scroll_up(1);
                     }
                     MouseEventKind::ScrollDown => {
-                        app.scroll = app.scroll.saturating_sub(1);
+                        app.scroll_down(1);
                     }
                     _ => {}
                 }
@@ -426,6 +572,8 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(frame.area());
 
+    app.history_viewport.update(chunks[0]);
+    app.clamp_scroll_state();
     render_history(frame, chunks[0], app);
 
     let input = Paragraph::new(app.input.as_str())
@@ -445,7 +593,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let mut rows_remaining = area.height as usize;
     let mut y = area.y + area.height;
-    let mut rows_to_skip = app.scroll;
+    let mut rows_to_skip = app.effective_scroll();
 
     for item in app.history.iter_mut().rev() {
         if rows_remaining == 0 {
@@ -517,13 +665,13 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 rows_to_skip = 0;
             }
             HistoryItem::Image(image) => {
-                let full_height = image_history_height(area.height as usize);
+                let full_height = image_block_height(area.height as usize);
                 if rows_to_skip >= full_height {
                     rows_to_skip -= full_height;
                     continue;
                 }
 
-                let height = image_history_height(rows_remaining) as u16;
+                let height = image_block_height(rows_remaining) as u16;
                 if height == 0 {
                     break;
                 }
@@ -631,8 +779,8 @@ fn wrapped_line_height(line: &str, width: usize) -> usize {
     }
 }
 
-fn image_history_height(rows_remaining: usize) -> usize {
-    rows_remaining.min(12)
+fn image_block_height(available_height: usize) -> usize {
+    available_height.min(12)
 }
 
 #[cfg(test)]
@@ -680,6 +828,36 @@ mod tests {
             }
             _ => panic!("expected streaming text item"),
         }
+    }
+
+    #[test]
+    fn append_stream_text_preserves_manual_scroll_position() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+        app.history_viewport.width = 10;
+        app.history_viewport.height = 1;
+        app.push_text("older");
+        app.push_text("older still");
+        app.begin_stream(7);
+        app.scroll_up(3);
+
+        app.append_stream_text(7, OutputStream::Answer, "hello");
+
+        assert_eq!(app.scroll, 3);
+        assert_eq!(app.scroll_compensation, 1);
+        assert_eq!(app.effective_scroll(), 4);
+        assert!(!app.follow_output);
+    }
+
+    #[test]
+    fn append_stream_text_keeps_following_when_at_bottom() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+        app.begin_stream(7);
+
+        app.append_stream_text(7, OutputStream::Answer, "hello");
+
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.scroll_compensation, 0);
+        assert!(app.follow_output);
     }
 
     #[test]
@@ -734,9 +912,9 @@ mod tests {
 
     #[test]
     fn image_history_height_caps_to_twelve_rows() {
-        assert_eq!(image_history_height(0), 0);
-        assert_eq!(image_history_height(4), 4);
-        assert_eq!(image_history_height(20), 12);
+        assert_eq!(image_block_height(0), 0);
+        assert_eq!(image_block_height(4), 4);
+        assert_eq!(image_block_height(20), 12);
     }
 
     #[tokio::test]
@@ -835,7 +1013,11 @@ mod tests {
     async fn mouse_scroll_outside_history_box_does_not_change_scroll() {
         let (tx, _rx) = mpsc::channel(1);
         let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
-        app.scroll = 5;
+        app.history_viewport.height = 1;
+        for index in 0..8 {
+            app.push_text(format!("line {index}"));
+        }
+        app.scroll_up(5);
 
         let (_, height) = crossterm::terminal::size().expect("terminal size");
         let row = height.saturating_sub(1);
@@ -853,5 +1035,108 @@ mod tests {
         .expect("handle mouse");
 
         assert_eq!(app.scroll, 5);
+        assert!(!app.follow_output);
+    }
+
+    #[test]
+    fn scrolling_up_disables_follow_and_scrolling_back_to_bottom_enables_it() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+
+        app.scroll_up(3);
+        assert_eq!(app.scroll, 0);
+        assert!(app.follow_output);
+
+        app.history_viewport.height = 1;
+        app.scroll_up(3);
+        assert_eq!(app.scroll, 1);
+        assert!(!app.follow_output);
+
+        app.scroll_down(1);
+        assert_eq!(app.scroll, 0);
+        assert!(app.follow_output);
+    }
+
+    #[test]
+    fn push_text_respects_follow_output_mode() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+        app.history_viewport.width = 10;
+        app.history_viewport.height = 1;
+        for index in 0..8 {
+            app.push_text(format!("line {index}"));
+        }
+        app.scroll_up(4);
+
+        app.push_text("later");
+        assert_eq!(app.scroll, 4);
+        assert_eq!(app.scroll_compensation, 1);
+        assert_eq!(app.effective_scroll(), 5);
+        assert!(!app.follow_output);
+
+        app.scroll_down(1);
+        assert_eq!(app.scroll, 4);
+        assert_eq!(app.scroll_compensation, 0);
+
+        app.scroll_down(4);
+        app.push_text("latest");
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.scroll_compensation, 0);
+        assert!(app.follow_output);
+    }
+
+    #[test]
+    fn streaming_growth_above_viewport_preserves_visible_content_offset() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+        app.history_viewport.width = 5;
+        app.history_viewport.height = 1;
+        app.push_text("older history");
+        app.push_text("older history two");
+        app.begin_stream(7);
+        app.scroll_up(2);
+
+        app.append_stream_text(7, OutputStream::Answer, "123456");
+
+        assert_eq!(app.scroll, 2);
+        assert_eq!(app.scroll_compensation, 2);
+        assert_eq!(app.effective_scroll(), 4);
+        assert!(!app.follow_output);
+    }
+
+    #[test]
+    fn trimming_history_reduces_scroll_by_trimmed_height() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+        app.history_viewport.width = 10;
+        app.history_viewport.height = 1;
+        app.follow_output = false;
+        app.history = (0..499)
+            .map(|index| HistoryItem::Text(format!("line {index}")))
+            .collect();
+        app.scroll = 20;
+
+        app.push_text("tail");
+        assert_eq!(app.scroll, 20);
+        assert_eq!(app.scroll_compensation, 1);
+        assert_eq!(app.effective_scroll(), 21);
+
+        app.push_text("tail");
+
+        assert_eq!(app.history.len(), 500);
+        assert_eq!(app.scroll, 20);
+        assert_eq!(app.scroll_compensation, 1);
+        assert_eq!(app.effective_scroll(), 21);
+        assert!(!app.follow_output);
+    }
+
+    #[test]
+    fn scrolling_to_top_clamps_without_emptying_history_view() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+        app.history_viewport.height = 1;
+
+        app.scroll_up(100);
+
+        assert_eq!(app.max_scroll_offset(), 1);
+        assert_eq!(app.effective_scroll(), 1);
+        assert_eq!(app.scroll, 1);
+        assert_eq!(app.scroll_compensation, 0);
+        assert!(!app.follow_output);
     }
 }
