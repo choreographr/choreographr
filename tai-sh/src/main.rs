@@ -362,10 +362,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(frame.area());
 
-    let history_block = Block::default().borders(Borders::ALL).title("history");
-    let history_area = history_block.inner(chunks[0]);
-    frame.render_widget(history_block, chunks[0]);
-    render_history(frame, history_area, app);
+    render_history(frame, chunks[0], app);
 
     let input = Paragraph::new(app.input.as_str())
         .block(Block::default().borders(Borders::ALL).title("command"))
