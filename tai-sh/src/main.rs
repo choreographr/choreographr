@@ -35,9 +35,7 @@ struct App {
     active: HashSet<u32>,
     history: Vec<HistoryItem>,
     in_progress: HashMap<u32, usize>,
-    scroll: usize,
-    scroll_compensation: usize,
-    follow_output: bool,
+    history_scroll: HistoryScrollState,
     history_viewport: HistoryViewport,
     should_quit: bool,
 }
@@ -46,6 +44,13 @@ struct App {
 struct HistoryViewport {
     width: u16,
     height: u16,
+}
+
+#[derive(Clone, Copy)]
+struct HistoryScrollState {
+    scroll: usize,
+    scroll_compensation: usize,
+    follow_output: bool,
 }
 
 enum HistoryItem {
@@ -85,6 +90,97 @@ impl HistoryViewport {
     }
 }
 
+impl HistoryScrollState {
+    fn new() -> Self {
+        Self {
+            scroll: 0,
+            scroll_compensation: 0,
+            follow_output: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn scroll(&self) -> usize {
+        self.scroll
+    }
+
+    #[cfg(test)]
+    fn scroll_compensation(&self) -> usize {
+        self.scroll_compensation
+    }
+
+    fn follow_output(&self) -> bool {
+        self.follow_output
+    }
+
+    fn unclamped_effective_scroll(&self) -> usize {
+        self.scroll.saturating_add(self.scroll_compensation)
+    }
+
+    fn clamp(&mut self, max_scroll: usize) {
+        let effective = self.unclamped_effective_scroll();
+        if effective <= max_scroll {
+            return;
+        }
+
+        let overflow = effective - max_scroll;
+        let compensation_reduction = self.scroll_compensation.min(overflow);
+        self.scroll_compensation -= compensation_reduction;
+        let remaining = overflow - compensation_reduction;
+        self.scroll = self.scroll.saturating_sub(remaining);
+        if self.scroll == 0 && self.scroll_compensation == 0 {
+            self.follow_output = true;
+        }
+    }
+
+    fn effective_scroll(&self, max_scroll: usize) -> usize {
+        self.unclamped_effective_scroll().min(max_scroll)
+    }
+
+    fn preserve_for_growth(&mut self, old_height: usize, new_height: usize, max_scroll: usize) {
+        if !self.follow_output && new_height > old_height {
+            self.scroll_compensation = self
+                .scroll_compensation
+                .saturating_add(new_height - old_height);
+            self.clamp(max_scroll);
+        }
+    }
+
+    fn on_item_appended(&mut self, added_height: usize, max_scroll: usize) {
+        if self.follow_output {
+            self.scroll = 0;
+            self.scroll_compensation = 0;
+        } else {
+            self.scroll_compensation = self.scroll_compensation.saturating_add(added_height);
+        }
+        self.clamp(max_scroll);
+    }
+
+    fn scroll_up(&mut self, amount: usize, max_scroll: usize) {
+        self.scroll = self.scroll.saturating_add(amount);
+        if self.scroll > 0 {
+            self.follow_output = false;
+        }
+        self.clamp(max_scroll);
+    }
+
+    fn scroll_down(&mut self, amount: usize, max_scroll: usize) {
+        let compensation_reduction = self.scroll_compensation.min(amount);
+        self.scroll_compensation -= compensation_reduction;
+        let remaining = amount.saturating_sub(compensation_reduction);
+        self.scroll = self.scroll.saturating_sub(remaining);
+        if self.scroll == 0 && self.scroll_compensation == 0 {
+            self.follow_output = true;
+        }
+        self.clamp(max_scroll);
+    }
+
+    fn account_for_trimmed_height(&mut self, trimmed_height: usize, max_scroll: usize) {
+        self.scroll_compensation = self.scroll_compensation.saturating_sub(trimmed_height);
+        self.clamp(max_scroll);
+    }
+}
+
 impl App {
     fn new(socket_path: String, picker_protocol: String) -> Self {
         Self {
@@ -96,9 +192,7 @@ impl App {
                 HistoryItem::Text(format!("image protocol: {picker_protocol}")),
             ],
             in_progress: HashMap::new(),
-            scroll: 0,
-            scroll_compensation: 0,
-            follow_output: true,
+            history_scroll: HistoryScrollState::new(),
             history_viewport: HistoryViewport::new(),
             should_quit: false,
         }
@@ -118,47 +212,24 @@ impl App {
     }
 
     fn clamp_scroll_state(&mut self) {
-        let max_scroll = self.max_scroll_offset();
-        let effective = self.scroll.saturating_add(self.scroll_compensation);
-        if effective <= max_scroll {
-            return;
-        }
-
-        let overflow = effective - max_scroll;
-        let compensation_reduction = self.scroll_compensation.min(overflow);
-        self.scroll_compensation -= compensation_reduction;
-        let remaining = overflow - compensation_reduction;
-        self.scroll = self.scroll.saturating_sub(remaining);
-        if self.scroll == 0 && self.scroll_compensation == 0 {
-            self.follow_output = true;
-        }
+        self.history_scroll.clamp(self.max_scroll_offset());
     }
 
     fn effective_scroll(&self) -> usize {
-        self.scroll
-            .saturating_add(self.scroll_compensation)
-            .min(self.max_scroll_offset())
+        self.history_scroll.effective_scroll(self.max_scroll_offset())
     }
 
     fn preserve_scroll_for_growth(&mut self, old_height: usize, new_height: usize) {
-        if !self.follow_output && new_height > old_height {
-            self.scroll_compensation = self
-                .scroll_compensation
-                .saturating_add(new_height - old_height);
-            self.clamp_scroll_state();
-        }
+        self.history_scroll
+            .preserve_for_growth(old_height, new_height, self.max_scroll_offset());
     }
 
     fn push_text(&mut self, line: impl Into<String>) {
         let item = HistoryItem::Text(line.into());
         let added_height = self.history_viewport.item_height(&item);
         self.history.push(item);
-        if self.follow_output {
-            self.scroll = 0;
-            self.scroll_compensation = 0;
-        } else {
-            self.scroll_compensation = self.scroll_compensation.saturating_add(added_height);
-        }
+        self.history_scroll
+            .on_item_appended(added_height, self.max_scroll_offset());
         self.trim_history();
         self.clamp_scroll_state();
     }
@@ -167,12 +238,8 @@ impl App {
         let item = HistoryItem::Image(image);
         let added_height = self.history_viewport.item_height(&item);
         self.history.push(item);
-        if self.follow_output {
-            self.scroll = 0;
-            self.scroll_compensation = 0;
-        } else {
-            self.scroll_compensation = self.scroll_compensation.saturating_add(added_height);
-        }
+        self.history_scroll
+            .on_item_appended(added_height, self.max_scroll_offset());
         self.trim_history();
         self.clamp_scroll_state();
     }
@@ -190,12 +257,8 @@ impl App {
         let added_height = self.history_viewport.item_height(&item);
         self.history.push(item);
         self.in_progress.insert(request_id, index);
-        if self.follow_output {
-            self.scroll = 0;
-            self.scroll_compensation = 0;
-        } else {
-            self.scroll_compensation = self.scroll_compensation.saturating_add(added_height);
-        }
+        self.history_scroll
+            .on_item_appended(added_height, self.max_scroll_offset());
         self.trim_history();
         self.clamp_scroll_state();
     }
@@ -230,22 +293,12 @@ impl App {
     }
 
     fn scroll_up(&mut self, amount: usize) {
-        self.scroll = self.scroll.saturating_add(amount);
-        if self.scroll > 0 {
-            self.follow_output = false;
-        }
-        self.clamp_scroll_state();
+        self.history_scroll.scroll_up(amount, self.max_scroll_offset());
     }
 
     fn scroll_down(&mut self, amount: usize) {
-        let compensation_reduction = self.scroll_compensation.min(amount);
-        self.scroll_compensation -= compensation_reduction;
-        let remaining = amount.saturating_sub(compensation_reduction);
-        self.scroll = self.scroll.saturating_sub(remaining);
-        if self.scroll == 0 && self.scroll_compensation == 0 {
-            self.follow_output = true;
-        }
-        self.clamp_scroll_state();
+        self.history_scroll
+            .scroll_down(amount, self.max_scroll_offset());
     }
 
     fn drop_request(&mut self, request_id: u32) {
@@ -258,7 +311,7 @@ impl App {
             return;
         }
         let excess = self.history.len() - 500;
-        let trimmed_height = if self.follow_output {
+        let trimmed_height = if self.history_scroll.follow_output() {
             0
         } else {
             self.history
@@ -268,12 +321,12 @@ impl App {
                 .sum::<usize>()
         };
         self.history.drain(0..excess);
-        self.scroll_compensation = self.scroll_compensation.saturating_sub(trimmed_height);
         for index in self.in_progress.values_mut() {
             *index = index.saturating_sub(excess);
         }
         self.in_progress.retain(|_, index| *index < self.history.len());
-        self.clamp_scroll_state();
+        self.history_scroll
+            .account_for_trimmed_height(trimmed_height, self.max_scroll_offset());
     }
 }
 
@@ -842,10 +895,10 @@ mod tests {
 
         app.append_stream_text(7, OutputStream::Answer, "hello");
 
-        assert_eq!(app.scroll, 3);
-        assert_eq!(app.scroll_compensation, 1);
+        assert_eq!(app.history_scroll.scroll(), 3);
+        assert_eq!(app.history_scroll.scroll_compensation(), 1);
         assert_eq!(app.effective_scroll(), 4);
-        assert!(!app.follow_output);
+        assert!(!app.history_scroll.follow_output());
     }
 
     #[test]
@@ -855,9 +908,9 @@ mod tests {
 
         app.append_stream_text(7, OutputStream::Answer, "hello");
 
-        assert_eq!(app.scroll, 0);
-        assert_eq!(app.scroll_compensation, 0);
-        assert!(app.follow_output);
+        assert_eq!(app.history_scroll.scroll(), 0);
+        assert_eq!(app.history_scroll.scroll_compensation(), 0);
+        assert!(app.history_scroll.follow_output());
     }
 
     #[test]
@@ -1034,8 +1087,8 @@ mod tests {
         .await
         .expect("handle mouse");
 
-        assert_eq!(app.scroll, 5);
-        assert!(!app.follow_output);
+        assert_eq!(app.history_scroll.scroll(), 5);
+        assert!(!app.history_scroll.follow_output());
     }
 
     #[test]
@@ -1043,17 +1096,17 @@ mod tests {
         let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
 
         app.scroll_up(3);
-        assert_eq!(app.scroll, 0);
-        assert!(app.follow_output);
+        assert_eq!(app.history_scroll.scroll(), 0);
+        assert!(app.history_scroll.follow_output());
 
         app.history_viewport.height = 1;
         app.scroll_up(3);
-        assert_eq!(app.scroll, 1);
-        assert!(!app.follow_output);
+        assert_eq!(app.history_scroll.scroll(), 1);
+        assert!(!app.history_scroll.follow_output());
 
         app.scroll_down(1);
-        assert_eq!(app.scroll, 0);
-        assert!(app.follow_output);
+        assert_eq!(app.history_scroll.scroll(), 0);
+        assert!(app.history_scroll.follow_output());
     }
 
     #[test]
@@ -1067,20 +1120,20 @@ mod tests {
         app.scroll_up(4);
 
         app.push_text("later");
-        assert_eq!(app.scroll, 4);
-        assert_eq!(app.scroll_compensation, 1);
+        assert_eq!(app.history_scroll.scroll(), 4);
+        assert_eq!(app.history_scroll.scroll_compensation(), 1);
         assert_eq!(app.effective_scroll(), 5);
-        assert!(!app.follow_output);
+        assert!(!app.history_scroll.follow_output());
 
         app.scroll_down(1);
-        assert_eq!(app.scroll, 4);
-        assert_eq!(app.scroll_compensation, 0);
+        assert_eq!(app.history_scroll.scroll(), 4);
+        assert_eq!(app.history_scroll.scroll_compensation(), 0);
 
         app.scroll_down(4);
         app.push_text("latest");
-        assert_eq!(app.scroll, 0);
-        assert_eq!(app.scroll_compensation, 0);
-        assert!(app.follow_output);
+        assert_eq!(app.history_scroll.scroll(), 0);
+        assert_eq!(app.history_scroll.scroll_compensation(), 0);
+        assert!(app.history_scroll.follow_output());
     }
 
     #[test]
@@ -1095,10 +1148,10 @@ mod tests {
 
         app.append_stream_text(7, OutputStream::Answer, "123456");
 
-        assert_eq!(app.scroll, 2);
-        assert_eq!(app.scroll_compensation, 2);
+        assert_eq!(app.history_scroll.scroll(), 2);
+        assert_eq!(app.history_scroll.scroll_compensation(), 2);
         assert_eq!(app.effective_scroll(), 4);
-        assert!(!app.follow_output);
+        assert!(!app.history_scroll.follow_output());
     }
 
     #[test]
@@ -1106,24 +1159,24 @@ mod tests {
         let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
         app.history_viewport.width = 10;
         app.history_viewport.height = 1;
-        app.follow_output = false;
+        app.history_scroll.follow_output = false;
         app.history = (0..499)
             .map(|index| HistoryItem::Text(format!("line {index}")))
             .collect();
-        app.scroll = 20;
+        app.history_scroll.scroll = 20;
 
         app.push_text("tail");
-        assert_eq!(app.scroll, 20);
-        assert_eq!(app.scroll_compensation, 1);
+        assert_eq!(app.history_scroll.scroll(), 20);
+        assert_eq!(app.history_scroll.scroll_compensation(), 1);
         assert_eq!(app.effective_scroll(), 21);
 
         app.push_text("tail");
 
         assert_eq!(app.history.len(), 500);
-        assert_eq!(app.scroll, 20);
-        assert_eq!(app.scroll_compensation, 1);
+        assert_eq!(app.history_scroll.scroll(), 20);
+        assert_eq!(app.history_scroll.scroll_compensation(), 1);
         assert_eq!(app.effective_scroll(), 21);
-        assert!(!app.follow_output);
+        assert!(!app.history_scroll.follow_output());
     }
 
     #[test]
@@ -1135,8 +1188,8 @@ mod tests {
 
         assert_eq!(app.max_scroll_offset(), 1);
         assert_eq!(app.effective_scroll(), 1);
-        assert_eq!(app.scroll, 1);
-        assert_eq!(app.scroll_compensation, 0);
-        assert!(!app.follow_output);
+        assert_eq!(app.history_scroll.scroll(), 1);
+        assert_eq!(app.history_scroll.scroll_compensation(), 0);
+        assert!(!app.history_scroll.follow_output());
     }
 }
