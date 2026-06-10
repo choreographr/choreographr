@@ -13,6 +13,7 @@ The current implementation is intentionally small and local-first:
 - communication happens over a Unix domain socket
 - the daemon speaks to an OpenAI-compatible HTTP API
 - the shell lets you list/select models and submit prompts interactively
+- the daemon streams text responses incrementally when the provider supports SSE/token streaming
 - the protocol and UI already have image support primitives, though the daemon currently only returns text
 
 ## Workspace layout
@@ -35,6 +36,8 @@ The current implementation is intentionally small and local-first:
 - Supports cancellation for active requests
 - Exposes model discovery and model selection
 - Uses structured logging via `tracing`
+- Reuses a shared HTTP client for model listing and completions
+- Streams text tokens/chunks to clients when enabled
 
 ### `tai-sh`
 
@@ -74,6 +77,7 @@ model_list_path = "/models"
 responses_path = "/responses"
 chat_completions_path = "/chat/completions"
 default_request_format = "chat_completions"
+streaming = true
 
 [model_request_formats]
 gpt-5 = "responses"
@@ -85,12 +89,13 @@ Only `api_key` is required if you want the default OpenAI endpoints.
 
 ### Migration note
 
-If you already have a `~/.config/tai-daemon/auth.toml`, you can now configure both request formats and choose a default:
+If you already have a `~/.config/tai-daemon/auth.toml`, you can now configure both request formats, choose a default, and control streaming:
 
 ```toml
 responses_path = "/responses"
 chat_completions_path = "/chat/completions"
 default_request_format = "chat_completions"
+streaming = true
 
 [model_request_formats]
 gpt-5 = "responses"
@@ -107,6 +112,7 @@ Supported request format values are `"chat_completions"` and `"responses"`.
 - `chat_completions_path` — path used for chat completions requests
 - `default_request_format` — default request format for models not explicitly overridden
 - `model_request_formats` — per-model request format overrides
+- `streaming` — enable streaming completions via SSE when the provider supports it; falls back to one-shot requests when false
 
 ## Socket path
 
@@ -187,7 +193,7 @@ Current protocol version:
 ### Daemon messages
 
 - `Started { request_id }`
-- `OutputChunk { request_id, stream, data }`
+- `OutputChunk { request_id, stream, data }` — emitted incrementally for streamed text and once for non-streaming text
 - `ImageStart { ... }`
 - `ImageChunk { ... }`
 - `ImageEnd { ... }`

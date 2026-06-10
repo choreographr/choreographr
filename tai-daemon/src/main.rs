@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, sync::Arc};
 use tai_proto::socket_path;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -11,8 +11,9 @@ async fn main() -> io::Result<()> {
         .init();
 
     let auth_config = tai_daemon::openai::load_auth_config()?;
-    info!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, responses_path = %auth_config.responses_path, chat_completions_path = %auth_config.chat_completions_path, default_request_format = ?auth_config.default_request_format, "validating OpenAI credentials on startup");
-    let models = tai_daemon::openai::validate_and_list_models(&auth_config).await?;
+    info!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, responses_path = %auth_config.responses_path, chat_completions_path = %auth_config.chat_completions_path, default_request_format = ?auth_config.default_request_format, streaming = auth_config.streaming, "validating OpenAI credentials on startup");
+    let client = Arc::new(tai_daemon::openai::OpenAiClient::new(auth_config)?);
+    let models = client.validate_and_list_models().await?;
     if models.is_empty() {
         warn!("startup validation succeeded but provider returned no models");
     } else {
@@ -20,5 +21,5 @@ async fn main() -> io::Result<()> {
     }
 
     let socket_path = socket_path();
-    tai_daemon::run_server(&socket_path, auth_config).await
+    tai_daemon::run_server(&socket_path, client.config().clone()).await
 }

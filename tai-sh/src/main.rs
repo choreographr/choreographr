@@ -13,7 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
-use std::{collections::HashSet, io, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, io, sync::Arc, time::Duration};
 use tai_proto::{read_message, socket_path, write_message, ClientMessage, DaemonMessage};
 use tai_sh::{
     ImageAssembler, RenderedImage, ShellCommand, build_picker, build_rendered_image,
@@ -30,12 +30,14 @@ struct App {
     next_request_id: u32,
     active: HashSet<u32>,
     history: Vec<HistoryItem>,
+    in_progress: HashMap<u32, usize>,
     scroll: usize,
     should_quit: bool,
 }
 
 enum HistoryItem {
     Text(String),
+    StreamingText(String),
     Image(RenderedImage),
 }
 
@@ -49,6 +51,7 @@ impl App {
                 HistoryItem::Text(format!("Connected to tai-daemon at {socket_path}")),
                 HistoryItem::Text(format!("image protocol: {picker_protocol}")),
             ],
+            in_progress: HashMap::new(),
             scroll: 0,
             should_quit: false,
         }
@@ -57,19 +60,58 @@ impl App {
     fn push_text(&mut self, line: impl Into<String>) {
         self.history.push(HistoryItem::Text(line.into()));
         self.scroll = 0;
-        if self.history.len() > 500 {
-            let excess = self.history.len() - 500;
-            self.history.drain(0..excess);
-        }
+        self.trim_history();
     }
 
     fn push_image(&mut self, image: RenderedImage) {
         self.history.push(HistoryItem::Image(image));
         self.scroll = 0;
+        self.trim_history();
+    }
+
+    fn begin_stream(&mut self, request_id: u32) {
+        if self.in_progress.contains_key(&request_id) {
+            return;
+        }
+        let index = self.history.len();
+        self.history
+            .push(HistoryItem::StreamingText(format!("[{request_id}] ")));
+        self.in_progress.insert(request_id, index);
+        self.scroll = 0;
+        self.trim_history();
+    }
+
+    fn append_stream_text(&mut self, request_id: u32, chunk: &str) {
+        if !self.in_progress.contains_key(&request_id) {
+            self.begin_stream(request_id);
+        }
+        if let Some(&index) = self.in_progress.get(&request_id)
+            && let Some(HistoryItem::StreamingText(text)) = self.history.get_mut(index)
+        {
+            text.push_str(chunk);
+        }
+        self.scroll = 0;
+    }
+
+    fn finalize_stream(&mut self, request_id: u32) {
+        self.in_progress.remove(&request_id);
     }
 
     fn drop_request(&mut self, request_id: u32) {
         self.active.remove(&request_id);
+        self.finalize_stream(request_id);
+    }
+
+    fn trim_history(&mut self) {
+        if self.history.len() <= 500 {
+            return;
+        }
+        let excess = self.history.len() - 500;
+        self.history.drain(0..excess);
+        for index in self.in_progress.values_mut() {
+            *index = index.saturating_sub(excess);
+        }
+        self.in_progress.retain(|_, index| *index < self.history.len());
     }
 }
 
@@ -279,12 +321,12 @@ async fn handle_daemon_message(
 ) -> io::Result<()> {
     match message {
         DaemonMessage::Started { request_id } => {
-            app.push_text(format!("[{request_id}] started"));
+            app.begin_stream(request_id);
         }
         DaemonMessage::OutputChunk { request_id, data, .. } => {
-            for line in String::from_utf8_lossy(&data).lines() {
-                app.push_text(format!("[{request_id}] {line}"));
-            }
+            let text = String::from_utf8(data)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            app.append_stream_text(request_id, &text);
         }
         DaemonMessage::ImageStart { request_id, metadata } => {
             assembler.start(request_id, metadata)?;
@@ -298,18 +340,21 @@ async fn handle_daemon_message(
             app.push_image(rendered);
         }
         DaemonMessage::Done { request_id } => {
+            app.finalize_stream(request_id);
             app.push_text(format!("[{request_id}] done"));
             assembler.drop_request(request_id);
             active.lock().await.remove(&request_id);
             app.drop_request(request_id);
         }
         DaemonMessage::Failed { request_id, error } => {
+            app.finalize_stream(request_id);
             app.push_text(format!("[{request_id}] failed: {error}"));
             assembler.drop_request(request_id);
             active.lock().await.remove(&request_id);
             app.drop_request(request_id);
         }
         DaemonMessage::Cancelled { request_id } => {
+            app.finalize_stream(request_id);
             app.push_text(format!("[{request_id}] cancelled"));
             assembler.drop_request(request_id);
             active.lock().await.remove(&request_id);
@@ -388,7 +433,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         }
 
         match item {
-            HistoryItem::Text(text) => {
+            HistoryItem::Text(text) | HistoryItem::StreamingText(text) => {
                 let wrapped = history_text_height(text, area.width).max(1);
                 if rows_to_skip >= wrapped {
                     rows_to_skip -= wrapped;
@@ -490,7 +535,7 @@ mod tests {
         assert_eq!(app.history.len(), 500);
         match &app.history[0] {
             HistoryItem::Text(text) => assert!(text.contains("line 100")),
-            HistoryItem::Image(_) => panic!("expected text history item"),
+            HistoryItem::StreamingText(_) | HistoryItem::Image(_) => panic!("expected text history item"),
         }
     }
 
@@ -498,8 +543,26 @@ mod tests {
     fn drop_request_removes_active_request() {
         let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
         app.active.insert(42);
+        app.begin_stream(42);
         app.drop_request(42);
         assert!(!app.active.contains(&42));
+        assert!(!app.in_progress.contains_key(&42));
+    }
+
+    #[test]
+    fn append_stream_text_updates_mutable_history_entry() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+        app.begin_stream(7);
+        app.append_stream_text(7, "hello");
+        app.append_stream_text(7, " world");
+
+        let index = app.in_progress[&7];
+        match &app.history[index] {
+            HistoryItem::StreamingText(text) => {
+                assert_eq!(text, "[7] hello world");
+            }
+            _ => panic!("expected streaming text item"),
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 pub mod openai;
 
-use crate::openai::AuthConfig;
+use crate::openai::{AuthConfig, OpenAiClient};
 use std::{collections::HashMap, io, path::Path, sync::Arc};
 use tai_proto::{
     ClientMessage, DaemonMessage, OutputStream, read_message, write_message,
@@ -8,7 +8,7 @@ use tai_proto::{
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
@@ -20,6 +20,7 @@ pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Resul
     }
 
     let listener = UnixListener::bind(socket_path)?;
+    let client = Arc::new(OpenAiClient::new(auth_config)?);
     info!(%socket_path, "tai-daemon listening");
 
     let result = loop {
@@ -27,9 +28,9 @@ pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Resul
             accept_result = listener.accept() => {
                 let (stream, _) = accept_result?;
                 debug!("accepted client connection");
-                let auth_config = auth_config.clone();
+                let client = Arc::clone(&client);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, auth_config).await {
+                    if let Err(error) = handle_client(stream, client).await {
                         error!(error = %error, "client error");
                     }
                 });
@@ -50,7 +51,7 @@ pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Resul
     result
 }
 
-pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::Result<()> {
+pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<DaemonMessage>(128);
     let requests = Arc::new(Mutex::new(HashMap::<u32, JoinHandle<()>>::new()));
@@ -88,9 +89,7 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                         let text = String::from_utf8_lossy(&input).trim().to_string();
                         if text.is_empty() {
                             warn!(request_id, "request failed: empty input");
-                            let _ = tx
-                                .send(DaemonMessage::Started { request_id })
-                                .await;
+                            let _ = tx.send(DaemonMessage::Started { request_id }).await;
                             let _ = tx
                                 .send(DaemonMessage::Failed {
                                     request_id,
@@ -102,9 +101,7 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
 
                         let Some(model) = selected_model.clone() else {
                             warn!(request_id, "request failed: no model selected");
-                            let _ = tx
-                                .send(DaemonMessage::Started { request_id })
-                                .await;
+                            let _ = tx.send(DaemonMessage::Started { request_id }).await;
                             let _ = tx
                                 .send(DaemonMessage::Failed {
                                     request_id,
@@ -117,30 +114,36 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                         info!(request_id, input_len = input.len(), selected_model = %model, "starting request");
                         let tx_clone = tx.clone();
                         let requests_clone = Arc::clone(&requests);
-                        let auth_config = auth_config.clone();
+                        let client_clone = Arc::clone(&client);
                         let handle = tokio::spawn(async move {
                             let _ = tx_clone.send(DaemonMessage::Started { request_id }).await;
-                            match openai::completion(&auth_config, &model, &text).await {
-                                Ok(response) => {
-                                    debug!(request_id, response_len = response.len(), "emitting provider response");
-                                    let mut data = response.into_bytes();
-                                    if !data.ends_with(b"\n") {
-                                        data.push(b'\n');
-                                    }
-                                    if tx_clone
-                                        .send(DaemonMessage::OutputChunk {
+                            let completion = client_clone
+                                .completion_stream(&model, &text, |chunk| {
+                                    let tx = tx_clone.clone();
+                                    async move {
+                                        tx.send(DaemonMessage::OutputChunk {
                                             request_id,
                                             stream: OutputStream::Stdout,
-                                            data,
+                                            data: chunk.into_bytes(),
                                         })
                                         .await
-                                        .is_ok()
-                                    {
-                                        info!(request_id, "request completed");
-                                        let _ = tx_clone.send(DaemonMessage::Done { request_id }).await;
-                                    } else {
-                                        warn!(request_id, "client disconnected before output could be delivered");
+                                        .map_err(|_| {
+                                            io::Error::new(
+                                                io::ErrorKind::BrokenPipe,
+                                                "client disconnected before output could be delivered",
+                                            )
+                                        })
                                     }
+                                })
+                                .await;
+
+                            match completion {
+                                Ok(()) => {
+                                    info!(request_id, "request completed");
+                                    let _ = tx_clone.send(DaemonMessage::Done { request_id }).await;
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                                    warn!(request_id, "client disconnected before output could be delivered");
                                 }
                                 Err(error) => {
                                     warn!(request_id, error = %error, "request failed");
@@ -177,8 +180,9 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                         let _ = tx.send(DaemonMessage::Pong).await;
                     }
                     ClientMessage::ListModels => {
-                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, responses_path = %auth_config.responses_path, "listing configured models");
-                        match openai::validate_and_list_models(&auth_config).await {
+                        let config = client.config();
+                        debug!(base_url = %config.base_url, model_list_path = %config.model_list_path, responses_path = %config.responses_path, "listing configured models");
+                        match client.validate_and_list_models().await {
                             Ok(models) => {
                                 let _ = tx
                                     .send(DaemonMessage::Models {
@@ -198,8 +202,9 @@ pub async fn handle_client(stream: UnixStream, auth_config: AuthConfig) -> io::R
                         }
                     }
                     ClientMessage::SetModel { model } => {
-                        debug!(base_url = %auth_config.base_url, model_list_path = %auth_config.model_list_path, responses_path = %auth_config.responses_path, requested_model = %model, "setting selected model");
-                        match openai::validate_and_list_models(&auth_config).await {
+                        let config = client.config();
+                        debug!(base_url = %config.base_url, model_list_path = %config.model_list_path, responses_path = %config.responses_path, requested_model = %model, "setting selected model");
+                        match client.validate_and_list_models().await {
                             Ok(models) => {
                                 if models.iter().any(|candidate| candidate == &model) {
                                     selected_model = Some(model.clone());
@@ -261,7 +266,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, UnixStream},
-        time::{timeout, Duration},
+        time::{Duration, timeout},
     };
 
     fn test_auth_config() -> AuthConfig {
@@ -273,10 +278,11 @@ mod tests {
             chat_completions_path: "/chat/completions".to_string(),
             default_request_format: openai::RequestFormat::ChatCompletions,
             model_request_formats: std::collections::HashMap::new(),
+            streaming: true,
         }
     }
 
-    async fn spawn_mock_openai_server(chat_response: Option<&'static str>) -> (AuthConfig, tokio::task::JoinHandle<()>) {
+    async fn spawn_mock_openai_server(chat_response: Option<&'static str>, chat_stream: Option<&'static [&'static str]>) -> (Arc<OpenAiClient>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
         let addr = listener.local_addr().expect("mock local addr");
         let handle = tokio::spawn(async move {
@@ -284,7 +290,6 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
-                let chat_response = chat_response;
                 tokio::spawn(async move {
                     let mut buffer = vec![0_u8; 8192];
                     let Ok(read_len) = stream.read(&mut buffer).await else {
@@ -295,30 +300,59 @@ mod tests {
                     }
                     let request = String::from_utf8_lossy(&buffer[..read_len]);
                     let first_line = request.lines().next().unwrap_or_default();
-                    let (status, body) = if first_line.starts_with("GET /v1/models ") || first_line.starts_with("GET /models ") {
-                        (
-                            "200 OK",
-                            r#"{"data":[{"id":"gpt-5.4-nano"}]}"#.to_string(),
-                        )
-                    } else if first_line.starts_with("POST /v1/chat/completions ") || first_line.starts_with("POST /chat/completions ") {
+                    let is_streaming = request.contains("\"stream\":true");
+                    if first_line.starts_with("GET /v1/models ") || first_line.starts_with("GET /models ") {
+                        let body = r#"{"data":[{"id":"gpt-5.4-nano"}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+
+                    if first_line.starts_with("POST /v1/chat/completions ") || first_line.starts_with("POST /chat/completions ") {
+                        if is_streaming {
+                            let chunks = chat_stream.unwrap_or(&[]);
+                            let header = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+                            let _ = stream.write_all(header.as_bytes()).await;
+                            for chunk in chunks {
+                                let event = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n", chunk);
+                                let _ = stream.write_all(event.as_bytes()).await;
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            let _ = stream.write_all(b"data: [DONE]\n\n").await;
+                            let _ = stream.shutdown().await;
+                            return;
+                        }
+
                         match chat_response {
-                            Some(content) => (
-                                "200 OK",
-                                format!(
+                            Some(content) => {
+                                let body = format!(
                                     "{{\"choices\":[{{\"message\":{{\"content\":\"{}\"}}}}]}}",
                                     content
-                                ),
-                            ),
+                                );
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.shutdown().await;
+                                return;
+                            }
                             None => {
                                 tokio::time::sleep(Duration::from_secs(30)).await;
                                 return;
                             }
                         }
-                    } else {
-                        ("404 Not Found", r#"{"error":"not found"}"#.to_string())
-                    };
+                    }
+
+                    let body = r#"{"error":"not found"}"#;
                     let response = format!(
-                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                         body.len(),
                         body
                     );
@@ -327,18 +361,17 @@ mod tests {
                 });
             }
         });
-        (
-            AuthConfig {
-                api_key: "test-key".to_string(),
-                base_url: format!("http://{}/v1", addr),
-                model_list_path: "/models".to_string(),
-                responses_path: "/responses".to_string(),
-                chat_completions_path: "/chat/completions".to_string(),
-                default_request_format: openai::RequestFormat::ChatCompletions,
-                model_request_formats: std::collections::HashMap::new(),
-            },
-            handle,
-        )
+        let config = AuthConfig {
+            api_key: "test-key".to_string(),
+            base_url: format!("http://{}/v1", addr),
+            model_list_path: "/models".to_string(),
+            responses_path: "/responses".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            default_request_format: openai::RequestFormat::ChatCompletions,
+            model_request_formats: std::collections::HashMap::new(),
+            streaming: true,
+        };
+        (Arc::new(OpenAiClient::new(config).expect("client")), handle)
     }
 
     async fn set_selected_model(client: &mut UnixStream, model: &str) {
@@ -362,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn ping_round_trip() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
+        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(test_auth_config()).expect("client"))));
 
         write_message(&mut client, &ClientMessage::Ping).await.expect("write ping");
         assert!(matches!(recv(&mut client).await, DaemonMessage::Pong));
@@ -373,9 +406,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_requests_complete_independently() {
-        let (auth_config, mock_server) = spawn_mock_openai_server(Some("mock completion")).await;
+        let (client_impl, mock_server) = spawn_mock_openai_server(Some("mock completion"), Some(&["mock ", "completion"])) .await;
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, auth_config));
+        let server_task = tokio::spawn(handle_client(server, client_impl));
 
         set_selected_model(&mut client, "gpt-5.4-nano").await;
         assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
@@ -413,8 +446,10 @@ mod tests {
         }
 
         assert_eq!(started.len(), 2);
-        assert!(chunks.iter().any(|(id, chunk)| *id == 1 && chunk.contains("mock completion")));
-        assert!(chunks.iter().any(|(id, chunk)| *id == 2 && chunk.contains("mock completion")));
+        let combined_one = chunks.iter().filter(|(id, _)| *id == 1).map(|(_, chunk)| chunk.as_str()).collect::<String>();
+        let combined_two = chunks.iter().filter(|(id, _)| *id == 2).map(|(_, chunk)| chunk.as_str()).collect::<String>();
+        assert_eq!(combined_one, "mock completion");
+        assert_eq!(combined_two, "mock completion");
 
         drop(client);
         server_task.await.expect("join").expect("server ok");
@@ -423,9 +458,9 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_request_id_is_rejected() {
-        let (auth_config, mock_server) = spawn_mock_openai_server(None).await;
+        let (client_impl, mock_server) = spawn_mock_openai_server(None, None).await;
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, auth_config));
+        let server_task = tokio::spawn(handle_client(server, client_impl));
 
         set_selected_model(&mut client, "gpt-5.4-nano").await;
         assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
@@ -463,9 +498,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_stops_active_request() {
-        let (auth_config, mock_server) = spawn_mock_openai_server(None).await;
+        let (client_impl, mock_server) = spawn_mock_openai_server(None, None).await;
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, auth_config));
+        let server_task = tokio::spawn(handle_client(server, client_impl));
 
         set_selected_model(&mut client, "gpt-5.4-nano").await;
         assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
@@ -501,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn run_input_fails_when_no_model_selected() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
+        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(test_auth_config()).expect("client"))));
 
         write_message(
             &mut client,
@@ -535,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn empty_input_fails_request() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
+        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(test_auth_config()).expect("client"))));
 
         write_message(
             &mut client,
@@ -568,7 +603,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_inactive_request_fails() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, test_auth_config()));
+        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(test_auth_config()).expect("client"))));
 
         write_message(&mut client, &ClientMessage::Cancel { request_id: 99 })
             .await
@@ -597,8 +632,9 @@ mod tests {
             chat_completions_path: "/chat/completions".to_string(),
             default_request_format: openai::RequestFormat::ChatCompletions,
             model_request_formats: std::collections::HashMap::new(),
+            streaming: true,
         };
-        let server_task = tokio::spawn(handle_client(server, auth_config));
+        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(auth_config).expect("client"))));
 
         write_message(&mut client, &ClientMessage::ListModels)
             .await
@@ -627,8 +663,9 @@ mod tests {
             chat_completions_path: "/chat/completions".to_string(),
             default_request_format: openai::RequestFormat::ChatCompletions,
             model_request_formats: std::collections::HashMap::new(),
+            streaming: true,
         };
-        let server_task = tokio::spawn(handle_client(server, auth_config));
+        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(auth_config).expect("client"))));
 
         write_message(
             &mut client,
@@ -650,5 +687,4 @@ mod tests {
         drop(client);
         server_task.await.expect("join").expect("server ok");
     }
-
 }

@@ -1,6 +1,7 @@
-use tai_daemon::{handle_client, openai::{AuthConfig, RequestFormat}};
+use std::sync::Arc;
+use tai_daemon::{handle_client, openai::{AuthConfig, OpenAiClient, RequestFormat}};
 use tai_proto::{read_message, write_message, ClientMessage, DaemonMessage};
-use tokio::{net::UnixStream, time::{timeout, Duration}};
+use tokio::{net::UnixStream, time::{Duration, timeout}};
 
 fn test_auth_config() -> AuthConfig {
     AuthConfig {
@@ -11,6 +12,7 @@ fn test_auth_config() -> AuthConfig {
         chat_completions_path: "/chat/completions".to_string(),
         default_request_format: RequestFormat::ChatCompletions,
         model_request_formats: std::collections::HashMap::new(),
+        streaming: true,
     }
 }
 
@@ -24,7 +26,7 @@ async fn recv(client: &mut UnixStream) -> DaemonMessage {
 #[tokio::test]
 async fn daemon_handler_run_input_requires_selected_model() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(server, test_auth_config()));
+    let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(test_auth_config()).expect("client"))));
 
     write_message(
         &mut client,
@@ -66,8 +68,9 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
         chat_completions_path: "/chat/completions".to_string(),
         default_request_format: RequestFormat::ChatCompletions,
         model_request_formats: std::collections::HashMap::new(),
+        streaming: true,
     };
-    let server_task = tokio::spawn(handle_client(server, auth_config));
+    let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(auth_config).expect("client"))));
 
     write_message(
         &mut client,
@@ -89,4 +92,3 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
     drop(client);
     server_task.await.expect("join").expect("server ok");
 }
-
