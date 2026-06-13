@@ -5,3 +5,9 @@ members = [
     "tai-sh",
 ]
 resolver = "3"
+
+[workspace.dependencies]
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+tai-proto = { path = "tai-proto" }
+tokio = { version = "1" }

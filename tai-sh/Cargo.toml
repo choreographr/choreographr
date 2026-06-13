@@ -5,9 +5,9 @@ edition = "2024"
 
 [dependencies]
 crossterm = { version = "0.29", features = ["event-stream"] }
-futures-util = "0.3"
+futures-util.workspace = true
 image = "0.25"
 ratatui = "0.30.1"
 ratatui-image = { version = "11.0.4", default-features = false, features = ["crossterm", "image-defaults"] }
-tai-proto = { path = "../tai-proto" }
-tokio = { version = "1", features = ["full"] }
+tai-proto.workspace = true
+tokio = { workspace = true, features = ["full"] }
