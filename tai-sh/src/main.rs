@@ -1,7 +1,6 @@
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-        MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -15,7 +14,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
-use std::{collections::{HashMap, HashSet}, io, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    sync::Arc,
+    time::Duration,
+};
 use tai_proto::{
     ClientMessage, DaemonMessage, OutputStream, read_message, socket_path, write_message,
 };
@@ -216,7 +220,8 @@ impl App {
     }
 
     fn effective_scroll(&self) -> usize {
-        self.history_scroll.effective_scroll(self.max_scroll_offset())
+        self.history_scroll
+            .effective_scroll(self.max_scroll_offset())
     }
 
     fn preserve_scroll_for_growth(&mut self, old_height: usize, new_height: usize) {
@@ -293,7 +298,8 @@ impl App {
     }
 
     fn scroll_up(&mut self, amount: usize) {
-        self.history_scroll.scroll_up(amount, self.max_scroll_offset());
+        self.history_scroll
+            .scroll_up(amount, self.max_scroll_offset());
     }
 
     fn scroll_down(&mut self, amount: usize) {
@@ -324,7 +330,8 @@ impl App {
         for index in self.in_progress.values_mut() {
             *index = index.saturating_sub(excess);
         }
-        self.in_progress.retain(|_, index| *index < self.history.len());
+        self.in_progress
+            .retain(|_, index| *index < self.history.len());
         self.history_scroll
             .account_for_trimmed_height(trimmed_height, self.max_scroll_offset());
     }
@@ -395,10 +402,23 @@ async fn main() -> io::Result<()> {
     let mut app = App::new(socket_path.clone(), picker_protocol);
     let mut assembler = ImageAssembler::new();
 
-    let result = run_ui_loop(&mut terminal, &mut app, &picker, &mut assembler, &client_tx, &mut ui_rx, &active).await;
+    let result = run_ui_loop(
+        &mut terminal,
+        &mut app,
+        &picker,
+        &mut assembler,
+        &client_tx,
+        &mut ui_rx,
+        &active,
+    )
+    .await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     drop(client_tx);
@@ -474,7 +494,11 @@ async fn handle_terminal_event(
                 return Ok(());
             }
             match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                KeyCode::Char('c')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
                     app.should_quit = true;
                 }
                 KeyCode::Char('q') if app.input.is_empty() => app.should_quit = true,
@@ -484,7 +508,9 @@ async fn handle_terminal_event(
                     app.input.clear();
                     match parse_input_line(&line, &mut app.next_request_id) {
                         ShellCommand::Empty => {}
-                        ShellCommand::InvalidCancel(value) => app.push_text(format!("invalid request id: {value}")),
+                        ShellCommand::InvalidCancel(value) => {
+                            app.push_text(format!("invalid request id: {value}"))
+                        }
                         ShellCommand::Send(message) => {
                             if let ClientMessage::RunInput { request_id, input } = &message {
                                 app.active.insert(*request_id);
@@ -547,13 +573,23 @@ async fn handle_daemon_message(
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             app.append_stream_text(request_id, stream, &text);
         }
-        DaemonMessage::ImageStart { request_id, metadata } => {
+        DaemonMessage::ImageStart {
+            request_id,
+            metadata,
+        } => {
             assembler.start(request_id, metadata)?;
         }
-        DaemonMessage::ImageChunk { request_id, image_id, data } => {
+        DaemonMessage::ImageChunk {
+            request_id,
+            image_id,
+            data,
+        } => {
             assembler.push_chunk(request_id, image_id, &data)?;
         }
-        DaemonMessage::ImageEnd { request_id, image_id } => {
+        DaemonMessage::ImageEnd {
+            request_id,
+            image_id,
+        } => {
             let (metadata, data) = assembler.finish(request_id, image_id)?;
             let rendered = build_rendered_image(picker, metadata, data)?;
             app.push_image(rendered);
@@ -640,7 +676,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         .wrap(Wrap { trim: false });
     frame.render_widget(input, chunks[1]);
 
-    let cursor_x = chunks[1].x.saturating_add(1 + app.input.chars().count() as u16);
+    let cursor_x = chunks[1]
+        .x
+        .saturating_add(1 + app.input.chars().count() as u16);
     let cursor_y = chunks[1].y.saturating_add(1);
     frame.set_cursor_position((cursor_x, cursor_y));
 }
@@ -773,10 +811,7 @@ fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
         return 0;
     }
 
-    let text = lines
-        .iter()
-        .map(Line::width)
-        .sum::<usize>();
+    let text = lines.iter().map(Line::width).sum::<usize>();
     if text == 0 && lines.len() <= 1 {
         return 1;
     }
@@ -811,7 +846,12 @@ fn streaming_text_lines(text: &StreamingTextItem) -> Vec<Line<'static>> {
     lines
 }
 
-fn append_labeled_lines(lines: &mut Vec<Line<'static>>, label: &'static str, text: &str, style: Style) {
+fn append_labeled_lines(
+    lines: &mut Vec<Line<'static>>,
+    label: &'static str,
+    text: &str,
+    style: Style,
+) {
     let mut split = text.split('\n');
     if let Some(first) = split.next() {
         lines.push(Line::from(vec![
@@ -856,7 +896,9 @@ mod tests {
         assert_eq!(app.history.len(), 500);
         match &app.history[0] {
             HistoryItem::Text(text) => assert!(text.contains("line 100")),
-            HistoryItem::StreamingText(_) | HistoryItem::Image(_) => panic!("expected text history item"),
+            HistoryItem::StreamingText(_) | HistoryItem::Image(_) => {
+                panic!("expected text history item")
+            }
         }
     }
 

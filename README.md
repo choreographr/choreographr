@@ -6,6 +6,7 @@ A small Rust workspace for a local AI terminal interface.
 
 - `tai-daemon` — a Unix socket server that validates OpenAI-compatible credentials, lists models, accepts requests, and returns model output
 - `tai-sh` — a terminal UI client built with `ratatui` and `crossterm`
+- `tai-dioxus` — a minimal desktop app client built with `Dioxus`
 - `tai-proto` — the shared framed binary protocol used between the client and daemon
 
 The current implementation is intentionally small and local-first:
@@ -21,6 +22,7 @@ The current implementation is intentionally small and local-first:
 ```text
 .
 ├── tai-daemon/
+├── tai-dioxus/
 ├── tai-proto/
 └── tai-sh/
 ```
@@ -46,6 +48,13 @@ The current implementation is intentionally small and local-first:
 - Interactive command input
 - Displays daemon status, request lifecycle events, and model information
 - Includes image rendering support through `ratatui-image` for protocol messages that carry images
+
+### `tai-dioxus`
+
+- Minimal desktop app UI
+- Uses the same Unix socket transport and `tai-proto` message types as `tai-sh`
+- Supports prompt input, streaming output, model listing/selection, and cancellation
+- Image messages are not rendered yet
 
 ### `tai-proto`
 
@@ -158,6 +167,12 @@ Start the shell in another:
 cargo run -p tai-sh
 ```
 
+Or start the desktop app:
+
+```bash
+cargo run -p tai-dioxus
+```
+
 If startup succeeds, the daemon will validate your config against the provider before listening for requests.
 
 ## Shell commands
@@ -247,6 +262,7 @@ This workspace includes unit and integration tests for:
 - `tai-proto`: shared wire format and socket helpers
 - `tai-daemon`: provider-backed request executor
 - `tai-sh`: terminal client and image-capable history viewer
+- `tai-dioxus`: minimal Dioxus desktop client
 
 ## License
 

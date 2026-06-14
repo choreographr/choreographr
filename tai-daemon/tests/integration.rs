@@ -1,7 +1,13 @@
 use std::sync::Arc;
-use tai_daemon::{handle_client, openai::{AuthConfig, OpenAiClient, RequestFormat}};
-use tai_proto::{read_message, write_message, ClientMessage, DaemonMessage};
-use tokio::{net::UnixStream, time::{Duration, timeout}};
+use tai_daemon::{
+    handle_client,
+    openai::{AuthConfig, OpenAiClient, RequestFormat},
+};
+use tai_proto::{ClientMessage, DaemonMessage, read_message, write_message};
+use tokio::{
+    net::UnixStream,
+    time::{Duration, timeout},
+};
 
 fn test_auth_config() -> AuthConfig {
     AuthConfig {
@@ -19,20 +25,29 @@ fn test_auth_config() -> AuthConfig {
 }
 
 async fn recv(client: &mut UnixStream) -> DaemonMessage {
-    timeout(Duration::from_secs(3), read_message::<_, DaemonMessage>(client))
-        .await
-        .expect("timed out")
-        .expect("read failed")
+    timeout(
+        Duration::from_secs(3),
+        read_message::<_, DaemonMessage>(client),
+    )
+    .await
+    .expect("timed out")
+    .expect("read failed")
 }
 
 #[tokio::test]
 async fn daemon_handler_run_input_requires_selected_model() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(test_auth_config()).expect("client"))));
+    let server_task = tokio::spawn(handle_client(
+        server,
+        Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+    ));
 
     write_message(
         &mut client,
-        &ClientMessage::RunInput { request_id: 1, input: b"alpha beta".to_vec() },
+        &ClientMessage::RunInput {
+            request_id: 1,
+            input: b"alpha beta".to_vec(),
+        },
     )
     .await
     .expect("write req1");
@@ -74,7 +89,10 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(auth_config).expect("client"))));
+    let server_task = tokio::spawn(handle_client(
+        server,
+        Arc::new(OpenAiClient::new(auth_config).expect("client")),
+    ));
 
     write_message(
         &mut client,

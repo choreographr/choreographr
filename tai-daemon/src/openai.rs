@@ -195,7 +195,10 @@ pub fn load_auth_config() -> io::Result<AuthConfig> {
     if config.api_key.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("auth config at {} contains an empty api_key", path.display()),
+            format!(
+                "auth config at {} contains an empty api_key",
+                path.display()
+            ),
         ));
     }
 
@@ -269,7 +272,9 @@ fn chat_completions_max_tokens_field(config: &AuthConfig, model: &str) -> MaxTok
 
 impl OpenAiClient {
     pub fn new(config: AuthConfig) -> io::Result<Self> {
-        let http = reqwest::Client::builder().build().map_err(io::Error::other)?;
+        let http = reqwest::Client::builder()
+            .build()
+            .map_err(io::Error::other)?;
         Ok(Self { config, http })
     }
 
@@ -279,23 +284,28 @@ impl OpenAiClient {
 
     pub async fn validate_and_list_models(&self) -> io::Result<Vec<String>> {
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
-        let payload: ModelListResponse = send_request(
-            self.http.get(&url).bearer_auth(self.config.api_key.trim()),
-        )
-        .await?;
+        let payload: ModelListResponse =
+            send_request(self.http.get(&url).bearer_auth(self.config.api_key.trim())).await?;
         Ok(payload.data.into_iter().map(|model| model.id).collect())
     }
 
     pub async fn completion(&self, model: &str, prompt: &str) -> io::Result<String> {
         match self.config.request_format_for_model(model) {
-            RequestFormat::Responses => responses_request(&self.http, &self.config, model, prompt).await,
+            RequestFormat::Responses => {
+                responses_request(&self.http, &self.config, model, prompt).await
+            }
             RequestFormat::ChatCompletions => {
                 chat_completions_request(&self.http, &self.config, model, prompt).await
             }
         }
     }
 
-    pub async fn completion_stream<F, Fut>(&self, model: &str, prompt: &str, mut on_chunk: F) -> io::Result<()>
+    pub async fn completion_stream<F, Fut>(
+        &self,
+        model: &str,
+        prompt: &str,
+        mut on_chunk: F,
+    ) -> io::Result<()>
     where
         F: FnMut(CompletionChunkKind, String) -> Fut,
         Fut: Future<Output = io::Result<()>>,
@@ -310,29 +320,39 @@ impl OpenAiClient {
 
         match self.config.request_format_for_model(model) {
             RequestFormat::Responses => {
-                responses_request_streaming(&self.http, &self.config, model, prompt, &mut on_chunk).await
+                responses_request_streaming(&self.http, &self.config, model, prompt, &mut on_chunk)
+                    .await
             }
             RequestFormat::ChatCompletions => {
-                chat_completions_request_streaming(&self.http, &self.config, model, prompt, &mut on_chunk)
-                    .await
+                chat_completions_request_streaming(
+                    &self.http,
+                    &self.config,
+                    model,
+                    prompt,
+                    &mut on_chunk,
+                )
+                .await
             }
         }
     }
 }
 
-async fn responses_request(client: &reqwest::Client, config: &AuthConfig, model: &str, prompt: &str) -> io::Result<String> {
+async fn responses_request(
+    client: &reqwest::Client,
+    config: &AuthConfig,
+    model: &str,
+    prompt: &str,
+) -> io::Result<String> {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
-    let payload: ResponsesResponse = send_request(
-        client
-            .post(&url)
-            .bearer_auth(config.api_key.trim())
-            .json(&ResponsesRequest {
+    let payload: ResponsesResponse =
+        send_request(client.post(&url).bearer_auth(config.api_key.trim()).json(
+            &ResponsesRequest {
                 model,
                 input: prompt,
                 stream: false,
-            }),
-    )
-    .await?;
+            },
+        ))
+        .await?;
 
     let content = payload
         .output
@@ -353,18 +373,22 @@ async fn responses_request(client: &reqwest::Client, config: &AuthConfig, model:
     Ok(content)
 }
 
-async fn chat_completions_request(client: &reqwest::Client, config: &AuthConfig, model: &str, prompt: &str) -> io::Result<String> {
+async fn chat_completions_request(
+    client: &reqwest::Client,
+    config: &AuthConfig,
+    model: &str,
+    prompt: &str,
+) -> io::Result<String> {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
-    let (max_tokens_field, max_completion_tokens_field) = match chat_completions_max_tokens_field(config, model) {
-        MaxTokensField::MaxTokens => (max_tokens, None),
-        MaxTokensField::MaxCompletionTokens => (None, max_tokens),
-    };
-    let payload: ChatCompletionsResponse = send_request(
-        client
-            .post(&url)
-            .bearer_auth(config.api_key.trim())
-            .json(&ChatCompletionsRequest {
+    let (max_tokens_field, max_completion_tokens_field) =
+        match chat_completions_max_tokens_field(config, model) {
+            MaxTokensField::MaxTokens => (max_tokens, None),
+            MaxTokensField::MaxCompletionTokens => (None, max_tokens),
+        };
+    let payload: ChatCompletionsResponse =
+        send_request(client.post(&url).bearer_auth(config.api_key.trim()).json(
+            &ChatCompletionsRequest {
                 model,
                 messages: vec![ChatMessage {
                     role: "user",
@@ -374,9 +398,9 @@ async fn chat_completions_request(client: &reqwest::Client, config: &AuthConfig,
                 stream_options: None,
                 max_tokens: max_tokens_field,
                 max_completion_tokens: max_completion_tokens_field,
-            }),
-    )
-    .await?;
+            },
+        ))
+        .await?;
 
     let content = payload
         .choices
@@ -410,32 +434,33 @@ where
 {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
-    let (max_tokens_field, max_completion_tokens_field) = match chat_completions_max_tokens_field(config, model) {
-        MaxTokensField::MaxTokens => (max_tokens, None),
-        MaxTokensField::MaxCompletionTokens => (None, max_tokens),
-    };
-    let response = send_request_raw(
-        client
-            .post(&url)
-            .bearer_auth(config.api_key.trim())
-            .json(&ChatCompletionsRequest {
-                model,
-                messages: vec![ChatMessage {
-                    role: "user",
-                    content: prompt,
-                }],
-                stream: true,
-                stream_options: Some(ChatCompletionsStreamOptions { include_usage: true }),
-                max_tokens: max_tokens_field,
-                max_completion_tokens: max_completion_tokens_field,
+    let (max_tokens_field, max_completion_tokens_field) =
+        match chat_completions_max_tokens_field(config, model) {
+            MaxTokensField::MaxTokens => (max_tokens, None),
+            MaxTokensField::MaxCompletionTokens => (None, max_tokens),
+        };
+    let response = send_request_raw(client.post(&url).bearer_auth(config.api_key.trim()).json(
+        &ChatCompletionsRequest {
+            model,
+            messages: vec![ChatMessage {
+                role: "user",
+                content: prompt,
+            }],
+            stream: true,
+            stream_options: Some(ChatCompletionsStreamOptions {
+                include_usage: true,
             }),
-    )
+            max_tokens: max_tokens_field,
+            max_completion_tokens: max_completion_tokens_field,
+        },
+    ))
     .await?;
 
     let mut reader = SseReader::new(response);
     let mut saw_text = false;
     while let Some(data) = reader.next_event().await? {
-        let payload: ChatCompletionsStreamResponse = serde_json::from_str(&data).map_err(io::Error::other)?;
+        let payload: ChatCompletionsStreamResponse =
+            serde_json::from_str(&data).map_err(io::Error::other)?;
         for choice in payload.choices {
             let Some(delta) = choice.delta else {
                 continue;
@@ -445,10 +470,14 @@ where
                 saw_text = true;
                 on_chunk(CompletionChunkKind::Answer, content).await?;
             }
-            for reasoning in [delta.reasoning_content, delta.reasoning, delta.reasoning_text]
-                .into_iter()
-                .flatten()
-                .filter(|content| !content.is_empty())
+            for reasoning in [
+                delta.reasoning_content,
+                delta.reasoning,
+                delta.reasoning_text,
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|content| !content.is_empty())
             {
                 saw_text = true;
                 on_chunk(CompletionChunkKind::Reasoning, reasoning).await?;
@@ -478,16 +507,13 @@ where
     Fut: Future<Output = io::Result<()>>,
 {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
-    let response = send_request_raw(
-        client
-            .post(&url)
-            .bearer_auth(config.api_key.trim())
-            .json(&ResponsesRequest {
-                model,
-                input: prompt,
-                stream: true,
-            }),
-    )
+    let response = send_request_raw(client.post(&url).bearer_auth(config.api_key.trim()).json(
+        &ResponsesRequest {
+            model,
+            input: prompt,
+            stream: true,
+        },
+    ))
     .await?;
 
     let mut reader = SseReader::new(response);
@@ -547,7 +573,8 @@ impl SseReader {
                     if !self.pending.is_empty() {
                         let line = String::from_utf8(std::mem::take(&mut self.pending))
                             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                        self.event_lines.push(line.trim_end_matches('\r').to_string());
+                        self.event_lines
+                            .push(line.trim_end_matches('\r').to_string());
                     }
                     self.finished = true;
                     return self.finish_event();
@@ -609,11 +636,7 @@ fn build_sse_event(event_lines: &mut Vec<String>) -> Option<String> {
         .join("\n");
     event_lines.clear();
 
-    if data.is_empty() {
-        None
-    } else {
-        Some(data)
-    }
+    if data.is_empty() { None } else { Some(data) }
 }
 
 fn extract_responses_text_delta(data: &str) -> io::Result<Option<String>> {
@@ -632,11 +655,15 @@ fn extract_responses_text_delta(data: &str) -> io::Result<Option<String>> {
 }
 
 pub async fn validate_and_list_models(config: &AuthConfig) -> io::Result<Vec<String>> {
-    OpenAiClient::new(config.clone())?.validate_and_list_models().await
+    OpenAiClient::new(config.clone())?
+        .validate_and_list_models()
+        .await
 }
 
 pub async fn completion(config: &AuthConfig, model: &str, prompt: &str) -> io::Result<String> {
-    OpenAiClient::new(config.clone())?.completion(model, prompt).await
+    OpenAiClient::new(config.clone())?
+        .completion(model, prompt)
+        .await
 }
 
 #[cfg(test)]
@@ -665,9 +692,11 @@ mod tests {
 
     #[test]
     fn extracts_responses_text_delta() {
-        let delta = extract_responses_text_delta(r#"{"type":"response.output_text.delta","delta":"hello"}"#)
-            .expect("extract")
-            .expect("delta");
+        let delta = extract_responses_text_delta(
+            r#"{"type":"response.output_text.delta","delta":"hello"}"#,
+        )
+        .expect("extract")
+        .expect("delta");
         assert_eq!(delta, "hello");
     }
 
@@ -678,7 +707,13 @@ mod tests {
         )
         .expect("parse");
 
-        let delta = payload.choices.into_iter().next().expect("choice").delta.expect("delta");
+        let delta = payload
+            .choices
+            .into_iter()
+            .next()
+            .expect("choice")
+            .delta
+            .expect("delta");
         assert_eq!(delta.content.as_deref(), Some("answer"));
         assert_eq!(delta.reasoning_text.as_deref(), Some("think"));
     }

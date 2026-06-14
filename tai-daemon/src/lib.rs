@@ -2,9 +2,7 @@ pub mod openai;
 
 use crate::openai::{AuthConfig, CompletionChunkKind, OpenAiClient};
 use std::{collections::HashMap, io, path::Path, sync::Arc};
-use tai_proto::{
-    ClientMessage, DaemonMessage, OutputStream, read_message, write_message,
-};
+use tai_proto::{ClientMessage, DaemonMessage, OutputStream, read_message, write_message};
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
@@ -146,7 +144,10 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
                                     let _ = tx_clone.send(DaemonMessage::Done { request_id }).await;
                                 }
                                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                                    warn!(request_id, "client disconnected before output could be delivered");
+                                    warn!(
+                                        request_id,
+                                        "client disconnected before output could be delivered"
+                                    );
                                 }
                                 Err(error) => {
                                     warn!(request_id, error = %error, "request failed");
@@ -248,7 +249,12 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
         }
     }
 
-    let handles: Vec<_> = requests.lock().await.drain().map(|(_, handle)| handle).collect();
+    let handles: Vec<_> = requests
+        .lock()
+        .await
+        .drain()
+        .map(|(_, handle)| handle)
+        .collect();
     if !handles.is_empty() {
         debug!(count = handles.len(), "aborting remaining request tasks");
     }
@@ -286,8 +292,13 @@ mod tests {
         }
     }
 
-    async fn spawn_mock_openai_server(chat_response: Option<&'static str>, chat_stream: Option<&'static [&'static str]>) -> (Arc<OpenAiClient>, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
+    async fn spawn_mock_openai_server(
+        chat_response: Option<&'static str>,
+        chat_stream: Option<&'static [&'static str]>,
+    ) -> (Arc<OpenAiClient>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
         let addr = listener.local_addr().expect("mock local addr");
         let handle = tokio::spawn(async move {
             loop {
@@ -305,7 +316,9 @@ mod tests {
                     let request = String::from_utf8_lossy(&buffer[..read_len]);
                     let first_line = request.lines().next().unwrap_or_default();
                     let is_streaming = request.contains("\"stream\":true");
-                    if first_line.starts_with("GET /v1/models ") || first_line.starts_with("GET /models ") {
+                    if first_line.starts_with("GET /v1/models ")
+                        || first_line.starts_with("GET /models ")
+                    {
                         let body = r#"{"data":[{"id":"gpt-5.4-nano"}]}"#;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -317,13 +330,18 @@ mod tests {
                         return;
                     }
 
-                    if first_line.starts_with("POST /v1/chat/completions ") || first_line.starts_with("POST /chat/completions ") {
+                    if first_line.starts_with("POST /v1/chat/completions ")
+                        || first_line.starts_with("POST /chat/completions ")
+                    {
                         if is_streaming {
                             let chunks = chat_stream.unwrap_or(&[]);
                             let header = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
                             let _ = stream.write_all(header.as_bytes()).await;
                             for chunk in chunks {
-                                let event = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n", chunk);
+                                let event = format!(
+                                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                                    chunk
+                                );
                                 let _ = stream.write_all(event.as_bytes()).await;
                                 tokio::time::sleep(Duration::from_millis(10)).await;
                             }
@@ -392,18 +410,26 @@ mod tests {
     }
 
     async fn recv(client: &mut UnixStream) -> DaemonMessage {
-        timeout(Duration::from_secs(2), read_message::<_, DaemonMessage>(client))
-            .await
-            .expect("timed out")
-            .expect("read failed")
+        timeout(
+            Duration::from_secs(2),
+            read_message::<_, DaemonMessage>(client),
+        )
+        .await
+        .expect("timed out")
+        .expect("read failed")
     }
 
     #[tokio::test]
     async fn ping_round_trip() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(test_auth_config()).expect("client"))));
+        let server_task = tokio::spawn(handle_client(
+            server,
+            Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+        ));
 
-        write_message(&mut client, &ClientMessage::Ping).await.expect("write ping");
+        write_message(&mut client, &ClientMessage::Ping)
+            .await
+            .expect("write ping");
         assert!(matches!(recv(&mut client).await, DaemonMessage::Pong));
 
         drop(client);
@@ -412,22 +438,32 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_requests_complete_independently() {
-        let (client_impl, mock_server) = spawn_mock_openai_server(Some("mock completion"), Some(&["mock ", "completion"])) .await;
+        let (client_impl, mock_server) =
+            spawn_mock_openai_server(Some("mock completion"), Some(&["mock ", "completion"])).await;
         let (server, mut client) = UnixStream::pair().expect("pair");
         let server_task = tokio::spawn(handle_client(server, client_impl));
 
         set_selected_model(&mut client, "gpt-5.4-nano").await;
-        assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
+        assert!(matches!(
+            recv(&mut client).await,
+            DaemonMessage::ModelSelected { .. }
+        ));
 
         write_message(
             &mut client,
-            &ClientMessage::RunInput { request_id: 1, input: b"alpha beta".to_vec() },
+            &ClientMessage::RunInput {
+                request_id: 1,
+                input: b"alpha beta".to_vec(),
+            },
         )
         .await
         .expect("write req1");
         write_message(
             &mut client,
-            &ClientMessage::RunInput { request_id: 2, input: b"gamma".to_vec() },
+            &ClientMessage::RunInput {
+                request_id: 2,
+                input: b"gamma".to_vec(),
+            },
         )
         .await
         .expect("write req2");
@@ -441,7 +477,9 @@ mod tests {
                 DaemonMessage::Started { request_id } => {
                     started.insert(request_id);
                 }
-                DaemonMessage::OutputChunk { request_id, data, .. } => {
+                DaemonMessage::OutputChunk {
+                    request_id, data, ..
+                } => {
                     chunks.push((request_id, String::from_utf8_lossy(&data).to_string()));
                 }
                 DaemonMessage::Done { request_id } => {
@@ -452,8 +490,16 @@ mod tests {
         }
 
         assert_eq!(started.len(), 2);
-        let combined_one = chunks.iter().filter(|(id, _)| *id == 1).map(|(_, chunk)| chunk.as_str()).collect::<String>();
-        let combined_two = chunks.iter().filter(|(id, _)| *id == 2).map(|(_, chunk)| chunk.as_str()).collect::<String>();
+        let combined_one = chunks
+            .iter()
+            .filter(|(id, _)| *id == 1)
+            .map(|(_, chunk)| chunk.as_str())
+            .collect::<String>();
+        let combined_two = chunks
+            .iter()
+            .filter(|(id, _)| *id == 2)
+            .map(|(_, chunk)| chunk.as_str())
+            .collect::<String>();
         assert_eq!(combined_one, "mock completion");
         assert_eq!(combined_two, "mock completion");
 
@@ -469,17 +515,26 @@ mod tests {
         let server_task = tokio::spawn(handle_client(server, client_impl));
 
         set_selected_model(&mut client, "gpt-5.4-nano").await;
-        assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
+        assert!(matches!(
+            recv(&mut client).await,
+            DaemonMessage::ModelSelected { .. }
+        ));
 
         write_message(
             &mut client,
-            &ClientMessage::RunInput { request_id: 7, input: b"first second".to_vec() },
+            &ClientMessage::RunInput {
+                request_id: 7,
+                input: b"first second".to_vec(),
+            },
         )
         .await
         .expect("write first");
         write_message(
             &mut client,
-            &ClientMessage::RunInput { request_id: 7, input: b"duplicate".to_vec() },
+            &ClientMessage::RunInput {
+                request_id: 7,
+                input: b"duplicate".to_vec(),
+            },
         )
         .await
         .expect("write duplicate");
@@ -509,11 +564,17 @@ mod tests {
         let server_task = tokio::spawn(handle_client(server, client_impl));
 
         set_selected_model(&mut client, "gpt-5.4-nano").await;
-        assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
+        assert!(matches!(
+            recv(&mut client).await,
+            DaemonMessage::ModelSelected { .. }
+        ));
 
         write_message(
             &mut client,
-            &ClientMessage::RunInput { request_id: 9, input: b"one two three four".to_vec() },
+            &ClientMessage::RunInput {
+                request_id: 9,
+                input: b"one two three four".to_vec(),
+            },
         )
         .await
         .expect("write request");
@@ -542,11 +603,17 @@ mod tests {
     #[tokio::test]
     async fn run_input_fails_when_no_model_selected() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(test_auth_config()).expect("client"))));
+        let server_task = tokio::spawn(handle_client(
+            server,
+            Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+        ));
 
         write_message(
             &mut client,
-            &ClientMessage::RunInput { request_id: 12, input: b"show image please".to_vec() },
+            &ClientMessage::RunInput {
+                request_id: 12,
+                input: b"show image please".to_vec(),
+            },
         )
         .await
         .expect("write request");
@@ -576,11 +643,17 @@ mod tests {
     #[tokio::test]
     async fn empty_input_fails_request() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(test_auth_config()).expect("client"))));
+        let server_task = tokio::spawn(handle_client(
+            server,
+            Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+        ));
 
         write_message(
             &mut client,
-            &ClientMessage::RunInput { request_id: 15, input: b"   ".to_vec() },
+            &ClientMessage::RunInput {
+                request_id: 15,
+                input: b"   ".to_vec(),
+            },
         )
         .await
         .expect("write request");
@@ -609,7 +682,10 @@ mod tests {
     #[tokio::test]
     async fn cancel_inactive_request_fails() {
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(test_auth_config()).expect("client"))));
+        let server_task = tokio::spawn(handle_client(
+            server,
+            Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+        ));
 
         write_message(&mut client, &ClientMessage::Cancel { request_id: 99 })
             .await
@@ -642,7 +718,10 @@ mod tests {
             model_max_tokens: std::collections::HashMap::new(),
             streaming: true,
         };
-        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(auth_config).expect("client"))));
+        let server_task = tokio::spawn(handle_client(
+            server,
+            Arc::new(OpenAiClient::new(auth_config).expect("client")),
+        ));
 
         write_message(&mut client, &ClientMessage::ListModels)
             .await
@@ -674,7 +753,10 @@ mod tests {
             model_max_tokens: std::collections::HashMap::new(),
             streaming: true,
         };
-        let server_task = tokio::spawn(handle_client(server, Arc::new(OpenAiClient::new(auth_config).expect("client"))));
+        let server_task = tokio::spawn(handle_client(
+            server,
+            Arc::new(OpenAiClient::new(auth_config).expect("client")),
+        ));
 
         write_message(
             &mut client,

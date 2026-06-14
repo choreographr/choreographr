@@ -35,7 +35,9 @@ pub struct ImageMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonMessage {
-    Started { request_id: u32 },
+    Started {
+        request_id: u32,
+    },
     OutputChunk {
         request_id: u32,
         stream: OutputStream,
@@ -54,25 +56,37 @@ pub enum DaemonMessage {
         request_id: u32,
         image_id: u32,
     },
-    Done { request_id: u32 },
-    Failed { request_id: u32, error: String },
-    Cancelled { request_id: u32 },
+    Done {
+        request_id: u32,
+    },
+    Failed {
+        request_id: u32,
+        error: String,
+    },
+    Cancelled {
+        request_id: u32,
+    },
     Pong,
     Models {
         models: Vec<String>,
         selected_model: Option<String>,
     },
-    ModelsFailed { error: String },
-    ModelSelected { model: String },
-    ModelSelectionFailed { model: String, error: String },
+    ModelsFailed {
+        error: String,
+    },
+    ModelSelected {
+        model: String,
+    },
+    ModelSelectionFailed {
+        model: String,
+        error: String,
+    },
 }
 
 pub fn encode_frame<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
-    let payload = bincode::serde::encode_to_vec(
-        (PROTOCOL_VERSION, message),
-        bincode::config::standard(),
-    )
-    .map_err(io::Error::other)?;
+    let payload =
+        bincode::serde::encode_to_vec((PROTOCOL_VERSION, message), bincode::config::standard())
+            .map_err(io::Error::other)?;
 
     if payload.len() > MAX_FRAME_SIZE {
         return Err(io::Error::new(
@@ -207,7 +221,9 @@ mod tests {
         let expected_for_writer = expected.clone();
         let write_task =
             tokio::spawn(async move { write_message(&mut writer, &expected_for_writer).await });
-        let actual = read_message::<_, DaemonMessage>(&mut reader).await.expect("read");
+        let actual = read_message::<_, DaemonMessage>(&mut reader)
+            .await
+            .expect("read");
         write_task.await.expect("join").expect("write");
         assert_eq!(actual, expected);
     }
