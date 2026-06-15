@@ -2,10 +2,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
 use std::{collections::HashMap, io};
-use tai_client_core::{ImageAssembler, ShellCommand, StreamingText, parse_input_line};
+use tai_client_core::{
+    ImageAssembler, ShellCommand, StreamingText, parse_input_line, render_markdown_html,
+};
 use tai_proto::{
-    ClientMessage, DaemonMessage, ImageMetadata, OutputStream, read_message, socket_path,
-    write_message,
+    ClientMessage, DaemonMessage, ImageMetadata, OutputStream, SessionMessage, read_message,
+    socket_path, write_message,
 };
 use tokio::{
     net::UnixStream,
@@ -23,6 +25,7 @@ struct DisplayImage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HistoryItem {
     Text(String),
+    SessionMessage(SessionMessage),
     Streaming(StreamingEntry),
     Image(DisplayImage),
 }
@@ -60,7 +63,15 @@ impl AppState {
     }
 
     fn push_text(&mut self, text: impl Into<String>) {
-        self.history.push(HistoryItem::Text(text.into()));
+        self.push_history_item(HistoryItem::Text(text.into()));
+    }
+
+    fn push_session_message(&mut self, message: SessionMessage) {
+        self.push_history_item(HistoryItem::SessionMessage(message));
+    }
+
+    fn push_history_item(&mut self, item: HistoryItem) {
+        self.history.push(item);
         self.trim_history();
     }
 
@@ -92,8 +103,7 @@ impl AppState {
     }
 
     fn push_image(&mut self, image: DisplayImage) {
-        self.history.push(HistoryItem::Image(image));
-        self.trim_history();
+        self.push_history_item(HistoryItem::Image(image));
     }
 
     fn trim_history(&mut self) {
@@ -275,52 +285,7 @@ fn App() -> Element {
 
             div { class: "history",
                 for item in history {
-                    match item {
-                        HistoryItem::Text(text) => rsx! {
-                            div { class: "history-item text-item",
-                                pre { "{text}" }
-                            }
-                        },
-                        HistoryItem::Streaming(entry) => rsx! {
-                            div { class: "history-item stream-item",
-                                div { class: "request-id", "[{entry.request_id}]" }
-                                if !entry.reasoning.is_empty() {
-                                    div { class: "stream-section reasoning",
-                                        div { class: "label", "reasoning" }
-                                        pre { "{entry.reasoning}" }
-                                    }
-                                }
-                                if !entry.answer.is_empty() {
-                                    div { class: "stream-section answer",
-                                        div { class: "label", "answer" }
-                                        pre { "{entry.answer}" }
-                                    }
-                                }
-                            }
-                        },
-                        HistoryItem::Image(image) => rsx! {
-                            div { class: "history-item image-item",
-                                div { class: "image-meta",
-                                    {format!(
-                                        "image {} ({} {}x{})",
-                                        image.metadata.image_id,
-                                        image.metadata.mime_type,
-                                        image.metadata.width,
-                                        image.metadata.height
-                                    )}
-                                }
-                                img {
-                                    class: "history-image",
-                                    src: image.data_url.clone(),
-                                    alt: image
-                                        .metadata
-                                        .alt
-                                        .clone()
-                                        .unwrap_or_else(|| String::from("image"))
-                                }
-                            }
-                        },
-                    }
+                    {render_history_item(item)}
                 }
             }
 
@@ -339,6 +304,151 @@ fn App() -> Element {
                 }
                 div { class: "composer-actions",
                     button { onclick: move |_| on_submit_click(), "Send" }
+                }
+            }
+        }
+    }
+}
+
+fn render_history_item(item: HistoryItem) -> Element {
+    match item {
+        HistoryItem::Text(text) => rsx! {
+            div { class: "history-item text-item",
+                pre { "{text}" }
+            }
+        },
+        HistoryItem::SessionMessage(message) => render_session_message(message),
+        HistoryItem::Streaming(entry) => render_streaming_entry(entry),
+        HistoryItem::Image(image) => rsx! {
+            div { class: "history-item image-item",
+                div { class: "image-meta",
+                    {format!(
+                        "image {} ({} {}x{})",
+                        image.metadata.image_id,
+                        image.metadata.mime_type,
+                        image.metadata.width,
+                        image.metadata.height
+                    )}
+                }
+                img {
+                    class: "history-image",
+                    src: image.data_url.clone(),
+                    alt: image
+                        .metadata
+                        .alt
+                        .clone()
+                        .unwrap_or_else(|| String::from("image"))
+                }
+            }
+        },
+    }
+}
+
+fn render_session_message(message: SessionMessage) -> Element {
+    match message {
+        SessionMessage::SystemText { content } => {
+            render_labeled_plain_message("system", content, "session-item system-item")
+        }
+        SessionMessage::UserText { content } => {
+            render_labeled_plain_message("user", content, "session-item user-item")
+        }
+        SessionMessage::AssistantText { content } => {
+            let html = render_markdown_html(&content);
+            rsx! {
+                div { class: "history-item session-item assistant-item",
+                    div { class: "message-label", "assistant" }
+                    div { class: "markdown-body", dangerous_inner_html: "{html}" }
+                }
+            }
+        }
+        SessionMessage::AssistantToolUse {
+            content,
+            tool_calls,
+            reasoning_content,
+            reasoning,
+            reasoning_text,
+        } => {
+            let tool_call_text = tool_calls
+                .iter()
+                .map(|call| format!("{}({})", call.name, call.arguments_json))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let reasoning = reasoning_content
+                .or(reasoning)
+                .or(reasoning_text)
+                .filter(|value| !value.trim().is_empty());
+            let content_html = content
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| render_markdown_html(&value));
+            rsx! {
+                div { class: "history-item session-item tool-use-item",
+                    div { class: "message-label", "tool call" }
+                    pre { class: "plain-body", "{tool_call_text}" }
+                    if let Some(reasoning) = reasoning {
+                        div { class: "stream-section reasoning",
+                            div { class: "label", "reasoning" }
+                            pre { class: "plain-body", "{reasoning}" }
+                        }
+                    }
+                    if let Some(content_html) = content_html {
+                        div { class: "stream-section answer markdown-section",
+                            div { class: "label", "content" }
+                            div { class: "markdown-body", dangerous_inner_html: "{content_html}" }
+                        }
+                    }
+                }
+            }
+        }
+        SessionMessage::ToolResult {
+            name,
+            content,
+            is_error,
+            ..
+        } => {
+            let label = if is_error {
+                "tool error"
+            } else {
+                "tool result"
+            };
+            render_labeled_plain_message(
+                label,
+                format!("{name}: {content}"),
+                "session-item tool-result-item",
+            )
+        }
+    }
+}
+
+fn render_labeled_plain_message(
+    label: &'static str,
+    content: impl Into<String>,
+    class: &'static str,
+) -> Element {
+    let content = content.into();
+    rsx! {
+        div { class: "history-item {class}",
+            div { class: "message-label", "{label}" }
+            pre { class: "plain-body", "{content}" }
+        }
+    }
+}
+
+fn render_streaming_entry(entry: StreamingEntry) -> Element {
+    let answer_html =
+        (!entry.answer.trim().is_empty()).then(|| render_markdown_html(&entry.answer));
+    rsx! {
+        div { class: "history-item stream-item",
+            div { class: "request-id", "[{entry.request_id}]" }
+            if !entry.reasoning.is_empty() {
+                div { class: "stream-section reasoning",
+                    div { class: "label", "reasoning" }
+                    pre { class: "plain-body", "{entry.reasoning}" }
+                }
+            }
+            if let Some(answer_html) = answer_html {
+                div { class: "stream-section answer markdown-section",
+                    div { class: "label", "answer" }
+                    div { class: "markdown-body", dangerous_inner_html: "{answer_html}" }
                 }
             }
         }
@@ -485,14 +595,14 @@ fn apply_daemon_message(
                 state.push_text(format!("[daemon] selected model: {model}"));
             }
             for message in messages {
-                state.push_text(message.render_line());
+                state.push_session_message(message);
             }
         }
         DaemonMessage::SessionFailed { operation, error } => {
             state.push_text(format!("[daemon] {operation} failed: {error}"));
         }
         DaemonMessage::SessionMessageAppended { message } => {
-            state.push_text(message.render_line());
+            state.push_session_message(message);
         }
         DaemonMessage::Started { request_id } => {
             state.begin_stream(request_id);
@@ -663,12 +773,94 @@ body {
 }
 
 .text-item pre,
-.stream-section pre {
+.stream-section pre,
+.plain-body {
     margin: 0;
     white-space: pre-wrap;
     word-break: break-word;
     font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
     line-height: 1.45;
+}
+
+.message-label {
+    margin-bottom: 6px;
+    color: #8b949e;
+    font-size: 12px;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+}
+
+.markdown-body {
+    line-height: 1.55;
+}
+
+.markdown-body p,
+.markdown-body pre,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body blockquote,
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+    margin: 0 0 0.75em;
+}
+
+.markdown-body p:last-child,
+.markdown-body pre:last-child,
+.markdown-body ul:last-child,
+.markdown-body ol:last-child,
+.markdown-body blockquote:last-child,
+.markdown-body h1:last-child,
+.markdown-body h2:last-child,
+.markdown-body h3:last-child,
+.markdown-body h4:last-child,
+.markdown-body h5:last-child,
+.markdown-body h6:last-child {
+    margin-bottom: 0;
+}
+
+.markdown-body code,
+.markdown-body pre {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+.markdown-body code {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 0.1em 0.35em;
+}
+
+.markdown-body pre {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 12px;
+    overflow-x: auto;
+}
+
+.markdown-body pre code {
+    background: transparent;
+    border: 0;
+    padding: 0;
+}
+
+.markdown-body blockquote {
+    border-left: 3px solid #30363d;
+    padding-left: 12px;
+    color: #a5b3c2;
+}
+
+.markdown-body a {
+    color: #58a6ff;
+    text-decoration: none;
+}
+
+.markdown-body a:hover {
+    text-decoration: underline;
 }
 
 .request-id {

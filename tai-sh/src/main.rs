@@ -21,11 +21,13 @@ use std::{
     time::Duration,
 };
 use tai_proto::{
-    ClientMessage, DaemonMessage, OutputStream, read_message, socket_path, write_message,
+    ClientMessage, DaemonMessage, OutputStream, SessionMessage, read_message, socket_path,
+    write_message,
 };
 use tai_sh::{
-    ImageAssembler, RenderedImage, ShellCommand, StreamingText, build_picker, build_rendered_image,
-    channel_closed, parse_input_line,
+    ImageAssembler, MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline,
+    RenderedImage, ShellCommand, StreamingText, build_picker, build_rendered_image, channel_closed,
+    parse_input_line,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -59,6 +61,7 @@ struct HistoryScrollState {
 
 enum HistoryItem {
     Text(String),
+    SessionMessage(SessionMessage),
     StreamingText(StreamingTextItem),
     Image(RenderedImage),
 }
@@ -81,8 +84,12 @@ impl HistoryViewport {
     fn item_height(&self, item: &HistoryItem) -> usize {
         match item {
             HistoryItem::Text(text) => history_text_height(text, self.width).max(1),
+            HistoryItem::SessionMessage(message) => {
+                let lines = session_message_lines(message, self.width);
+                lines_height(&lines, self.width).max(1)
+            }
             HistoryItem::StreamingText(text) => {
-                let lines = streaming_text_lines(text);
+                let lines = streaming_text_lines(text, self.width);
                 lines_height(&lines, self.width).max(1)
             }
             HistoryItem::Image(_) => image_block_height(self.height as usize),
@@ -226,17 +233,19 @@ impl App {
     }
 
     fn push_text(&mut self, line: impl Into<String>) {
-        let item = HistoryItem::Text(line.into());
-        let added_height = self.history_viewport.item_height(&item);
-        self.history.push(item);
-        self.history_scroll
-            .on_item_appended(added_height, self.max_scroll_offset());
-        self.trim_history();
-        self.clamp_scroll_state();
+        self.push_history_item(HistoryItem::Text(line.into()));
+    }
+
+    fn push_session_message(&mut self, message: SessionMessage) {
+        self.push_history_item(HistoryItem::SessionMessage(message));
     }
 
     fn push_image(&mut self, image: RenderedImage) {
         let item = HistoryItem::Image(image);
+        self.push_history_item(item);
+    }
+
+    fn push_history_item(&mut self, item: HistoryItem) {
         let added_height = self.history_viewport.item_height(&item);
         self.history.push(item);
         self.history_scroll
@@ -599,14 +608,14 @@ async fn handle_daemon_message(
                 app.push_text(format!("[daemon] selected model: {model}"));
             }
             for message in messages {
-                app.push_text(message.render_line());
+                app.push_session_message(message);
             }
         }
         DaemonMessage::SessionFailed { operation, error } => {
             app.push_text(format!("[daemon] {operation} failed: {error}"));
         }
         DaemonMessage::SessionMessageAppended { message } => {
-            app.push_text(message.render_line());
+            app.push_session_message(message);
         }
         DaemonMessage::Started { request_id } => {
             app.begin_stream(request_id);
@@ -776,67 +785,36 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
         match item {
             HistoryItem::Text(text) => {
-                let wrapped = history_text_height(text, area.width).max(1);
-                if rows_to_skip >= wrapped {
-                    rows_to_skip -= wrapped;
-                    continue;
-                }
-
-                let visible_height = wrapped.min(rows_remaining);
-                if visible_height == 0 {
-                    break;
-                }
-
-                let bottom_line = wrapped.saturating_sub(rows_to_skip);
-                let top_line = bottom_line.saturating_sub(visible_height);
-
-                y = y.saturating_sub(visible_height as u16);
-                let rect = Rect {
-                    x: area.x,
-                    y,
-                    width: area.width,
-                    height: visible_height as u16,
-                };
-                frame.render_widget(
-                    Paragraph::new(text.as_str())
-                        .wrap(Wrap { trim: false })
-                        .scroll((top_line as u16, 0)),
-                    rect,
+                render_history_text(
+                    frame,
+                    area,
+                    text.as_str(),
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
                 );
-                rows_remaining -= visible_height;
-                rows_to_skip = 0;
+            }
+            HistoryItem::SessionMessage(message) => {
+                let lines = session_message_lines(message, area.width);
+                render_history_lines(
+                    frame,
+                    area,
+                    lines,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
             }
             HistoryItem::StreamingText(text) => {
-                let lines = streaming_text_lines(text);
-                let wrapped = lines_height(&lines, area.width).max(1);
-                if rows_to_skip >= wrapped {
-                    rows_to_skip -= wrapped;
-                    continue;
-                }
-
-                let visible_height = wrapped.min(rows_remaining);
-                if visible_height == 0 {
-                    break;
-                }
-
-                let bottom_line = wrapped.saturating_sub(rows_to_skip);
-                let top_line = bottom_line.saturating_sub(visible_height);
-
-                y = y.saturating_sub(visible_height as u16);
-                let rect = Rect {
-                    x: area.x,
-                    y,
-                    width: area.width,
-                    height: visible_height as u16,
-                };
-                frame.render_widget(
-                    Paragraph::new(lines)
-                        .wrap(Wrap { trim: false })
-                        .scroll((top_line as u16, 0)),
-                    rect,
+                let lines = streaming_text_lines(text, area.width);
+                render_history_lines(
+                    frame,
+                    area,
+                    lines,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
                 );
-                rows_remaining -= visible_height;
-                rows_to_skip = 0;
             }
             HistoryItem::Image(image) => {
                 let full_height = image_block_height(area.height as usize);
@@ -873,12 +851,86 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
-fn history_text_height(text: &str, width: u16) -> usize {
-    let lines: Vec<Line<'_>> = if text.is_empty() {
-        vec![Line::from("")]
-    } else {
-        text.split('\n').map(Line::from).collect()
+fn render_history_text(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    text: &str,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+) {
+    let wrapped = history_text_height(text, area.width).max(1);
+    if *rows_to_skip >= wrapped {
+        *rows_to_skip -= wrapped;
+        return;
+    }
+
+    let visible_height = wrapped.min(*rows_remaining);
+    if visible_height == 0 {
+        return;
+    }
+
+    let bottom_line = wrapped.saturating_sub(*rows_to_skip);
+    let top_line = bottom_line.saturating_sub(visible_height);
+
+    *y = (*y).saturating_sub(visible_height as u16);
+    let rect = Rect {
+        x: area.x,
+        y: *y,
+        width: area.width,
+        height: visible_height as u16,
     };
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((top_line as u16, 0)),
+        rect,
+    );
+    *rows_remaining -= visible_height;
+    *rows_to_skip = 0;
+}
+
+fn render_history_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+) {
+    let wrapped = lines_height(&lines, area.width).max(1);
+    if *rows_to_skip >= wrapped {
+        *rows_to_skip -= wrapped;
+        return;
+    }
+
+    let visible_height = wrapped.min(*rows_remaining);
+    if visible_height == 0 {
+        return;
+    }
+
+    let bottom_line = wrapped.saturating_sub(*rows_to_skip);
+    let top_line = bottom_line.saturating_sub(visible_height);
+
+    *y = (*y).saturating_sub(visible_height as u16);
+    let rect = Rect {
+        x: area.x,
+        y: *y,
+        width: area.width,
+        height: visible_height as u16,
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((top_line as u16, 0)),
+        rect,
+    );
+    *rows_remaining -= visible_height;
+    *rows_to_skip = 0;
+}
+
+fn history_text_height(text: &str, width: u16) -> usize {
+    let lines = plain_text_lines(text, Style::default());
     lines_height(&lines, width)
 }
 
@@ -900,20 +952,121 @@ fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
         .max(1)
 }
 
-fn streaming_text_lines(text: &StreamingTextItem) -> Vec<Line<'static>> {
+fn plain_text_lines(text: &str, style: Style) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        vec![Line::from(Span::styled(String::new(), style))]
+    } else {
+        text.split('\n')
+            .map(|line| Line::from(Span::styled(line.to_string(), style)))
+            .collect()
+    }
+}
+
+fn session_message_lines(message: &SessionMessage, width: u16) -> Vec<Line<'static>> {
+    match message {
+        SessionMessage::SystemText { content } => labeled_plain_text_lines(
+            "system",
+            content,
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        SessionMessage::UserText { content } => {
+            labeled_plain_text_lines("user", content, Style::default())
+        }
+        SessionMessage::AssistantText { content } => {
+            let body = markdown_lines(content, Style::default(), width);
+            prefixed_lines(
+                "assistant",
+                body,
+                Style::default().add_modifier(Modifier::BOLD),
+            )
+        }
+        SessionMessage::AssistantToolUse {
+            content,
+            tool_calls,
+            reasoning_content,
+            reasoning,
+            reasoning_text,
+        } => {
+            let mut lines = vec![Line::from(vec![
+                Span::styled("tool-call", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(": "),
+                Span::raw(
+                    tool_calls
+                        .iter()
+                        .map(|call| format!("{}({})", call.name, call.arguments_json))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            ])];
+            if let Some(reasoning_text) = reasoning_content
+                .as_deref()
+                .or(reasoning.as_deref())
+                .or(reasoning_text.as_deref())
+                .filter(|value| !value.trim().is_empty())
+            {
+                append_section(
+                    &mut lines,
+                    "reasoning",
+                    plain_text_lines(
+                        reasoning_text,
+                        Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+                    ),
+                );
+            }
+            if let Some(content) = content.as_deref().filter(|value| !value.trim().is_empty()) {
+                append_section(
+                    &mut lines,
+                    "content",
+                    markdown_lines(content, Style::default(), width),
+                );
+            }
+            lines
+        }
+        SessionMessage::ToolResult {
+            name,
+            content,
+            is_error,
+            ..
+        } => {
+            let label = if *is_error {
+                "tool error"
+            } else {
+                "tool result"
+            };
+            let style = if *is_error {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            prefixed_lines(
+                label,
+                plain_text_lines(&format!("{name}: {content}"), style),
+                style,
+            )
+        }
+    }
+}
+
+fn streaming_text_lines(text: &StreamingTextItem, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(format!("[{}]", text.request_id))];
 
     if !text.reasoning.is_empty() {
-        append_labeled_lines(
+        append_section(
             &mut lines,
-            "reasoning: ",
-            &text.reasoning,
-            Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+            "reasoning",
+            plain_text_lines(
+                &text.reasoning,
+                Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+            ),
         );
     }
 
     if !text.answer.is_empty() {
-        append_labeled_lines(&mut lines, "answer: ", &text.answer, Style::default());
+        append_section(
+            &mut lines,
+            "answer",
+            markdown_lines(&text.answer, Style::default(), width),
+        );
     }
 
     if text.reasoning.is_empty() && text.answer.is_empty() {
@@ -923,22 +1076,611 @@ fn streaming_text_lines(text: &StreamingTextItem) -> Vec<Line<'static>> {
     lines
 }
 
-fn append_labeled_lines(
+fn labeled_plain_text_lines(label: &'static str, text: &str, style: Style) -> Vec<Line<'static>> {
+    prefixed_lines(label, plain_text_lines(text, style), style)
+}
+
+fn prefixed_lines(
+    label: &'static str,
+    body: Vec<Line<'static>>,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    append_section_with_style(&mut lines, label, body, style);
+    lines
+}
+
+fn append_section(lines: &mut Vec<Line<'static>>, label: &'static str, body: Vec<Line<'static>>) {
+    append_section_with_style(
+        lines,
+        label,
+        body,
+        Style::default().add_modifier(Modifier::BOLD),
+    );
+}
+
+fn append_section_with_style(
     lines: &mut Vec<Line<'static>>,
     label: &'static str,
-    text: &str,
-    style: Style,
+    body: Vec<Line<'static>>,
+    label_style: Style,
 ) {
-    let mut split = text.split('\n');
-    if let Some(first) = split.next() {
-        lines.push(Line::from(vec![
-            Span::styled(label, style),
-            Span::styled(first.to_string(), style),
-        ]));
+    let mut body_iter = body.into_iter();
+    if let Some(first) = body_iter.next() {
+        let mut spans = vec![Span::styled(format!("{label}: "), label_style)];
+        spans.extend(first.spans);
+        lines.push(Line::from(spans));
+    } else {
+        lines.push(Line::from(Span::styled(format!("{label}:"), label_style)));
     }
 
-    for line in split {
-        lines.push(Line::from(Span::styled(line.to_string(), style)));
+    lines.extend(body_iter);
+}
+
+fn markdown_lines(markdown: &str, style: Style, width: u16) -> Vec<Line<'static>> {
+    let document = MarkdownDocument::parse(markdown);
+    let mut lines = Vec::new();
+    render_markdown_blocks(&document.blocks, &mut lines, style, 0, width as usize);
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    while matches!(lines.last(), Some(line) if line.spans.is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn render_markdown_blocks(
+    blocks: &[MarkdownBlock],
+    lines: &mut Vec<Line<'static>>,
+    style: Style,
+    indent: usize,
+    width: usize,
+) {
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::default());
+        }
+        render_markdown_block(block, lines, style, indent, width);
+    }
+}
+
+fn render_markdown_block(
+    block: &MarkdownBlock,
+    lines: &mut Vec<Line<'static>>,
+    style: Style,
+    indent: usize,
+    width: usize,
+) {
+    match block {
+        MarkdownBlock::Paragraph(content) => {
+            lines.extend(inlines_to_lines(content, style, indent, None));
+        }
+        MarkdownBlock::Heading { level, content } => {
+            let heading_style = style.add_modifier(Modifier::BOLD);
+            let prefix = Some(format!("{} ", "#".repeat(*level as usize)));
+            lines.extend(inlines_to_lines(content, heading_style, indent, prefix));
+        }
+        MarkdownBlock::CodeBlock { language, code } => {
+            let header = language
+                .as_deref()
+                .map(|value| format!("```{value}"))
+                .unwrap_or_else(|| "```".to_string());
+            lines.push(indented_line(
+                indent,
+                vec![Span::styled(header, style.add_modifier(Modifier::DIM))],
+            ));
+            for line in code.split('\n') {
+                lines.push(indented_line(
+                    indent,
+                    vec![Span::styled(
+                        line.to_string(),
+                        style.add_modifier(Modifier::DIM),
+                    )],
+                ));
+            }
+            lines.push(indented_line(
+                indent,
+                vec![Span::styled("```", style.add_modifier(Modifier::DIM))],
+            ));
+        }
+        MarkdownBlock::BlockQuote(blocks) => {
+            let mut quoted = Vec::new();
+            render_markdown_blocks(
+                blocks,
+                &mut quoted,
+                style.add_modifier(Modifier::ITALIC),
+                0,
+                width,
+            );
+            for line in quoted {
+                let mut spans = vec![Span::styled(
+                    "> ",
+                    style.add_modifier(Modifier::DIM | Modifier::ITALIC),
+                )];
+                spans.extend(line.spans);
+                lines.push(indented_line(indent, spans));
+            }
+        }
+        MarkdownBlock::List {
+            ordered,
+            start,
+            items,
+        } => {
+            for (index, item) in items.iter().enumerate() {
+                let marker = if *ordered {
+                    format!("{}. ", start + index)
+                } else {
+                    "• ".to_string()
+                };
+                let continuation_indent = indent + marker.chars().count();
+                let mut rendered = Vec::new();
+                render_markdown_blocks(item, &mut rendered, style, 0, width);
+                let mut rendered_iter = rendered.into_iter();
+                if let Some(first) = rendered_iter.next() {
+                    let mut spans =
+                        vec![Span::raw(" ".repeat(indent)), Span::styled(marker, style)];
+                    spans.extend(first.spans);
+                    lines.push(Line::from(spans));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::raw(" ".repeat(indent)),
+                        Span::styled(marker, style),
+                    ]));
+                }
+                for line in rendered_iter {
+                    let mut spans = vec![Span::raw(" ".repeat(continuation_indent))];
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
+                }
+            }
+        }
+        MarkdownBlock::Table {
+            alignments,
+            header,
+            rows,
+        } => lines.extend(render_table_lines(
+            alignments, header, rows, style, indent, width,
+        )),
+        MarkdownBlock::Rule => lines.push(indented_line(
+            indent,
+            vec![Span::styled("---", style.add_modifier(Modifier::DIM))],
+        )),
+    }
+}
+
+fn render_table_lines(
+    alignments: &[MarkdownAlignment],
+    header: &[Vec<MarkdownInline>],
+    rows: &[Vec<Vec<MarkdownInline>>],
+    style: Style,
+    indent: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let column_count = alignments
+        .len()
+        .max(header.len())
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+    if column_count == 0 {
+        return vec![Line::from("")];
+    }
+
+    let mut table_rows = Vec::with_capacity(rows.len() + 1);
+    table_rows.push(normalize_table_row(header, column_count));
+    table_rows.extend(
+        rows.iter()
+            .map(|row| normalize_table_row(row, column_count)),
+    );
+
+    let mut widths = vec![3usize; column_count];
+    for row in &table_rows {
+        for (index, cell) in row.iter().enumerate() {
+            for line in cell.lines() {
+                widths[index] = widths[index].max(display_width(line));
+            }
+        }
+    }
+
+    let border_width = column_count * 3 + 1;
+    let available = width
+        .saturating_sub(indent)
+        .max(border_width + column_count);
+    let content_budget = available.saturating_sub(border_width).max(column_count);
+    shrink_column_widths(&mut widths, content_budget);
+
+    let mut lines = Vec::new();
+    let header_alignment = normalized_alignments(alignments, column_count);
+    lines.push(table_border_line('┌', '┬', '┐', &widths, style, indent));
+    lines.extend(render_table_row_wrapped(
+        &table_rows[0],
+        &widths,
+        &header_alignment,
+        style.add_modifier(Modifier::BOLD),
+        indent,
+    ));
+    lines.push(table_separator_line(
+        &widths,
+        &header_alignment,
+        style,
+        indent,
+    ));
+    for (index, row) in table_rows.iter().enumerate().skip(1) {
+        lines.extend(render_table_row_wrapped(
+            row,
+            &widths,
+            &header_alignment,
+            style,
+            indent,
+        ));
+        if index < table_rows.len() - 1 {
+            lines.push(table_border_line('├', '┼', '┤', &widths, style, indent));
+        }
+    }
+    lines.push(table_border_line('└', '┴', '┘', &widths, style, indent));
+    lines
+}
+
+fn normalized_alignments(
+    alignments: &[MarkdownAlignment],
+    column_count: usize,
+) -> Vec<MarkdownAlignment> {
+    (0..column_count)
+        .map(|index| {
+            alignments
+                .get(index)
+                .copied()
+                .unwrap_or(MarkdownAlignment::None)
+        })
+        .collect()
+}
+
+fn normalize_table_row(row: &[Vec<MarkdownInline>], column_count: usize) -> Vec<String> {
+    (0..column_count)
+        .map(|index| {
+            row.get(index)
+                .map(|cell| inline_plain_text(cell))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn shrink_column_widths(widths: &mut [usize], budget: usize) {
+    let min_width = 3usize;
+    while widths.iter().sum::<usize>() > budget {
+        if let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > min_width)
+            .max_by_key(|(_, width)| **width)
+        {
+            widths[index] -= 1;
+        } else {
+            break;
+        }
+    }
+}
+
+fn table_border_line(
+    left: char,
+    middle: char,
+    right: char,
+    widths: &[usize],
+    style: Style,
+    indent: usize,
+) -> Line<'static> {
+    let mut text = String::new();
+    text.push(left);
+    for (index, width) in widths.iter().enumerate() {
+        text.push_str(&"─".repeat(*width + 2));
+        text.push(if index + 1 == widths.len() {
+            right
+        } else {
+            middle
+        });
+    }
+    indented_line(
+        indent,
+        vec![Span::styled(text, style.add_modifier(Modifier::DIM))],
+    )
+}
+
+fn table_separator_line(
+    widths: &[usize],
+    alignments: &[MarkdownAlignment],
+    style: Style,
+    indent: usize,
+) -> Line<'static> {
+    let mut text = String::new();
+    text.push('├');
+    for (index, width) in widths.iter().enumerate() {
+        text.push_str(&alignment_rule_segment(*width, alignments[index]));
+        text.push(if index + 1 == widths.len() {
+            '┤'
+        } else {
+            '┼'
+        });
+    }
+    indented_line(
+        indent,
+        vec![Span::styled(text, style.add_modifier(Modifier::DIM))],
+    )
+}
+
+fn alignment_rule_segment(width: usize, alignment: MarkdownAlignment) -> String {
+    let inner = width + 2;
+    match alignment {
+        MarkdownAlignment::Left => format!(":{}", "─".repeat(inner.saturating_sub(1))),
+        MarkdownAlignment::Center => {
+            if inner <= 2 {
+                ":".repeat(inner)
+            } else {
+                format!(":{}:", "─".repeat(inner - 2))
+            }
+        }
+        MarkdownAlignment::Right => format!("{}:", "─".repeat(inner.saturating_sub(1))),
+        MarkdownAlignment::None => "─".repeat(inner),
+    }
+}
+
+fn render_table_row_wrapped(
+    row: &[String],
+    widths: &[usize],
+    alignments: &[MarkdownAlignment],
+    style: Style,
+    indent: usize,
+) -> Vec<Line<'static>> {
+    let wrapped_cells: Vec<Vec<String>> = row
+        .iter()
+        .zip(widths.iter())
+        .map(|(cell, width)| wrap_cell_text(cell, *width))
+        .collect();
+    let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    let mut lines = Vec::with_capacity(row_height);
+
+    for line_index in 0..row_height {
+        let mut text = String::new();
+        text.push('│');
+        for column_index in 0..widths.len() {
+            let cell_line = wrapped_cells[column_index]
+                .get(line_index)
+                .map(String::as_str)
+                .unwrap_or("");
+            text.push(' ');
+            text.push_str(&pad_aligned(
+                cell_line,
+                widths[column_index],
+                alignments[column_index],
+            ));
+            text.push(' ');
+            text.push('│');
+        }
+        lines.push(indented_line(indent, vec![Span::styled(text, style)]));
+    }
+
+    lines
+}
+
+fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for raw_line in text.split('\n') {
+        let mut current = String::new();
+        let mut current_width = 0;
+        for word in raw_line.split_whitespace() {
+            let word_width = display_width(word);
+            let separator = usize::from(!current.is_empty());
+            if current_width + separator + word_width <= width {
+                if separator == 1 {
+                    current.push(' ');
+                    current_width += 1;
+                }
+                current.push_str(word);
+                current_width += word_width;
+            } else if current.is_empty() {
+                for chunk in split_word_to_width(word, width) {
+                    lines.push(chunk);
+                }
+            } else {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+                if word_width <= width {
+                    current.push_str(word);
+                    current_width = word_width;
+                } else {
+                    for chunk in split_word_to_width(word, width) {
+                        lines.push(chunk);
+                    }
+                }
+            }
+        }
+        if current.is_empty() {
+            lines.push(String::new());
+        } else {
+            lines.push(current);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn split_word_to_width(word: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for ch in word.chars() {
+        let ch_width = 1;
+        if current_width + ch_width > width && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+fn pad_aligned(text: &str, width: usize, alignment: MarkdownAlignment) -> String {
+    let text_width = display_width(text);
+    if text_width >= width {
+        return text.to_string();
+    }
+    let remaining = width - text_width;
+    let (left, right) = match alignment {
+        MarkdownAlignment::Right => (remaining, 0),
+        MarkdownAlignment::Center => (remaining / 2, remaining - (remaining / 2)),
+        MarkdownAlignment::Left | MarkdownAlignment::None => (0, remaining),
+    };
+    format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn inline_plain_text(inlines: &[MarkdownInline]) -> String {
+    let mut text = String::new();
+    append_inline_plain_text(inlines, &mut text);
+    text
+}
+
+fn append_inline_plain_text(inlines: &[MarkdownInline], text: &mut String) {
+    for inline in inlines {
+        match inline {
+            MarkdownInline::Text(value) | MarkdownInline::Code(value) => text.push_str(value),
+            MarkdownInline::Emphasis(content) | MarkdownInline::Strong(content) => {
+                append_inline_plain_text(content, text)
+            }
+            MarkdownInline::Link {
+                content,
+                destination,
+            } => {
+                append_inline_plain_text(content, text);
+                if !destination.is_empty() {
+                    text.push_str(" (");
+                    text.push_str(destination);
+                    text.push(')');
+                }
+            }
+            MarkdownInline::Image { alt, destination } => {
+                text.push_str("[image: ");
+                append_inline_plain_text(alt, text);
+                if !destination.is_empty() {
+                    text.push_str("] (");
+                    text.push_str(destination);
+                    text.push(')');
+                } else {
+                    text.push(']');
+                }
+            }
+            MarkdownInline::LineBreak => text.push('\n'),
+        }
+    }
+}
+
+fn indented_line(indent: usize, mut spans: Vec<Span<'static>>) -> Line<'static> {
+    if indent > 0 {
+        let mut prefixed = vec![Span::raw(" ".repeat(indent))];
+        prefixed.append(&mut spans);
+        Line::from(prefixed)
+    } else {
+        Line::from(spans)
+    }
+}
+
+fn inlines_to_lines(
+    inlines: &[MarkdownInline],
+    style: Style,
+    indent: usize,
+    prefix: Option<String>,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut current = if indent > 0 {
+        vec![Span::raw(" ".repeat(indent))]
+    } else {
+        Vec::new()
+    };
+    if let Some(prefix) = prefix {
+        current.push(Span::styled(prefix, style));
+    }
+    render_inlines_to_lines(inlines, style, &mut lines, &mut current, indent);
+    lines.push(Line::from(current));
+    lines
+}
+
+fn render_inlines_to_lines(
+    inlines: &[MarkdownInline],
+    style: Style,
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
+    indent: usize,
+) {
+    for inline in inlines {
+        match inline {
+            MarkdownInline::Text(text) => current.push(Span::styled(text.to_string(), style)),
+            MarkdownInline::Code(code) => current.push(Span::styled(
+                code.to_string(),
+                style.add_modifier(Modifier::REVERSED),
+            )),
+            MarkdownInline::Emphasis(content) => {
+                render_inlines_to_lines(
+                    content,
+                    style.add_modifier(Modifier::ITALIC),
+                    lines,
+                    current,
+                    indent,
+                );
+            }
+            MarkdownInline::Strong(content) => {
+                render_inlines_to_lines(
+                    content,
+                    style.add_modifier(Modifier::BOLD),
+                    lines,
+                    current,
+                    indent,
+                );
+            }
+            MarkdownInline::Link {
+                content,
+                destination,
+            } => {
+                render_inlines_to_lines(
+                    content,
+                    style.add_modifier(Modifier::UNDERLINED),
+                    lines,
+                    current,
+                    indent,
+                );
+                current.push(Span::styled(
+                    format!(" ({destination})"),
+                    style.add_modifier(Modifier::DIM),
+                ));
+            }
+            MarkdownInline::Image { alt, destination } => {
+                current.push(Span::styled("[image: ", style.add_modifier(Modifier::DIM)));
+                render_inlines_to_lines(alt, style, lines, current, indent);
+                current.push(Span::styled(
+                    format!("] ({destination})"),
+                    style.add_modifier(Modifier::DIM),
+                ));
+            }
+            MarkdownInline::LineBreak => {
+                lines.push(Line::from(std::mem::take(current)));
+                if indent > 0 {
+                    current.push(Span::raw(" ".repeat(indent)));
+                }
+            }
+        }
     }
 }
 
@@ -973,7 +1715,9 @@ mod tests {
         assert_eq!(app.history.len(), 500);
         match &app.history[0] {
             HistoryItem::Text(text) => assert!(text.contains("line 100")),
-            HistoryItem::StreamingText(_) | HistoryItem::Image(_) => {
+            HistoryItem::SessionMessage(_)
+            | HistoryItem::StreamingText(_)
+            | HistoryItem::Image(_) => {
                 panic!("expected text history item")
             }
         }
@@ -1049,11 +1793,14 @@ mod tests {
 
     #[test]
     fn streaming_text_lines_include_reasoning_and_answer() {
-        let lines = streaming_text_lines(&StreamingTextItem {
-            request_id: 9,
-            reasoning: "step by step".to_string(),
-            answer: "final".to_string(),
-        });
+        let lines = streaming_text_lines(
+            &StreamingTextItem {
+                request_id: 9,
+                reasoning: "step by step".to_string(),
+                answer: "final".to_string(),
+            },
+            80,
+        );
 
         assert_eq!(lines[0].to_string(), "[9]");
         assert_eq!(lines[1].to_string(), "reasoning: step by step");
@@ -1062,17 +1809,40 @@ mod tests {
 
     #[test]
     fn streaming_text_lines_preserve_newlines() {
-        let lines = streaming_text_lines(&StreamingTextItem {
-            request_id: 3,
-            reasoning: "line one\nline two".to_string(),
-            answer: "final one\nfinal two".to_string(),
-        });
+        let lines = streaming_text_lines(
+            &StreamingTextItem {
+                request_id: 3,
+                reasoning: "line one\nline two".to_string(),
+                answer: "final one\nfinal two".to_string(),
+            },
+            80,
+        );
 
         assert_eq!(lines[0].to_string(), "[3]");
         assert_eq!(lines[1].to_string(), "reasoning: line one");
         assert_eq!(lines[2].to_string(), "line two");
         assert_eq!(lines[3].to_string(), "answer: final one");
         assert_eq!(lines[4].to_string(), "final two");
+    }
+
+    #[test]
+    fn markdown_lines_render_tables() {
+        let lines = markdown_lines(
+            "| Name | Role | Years |\n|:--|:--:|--:|\n| Ada Lovelace | Mathematician | 1842 |\n| Grace Hopper | Computer Scientist | 1943 |",
+            Style::default(),
+            60,
+        );
+
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("┌"));
+        assert!(rendered.contains("Ada Lovelace"));
+        assert!(rendered.contains("Grace Hopper"));
+        assert!(rendered.contains("Mathematician"));
     }
 
     #[test]
