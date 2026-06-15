@@ -34,6 +34,8 @@ use tokio::{
     net::UnixStream,
     sync::{Mutex, mpsc},
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 struct App {
     input: String,
@@ -764,7 +766,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let cursor_x = chunks[1]
         .x
-        .saturating_add(1 + app.input.chars().count() as u16);
+        .saturating_add(1 + display_width(&app.input) as u16);
     let cursor_y = chunks[1].y.saturating_add(1);
     frame.set_cursor_position((cursor_x, cursor_y));
 }
@@ -940,8 +942,7 @@ fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
         return 0;
     }
 
-    let text = lines.iter().map(Line::width).sum::<usize>();
-    if text == 0 && lines.len() <= 1 {
+    if lines.len() <= 1 && lines.iter().all(|line| line.to_string().is_empty()) {
         return 1;
     }
 
@@ -1216,7 +1217,7 @@ fn render_markdown_block(
                 } else {
                     "• ".to_string()
                 };
-                let continuation_indent = indent + marker.chars().count();
+                let continuation_indent = indent + display_width(&marker);
                 let mut rendered = Vec::new();
                 render_markdown_blocks(item, &mut rendered, style, 0, width);
                 let mut rendered_iter = rendered.into_iter();
@@ -1471,18 +1472,16 @@ fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
         let mut current_width = 0;
         for word in raw_line.split_whitespace() {
             let word_width = display_width(word);
-            let separator = usize::from(!current.is_empty());
-            if current_width + separator + word_width <= width {
-                if separator == 1 {
+            let separator_width = usize::from(!current.is_empty());
+            if current_width + separator_width + word_width <= width {
+                if separator_width == 1 {
                     current.push(' ');
                     current_width += 1;
                 }
                 current.push_str(word);
                 current_width += word_width;
             } else if current.is_empty() {
-                for chunk in split_word_to_width(word, width) {
-                    lines.push(chunk);
-                }
+                lines.extend(split_word_to_width(word, width));
             } else {
                 lines.push(std::mem::take(&mut current));
                 current_width = 0;
@@ -1490,9 +1489,7 @@ fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
                     current.push_str(word);
                     current_width = word_width;
                 } else {
-                    for chunk in split_word_to_width(word, width) {
-                        lines.push(chunk);
-                    }
+                    lines.extend(split_word_to_width(word, width));
                 }
             }
         }
@@ -1509,18 +1506,27 @@ fn wrap_cell_text(text: &str, width: usize) -> Vec<String> {
 }
 
 fn split_word_to_width(word: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut current_width = 0;
-    for ch in word.chars() {
-        let ch_width = 1;
-        if current_width + ch_width > width && !current.is_empty() {
+
+    for grapheme in UnicodeSegmentation::graphemes(word, true) {
+        let grapheme_width = grapheme_width(grapheme).max(1);
+        if !current.is_empty() && current_width + grapheme_width > width {
             chunks.push(std::mem::take(&mut current));
             current_width = 0;
         }
-        current.push(ch);
-        current_width += ch_width;
+
+        current.push_str(grapheme);
+        current_width += grapheme_width;
+
+        if current_width >= width {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
     }
+
     if !current.is_empty() {
         chunks.push(current);
     }
@@ -1545,7 +1551,21 @@ fn pad_aligned(text: &str, width: usize, alignment: MarkdownAlignment) -> String
 }
 
 fn display_width(text: &str) -> usize {
-    text.chars().count()
+    UnicodeWidthStr::width(text)
+}
+
+fn grapheme_width(grapheme: &str) -> usize {
+    if grapheme.is_empty() {
+        0
+    } else {
+        UnicodeWidthStr::width(grapheme).max(
+            grapheme
+                .chars()
+                .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+                .max()
+                .unwrap_or(0),
+        )
+    }
 }
 
 fn inline_plain_text(inlines: &[MarkdownInline]) -> String {
@@ -1689,7 +1709,7 @@ fn wrapped_line_height(line: &str, width: usize) -> usize {
         return 0;
     }
 
-    let line_width = line.chars().count();
+    let line_width = display_width(line);
     if line_width == 0 {
         1
     } else {
@@ -1789,6 +1809,25 @@ mod tests {
         assert_eq!(history_text_height("a\nb\n", 10), 3);
         assert_eq!(history_text_height("", 10), 1);
         assert_eq!(history_text_height("\n", 10), 2);
+    }
+
+    #[test]
+    fn display_width_treats_emoji_as_terminal_cells() {
+        assert_eq!(display_width("😀"), 2);
+        assert_eq!(display_width("A😀B"), 4);
+        assert_eq!(display_width("👨‍👩‍👧‍👦"), 2);
+    }
+
+    #[test]
+    fn split_word_to_width_keeps_emoji_graphemes_together() {
+        assert_eq!(split_word_to_width("😀😀", 2), vec!["😀", "😀"]);
+        assert_eq!(split_word_to_width("👨‍👩‍👧‍👦x", 2), vec!["👨‍👩‍👧‍👦", "x"]);
+    }
+
+    #[test]
+    fn wrapped_line_height_uses_terminal_display_width() {
+        assert_eq!(wrapped_line_height("😀😀", 2), 2);
+        assert_eq!(wrapped_line_height("👨‍👩‍👧‍👦", 2), 1);
     }
 
     #[test]

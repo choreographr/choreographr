@@ -7225,6 +7225,8 @@ dependencies = [
  "tai-client-core",
  "tai-proto",
  "tokio",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

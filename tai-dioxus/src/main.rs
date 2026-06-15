@@ -718,7 +718,7 @@ fn apply_daemon_message(
 const APP_CSS: &str = r#"
 :root {
     color-scheme: dark;
-    font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
 }
 
 html, body {
@@ -778,7 +778,7 @@ body {
     margin: 0;
     white-space: pre-wrap;
     word-break: break-word;
-    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", monospace;
     line-height: 1.45;
 }
 
@@ -824,7 +824,7 @@ body {
 
 .markdown-body code,
 .markdown-body pre {
-    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", monospace;
 }
 
 .markdown-body code {
@@ -866,13 +866,13 @@ body {
 .request-id {
     margin-bottom: 6px;
     color: #8b949e;
-    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", monospace;
 }
 
 .image-meta {
     margin-bottom: 8px;
     color: #8b949e;
-    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", monospace;
 }
 
 .history-image {

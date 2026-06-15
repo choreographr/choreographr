@@ -11,5 +11,7 @@ ratatui = "0.30.1"
 ratatui-image = { version = "11.0.4", default-features = false, features = ["crossterm", "image-defaults"] }
 resvg = "0.45"
 tai-client-core.workspace = true
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
 tai-proto.workspace = true
 tokio = { workspace = true, features = ["full"] }

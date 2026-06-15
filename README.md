@@ -48,6 +48,7 @@ The current implementation is intentionally small and local-first:
 - Scrollable history pane
 - Interactive command input
 - Displays daemon status, request lifecycle events, and model information
+- Uses Unicode-aware terminal width calculations so emoji and other wide graphemes wrap and align more accurately
 - Includes image rendering support through `ratatui-image` for protocol messages that carry images
 - Rasterizes SVG image messages for terminal display
 
@@ -56,6 +57,7 @@ The current implementation is intentionally small and local-first:
 - Minimal desktop app UI
 - Uses the same Unix socket transport and `tai-proto` message types as `tai-sh`
 - Supports prompt input, streaming output, model listing/selection, and cancellation
+- Uses emoji-capable fallback font stacks for better native emoji rendering in the desktop UI
 - Renders image messages with standard `data:` URLs, including SVG
 
 ### `tai-proto`
@@ -71,6 +73,7 @@ The current implementation is intentionally small and local-first:
 - Rust toolchain with Cargo
 - Unix-like OS with Unix domain socket support
 - An OpenAI-compatible API endpoint
+- For best emoji rendering in `tai-dioxus` on Linux, an installed color emoji font such as `Noto Color Emoji` (`fonts-noto-color-emoji` on Debian/Ubuntu)
 
 ## Configuration
 
@@ -257,6 +260,8 @@ This workspace includes unit and integration tests for:
 - Request format is selected by `default_request_format`, with optional per-model overrides in `model_request_formats`.
 - Model selection is per client connection, not global.
 - `tai-sh` currently targets a local daemon over Unix sockets; there is no Windows named-pipe transport.
+- Emoji display in `tai-sh` still depends on your terminal emulator and installed fonts; the client now computes wrapping/alignment using Unicode display width, but it does not render emoji glyphs itself.
+- `tai-dioxus` relies on OS/webview font fallback for emoji glyph rendering.
 - The protocol caps frame sizes at 1 MiB.
 
 ## Crate summary
