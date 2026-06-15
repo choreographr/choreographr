@@ -1,10 +1,13 @@
 pub mod openai;
 
-use crate::openai::{AuthConfig, CompletionChunkKind, OpenAiClient};
+use crate::openai::{
+    AuthConfig, ChatAssistantToolUse, ChatRequestMessage, ChatToolCall, ChatToolDefinition,
+    ChatTurnResult, CompletionChunkKind, OpenAiClient, RequestFormat,
+};
 use std::{collections::HashMap, io, path::Path, sync::Arc};
 use tai_proto::{
-    ClientMessage, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
-    SessionMessage, SessionRole, SessionSummary, read_message, write_message,
+    AssistantToolCallRecord, ClientMessage, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE,
+    OutputStream, SessionMessage, SessionSummary, read_message, write_message,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -33,6 +36,127 @@ pub struct DaemonStateInner {
 }
 
 pub type DaemonState = Arc<Mutex<DaemonStateInner>>;
+
+#[derive(Debug, Clone)]
+struct ToolResult {
+    content: String,
+    is_error: bool,
+}
+
+fn available_tools() -> Vec<ChatToolDefinition> {
+    vec![
+        ChatToolDefinition::function(
+            "read_file",
+            "Read a UTF-8 text file from the local workspace.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative or absolute path to a text file"
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "list_files",
+            "List files in a local directory.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative or absolute path to a directory",
+                        "default": "."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
+    ]
+}
+
+async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolResult {
+    match tool_call.name.as_str() {
+        "read_file" => {
+            let path = match serde_json::from_str::<serde_json::Value>(&tool_call.arguments_json)
+                .ok()
+                .and_then(|value| value.get("path").and_then(|value| value.as_str()).map(str::to_string))
+            {
+                Some(path) if !path.trim().is_empty() => path,
+                _ => {
+                    return ToolResult {
+                        content: "missing required string argument: path".to_string(),
+                        is_error: true,
+                    }
+                }
+            };
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => ToolResult {
+                    content: truncate_tool_output(&content),
+                    is_error: false,
+                },
+                Err(error) => ToolResult {
+                    content: format!("failed to read {path}: {error}"),
+                    is_error: true,
+                },
+            }
+        }
+        "list_files" => {
+            let path = serde_json::from_str::<serde_json::Value>(&tool_call.arguments_json)
+                .ok()
+                .and_then(|value| value.get("path").and_then(|value| value.as_str()).map(str::to_string))
+                .unwrap_or_else(|| ".".to_string());
+            match tokio::fs::read_dir(&path).await {
+                Ok(mut entries) => {
+                    let mut names = Vec::new();
+                    loop {
+                        match entries.next_entry().await {
+                            Ok(Some(entry)) => {
+                                let mut name = entry.file_name().to_string_lossy().to_string();
+                                if entry.file_type().await.map(|kind| kind.is_dir()).unwrap_or(false) {
+                                    name.push('/');
+                                }
+                                names.push(name);
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                return ToolResult {
+                                    content: format!("failed to list {path}: {error}"),
+                                    is_error: true,
+                                }
+                            }
+                        }
+                    }
+                    names.sort();
+                    ToolResult {
+                        content: truncate_tool_output(&names.join("\n")),
+                        is_error: false,
+                    }
+                }
+                Err(error) => ToolResult {
+                    content: format!("failed to list {path}: {error}"),
+                    is_error: true,
+                },
+            }
+        }
+        _ => ToolResult {
+            content: format!("unknown tool: {}", tool_call.name),
+            is_error: true,
+        },
+    }
+}
+
+fn truncate_tool_output(content: &str) -> String {
+    const MAX_TOOL_OUTPUT_CHARS: usize = 16 * 1024;
+    if content.chars().count() <= MAX_TOOL_OUTPUT_CHARS {
+        return content.to_string();
+    }
+    let truncated = content.chars().take(MAX_TOOL_OUTPUT_CHARS).collect::<String>();
+    format!("{truncated}\n...[truncated]")
+}
 
 pub fn new_daemon_state() -> DaemonState {
     let mut sessions = HashMap::new();
@@ -209,7 +333,7 @@ pub async fn handle_client(
                             continue;
                         }
 
-                        let (model, prompt) = {
+                        let model = {
                             let mut guard = session.lock().await;
                             if guard.active_requests.contains_key(&request_id) {
                                 warn!(request_id, session_id, "duplicate request id rejected");
@@ -232,18 +356,17 @@ pub async fn handle_client(
                                     .await;
                                 continue;
                             };
-                            let message = SessionMessage {
-                                role: SessionRole::User,
+                            let message = SessionMessage::UserText {
                                 content: text.clone(),
                             };
                             guard.messages.push(message.clone());
                             drop(guard);
                             broadcast_message_appended(&session, message, Some(client_id)).await;
-                            let guard = session.lock().await;
-                            (model, build_prompt(&guard.messages))
+                            model
                         };
 
-                        info!(request_id, session_id, input_len = input.len(), selected_model = %model, "starting request");
+                        let request_format = client.config().request_format_for_model(&model);
+                        info!(request_id, session_id, input_len = input.len(), selected_model = %model, ?request_format, "starting request");
                         let client_clone = Arc::clone(&client);
                         let session_clone = Arc::clone(&session);
                         let handle = tokio::spawn(async move {
@@ -253,44 +376,18 @@ pub async fn handle_client(
                                 None,
                             )
                             .await;
-                            let answer = Arc::new(Mutex::new(String::new()));
-                            let answer_clone = Arc::clone(&answer);
-                            let completion = client_clone
-                                .completion_stream(&model, &prompt, |kind, chunk| {
-                                    let answer = Arc::clone(&answer_clone);
-                                    let session_for_chunk = Arc::clone(&session_clone);
-                                    async move {
-                                        if matches!(kind, CompletionChunkKind::Answer) {
-                                            answer.lock().await.push_str(&chunk);
-                                        }
-                                        broadcast_to_session(
-                                            &session_for_chunk,
-                                            DaemonMessage::OutputChunk {
-                                                request_id,
-                                                stream: match kind {
-                                                    CompletionChunkKind::Answer => OutputStream::Answer,
-                                                    CompletionChunkKind::Reasoning => OutputStream::Reasoning,
-                                                },
-                                                data: chunk.into_bytes(),
-                                            },
-                                            None,
-                                        )
-                                        .await;
-                                        Ok(())
-                                    }
-                                })
-                                .await;
 
-                            match completion {
+                            let result = match request_format {
+                                RequestFormat::Responses => {
+                                    execute_plain_request(&client_clone, &session_clone, &model, request_id).await
+                                }
+                                RequestFormat::ChatCompletions => {
+                                    execute_chat_tool_request(&client_clone, &session_clone, &model, request_id).await
+                                }
+                            };
+
+                            match result {
                                 Ok(()) => {
-                                    let final_answer = answer.lock().await.trim().to_string();
-                                    if !final_answer.is_empty() {
-                                        let message = SessionMessage {
-                                            role: SessionRole::Assistant,
-                                            content: final_answer,
-                                        };
-                                        session_clone.lock().await.messages.push(message);
-                                    }
                                     info!(request_id, session_id, "request completed");
                                     broadcast_to_session(
                                         &session_clone,
@@ -312,11 +409,7 @@ pub async fn handle_client(
                                     .await;
                                 }
                             }
-                            session_clone
-                                .lock()
-                                .await
-                                .active_requests
-                                .remove(&request_id);
+                            session_clone.lock().await.active_requests.remove(&request_id);
                         });
 
                         session
@@ -616,19 +709,242 @@ async fn require_attached_session(
     Ok(Some((session_id, session)))
 }
 
+async fn execute_plain_request(
+    client: &OpenAiClient,
+    session: &Arc<Mutex<SessionState>>,
+    model: &str,
+    request_id: u32,
+) -> io::Result<()> {
+    let prompt = {
+        let guard = session.lock().await;
+        build_prompt(&guard.messages)
+    };
+    let answer = Arc::new(Mutex::new(String::new()));
+    let answer_clone = Arc::clone(&answer);
+    client
+        .completion_stream(model, &prompt, |kind, chunk| {
+            let answer = Arc::clone(&answer_clone);
+            let session_for_chunk = Arc::clone(session);
+            async move {
+                if matches!(kind, CompletionChunkKind::Answer) {
+                    answer.lock().await.push_str(&chunk);
+                }
+                broadcast_to_session(
+                    &session_for_chunk,
+                    DaemonMessage::OutputChunk {
+                        request_id,
+                        stream: match kind {
+                            CompletionChunkKind::Answer => OutputStream::Answer,
+                            CompletionChunkKind::Reasoning => OutputStream::Reasoning,
+                        },
+                        data: chunk.into_bytes(),
+                    },
+                    None,
+                )
+                .await;
+                Ok(())
+            }
+        })
+        .await?;
+
+    let final_answer = answer.lock().await.trim().to_string();
+    if !final_answer.is_empty() {
+        session
+            .lock()
+            .await
+            .messages
+            .push(SessionMessage::AssistantText {
+                content: final_answer,
+            });
+    }
+    Ok(())
+}
+
+async fn execute_chat_tool_request(
+    client: &OpenAiClient,
+    session: &Arc<Mutex<SessionState>>,
+    model: &str,
+    request_id: u32,
+) -> io::Result<()> {
+    let tools = available_tools();
+    for _ in 0..8 {
+        let messages = {
+            let guard = session.lock().await;
+            build_chat_request_messages(&guard.messages)
+        };
+        match client.chat_completion_turn(model, &messages, &tools).await? {
+            ChatTurnResult::FinalText(content) => {
+                broadcast_to_session(
+                    session,
+                    DaemonMessage::OutputChunk {
+                        request_id,
+                        stream: OutputStream::Answer,
+                        data: content.clone().into_bytes(),
+                    },
+                    None,
+                )
+                .await;
+                session
+                    .lock()
+                    .await
+                    .messages
+                    .push(SessionMessage::AssistantText { content });
+                return Ok(());
+            }
+            ChatTurnResult::ToolUse(tool_use) => {
+                persist_assistant_tool_use(session, &tool_use).await;
+                for tool_call in tool_use.tool_calls {
+                    broadcast_to_session(
+                        session,
+                        DaemonMessage::ToolCallStarted {
+                            request_id,
+                            call_id: tool_call.id.clone(),
+                            tool_name: tool_call.name.clone(),
+                            arguments_json: tool_call.arguments_json.clone(),
+                        },
+                        None,
+                    )
+                    .await;
+                    let result = execute_tool_call(&tool_call).await;
+                    session.lock().await.messages.push(SessionMessage::ToolResult {
+                        call_id: tool_call.id.clone(),
+                        name: tool_call.name.clone(),
+                        content: result.content.clone(),
+                        is_error: result.is_error,
+                    });
+                    let event = if result.is_error {
+                        DaemonMessage::ToolCallFailed {
+                            request_id,
+                            call_id: tool_call.id.clone(),
+                            tool_name: tool_call.name.clone(),
+                            error: result.content.clone(),
+                        }
+                    } else {
+                        DaemonMessage::ToolCallFinished {
+                            request_id,
+                            call_id: tool_call.id.clone(),
+                            tool_name: tool_call.name.clone(),
+                            output: result.content.clone(),
+                        }
+                    };
+                    broadcast_to_session(session, event, None).await;
+                }
+            }
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "tool loop exceeded maximum iterations",
+    ))
+}
+
+async fn persist_assistant_tool_use(
+    session: &Arc<Mutex<SessionState>>,
+    tool_use: &ChatAssistantToolUse,
+) {
+    session
+        .lock()
+        .await
+        .messages
+        .push(SessionMessage::AssistantToolUse {
+            content: tool_use.content.clone(),
+            tool_calls: tool_use
+                .tool_calls
+                .iter()
+                .map(|tool_call| AssistantToolCallRecord {
+                    call_id: tool_call.id.clone(),
+                    name: tool_call.name.clone(),
+                    arguments_json: tool_call.arguments_json.clone(),
+                })
+                .collect(),
+            reasoning_content: tool_use.reasoning_content.clone(),
+            reasoning: tool_use.reasoning.clone(),
+            reasoning_text: tool_use.reasoning_text.clone(),
+        });
+}
+
+fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMessage> {
+    messages
+        .iter()
+        .map(|message| match message {
+            SessionMessage::SystemText { content } => ChatRequestMessage {
+                role: "system",
+                content: Some(content.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_text: None,
+            },
+            SessionMessage::UserText { content } => ChatRequestMessage {
+                role: "user",
+                content: Some(content.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_text: None,
+            },
+            SessionMessage::AssistantText { content } => ChatRequestMessage {
+                role: "assistant",
+                content: Some(content.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_text: None,
+            },
+            SessionMessage::AssistantToolUse {
+                content,
+                tool_calls,
+                reasoning_content,
+                reasoning,
+                reasoning_text,
+            } => ChatRequestMessage {
+                role: "assistant",
+                content: content.clone(),
+                tool_call_id: None,
+                tool_calls: Some(
+                    tool_calls
+                        .iter()
+                        .map(|tool_call| openai::AssistantToolCall {
+                            id: tool_call.call_id.clone(),
+                            kind: "function".to_string(),
+                            function: openai::AssistantToolFunction {
+                                name: tool_call.name.clone(),
+                                arguments: tool_call.arguments_json.clone(),
+                            },
+                        })
+                        .collect(),
+                ),
+                reasoning_content: reasoning_content.clone(),
+                reasoning: reasoning.clone(),
+                reasoning_text: reasoning_text.clone(),
+            },
+            SessionMessage::ToolResult {
+                call_id, content, ..
+            } => ChatRequestMessage {
+                role: "tool",
+                content: Some(content.clone()),
+                tool_call_id: Some(call_id.clone()),
+                tool_calls: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_text: None,
+            },
+        })
+        .collect()
+}
+
 fn build_prompt(messages: &[SessionMessage]) -> String {
     let mut prompt = String::new();
     for message in messages {
-        let role = match message.role {
-            SessionRole::User => "User",
-            SessionRole::Assistant => "Assistant",
-        };
+        let line = message.render_line();
         if !prompt.is_empty() {
             prompt.push_str("\n\n");
         }
-        prompt.push_str(role);
-        prompt.push_str(": ");
-        prompt.push_str(message.content.trim());
+        prompt.push_str(line.trim());
     }
     prompt
 }

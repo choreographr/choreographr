@@ -9,15 +9,70 @@ pub const SOCKET_PATH_ENV: &str = "TAI_SOCKET_PATH";
 pub const MAX_IMAGE_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SessionRole {
-    User,
-    Assistant,
+pub struct AssistantToolCallRecord {
+    pub call_id: String,
+    pub name: String,
+    pub arguments_json: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionMessage {
-    pub role: SessionRole,
-    pub content: String,
+pub enum SessionMessage {
+    SystemText {
+        content: String,
+    },
+    UserText {
+        content: String,
+    },
+    AssistantText {
+        content: String,
+    },
+    AssistantToolUse {
+        content: Option<String>,
+        tool_calls: Vec<AssistantToolCallRecord>,
+        reasoning_content: Option<String>,
+        reasoning: Option<String>,
+        reasoning_text: Option<String>,
+    },
+    ToolResult {
+        call_id: String,
+        name: String,
+        content: String,
+        is_error: bool,
+    },
+}
+
+impl SessionMessage {
+    pub fn render_line(&self) -> String {
+        match self {
+            Self::SystemText { content } => format!("[system] {content}"),
+            Self::UserText { content } => format!("> {content}"),
+            Self::AssistantText { content } => format!("< {content}"),
+            Self::AssistantToolUse {
+                content,
+                tool_calls,
+                ..
+            } => {
+                let calls = tool_calls
+                    .iter()
+                    .map(|call| format!("{}({})", call.name, call.arguments_json))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                match content.as_deref().map(str::trim).filter(|content| !content.is_empty()) {
+                    Some(content) => format!("[tool-call] {calls} — {content}"),
+                    None => format!("[tool-call] {calls}"),
+                }
+            }
+            Self::ToolResult {
+                name,
+                content,
+                is_error,
+                ..
+            } => {
+                let status = if *is_error { "error" } else { "ok" };
+                format!("[tool-result:{status}] {name}: {content}")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +140,24 @@ pub enum DaemonMessage {
     },
     Started {
         request_id: u32,
+    },
+    ToolCallStarted {
+        request_id: u32,
+        call_id: String,
+        tool_name: String,
+        arguments_json: String,
+    },
+    ToolCallFinished {
+        request_id: u32,
+        call_id: String,
+        tool_name: String,
+        output: String,
+    },
+    ToolCallFailed {
+        request_id: u32,
+        call_id: String,
+        tool_name: String,
+        error: String,
     },
     OutputChunk {
         request_id: u32,

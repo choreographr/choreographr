@@ -1,11 +1,12 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 use tai_daemon::{
     handle_client, new_daemon_state,
     openai::{AuthConfig, OpenAiClient, RequestFormat},
 };
 use tai_proto::{ClientMessage, DaemonMessage, read_message, write_message};
 use tokio::{
-    net::UnixStream,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, UnixStream},
     time::{Duration, timeout},
 };
 
@@ -32,6 +33,73 @@ async fn recv(client: &mut UnixStream) -> DaemonMessage {
     .await
     .expect("timed out")
     .expect("read failed")
+}
+
+async fn spawn_tool_call_server(tool_path: String) -> (Arc<OpenAiClient>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let tool_path = tool_path.clone();
+            tokio::spawn(async move {
+                let mut buffer = vec![0_u8; 32 * 1024];
+                let Ok(read_len) = stream.read(&mut buffer).await else {
+                    return;
+                };
+                if read_len == 0 {
+                    return;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read_len]);
+                let first_line = request.lines().next().unwrap_or_default();
+                if first_line.starts_with("GET /v1/models ") || first_line.starts_with("GET /models ") {
+                    let body = r#"{"data":[{"id":"gpt-5.4-nano"}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if first_line.starts_with("POST /v1/chat/completions ") || first_line.starts_with("POST /chat/completions ") {
+                    let body = if request.contains("\"role\":\"tool\"") {
+                        r#"{"choices":[{"message":{"content":"tool answer"}}]}"#.to_string()
+                    } else {
+                        format!(
+                            "{{\"choices\":[{{\"message\":{{\"content\":null,\"tool_calls\":[{{\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"read_file\",\"arguments\":\"{{\\\"path\\\":\\\"{}\\\"}}\"}}}}]}}}}]}}",
+                            tool_path.replace('\\', "\\\\").replace('"', "\\\"")
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+            });
+        }
+    });
+
+    let config = AuthConfig {
+        api_key: "test-key".to_string(),
+        base_url: format!("http://{}/v1", addr),
+        model_list_path: "/models".to_string(),
+        responses_path: "/responses".to_string(),
+        chat_completions_path: "/chat/completions".to_string(),
+        default_request_format: RequestFormat::ChatCompletions,
+        model_request_formats: std::collections::HashMap::new(),
+        chat_completions_max_tokens: None,
+        model_max_tokens: std::collections::HashMap::new(),
+        streaming: true,
+    };
+    (Arc::new(OpenAiClient::new(config).expect("client")), handle)
 }
 
 #[tokio::test]
@@ -115,4 +183,96 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
 
     drop(client);
     server_task.await.expect("join").expect("server ok");
+}
+
+#[tokio::test]
+async fn daemon_handler_executes_chat_tools() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let tool_path = std::env::temp_dir().join(format!("tai-tool-test-{unique}.txt"));
+    tokio::fs::write(&tool_path, "hello from tool\n")
+        .await
+        .expect("write tool file");
+
+    let (client_impl, mock_server) = spawn_tool_call_server(tool_path.display().to_string()).await;
+    let (server, mut client) = UnixStream::pair().expect("pair");
+    let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
+
+    write_message(
+        &mut client,
+        &ClientMessage::SetModel {
+            model: "gpt-5.4-nano".to_string(),
+        },
+    )
+    .await
+    .expect("write set-model");
+    assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
+
+    write_message(
+        &mut client,
+        &ClientMessage::RunInput {
+            request_id: 42,
+            input: b"use a tool".to_vec(),
+        },
+    )
+    .await
+    .expect("write request");
+
+    let mut saw_tool_start = false;
+    let mut saw_tool_finish = false;
+    let mut saw_answer = false;
+    loop {
+        match recv(&mut client).await {
+            DaemonMessage::Started { request_id } => assert_eq!(request_id, 42),
+            DaemonMessage::ToolCallStarted {
+                request_id,
+                call_id,
+                tool_name,
+                arguments_json,
+            } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(call_id, "call_1");
+                assert_eq!(tool_name, "read_file");
+                assert!(arguments_json.contains(tool_path.to_string_lossy().as_ref()));
+                saw_tool_start = true;
+            }
+            DaemonMessage::ToolCallFinished {
+                request_id,
+                call_id,
+                tool_name,
+                output,
+            } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(call_id, "call_1");
+                assert_eq!(tool_name, "read_file");
+                assert!(output.contains("hello from tool"));
+                saw_tool_finish = true;
+            }
+            DaemonMessage::OutputChunk {
+                request_id,
+                data,
+                ..
+            } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(String::from_utf8_lossy(&data), "tool answer");
+                saw_answer = true;
+            }
+            DaemonMessage::Done { request_id } => {
+                assert_eq!(request_id, 42);
+                break;
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    assert!(saw_tool_start);
+    assert!(saw_tool_finish);
+    assert!(saw_answer);
+
+    let _ = tokio::fs::remove_file(&tool_path).await;
+    drop(client);
+    server_task.await.expect("join").expect("server ok");
+    mock_server.abort();
 }

@@ -599,25 +599,41 @@ async fn handle_daemon_message(
                 app.push_text(format!("[daemon] selected model: {model}"));
             }
             for message in messages {
-                let prefix = match message.role {
-                    tai_proto::SessionRole::User => ">",
-                    tai_proto::SessionRole::Assistant => "<",
-                };
-                app.push_text(format!("{prefix} {}", message.content));
+                app.push_text(message.render_line());
             }
         }
         DaemonMessage::SessionFailed { operation, error } => {
             app.push_text(format!("[daemon] {operation} failed: {error}"));
         }
         DaemonMessage::SessionMessageAppended { message } => {
-            let prefix = match message.role {
-                tai_proto::SessionRole::User => ">",
-                tai_proto::SessionRole::Assistant => "<",
-            };
-            app.push_text(format!("{prefix} {}", message.content));
+            app.push_text(message.render_line());
         }
         DaemonMessage::Started { request_id } => {
             app.begin_stream(request_id);
+        }
+        DaemonMessage::ToolCallStarted {
+            request_id,
+            call_id,
+            tool_name,
+            arguments_json,
+        } => {
+            app.push_text(format!("[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"));
+        }
+        DaemonMessage::ToolCallFinished {
+            request_id,
+            call_id,
+            tool_name,
+            output,
+        } => {
+            app.push_text(format!("[{request_id}] tool {tool_name}#{call_id} ok: {output}"));
+        }
+        DaemonMessage::ToolCallFailed {
+            request_id,
+            call_id,
+            tool_name,
+            error,
+        } => {
+            app.push_text(format!("[{request_id}] tool {tool_name}#{call_id} failed: {error}"));
         }
         DaemonMessage::OutputChunk {
             request_id,

@@ -97,9 +97,14 @@ struct ContentItem {
 }
 
 #[derive(Debug, Serialize)]
-struct ChatCompletionsRequest<'a> {
+struct ChatCompletionsRequest<'a, M>
+where
+    M: Serialize,
+{
     model: &'a str,
-    messages: Vec<ChatMessage<'a>>,
+    messages: Vec<M>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ChatToolDefinition>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,10 +120,49 @@ struct ChatCompletionsStreamOptions {
     include_usage: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatToolDefinition {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ChatToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ChatToolFunction {
+    name: &'static str,
+    description: &'static str,
+    parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatRequestMessage {
+    pub role: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<AssistantToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: AssistantToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantToolFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,7 +177,34 @@ struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct AssistantMessage {
-    content: String,
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<AssistantToolCall>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    reasoning_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatAssistantToolUse {
+    pub content: Option<String>,
+    pub tool_calls: Vec<ChatToolCall>,
+    pub reasoning_content: Option<String>,
+    pub reasoning: Option<String>,
+    pub reasoning_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatTurnResult {
+    FinalText(String),
+    ToolUse(ChatAssistantToolUse),
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +229,23 @@ struct StreamDelta {
 pub enum CompletionChunkKind {
     Answer,
     Reasoning,
+}
+
+impl ChatToolDefinition {
+    pub fn function(
+        name: &'static str,
+        description: &'static str,
+        parameters: serde_json::Value,
+    ) -> Self {
+        Self {
+            kind: "function",
+            function: ChatToolFunction {
+                name,
+                description,
+                parameters,
+            },
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -335,6 +423,15 @@ impl OpenAiClient {
             }
         }
     }
+
+    pub async fn chat_completion_turn(
+        &self,
+        model: &str,
+        messages: &[ChatRequestMessage],
+        tools: &[ChatToolDefinition],
+    ) -> io::Result<ChatTurnResult> {
+        chat_completions_request_with_tools(&self.http, &self.config, model, messages, tools).await
+    }
 }
 
 async fn responses_request(
@@ -390,10 +487,16 @@ async fn chat_completions_request(
         send_request(client.post(&url).bearer_auth(config.api_key.trim()).json(
             &ChatCompletionsRequest {
                 model,
-                messages: vec![ChatMessage {
+                messages: vec![ChatRequestMessage {
                     role: "user",
-                    content: prompt,
+                    content: Some(prompt.to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    reasoning_content: None,
+                    reasoning: None,
+                    reasoning_text: None,
                 }],
+                tools: None,
                 stream: false,
                 stream_options: None,
                 max_tokens: max_tokens_field,
@@ -406,7 +509,7 @@ async fn chat_completions_request(
         .choices
         .into_iter()
         .next()
-        .map(|choice| choice.message.content)
+        .and_then(|choice| choice.message.content)
         .unwrap_or_default()
         .trim()
         .to_string();
@@ -419,6 +522,71 @@ async fn chat_completions_request(
     }
 
     Ok(content)
+}
+
+async fn chat_completions_request_with_tools(
+    client: &reqwest::Client,
+    config: &AuthConfig,
+    model: &str,
+    messages: &[ChatRequestMessage],
+    tools: &[ChatToolDefinition],
+) -> io::Result<ChatTurnResult> {
+    let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
+    let max_tokens = config.max_tokens_for_model(model);
+    let (max_tokens_field, max_completion_tokens_field) =
+        match chat_completions_max_tokens_field(config, model) {
+            MaxTokensField::MaxTokens => (max_tokens, None),
+            MaxTokensField::MaxCompletionTokens => (None, max_tokens),
+        };
+    let payload: ChatCompletionsResponse =
+        send_request(client.post(&url).bearer_auth(config.api_key.trim()).json(
+            &ChatCompletionsRequest {
+                model,
+                messages: messages.to_vec(),
+                tools: Some(tools.to_vec()),
+                stream: false,
+                stream_options: None,
+                max_tokens: max_tokens_field,
+                max_completion_tokens: max_completion_tokens_field,
+            },
+        ))
+        .await?;
+
+    let Some(choice) = payload.choices.into_iter().next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider returned an empty response",
+        ));
+    };
+
+    if !choice.message.tool_calls.is_empty() {
+        return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
+            content: choice.message.content,
+            tool_calls: choice
+                .message
+                .tool_calls
+                .into_iter()
+                .map(|tool_call| ChatToolCall {
+                    id: tool_call.id,
+                    name: tool_call.function.name,
+                    arguments_json: tool_call.function.arguments,
+                })
+                .collect(),
+            reasoning_content: choice.message.reasoning_content,
+            reasoning: choice.message.reasoning,
+            reasoning_text: choice.message.reasoning_text,
+        }));
+    }
+
+    let content = choice.message.content.unwrap_or_default().trim().to_string();
+    if content.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider returned an empty response",
+        ));
+    }
+
+    Ok(ChatTurnResult::FinalText(content))
 }
 
 async fn chat_completions_request_streaming<F, Fut>(
@@ -442,10 +610,16 @@ where
     let response = send_request_raw(client.post(&url).bearer_auth(config.api_key.trim()).json(
         &ChatCompletionsRequest {
             model,
-            messages: vec![ChatMessage {
+            messages: vec![ChatRequestMessage {
                 role: "user",
-                content: prompt,
+                content: Some(prompt.to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: None,
+                reasoning: None,
+                reasoning_text: None,
             }],
+            tools: None,
             stream: true,
             stream_options: Some(ChatCompletionsStreamOptions {
                 include_usage: true,
