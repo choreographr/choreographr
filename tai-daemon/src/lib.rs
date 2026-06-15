@@ -15,6 +15,7 @@ use tai_proto::{
     OutputStream, SessionMessage, SessionSummary, read_message, write_message,
 };
 use tokio::{
+    fs::OpenOptions,
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
     sync::{Mutex, mpsc},
@@ -56,6 +57,14 @@ struct HttpRequestArgs {
     headers: HashMap<String, String>,
     body: Option<String>,
     timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WriteFileArgs {
+    path: String,
+    content: String,
+    overwrite: Option<bool>,
+    create_parents: Option<bool>,
 }
 
 fn available_tools() -> Vec<ChatToolDefinition> {
@@ -123,6 +132,35 @@ fn available_tools() -> Vec<ChatToolDefinition> {
                     }
                 },
                 "required": ["method", "url"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "write_file",
+            "Write a UTF-8 text file to the local workspace.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative or absolute path to the file to write"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full UTF-8 file contents to write"
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Whether to overwrite an existing file",
+                        "default": true
+                    },
+                    "create_parents": {
+                        "type": "boolean",
+                        "description": "Whether to create missing parent directories",
+                        "default": true
+                    }
+                },
+                "required": ["path", "content"],
                 "additionalProperties": false
             }),
         ),
@@ -194,10 +232,78 @@ async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolResult {
             }
         }
         "http_request" => execute_http_request_tool(&tool_call.arguments_json).await,
+        "write_file" => execute_write_file_tool(&tool_call.arguments_json).await,
         _ => ToolResult {
             content: format!("unknown tool: {}", tool_call.name),
             is_error: true,
         },
+    }
+}
+
+async fn execute_write_file_tool(arguments_json: &str) -> ToolResult {
+    let args = match serde_json::from_str::<WriteFileArgs>(arguments_json) {
+        Ok(args) => args,
+        Err(error) => {
+            return ToolResult {
+                content: format!("invalid arguments: {error}"),
+                is_error: true,
+            };
+        }
+    };
+
+    let path = args.path.trim();
+    if path.is_empty() {
+        return ToolResult {
+            content: "missing required string argument: path".to_string(),
+            is_error: true,
+        };
+    }
+
+    let path_ref = Path::new(path);
+    if args.create_parents.unwrap_or(true) {
+        if let Some(parent) = path_ref.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(error) = tokio::fs::create_dir_all(parent).await {
+                    return ToolResult {
+                        content: format!("failed to create parent directories for {path}: {error}"),
+                        is_error: true,
+                    };
+                }
+            }
+        }
+    }
+
+    let overwrite = args.overwrite.unwrap_or(true);
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if overwrite {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+
+    match options.open(path_ref).await {
+        Ok(mut file) => match file.write_all(args.content.as_bytes()).await {
+            Ok(()) => ToolResult {
+                content: format!("wrote file: {path}"),
+                is_error: false,
+            },
+            Err(error) => ToolResult {
+                content: format!("failed to write {path}: {error}"),
+                is_error: true,
+            },
+        },
+        Err(error) => {
+            let content = if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
+                format!("refusing to overwrite existing file: {path}")
+            } else {
+                format!("failed to write {path}: {error}")
+            };
+            ToolResult {
+                content,
+                is_error: true,
+            }
+        }
     }
 }
 
@@ -1456,6 +1562,89 @@ mod tests {
             }
         });
         (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn write_file_tool_writes_new_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("tai-write-tool-{unique}.txt"));
+
+        let result = execute_write_file_tool(
+            &serde_json::json!({
+                "path": path,
+                "content": "hello from write tool\n"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "hello from write tool\n"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_tool_refuses_overwrite_when_disabled() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("tai-write-tool-existing-{unique}.txt"));
+        tokio::fs::write(&path, "original\n").await.expect("seed file");
+
+        let result = execute_write_file_tool(
+            &serde_json::json!({
+                "path": path,
+                "content": "replacement\n",
+                "overwrite": false
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(result.is_error, "{}", result.content);
+        assert!(result.content.contains("refusing to overwrite existing file"));
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "original\n"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn write_file_tool_creates_parent_directories() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("tai-write-tool-dir-{unique}"));
+        let path = dir.join("nested/output.txt");
+
+        let result = execute_write_file_tool(
+            &serde_json::json!({
+                "path": path,
+                "content": "nested hello\n",
+                "create_parents": true
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "nested hello\n"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
