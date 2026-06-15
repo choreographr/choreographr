@@ -1846,6 +1846,26 @@ mod tests {
     }
 
     #[test]
+    fn markdown_lines_render_lists_with_item_text() {
+        let lines = markdown_lines(
+            "- one\n- [x] done\n1. first\n2. second",
+            Style::default(),
+            80,
+        );
+
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("• one"));
+        assert!(rendered.contains("• [x] done"));
+        assert!(rendered.contains("1. first"));
+        assert!(rendered.contains("2. second"));
+    }
+
+    #[test]
     fn oversized_history_item_keeps_visible_tail() {
         let wrapped = history_text_height("123456789", 3);
         assert_eq!(wrapped, 3);
