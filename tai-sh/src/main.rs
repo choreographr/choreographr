@@ -24,8 +24,8 @@ use tai_proto::{
     ClientMessage, DaemonMessage, OutputStream, read_message, socket_path, write_message,
 };
 use tai_sh::{
-    ImageAssembler, RenderedImage, ShellCommand, build_picker, build_rendered_image,
-    channel_closed, parse_input_line,
+    ImageAssembler, RenderedImage, ShellCommand, StreamingText, build_picker,
+    build_rendered_image, channel_closed, parse_input_line,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -63,11 +63,7 @@ enum HistoryItem {
     Image(RenderedImage),
 }
 
-struct StreamingTextItem {
-    request_id: u32,
-    reasoning: String,
-    answer: String,
-}
+type StreamingTextItem = StreamingText;
 
 impl HistoryViewport {
     fn new() -> Self {
@@ -254,11 +250,7 @@ impl App {
             return;
         }
         let index = self.history.len();
-        let item = HistoryItem::StreamingText(StreamingTextItem {
-            request_id,
-            reasoning: String::new(),
-            answer: String::new(),
-        });
+        let item = HistoryItem::StreamingText(StreamingTextItem::new(request_id));
         let added_height = self.history_viewport.item_height(&item);
         self.history.push(item);
         self.in_progress.insert(request_id, index);
@@ -279,10 +271,7 @@ impl App {
                 .map(|item| self.history_viewport.item_height(item))
                 .unwrap_or(0);
             if let Some(HistoryItem::StreamingText(text)) = self.history.get_mut(index) {
-                match stream {
-                    OutputStream::Answer => text.answer.push_str(chunk),
-                    OutputStream::Reasoning => text.reasoning.push_str(chunk),
-                }
+                text.append(stream, chunk);
             }
             let new_height = self
                 .history

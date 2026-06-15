@@ -1,50 +1,9 @@
 use image::load_from_memory;
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use std::{collections::HashMap, io};
-use tai_proto::{ClientMessage, ImageMetadata};
+pub use tai_client_core::{ShellCommand, StreamingText, parse_input_line};
+use tai_proto::ImageMetadata;
 use tokio::sync::mpsc;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShellCommand {
-    Send(ClientMessage),
-    InvalidCancel(String),
-    Empty,
-}
-
-pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> ShellCommand {
-    let line = line.trim();
-    if line.is_empty() {
-        return ShellCommand::Empty;
-    }
-
-    if let Some(rest) = line.strip_prefix(":cancel ") {
-        return match rest.trim().parse::<u32>() {
-            Ok(request_id) => ShellCommand::Send(ClientMessage::Cancel { request_id }),
-            Err(_) => ShellCommand::InvalidCancel(rest.trim().to_string()),
-        };
-    }
-
-    if line == ":ping" {
-        return ShellCommand::Send(ClientMessage::Ping);
-    }
-
-    if let Some(rest) = line.strip_prefix("/models") {
-        let model = rest.trim();
-        if model.is_empty() {
-            return ShellCommand::Send(ClientMessage::ListModels);
-        }
-        return ShellCommand::Send(ClientMessage::SetModel {
-            model: model.to_string(),
-        });
-    }
-
-    let request_id = *next_request_id;
-    *next_request_id = next_request_id.wrapping_add(1);
-    ShellCommand::Send(ClientMessage::RunInput {
-        request_id,
-        input: line.as_bytes().to_vec(),
-    })
-}
 
 pub fn channel_closed<T>(_: mpsc::error::SendError<T>) -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "connection writer closed")
@@ -192,6 +151,7 @@ pub fn build_rendered_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tai_proto::ClientMessage;
 
     #[test]
     fn parses_empty_line() {

@@ -1,6 +1,7 @@
 use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
 use std::{collections::HashMap, io};
+use tai_client_core::{ShellCommand, StreamingText, parse_input_line};
 use tai_proto::{
     ClientMessage, DaemonMessage, OutputStream, read_message, socket_path, write_message,
 };
@@ -9,12 +10,7 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StreamingEntry {
-    request_id: u32,
-    reasoning: String,
-    answer: String,
-}
+type StreamingEntry = StreamingText;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HistoryItem {
@@ -62,11 +58,8 @@ impl AppState {
             return;
         }
         let index = self.history.len();
-        self.history.push(HistoryItem::Streaming(StreamingEntry {
-            request_id,
-            reasoning: String::new(),
-            answer: String::new(),
-        }));
+        self.history
+            .push(HistoryItem::Streaming(StreamingEntry::new(request_id)));
         self.in_progress.insert(request_id, index);
         self.trim_history();
     }
@@ -78,10 +71,7 @@ impl AppState {
         if let Some(&index) = self.in_progress.get(&request_id)
             && let Some(HistoryItem::Streaming(entry)) = self.history.get_mut(index)
         {
-            match stream {
-                OutputStream::Answer => entry.answer.push_str(chunk),
-                OutputStream::Reasoning => entry.reasoning.push_str(chunk),
-            }
+            entry.append(stream, chunk);
         }
     }
 
@@ -103,47 +93,6 @@ impl AppState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ShellCommand {
-    Send(ClientMessage),
-    InvalidCancel(String),
-    Empty,
-}
-
-fn parse_input_line(line: &str, next_request_id: &mut u32) -> ShellCommand {
-    let line = line.trim();
-    if line.is_empty() {
-        return ShellCommand::Empty;
-    }
-
-    if let Some(rest) = line.strip_prefix(":cancel ") {
-        return match rest.trim().parse::<u32>() {
-            Ok(request_id) => ShellCommand::Send(ClientMessage::Cancel { request_id }),
-            Err(_) => ShellCommand::InvalidCancel(rest.trim().to_string()),
-        };
-    }
-
-    if line == ":ping" {
-        return ShellCommand::Send(ClientMessage::Ping);
-    }
-
-    if let Some(rest) = line.strip_prefix("/models") {
-        let model = rest.trim();
-        if model.is_empty() {
-            return ShellCommand::Send(ClientMessage::ListModels);
-        }
-        return ShellCommand::Send(ClientMessage::SetModel {
-            model: model.to_string(),
-        });
-    }
-
-    let request_id = *next_request_id;
-    *next_request_id = next_request_id.wrapping_add(1);
-    ShellCommand::Send(ClientMessage::RunInput {
-        request_id,
-        input: line.as_bytes().to_vec(),
-    })
-}
 
 fn main() {
     dioxus::LaunchBuilder::desktop()

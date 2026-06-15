@@ -5787,6 +5787,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tai-client-core"
+version = "0.1.0"
+dependencies = [
+ "tai-proto",
+]
+
+[[package]]
 name = "tai-daemon"
 version = "0.1.0"
 dependencies = [
@@ -5808,6 +5815,7 @@ name = "tai-dioxus"
 version = "0.1.0"
 dependencies = [
  "dioxus",
+ "tai-client-core",
  "tai-proto",
  "tokio",
 ]
@@ -5830,6 +5838,7 @@ dependencies = [
  "image",
  "ratatui",
  "ratatui-image",
+ "tai-client-core",
  "tai-proto",
  "tokio",
 ]

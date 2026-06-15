@@ -1,0 +1,7 @@
+[package]
+name = "tai-client-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tai-proto.workspace = true
