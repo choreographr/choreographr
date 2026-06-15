@@ -15,7 +15,7 @@ The current implementation is intentionally small and local-first:
 - the daemon speaks to an OpenAI-compatible HTTP API
 - the shell lets you list/select models and submit prompts interactively
 - the daemon streams text responses incrementally when the provider supports SSE/token streaming
-- the protocol and UI already have image support primitives, though the daemon currently only returns text
+- the protocol supports streamed image messages, and chat-completions models can trigger image display via the `display_image` tool
 
 ## Workspace layout
 
@@ -40,6 +40,7 @@ The current implementation is intentionally small and local-first:
 - Uses structured logging via `tracing`
 - Reuses a shared HTTP client for model listing and completions
 - Streams text tokens/chunks to clients when enabled
+- Lets chat-completions models display PNG, JPEG, and SVG images through the `display_image` tool
 
 ### `tai-sh`
 
@@ -48,13 +49,14 @@ The current implementation is intentionally small and local-first:
 - Interactive command input
 - Displays daemon status, request lifecycle events, and model information
 - Includes image rendering support through `ratatui-image` for protocol messages that carry images
+- Rasterizes SVG image messages for terminal display
 
 ### `tai-dioxus`
 
 - Minimal desktop app UI
 - Uses the same Unix socket transport and `tai-proto` message types as `tai-sh`
 - Supports prompt input, streaming output, model listing/selection, and cancellation
-- Image messages are not rendered yet
+- Renders image messages with standard `data:` URLs, including SVG
 
 ### `tai-proto`
 
@@ -250,7 +252,7 @@ This workspace includes unit and integration tests for:
 
 ## Notes and current limitations
 
-- The shell and protocol support image messages, but the current daemon implementation only emits text completions.
+- `display_image` is currently exposed only through chat-completions tool calls; plain Responses API requests still return text-only output.
 - The daemon supports both chat completions and Responses API requests.
 - Request format is selected by `default_request_format`, with optional per-model overrides in `model_request_formats`.
 - Model selection is per client connection, not global.

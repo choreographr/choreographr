@@ -57,7 +57,11 @@ impl SessionMessage {
                     .map(|call| format!("{}({})", call.name, call.arguments_json))
                     .collect::<Vec<_>>()
                     .join(", ");
-                match content.as_deref().map(str::trim).filter(|content| !content.is_empty()) {
+                match content
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|content| !content.is_empty())
+                {
                     Some(content) => format!("[tool-call] {calls} — {content}"),
                     None => format!("[tool-call] {calls}"),
                 }

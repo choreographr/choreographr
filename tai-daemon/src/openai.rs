@@ -578,7 +578,12 @@ async fn chat_completions_request_with_tools(
         }));
     }
 
-    let content = choice.message.content.unwrap_or_default().trim().to_string();
+    let content = choice
+        .message
+        .content
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if content.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

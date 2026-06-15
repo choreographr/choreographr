@@ -503,7 +503,9 @@ fn apply_daemon_message(
             tool_name,
             arguments_json,
         } => {
-            state.push_text(format!("[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"));
+            state.push_text(format!(
+                "[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"
+            ));
         }
         DaemonMessage::ToolCallFinished {
             request_id,
@@ -511,7 +513,9 @@ fn apply_daemon_message(
             tool_name,
             output,
         } => {
-            state.push_text(format!("[{request_id}] tool {tool_name}#{call_id} ok: {output}"));
+            state.push_text(format!(
+                "[{request_id}] tool {tool_name}#{call_id} ok: {output}"
+            ));
         }
         DaemonMessage::ToolCallFailed {
             request_id,
@@ -519,7 +523,9 @@ fn apply_daemon_message(
             tool_name,
             error,
         } => {
-            state.push_text(format!("[{request_id}] tool {tool_name}#{call_id} failed: {error}"));
+            state.push_text(format!(
+                "[{request_id}] tool {tool_name}#{call_id} failed: {error}"
+            ));
         }
         DaemonMessage::OutputChunk {
             request_id,

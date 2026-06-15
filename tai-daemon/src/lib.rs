@@ -4,10 +4,13 @@ use crate::openai::{
     AuthConfig, ChatAssistantToolUse, ChatRequestMessage, ChatToolCall, ChatToolDefinition,
     ChatTurnResult, CompletionChunkKind, OpenAiClient, RequestFormat,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use image::GenericImageView;
 use reqwest::{
     Method, StatusCode, Url,
-    header::{HeaderMap, HeaderName, HeaderValue},
+    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue},
 };
+use resvg::usvg;
 use serde::Deserialize;
 use std::{collections::HashMap, io, path::Path, sync::Arc, time::Duration};
 use tai_proto::{
@@ -49,6 +52,21 @@ struct ToolResult {
     is_error: bool,
 }
 
+#[derive(Debug)]
+struct ToolExecutionOutput {
+    result: ToolResult,
+    image: Option<PreparedImage>,
+}
+
+#[derive(Debug)]
+struct PreparedImage {
+    mime_type: String,
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    alt: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct HttpRequestArgs {
     method: String,
@@ -65,6 +83,16 @@ struct WriteFileArgs {
     content: String,
     overwrite: Option<bool>,
     create_parents: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DisplayImageArgs {
+    mime_type: String,
+    path: Option<String>,
+    url: Option<String>,
+    base64_data: Option<String>,
+    svg_text: Option<String>,
+    alt: Option<String>,
 }
 
 fn available_tools() -> Vec<ChatToolDefinition> {
@@ -164,80 +192,363 @@ fn available_tools() -> Vec<ChatToolDefinition> {
                 "additionalProperties": false
             }),
         ),
+        ChatToolDefinition::function(
+            "display_image",
+            "Display a PNG, JPEG, or SVG image on the client. Provide exactly one source: path, url, base64_data, or svg_text.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mime_type": {
+                        "type": "string",
+                        "enum": ["image/png", "image/jpeg", "image/svg+xml"]
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative or absolute path to an image file"
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "Absolute http or https URL for an image"
+                    },
+                    "base64_data": {
+                        "type": "string",
+                        "description": "Base64-encoded PNG or JPEG bytes"
+                    },
+                    "svg_text": {
+                        "type": "string",
+                        "description": "Raw SVG XML source when mime_type is image/svg+xml"
+                    },
+                    "alt": {
+                        "type": "string",
+                        "description": "Short alt text for the image"
+                    }
+                },
+                "required": ["mime_type"],
+                "additionalProperties": false
+            }),
+        ),
     ]
 }
 
-async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolResult {
+async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecutionOutput {
     match tool_call.name.as_str() {
-        "read_file" => {
-            let path = match serde_json::from_str::<serde_json::Value>(&tool_call.arguments_json)
-                .ok()
-                .and_then(|value| value.get("path").and_then(|value| value.as_str()).map(str::to_string))
-            {
-                Some(path) if !path.trim().is_empty() => path,
-                _ => {
-                    return ToolResult {
-                        content: "missing required string argument: path".to_string(),
-                        is_error: true,
-                    }
-                }
+        "read_file" => ToolExecutionOutput {
+            result: execute_read_file_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "list_files" => ToolExecutionOutput {
+            result: execute_list_files_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "http_request" => ToolExecutionOutput {
+            result: execute_http_request_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "write_file" => ToolExecutionOutput {
+            result: execute_write_file_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "display_image" => execute_display_image_tool(&tool_call.arguments_json).await,
+        _ => ToolExecutionOutput {
+            result: ToolResult {
+                content: format!("unknown tool: {}", tool_call.name),
+                is_error: true,
+            },
+            image: None,
+        },
+    }
+}
+
+async fn execute_read_file_tool(arguments_json: &str) -> ToolResult {
+    let path = match serde_json::from_str::<serde_json::Value>(arguments_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        }) {
+        Some(path) if !path.trim().is_empty() => path,
+        _ => {
+            return ToolResult {
+                content: "missing required string argument: path".to_string(),
+                is_error: true,
             };
-            match tokio::fs::read_to_string(&path).await {
-                Ok(content) => ToolResult {
-                    content: truncate_tool_output(&content),
-                    is_error: false,
-                },
-                Err(error) => ToolResult {
-                    content: format!("failed to read {path}: {error}"),
-                    is_error: true,
-                },
-            }
         }
-        "list_files" => {
-            let path = serde_json::from_str::<serde_json::Value>(&tool_call.arguments_json)
-                .ok()
-                .and_then(|value| value.get("path").and_then(|value| value.as_str()).map(str::to_string))
-                .unwrap_or_else(|| ".".to_string());
-            match tokio::fs::read_dir(&path).await {
-                Ok(mut entries) => {
-                    let mut names = Vec::new();
-                    loop {
-                        match entries.next_entry().await {
-                            Ok(Some(entry)) => {
-                                let mut name = entry.file_name().to_string_lossy().to_string();
-                                if entry.file_type().await.map(|kind| kind.is_dir()).unwrap_or(false) {
-                                    name.push('/');
-                                }
-                                names.push(name);
-                            }
-                            Ok(None) => break,
-                            Err(error) => {
-                                return ToolResult {
-                                    content: format!("failed to list {path}: {error}"),
-                                    is_error: true,
-                                }
-                            }
-                        }
-                    }
-                    names.sort();
-                    ToolResult {
-                        content: truncate_tool_output(&names.join("\n")),
-                        is_error: false,
-                    }
-                }
-                Err(error) => ToolResult {
-                    content: format!("failed to list {path}: {error}"),
-                    is_error: true,
-                },
-            }
-        }
-        "http_request" => execute_http_request_tool(&tool_call.arguments_json).await,
-        "write_file" => execute_write_file_tool(&tool_call.arguments_json).await,
-        _ => ToolResult {
-            content: format!("unknown tool: {}", tool_call.name),
+    };
+    match tokio::fs::read_to_string(&path).await {
+        Ok(content) => ToolResult {
+            content: truncate_tool_output(&content),
+            is_error: false,
+        },
+        Err(error) => ToolResult {
+            content: format!("failed to read {path}: {error}"),
             is_error: true,
         },
     }
+}
+
+async fn execute_list_files_tool(arguments_json: &str) -> ToolResult {
+    let path = serde_json::from_str::<serde_json::Value>(arguments_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("path")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| ".".to_string());
+    match tokio::fs::read_dir(&path).await {
+        Ok(mut entries) => {
+            let mut names = Vec::new();
+            loop {
+                match entries.next_entry().await {
+                    Ok(Some(entry)) => {
+                        let mut name = entry.file_name().to_string_lossy().to_string();
+                        if entry
+                            .file_type()
+                            .await
+                            .map(|kind| kind.is_dir())
+                            .unwrap_or(false)
+                        {
+                            name.push('/');
+                        }
+                        names.push(name);
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        return ToolResult {
+                            content: format!("failed to list {path}: {error}"),
+                            is_error: true,
+                        };
+                    }
+                }
+            }
+            names.sort();
+            ToolResult {
+                content: truncate_tool_output(&names.join("\n")),
+                is_error: false,
+            }
+        }
+        Err(error) => ToolResult {
+            content: format!("failed to list {path}: {error}"),
+            is_error: true,
+        },
+    }
+}
+
+const MAX_DISPLAY_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const SUPPORTED_IMAGE_MIME_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/svg+xml"];
+
+async fn execute_display_image_tool(arguments_json: &str) -> ToolExecutionOutput {
+    let args = match serde_json::from_str::<DisplayImageArgs>(arguments_json) {
+        Ok(args) => args,
+        Err(error) => {
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!("invalid arguments: {error}"),
+                    is_error: true,
+                },
+                image: None,
+            };
+        }
+    };
+
+    match prepare_image(args).await {
+        Ok(image) => {
+            let mime_type = image.mime_type.clone();
+            let width = image.width;
+            let height = image.height;
+            let byte_len = image.data.len();
+            ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!(
+                        "displayed image ({mime_type}, {width}x{height}, {byte_len} bytes)"
+                    ),
+                    is_error: false,
+                },
+                image: Some(image),
+            }
+        }
+        Err(error) => ToolExecutionOutput {
+            result: ToolResult {
+                content: error.to_string(),
+                is_error: true,
+            },
+            image: None,
+        },
+    }
+}
+
+async fn prepare_image(args: DisplayImageArgs) -> io::Result<PreparedImage> {
+    let mime_type = normalize_image_mime_type(&args.mime_type)?;
+    let selected_sources = [
+        args.path.as_ref().map(|_| "path"),
+        args.url.as_ref().map(|_| "url"),
+        args.base64_data.as_ref().map(|_| "base64_data"),
+        args.svg_text.as_ref().map(|_| "svg_text"),
+    ]
+    .into_iter()
+    .flatten()
+    .count();
+    if selected_sources != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "provide exactly one image source: path, url, base64_data, or svg_text",
+        ));
+    }
+
+    let data = if let Some(path) = args.path {
+        tokio::fs::read(path.trim()).await?
+    } else if let Some(url) = args.url {
+        fetch_image_bytes(url.trim(), mime_type).await?
+    } else if let Some(base64_data) = args.base64_data {
+        BASE64.decode(base64_data.trim()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid base64_data: {error}"),
+            )
+        })?
+    } else if let Some(svg_text) = args.svg_text {
+        svg_text.into_bytes()
+    } else {
+        unreachable!("source count validated")
+    };
+
+    if data.len() > MAX_DISPLAY_IMAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "image exceeds maximum allowed size of {} bytes",
+                MAX_DISPLAY_IMAGE_BYTES
+            ),
+        ));
+    }
+
+    let (width, height) = inspect_image_dimensions(mime_type, &data)?;
+    Ok(PreparedImage {
+        mime_type: mime_type.to_string(),
+        data,
+        width,
+        height,
+        alt: args.alt.filter(|alt| !alt.trim().is_empty()),
+    })
+}
+
+fn normalize_image_mime_type(mime_type: &str) -> io::Result<&str> {
+    let normalized = mime_type.trim();
+    if SUPPORTED_IMAGE_MIME_TYPES.contains(&normalized) {
+        Ok(normalized)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported image mime type: {normalized}"),
+        ))
+    }
+}
+
+async fn fetch_image_bytes(url: &str, expected_mime_type: &str) -> io::Result<Vec<u8>> {
+    let url =
+        Url::parse(url).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "image url must use http or https",
+            ));
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(io::Error::other)?;
+    let response = client.get(url).send().await.map_err(io::Error::other)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(io::Error::other(format!(
+            "image request failed with status {status}"
+        )));
+    }
+    if let Some(content_type) = response.headers().get(CONTENT_TYPE)
+        && let Ok(content_type) = content_type.to_str()
+        && !content_type.starts_with(expected_mime_type)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "image response content-type {content_type} does not match {expected_mime_type}"
+            ),
+        ));
+    }
+    let bytes = response.bytes().await.map_err(io::Error::other)?;
+    Ok(bytes.to_vec())
+}
+
+fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u32)> {
+    match mime_type {
+        "image/png" | "image/jpeg" => {
+            let image = image::load_from_memory(data).map_err(io::Error::other)?;
+            Ok(image.dimensions())
+        }
+        "image/svg+xml" => {
+            let options = usvg::Options::default();
+            let tree = usvg::Tree::from_data(data, &options).map_err(io::Error::other)?;
+            let size = tree.size().to_int_size();
+            Ok((size.width(), size.height()))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported image mime type: {mime_type}"),
+        )),
+    }
+}
+
+async fn emit_prepared_image(
+    session: &Arc<Mutex<SessionState>>,
+    request_id: u32,
+    image_id: u32,
+    image: PreparedImage,
+) {
+    let metadata = ImageMetadata {
+        image_id,
+        mime_type: image.mime_type,
+        width: image.width,
+        height: image.height,
+        byte_len: image.data.len() as u64,
+        alt: image.alt,
+    };
+    broadcast_to_session(
+        session,
+        DaemonMessage::ImageStart {
+            request_id,
+            metadata,
+        },
+        None,
+    )
+    .await;
+    for data in image.data.chunks(MAX_IMAGE_CHUNK_SIZE) {
+        broadcast_to_session(
+            session,
+            DaemonMessage::ImageChunk {
+                request_id,
+                image_id,
+                data: data.to_vec(),
+            },
+            None,
+        )
+        .await;
+    }
+    broadcast_to_session(
+        session,
+        DaemonMessage::ImageEnd {
+            request_id,
+            image_id,
+        },
+        None,
+    )
+    .await;
 }
 
 async fn execute_write_file_tool(arguments_json: &str) -> ToolResult {
@@ -478,7 +789,10 @@ fn truncate_tool_output(content: &str) -> String {
     if content.chars().count() <= MAX_TOOL_OUTPUT_CHARS {
         return content.to_string();
     }
-    let truncated = content.chars().take(MAX_TOOL_OUTPUT_CHARS).collect::<String>();
+    let truncated = content
+        .chars()
+        .take(MAX_TOOL_OUTPUT_CHARS)
+        .collect::<String>();
     format!("{truncated}\n...[truncated]")
 }
 
@@ -590,8 +904,14 @@ pub async fn handle_client(
                             guard.sessions.insert(session_id, Arc::clone(&session));
                             (session_id, session)
                         };
-                        update_subscription(&state, client_id, attached_session_id, Some(session_id), &tx)
-                            .await;
+                        update_subscription(
+                            &state,
+                            client_id,
+                            attached_session_id,
+                            Some(session_id),
+                            &tx,
+                        )
+                        .await;
                         attached_session_id = Some(session_id);
                         let _ = tx
                             .send(DaemonMessage::SessionCreated {
@@ -617,8 +937,14 @@ pub async fn handle_client(
                                 .await;
                             continue;
                         };
-                        update_subscription(&state, client_id, attached_session_id, Some(session_id), &tx)
-                            .await;
+                        update_subscription(
+                            &state,
+                            client_id,
+                            attached_session_id,
+                            Some(session_id),
+                            &tx,
+                        )
+                        .await;
                         attached_session_id = Some(session_id);
                         let _ = tx.send(DaemonMessage::SessionAttached { session_id }).await;
                         let snapshot = session_snapshot(session_id, &session).await;
@@ -703,10 +1029,22 @@ pub async fn handle_client(
 
                             let result = match request_format {
                                 RequestFormat::Responses => {
-                                    execute_plain_request(&client_clone, &session_clone, &model, request_id).await
+                                    execute_plain_request(
+                                        &client_clone,
+                                        &session_clone,
+                                        &model,
+                                        request_id,
+                                    )
+                                    .await
                                 }
                                 RequestFormat::ChatCompletions => {
-                                    execute_chat_tool_request(&client_clone, &session_clone, &model, request_id).await
+                                    execute_chat_tool_request(
+                                        &client_clone,
+                                        &session_clone,
+                                        &model,
+                                        request_id,
+                                    )
+                                    .await
                                 }
                             };
 
@@ -733,7 +1071,11 @@ pub async fn handle_client(
                                     .await;
                                 }
                             }
-                            session_clone.lock().await.active_requests.remove(&request_id);
+                            session_clone
+                                .lock()
+                                .await
+                                .active_requests
+                                .remove(&request_id);
                         });
 
                         session
@@ -837,8 +1179,12 @@ pub async fn handle_client(
                             Ok(models) => {
                                 if models.iter().any(|candidate| candidate == &model) {
                                     session.lock().await.selected_model = Some(model.clone());
-                                    broadcast_to_session(&session, DaemonMessage::ModelSelected { model }, None)
-                                        .await;
+                                    broadcast_to_session(
+                                        &session,
+                                        DaemonMessage::ModelSelected { model },
+                                        None,
+                                    )
+                                    .await;
                                 } else {
                                     let _ = tx
                                         .send(DaemonMessage::ModelSelectionFailed {
@@ -1091,12 +1437,16 @@ async fn execute_chat_tool_request(
     request_id: u32,
 ) -> io::Result<()> {
     let tools = available_tools();
+    let mut next_image_id = 1;
     for _ in 0..8 {
         let messages = {
             let guard = session.lock().await;
             build_chat_request_messages(&guard.messages)
         };
-        match client.chat_completion_turn(model, &messages, &tools).await? {
+        match client
+            .chat_completion_turn(model, &messages, &tools)
+            .await?
+        {
             ChatTurnResult::FinalText(content) => {
                 broadcast_to_session(
                     session,
@@ -1129,26 +1479,34 @@ async fn execute_chat_tool_request(
                         None,
                     )
                     .await;
-                    let result = execute_tool_call(&tool_call).await;
-                    session.lock().await.messages.push(SessionMessage::ToolResult {
-                        call_id: tool_call.id.clone(),
-                        name: tool_call.name.clone(),
-                        content: result.content.clone(),
-                        is_error: result.is_error,
-                    });
-                    let event = if result.is_error {
+                    let output = execute_tool_call(&tool_call).await;
+                    if let Some(image) = output.image {
+                        emit_prepared_image(session, request_id, next_image_id, image).await;
+                        next_image_id = next_image_id.wrapping_add(1);
+                    }
+                    session
+                        .lock()
+                        .await
+                        .messages
+                        .push(SessionMessage::ToolResult {
+                            call_id: tool_call.id.clone(),
+                            name: tool_call.name.clone(),
+                            content: output.result.content.clone(),
+                            is_error: output.result.is_error,
+                        });
+                    let event = if output.result.is_error {
                         DaemonMessage::ToolCallFailed {
                             request_id,
                             call_id: tool_call.id.clone(),
                             tool_name: tool_call.name.clone(),
-                            error: result.content.clone(),
+                            error: output.result.content.clone(),
                         }
                     } else {
                         DaemonMessage::ToolCallFinished {
                             request_id,
                             call_id: tool_call.id.clone(),
                             tool_name: tool_call.name.clone(),
-                            output: result.content.clone(),
+                            output: output.result.content.clone(),
                         }
                     };
                     broadcast_to_session(session, event, None).await;
@@ -1597,7 +1955,9 @@ mod tests {
             .expect("time")
             .as_nanos();
         let path = std::env::temp_dir().join(format!("tai-write-tool-existing-{unique}.txt"));
-        tokio::fs::write(&path, "original\n").await.expect("seed file");
+        tokio::fs::write(&path, "original\n")
+            .await
+            .expect("seed file");
 
         let result = execute_write_file_tool(
             &serde_json::json!({
@@ -1610,7 +1970,11 @@ mod tests {
         .await;
 
         assert!(result.is_error, "{}", result.content);
-        assert!(result.content.contains("refusing to overwrite existing file"));
+        assert!(
+            result
+                .content
+                .contains("refusing to overwrite existing file")
+        );
         assert_eq!(
             tokio::fs::read_to_string(&path).await.expect("read file"),
             "original\n"
@@ -1703,7 +2067,11 @@ mod tests {
         .await;
 
         assert!(!result.is_error, "{}", result.content);
-        assert!(result.content.contains("content-type: application/octet-stream"));
+        assert!(
+            result
+                .content
+                .contains("content-type: application/octet-stream")
+        );
         assert!(result.content.ends_with("body omitted: non-text response"));
 
         server.abort();

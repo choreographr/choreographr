@@ -1,5 +1,6 @@
-use image::load_from_memory;
+use image::{DynamicImage, RgbaImage, load_from_memory};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
+use resvg::{tiny_skia, usvg};
 use std::io;
 pub use tai_client_core::{ImageAssembler, ShellCommand, StreamingText, parse_input_line};
 use tai_proto::ImageMetadata;
@@ -23,9 +24,38 @@ pub fn build_rendered_image(
     metadata: ImageMetadata,
     data: Vec<u8>,
 ) -> io::Result<RenderedImage> {
-    let image = load_from_memory(&data).map_err(io::Error::other)?;
+    let image = decode_display_image(&metadata, &data)?;
     let protocol = picker.new_resize_protocol(image);
     Ok(RenderedImage { metadata, protocol })
+}
+
+fn decode_display_image(metadata: &ImageMetadata, data: &[u8]) -> io::Result<DynamicImage> {
+    if metadata.mime_type == "image/svg+xml" {
+        rasterize_svg(data)
+    } else {
+        load_from_memory(data).map_err(io::Error::other)
+    }
+}
+
+fn rasterize_svg(data: &[u8]) -> io::Result<DynamicImage> {
+    let options = usvg::Options::default();
+    let tree = usvg::Tree::from_data(data, &options).map_err(io::Error::other)?;
+    let size = tree.size().to_int_size();
+    let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "svg dimensions are too large to rasterize",
+        )
+    })?;
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    let image =
+        RgbaImage::from_raw(size.width(), size.height(), pixmap.take()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "failed to build raster image from svg",
+            )
+        })?;
+    Ok(DynamicImage::ImageRgba8(image))
 }
 
 #[cfg(test)]
@@ -224,5 +254,26 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn build_rendered_image_rasterizes_svg() {
+        let picker = Picker::halfblocks();
+        let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='red'/></svg>"#;
+        let result = build_rendered_image(
+            &picker,
+            ImageMetadata {
+                image_id: 2,
+                mime_type: "image/svg+xml".to_string(),
+                width: 4,
+                height: 3,
+                byte_len: svg.len() as u64,
+                alt: Some("red rectangle".to_string()),
+            },
+            svg.to_vec(),
+        );
+
+        let image = result.expect("svg should render");
+        assert_eq!(image.metadata.mime_type, "image/svg+xml");
     }
 }

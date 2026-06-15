@@ -617,7 +617,9 @@ async fn handle_daemon_message(
             tool_name,
             arguments_json,
         } => {
-            app.push_text(format!("[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"));
+            app.push_text(format!(
+                "[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"
+            ));
         }
         DaemonMessage::ToolCallFinished {
             request_id,
@@ -625,7 +627,9 @@ async fn handle_daemon_message(
             tool_name,
             output,
         } => {
-            app.push_text(format!("[{request_id}] tool {tool_name}#{call_id} ok: {output}"));
+            app.push_text(format!(
+                "[{request_id}] tool {tool_name}#{call_id} ok: {output}"
+            ));
         }
         DaemonMessage::ToolCallFailed {
             request_id,
@@ -633,7 +637,9 @@ async fn handle_daemon_message(
             tool_name,
             error,
         } => {
-            app.push_text(format!("[{request_id}] tool {tool_name}#{call_id} failed: {error}"));
+            app.push_text(format!(
+                "[{request_id}] tool {tool_name}#{call_id} failed: {error}"
+            ));
         }
         DaemonMessage::OutputChunk {
             request_id,
