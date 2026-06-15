@@ -9,7 +9,31 @@ pub const SOCKET_PATH_ENV: &str = "TAI_SOCKET_PATH";
 pub const MAX_IMAGE_CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionRole {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMessage {
+    pub role: SessionRole,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub session_id: u64,
+    pub title: Option<String>,
+    pub selected_model: Option<String>,
+    pub message_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClientMessage {
+    CreateSession { title: Option<String> },
+    ListSessions,
+    AttachSession { session_id: u64 },
+    GetSessionState { session_id: u64 },
     RunInput { request_id: u32, input: Vec<u8> },
     TestImage { request_id: u32 },
     Cancel { request_id: u32 },
@@ -36,6 +60,29 @@ pub struct ImageMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DaemonMessage {
+    SessionCreated {
+        session_id: u64,
+        title: Option<String>,
+    },
+    Sessions {
+        sessions: Vec<SessionSummary>,
+    },
+    SessionAttached {
+        session_id: u64,
+    },
+    SessionState {
+        session_id: u64,
+        title: Option<String>,
+        selected_model: Option<String>,
+        messages: Vec<SessionMessage>,
+    },
+    SessionMessageAppended {
+        message: SessionMessage,
+    },
+    SessionFailed {
+        operation: String,
+        error: String,
+    },
     Started {
         request_id: u32,
     },

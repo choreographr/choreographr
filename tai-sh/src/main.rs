@@ -390,6 +390,10 @@ async fn main() -> io::Result<()> {
 
     let mut app = App::new(socket_path.clone(), picker_protocol);
     let mut assembler = ImageAssembler::new();
+    client_tx
+        .send(ClientMessage::ListSessions)
+        .await
+        .map_err(channel_closed)?;
 
     let result = run_ui_loop(
         &mut terminal,
@@ -449,7 +453,8 @@ async fn run_ui_loop(
         while let Ok(message) = ui_rx.try_recv() {
             match message {
                 UiEvent::Daemon(message) => {
-                    handle_daemon_message(message, app, picker, assembler, active).await?;
+                    handle_daemon_message(message, app, picker, assembler, active, client_tx)
+                        .await?;
                 }
                 UiEvent::ReaderClosed => {
                     app.push_text("daemon connection closed");
@@ -555,8 +560,62 @@ async fn handle_daemon_message(
     picker: &ratatui_image::picker::Picker,
     assembler: &mut ImageAssembler,
     active: &Arc<Mutex<HashSet<u32>>>,
+    client_tx: &mpsc::Sender<ClientMessage>,
 ) -> io::Result<()> {
     match message {
+        DaemonMessage::SessionCreated { session_id, title } => {
+            let label = title.unwrap_or_else(|| "untitled".to_string());
+            app.push_text(format!("[daemon] created session {session_id}: {label}"));
+        }
+        DaemonMessage::Sessions { sessions } => {
+            if let Some(session) = sessions.first() {
+                client_tx
+                    .send(ClientMessage::AttachSession {
+                        session_id: session.session_id,
+                    })
+                    .await
+                    .map_err(channel_closed)?;
+            } else {
+                client_tx
+                    .send(ClientMessage::CreateSession {
+                        title: Some("default".to_string()),
+                    })
+                    .await
+                    .map_err(channel_closed)?;
+            }
+        }
+        DaemonMessage::SessionAttached { session_id } => {
+            app.push_text(format!("[daemon] attached session: {session_id}"));
+        }
+        DaemonMessage::SessionState {
+            session_id,
+            title,
+            selected_model,
+            messages,
+        } => {
+            let title = title.unwrap_or_else(|| "untitled".to_string());
+            app.push_text(format!("[daemon] session {session_id}: {title}"));
+            if let Some(model) = selected_model {
+                app.push_text(format!("[daemon] selected model: {model}"));
+            }
+            for message in messages {
+                let prefix = match message.role {
+                    tai_proto::SessionRole::User => ">",
+                    tai_proto::SessionRole::Assistant => "<",
+                };
+                app.push_text(format!("{prefix} {}", message.content));
+            }
+        }
+        DaemonMessage::SessionFailed { operation, error } => {
+            app.push_text(format!("[daemon] {operation} failed: {error}"));
+        }
+        DaemonMessage::SessionMessageAppended { message } => {
+            let prefix = match message.role {
+                tai_proto::SessionRole::User => ">",
+                tai_proto::SessionRole::Assistant => "<",
+            };
+            app.push_text(format!("{prefix} {}", message.content));
+        }
         DaemonMessage::Started { request_id } => {
             app.begin_stream(request_id);
         }

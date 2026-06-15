@@ -3,8 +3,8 @@ pub mod openai;
 use crate::openai::{AuthConfig, CompletionChunkKind, OpenAiClient};
 use std::{collections::HashMap, io, path::Path, sync::Arc};
 use tai_proto::{
-    ClientMessage, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream, read_message,
-    write_message,
+    ClientMessage, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
+    SessionMessage, SessionRole, SessionSummary, read_message, write_message,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -14,6 +14,45 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
+struct ActiveRequest {
+    handle: JoinHandle<()>,
+}
+
+struct SessionState {
+    title: Option<String>,
+    selected_model: Option<String>,
+    messages: Vec<SessionMessage>,
+    active_requests: HashMap<u32, ActiveRequest>,
+    subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>,
+}
+
+pub struct DaemonStateInner {
+    next_session_id: u64,
+    next_client_id: u64,
+    sessions: HashMap<u64, Arc<Mutex<SessionState>>>,
+}
+
+pub type DaemonState = Arc<Mutex<DaemonStateInner>>;
+
+pub fn new_daemon_state() -> DaemonState {
+    let mut sessions = HashMap::new();
+    sessions.insert(
+        1,
+        Arc::new(Mutex::new(SessionState {
+            title: Some("default".to_string()),
+            selected_model: None,
+            messages: Vec::new(),
+            active_requests: HashMap::new(),
+            subscribers: HashMap::new(),
+        })),
+    );
+    Arc::new(Mutex::new(DaemonStateInner {
+        next_session_id: 2,
+        next_client_id: 1,
+        sessions,
+    }))
+}
+
 pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Result<()> {
     if Path::new(socket_path).exists() {
         info!(%socket_path, "removing stale socket");
@@ -22,6 +61,7 @@ pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Resul
 
     let listener = UnixListener::bind(socket_path)?;
     let client = Arc::new(OpenAiClient::new(auth_config)?);
+    let state = new_daemon_state();
     info!(%socket_path, "tai-daemon listening");
 
     let result = loop {
@@ -30,8 +70,9 @@ pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Resul
                 let (stream, _) = accept_result?;
                 debug!("accepted client connection");
                 let client = Arc::clone(&client);
+                let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, client).await {
+                    if let Err(error) = handle_client(stream, client, state).await {
                         error!(error = %error, "client error");
                     }
                 });
@@ -52,11 +93,23 @@ pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Resul
     result
 }
 
-pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io::Result<()> {
+pub async fn handle_client(
+    stream: UnixStream,
+    client: Arc<OpenAiClient>,
+    state: DaemonState,
+) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<DaemonMessage>(128);
-    let requests = Arc::new(Mutex::new(HashMap::<u32, JoinHandle<()>>::new()));
-    let mut selected_model: Option<String> = None;
+    let client_id = {
+        let mut guard = state.lock().await;
+        let client_id = guard.next_client_id;
+        guard.next_client_id = guard.next_client_id.wrapping_add(1);
+        client_id
+    };
+    let mut attached_session_id = default_session_id(&state).await;
+    if let Some(session_id) = attached_session_id {
+        update_subscription(&state, client_id, None, Some(session_id), &tx).await;
+    }
 
     debug!("starting client handler");
 
@@ -74,18 +127,74 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
             Ok(message) => {
                 debug!(?message, "received client message");
                 match message {
-                    ClientMessage::RunInput { request_id, input } => {
-                        let mut guard = requests.lock().await;
-                        if guard.contains_key(&request_id) {
-                            warn!(request_id, "duplicate request id rejected");
+                    ClientMessage::CreateSession { title } => {
+                        let (session_id, session) = {
+                            let mut guard = state.lock().await;
+                            let session_id = guard.next_session_id;
+                            guard.next_session_id = guard.next_session_id.wrapping_add(1);
+                            let session = Arc::new(Mutex::new(SessionState {
+                                title: title.clone(),
+                                selected_model: None,
+                                messages: Vec::new(),
+                                active_requests: HashMap::new(),
+                                subscribers: HashMap::new(),
+                            }));
+                            guard.sessions.insert(session_id, Arc::clone(&session));
+                            (session_id, session)
+                        };
+                        update_subscription(&state, client_id, attached_session_id, Some(session_id), &tx)
+                            .await;
+                        attached_session_id = Some(session_id);
+                        let _ = tx
+                            .send(DaemonMessage::SessionCreated {
+                                session_id,
+                                title: title.clone(),
+                            })
+                            .await;
+                        let _ = tx.send(DaemonMessage::SessionAttached { session_id }).await;
+                        let snapshot = session_snapshot(session_id, &session).await;
+                        let _ = tx.send(snapshot).await;
+                    }
+                    ClientMessage::ListSessions => {
+                        let sessions = list_sessions(&state).await;
+                        let _ = tx.send(DaemonMessage::Sessions { sessions }).await;
+                    }
+                    ClientMessage::AttachSession { session_id } => {
+                        let Some(session) = session_by_id(&state, session_id).await else {
                             let _ = tx
-                                .send(DaemonMessage::Failed {
-                                    request_id,
-                                    error: "request id already active".to_string(),
+                                .send(DaemonMessage::SessionFailed {
+                                    operation: "attach_session".to_string(),
+                                    error: format!("unknown session: {session_id}"),
                                 })
                                 .await;
                             continue;
-                        }
+                        };
+                        update_subscription(&state, client_id, attached_session_id, Some(session_id), &tx)
+                            .await;
+                        attached_session_id = Some(session_id);
+                        let _ = tx.send(DaemonMessage::SessionAttached { session_id }).await;
+                        let snapshot = session_snapshot(session_id, &session).await;
+                        let _ = tx.send(snapshot).await;
+                    }
+                    ClientMessage::GetSessionState { session_id } => {
+                        let Some(session) = session_by_id(&state, session_id).await else {
+                            let _ = tx
+                                .send(DaemonMessage::SessionFailed {
+                                    operation: "get_session_state".to_string(),
+                                    error: format!("unknown session: {session_id}"),
+                                })
+                                .await;
+                            continue;
+                        };
+                        let snapshot = session_snapshot(session_id, &session).await;
+                        let _ = tx.send(snapshot).await;
+                    }
+                    ClientMessage::RunInput { request_id, input } => {
+                        let Some((session_id, session)) =
+                            require_attached_session(&state, attached_session_id, &tx).await?
+                        else {
+                            continue;
+                        };
 
                         let text = String::from_utf8_lossy(&input).trim().to_string();
                         if text.is_empty() {
@@ -100,85 +209,128 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
                             continue;
                         }
 
-                        let Some(model) = selected_model.clone() else {
-                            warn!(request_id, "request failed: no model selected");
-                            let _ = tx.send(DaemonMessage::Started { request_id }).await;
-                            let _ = tx
-                                .send(DaemonMessage::Failed {
-                                    request_id,
-                                    error: "no model selected".to_string(),
-                                })
-                                .await;
-                            continue;
+                        let (model, prompt) = {
+                            let mut guard = session.lock().await;
+                            if guard.active_requests.contains_key(&request_id) {
+                                warn!(request_id, session_id, "duplicate request id rejected");
+                                let _ = tx
+                                    .send(DaemonMessage::Failed {
+                                        request_id,
+                                        error: "request id already active".to_string(),
+                                    })
+                                    .await;
+                                continue;
+                            }
+                            let Some(model) = guard.selected_model.clone() else {
+                                warn!(request_id, session_id, "request failed: no model selected");
+                                let _ = tx.send(DaemonMessage::Started { request_id }).await;
+                                let _ = tx
+                                    .send(DaemonMessage::Failed {
+                                        request_id,
+                                        error: "no model selected".to_string(),
+                                    })
+                                    .await;
+                                continue;
+                            };
+                            let message = SessionMessage {
+                                role: SessionRole::User,
+                                content: text.clone(),
+                            };
+                            guard.messages.push(message.clone());
+                            drop(guard);
+                            broadcast_message_appended(&session, message, Some(client_id)).await;
+                            let guard = session.lock().await;
+                            (model, build_prompt(&guard.messages))
                         };
 
-                        info!(request_id, input_len = input.len(), selected_model = %model, "starting request");
-                        let tx_clone = tx.clone();
-                        let requests_clone = Arc::clone(&requests);
+                        info!(request_id, session_id, input_len = input.len(), selected_model = %model, "starting request");
                         let client_clone = Arc::clone(&client);
+                        let session_clone = Arc::clone(&session);
                         let handle = tokio::spawn(async move {
-                            let _ = tx_clone.send(DaemonMessage::Started { request_id }).await;
+                            broadcast_to_session(
+                                &session_clone,
+                                DaemonMessage::Started { request_id },
+                                None,
+                            )
+                            .await;
+                            let answer = Arc::new(Mutex::new(String::new()));
+                            let answer_clone = Arc::clone(&answer);
                             let completion = client_clone
-                                .completion_stream(&model, &text, |kind, chunk| {
-                                    let tx = tx_clone.clone();
+                                .completion_stream(&model, &prompt, |kind, chunk| {
+                                    let answer = Arc::clone(&answer_clone);
+                                    let session_for_chunk = Arc::clone(&session_clone);
                                     async move {
-                                        tx.send(DaemonMessage::OutputChunk {
-                                            request_id,
-                                            stream: match kind {
-                                                CompletionChunkKind::Answer => OutputStream::Answer,
-                                                CompletionChunkKind::Reasoning => OutputStream::Reasoning,
+                                        if matches!(kind, CompletionChunkKind::Answer) {
+                                            answer.lock().await.push_str(&chunk);
+                                        }
+                                        broadcast_to_session(
+                                            &session_for_chunk,
+                                            DaemonMessage::OutputChunk {
+                                                request_id,
+                                                stream: match kind {
+                                                    CompletionChunkKind::Answer => OutputStream::Answer,
+                                                    CompletionChunkKind::Reasoning => OutputStream::Reasoning,
+                                                },
+                                                data: chunk.into_bytes(),
                                             },
-                                            data: chunk.into_bytes(),
-                                        })
-                                        .await
-                                        .map_err(|_| {
-                                            io::Error::new(
-                                                io::ErrorKind::BrokenPipe,
-                                                "client disconnected before output could be delivered",
-                                            )
-                                        })
+                                            None,
+                                        )
+                                        .await;
+                                        Ok(())
                                     }
                                 })
                                 .await;
 
                             match completion {
                                 Ok(()) => {
-                                    info!(request_id, "request completed");
-                                    let _ = tx_clone.send(DaemonMessage::Done { request_id }).await;
-                                }
-                                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
-                                    warn!(
-                                        request_id,
-                                        "client disconnected before output could be delivered"
-                                    );
+                                    let final_answer = answer.lock().await.trim().to_string();
+                                    if !final_answer.is_empty() {
+                                        let message = SessionMessage {
+                                            role: SessionRole::Assistant,
+                                            content: final_answer,
+                                        };
+                                        session_clone.lock().await.messages.push(message);
+                                    }
+                                    info!(request_id, session_id, "request completed");
+                                    broadcast_to_session(
+                                        &session_clone,
+                                        DaemonMessage::Done { request_id },
+                                        None,
+                                    )
+                                    .await;
                                 }
                                 Err(error) => {
-                                    warn!(request_id, error = %error, "request failed");
-                                    let _ = tx_clone
-                                        .send(DaemonMessage::Failed {
+                                    warn!(request_id, session_id, error = %error, "request failed");
+                                    broadcast_to_session(
+                                        &session_clone,
+                                        DaemonMessage::Failed {
                                             request_id,
                                             error: format!("model request failed: {error}"),
-                                        })
-                                        .await;
+                                        },
+                                        None,
+                                    )
+                                    .await;
                                 }
                             }
-                            requests_clone.lock().await.remove(&request_id);
+                            session_clone
+                                .lock()
+                                .await
+                                .active_requests
+                                .remove(&request_id);
                         });
 
-                        guard.insert(request_id, handle);
+                        session
+                            .lock()
+                            .await
+                            .active_requests
+                            .insert(request_id, ActiveRequest { handle });
                     }
                     ClientMessage::TestImage { request_id } => {
-                        if requests.lock().await.contains_key(&request_id) {
-                            warn!(request_id, "duplicate request id rejected");
-                            let _ = tx
-                                .send(DaemonMessage::Failed {
-                                    request_id,
-                                    error: "request id already active".to_string(),
-                                })
-                                .await;
+                        let Some((_session_id, _session)) =
+                            require_attached_session(&state, attached_session_id, &tx).await?
+                        else {
                             continue;
-                        }
-
+                        };
                         info!(request_id, "sending demo image");
                         let _ = tx.send(DaemonMessage::Started { request_id }).await;
                         match emit_demo_image(&tx, request_id, 1).await {
@@ -194,12 +346,28 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
                         }
                     }
                     ClientMessage::Cancel { request_id } => {
-                        if let Some(handle) = requests.lock().await.remove(&request_id) {
-                            info!(request_id, "cancelling active request");
-                            handle.abort();
+                        let Some((session_id, session)) =
+                            require_attached_session(&state, attached_session_id, &tx).await?
+                        else {
+                            continue;
+                        };
+                        if let Some(active_request) =
+                            session.lock().await.active_requests.remove(&request_id)
+                        {
+                            info!(request_id, session_id, "cancelling active request");
+                            active_request.handle.abort();
                             let _ = tx.send(DaemonMessage::Cancelled { request_id }).await;
+                            broadcast_to_session(
+                                &session,
+                                DaemonMessage::Cancelled { request_id },
+                                Some(client_id),
+                            )
+                            .await;
                         } else {
-                            warn!(request_id, "cancel requested for inactive request");
+                            warn!(
+                                request_id,
+                                session_id, "cancel requested for inactive request"
+                            );
                             let _ = tx
                                 .send(DaemonMessage::Failed {
                                     request_id,
@@ -215,12 +383,19 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
                     ClientMessage::ListModels => {
                         let config = client.config();
                         debug!(base_url = %config.base_url, model_list_path = %config.model_list_path, responses_path = %config.responses_path, "listing configured models");
+                        let selected_model = match attached_session_id {
+                            Some(session_id) => match session_by_id(&state, session_id).await {
+                                Some(session) => session.lock().await.selected_model.clone(),
+                                None => None,
+                            },
+                            None => None,
+                        };
                         match client.validate_and_list_models().await {
                             Ok(models) => {
                                 let _ = tx
                                     .send(DaemonMessage::Models {
                                         models,
-                                        selected_model: selected_model.clone(),
+                                        selected_model,
                                     })
                                     .await;
                             }
@@ -234,13 +409,19 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
                         }
                     }
                     ClientMessage::SetModel { model } => {
+                        let Some((session_id, session)) =
+                            require_attached_session(&state, attached_session_id, &tx).await?
+                        else {
+                            continue;
+                        };
                         let config = client.config();
-                        debug!(base_url = %config.base_url, model_list_path = %config.model_list_path, responses_path = %config.responses_path, requested_model = %model, "setting selected model");
+                        debug!(base_url = %config.base_url, model_list_path = %config.model_list_path, responses_path = %config.responses_path, requested_model = %model, session_id, "setting selected model");
                         match client.validate_and_list_models().await {
                             Ok(models) => {
                                 if models.iter().any(|candidate| candidate == &model) {
-                                    selected_model = Some(model.clone());
-                                    let _ = tx.send(DaemonMessage::ModelSelected { model }).await;
+                                    session.lock().await.selected_model = Some(model.clone());
+                                    broadcast_to_session(&session, DaemonMessage::ModelSelected { model }, None)
+                                        .await;
                                 } else {
                                     let _ = tx
                                         .send(DaemonMessage::ModelSelectionFailed {
@@ -278,22 +459,178 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
         }
     }
 
-    let handles: Vec<_> = requests
-        .lock()
-        .await
-        .drain()
-        .map(|(_, handle)| handle)
-        .collect();
-    if !handles.is_empty() {
-        debug!(count = handles.len(), "aborting remaining request tasks");
-    }
-    for handle in handles {
-        handle.abort();
-    }
+    update_subscription(&state, client_id, attached_session_id, None, &tx).await;
     drop(tx);
-    writer_task.await.map_err(io::Error::other)??;
+    writer_task.abort();
+    match writer_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            debug!(error = %error, "writer task ended after client disconnect");
+        }
+        Ok(Err(error)) => return Err(error),
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => return Err(io::Error::other(error)),
+    }
     debug!("client handler finished");
     Ok(())
+}
+
+async fn default_session_id(state: &DaemonState) -> Option<u64> {
+    state.lock().await.sessions.keys().min().copied()
+}
+
+async fn update_subscription(
+    state: &DaemonState,
+    client_id: u64,
+    previous_session_id: Option<u64>,
+    next_session_id: Option<u64>,
+    tx: &mpsc::Sender<DaemonMessage>,
+) {
+    if previous_session_id == next_session_id {
+        return;
+    }
+
+    if let Some(session_id) = previous_session_id
+        && let Some(session) = session_by_id(state, session_id).await
+    {
+        session.lock().await.subscribers.remove(&client_id);
+    }
+
+    if let Some(session_id) = next_session_id
+        && let Some(session) = session_by_id(state, session_id).await
+    {
+        session
+            .lock()
+            .await
+            .subscribers
+            .insert(client_id, tx.clone());
+    }
+}
+
+async fn broadcast_to_session(
+    session: &Arc<Mutex<SessionState>>,
+    message: DaemonMessage,
+    exclude_client_id: Option<u64>,
+) {
+    let subscribers = {
+        let guard = session.lock().await;
+        guard
+            .subscribers
+            .iter()
+            .filter(|(client_id, _)| Some(**client_id) != exclude_client_id)
+            .map(|(_, tx)| tx.clone())
+            .collect::<Vec<_>>()
+    };
+    for tx in subscribers {
+        let _ = tx.send(message.clone()).await;
+    }
+}
+
+async fn broadcast_message_appended(
+    session: &Arc<Mutex<SessionState>>,
+    message: SessionMessage,
+    exclude_client_id: Option<u64>,
+) {
+    let subscribers = {
+        let guard = session.lock().await;
+        guard
+            .subscribers
+            .iter()
+            .filter(|(client_id, _)| Some(**client_id) != exclude_client_id)
+            .map(|(_, tx)| tx.clone())
+            .collect::<Vec<_>>()
+    };
+    for tx in subscribers {
+        let _ = tx
+            .send(DaemonMessage::SessionMessageAppended {
+                message: message.clone(),
+            })
+            .await;
+    }
+}
+
+async fn session_by_id(state: &DaemonState, session_id: u64) -> Option<Arc<Mutex<SessionState>>> {
+    state.lock().await.sessions.get(&session_id).cloned()
+}
+
+async fn list_sessions(state: &DaemonState) -> Vec<SessionSummary> {
+    let sessions: Vec<(u64, Arc<Mutex<SessionState>>)> = state
+        .lock()
+        .await
+        .sessions
+        .iter()
+        .map(|(session_id, session)| (*session_id, Arc::clone(session)))
+        .collect();
+    let mut summaries = Vec::with_capacity(sessions.len());
+    for (session_id, session) in sessions {
+        let guard = session.lock().await;
+        summaries.push(SessionSummary {
+            session_id,
+            title: guard.title.clone(),
+            selected_model: guard.selected_model.clone(),
+            message_count: guard.messages.len() as u32,
+        });
+    }
+    summaries.sort_by_key(|summary| summary.session_id);
+    summaries
+}
+
+async fn session_snapshot(session_id: u64, session: &Arc<Mutex<SessionState>>) -> DaemonMessage {
+    let guard = session.lock().await;
+    DaemonMessage::SessionState {
+        session_id,
+        title: guard.title.clone(),
+        selected_model: guard.selected_model.clone(),
+        messages: guard.messages.clone(),
+    }
+}
+
+async fn require_attached_session(
+    state: &DaemonState,
+    attached_session_id: Option<u64>,
+    tx: &mpsc::Sender<DaemonMessage>,
+) -> io::Result<Option<(u64, Arc<Mutex<SessionState>>)>> {
+    let Some(session_id) = attached_session_id else {
+        let _ = tx
+            .send(DaemonMessage::SessionFailed {
+                operation: "require_attached_session".to_string(),
+                error: "no session attached".to_string(),
+            })
+            .await;
+        return Ok(None);
+    };
+    let Some(session) = session_by_id(state, session_id).await else {
+        let _ = tx
+            .send(DaemonMessage::SessionFailed {
+                operation: "require_attached_session".to_string(),
+                error: format!("unknown session: {session_id}"),
+            })
+            .await;
+        return Ok(None);
+    };
+    Ok(Some((session_id, session)))
+}
+
+fn build_prompt(messages: &[SessionMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let role = match message.role {
+            SessionRole::User => "User",
+            SessionRole::Assistant => "Assistant",
+        };
+        if !prompt.is_empty() {
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(role);
+        prompt.push_str(": ");
+        prompt.push_str(message.content.trim());
+    }
+    prompt
 }
 
 const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
@@ -492,6 +829,7 @@ mod tests {
         let server_task = tokio::spawn(handle_client(
             server,
             Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+            new_daemon_state(),
         ));
 
         write_message(&mut client, &ClientMessage::Ping)
@@ -508,7 +846,7 @@ mod tests {
         let (client_impl, mock_server) =
             spawn_mock_openai_server(Some("mock completion"), Some(&["mock ", "completion"])).await;
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, client_impl));
+        let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
 
         set_selected_model(&mut client, "gpt-5.4-nano").await;
         assert!(matches!(
@@ -579,7 +917,7 @@ mod tests {
     async fn duplicate_request_id_is_rejected() {
         let (client_impl, mock_server) = spawn_mock_openai_server(None, None).await;
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, client_impl));
+        let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
 
         set_selected_model(&mut client, "gpt-5.4-nano").await;
         assert!(matches!(
@@ -628,7 +966,7 @@ mod tests {
     async fn cancel_stops_active_request() {
         let (client_impl, mock_server) = spawn_mock_openai_server(None, None).await;
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let server_task = tokio::spawn(handle_client(server, client_impl));
+        let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
 
         set_selected_model(&mut client, "gpt-5.4-nano").await;
         assert!(matches!(
@@ -663,7 +1001,8 @@ mod tests {
         }
 
         drop(client);
-        server_task.await.expect("join").expect("server ok");
+        server_task.abort();
+        let _ = server_task.await;
         mock_server.abort();
     }
 
@@ -673,6 +1012,7 @@ mod tests {
         let server_task = tokio::spawn(handle_client(
             server,
             Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+            new_daemon_state(),
         ));
 
         write_message(&mut client, &ClientMessage::TestImage { request_id: 12 })
@@ -741,6 +1081,7 @@ mod tests {
         let server_task = tokio::spawn(handle_client(
             server,
             Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+            new_daemon_state(),
         ));
 
         write_message(
@@ -781,6 +1122,7 @@ mod tests {
         let server_task = tokio::spawn(handle_client(
             server,
             Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+            new_daemon_state(),
         ));
 
         write_message(
@@ -820,6 +1162,7 @@ mod tests {
         let server_task = tokio::spawn(handle_client(
             server,
             Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+            new_daemon_state(),
         ));
 
         write_message(&mut client, &ClientMessage::Cancel { request_id: 99 })
@@ -856,6 +1199,7 @@ mod tests {
         let server_task = tokio::spawn(handle_client(
             server,
             Arc::new(OpenAiClient::new(auth_config).expect("client")),
+            new_daemon_state(),
         ));
 
         write_message(&mut client, &ClientMessage::ListModels)
@@ -891,6 +1235,7 @@ mod tests {
         let server_task = tokio::spawn(handle_client(
             server,
             Arc::new(OpenAiClient::new(auth_config).expect("client")),
+            new_daemon_state(),
         ));
 
         write_message(

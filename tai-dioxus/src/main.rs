@@ -130,6 +130,7 @@ fn App() -> Element {
         move || {
             let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
             let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+            let _ = client_tx.send(ClientMessage::ListSessions);
             daemon_tx.set(Some(client_tx));
             events_rx.set(Some(ui_rx));
             tokio::spawn(async move {
@@ -163,7 +164,7 @@ fn App() -> Element {
                     UiEvent::Daemon(message) => {
                         let result = {
                             let mut app_state = state.write();
-                            apply_daemon_message(&mut app_state, message)
+                            apply_daemon_message(&mut app_state, message, daemon_tx.read().clone())
                         };
                         if let Err(error) = result {
                             state.write().push_text(format!(
@@ -445,8 +446,62 @@ fn send_client_message(
     }
 }
 
-fn apply_daemon_message(state: &mut AppState, message: DaemonMessage) -> io::Result<()> {
+fn apply_daemon_message(
+    state: &mut AppState,
+    message: DaemonMessage,
+    daemon_tx: Option<UnboundedSender<ClientMessage>>,
+) -> io::Result<()> {
     match message {
+        DaemonMessage::SessionCreated { session_id, title } => {
+            let label = title.unwrap_or_else(|| "untitled".to_string());
+            state.push_text(format!("[daemon] created session {session_id}: {label}"));
+        }
+        DaemonMessage::Sessions { sessions } => {
+            if let Some(sender) = daemon_tx {
+                let message = if let Some(session) = sessions.first() {
+                    ClientMessage::AttachSession {
+                        session_id: session.session_id,
+                    }
+                } else {
+                    ClientMessage::CreateSession {
+                        title: Some("default".to_string()),
+                    }
+                };
+                let _ = sender.send(message);
+            }
+        }
+        DaemonMessage::SessionAttached { session_id } => {
+            state.push_text(format!("[daemon] attached session: {session_id}"));
+        }
+        DaemonMessage::SessionState {
+            session_id,
+            title,
+            selected_model,
+            messages,
+        } => {
+            let title = title.unwrap_or_else(|| "untitled".to_string());
+            state.push_text(format!("[daemon] session {session_id}: {title}"));
+            if let Some(model) = selected_model {
+                state.push_text(format!("[daemon] selected model: {model}"));
+            }
+            for message in messages {
+                let prefix = match message.role {
+                    tai_proto::SessionRole::User => ">",
+                    tai_proto::SessionRole::Assistant => "<",
+                };
+                state.push_text(format!("{prefix} {}", message.content));
+            }
+        }
+        DaemonMessage::SessionFailed { operation, error } => {
+            state.push_text(format!("[daemon] {operation} failed: {error}"));
+        }
+        DaemonMessage::SessionMessageAppended { message } => {
+            let prefix = match message.role {
+                tai_proto::SessionRole::User => ">",
+                tai_proto::SessionRole::Assistant => "<",
+            };
+            state.push_text(format!("{prefix} {}", message.content));
+        }
         DaemonMessage::Started { request_id } => {
             state.begin_stream(request_id);
         }
@@ -810,6 +865,7 @@ mod tests {
                 request_id: 7,
                 metadata: metadata.clone(),
             },
+            None,
         )
         .expect("start");
         apply_daemon_message(
@@ -819,6 +875,7 @@ mod tests {
                 image_id: 5,
                 data: png,
             },
+            None,
         )
         .expect("chunk");
         apply_daemon_message(
@@ -827,6 +884,7 @@ mod tests {
                 request_id: 7,
                 image_id: 5,
             },
+            None,
         )
         .expect("end");
 

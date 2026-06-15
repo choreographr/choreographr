@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tai_daemon::{
-    handle_client,
+    handle_client, new_daemon_state,
     openai::{AuthConfig, OpenAiClient, RequestFormat},
 };
 use tai_proto::{ClientMessage, DaemonMessage, read_message, write_message};
@@ -40,6 +40,7 @@ async fn daemon_handler_run_input_requires_selected_model() {
     let server_task = tokio::spawn(handle_client(
         server,
         Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+        new_daemon_state(),
     ));
 
     write_message(
@@ -92,6 +93,7 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
     let server_task = tokio::spawn(handle_client(
         server,
         Arc::new(OpenAiClient::new(auth_config).expect("client")),
+        new_daemon_state(),
     ));
 
     write_message(
