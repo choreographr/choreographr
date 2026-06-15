@@ -24,8 +24,8 @@ use tai_proto::{
     ClientMessage, DaemonMessage, OutputStream, read_message, socket_path, write_message,
 };
 use tai_sh::{
-    ImageAssembler, RenderedImage, ShellCommand, StreamingText, build_picker,
-    build_rendered_image, channel_closed, parse_input_line,
+    ImageAssembler, RenderedImage, ShellCommand, StreamingText, build_picker, build_rendered_image,
+    channel_closed, parse_input_line,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -501,9 +501,16 @@ async fn handle_terminal_event(
                             app.push_text(format!("invalid request id: {value}"))
                         }
                         ShellCommand::Send(message) => {
-                            if let ClientMessage::RunInput { request_id, input } = &message {
-                                app.active.insert(*request_id);
-                                app.push_text(format!("> {}", String::from_utf8_lossy(input)));
+                            match &message {
+                                ClientMessage::RunInput { request_id, input } => {
+                                    app.active.insert(*request_id);
+                                    app.push_text(format!("> {}", String::from_utf8_lossy(input)));
+                                }
+                                ClientMessage::TestImage { request_id } => {
+                                    app.active.insert(*request_id);
+                                    app.push_text("> /image".to_string());
+                                }
+                                _ => {}
                             }
                             client_tx.send(message).await.map_err(channel_closed)?;
                         }

@@ -2,7 +2,10 @@ pub mod openai;
 
 use crate::openai::{AuthConfig, CompletionChunkKind, OpenAiClient};
 use std::{collections::HashMap, io, path::Path, sync::Arc};
-use tai_proto::{ClientMessage, DaemonMessage, OutputStream, read_message, write_message};
+use tai_proto::{
+    ClientMessage, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream, read_message,
+    write_message,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
@@ -164,6 +167,32 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
 
                         guard.insert(request_id, handle);
                     }
+                    ClientMessage::TestImage { request_id } => {
+                        if requests.lock().await.contains_key(&request_id) {
+                            warn!(request_id, "duplicate request id rejected");
+                            let _ = tx
+                                .send(DaemonMessage::Failed {
+                                    request_id,
+                                    error: "request id already active".to_string(),
+                                })
+                                .await;
+                            continue;
+                        }
+
+                        info!(request_id, "sending demo image");
+                        let _ = tx.send(DaemonMessage::Started { request_id }).await;
+                        match emit_demo_image(&tx, request_id, 1).await {
+                            Ok(()) => {
+                                let _ = tx.send(DaemonMessage::Done { request_id }).await;
+                            }
+                            Err(_) => {
+                                warn!(
+                                    request_id,
+                                    "client disconnected before image could be delivered"
+                                );
+                            }
+                        }
+                    }
                     ClientMessage::Cancel { request_id } => {
                         if let Some(handle) = requests.lock().await.remove(&request_id) {
                             info!(request_id, "cancelling active request");
@@ -265,6 +294,44 @@ pub async fn handle_client(stream: UnixStream, client: Arc<OpenAiClient>) -> io:
     writer_task.await.map_err(io::Error::other)??;
     debug!("client handler finished");
     Ok(())
+}
+
+const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
+const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
+const REQUEST_IMAGE_WIDTH: u32 = 640;
+const REQUEST_IMAGE_HEIGHT: u32 = 640;
+
+async fn emit_demo_image(
+    tx: &mpsc::Sender<DaemonMessage>,
+    request_id: u32,
+    image_id: u32,
+) -> Result<(), mpsc::error::SendError<DaemonMessage>> {
+    let metadata = ImageMetadata {
+        image_id,
+        mime_type: REQUEST_IMAGE_MIME_TYPE.to_string(),
+        width: REQUEST_IMAGE_WIDTH,
+        height: REQUEST_IMAGE_HEIGHT,
+        byte_len: REQUEST_IMAGE_BYTES.len() as u64,
+        alt: Some("dua".to_string()),
+    };
+    tx.send(DaemonMessage::ImageStart {
+        request_id,
+        metadata,
+    })
+    .await?;
+    for data in REQUEST_IMAGE_BYTES.chunks(MAX_IMAGE_CHUNK_SIZE) {
+        tx.send(DaemonMessage::ImageChunk {
+            request_id,
+            image_id,
+            data: data.to_vec(),
+        })
+        .await?;
+    }
+    tx.send(DaemonMessage::ImageEnd {
+        request_id,
+        image_id,
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -598,6 +665,74 @@ mod tests {
         drop(client);
         server_task.await.expect("join").expect("server ok");
         mock_server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_image_emits_complete_sequence() {
+        let (server, mut client) = UnixStream::pair().expect("pair");
+        let server_task = tokio::spawn(handle_client(
+            server,
+            Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
+        ));
+
+        write_message(&mut client, &ClientMessage::TestImage { request_id: 12 })
+            .await
+            .expect("write request");
+
+        let mut saw_started = false;
+        let mut saw_image_start = false;
+        let mut saw_image_chunk = false;
+        let mut saw_image_end = false;
+        loop {
+            match recv(&mut client).await {
+                DaemonMessage::Started { request_id } => {
+                    assert_eq!(request_id, 12);
+                    saw_started = true;
+                }
+                DaemonMessage::ImageStart {
+                    request_id,
+                    metadata,
+                } => {
+                    assert_eq!(request_id, 12);
+                    assert_eq!(metadata.mime_type, REQUEST_IMAGE_MIME_TYPE);
+                    assert_eq!(metadata.width, REQUEST_IMAGE_WIDTH);
+                    assert_eq!(metadata.height, REQUEST_IMAGE_HEIGHT);
+                    assert_eq!(metadata.byte_len, REQUEST_IMAGE_BYTES.len() as u64);
+                    saw_image_start = true;
+                }
+                DaemonMessage::ImageChunk {
+                    request_id,
+                    image_id,
+                    data,
+                } => {
+                    assert_eq!(request_id, 12);
+                    assert_eq!(image_id, 1);
+                    assert!(!data.is_empty());
+                    saw_image_chunk = true;
+                }
+                DaemonMessage::ImageEnd {
+                    request_id,
+                    image_id,
+                } => {
+                    assert_eq!(request_id, 12);
+                    assert_eq!(image_id, 1);
+                    saw_image_end = true;
+                }
+                DaemonMessage::Done { request_id } => {
+                    assert_eq!(request_id, 12);
+                    break;
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+
+        assert!(saw_started);
+        assert!(saw_image_start);
+        assert!(saw_image_chunk);
+        assert!(saw_image_end);
+
+        drop(client);
+        server_task.await.expect("join").expect("server ok");
     }
 
     #[tokio::test]

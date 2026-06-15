@@ -1,9 +1,11 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
 use std::{collections::HashMap, io};
-use tai_client_core::{ShellCommand, StreamingText, parse_input_line};
+use tai_client_core::{ImageAssembler, ShellCommand, StreamingText, parse_input_line};
 use tai_proto::{
-    ClientMessage, DaemonMessage, OutputStream, read_message, socket_path, write_message,
+    ClientMessage, DaemonMessage, ImageMetadata, OutputStream, read_message, socket_path,
+    write_message,
 };
 use tokio::{
     net::UnixStream,
@@ -13,9 +15,16 @@ use tokio::{
 type StreamingEntry = StreamingText;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct DisplayImage {
+    metadata: ImageMetadata,
+    data_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum HistoryItem {
     Text(String),
     Streaming(StreamingEntry),
+    Image(DisplayImage),
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +41,7 @@ struct AppState {
     next_request_id: u32,
     history: Vec<HistoryItem>,
     in_progress: HashMap<u32, usize>,
+    pending_images: ImageAssembler,
     pending_cancel: String,
 }
 
@@ -44,6 +54,7 @@ impl AppState {
                 "Connected to tai-daemon at {socket_path}"
             ))],
             in_progress: HashMap::new(),
+            pending_images: ImageAssembler::new(),
             pending_cancel: String::new(),
         }
     }
@@ -77,6 +88,12 @@ impl AppState {
 
     fn finalize_stream(&mut self, request_id: u32) {
         self.in_progress.remove(&request_id);
+        self.pending_images.drop_request(request_id);
+    }
+
+    fn push_image(&mut self, image: DisplayImage) {
+        self.history.push(HistoryItem::Image(image));
+        self.trim_history();
     }
 
     fn trim_history(&mut self) {
@@ -92,7 +109,6 @@ impl AppState {
             .retain(|_, index| *index < self.history.len());
     }
 }
-
 
 fn main() {
     dioxus::LaunchBuilder::desktop()
@@ -281,6 +297,28 @@ fn App() -> Element {
                                 }
                             }
                         },
+                        HistoryItem::Image(image) => rsx! {
+                            div { class: "history-item image-item",
+                                div { class: "image-meta",
+                                    {format!(
+                                        "image {} ({} {}x{})",
+                                        image.metadata.image_id,
+                                        image.metadata.mime_type,
+                                        image.metadata.width,
+                                        image.metadata.height
+                                    )}
+                                }
+                                img {
+                                    class: "history-image",
+                                    src: image.data_url.clone(),
+                                    alt: image
+                                        .metadata
+                                        .alt
+                                        .clone()
+                                        .unwrap_or_else(|| String::from("image"))
+                                }
+                            }
+                        },
                     }
                 }
             }
@@ -288,7 +326,7 @@ fn App() -> Element {
             div { class: "composer",
                 textarea {
                     rows: "4",
-                    placeholder: "Enter a prompt, :ping, /models, /models <model>, or :cancel <id>",
+                    placeholder: "Enter a prompt, /image, :ping, /models, /models <model>, or :cancel <id>",
                     value: "{input_value}",
                     oninput: move |event| state.write().input = event.value(),
                     onkeydown: move |event| {
@@ -394,8 +432,12 @@ fn send_client_message(
         return;
     };
 
-    if let ClientMessage::RunInput { input, .. } = &message {
-        state.push_text(format!("> {}", String::from_utf8_lossy(input)));
+    match &message {
+        ClientMessage::RunInput { input, .. } => {
+            state.push_text(format!("> {}", String::from_utf8_lossy(input)));
+        }
+        ClientMessage::TestImage { .. } => state.push_text("> /image"),
+        _ => {}
     }
 
     if let Err(error) = sender.send(message) {
@@ -417,10 +459,30 @@ fn apply_daemon_message(state: &mut AppState, message: DaemonMessage) -> io::Res
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             state.append_stream(request_id, stream, &text);
         }
-        DaemonMessage::ImageStart { .. }
-        | DaemonMessage::ImageChunk { .. }
-        | DaemonMessage::ImageEnd { .. } => {
-            state.push_text("[client] image messages are not supported in tai-dioxus yet");
+        DaemonMessage::ImageStart {
+            request_id,
+            metadata,
+        } => {
+            state.pending_images.start(request_id, metadata)?;
+        }
+        DaemonMessage::ImageChunk {
+            request_id,
+            image_id,
+            data,
+        } => {
+            state
+                .pending_images
+                .push_chunk(request_id, image_id, &data)?;
+        }
+        DaemonMessage::ImageEnd {
+            request_id,
+            image_id,
+        } => {
+            let (metadata, data) = state.pending_images.finish(request_id, image_id)?;
+            state.push_image(DisplayImage {
+                data_url: format!("data:{};base64,{}", metadata.mime_type, BASE64.encode(data)),
+                metadata,
+            });
         }
         DaemonMessage::Done { request_id } => {
             state.finalize_stream(request_id);
@@ -538,6 +600,20 @@ body {
     font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
 }
 
+.image-meta {
+    margin-bottom: 8px;
+    color: #8b949e;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+.history-image {
+    display: block;
+    max-width: min(100%, 640px);
+    height: auto;
+    border-radius: 8px;
+    border: 1px solid #30363d;
+}
+
 .stream-section {
     margin-top: 6px;
 }
@@ -646,6 +722,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_test_image_command() {
+        let mut next = 10;
+        assert_eq!(
+            parse_input_line("/image", &mut next),
+            ShellCommand::Send(ClientMessage::TestImage { request_id: 10 })
+        );
+        assert_eq!(next, 11);
+    }
+
+    #[test]
     fn parses_models_command() {
         let mut next = 10;
         assert_eq!(
@@ -696,6 +782,60 @@ mod tests {
                 assert_eq!(entry.answer, "hello world");
             }
             _ => panic!("expected streaming entry"),
+        }
+    }
+
+    #[test]
+    fn apply_daemon_image_messages_pushes_renderable_image() {
+        let mut state = AppState::new("/tmp/tai.sock".to_string());
+        let metadata = ImageMetadata {
+            image_id: 5,
+            mime_type: "image/png".to_string(),
+            width: 1,
+            height: 1,
+            byte_len: 68,
+            alt: Some("tiny".to_string()),
+        };
+        let png = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xB5, 0x1C, 0x0C, 0x02, 0x00, 0x00, 0x00, 0x0B, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xDA, 0x63, 0xFC, 0xFF, 0x1F, 0x00, 0x03, 0x03, 0x01, 0xFF, 0xA5, 0xC2, 0xB9, 0x81,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        apply_daemon_message(
+            &mut state,
+            DaemonMessage::ImageStart {
+                request_id: 7,
+                metadata: metadata.clone(),
+            },
+        )
+        .expect("start");
+        apply_daemon_message(
+            &mut state,
+            DaemonMessage::ImageChunk {
+                request_id: 7,
+                image_id: 5,
+                data: png,
+            },
+        )
+        .expect("chunk");
+        apply_daemon_message(
+            &mut state,
+            DaemonMessage::ImageEnd {
+                request_id: 7,
+                image_id: 5,
+            },
+        )
+        .expect("end");
+
+        match state.history.last().expect("image history item") {
+            HistoryItem::Image(image) => {
+                assert_eq!(image.metadata, metadata);
+                assert!(image.data_url.starts_with("data:image/png;base64,"));
+            }
+            other => panic!("expected image item, got {other:?}"),
         }
     }
 }

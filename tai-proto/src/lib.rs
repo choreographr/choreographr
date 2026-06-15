@@ -11,6 +11,7 @@ pub const MAX_IMAGE_CHUNK_SIZE: usize = 64 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClientMessage {
     RunInput { request_id: u32, input: Vec<u8> },
+    TestImage { request_id: u32 },
     Cancel { request_id: u32 },
     Ping,
     ListModels,
