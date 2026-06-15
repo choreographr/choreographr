@@ -109,6 +109,13 @@ struct TextEditArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct ReadFileRangeArgs {
+    path: String,
+    start_line: usize,
+    max_lines: usize,
+}
+
+#[derive(Debug, Deserialize)]
 struct DisplayImageArgs {
     mime_type: String,
     path: Option<String>,
@@ -132,6 +139,32 @@ fn available_tools() -> Vec<ChatToolDefinition> {
                     }
                 },
                 "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "read_file_range",
+            "Read a line range from a UTF-8 text file in the local workspace.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative or absolute path to a text file"
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based inclusive start line"
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "description": "Maximum number of lines to return"
+                    }
+                },
+                "required": ["path", "start_line", "max_lines"],
                 "additionalProperties": false
             }),
         ),
@@ -368,6 +401,10 @@ async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecutionOutput {
             result: execute_read_file_tool(&tool_call.arguments_json).await,
             image: None,
         },
+        "read_file_range" => ToolExecutionOutput {
+            result: execute_read_file_range_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
         "list_files" => ToolExecutionOutput {
             result: execute_list_files_tool(&tool_call.arguments_json).await,
             image: None,
@@ -433,6 +470,91 @@ async fn execute_read_file_tool(arguments_json: &str) -> ToolResult {
             content: format!("failed to read {path}: {error}"),
             is_error: true,
         },
+    }
+}
+
+async fn execute_read_file_range_tool(arguments_json: &str) -> ToolResult {
+    const MAX_READ_FILE_RANGE_LINES: usize = 200;
+
+    let args = match serde_json::from_str::<ReadFileRangeArgs>(arguments_json) {
+        Ok(args) if !args.path.trim().is_empty() => args,
+        Ok(_) => {
+            return ToolResult {
+                content: "missing required string argument: path".to_string(),
+                is_error: true,
+            };
+        }
+        Err(error) => {
+            return ToolResult {
+                content: format!("invalid arguments: {error}"),
+                is_error: true,
+            };
+        }
+    };
+
+    if args.start_line == 0 {
+        return ToolResult {
+            content: "start_line must be >= 1".to_string(),
+            is_error: true,
+        };
+    }
+
+    if args.max_lines == 0 {
+        return ToolResult {
+            content: "max_lines must be >= 1".to_string(),
+            is_error: true,
+        };
+    }
+
+    if args.max_lines > MAX_READ_FILE_RANGE_LINES {
+        return ToolResult {
+            content: format!(
+                "max_lines must be <= {MAX_READ_FILE_RANGE_LINES}"
+            ),
+            is_error: true,
+        };
+    }
+
+    let content = match tokio::fs::read_to_string(&args.path).await {
+        Ok(content) => content,
+        Err(error) => {
+            return ToolResult {
+                content: format!("failed to read {}: {}", args.path, error),
+                is_error: true,
+            };
+        }
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+
+    if args.start_line > total_lines {
+        return ToolResult {
+            content: format!(
+                "start_line {} is past end of file; file has {} lines",
+                args.start_line, total_lines
+            ),
+            is_error: true,
+        };
+    }
+
+    let end_line = total_lines.min(args.start_line + args.max_lines - 1);
+    let start_idx = args.start_line - 1;
+    let end_idx = end_line;
+
+    let mut output = format!(
+        "path: {}\nlines: {}-{} of {}\n\n",
+        args.path, args.start_line, end_line, total_lines
+    );
+
+    for (index, line) in lines[start_idx..end_idx].iter().enumerate() {
+        let line_number = args.start_line + index;
+        output.push_str(&format!("{line_number} | {line}\n"));
+    }
+
+    ToolResult {
+        content: truncate_tool_output(&output),
+        is_error: false,
     }
 }
 
@@ -2282,6 +2404,102 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{unique}.txt"))
+    }
+
+    #[tokio::test]
+    async fn read_file_range_tool_reads_numbered_line_chunks() {
+        let path = test_temp_path("tai-read-range-tool");
+        tokio::fs::write(&path, "alpha\nbeta\ngamma\ndelta\n")
+            .await
+            .expect("seed file");
+
+        let result = execute_read_file_range_tool(
+            &serde_json::json!({
+                "path": path,
+                "start_line": 2,
+                "max_lines": 2
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("lines: 2-3 of 4"));
+        assert!(result.content.contains("2 | beta"));
+        assert!(result.content.contains("3 | gamma"));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn read_file_range_tool_clamps_to_eof() {
+        let path = test_temp_path("tai-read-range-eof-tool");
+        tokio::fs::write(&path, "alpha\nbeta\ngamma\n")
+            .await
+            .expect("seed file");
+
+        let result = execute_read_file_range_tool(
+            &serde_json::json!({
+                "path": path,
+                "start_line": 2,
+                "max_lines": 10
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("lines: 2-3 of 3"));
+        assert!(result.content.contains("2 | beta"));
+        assert!(result.content.contains("3 | gamma"));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn read_file_range_tool_rejects_start_line_past_eof() {
+        let path = test_temp_path("tai-read-range-past-eof-tool");
+        tokio::fs::write(&path, "alpha\nbeta\n")
+            .await
+            .expect("seed file");
+
+        let result = execute_read_file_range_tool(
+            &serde_json::json!({
+                "path": path,
+                "start_line": 5,
+                "max_lines": 1
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(result.is_error, "{}", result.content);
+        assert!(result.content.contains("past end of file"));
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn read_file_range_tool_rejects_excessive_max_lines() {
+        let path = test_temp_path("tai-read-range-max-lines-tool");
+        tokio::fs::write(&path, "alpha\n")
+            .await
+            .expect("seed file");
+
+        let result = execute_read_file_range_tool(
+            &serde_json::json!({
+                "path": path,
+                "start_line": 1,
+                "max_lines": 201
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(result.is_error, "{}", result.content);
+        assert!(result.content.contains("max_lines must be <= 200"));
+
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]
