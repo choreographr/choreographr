@@ -1,3 +1,4 @@
+mod git_tools;
 pub mod openai;
 
 use crate::openai::{
@@ -227,6 +228,67 @@ fn available_tools() -> Vec<ChatToolDefinition> {
                 "additionalProperties": false
             }),
         ),
+        ChatToolDefinition::function(
+            "git_status",
+            "Summarize the current Git repository status, including branch, staged, unstaged, and untracked changes.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Relative or absolute path inside a Git repository",
+                        "default": "."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "git_diff",
+            "Summarize Git changes in the working tree or index. Set cached=true to show staged changes.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Relative or absolute path inside a Git repository",
+                        "default": "."
+                    },
+                    "cached": {
+                        "type": "boolean",
+                        "description": "When true, summarize staged changes instead of working tree changes",
+                        "default": false
+                    },
+                    "pathspec": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional Git-style pathspec filters"
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "git_log",
+            "Show recent Git commits for the current repository.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Relative or absolute path inside a Git repository",
+                        "default": "."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 10
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
     ]
 }
 
@@ -249,6 +311,18 @@ async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecutionOutput {
             image: None,
         },
         "display_image" => execute_display_image_tool(&tool_call.arguments_json).await,
+        "git_status" => ToolExecutionOutput {
+            result: git_tools::execute_git_status_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "git_diff" => ToolExecutionOutput {
+            result: git_tools::execute_git_diff_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "git_log" => ToolExecutionOutput {
+            result: git_tools::execute_git_log_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
         _ => ToolExecutionOutput {
             result: ToolResult {
                 content: format!("unknown tool: {}", tool_call.name),
