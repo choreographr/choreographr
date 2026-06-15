@@ -1,13 +1,14 @@
 use crate::{ToolResult, truncate_tool_output};
 use gix::{
     ObjectId,
-    bstr::{BString, ByteSlice},
+    bstr::{BStr, BString, ByteSlice},
     prelude::ObjectIdExt,
     progress::Discard,
     status::{Item as StatusItem, UntrackedFiles},
+    worktree::IndexPersistedOrInMemory,
 };
 use serde::Deserialize;
-use std::{fmt::Write as _, io, path::Path};
+use std::{collections::BTreeSet, fmt::Write as _, io, path::Path};
 
 #[derive(Debug, Deserialize)]
 struct GitRepoArgs {
@@ -27,22 +28,26 @@ struct GitLogArgs {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GitAddArgs {
+    repo_path: Option<String>,
+    pathspec: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitCommitArgs {
+    repo_path: Option<String>,
+    message: String,
+    allow_empty: Option<bool>,
+}
+
 pub(crate) async fn execute_git_status_tool(arguments_json: &str) -> ToolResult {
     let args = match serde_json::from_str::<GitRepoArgs>(arguments_json) {
         Ok(args) => args,
         Err(error) => return invalid_arguments(error),
     };
 
-    match git_status_impl(args.repo_path.as_deref()) {
-        Ok(content) => ToolResult {
-            content: truncate_tool_output(&content),
-            is_error: false,
-        },
-        Err(error) => ToolResult {
-            content: error.to_string(),
-            is_error: true,
-        },
-    }
+    map_io_result(git_status_impl(args.repo_path.as_deref()))
 }
 
 pub(crate) async fn execute_git_diff_tool(arguments_json: &str) -> ToolResult {
@@ -51,20 +56,11 @@ pub(crate) async fn execute_git_diff_tool(arguments_json: &str) -> ToolResult {
         Err(error) => return invalid_arguments(error),
     };
 
-    match git_diff_impl(
+    map_io_result(git_diff_impl(
         args.repo_path.as_deref(),
         args.cached.unwrap_or(false),
         args.pathspec.unwrap_or_default(),
-    ) {
-        Ok(content) => ToolResult {
-            content: truncate_tool_output(&content),
-            is_error: false,
-        },
-        Err(error) => ToolResult {
-            content: error.to_string(),
-            is_error: true,
-        },
-    }
+    ))
 }
 
 pub(crate) async fn execute_git_log_tool(arguments_json: &str) -> ToolResult {
@@ -73,10 +69,53 @@ pub(crate) async fn execute_git_log_tool(arguments_json: &str) -> ToolResult {
         Err(error) => return invalid_arguments(error),
     };
 
-    match git_log_impl(
+    map_io_result(git_log_impl(
         args.repo_path.as_deref(),
         args.limit.unwrap_or(10).clamp(1, 100),
-    ) {
+    ))
+}
+
+pub(crate) async fn execute_git_add_tool(arguments_json: &str) -> ToolResult {
+    let args = match serde_json::from_str::<GitAddArgs>(arguments_json) {
+        Ok(args) => args,
+        Err(error) => return invalid_arguments(error),
+    };
+
+    let pathspec = match normalize_pathspecs(args.pathspec) {
+        Ok(pathspec) => pathspec,
+        Err(error) => {
+            return ToolResult {
+                content: error.to_string(),
+                is_error: true,
+            };
+        }
+    };
+
+    map_io_result(git_add_impl(args.repo_path.as_deref(), pathspec))
+}
+
+pub(crate) async fn execute_git_commit_tool(arguments_json: &str) -> ToolResult {
+    let args = match serde_json::from_str::<GitCommitArgs>(arguments_json) {
+        Ok(args) => args,
+        Err(error) => return invalid_arguments(error),
+    };
+
+    map_io_result(git_commit_impl(
+        args.repo_path.as_deref(),
+        &args.message,
+        args.allow_empty.unwrap_or(false),
+    ))
+}
+
+fn invalid_arguments(error: serde_json::Error) -> ToolResult {
+    ToolResult {
+        content: format!("invalid arguments: {error}"),
+        is_error: true,
+    }
+}
+
+fn map_io_result(result: io::Result<String>) -> ToolResult {
+    match result {
         Ok(content) => ToolResult {
             content: truncate_tool_output(&content),
             is_error: false,
@@ -88,10 +127,19 @@ pub(crate) async fn execute_git_log_tool(arguments_json: &str) -> ToolResult {
     }
 }
 
-fn invalid_arguments(error: serde_json::Error) -> ToolResult {
-    ToolResult {
-        content: format!("invalid arguments: {error}"),
-        is_error: true,
+fn normalize_pathspecs(pathspec: Vec<String>) -> io::Result<Vec<String>> {
+    let normalized = pathspec
+        .into_iter()
+        .map(|spec| spec.trim().to_string())
+        .filter(|spec| !spec.is_empty())
+        .collect::<Vec<_>>();
+    if normalized.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pathspec must contain at least one non-empty entry",
+        ))
+    } else {
+        Ok(normalized)
     }
 }
 
@@ -218,6 +266,65 @@ fn git_log_impl(repo_path: Option<&str>, limit: usize) -> io::Result<String> {
     Ok(out.trim_end().to_string())
 }
 
+fn git_add_impl(repo_path: Option<&str>, pathspec: Vec<String>) -> io::Result<String> {
+    let repo = open_repo(repo_path)?;
+    let effective_pathspec = prefix_pathspecs(&repo, repo_path, &pathspec)?;
+    let mut index = load_mutable_index(&repo)?;
+    let paths = collect_paths_to_stage(&repo, &index, &effective_pathspec)?;
+    if paths.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("pathspec did not match any tracked or untracked paths: {}", pathspec.join(", ")),
+        ));
+    }
+
+    let (mut pipeline, _) = repo.filter_pipeline(None).map_err(io::Error::other)?;
+    let mut changed = false;
+    for path in &paths {
+        changed |= stage_path(&repo, &mut pipeline, &mut index, path.as_bstr())?;
+    }
+
+    finalize_index(&mut index)?;
+
+    let mut out = String::new();
+    writeln!(&mut out, "repository: {}", repo_work_dir_display(&repo)).ok();
+    writeln!(&mut out, "head: {}", describe_head(&repo)?).ok();
+    writeln!(&mut out, "staged_paths: {}", paths.len()).ok();
+    writeln!(&mut out, "index_changed: {}", if changed { "yes" } else { "no" }).ok();
+    let diff = git_diff_impl(repo_path, true, effective_pathspec)?;
+    writeln!(&mut out).ok();
+    writeln!(&mut out, "{diff}").ok();
+    Ok(out.trim_end().to_string())
+}
+
+fn git_commit_impl(repo_path: Option<&str>, message: &str, allow_empty: bool) -> io::Result<String> {
+    let repo = open_repo(repo_path)?;
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "commit message must not be empty",
+        ));
+    }
+
+    let index = load_mutable_index(&repo)?;
+    ensure_index_has_no_conflicts(&index)?;
+
+    if !allow_empty && collect_cached_diff_lines(&repo, &[] as &[String])?.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no staged changes to commit",
+        ));
+    }
+    let tree_id = write_tree_from_index(&repo, &index)?;
+    let parents = current_head_parents(&repo)?;
+
+    repo.commit("HEAD", message, tree_id, parents)
+        .map_err(io::Error::other)?;
+
+    git_log_impl(repo_path, 1)
+}
+
 fn open_repo(repo_path: Option<&str>) -> io::Result<gix::Repository> {
     let path = repo_path.unwrap_or(".").trim();
     let path = if path.is_empty() { "." } else { path };
@@ -258,10 +365,7 @@ fn collect_worktree_diff_lines(
     repo: &gix::Repository,
     pathspec: &[String],
 ) -> io::Result<Vec<String>> {
-    let patterns = pathspec
-        .iter()
-        .map(|p| BString::from(p.as_str()))
-        .collect::<Vec<_>>();
+    let patterns = pathspec_patterns(pathspec);
     let iter = repo
         .status(Discard)
         .map_err(io::Error::other)?
@@ -299,6 +403,237 @@ fn collect_cached_diff_lines(
         }
     }
     Ok(lines)
+}
+
+fn load_mutable_index(repo: &gix::Repository) -> io::Result<gix::index::File> {
+    match repo
+        .index_or_load_from_head_or_empty()
+        .map_err(io::Error::other)?
+    {
+        IndexPersistedOrInMemory::Persisted(index) => Ok((**index).clone()),
+        IndexPersistedOrInMemory::InMemory(index) => Ok(index),
+    }
+}
+
+fn pathspec_patterns(pathspec: &[String]) -> Vec<BString> {
+    pathspec
+        .iter()
+        .map(|spec| BString::from(spec.as_str()))
+        .collect()
+}
+
+fn collect_paths_to_stage(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    pathspec: &[String],
+) -> io::Result<Vec<BString>> {
+    let mut paths = BTreeSet::<BString>::new();
+
+    let patterns = pathspec_patterns(pathspec);
+    let mut matcher = repo
+        .pathspec(
+            true,
+            patterns.iter().map(|pattern| pattern.as_bstr()),
+            true,
+            index,
+            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+        )
+        .map_err(io::Error::other)?;
+
+    if let Some(entries) = matcher.index_entries_with_paths(index) {
+        for (path, _) in entries {
+            paths.insert(path.to_owned());
+        }
+    }
+
+    let iter = repo
+        .status(Discard)
+        .map_err(io::Error::other)?
+        .untracked_files(UntrackedFiles::Files)
+        .into_iter(patterns)
+        .map_err(io::Error::other)?;
+
+    for item in iter {
+        let item = item.map_err(io::Error::other)?;
+        paths.insert(item.location().to_owned());
+    }
+
+    Ok(paths.into_iter().collect())
+}
+
+fn stage_path(
+    repo: &gix::Repository,
+    pipeline: &mut gix::filter::Pipeline<'_>,
+    index: &mut gix::index::File,
+    path: &BStr,
+) -> io::Result<bool> {
+    let previous = current_entry_snapshot(index, path);
+    remove_entries_for_path(index, path);
+
+    let maybe_object = pipeline
+        .worktree_file_to_object(path, index)
+        .map_err(io::Error::other)?;
+
+    match maybe_object {
+        Some((id, kind, _)) => {
+            let metadata = worktree_metadata(repo, path)?;
+            let stat = gix::index::entry::Stat::from_fs(&metadata).map_err(io::Error::other)?;
+            index.dangerously_push_entry(
+                stat,
+                id,
+                gix::index::entry::Flags::from(gix::index::entry::Stage::Unconflicted),
+                kind.into(),
+                path,
+            );
+            let current = current_entry_snapshot(index, path)
+                .expect("entry was just inserted for staged path");
+            Ok(previous.as_ref() != Some(&current))
+        }
+        None => Ok(previous.is_some()),
+    }
+}
+
+fn current_entry_snapshot(index: &gix::index::File, path: &BStr) -> Option<IndexEntrySnapshot> {
+    index
+        .entry_by_path(path)
+        .map(|entry| IndexEntrySnapshot::from_entry(path, entry))
+}
+
+fn remove_entries_for_path(index: &mut gix::index::File, path: &BStr) {
+    index.remove_entries(|_, entry_path, _| entry_path == path);
+}
+
+fn prefix_pathspecs(
+    repo: &gix::Repository,
+    repo_path: Option<&str>,
+    pathspec: &[String],
+) -> io::Result<Vec<String>> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(pathspec.to_vec());
+    };
+    let Some(repo_path) = repo_path else {
+        return Ok(pathspec.to_vec());
+    };
+
+    let trimmed = repo_path.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return Ok(pathspec.to_vec());
+    }
+
+    let candidate = Path::new(trimmed);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(candidate)
+    };
+
+    let Ok(prefix) = absolute.strip_prefix(workdir) else {
+        return Ok(pathspec.to_vec());
+    };
+    if prefix.as_os_str().is_empty() {
+        return Ok(pathspec.to_vec());
+    }
+
+    let prefix = prefix
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    Ok(pathspec
+        .iter()
+        .map(|spec| {
+            if spec == "." || spec == "./" {
+                prefix.clone()
+            } else {
+                format!("{prefix}/{}", spec.trim_start_matches("./"))
+            }
+        })
+        .collect())
+}
+
+fn worktree_metadata(repo: &gix::Repository, path: &BStr) -> io::Result<gix::index::fs::Metadata> {
+    let workdir = repo.workdir().ok_or_else(|| io::Error::other("repository has no worktree"))?;
+    gix::index::fs::Metadata::from_path_no_follow(&workdir.join(gix::path::from_bstr(path)))
+        .map_err(io::Error::other)
+}
+
+fn finalize_index(index: &mut gix::index::File) -> io::Result<()> {
+    index.sort_entries();
+    let _ = index.remove_tree();
+    index.write(Default::default()).map_err(io::Error::other)
+}
+
+fn ensure_index_has_no_conflicts(index: &gix::index::File) -> io::Result<()> {
+    if let Some(path) = index
+        .entries()
+        .iter()
+        .find(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+        .map(|entry| path_from_bytes(entry.path(index).as_ref()))
+    {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("cannot commit with unresolved index conflicts at {path}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn write_tree_from_index(repo: &gix::Repository, index: &gix::index::File) -> io::Result<ObjectId> {
+    let mut editor = repo.empty_tree().edit().map_err(io::Error::other)?;
+    for entry in index.entries() {
+        if entry.stage() != gix::index::entry::Stage::Unconflicted {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot write tree with conflicted index entry at {}",
+                    path_from_bytes(entry.path(index).as_ref())
+                ),
+            ));
+        }
+        let kind = entry.mode.to_tree_entry_mode().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported index entry mode {} at {}",
+                    entry.mode.bits(),
+                    path_from_bytes(entry.path(index).as_ref())
+                ),
+            )
+        })?;
+        editor
+            .upsert(entry.path(index).to_owned(), kind.into(), entry.id)
+            .map_err(io::Error::other)?;
+    }
+    editor.write().map(|id| id.detach()).map_err(io::Error::other)
+}
+
+fn current_head_parents(repo: &gix::Repository) -> io::Result<Vec<ObjectId>> {
+    match repo.head_id() {
+        Ok(head) => Ok(vec![head.detach()]),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndexEntrySnapshot {
+    id: ObjectId,
+    mode: gix::index::entry::Mode,
+    flags: gix::index::entry::Flags,
+    stat: gix::index::entry::Stat,
+    path: BString,
+}
+
+impl IndexEntrySnapshot {
+    fn from_entry(path: &BStr, entry: &gix::index::Entry) -> Self {
+        Self {
+            id: entry.id,
+            mode: entry.mode,
+            flags: entry.flags,
+            stat: entry.stat,
+            path: path.to_owned(),
+        }
+    }
 }
 
 fn format_index_worktree_change(change: &gix::status::index_worktree::Item) -> String {
@@ -472,6 +807,21 @@ mod tests {
         assert!(status.success(), "git {:?} failed with {status}", args);
     }
 
+    fn git_output(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
     fn init_repo() -> std::path::PathBuf {
         let dir = unique_repo_dir("repo");
         std::fs::create_dir_all(&dir).expect("create repo dir");
@@ -563,6 +913,193 @@ mod tests {
                 .content
                 .contains("Tai Test <tai@example.com> first commit")
         );
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn git_add_stages_modified_untracked_and_deleted_paths() {
+        let repo = init_repo();
+        std::fs::write(repo.join("tracked.txt"), "one\n").expect("write tracked");
+        std::fs::write(repo.join("delete-me.txt"), "gone\n").expect("write delete me");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial commit"]);
+
+        std::fs::write(repo.join("tracked.txt"), "two\n").expect("modify tracked");
+        std::fs::write(repo.join("new.txt"), "brand new\n").expect("write new");
+        std::fs::remove_file(repo.join("delete-me.txt")).expect("remove file");
+
+        let result = execute_git_add_tool(
+            &serde_json::json!({
+                "repo_path": repo,
+                "pathspec": ["tracked.txt", "new.txt", "delete-me.txt"]
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        let cached = git_output(&repo, &["diff", "--cached", "--name-status"]);
+        assert!(cached.contains("M\ttracked.txt"), "{cached}");
+        assert!(cached.contains("A\tnew.txt"), "{cached}");
+        assert!(cached.contains("D\tdelete-me.txt"), "{cached}");
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn git_add_accepts_clean_tracked_paths_as_noop() {
+        let repo = init_repo();
+        std::fs::write(repo.join("tracked.txt"), "one\n").expect("write tracked");
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-m", "initial commit"]);
+
+        let result = execute_git_add_tool(
+            &serde_json::json!({ "repo_path": repo, "pathspec": ["tracked.txt"] }).to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("index_changed: no"));
+        assert!(result.content.contains("no changes"));
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn git_add_works_from_subdirectory_repo_path() {
+        let repo = init_repo();
+        std::fs::create_dir_all(repo.join("src")).expect("create src");
+        std::fs::write(repo.join("src/lib.rs"), "pub fn one() {}\n").expect("write file");
+
+        let subdir = repo.join("src");
+        let result = execute_git_add_tool(
+            &serde_json::json!({ "repo_path": subdir, "pathspec": ["lib.rs"] }).to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        let cached = git_output(&repo, &["diff", "--cached", "--name-status"]);
+        assert!(cached.contains("A\tsrc/lib.rs"), "{cached}");
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn git_add_rejects_empty_and_unmatched_pathspecs() {
+        let repo = init_repo();
+
+        let empty = execute_git_add_tool(
+            &serde_json::json!({ "repo_path": repo, "pathspec": ["", "  "] }).to_string(),
+        )
+        .await;
+        assert!(empty.is_error);
+        assert!(empty.content.contains("pathspec must contain at least one non-empty entry"));
+
+        let unmatched = execute_git_add_tool(
+            &serde_json::json!({ "repo_path": repo, "pathspec": ["missing.txt"] }).to_string(),
+        )
+        .await;
+        assert!(unmatched.is_error);
+        assert!(unmatched.content.contains("pathspec did not match any tracked or untracked paths"));
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn git_commit_creates_commit_from_staged_index() {
+        let repo = init_repo();
+        std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
+        execute_git_add_tool(
+            &serde_json::json!({ "repo_path": repo, "pathspec": ["file.txt"] }).to_string(),
+        )
+        .await;
+
+        let result = execute_git_commit_tool(
+            &serde_json::json!({ "repo_path": repo, "message": "Add file" }).to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("head: main"));
+        assert!(result.content.contains("Tai Test <tai@example.com> Add file"));
+        let log = git_output(&repo, &["log", "--format=%s", "-1"]);
+        assert_eq!(log.trim(), "Add file");
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn git_commit_supports_multiline_messages_and_allow_empty() {
+        let repo = init_repo();
+
+        let empty_commit = execute_git_commit_tool(
+            &serde_json::json!({
+                "repo_path": repo,
+                "message": "Initial empty\n\nBody",
+                "allow_empty": true
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(!empty_commit.is_error, "{}", empty_commit.content);
+        assert!(empty_commit.content.contains("Initial empty"));
+
+        let body = git_output(&repo, &["log", "--format=%B", "-1"]);
+        assert!(body.starts_with("Initial empty\n\nBody"), "{body}");
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn git_commit_rejects_blank_message_and_missing_staged_changes() {
+        let repo = init_repo();
+
+        let blank = execute_git_commit_tool(
+            &serde_json::json!({ "repo_path": repo, "message": "   " }).to_string(),
+        )
+        .await;
+        assert!(blank.is_error);
+        assert!(blank.content.contains("commit message must not be empty"));
+
+        let no_changes = execute_git_commit_tool(
+            &serde_json::json!({ "repo_path": repo, "message": "Nothing" }).to_string(),
+        )
+        .await;
+        assert!(no_changes.is_error);
+        assert!(no_changes.content.contains("no staged changes to commit"));
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn git_commit_rejects_conflicted_index() {
+        let repo = init_repo();
+        std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
+        git(&repo, &["add", "file.txt"]);
+        git(&repo, &["commit", "-m", "base"]);
+
+        git(&repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("file.txt"), "feature\n").expect("write feature");
+        git(&repo, &["commit", "-am", "feature change"]);
+
+        git(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("file.txt"), "main\n").expect("write main");
+        git(&repo, &["commit", "-am", "main change"]);
+
+        let output = Command::new("git")
+            .args(["merge", "feature"])
+            .current_dir(&repo)
+            .output()
+            .expect("run git merge");
+        assert!(!output.status.success(), "merge unexpectedly succeeded");
+
+        let result = execute_git_commit_tool(
+            &serde_json::json!({ "repo_path": repo, "message": "should fail" }).to_string(),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("unresolved index conflicts"));
 
         let _ = std::fs::remove_dir_all(repo);
     }

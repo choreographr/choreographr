@@ -8,7 +8,7 @@ base64 = "0.22"
 bytes = "1"
 dirs = "6"
 futures-util.workspace = true
-gix = "0.84"
+gix = { version = "0.84", features = ["tree-editor"] }
 image = "0.25"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 resvg = "0.45"

@@ -392,6 +392,53 @@ fn available_tools() -> Vec<ChatToolDefinition> {
                 "additionalProperties": false
             }),
         ),
+        ChatToolDefinition::function(
+            "git_add",
+            "Stage one or more Git pathspecs in the current repository index.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Relative or absolute path inside a Git repository",
+                        "default": "."
+                    },
+                    "pathspec": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "One or more Git-style pathspecs to stage"
+                    }
+                },
+                "required": ["pathspec"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "git_commit",
+            "Create a Git commit from the currently staged index.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Relative or absolute path inside a Git repository",
+                        "default": "."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Commit message"
+                    },
+                    "allow_empty": {
+                        "type": "boolean",
+                        "description": "Whether to allow a commit when no staged changes are present",
+                        "default": false
+                    }
+                },
+                "required": ["message"],
+                "additionalProperties": false
+            }),
+        ),
     ]
 }
 
@@ -432,6 +479,14 @@ async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecutionOutput {
         },
         "git_log" => ToolExecutionOutput {
             result: git_tools::execute_git_log_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "git_add" => ToolExecutionOutput {
+            result: git_tools::execute_git_add_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "git_commit" => ToolExecutionOutput {
+            result: git_tools::execute_git_commit_tool(&tool_call.arguments_json).await,
             image: None,
         },
         _ => ToolExecutionOutput {
