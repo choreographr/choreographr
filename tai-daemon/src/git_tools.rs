@@ -73,7 +73,10 @@ pub(crate) async fn execute_git_log_tool(arguments_json: &str) -> ToolResult {
         Err(error) => return invalid_arguments(error),
     };
 
-    match git_log_impl(args.repo_path.as_deref(), args.limit.unwrap_or(10).clamp(1, 100)) {
+    match git_log_impl(
+        args.repo_path.as_deref(),
+        args.limit.unwrap_or(10).clamp(1, 100),
+    ) {
         Ok(content) => ToolResult {
             content: truncate_tool_output(&content),
             is_error: false,
@@ -113,7 +116,10 @@ fn git_status_impl(repo_path: Option<&str>) -> io::Result<String> {
                 gix::status::index_worktree::Item::DirectoryContents { entry, .. }
                     if matches!(entry.status, gix::dir::entry::Status::Untracked) =>
                 {
-                    untracked.push(format!("?? {}", path_from_bytes(change.rela_path().as_ref())));
+                    untracked.push(format!(
+                        "?? {}",
+                        path_from_bytes(change.rela_path().as_ref())
+                    ));
                 }
                 _ => unstaged.push(format_index_worktree_change(&change)),
             },
@@ -133,7 +139,11 @@ fn git_status_impl(repo_path: Option<&str>) -> io::Result<String> {
     Ok(out.trim_end().to_string())
 }
 
-fn git_diff_impl(repo_path: Option<&str>, cached: bool, pathspec: Vec<String>) -> io::Result<String> {
+fn git_diff_impl(
+    repo_path: Option<&str>,
+    cached: bool,
+    pathspec: Vec<String>,
+) -> io::Result<String> {
     let repo = open_repo(repo_path)?;
     let mut lines = if cached {
         collect_cached_diff_lines(&repo, &pathspec)?
@@ -144,7 +154,12 @@ fn git_diff_impl(repo_path: Option<&str>, cached: bool, pathspec: Vec<String>) -
 
     let mut out = String::new();
     writeln!(&mut out, "repository: {}", repo_work_dir_display(&repo)).ok();
-    writeln!(&mut out, "mode: {}", if cached { "staged" } else { "working tree" }).ok();
+    writeln!(
+        &mut out,
+        "mode: {}",
+        if cached { "staged" } else { "working tree" }
+    )
+    .ok();
     if !pathspec.is_empty() {
         writeln!(&mut out, "pathspec: {}", pathspec.join(", ")).ok();
     }
@@ -190,10 +205,7 @@ fn git_log_impl(repo_path: Option<&str>, limit: usize) -> io::Result<String> {
         writeln!(
             &mut out,
             "{} {} <{}> {}",
-            short_id,
-            author.name,
-            author.email,
-            title
+            short_id, author.name, author.email, title
         )
         .ok();
         count += 1;
@@ -228,7 +240,11 @@ fn describe_head(repo: &gix::Repository) -> io::Result<String> {
 }
 
 fn shorten_id(repo: &gix::Repository, id: ObjectId) -> io::Result<String> {
-    Ok(id.attach(repo).shorten().map_err(io::Error::other)?.to_string())
+    Ok(id
+        .attach(repo)
+        .shorten()
+        .map_err(io::Error::other)?
+        .to_string())
 }
 
 fn repo_work_dir_display(repo: &gix::Repository) -> String {
@@ -238,8 +254,14 @@ fn repo_work_dir_display(repo: &gix::Repository) -> String {
         .to_string()
 }
 
-fn collect_worktree_diff_lines(repo: &gix::Repository, pathspec: &[String]) -> io::Result<Vec<String>> {
-    let patterns = pathspec.iter().map(|p| BString::from(p.as_str())).collect::<Vec<_>>();
+fn collect_worktree_diff_lines(
+    repo: &gix::Repository,
+    pathspec: &[String],
+) -> io::Result<Vec<String>> {
+    let patterns = pathspec
+        .iter()
+        .map(|p| BString::from(p.as_str()))
+        .collect::<Vec<_>>();
     let iter = repo
         .status(Discard)
         .map_err(io::Error::other)?
@@ -255,7 +277,10 @@ fn collect_worktree_diff_lines(repo: &gix::Repository, pathspec: &[String]) -> i
     Ok(lines)
 }
 
-fn collect_cached_diff_lines(repo: &gix::Repository, pathspec: &[String]) -> io::Result<Vec<String>> {
+fn collect_cached_diff_lines(
+    repo: &gix::Repository,
+    pathspec: &[String],
+) -> io::Result<Vec<String>> {
     let iter = repo
         .status(Discard)
         .map_err(io::Error::other)?
@@ -280,7 +305,11 @@ fn format_index_worktree_change(change: &gix::status::index_worktree::Item) -> S
     use gix::status::index_worktree::Item;
     match change {
         Item::Modification { .. } => match change.summary() {
-            Some(summary) => format!("{} {}", worktree_summary_code(summary), path_from_bytes(change.rela_path().as_ref())),
+            Some(summary) => format!(
+                "{} {}",
+                worktree_summary_code(summary),
+                path_from_bytes(change.rela_path().as_ref())
+            ),
             None => format!("M {}", path_from_bytes(change.rela_path().as_ref())),
         },
         Item::DirectoryContents { entry, .. } => {
@@ -314,7 +343,11 @@ fn format_tree_index_change(change: &gix::diff::index::Change) -> String {
             entry_mode,
             ..
         } => {
-            let prefix = if previous_entry_mode != entry_mode { "T" } else { "M" };
+            let prefix = if previous_entry_mode != entry_mode {
+                "T"
+            } else {
+                "M"
+            };
             format!("{prefix} {}", path_from_bytes(location.as_ref()))
         }
         ChangeRef::Rewrite {
@@ -417,7 +450,10 @@ fn write_section(out: &mut String, title: &str, lines: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{process::Command, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn unique_repo_dir(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -457,10 +493,8 @@ mod tests {
         std::fs::write(repo.join("untracked.txt"), "new\n").expect("write untracked");
         git(&repo, &["add", "staged.txt"]);
 
-        let result = execute_git_status_tool(
-            &serde_json::json!({ "repo_path": repo }).to_string(),
-        )
-        .await;
+        let result =
+            execute_git_status_tool(&serde_json::json!({ "repo_path": repo }).to_string()).await;
 
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("head: main"));
@@ -513,15 +547,22 @@ mod tests {
         std::fs::write(repo.join("file.txt"), "two\n").expect("rewrite file");
         git(&repo, &["commit", "-am", "second commit"]);
 
-        let result = execute_git_log_tool(
-            &serde_json::json!({ "repo_path": repo, "limit": 2 }).to_string(),
-        )
-        .await;
+        let result =
+            execute_git_log_tool(&serde_json::json!({ "repo_path": repo, "limit": 2 }).to_string())
+                .await;
 
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("head: main"));
-        assert!(result.content.contains("Tai Test <tai@example.com> second commit"));
-        assert!(result.content.contains("Tai Test <tai@example.com> first commit"));
+        assert!(
+            result
+                .content
+                .contains("Tai Test <tai@example.com> second commit")
+        );
+        assert!(
+            result
+                .content
+                .contains("Tai Test <tai@example.com> first commit")
+        );
 
         let _ = std::fs::remove_dir_all(repo);
     }

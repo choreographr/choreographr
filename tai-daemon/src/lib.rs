@@ -13,7 +13,14 @@ use reqwest::{
 };
 use resvg::usvg;
 use serde::Deserialize;
-use std::{collections::HashMap, io, path::Path, sync::Arc, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tai_proto::{
     AssistantToolCallRecord, ClientMessage, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE,
     OutputStream, SessionMessage, SessionSummary, read_message, write_message,
@@ -84,6 +91,21 @@ struct WriteFileArgs {
     content: String,
     overwrite: Option<bool>,
     create_parents: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EditFileArgs {
+    path: String,
+    edits: Vec<TextEditArgs>,
+    expected_sha256: Option<String>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TextEditArgs {
+    old_text: String,
+    new_text: String,
+    replace_all: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +212,54 @@ fn available_tools() -> Vec<ChatToolDefinition> {
                     }
                 },
                 "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "edit_file",
+            "Edit a UTF-8 text file by applying one or more exact text replacements. Each edit must match at least once; non-replace_all edits must match exactly once.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative or absolute path to the file to edit"
+                    },
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {
+                                    "type": "string",
+                                    "description": "Exact text to replace"
+                                },
+                                "new_text": {
+                                    "type": "string",
+                                    "description": "Replacement text"
+                                },
+                                "replace_all": {
+                                    "type": "boolean",
+                                    "description": "When true, replace all exact matches instead of requiring exactly one match",
+                                    "default": false
+                                }
+                            },
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "expected_sha256": {
+                        "type": "string",
+                        "description": "Optional lowercase hex SHA-256 of the file before editing"
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "When true, validate and preview the edit without writing the file",
+                        "default": false
+                    }
+                },
+                "required": ["path", "edits"],
                 "additionalProperties": false
             }),
         ),
@@ -308,6 +378,10 @@ async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecutionOutput {
         },
         "write_file" => ToolExecutionOutput {
             result: execute_write_file_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "edit_file" => ToolExecutionOutput {
+            result: execute_edit_file_tool(&tool_call.arguments_json).await,
             image: None,
         },
         "display_image" => execute_display_image_tool(&tool_call.arguments_json).await,
@@ -636,60 +710,266 @@ async fn execute_write_file_tool(arguments_json: &str) -> ToolResult {
         }
     };
 
-    let path = args.path.trim();
-    if path.is_empty() {
+    let path = match validate_nonempty_path(&args.path) {
+        Ok(path) => path,
+        Err(result) => return result,
+    };
+
+    let path_ref = Path::new(&path);
+    if let Err(error) =
+        ensure_parent_directories(path_ref, args.create_parents.unwrap_or(true)).await
+    {
         return ToolResult {
-            content: "missing required string argument: path".to_string(),
+            content: format!("failed to create parent directories for {path}: {error}"),
             is_error: true,
         };
     }
 
-    let path_ref = Path::new(path);
-    if args.create_parents.unwrap_or(true) {
-        if let Some(parent) = path_ref.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Err(error) = tokio::fs::create_dir_all(parent).await {
-                    return ToolResult {
-                        content: format!("failed to create parent directories for {path}: {error}"),
-                        is_error: true,
-                    };
-                }
-            }
-        }
-    }
-
-    let overwrite = args.overwrite.unwrap_or(true);
-    let mut options = OpenOptions::new();
-    options.write(true);
-    if overwrite {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
-    }
-
-    match options.open(path_ref).await {
-        Ok(mut file) => match file.write_all(args.content.as_bytes()).await {
-            Ok(()) => ToolResult {
-                content: format!("wrote file: {path}"),
-                is_error: false,
-            },
-            Err(error) => ToolResult {
-                content: format!("failed to write {path}: {error}"),
-                is_error: true,
-            },
+    match write_text_file(path_ref, &args.content, args.overwrite.unwrap_or(true)).await {
+        Ok(()) => ToolResult {
+            content: format!("wrote file: {path}"),
+            is_error: false,
         },
+        Err(error) => ToolResult {
+            content: format_write_error(&path, error, args.overwrite.unwrap_or(true)),
+            is_error: true,
+        },
+    }
+}
+
+async fn execute_edit_file_tool(arguments_json: &str) -> ToolResult {
+    let args = match serde_json::from_str::<EditFileArgs>(arguments_json) {
+        Ok(args) => args,
         Err(error) => {
-            let content = if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
-                format!("refusing to overwrite existing file: {path}")
-            } else {
-                format!("failed to write {path}: {error}")
-            };
-            ToolResult {
-                content,
+            return ToolResult {
+                content: format!("invalid arguments: {error}"),
                 is_error: true,
-            }
+            };
+        }
+    };
+
+    let path = match validate_nonempty_path(&args.path) {
+        Ok(path) => path,
+        Err(result) => return result,
+    };
+
+    if args.edits.is_empty() {
+        return ToolResult {
+            content: "missing required array argument: edits".to_string(),
+            is_error: true,
+        };
+    }
+
+    let path_ref = Path::new(&path);
+    let original_content = match tokio::fs::read_to_string(path_ref).await {
+        Ok(content) => content,
+        Err(error) => {
+            return ToolResult {
+                content: format!("failed to read {path}: {error}"),
+                is_error: true,
+            };
+        }
+    };
+
+    if let Some(expected_sha256) = args.expected_sha256.as_deref() {
+        let actual_sha256 = sha256_hex(&original_content);
+        if actual_sha256 != expected_sha256.trim().to_ascii_lowercase() {
+            return ToolResult {
+                content: format!(
+                    "expected_sha256 mismatch for {path}: expected {}, got {}",
+                    expected_sha256.trim(),
+                    actual_sha256
+                ),
+                is_error: true,
+            };
         }
     }
+
+    let edit_summary = match apply_text_edits(&original_content, &args.edits) {
+        Ok(summary) => summary,
+        Err(error) => {
+            return ToolResult {
+                content: error,
+                is_error: true,
+            };
+        }
+    };
+
+    if args.dry_run.unwrap_or(false) {
+        return ToolResult {
+            content: format_edit_result("would edit", &path, &edit_summary),
+            is_error: false,
+        };
+    }
+
+    match write_text_file(path_ref, &edit_summary.content, true).await {
+        Ok(()) => ToolResult {
+            content: format_edit_result("edited", &path, &edit_summary),
+            is_error: false,
+        },
+        Err(error) => ToolResult {
+            content: format!("failed to write {path}: {error}"),
+            is_error: true,
+        },
+    }
+}
+
+fn validate_nonempty_path(path: &str) -> Result<String, ToolResult> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        Err(ToolResult {
+            content: "missing required string argument: path".to_string(),
+            is_error: true,
+        })
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+async fn ensure_parent_directories(path: &Path, create_parents: bool) -> io::Result<()> {
+    if !create_parents {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    Ok(())
+}
+
+async fn write_text_file(path: &Path, content: &str, overwrite: bool) -> io::Result<()> {
+    if !overwrite {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = options.open(path).await?;
+        file.write_all(content.as_bytes()).await?;
+        file.flush().await?;
+        return Ok(());
+    }
+
+    atomic_write_text_file(path, content).await
+}
+
+async fn atomic_write_text_file(path: &Path, content: &str) -> io::Result<()> {
+    let temp_path = temporary_sibling_path(path);
+    let write_result = async {
+        let mut temp_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await?;
+        temp_file.write_all(content.as_bytes()).await?;
+        temp_file.flush().await?;
+        drop(temp_file);
+        tokio::fs::rename(&temp_path, path).await
+    }
+    .await;
+
+    match write_result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            Err(error)
+        }
+    }
+}
+
+fn temporary_sibling_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_file_name(format!(".{file_name}.tai-tmp-{unique}"))
+}
+
+fn format_write_error(path: &str, error: io::Error, overwrite: bool) -> String {
+    if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
+        format!("refusing to overwrite existing file: {path}")
+    } else {
+        format!("failed to write {path}: {error}")
+    }
+}
+
+struct AppliedEditSummary {
+    content: String,
+    replacement_count: usize,
+    char_delta: isize,
+}
+
+fn apply_text_edits(
+    original_content: &str,
+    edits: &[TextEditArgs],
+) -> Result<AppliedEditSummary, String> {
+    let mut content = original_content.to_string();
+    let mut replacement_count = 0usize;
+    let mut char_delta = 0isize;
+
+    for (index, edit) in edits.iter().enumerate() {
+        if edit.old_text.is_empty() {
+            return Err(format!("edit {}: old_text must not be empty", index + 1));
+        }
+
+        let matches = content
+            .match_indices(&edit.old_text)
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            return Err(format!("edit {}: old_text not found", index + 1));
+        }
+
+        let replace_all = edit.replace_all.unwrap_or(false);
+        let replacements_for_edit = if replace_all {
+            matches.len()
+        } else {
+            if matches.len() != 1 {
+                return Err(format!(
+                    "edit {}: old_text matched {} locations; edit is ambiguous",
+                    index + 1,
+                    matches.len()
+                ));
+            }
+            1
+        };
+
+        content = if replace_all {
+            content.replace(&edit.old_text, &edit.new_text)
+        } else {
+            content.replacen(&edit.old_text, &edit.new_text, 1)
+        };
+        replacement_count += replacements_for_edit;
+        char_delta += (edit.new_text.chars().count() as isize
+            - edit.old_text.chars().count() as isize)
+            * replacements_for_edit as isize;
+    }
+
+    Ok(AppliedEditSummary {
+        content,
+        replacement_count,
+        char_delta,
+    })
+}
+
+fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) -> String {
+    format!(
+        "{action} file: {path} ({} replacement{}, {:+} chars)",
+        summary.replacement_count,
+        if summary.replacement_count == 1 {
+            ""
+        } else {
+            "s"
+        },
+        summary.char_delta,
+    )
+}
+
+fn sha256_hex(content: &str) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    format!("{digest:x}")
 }
 
 async fn execute_http_request_tool(arguments_json: &str) -> ToolResult {
@@ -1996,13 +2276,17 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    #[tokio::test]
-    async fn write_file_tool_writes_new_file() {
+    fn test_temp_path(prefix: &str) -> std::path::PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("tai-write-tool-{unique}.txt"));
+        std::env::temp_dir().join(format!("{prefix}-{unique}.txt"))
+    }
+
+    #[tokio::test]
+    async fn write_file_tool_writes_new_file() {
+        let path = test_temp_path("tai-write-tool");
 
         let result = execute_write_file_tool(
             &serde_json::json!({
@@ -2024,11 +2308,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_file_tool_refuses_overwrite_when_disabled() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("tai-write-tool-existing-{unique}.txt"));
+        let path = test_temp_path("tai-write-tool-existing");
         tokio::fs::write(&path, "original\n")
             .await
             .expect("seed file");
@@ -2059,11 +2339,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_file_tool_creates_parent_directories() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("tai-write-tool-dir-{unique}"));
+        let dir = test_temp_path("tai-write-tool-dir").with_extension("");
         let path = dir.join("nested/output.txt");
 
         let result = execute_write_file_tool(
@@ -2083,6 +2359,184 @@ mod tests {
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_tool_replaces_single_unique_match() {
+        let path = test_temp_path("tai-edit-tool-single");
+        tokio::fs::write(&path, "alpha\nbeta\ngamma\n")
+            .await
+            .expect("seed file");
+
+        let result = execute_edit_file_tool(
+            &serde_json::json!({
+                "path": path,
+                "edits": [
+                    {
+                        "old_text": "beta",
+                        "new_text": "delta"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("edited file:"));
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "alpha\ndelta\ngamma\n"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_tool_fails_when_old_text_is_missing() {
+        let path = test_temp_path("tai-edit-tool-missing");
+        tokio::fs::write(&path, "hello\nworld\n")
+            .await
+            .expect("seed file");
+
+        let result = execute_edit_file_tool(
+            &serde_json::json!({
+                "path": path,
+                "edits": [
+                    {
+                        "old_text": "absent",
+                        "new_text": "present"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(result.is_error, "{}", result.content);
+        assert!(result.content.contains("old_text not found"));
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "hello\nworld\n"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_tool_fails_on_ambiguous_non_replace_all_edit() {
+        let path = test_temp_path("tai-edit-tool-ambiguous");
+        tokio::fs::write(&path, "repeat\nrepeat\n")
+            .await
+            .expect("seed file");
+
+        let result = execute_edit_file_tool(
+            &serde_json::json!({
+                "path": path,
+                "edits": [
+                    {
+                        "old_text": "repeat",
+                        "new_text": "done"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(result.is_error, "{}", result.content);
+        assert!(result.content.contains("matched 2 locations"));
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "repeat\nrepeat\n"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_tool_supports_replace_all_and_dry_run() {
+        let path = test_temp_path("tai-edit-tool-replace-all");
+        tokio::fs::write(&path, "foo\nfoo\n")
+            .await
+            .expect("seed file");
+
+        let result = execute_edit_file_tool(
+            &serde_json::json!({
+                "path": path,
+                "dry_run": true,
+                "edits": [
+                    {
+                        "old_text": "foo",
+                        "new_text": "bar",
+                        "replace_all": true
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("would edit file:"));
+        assert!(result.content.contains("2 replacements"));
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "foo\nfoo\n"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn edit_file_tool_validates_expected_sha256() {
+        let path = test_temp_path("tai-edit-tool-sha");
+        let original = "red\nblue\n";
+        tokio::fs::write(&path, original).await.expect("seed file");
+        let expected_sha256 = sha256_hex(original);
+
+        let success = execute_edit_file_tool(
+            &serde_json::json!({
+                "path": path,
+                "expected_sha256": expected_sha256,
+                "edits": [
+                    {
+                        "old_text": "blue",
+                        "new_text": "green"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(!success.is_error, "{}", success.content);
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "red\ngreen\n"
+        );
+
+        let failure = execute_edit_file_tool(
+            &serde_json::json!({
+                "path": path,
+                "expected_sha256": expected_sha256,
+                "edits": [
+                    {
+                        "old_text": "green",
+                        "new_text": "purple"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(failure.is_error, "{}", failure.content);
+        assert!(failure.content.contains("expected_sha256 mismatch"));
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.expect("read file"),
+            "red\ngreen\n"
+        );
+
+        let _ = tokio::fs::remove_file(&path).await;
     }
 
     #[tokio::test]

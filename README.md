@@ -40,6 +40,7 @@ The current implementation is intentionally small and local-first:
 - Uses structured logging via `tracing`
 - Reuses a shared HTTP client for model listing and completions
 - Streams text tokens/chunks to clients when enabled
+- Lets chat-completions models read, edit, and write local text files through the `read_file`, `edit_file`, and `write_file` tools
 - Lets chat-completions models display PNG, JPEG, and SVG images through the `display_image` tool
 
 ### `tai-sh`

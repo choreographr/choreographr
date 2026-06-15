@@ -7185,6 +7185,7 @@ dependencies = [
  "resvg",
  "serde",
  "serde_json",
+ "sha2",
  "tai-proto",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
