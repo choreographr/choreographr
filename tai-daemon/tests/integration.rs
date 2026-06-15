@@ -102,6 +102,107 @@ async fn spawn_tool_call_server(tool_path: String) -> (Arc<OpenAiClient>, tokio:
     (Arc::new(OpenAiClient::new(config).expect("client")), handle)
 }
 
+async fn spawn_http_tool_call_server() -> (Arc<OpenAiClient>, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock server");
+    let addr = listener.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = vec![0_u8; 32 * 1024];
+                let Ok(read_len) = stream.read(&mut buffer).await else {
+                    return;
+                };
+                if read_len == 0 {
+                    return;
+                }
+                let request = String::from_utf8_lossy(&buffer[..read_len]);
+                let first_line = request.lines().next().unwrap_or_default();
+                if first_line.starts_with("GET /v1/models ") || first_line.starts_with("GET /models ") {
+                    let body = r#"{"data":[{"id":"gpt-5.4-nano"}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if first_line.starts_with("POST /v1/chat/completions ") || first_line.starts_with("POST /chat/completions ") {
+                    let body = if request.contains("\"role\":\"tool\"") {
+                        r#"{"choices":[{"message":{"content":"http tool answer"}}]}"#.to_string()
+                    } else {
+                        serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": serde_json::Value::Null,
+                                    "tool_calls": [{
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "http_request",
+                                            "arguments": serde_json::json!({
+                                                "method": "GET",
+                                                "url": format!("http://{addr}/chunk"),
+                                                "headers": {
+                                                    "Range": "bytes=0-4"
+                                                }
+                                            }).to_string()
+                                        }
+                                    }]
+                                }
+                            }]
+                        }).to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+                if first_line.starts_with("GET /chunk ") {
+                    let range = request
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+                        .and_then(|line| line.split_once(':'))
+                        .map(|(_, value)| value.trim())
+                        .unwrap_or_default();
+                    assert_eq!(range, "bytes=0-4");
+                    let body = "hello";
+                    let response = format!(
+                        "HTTP/1.1 206 Partial Content\r\ncontent-type: text/plain\r\ncontent-range: bytes 0-4/11\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
+            });
+        }
+    });
+
+    let config = AuthConfig {
+        api_key: "test-key".to_string(),
+        base_url: format!("http://{}/v1", addr),
+        model_list_path: "/models".to_string(),
+        responses_path: "/responses".to_string(),
+        chat_completions_path: "/chat/completions".to_string(),
+        default_request_format: RequestFormat::ChatCompletions,
+        model_request_formats: std::collections::HashMap::new(),
+        chat_completions_max_tokens: None,
+        model_max_tokens: std::collections::HashMap::new(),
+        streaming: true,
+    };
+    (Arc::new(OpenAiClient::new(config).expect("client")), handle)
+}
+
 #[tokio::test]
 async fn daemon_handler_run_input_requires_selected_model() {
     let (server, mut client) = UnixStream::pair().expect("pair");
@@ -183,6 +284,90 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
 
     drop(client);
     server_task.await.expect("join").expect("server ok");
+}
+
+#[tokio::test]
+async fn daemon_handler_executes_http_request_tool() {
+    let (client_impl, mock_server) = spawn_http_tool_call_server().await;
+    let (server, mut client) = UnixStream::pair().expect("pair");
+    let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
+
+    write_message(
+        &mut client,
+        &ClientMessage::SetModel {
+            model: "gpt-5.4-nano".to_string(),
+        },
+    )
+    .await
+    .expect("write set-model");
+    assert!(matches!(recv(&mut client).await, DaemonMessage::ModelSelected { .. }));
+
+    write_message(
+        &mut client,
+        &ClientMessage::RunInput {
+            request_id: 41,
+            input: b"use http tool".to_vec(),
+        },
+    )
+    .await
+    .expect("write request");
+
+    let mut saw_tool_start = false;
+    let mut saw_tool_finish = false;
+    let mut saw_answer = false;
+    loop {
+        match recv(&mut client).await {
+            DaemonMessage::Started { request_id } => assert_eq!(request_id, 41),
+            DaemonMessage::ToolCallStarted {
+                request_id,
+                call_id,
+                tool_name,
+                arguments_json,
+            } => {
+                assert_eq!(request_id, 41);
+                assert_eq!(call_id, "call_1");
+                assert_eq!(tool_name, "http_request");
+                assert!(arguments_json.contains("\"Range\":\"bytes=0-4\""));
+                saw_tool_start = true;
+            }
+            DaemonMessage::ToolCallFinished {
+                request_id,
+                call_id,
+                tool_name,
+                output,
+            } => {
+                assert_eq!(request_id, 41);
+                assert_eq!(call_id, "call_1");
+                assert_eq!(tool_name, "http_request");
+                assert!(output.contains("status: 206 Partial Content"));
+                assert!(output.contains("content-range: bytes 0-4/11"));
+                assert!(output.ends_with("hello"));
+                saw_tool_finish = true;
+            }
+            DaemonMessage::OutputChunk {
+                request_id,
+                data,
+                ..
+            } => {
+                assert_eq!(request_id, 41);
+                assert_eq!(String::from_utf8_lossy(&data), "http tool answer");
+                saw_answer = true;
+            }
+            DaemonMessage::Done { request_id } => {
+                assert_eq!(request_id, 41);
+                break;
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    assert!(saw_tool_start);
+    assert!(saw_tool_finish);
+    assert!(saw_answer);
+
+    drop(client);
+    server_task.await.expect("join").expect("server ok");
+    mock_server.abort();
 }
 
 #[tokio::test]
