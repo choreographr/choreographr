@@ -439,6 +439,45 @@ fn available_tools() -> Vec<ChatToolDefinition> {
                 "additionalProperties": false
             }),
         ),
+        ChatToolDefinition::function(
+            "git_push",
+            "Push the current or specified branch to a named Git remote using the external git command.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Relative or absolute path inside a Git repository",
+                        "default": "."
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name to push to, such as origin"
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name to push. Defaults to the current branch when HEAD is attached."
+                    },
+                    "set_upstream": {
+                        "type": "boolean",
+                        "description": "Whether to pass --set-upstream",
+                        "default": false
+                    },
+                    "force_with_lease": {
+                        "type": "boolean",
+                        "description": "Whether to pass --force-with-lease",
+                        "default": false
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "Whether to pass --dry-run",
+                        "default": false
+                    }
+                },
+                "required": ["remote"],
+                "additionalProperties": false
+            }),
+        ),
     ]
 }
 
@@ -487,6 +526,10 @@ async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecutionOutput {
         },
         "git_commit" => ToolExecutionOutput {
             result: git_tools::execute_git_commit_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "git_push" => ToolExecutionOutput {
+            result: git_tools::execute_git_push_tool(&tool_call.arguments_json).await,
             image: None,
         },
         _ => ToolExecutionOutput {
@@ -563,9 +606,7 @@ async fn execute_read_file_range_tool(arguments_json: &str) -> ToolResult {
 
     if args.max_lines > MAX_READ_FILE_RANGE_LINES {
         return ToolResult {
-            content: format!(
-                "max_lines must be <= {MAX_READ_FILE_RANGE_LINES}"
-            ),
+            content: format!("max_lines must be <= {MAX_READ_FILE_RANGE_LINES}"),
             is_error: true,
         };
     }
@@ -2537,9 +2578,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_range_tool_rejects_excessive_max_lines() {
         let path = test_temp_path("tai-read-range-max-lines-tool");
-        tokio::fs::write(&path, "alpha\n")
-            .await
-            .expect("seed file");
+        tokio::fs::write(&path, "alpha\n").await.expect("seed file");
 
         let result = execute_read_file_range_tool(
             &serde_json::json!({

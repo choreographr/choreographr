@@ -41,6 +41,16 @@ struct GitCommitArgs {
     allow_empty: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GitPushArgs {
+    repo_path: Option<String>,
+    remote: String,
+    branch: Option<String>,
+    set_upstream: Option<bool>,
+    force_with_lease: Option<bool>,
+    dry_run: Option<bool>,
+}
+
 pub(crate) async fn execute_git_status_tool(arguments_json: &str) -> ToolResult {
     let args = match serde_json::from_str::<GitRepoArgs>(arguments_json) {
         Ok(args) => args,
@@ -104,6 +114,22 @@ pub(crate) async fn execute_git_commit_tool(arguments_json: &str) -> ToolResult 
         args.repo_path.as_deref(),
         &args.message,
         args.allow_empty.unwrap_or(false),
+    ))
+}
+
+pub(crate) async fn execute_git_push_tool(arguments_json: &str) -> ToolResult {
+    let args = match serde_json::from_str::<GitPushArgs>(arguments_json) {
+        Ok(args) => args,
+        Err(error) => return invalid_arguments(error),
+    };
+
+    map_io_result(git_push_impl(
+        args.repo_path.as_deref(),
+        &args.remote,
+        args.branch.as_deref(),
+        args.set_upstream.unwrap_or(false),
+        args.force_with_lease.unwrap_or(false),
+        args.dry_run.unwrap_or(false),
     ))
 }
 
@@ -274,7 +300,10 @@ fn git_add_impl(repo_path: Option<&str>, pathspec: Vec<String>) -> io::Result<St
     if paths.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("pathspec did not match any tracked or untracked paths: {}", pathspec.join(", ")),
+            format!(
+                "pathspec did not match any tracked or untracked paths: {}",
+                pathspec.join(", ")
+            ),
         ));
     }
 
@@ -290,14 +319,23 @@ fn git_add_impl(repo_path: Option<&str>, pathspec: Vec<String>) -> io::Result<St
     writeln!(&mut out, "repository: {}", repo_work_dir_display(&repo)).ok();
     writeln!(&mut out, "head: {}", describe_head(&repo)?).ok();
     writeln!(&mut out, "staged_paths: {}", paths.len()).ok();
-    writeln!(&mut out, "index_changed: {}", if changed { "yes" } else { "no" }).ok();
+    writeln!(
+        &mut out,
+        "index_changed: {}",
+        if changed { "yes" } else { "no" }
+    )
+    .ok();
     let diff = git_diff_impl(repo_path, true, effective_pathspec)?;
     writeln!(&mut out).ok();
     writeln!(&mut out, "{diff}").ok();
     Ok(out.trim_end().to_string())
 }
 
-fn git_commit_impl(repo_path: Option<&str>, message: &str, allow_empty: bool) -> io::Result<String> {
+fn git_commit_impl(
+    repo_path: Option<&str>,
+    message: &str,
+    allow_empty: bool,
+) -> io::Result<String> {
     let repo = open_repo(repo_path)?;
     let message = message.trim();
     if message.is_empty() {
@@ -325,6 +363,76 @@ fn git_commit_impl(repo_path: Option<&str>, message: &str, allow_empty: bool) ->
     git_log_impl(repo_path, 1)
 }
 
+fn git_push_impl(
+    repo_path: Option<&str>,
+    remote: &str,
+    branch: Option<&str>,
+    set_upstream: bool,
+    force_with_lease: bool,
+    dry_run: bool,
+) -> io::Result<String> {
+    let repo = open_repo(repo_path)?;
+    let remote = normalize_nonempty_argument(remote, "remote")?;
+    let branch = match branch {
+        Some(branch) => normalize_nonempty_argument(branch, "branch")?.to_string(),
+        None => current_branch_name(&repo)?,
+    };
+
+    let mut args = vec!["push".to_string()];
+    if dry_run {
+        args.push("--dry-run".to_string());
+    }
+    if set_upstream {
+        args.push("--set-upstream".to_string());
+    }
+    if force_with_lease {
+        args.push("--force-with-lease".to_string());
+    }
+    args.push(remote.to_string());
+    args.push(branch.clone());
+
+    let output = run_git_command(&repo, &args)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !output.status.success() {
+        let mut out = String::new();
+        writeln!(&mut out, "repository: {}", repo_work_dir_display(&repo)).ok();
+        writeln!(&mut out, "head: {}", describe_head(&repo)?).ok();
+        writeln!(&mut out, "remote: {remote}").ok();
+        writeln!(&mut out, "branch: {branch}").ok();
+        writeln!(&mut out, "dry_run: {}", yes_no(dry_run)).ok();
+        writeln!(&mut out, "set_upstream: {}", yes_no(set_upstream)).ok();
+        writeln!(&mut out, "force_with_lease: {}", yes_no(force_with_lease)).ok();
+        writeln!(&mut out, "result: push failed").ok();
+        append_command_output(&mut out, "stdout", &stdout);
+        append_command_output(&mut out, "stderr", &stderr);
+        return Err(io::Error::other(out.trim_end().to_string()));
+    }
+
+    let mut out = String::new();
+    writeln!(&mut out, "repository: {}", repo_work_dir_display(&repo)).ok();
+    writeln!(&mut out, "head: {}", describe_head(&repo)?).ok();
+    writeln!(&mut out, "remote: {remote}").ok();
+    writeln!(&mut out, "branch: {branch}").ok();
+    writeln!(&mut out, "dry_run: {}", yes_no(dry_run)).ok();
+    writeln!(&mut out, "set_upstream: {}", yes_no(set_upstream)).ok();
+    writeln!(&mut out, "force_with_lease: {}", yes_no(force_with_lease)).ok();
+    writeln!(
+        &mut out,
+        "result: {}",
+        if dry_run {
+            "dry run complete"
+        } else {
+            "pushed"
+        }
+    )
+    .ok();
+    append_command_output(&mut out, "stdout", &stdout);
+    append_command_output(&mut out, "stderr", &stderr);
+    Ok(out.trim_end().to_string())
+}
+
 fn open_repo(repo_path: Option<&str>) -> io::Result<gix::Repository> {
     let path = repo_path.unwrap_or(".").trim();
     let path = if path.is_empty() { "." } else { path };
@@ -334,6 +442,30 @@ fn open_repo(repo_path: Option<&str>) -> io::Result<gix::Repository> {
             Path::new(path).display()
         ))
     })
+}
+
+fn normalize_nonempty_argument<'a>(value: &'a str, name: &str) -> io::Result<&'a str> {
+    let value = value.trim();
+    if value.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must not be empty"),
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn current_branch_name(repo: &gix::Repository) -> io::Result<String> {
+    repo.head_name()
+        .map_err(io::Error::other)?
+        .map(|name| name.shorten().to_string())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "branch must be provided when HEAD is detached",
+            )
+        })
 }
 
 fn describe_head(repo: &gix::Repository) -> io::Result<String> {
@@ -354,11 +486,33 @@ fn shorten_id(repo: &gix::Repository, id: ObjectId) -> io::Result<String> {
         .to_string())
 }
 
+fn repo_work_dir(repo: &gix::Repository) -> &Path {
+    repo.workdir().unwrap_or_else(|| repo.git_dir())
+}
+
 fn repo_work_dir_display(repo: &gix::Repository) -> String {
-    repo.workdir()
-        .unwrap_or_else(|| repo.git_dir())
-        .display()
-        .to_string()
+    repo_work_dir(repo).display().to_string()
+}
+
+fn run_git_command(repo: &gix::Repository, args: &[String]) -> io::Result<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_work_dir(repo))
+        .output()
+        .map_err(|error| io::Error::other(format!("failed to run git {}: {error}", args.join(" "))))
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn append_command_output(out: &mut String, label: &str, content: &str) {
+    if content.is_empty() {
+        return;
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{label}:");
+    let _ = writeln!(out, "{content}");
 }
 
 fn collect_worktree_diff_lines(
@@ -552,7 +706,9 @@ fn prefix_pathspecs(
 }
 
 fn worktree_metadata(repo: &gix::Repository, path: &BStr) -> io::Result<gix::index::fs::Metadata> {
-    let workdir = repo.workdir().ok_or_else(|| io::Error::other("repository has no worktree"))?;
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| io::Error::other("repository has no worktree"))?;
     gix::index::fs::Metadata::from_path_no_follow(&workdir.join(gix::path::from_bstr(path)))
         .map_err(io::Error::other)
 }
@@ -605,7 +761,10 @@ fn write_tree_from_index(repo: &gix::Repository, index: &gix::index::File) -> io
             .upsert(entry.path(index).to_owned(), kind.into(), entry.id)
             .map_err(io::Error::other)?;
     }
-    editor.write().map(|id| id.detach()).map_err(io::Error::other)
+    editor
+        .write()
+        .map(|id| id.detach())
+        .map_err(io::Error::other)
 }
 
 fn current_head_parents(repo: &gix::Repository) -> io::Result<Vec<ObjectId>> {
@@ -831,6 +990,21 @@ mod tests {
         dir
     }
 
+    fn init_bare_remote() -> std::path::PathBuf {
+        let dir = unique_repo_dir("remote");
+        std::fs::create_dir_all(&dir).expect("create remote dir");
+        git(&dir, &["init", "--bare", "--initial-branch=main"]);
+        dir
+    }
+
+    fn git_output_result(repo: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git")
+    }
+
     #[tokio::test]
     async fn git_status_reports_staged_unstaged_and_untracked_changes() {
         let repo = init_repo();
@@ -994,14 +1168,22 @@ mod tests {
         )
         .await;
         assert!(empty.is_error);
-        assert!(empty.content.contains("pathspec must contain at least one non-empty entry"));
+        assert!(
+            empty
+                .content
+                .contains("pathspec must contain at least one non-empty entry")
+        );
 
         let unmatched = execute_git_add_tool(
             &serde_json::json!({ "repo_path": repo, "pathspec": ["missing.txt"] }).to_string(),
         )
         .await;
         assert!(unmatched.is_error);
-        assert!(unmatched.content.contains("pathspec did not match any tracked or untracked paths"));
+        assert!(
+            unmatched
+                .content
+                .contains("pathspec did not match any tracked or untracked paths")
+        );
 
         let _ = std::fs::remove_dir_all(repo);
     }
@@ -1022,7 +1204,11 @@ mod tests {
 
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("head: main"));
-        assert!(result.content.contains("Tai Test <tai@example.com> Add file"));
+        assert!(
+            result
+                .content
+                .contains("Tai Test <tai@example.com> Add file")
+        );
         let log = git_output(&repo, &["log", "--format=%s", "-1"]);
         assert_eq!(log.trim(), "Add file");
 
@@ -1100,6 +1286,151 @@ mod tests {
         .await;
         assert!(result.is_error);
         assert!(result.content.contains("unresolved index conflicts"));
+
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[tokio::test]
+    async fn git_push_pushes_branch_to_remote_and_sets_upstream() {
+        let repo = init_repo();
+        let remote = init_bare_remote();
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("utf8 remote"),
+            ],
+        );
+        std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
+        git(&repo, &["add", "file.txt"]);
+        git(&repo, &["commit", "-m", "initial commit"]);
+
+        let result = execute_git_push_tool(
+            &serde_json::json!({
+                "repo_path": repo,
+                "remote": "origin",
+                "set_upstream": true
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("remote: origin"));
+        assert!(result.content.contains("branch: main"));
+        assert!(result.content.contains("set_upstream: yes"));
+        assert!(result.content.contains("result: pushed"));
+        let remote_head = git_output(&remote, &["rev-parse", "main"]);
+        let local_head = git_output(&repo, &["rev-parse", "HEAD"]);
+        assert_eq!(remote_head.trim(), local_head.trim());
+        let upstream = git_output(
+            &repo,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        );
+        assert_eq!(upstream.trim(), "origin/main");
+
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(remote);
+    }
+
+    #[tokio::test]
+    async fn git_push_supports_dry_run() {
+        let repo = init_repo();
+        let remote = init_bare_remote();
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("utf8 remote"),
+            ],
+        );
+        std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
+        git(&repo, &["add", "file.txt"]);
+        git(&repo, &["commit", "-m", "initial commit"]);
+
+        let result = execute_git_push_tool(
+            &serde_json::json!({
+                "repo_path": repo,
+                "remote": "origin",
+                "branch": "main",
+                "dry_run": true
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("dry_run: yes"));
+        assert!(result.content.contains("result: dry run complete"));
+        let remote_lookup = git_output_result(&remote, &["rev-parse", "main"]);
+        assert!(
+            !remote_lookup.status.success(),
+            "dry run should not update remote"
+        );
+
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(remote);
+    }
+
+    #[tokio::test]
+    async fn git_push_rejects_detached_head_without_branch() {
+        let repo = init_repo();
+        let remote = init_bare_remote();
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("utf8 remote"),
+            ],
+        );
+        std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
+        git(&repo, &["add", "file.txt"]);
+        git(&repo, &["commit", "-m", "initial commit"]);
+        let head = git_output(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", head.trim()]);
+
+        let result = execute_git_push_tool(
+            &serde_json::json!({ "repo_path": repo, "remote": "origin" }).to_string(),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .content
+                .contains("branch must be provided when HEAD is detached")
+        );
+
+        let _ = std::fs::remove_dir_all(repo);
+        let _ = std::fs::remove_dir_all(remote);
+    }
+
+    #[tokio::test]
+    async fn git_push_reports_push_failure() {
+        let repo = init_repo();
+        std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
+        git(&repo, &["add", "file.txt"]);
+        git(&repo, &["commit", "-m", "initial commit"]);
+
+        let result = execute_git_push_tool(
+            &serde_json::json!({
+                "repo_path": repo,
+                "remote": "origin",
+                "branch": "main"
+            })
+            .to_string(),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("result: push failed"));
+        assert!(result.content.contains("remote: origin"));
 
         let _ = std::fs::remove_dir_all(repo);
     }
