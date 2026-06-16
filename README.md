@@ -2,11 +2,12 @@
 
 A small Rust workspace for a local AI terminal interface.
 
-`tai` is split into three crates:
+`tai` is a small Rust workspace with five crates:
 
-- `tai-daemon` — a Unix socket server that validates OpenAI-compatible credentials, lists models, accepts requests, and returns model output
+- `tai-daemon` — a Unix socket server that validates OpenAI-compatible credentials, manages sessions, accepts requests, runs tools, and returns model output
 - `tai-sh` — a terminal UI client built with `ratatui` and `crossterm`
 - `tai-dioxus` — a minimal desktop app client built with `Dioxus`
+- `tai-client-core` — shared client-side parsing, markdown, and image-assembly logic used by the UI crates
 - `tai-proto` — the shared framed binary protocol used between the client and daemon
 
 The current implementation is intentionally small and local-first:
@@ -21,11 +22,43 @@ The current implementation is intentionally small and local-first:
 
 ```text
 .
+├── tai-client-core/
 ├── tai-daemon/
 ├── tai-dioxus/
 ├── tai-proto/
 └── tai-sh/
 ```
+
+## Architecture
+
+The workspace is now split into smaller focused modules instead of a few large files.
+
+### `tai-daemon`
+
+- `server.rs` — socket lifecycle and client message handling
+- `sessions.rs` — session state, snapshots, subscriptions, and lookup helpers
+- `requests.rs` — prompt construction, request execution, tool-call loop, and demo image flow
+- `tools.rs` — file, HTTP, image, and generic tool execution helpers
+- `git_tools.rs` — Git-specific tool support
+- `openai.rs` — OpenAI-compatible provider integration
+
+### `tai-sh`
+
+- `connection.rs` — transport, UI loop, input handling, and daemon message handling
+- `render.rs` — terminal rendering and history/image presentation
+- `state.rs` — application state, scrolling, and markdown-to-terminal text shaping
+
+### `tai-dioxus`
+
+- `client.rs` — transport and daemon event handling
+- `render.rs` — history and markdown/image rendering helpers
+- `state.rs` — UI state and history modeling
+
+### `tai-client-core`
+
+- `shell.rs` — shell command parsing and streaming text helpers
+- `markdown.rs` — markdown parsing and safe HTML rendering
+- `image.rs` — streamed image assembly helpers
 
 ## Features
 
@@ -61,13 +94,20 @@ The current implementation is intentionally small and local-first:
 - Uses emoji-capable fallback font stacks for better native emoji rendering in the desktop UI
 - Renders image messages with standard `data:` URLs, including SVG
 
+### `tai-client-core`
+
+- Shared shell command parsing
+- Shared streaming text model
+- Shared markdown parsing and safe HTML rendering
+- Shared image assembly for streamed protocol images
+
 ### `tai-proto`
 
 - Length-prefixed framed protocol
 - Versioned message format
 - Shared client/daemon message enums
+- Session, streaming, tool-call, and image message support
 - Limits frame size to avoid unbounded payloads
-- Includes text and image message variants
 
 ## Requirements
 
@@ -215,7 +255,12 @@ Current protocol version:
 
 ### Client messages
 
+- `CreateSession { title }`
+- `ListSessions`
+- `AttachSession { session_id }`
+- `GetSessionState { session_id }`
 - `RunInput { request_id, input }`
+- `TestImage { request_id }`
 - `Cancel { request_id }`
 - `Ping`
 - `ListModels`
@@ -223,19 +268,33 @@ Current protocol version:
 
 ### Daemon messages
 
-- `Started { request_id }`
-- `OutputChunk { request_id, stream, data }` — emitted incrementally for streamed text and once for non-streaming text
-- `ImageStart { ... }`
-- `ImageChunk { ... }`
-- `ImageEnd { ... }`
-- `Done { request_id }`
-- `Failed { request_id, error }`
-- `Cancelled { request_id }`
-- `Pong`
-- `Models { models, selected_model }`
-- `ModelsFailed { error }`
-- `ModelSelected { model }`
-- `ModelSelectionFailed { model, error }`
+- session lifecycle and state messages:
+  - `SessionCreated { ... }`
+  - `Sessions { ... }`
+  - `SessionAttached { ... }`
+  - `SessionState { ... }`
+  - `SessionMessageAppended { ... }`
+  - `SessionFailed { ... }`
+- request lifecycle messages:
+  - `Started { request_id }`
+  - `OutputChunk { request_id, stream, data }` — emitted incrementally for streamed text and once for non-streaming text
+  - `Done { request_id }`
+  - `Failed { request_id, error }`
+  - `Cancelled { request_id }`
+- tool lifecycle messages:
+  - `ToolCallStarted { ... }`
+  - `ToolCallFinished { ... }`
+  - `ToolCallFailed { ... }`
+- image messages:
+  - `ImageStart { ... }`
+  - `ImageChunk { ... }`
+  - `ImageEnd { ... }`
+- misc messages:
+  - `Pong`
+  - `Models { models, selected_model }`
+  - `ModelsFailed { error }`
+  - `ModelSelected { model }`
+  - `ModelSelectionFailed { model, error }`
 
 ## Testing
 
@@ -249,10 +308,13 @@ This workspace includes unit and integration tests for:
 
 - protocol framing and version handling
 - shell command parsing
+- markdown parsing and HTML sanitization
 - image assembly logic
 - daemon request lifecycle behavior
+- session creation, attachment, and snapshot behavior
 - model-listing and selection failure cases
 - cancellation and duplicate request handling
+- tool-call and image-delivery flows
 
 ## Notes and current limitations
 
@@ -267,8 +329,9 @@ This workspace includes unit and integration tests for:
 
 ## Crate summary
 
+- `tai-client-core`: shared client parsing, markdown, and image helpers
 - `tai-proto`: shared wire format and socket helpers
-- `tai-daemon`: provider-backed request executor
+- `tai-daemon`: provider-backed request executor with sessions and tools
 - `tai-sh`: terminal client and image-capable history viewer
 - `tai-dioxus`: minimal Dioxus desktop client
 

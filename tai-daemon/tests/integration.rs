@@ -92,7 +92,6 @@ async fn spawn_tool_call_server(
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
                     let _ = stream.shutdown().await;
-                    return;
                 }
             });
         }
@@ -200,7 +199,6 @@ async fn spawn_http_tool_call_server() -> (Arc<OpenAiClient>, tokio::task::JoinH
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
                     let _ = stream.shutdown().await;
-                    return;
                 }
             });
         }
@@ -287,7 +285,6 @@ async fn spawn_display_image_tool_server() -> (Arc<OpenAiClient>, tokio::task::J
                     );
                     let _ = stream.write_all(response.as_bytes()).await;
                     let _ = stream.shutdown().await;
-                    return;
                 }
             });
         }

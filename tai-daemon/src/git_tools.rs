@@ -946,15 +946,20 @@ mod tests {
     use super::*;
     use std::{
         process::Command,
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    static NEXT_UNIQUE_ID: AtomicU64 = AtomicU64::new(1);
 
     fn unique_repo_dir(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        std::env::temp_dir().join(format!("tai-git-tool-{name}-{unique}"))
+        let counter = NEXT_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("tai-git-tool-{name}-{pid}-{unique}-{counter}"))
     }
 
     fn git(repo: &Path, args: &[&str]) {
