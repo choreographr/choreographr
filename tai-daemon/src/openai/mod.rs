@@ -1,20 +1,16 @@
-#[path = "openai_config.rs"]
-mod openai_config;
-#[path = "openai_requests.rs"]
-mod openai_requests;
-#[path = "openai_sse.rs"]
-mod openai_sse;
+mod config;
+mod requests;
+mod sse;
 #[cfg(test)]
-#[path = "openai_tests.rs"]
-mod openai_tests;
+mod tests;
 
-pub(crate) use openai_config::endpoint_url;
-pub use openai_config::{
+pub(crate) use config::endpoint_url;
+pub use config::{
     AuthConfig, auth_config_path, completion, load_auth_config, validate_and_list_models,
 };
 #[cfg(test)]
-pub(crate) use openai_sse::build_sse_event;
-pub(crate) use openai_sse::{SseReader, extract_responses_text_delta};
+pub(crate) use sse::build_sse_event;
+pub(crate) use sse::{SseReader, extract_responses_text_delta};
 
 use serde::{Deserialize, Serialize};
 use std::io;
