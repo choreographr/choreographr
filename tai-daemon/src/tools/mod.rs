@@ -1,13 +1,14 @@
-use crate::git_tools;
 use crate::openai::{ChatToolCall, ChatToolDefinition};
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use std::sync::OnceLock;
 
-mod catalog;
 mod fs;
 mod http;
 mod image;
 mod fff;
 mod evm;
+mod git;
 mod subxt;
 
 #[derive(Debug, Clone)]
@@ -31,8 +32,92 @@ pub(crate) struct PreparedImage {
     pub(crate) alt: Option<String>,
 }
 
-pub(crate) use catalog::available_tools;
 pub(crate) use image::emit_prepared_image;
+
+#[async_trait]
+pub(crate) trait Tool: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    fn schema(&self) -> serde_json::Value;
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput;
+}
+
+pub(crate) struct ToolRegistry {
+    tools: Vec<Box<dyn Tool>>,
+}
+
+impl ToolRegistry {
+    pub fn new() -> Self {
+        let mut reg = Self { tools: Vec::new() };
+        reg.register(fs::ReadFile);
+        reg.register(fs::ReadFileRange);
+        reg.register(fs::ListFiles);
+        reg.register(fs::LineCount);
+        reg.register(http::HttpRequest);
+        reg.register(fs::WriteFile);
+        reg.register(fs::EditFile);
+        reg.register(image::DisplayImage);
+        reg.register(git::GitStatus);
+        reg.register(git::GitDiff);
+        reg.register(git::GitLog);
+        reg.register(git::GitAdd);
+        reg.register(git::GitCommit);
+        reg.register(git::GitPush);
+        reg.register(fff::Fff);
+        reg.register(subxt::SubxtChain);
+        reg.register(subxt::SubxtBalance);
+        reg.register(subxt::SubxtQuery);
+        reg.register(subxt::SubxtBlock);
+        reg.register(evm::EvmChain);
+        reg.register(evm::EvmBalance);
+        reg.register(evm::EvmTokenBalance);
+        reg.register(evm::EvmBlock);
+        reg.register(evm::EvmTransaction);
+        reg.register(evm::EvmCall);
+        reg.register(evm::EvmGas);
+        reg.register(evm::EvmLogs);
+        reg.register(evm::EvmNonce);
+        reg.register(evm::EvmResolve);
+        reg
+    }
+
+    fn register(&mut self, tool: impl Tool + 'static) {
+        self.tools.push(Box::new(tool));
+    }
+
+    pub async fn execute(&self, tool_call: &ChatToolCall) -> ToolExecutionOutput {
+        match self.tools.iter().find(|t| t.name() == tool_call.name) {
+            Some(tool) => tool.execute(&tool_call.arguments_json).await,
+            None => ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!("unknown tool: {}", tool_call.name),
+                    is_error: true,
+                },
+                image: None,
+            },
+        }
+    }
+
+    pub fn available_definitions(&self) -> Vec<ChatToolDefinition> {
+        self.tools
+            .iter()
+            .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
+            .collect()
+    }
+}
+
+fn global_registry() -> &'static ToolRegistry {
+    static REGISTRY: OnceLock<ToolRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(ToolRegistry::new)
+}
+
+pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecutionOutput {
+    global_registry().execute(tool_call).await
+}
+
+pub(crate) fn available_tools() -> Vec<ChatToolDefinition> {
+    global_registry().available_definitions()
+}
 
 #[cfg(test)]
 pub(crate) async fn execute_read_file_range_tool(arguments_json: &str) -> ToolResult {
@@ -52,131 +137,6 @@ pub(crate) async fn execute_edit_file_tool(arguments_json: &str) -> ToolResult {
 #[cfg(test)]
 pub(crate) async fn execute_http_request_tool(arguments_json: &str) -> ToolResult {
     http::execute_http_request_tool(arguments_json).await
-}
-
-pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecutionOutput {
-    match tool_call.name.as_str() {
-        "read_file" => ToolExecutionOutput {
-            result: fs::execute_read_file_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "read_file_range" => ToolExecutionOutput {
-            result: fs::execute_read_file_range_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "list_files" => ToolExecutionOutput {
-            result: fs::execute_list_files_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "line_count" => ToolExecutionOutput {
-            result: fs::execute_line_count_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "http_request" => ToolExecutionOutput {
-            result: http::execute_http_request_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "write_file" => ToolExecutionOutput {
-            result: fs::execute_write_file_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "edit_file" => ToolExecutionOutput {
-            result: fs::execute_edit_file_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "display_image" => image::execute_display_image_tool(&tool_call.arguments_json).await,
-        "git_status" => ToolExecutionOutput {
-            result: git_tools::execute_git_status_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "git_diff" => ToolExecutionOutput {
-            result: git_tools::execute_git_diff_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "git_log" => ToolExecutionOutput {
-            result: git_tools::execute_git_log_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "git_add" => ToolExecutionOutput {
-            result: git_tools::execute_git_add_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "git_commit" => ToolExecutionOutput {
-            result: git_tools::execute_git_commit_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "git_push" => ToolExecutionOutput {
-            result: git_tools::execute_git_push_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "fff" => ToolExecutionOutput {
-            result: fff::execute_fff_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "subxt_chain" => ToolExecutionOutput {
-            result: subxt::execute_subxt_chain_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "subxt_balance" => ToolExecutionOutput {
-            result: subxt::execute_subxt_balance_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "subxt_query" => ToolExecutionOutput {
-            result: subxt::execute_subxt_query_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "subxt_block" => ToolExecutionOutput {
-            result: subxt::execute_subxt_block_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "evm_chain" => ToolExecutionOutput {
-            result: evm::execute_evm_chain_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "evm_balance" => ToolExecutionOutput {
-            result: evm::execute_evm_balance_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "evm_token_balance" => ToolExecutionOutput {
-            result: evm::execute_evm_token_balance_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "evm_block" => ToolExecutionOutput {
-            result: evm::execute_evm_block_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "evm_transaction" => ToolExecutionOutput {
-            result: evm::execute_evm_transaction_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "evm_call" => ToolExecutionOutput {
-            result: evm::execute_evm_call_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "evm_gas" => ToolExecutionOutput {
-            result: evm::execute_evm_gas_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "evm_logs" => ToolExecutionOutput {
-            result: evm::execute_evm_logs_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "evm_nonce" => ToolExecutionOutput {
-            result: evm::execute_evm_nonce_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        "evm_resolve" => ToolExecutionOutput {
-            result: evm::execute_evm_resolve_tool(&tool_call.arguments_json).await,
-            image: None,
-        },
-        _ => ToolExecutionOutput {
-            result: ToolResult {
-                content: format!("unknown tool: {}", tool_call.name),
-                is_error: true,
-            },
-            image: None,
-        },
-    }
 }
 
 pub(crate) fn sha256_hex(content: &str) -> String {

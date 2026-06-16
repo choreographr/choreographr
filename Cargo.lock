@@ -10802,6 +10802,7 @@ name = "tai-daemon"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "async-trait",
  "base64",
  "bytes",
  "dirs 6.0.0",

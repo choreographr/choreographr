@@ -1,4 +1,5 @@
-use crate::{ToolResult, truncate_tool_output};
+use crate::{Tool, ToolExecutionOutput, ToolResult, truncate_tool_output};
+use async_trait::async_trait;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, Bytes};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -527,6 +528,146 @@ async fn evm_resolve_impl(rpc_url: &str, name_or_address: &str) -> Result<String
             Ok(name) => Ok(format!("address: {name_or_address}\nname: {name}")),
             Err(e) => Err(e),
         }
+    }
+}
+
+pub(crate) struct EvmChain;
+
+#[async_trait]
+impl Tool for EvmChain {
+    fn name(&self) -> &'static str { "evm_chain" }
+    fn description(&self) -> &'static str { "Query information about an EVM blockchain node: chain ID, latest block number, gas price, max priority fee, and client version." }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node (e.g., https://ethereum-rpc.publicnode.com)"}},"required":["rpc_url"],"additionalProperties":false})
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput { result: execute_evm_chain_tool(arguments_json).await, image: None }
+    }
+}
+
+pub(crate) struct EvmBalance;
+
+#[async_trait]
+impl Tool for EvmBalance {
+    fn name(&self) -> &'static str { "evm_balance" }
+    fn description(&self) -> &'static str { "Query the native ETH/coin balance of an address on an EVM blockchain." }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"address":{"type":"string","description":"0x-prefixed hex address"}},"required":["rpc_url","address"],"additionalProperties":false})
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput { result: execute_evm_balance_tool(arguments_json).await, image: None }
+    }
+}
+
+pub(crate) struct EvmTokenBalance;
+
+#[async_trait]
+impl Tool for EvmTokenBalance {
+    fn name(&self) -> &'static str { "evm_token_balance" }
+    fn description(&self) -> &'static str { "Query the ERC-20 token balance for an address. Also attempts to fetch the token symbol." }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"token_address":{"type":"string","description":"0x-prefixed ERC-20 token contract address"},"address":{"type":"string","description":"0x-prefixed wallet address to check balance for"}},"required":["rpc_url","token_address","address"],"additionalProperties":false})
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput { result: execute_evm_token_balance_tool(arguments_json).await, image: None }
+    }
+}
+
+pub(crate) struct EvmBlock;
+
+#[async_trait]
+impl Tool for EvmBlock {
+    fn name(&self) -> &'static str { "evm_block" }
+    fn description(&self) -> &'static str { "Get details about a block on an EVM blockchain: block number, hash, timestamp, transaction count, gas used/limit, and base fee." }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"block_tag":{"type":"string","description":"Block number (decimal or 0x-hex), or 'latest', 'finalized', 'safe', 'pending', 'earliest'","default":"latest"}},"required":["rpc_url"],"additionalProperties":false})
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput { result: execute_evm_block_tool(arguments_json).await, image: None }
+    }
+}
+
+pub(crate) struct EvmTransaction;
+
+#[async_trait]
+impl Tool for EvmTransaction {
+    fn name(&self) -> &'static str { "evm_transaction" }
+    fn description(&self) -> &'static str { "Get details about a transaction on an EVM blockchain by its hash. Returns hash, block number, from/to, gas used, effective gas price, and log count." }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"tx_hash":{"type":"string","description":"0x-prefixed transaction hash"}},"required":["rpc_url","tx_hash"],"additionalProperties":false})
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput { result: execute_evm_transaction_tool(arguments_json).await, image: None }
+    }
+}
+
+pub(crate) struct EvmCall;
+
+#[async_trait]
+impl Tool for EvmCall {
+    fn name(&self) -> &'static str { "evm_call" }
+    fn description(&self) -> &'static str { "Execute a read-only smart contract call (eth_call) on an EVM blockchain. Returns the raw hex-encoded result bytes." }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"to":{"type":"string","description":"0x-prefixed contract address to call"},"data":{"type":"string","description":"0x-prefixed hex-encoded call data (method selector + ABI-encoded params)"},"block_tag":{"type":"string","description":"Block number (decimal or 0x-hex), or 'latest', 'finalized', 'safe', 'pending', 'earliest'","default":"latest"}},"required":["rpc_url","to","data"],"additionalProperties":false})
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput { result: execute_evm_call_tool(arguments_json).await, image: None }
+    }
+}
+
+pub(crate) struct EvmGas;
+
+#[async_trait]
+impl Tool for EvmGas {
+    fn name(&self) -> &'static str { "evm_gas" }
+    fn description(&self) -> &'static str { "Get current gas fee estimates on an EVM blockchain: gas price, max priority fee, and EIP-1559 fee estimation." }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"}},"required":["rpc_url"],"additionalProperties":false})
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput { result: execute_evm_gas_tool(arguments_json).await, image: None }
+    }
+}
+
+pub(crate) struct EvmLogs;
+
+#[async_trait]
+impl Tool for EvmLogs {
+    fn name(&self) -> &'static str { "evm_logs" }
+    fn description(&self) -> &'static str { "Query event logs on an EVM blockchain with optional filters by contract address, topic0, and block range." }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"address":{"type":"string","description":"Optional 0x-prefixed contract address to filter logs by"},"topic0":{"type":"string","description":"Optional 0x-prefixed event signature hash (topic0) to filter by"},"from_block":{"type":"string","description":"Optional starting block number or tag (e.g., '0x0', 'latest')"},"to_block":{"type":"string","description":"Optional ending block number or tag (e.g., '0x0', 'latest')"}},"required":["rpc_url"],"additionalProperties":false})
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput { result: execute_evm_logs_tool(arguments_json).await, image: None }
+    }
+}
+
+pub(crate) struct EvmNonce;
+
+#[async_trait]
+impl Tool for EvmNonce {
+    fn name(&self) -> &'static str { "evm_nonce" }
+    fn description(&self) -> &'static str { "Get the transaction count (nonce) for an address on an EVM blockchain." }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"address":{"type":"string","description":"0x-prefixed hex address"}},"required":["rpc_url","address"],"additionalProperties":false})
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput { result: execute_evm_nonce_tool(arguments_json).await, image: None }
+    }
+}
+
+pub(crate) struct EvmResolve;
+
+#[async_trait]
+impl Tool for EvmResolve {
+    fn name(&self) -> &'static str { "evm_resolve" }
+    fn description(&self) -> &'static str { "Resolve an ENS name to an address, or reverse-resolve an address to an ENS name on an EVM blockchain." }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node (must support ENS)"},"name_or_address":{"type":"string","description":"ENS name (e.g., 'vitalik.eth') or 0x-prefixed address for reverse lookup"}},"required":["rpc_url","name_or_address"],"additionalProperties":false})
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput { result: execute_evm_resolve_tool(arguments_json).await, image: None }
     }
 }
 

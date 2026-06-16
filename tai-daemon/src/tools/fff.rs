@@ -1,4 +1,5 @@
-use super::{ToolResult, sha256_hex, truncate_tool_output};
+use super::{Tool, ToolExecutionOutput, ToolResult, sha256_hex, truncate_tool_output};
+use async_trait::async_trait;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -84,6 +85,59 @@ fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, String> {
         .map_err(|e| format!("cache lock: {e}"))?
         .insert(abs, state.clone());
     Ok(state)
+}
+
+pub(crate) struct Fff;
+
+#[async_trait]
+impl Tool for Fff {
+    fn name(&self) -> &'static str {
+        "fff"
+    }
+    fn description(&self) -> &'static str {
+        "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes."
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query. Supports advanced syntax like 'ext:rs my_function' or 'path:src/**'. For file name search, this is a fuzzy pattern."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["grep", "files"],
+                    "description": "Search mode: 'grep' for content search (default), 'files' for file name fuzzy search",
+                    "default": "grep"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Root path for the search (default: current directory)"
+                },
+                "pattern_type": {
+                    "type": "string",
+                    "enum": ["plain", "regex", "fuzzy"],
+                    "description": "Pattern matching mode for grep: 'plain' (default), 'regex', or 'fuzzy'",
+                    "default": "plain"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 50
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        ToolExecutionOutput {
+            result: execute_fff_tool(arguments_json).await,
+            image: None,
+        }
+    }
 }
 
 pub(crate) async fn execute_fff_tool(arguments_json: &str) -> ToolResult {

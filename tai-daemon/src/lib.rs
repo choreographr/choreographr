@@ -1,4 +1,3 @@
-mod git_tools;
 pub mod openai;
 mod requests;
 mod server;

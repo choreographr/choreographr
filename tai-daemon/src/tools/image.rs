@@ -1,4 +1,5 @@
-use super::{PreparedImage, ToolExecutionOutput, ToolResult};
+use super::{PreparedImage, Tool, ToolExecutionOutput, ToolResult};
+use async_trait::async_trait;
 use crate::{SessionState, broadcast_to_session};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::GenericImageView;
@@ -231,4 +232,52 @@ pub(crate) async fn emit_prepared_image(
         None,
     )
     .await;
+}
+
+pub(crate) struct DisplayImage;
+
+#[async_trait]
+impl Tool for DisplayImage {
+    fn name(&self) -> &'static str {
+        "display_image"
+    }
+    fn description(&self) -> &'static str {
+        "Display a PNG, JPEG, or SVG image in the client UI."
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mime_type": {
+                    "type": "string",
+                    "enum": ["image/png", "image/jpeg", "image/svg+xml"]
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Relative or absolute path to an image file"
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Absolute http or https URL to an image"
+                },
+                "base64_data": {
+                    "type": "string",
+                    "description": "Raw image bytes encoded as base64"
+                },
+                "svg_text": {
+                    "type": "string",
+                    "description": "Inline SVG document text; only valid with mime_type image/svg+xml"
+                },
+                "alt": {
+                    "type": "string",
+                    "description": "Optional accessible description"
+                }
+            },
+            "required": ["mime_type"],
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+        execute_display_image_tool(arguments_json).await
+    }
 }
