@@ -12,6 +12,8 @@ mod http_tools;
 mod image_tools;
 #[path = "tools_fff.rs"]
 mod fff_tools;
+#[path = "tools_subxt.rs"]
+mod subxt_tools;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolResult {
@@ -114,6 +116,22 @@ pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecution
         },
         "fff" => ToolExecutionOutput {
             result: fff_tools::execute_fff_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "subxt_chain" => ToolExecutionOutput {
+            result: subxt_tools::execute_subxt_chain_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "subxt_balance" => ToolExecutionOutput {
+            result: subxt_tools::execute_subxt_balance_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "subxt_query" => ToolExecutionOutput {
+            result: subxt_tools::execute_subxt_query_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "subxt_block" => ToolExecutionOutput {
+            result: subxt_tools::execute_subxt_block_tool(&tool_call.arguments_json).await,
             image: None,
         },
         _ => ToolExecutionOutput {

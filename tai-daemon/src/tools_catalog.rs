@@ -586,5 +586,87 @@ pub(crate) fn available_tools() -> Vec<ChatToolDefinition> {
                 "additionalProperties": false
             }),
         ),
+        ChatToolDefinition::function(
+            "subxt_chain",
+            "Query information about a Substrate/Polkadot blockchain node: chain name, chain type, node name/version, genesis hash, best block, finalized head, system properties, and health.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "ws_url": {
+                        "type": "string",
+                        "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
+                        "default": "wss://rpc.polkadot.io"
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "subxt_balance",
+            "Query the balance of an account on a Substrate/Polkadot blockchain. Returns the System.Account info (free, reserved, frozen balances).",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "string",
+                        "description": "SS58-encoded account address"
+                    },
+                    "ws_url": {
+                        "type": "string",
+                        "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
+                        "default": "wss://rpc.polkadot.io"
+                    }
+                },
+                "required": ["address"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "subxt_query",
+            "Query a storage value from a Substrate/Polkadot blockchain by pallet and storage item name. Returns the decoded SCALE value as JSON.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pallet": {
+                        "type": "string",
+                        "description": "Pallet name (e.g., System, Balances, Staking)"
+                    },
+                    "storage_item": {
+                        "type": "string",
+                        "description": "Storage item name (e.g., Account, TotalIssuance, Validators)"
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Optional hex-encoded storage key bytes (without 0x prefix)"
+                    },
+                    "ws_url": {
+                        "type": "string",
+                        "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
+                        "default": "wss://rpc.polkadot.io"
+                    }
+                },
+                "required": ["pallet", "storage_item"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "subxt_block",
+            "Get details about a block on a Substrate/Polkadot blockchain: block number, hash, parent hash, state root, extrinsics root, and full block JSON.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "block_number": {
+                        "type": "integer",
+                        "description": "Optional block number (if omitted, gets the latest finalized block)"
+                    },
+                    "ws_url": {
+                        "type": "string",
+                        "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
+                        "default": "wss://rpc.polkadot.io"
+                    }
+                },
+                "additionalProperties": false
+            }),
+        ),
     ]
 }

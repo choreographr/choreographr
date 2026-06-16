@@ -8,6 +8,7 @@ base64 = "0.22"
 bytes = "1"
 dirs = "6"
 fff-search = "0.9.4"
+hex = "0.4"
 futures-util.workspace = true
 gix = { version = "0.84", features = ["tree-editor"] }
 image = "0.25"
@@ -16,6 +17,7 @@ resvg = "0.45"
 serde.workspace = true
 serde_json = "1"
 sha2 = "0.10"
+subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
 tai-proto.workspace = true
 tokio = { workspace = true, features = ["full"] }
 toml = "1.1"
