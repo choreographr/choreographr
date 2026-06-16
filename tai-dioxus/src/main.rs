@@ -150,7 +150,7 @@ fn App() -> Element {
         }
     };
 
-    let history = state.read().history.clone();
+    let history = state.read().client.history.clone();
     let input_value = state.read().input.clone();
     let cancel_value = state.read().pending_cancel.clone();
 

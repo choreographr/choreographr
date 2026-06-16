@@ -54,7 +54,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut y = area.y + area.height;
     let mut rows_to_skip = app.effective_scroll();
 
-    for item in app.history.iter_mut().rev() {
+    for item in app.client.history.iter_mut().rev() {
         if rows_remaining == 0 {
             break;
         }
@@ -81,7 +81,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     &mut rows_to_skip,
                 );
             }
-            HistoryItem::StreamingText(text) => {
+            HistoryItem::Streaming(text) => {
                 let lines = streaming_text_lines(text, area.width);
                 render_history_lines(
                     frame,

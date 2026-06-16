@@ -4,10 +4,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{collections::HashSet, io, sync::Arc, time::Duration};
 use tai_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
-use tai_sh::{
-    ImageAssembler, ShellCommand, build_picker, build_rendered_image, channel_closed,
-    parse_input_line,
-};
+use tai_sh::{ShellCommand, build_picker, build_rendered_image, channel_closed, parse_input_line};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
@@ -74,7 +71,6 @@ pub(crate) async fn run_app() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(socket_path.clone(), picker_protocol);
-    let mut assembler = ImageAssembler::new();
     client_tx
         .send(ClientMessage::ListSessions)
         .await
@@ -84,7 +80,6 @@ pub(crate) async fn run_app() -> io::Result<()> {
         &mut terminal,
         &mut app,
         &picker,
-        &mut assembler,
         &client_tx,
         &mut ui_rx,
         &active,
@@ -122,7 +117,6 @@ pub(crate) async fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     picker: &ratatui_image::picker::Picker,
-    assembler: &mut ImageAssembler,
     client_tx: &mpsc::Sender<ClientMessage>,
     ui_rx: &mut mpsc::Receiver<UiEvent>,
     active: &Arc<Mutex<HashSet<u32>>>,
@@ -138,7 +132,7 @@ pub(crate) async fn run_ui_loop(
         while let Ok(message) = ui_rx.try_recv() {
             match message {
                 UiEvent::Daemon(message) => {
-                    handle_daemon_message(message, app, picker, assembler, active, client_tx)
+                    handle_daemon_message(message, app, picker, active, client_tx)
                         .await?;
                 }
                 UiEvent::ReaderClosed => {
@@ -236,7 +230,6 @@ pub(crate) async fn handle_daemon_message(
     message: DaemonMessage,
     app: &mut App,
     picker: &ratatui_image::picker::Picker,
-    assembler: &mut ImageAssembler,
     active: &Arc<Mutex<HashSet<u32>>>,
     client_tx: &mpsc::Sender<ClientMessage>,
 ) -> io::Result<()> {
@@ -321,38 +314,35 @@ pub(crate) async fn handle_daemon_message(
         DaemonMessage::ImageStart {
             request_id,
             metadata,
-        } => assembler.start(request_id, metadata)?,
+        } => app.client.start_image(request_id, metadata)?,
         DaemonMessage::ImageChunk {
             request_id,
             image_id,
             data,
-        } => assembler.push_chunk(request_id, image_id, &data)?,
+        } => app.client.push_image_chunk(request_id, image_id, &data)?,
         DaemonMessage::ImageEnd {
             request_id,
             image_id,
         } => {
-            let (metadata, data) = assembler.finish(request_id, image_id)?;
+            let (metadata, data) = app.client.finish_image(request_id, image_id)?;
             let rendered = build_rendered_image(picker, metadata, data)?;
             app.push_image(rendered);
         }
         DaemonMessage::Done { request_id } => {
             app.finalize_stream(request_id);
             app.push_text(format!("[{request_id}] done"));
-            assembler.drop_request(request_id);
             active.lock().await.remove(&request_id);
             app.drop_request(request_id);
         }
         DaemonMessage::Failed { request_id, error } => {
             app.finalize_stream(request_id);
             app.push_text(format!("[{request_id}] failed: {error}"));
-            assembler.drop_request(request_id);
             active.lock().await.remove(&request_id);
             app.drop_request(request_id);
         }
         DaemonMessage::Cancelled { request_id } => {
             app.finalize_stream(request_id);
             app.push_text(format!("[{request_id}] cancelled"));
-            assembler.drop_request(request_id);
             active.lock().await.remove(&request_id);
             app.drop_request(request_id);
         }

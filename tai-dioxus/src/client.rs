@@ -207,22 +207,20 @@ pub(crate) fn apply_daemon_message(
             request_id,
             metadata,
         } => {
-            state.pending_images.start(request_id, metadata)?;
+            state.client.start_image(request_id, metadata)?;
         }
         DaemonMessage::ImageChunk {
             request_id,
             image_id,
             data,
         } => {
-            state
-                .pending_images
-                .push_chunk(request_id, image_id, &data)?;
+            state.client.push_image_chunk(request_id, image_id, &data)?;
         }
         DaemonMessage::ImageEnd {
             request_id,
             image_id,
         } => {
-            let (metadata, data) = state.pending_images.finish(request_id, image_id)?;
+            let (metadata, data) = state.client.finish_image(request_id, image_id)?;
             state.push_image(DisplayImage {
                 data_url: format!("data:{};base64,{}", metadata.mime_type, BASE64.encode(data)),
                 metadata,

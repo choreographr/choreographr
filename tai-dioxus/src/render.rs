@@ -1,18 +1,19 @@
 use crate::state::{HistoryItem, StreamingEntry};
+use tai_client_core::HistoryItem as SharedHistoryItem;
 use dioxus::prelude::*;
 use tai_client_core::render_markdown_html;
 use tai_proto::SessionMessage;
 
 pub(crate) fn render_history_item(item: HistoryItem) -> Element {
     match item {
-        HistoryItem::Text(text) => rsx! {
+        SharedHistoryItem::Text(text) => rsx! {
             div { class: "history-item text-item",
                 pre { "{text}" }
             }
         },
-        HistoryItem::SessionMessage(message) => render_session_message(message),
-        HistoryItem::Streaming(entry) => render_streaming_entry(entry),
-        HistoryItem::Image(image) => rsx! {
+        SharedHistoryItem::SessionMessage(message) => render_session_message(message),
+        SharedHistoryItem::Streaming(entry) => render_streaming_entry(entry),
+        SharedHistoryItem::Image(image) => rsx! {
             div { class: "history-item image-item",
                 div { class: "image-meta",
                     {format!(

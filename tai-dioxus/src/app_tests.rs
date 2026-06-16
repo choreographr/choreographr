@@ -93,8 +93,8 @@ fn app_state_stream_updates_history() {
     state.append_stream(7, OutputStream::Answer, "hello");
     state.append_stream(7, OutputStream::Answer, " world");
 
-    let index = state.in_progress[&7];
-    match &state.history[index] {
+    let index = state.client.in_progress[&7];
+    match &state.client.history[index] {
         HistoryItem::Streaming(entry) => {
             assert_eq!(entry.request_id, 7);
             assert_eq!(entry.reasoning, "thinking");
@@ -152,7 +152,7 @@ fn apply_daemon_image_messages_pushes_renderable_image() {
     )
     .expect("end");
 
-    match state.history.last().expect("image history item") {
+    match state.client.history.last().expect("image history item") {
         HistoryItem::Image(image) => {
             assert_eq!(image.metadata, metadata);
             assert!(image.data_url.starts_with("data:image/png;base64,"));

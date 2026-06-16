@@ -10,10 +10,10 @@ fn app_push_text_trims_history_to_limit() {
     for index in 0..600 {
         app.push_text(format!("line {index}"));
     }
-    assert_eq!(app.history.len(), 500);
-    match &app.history[0] {
+    assert_eq!(app.client.history.len(), 500);
+    match &app.client.history[0] {
         HistoryItem::Text(text) => assert!(text.contains("line 100")),
-        HistoryItem::SessionMessage(_) | HistoryItem::StreamingText(_) | HistoryItem::Image(_) => {
+        HistoryItem::SessionMessage(_) | HistoryItem::Streaming(_) | HistoryItem::Image(_) => {
             panic!("expected text history item")
         }
     }
@@ -26,7 +26,7 @@ fn drop_request_removes_active_request() {
     app.begin_stream(42);
     app.drop_request(42);
     assert!(!app.active.contains(&42));
-    assert!(!app.in_progress.contains_key(&42));
+    assert!(!app.client.in_progress.contains_key(&42));
 }
 
 #[test]
@@ -37,9 +37,9 @@ fn append_stream_text_updates_mutable_history_entry() {
     app.append_stream_text(7, OutputStream::Answer, "hello");
     app.append_stream_text(7, OutputStream::Answer, " world");
 
-    let index = app.in_progress[&7];
-    match &app.history[index] {
-        HistoryItem::StreamingText(text) => {
+    let index = app.client.in_progress[&7];
+    match &app.client.history[index] {
+        HistoryItem::Streaming(text) => {
             assert_eq!(text.request_id, 7);
             assert_eq!(text.reasoning, "thinking");
             assert_eq!(text.answer, "hello world");
@@ -371,7 +371,7 @@ fn trimming_history_reduces_scroll_by_trimmed_height() {
     app.history_viewport.width = 10;
     app.history_viewport.height = 1;
     app.history_scroll.follow_output = false;
-    app.history = (0..499)
+    app.client.history = (0..499)
         .map(|index| HistoryItem::Text(format!("line {index}")))
         .collect();
     app.history_scroll.scroll = 20;
@@ -383,7 +383,7 @@ fn trimming_history_reduces_scroll_by_trimmed_height() {
 
     app.push_text("tail");
 
-    assert_eq!(app.history.len(), 500);
+    assert_eq!(app.client.history.len(), 500);
     assert_eq!(app.history_scroll.scroll(), 20);
     assert_eq!(app.history_scroll.scroll_compensation(), 1);
     assert_eq!(app.effective_scroll(), 21);

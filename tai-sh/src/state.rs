@@ -1,5 +1,6 @@
 use ratatui::layout::Rect;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use tai_client_core::{ClientHistory, HistoryItem as SharedHistoryItem, MAX_HISTORY_ITEMS};
 use tai_proto::{OutputStream, SessionMessage};
 use tai_sh::{
     MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, RenderedImage,
@@ -10,8 +11,7 @@ pub(crate) struct App {
     pub(crate) input: String,
     pub(crate) next_request_id: u32,
     pub(crate) active: HashSet<u32>,
-    pub(crate) history: Vec<HistoryItem>,
-    pub(crate) in_progress: HashMap<u32, usize>,
+    pub(crate) client: ClientHistory<Box<RenderedImage>>,
     pub(crate) history_scroll: HistoryScrollState,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
@@ -30,13 +30,7 @@ pub(crate) struct HistoryScrollState {
     pub(crate) follow_output: bool,
 }
 
-pub(crate) enum HistoryItem {
-    Text(String),
-    SessionMessage(SessionMessage),
-    StreamingText(StreamingTextItem),
-    Image(Box<RenderedImage>),
-}
-
+pub(crate) type HistoryItem = SharedHistoryItem<Box<RenderedImage>>;
 pub(crate) type StreamingTextItem = StreamingText;
 
 pub(crate) enum UiEvent {
@@ -65,7 +59,7 @@ impl HistoryViewport {
                 let lines = session_message_lines(message, self.width);
                 lines_height(&lines, self.width).max(1)
             }
-            HistoryItem::StreamingText(text) => {
+            HistoryItem::Streaming(text) => {
                 let lines = streaming_text_lines(text, self.width);
                 lines_height(&lines, self.width).max(1)
             }
@@ -176,11 +170,10 @@ impl App {
             input: String::new(),
             next_request_id: 1,
             active: HashSet::new(),
-            history: vec![
+            client: ClientHistory::new(vec![
                 HistoryItem::Text(format!("Connected to tai-daemon at {socket_path}")),
                 HistoryItem::Text(format!("image protocol: {picker_protocol}")),
-            ],
-            in_progress: HashMap::new(),
+            ]),
             history_scroll: HistoryScrollState::new(),
             history_viewport: HistoryViewport::new(),
             should_quit: false,
@@ -188,7 +181,8 @@ impl App {
     }
 
     pub(crate) fn total_history_height(&self) -> usize {
-        self.history
+        self.client
+            .history
             .iter()
             .map(|item| self.history_viewport.item_height(item))
             .sum()
@@ -229,25 +223,25 @@ impl App {
 
     pub(crate) fn push_history_item(&mut self, item: HistoryItem) {
         let added_height = self.history_viewport.item_height(&item);
-        self.history.push(item);
+        let trimmed_height = self.trimmed_height_on_append();
+        self.client.push_history_item(item);
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
-        self.trim_history();
+        self.account_for_trimmed_height(trimmed_height);
         self.clamp_scroll_state();
     }
 
     pub(crate) fn begin_stream(&mut self, request_id: u32) {
-        if self.in_progress.contains_key(&request_id) {
+        if self.client.in_progress.contains_key(&request_id) {
             return;
         }
-        let index = self.history.len();
-        let item = HistoryItem::StreamingText(StreamingTextItem::new(request_id));
+        let item = HistoryItem::Streaming(StreamingTextItem::new(request_id));
         let added_height = self.history_viewport.item_height(&item);
-        self.history.push(item);
-        self.in_progress.insert(request_id, index);
+        let trimmed_height = self.trimmed_height_on_append();
+        self.client.begin_stream(request_id);
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
-        self.trim_history();
+        self.account_for_trimmed_height(trimmed_height);
         self.clamp_scroll_state();
     }
 
@@ -257,19 +251,19 @@ impl App {
         stream: OutputStream,
         chunk: &str,
     ) {
-        if !self.in_progress.contains_key(&request_id) {
+        if !self.client.in_progress.contains_key(&request_id) {
             self.begin_stream(request_id);
         }
-        if let Some(&index) = self.in_progress.get(&request_id) {
+        if let Some(&index) = self.client.in_progress.get(&request_id) {
             let old_height = self
+                .client
                 .history
                 .get(index)
                 .map(|item| self.history_viewport.item_height(item))
                 .unwrap_or(0);
-            if let Some(HistoryItem::StreamingText(text)) = self.history.get_mut(index) {
-                text.append(stream, chunk);
-            }
+            self.client.append_stream(request_id, stream, chunk);
             let new_height = self
+                .client
                 .history
                 .get(index)
                 .map(|item| self.history_viewport.item_height(item))
@@ -279,7 +273,7 @@ impl App {
     }
 
     pub(crate) fn finalize_stream(&mut self, request_id: u32) {
-        self.in_progress.remove(&request_id);
+        self.client.in_progress.remove(&request_id);
     }
 
     pub(crate) fn scroll_up(&mut self, amount: usize) {
@@ -297,26 +291,18 @@ impl App {
         self.finalize_stream(request_id);
     }
 
-    fn trim_history(&mut self) {
-        if self.history.len() <= 500 {
-            return;
+    fn trimmed_height_on_append(&self) -> usize {
+        if self.client.history.len() < MAX_HISTORY_ITEMS || self.history_scroll.follow_output() {
+            return 0;
         }
-        let excess = self.history.len() - 500;
-        let trimmed_height = if self.history_scroll.follow_output() {
-            0
-        } else {
-            self.history
-                .iter()
-                .take(excess)
-                .map(|item| self.history_viewport.item_height(item))
-                .sum::<usize>()
-        };
-        self.history.drain(0..excess);
-        for index in self.in_progress.values_mut() {
-            *index = index.saturating_sub(excess);
-        }
-        self.in_progress
-            .retain(|_, index| *index < self.history.len());
+        self.client
+            .history
+            .first()
+            .map(|item| self.history_viewport.item_height(item))
+            .unwrap_or(0)
+    }
+
+    fn account_for_trimmed_height(&mut self, trimmed_height: usize) {
         self.history_scroll
             .account_for_trimmed_height(trimmed_height, self.max_scroll_offset());
     }

@@ -44,7 +44,7 @@ impl PendingImage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ImageAssembler {
     pending: HashMap<(u32, u32), PendingImage>,
 }
