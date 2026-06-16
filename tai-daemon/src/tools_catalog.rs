@@ -650,6 +650,214 @@ pub(crate) fn available_tools() -> Vec<ChatToolDefinition> {
             }),
         ),
         ChatToolDefinition::function(
+            "evm_chain",
+            "Query information about an EVM blockchain node: chain ID, latest block number, gas price, max priority fee, and client version.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rpc_url": {
+                        "type": "string",
+                        "description": "JSON-RPC URL of the EVM node (e.g., https://ethereum-rpc.publicnode.com)"
+                    }
+                },
+                "required": ["rpc_url"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "evm_balance",
+            "Query the native ETH/coin balance of an address on an EVM blockchain.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rpc_url": {
+                        "type": "string",
+                        "description": "JSON-RPC URL of the EVM node"
+                    },
+                    "address": {
+                        "type": "string",
+                        "description": "0x-prefixed hex address"
+                    }
+                },
+                "required": ["rpc_url", "address"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "evm_token_balance",
+            "Query the ERC-20 token balance for an address. Also attempts to fetch the token symbol.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rpc_url": {
+                        "type": "string",
+                        "description": "JSON-RPC URL of the EVM node"
+                    },
+                    "token_address": {
+                        "type": "string",
+                        "description": "0x-prefixed ERC-20 token contract address"
+                    },
+                    "address": {
+                        "type": "string",
+                        "description": "0x-prefixed wallet address to check balance for"
+                    }
+                },
+                "required": ["rpc_url", "token_address", "address"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "evm_block",
+            "Get details about a block on an EVM blockchain: block number, hash, timestamp, transaction count, gas used/limit, and base fee.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rpc_url": {
+                        "type": "string",
+                        "description": "JSON-RPC URL of the EVM node"
+                    },
+                    "block_tag": {
+                        "type": "string",
+                        "description": "Block number (decimal or 0x-hex), or 'latest', 'finalized', 'safe', 'pending', 'earliest'",
+                        "default": "latest"
+                    }
+                },
+                "required": ["rpc_url"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "evm_transaction",
+            "Get details about a transaction on an EVM blockchain by its hash. Returns hash, block number, from/to, gas used, effective gas price, and log count.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rpc_url": {
+                        "type": "string",
+                        "description": "JSON-RPC URL of the EVM node"
+                    },
+                    "tx_hash": {
+                        "type": "string",
+                        "description": "0x-prefixed transaction hash"
+                    }
+                },
+                "required": ["rpc_url", "tx_hash"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "evm_call",
+            "Execute a read-only smart contract call (eth_call) on an EVM blockchain. Returns the raw hex-encoded result bytes.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rpc_url": {
+                        "type": "string",
+                        "description": "JSON-RPC URL of the EVM node"
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "0x-prefixed contract address to call"
+                    },
+                    "data": {
+                        "type": "string",
+                        "description": "0x-prefixed hex-encoded call data (method selector + ABI-encoded params)"
+                    },
+                    "block_tag": {
+                        "type": "string",
+                        "description": "Block number (decimal or 0x-hex), or 'latest', 'finalized', 'safe', 'pending', 'earliest'",
+                        "default": "latest"
+                    }
+                },
+                "required": ["rpc_url", "to", "data"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "evm_gas",
+            "Get current gas fee estimates on an EVM blockchain: gas price, max priority fee, and EIP-1559 fee estimation.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rpc_url": {
+                        "type": "string",
+                        "description": "JSON-RPC URL of the EVM node"
+                    }
+                },
+                "required": ["rpc_url"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "evm_logs",
+            "Query event logs on an EVM blockchain with optional filters by contract address, topic0, and block range.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rpc_url": {
+                        "type": "string",
+                        "description": "JSON-RPC URL of the EVM node"
+                    },
+                    "address": {
+                        "type": "string",
+                        "description": "Optional 0x-prefixed contract address to filter logs by"
+                    },
+                    "topic0": {
+                        "type": "string",
+                        "description": "Optional 0x-prefixed event signature hash (topic0) to filter by"
+                    },
+                    "from_block": {
+                        "type": "string",
+                        "description": "Optional starting block number or tag (e.g., '0x0', 'latest')"
+                    },
+                    "to_block": {
+                        "type": "string",
+                        "description": "Optional ending block number or tag (e.g., '0x0', 'latest')"
+                    }
+                },
+                "required": ["rpc_url"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "evm_nonce",
+            "Get the transaction count (nonce) for an address on an EVM blockchain.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rpc_url": {
+                        "type": "string",
+                        "description": "JSON-RPC URL of the EVM node"
+                    },
+                    "address": {
+                        "type": "string",
+                        "description": "0x-prefixed hex address"
+                    }
+                },
+                "required": ["rpc_url", "address"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
+            "evm_resolve",
+            "Resolve an ENS name to an address, or reverse-resolve an address to an ENS name on an EVM blockchain.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "rpc_url": {
+                        "type": "string",
+                        "description": "JSON-RPC URL of the EVM node (must support ENS)"
+                    },
+                    "name_or_address": {
+                        "type": "string",
+                        "description": "ENS name (e.g., 'vitalik.eth') or 0x-prefixed address for reverse lookup"
+                    }
+                },
+                "required": ["rpc_url", "name_or_address"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
             "subxt_block",
             "Get details about a block on a Substrate/Polkadot blockchain: block number, hash, parent hash, state root, extrinsics root, and full block JSON.",
             serde_json::json!({

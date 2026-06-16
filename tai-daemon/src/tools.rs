@@ -12,6 +12,8 @@ mod http_tools;
 mod image_tools;
 #[path = "tools_fff.rs"]
 mod fff_tools;
+#[path = "tools_evm.rs"]
+mod evm_tools;
 #[path = "tools_subxt.rs"]
 mod subxt_tools;
 
@@ -132,6 +134,46 @@ pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecution
         },
         "subxt_block" => ToolExecutionOutput {
             result: subxt_tools::execute_subxt_block_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "evm_chain" => ToolExecutionOutput {
+            result: evm_tools::execute_evm_chain_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "evm_balance" => ToolExecutionOutput {
+            result: evm_tools::execute_evm_balance_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "evm_token_balance" => ToolExecutionOutput {
+            result: evm_tools::execute_evm_token_balance_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "evm_block" => ToolExecutionOutput {
+            result: evm_tools::execute_evm_block_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "evm_transaction" => ToolExecutionOutput {
+            result: evm_tools::execute_evm_transaction_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "evm_call" => ToolExecutionOutput {
+            result: evm_tools::execute_evm_call_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "evm_gas" => ToolExecutionOutput {
+            result: evm_tools::execute_evm_gas_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "evm_logs" => ToolExecutionOutput {
+            result: evm_tools::execute_evm_logs_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "evm_nonce" => ToolExecutionOutput {
+            result: evm_tools::execute_evm_nonce_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "evm_resolve" => ToolExecutionOutput {
+            result: evm_tools::execute_evm_resolve_tool(&tool_call.arguments_json).await,
             image: None,
         },
         _ => ToolExecutionOutput {
