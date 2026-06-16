@@ -10,6 +10,8 @@ mod fs_tools;
 mod http_tools;
 #[path = "tools_image.rs"]
 mod image_tools;
+#[path = "tools_fff.rs"]
+mod fff_tools;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolResult {
@@ -108,6 +110,10 @@ pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecution
         },
         "git_push" => ToolExecutionOutput {
             result: git_tools::execute_git_push_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
+        "fff" => ToolExecutionOutput {
+            result: fff_tools::execute_fff_tool(&tool_call.arguments_json).await,
             image: None,
         },
         _ => ToolExecutionOutput {

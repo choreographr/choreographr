@@ -549,5 +549,42 @@ pub(crate) fn available_tools() -> Vec<ChatToolDefinition> {
                 "additionalProperties": false
             }),
         ),
+        ChatToolDefinition::function(
+            "fff",
+            "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query. Supports advanced syntax like 'ext:rs my_function' or 'path:src/**'. For file name search, this is a fuzzy pattern."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["grep", "files"],
+                        "description": "Search mode: 'grep' for content search (default), 'files' for file name fuzzy search",
+                        "default": "grep"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Root path for the search (default: current directory)"
+                    },
+                    "pattern_type": {
+                        "type": "string",
+                        "enum": ["plain", "regex", "fuzzy"],
+                        "description": "Pattern matching mode for grep: 'plain' (default), 'regex', or 'fuzzy'",
+                        "default": "plain"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 50
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        ),
     ]
 }
