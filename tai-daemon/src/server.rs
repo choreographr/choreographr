@@ -10,9 +10,19 @@ use tai_proto::{ClientMessage, DaemonMessage, SessionMessage, read_message, writ
 use tokio::{
     io::AsyncWriteExt,
     net::{UnixListener, UnixStream},
+    signal::unix::{signal, SignalKind},
     sync::{Mutex, mpsc},
 };
 use tracing::{debug, error, info, warn};
+
+async fn wait_for_shutdown() {
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    tokio::select! {
+        _ = sigint.recv() => info!("received SIGINT, shutting down tai-daemon"),
+        _ = sigterm.recv() => info!("received SIGTERM, shutting down tai-daemon"),
+    }
+}
 
 pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Result<()> {
     if Path::new(socket_path).exists() {
@@ -38,11 +48,7 @@ pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Resul
                     }
                 });
             }
-            ctrl_c_result = tokio::signal::ctrl_c() => {
-                ctrl_c_result.map_err(io::Error::other)?;
-                info!("received ctrl+c, shutting down tai-daemon");
-                break Ok(());
-            }
+            _ = wait_for_shutdown() => break Ok(()),
         }
     };
 
