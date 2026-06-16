@@ -61,15 +61,36 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
         match item {
             HistoryItem::Text(text) => {
-                render_history_text(frame, area, text.as_str(), &mut rows_remaining, &mut y, &mut rows_to_skip);
+                render_history_text(
+                    frame,
+                    area,
+                    text.as_str(),
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
             }
             HistoryItem::SessionMessage(message) => {
                 let lines = session_message_lines(message, area.width);
-                render_history_lines(frame, area, lines, &mut rows_remaining, &mut y, &mut rows_to_skip);
+                render_history_lines(
+                    frame,
+                    area,
+                    lines,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
             }
             HistoryItem::StreamingText(text) => {
                 let lines = streaming_text_lines(text, area.width);
-                render_history_lines(frame, area, lines, &mut rows_remaining, &mut y, &mut rows_to_skip);
+                render_history_lines(
+                    frame,
+                    area,
+                    lines,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
             }
             HistoryItem::Image(image) => {
                 let full_height = image_block_height(area.height as usize);
@@ -90,7 +111,12 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     image.metadata.width,
                     image.metadata.height
                 ));
-                let rect = Rect { x: area.x, y, width: area.width, height };
+                let rect = Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height,
+                };
                 let inner = block.inner(rect);
                 frame.render_widget(block, rect);
                 frame.render_stateful_widget(StatefulImage::default(), inner, &mut image.protocol);
@@ -124,9 +150,16 @@ fn render_history_text(
     let top_line = bottom_line.saturating_sub(visible_height);
 
     *y = (*y).saturating_sub(visible_height as u16);
-    let rect = Rect { x: area.x, y: *y, width: area.width, height: visible_height as u16 };
+    let rect = Rect {
+        x: area.x,
+        y: *y,
+        width: area.width,
+        height: visible_height as u16,
+    };
     frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).scroll((top_line as u16, 0)),
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((top_line as u16, 0)),
         rect,
     );
     *rows_remaining -= visible_height;
@@ -156,9 +189,16 @@ fn render_history_lines(
     let top_line = bottom_line.saturating_sub(visible_height);
 
     *y = (*y).saturating_sub(visible_height as u16);
-    let rect = Rect { x: area.x, y: *y, width: area.width, height: visible_height as u16 };
+    let rect = Rect {
+        x: area.x,
+        y: *y,
+        width: area.width,
+        height: visible_height as u16,
+    };
     frame.render_widget(
-        Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }).scroll((top_line as u16, 0)),
+        Paragraph::new(lines.join("\n"))
+            .wrap(Wrap { trim: false })
+            .scroll((top_line as u16, 0)),
         rect,
     );
     *rows_remaining -= visible_height;

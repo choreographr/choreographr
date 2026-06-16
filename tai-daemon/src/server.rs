@@ -2,8 +2,8 @@ use crate::openai::{AuthConfig, OpenAiClient, RequestFormat};
 use crate::requests::{emit_demo_image, execute_chat_tool_request, execute_plain_request};
 use crate::sessions::{
     ActiveRequest, DaemonState, SessionState, broadcast_message_appended, broadcast_to_session,
-    default_session_id, list_sessions, new_daemon_state, require_attached_session,
-    session_by_id, session_snapshot, update_subscription,
+    default_session_id, list_sessions, new_daemon_state, require_attached_session, session_by_id,
+    session_snapshot, update_subscription,
 };
 use std::{collections::HashMap, io, path::Path, sync::Arc};
 use tai_proto::{ClientMessage, DaemonMessage, SessionMessage, read_message, write_message};
@@ -103,8 +103,14 @@ pub async fn handle_client(
                             guard.sessions.insert(session_id, Arc::clone(&session));
                             (session_id, session)
                         };
-                        update_subscription(&state, client_id, attached_session_id, Some(session_id), &tx)
-                            .await;
+                        update_subscription(
+                            &state,
+                            client_id,
+                            attached_session_id,
+                            Some(session_id),
+                            &tx,
+                        )
+                        .await;
                         attached_session_id = Some(session_id);
                         let _ = tx
                             .send(DaemonMessage::SessionCreated {
@@ -130,8 +136,14 @@ pub async fn handle_client(
                                 .await;
                             continue;
                         };
-                        update_subscription(&state, client_id, attached_session_id, Some(session_id), &tx)
-                            .await;
+                        update_subscription(
+                            &state,
+                            client_id,
+                            attached_session_id,
+                            Some(session_id),
+                            &tx,
+                        )
+                        .await;
                         attached_session_id = Some(session_id);
                         let _ = tx.send(DaemonMessage::SessionAttached { session_id }).await;
                         let snapshot = session_snapshot(session_id, &session).await;
@@ -207,21 +219,43 @@ pub async fn handle_client(
                         let client_clone = Arc::clone(&client);
                         let session_clone = Arc::clone(&session);
                         let handle = tokio::spawn(async move {
-                            broadcast_to_session(&session_clone, DaemonMessage::Started { request_id }, None).await;
+                            broadcast_to_session(
+                                &session_clone,
+                                DaemonMessage::Started { request_id },
+                                None,
+                            )
+                            .await;
 
                             let result = match request_format {
                                 RequestFormat::Responses => {
-                                    execute_plain_request(&client_clone, &session_clone, &model, request_id).await
+                                    execute_plain_request(
+                                        &client_clone,
+                                        &session_clone,
+                                        &model,
+                                        request_id,
+                                    )
+                                    .await
                                 }
                                 RequestFormat::ChatCompletions => {
-                                    execute_chat_tool_request(&client_clone, &session_clone, &model, request_id).await
+                                    execute_chat_tool_request(
+                                        &client_clone,
+                                        &session_clone,
+                                        &model,
+                                        request_id,
+                                    )
+                                    .await
                                 }
                             };
 
                             match result {
                                 Ok(()) => {
                                     info!(request_id, session_id, "request completed");
-                                    broadcast_to_session(&session_clone, DaemonMessage::Done { request_id }, None).await;
+                                    broadcast_to_session(
+                                        &session_clone,
+                                        DaemonMessage::Done { request_id },
+                                        None,
+                                    )
+                                    .await;
                                 }
                                 Err(error) => {
                                     warn!(request_id, session_id, error = %error, "request failed");
@@ -236,10 +270,18 @@ pub async fn handle_client(
                                     .await;
                                 }
                             }
-                            session_clone.lock().await.active_requests.remove(&request_id);
+                            session_clone
+                                .lock()
+                                .await
+                                .active_requests
+                                .remove(&request_id);
                         });
 
-                        session.lock().await.active_requests.insert(request_id, ActiveRequest { handle });
+                        session
+                            .lock()
+                            .await
+                            .active_requests
+                            .insert(request_id, ActiveRequest { handle });
                     }
                     ClientMessage::TestImage { request_id } => {
                         let Some((_session_id, _session)) =
@@ -254,7 +296,10 @@ pub async fn handle_client(
                                 let _ = tx.send(DaemonMessage::Done { request_id }).await;
                             }
                             Err(_) => {
-                                warn!(request_id, "client disconnected before image could be delivered");
+                                warn!(
+                                    request_id,
+                                    "client disconnected before image could be delivered"
+                                );
                             }
                         }
                     }
@@ -264,13 +309,23 @@ pub async fn handle_client(
                         else {
                             continue;
                         };
-                        if let Some(active_request) = session.lock().await.active_requests.remove(&request_id) {
+                        if let Some(active_request) =
+                            session.lock().await.active_requests.remove(&request_id)
+                        {
                             info!(request_id, session_id, "cancelling active request");
                             active_request.handle.abort();
                             let _ = tx.send(DaemonMessage::Cancelled { request_id }).await;
-                            broadcast_to_session(&session, DaemonMessage::Cancelled { request_id }, Some(client_id)).await;
+                            broadcast_to_session(
+                                &session,
+                                DaemonMessage::Cancelled { request_id },
+                                Some(client_id),
+                            )
+                            .await;
                         } else {
-                            warn!(request_id, session_id, "cancel requested for inactive request");
+                            warn!(
+                                request_id,
+                                session_id, "cancel requested for inactive request"
+                            );
                             let _ = tx
                                 .send(DaemonMessage::Failed {
                                     request_id,
@@ -295,7 +350,12 @@ pub async fn handle_client(
                         };
                         match client.validate_and_list_models().await {
                             Ok(models) => {
-                                let _ = tx.send(DaemonMessage::Models { models, selected_model }).await;
+                                let _ = tx
+                                    .send(DaemonMessage::Models {
+                                        models,
+                                        selected_model,
+                                    })
+                                    .await;
                             }
                             Err(error) => {
                                 let _ = tx
@@ -318,7 +378,12 @@ pub async fn handle_client(
                             Ok(models) => {
                                 if models.iter().any(|candidate| candidate == &model) {
                                     session.lock().await.selected_model = Some(model.clone());
-                                    broadcast_to_session(&session, DaemonMessage::ModelSelected { model }, None).await;
+                                    broadcast_to_session(
+                                        &session,
+                                        DaemonMessage::ModelSelected { model },
+                                        None,
+                                    )
+                                    .await;
                                 } else {
                                     let _ = tx
                                         .send(DaemonMessage::ModelSelectionFailed {

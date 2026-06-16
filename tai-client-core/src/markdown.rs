@@ -124,7 +124,9 @@ impl MarkdownDocument {
                     Tag::BlockQuote(_) => block_stack.push(BlockContext::Quote(Vec::new())),
                     Tag::List(start) => block_stack.push(BlockContext::List {
                         ordered: start.is_some(),
-                        start: start.and_then(|value| usize::try_from(value).ok()).unwrap_or(1),
+                        start: start
+                            .and_then(|value| usize::try_from(value).ok())
+                            .unwrap_or(1),
                         items: Vec::new(),
                     }),
                     Tag::Item => block_stack.push(BlockContext::Item(Vec::new())),
@@ -145,7 +147,8 @@ impl MarkdownDocument {
                         in_header: false,
                     }),
                     Tag::TableHead => {
-                        if let Some(BlockContext::Table { in_header, .. }) = block_stack.last_mut() {
+                        if let Some(BlockContext::Table { in_header, .. }) = block_stack.last_mut()
+                        {
                             *in_header = true;
                         }
                     }
@@ -166,22 +169,47 @@ impl MarkdownDocument {
                 Event::End(tag) => match tag {
                     TagEnd::Paragraph => {
                         if let Some(BlockContext::Paragraph(content)) = block_stack.pop() {
-                            push_block(&mut blocks, &mut block_stack, MarkdownBlock::Paragraph(content));
+                            push_block(
+                                &mut blocks,
+                                &mut block_stack,
+                                MarkdownBlock::Paragraph(content),
+                            );
                         }
                     }
                     TagEnd::Heading(_) => {
                         if let Some(BlockContext::Heading { level, content }) = block_stack.pop() {
-                            push_block(&mut blocks, &mut block_stack, MarkdownBlock::Heading { level, content });
+                            push_block(
+                                &mut blocks,
+                                &mut block_stack,
+                                MarkdownBlock::Heading { level, content },
+                            );
                         }
                     }
                     TagEnd::BlockQuote(_) => {
                         if let Some(BlockContext::Quote(content)) = block_stack.pop() {
-                            push_block(&mut blocks, &mut block_stack, MarkdownBlock::BlockQuote(content));
+                            push_block(
+                                &mut blocks,
+                                &mut block_stack,
+                                MarkdownBlock::BlockQuote(content),
+                            );
                         }
                     }
                     TagEnd::List(_) => {
-                        if let Some(BlockContext::List { ordered, start, items }) = block_stack.pop() {
-                            push_block(&mut blocks, &mut block_stack, MarkdownBlock::List { ordered, start, items });
+                        if let Some(BlockContext::List {
+                            ordered,
+                            start,
+                            items,
+                        }) = block_stack.pop()
+                        {
+                            push_block(
+                                &mut blocks,
+                                &mut block_stack,
+                                MarkdownBlock::List {
+                                    ordered,
+                                    start,
+                                    items,
+                                },
+                            );
                         }
                     }
                     TagEnd::Item => {
@@ -192,25 +220,54 @@ impl MarkdownDocument {
                         }
                     }
                     TagEnd::CodeBlock => {
-                        if let Some(BlockContext::CodeBlock { language, code }) = block_stack.pop() {
-                            push_block(&mut blocks, &mut block_stack, MarkdownBlock::CodeBlock { language, code });
+                        if let Some(BlockContext::CodeBlock { language, code }) = block_stack.pop()
+                        {
+                            push_block(
+                                &mut blocks,
+                                &mut block_stack,
+                                MarkdownBlock::CodeBlock { language, code },
+                            );
                         }
                     }
                     TagEnd::Table => {
-                        if let Some(BlockContext::Table { alignments, header, rows, .. }) = block_stack.pop() {
-                            push_block(&mut blocks, &mut block_stack, MarkdownBlock::Table { alignments, header, rows });
+                        if let Some(BlockContext::Table {
+                            alignments,
+                            header,
+                            rows,
+                            ..
+                        }) = block_stack.pop()
+                        {
+                            push_block(
+                                &mut blocks,
+                                &mut block_stack,
+                                MarkdownBlock::Table {
+                                    alignments,
+                                    header,
+                                    rows,
+                                },
+                            );
                         }
                     }
                     TagEnd::TableHead => {
-                        if let Some(BlockContext::Table { in_header, .. }) = block_stack.last_mut() {
+                        if let Some(BlockContext::Table { in_header, .. }) = block_stack.last_mut()
+                        {
                             *in_header = false;
                         }
                     }
                     TagEnd::TableRow => {
                         if let Some(BlockContext::TableRow(row)) = block_stack.pop()
-                            && let Some(BlockContext::Table { header, rows, in_header, .. }) = block_stack.last_mut()
+                            && let Some(BlockContext::Table {
+                                header,
+                                rows,
+                                in_header,
+                                ..
+                            }) = block_stack.last_mut()
                         {
-                            if *in_header { *header = row; } else { rows.push(row); }
+                            if *in_header {
+                                *header = row;
+                            } else {
+                                rows.push(row);
+                            }
                         }
                     }
                     TagEnd::TableCell => {
@@ -222,22 +279,46 @@ impl MarkdownDocument {
                     }
                     TagEnd::Emphasis => {
                         if let Some(InlineContext::Emphasis(content)) = inline_stack.pop() {
-                            push_inline(&mut block_stack, &mut inline_stack, MarkdownInline::Emphasis(content));
+                            push_inline(
+                                &mut block_stack,
+                                &mut inline_stack,
+                                MarkdownInline::Emphasis(content),
+                            );
                         }
                     }
                     TagEnd::Strong => {
                         if let Some(InlineContext::Strong(content)) = inline_stack.pop() {
-                            push_inline(&mut block_stack, &mut inline_stack, MarkdownInline::Strong(content));
+                            push_inline(
+                                &mut block_stack,
+                                &mut inline_stack,
+                                MarkdownInline::Strong(content),
+                            );
                         }
                     }
                     TagEnd::Link => {
-                        if let Some(InlineContext::Link { destination, content }) = inline_stack.pop() {
-                            push_inline(&mut block_stack, &mut inline_stack, MarkdownInline::Link { content, destination });
+                        if let Some(InlineContext::Link {
+                            destination,
+                            content,
+                        }) = inline_stack.pop()
+                        {
+                            push_inline(
+                                &mut block_stack,
+                                &mut inline_stack,
+                                MarkdownInline::Link {
+                                    content,
+                                    destination,
+                                },
+                            );
                         }
                     }
                     TagEnd::Image => {
-                        if let Some(InlineContext::Image { destination, alt }) = inline_stack.pop() {
-                            push_inline(&mut block_stack, &mut inline_stack, MarkdownInline::Image { alt, destination });
+                        if let Some(InlineContext::Image { destination, alt }) = inline_stack.pop()
+                        {
+                            push_inline(
+                                &mut block_stack,
+                                &mut inline_stack,
+                                MarkdownInline::Image { alt, destination },
+                            );
                         }
                     }
                     _ => {}
@@ -245,12 +326,28 @@ impl MarkdownDocument {
                 Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
                     push_text(&mut block_stack, &mut inline_stack, &text);
                 }
-                Event::Code(text) => push_inline(&mut block_stack, &mut inline_stack, MarkdownInline::Code(text.to_string())),
-                Event::SoftBreak | Event::HardBreak => push_inline(&mut block_stack, &mut inline_stack, MarkdownInline::LineBreak),
+                Event::Code(text) => push_inline(
+                    &mut block_stack,
+                    &mut inline_stack,
+                    MarkdownInline::Code(text.to_string()),
+                ),
+                Event::SoftBreak | Event::HardBreak => push_inline(
+                    &mut block_stack,
+                    &mut inline_stack,
+                    MarkdownInline::LineBreak,
+                ),
                 Event::Rule => push_block(&mut blocks, &mut block_stack, MarkdownBlock::Rule),
-                Event::InlineMath(text) | Event::DisplayMath(text) => push_text(&mut block_stack, &mut inline_stack, &text),
-                Event::FootnoteReference(text) => push_text(&mut block_stack, &mut inline_stack, &format!("[{text}]")),
-                Event::TaskListMarker(checked) => push_text(&mut block_stack, &mut inline_stack, if checked { "[x] " } else { "[ ] " }),
+                Event::InlineMath(text) | Event::DisplayMath(text) => {
+                    push_text(&mut block_stack, &mut inline_stack, &text)
+                }
+                Event::FootnoteReference(text) => {
+                    push_text(&mut block_stack, &mut inline_stack, &format!("[{text}]"))
+                }
+                Event::TaskListMarker(checked) => push_text(
+                    &mut block_stack,
+                    &mut inline_stack,
+                    if checked { "[x] " } else { "[ ] " },
+                ),
             }
         }
 
@@ -324,7 +421,11 @@ fn push_block(root: &mut Vec<MarkdownBlock>, stack: &mut [BlockContext], block: 
 
 fn push_text(block_stack: &mut [BlockContext], inline_stack: &mut [InlineContext], text: &str) {
     if !text.is_empty() {
-        push_inline(block_stack, inline_stack, MarkdownInline::Text(text.to_string()));
+        push_inline(
+            block_stack,
+            inline_stack,
+            MarkdownInline::Text(text.to_string()),
+        );
     }
 }
 
@@ -431,12 +532,22 @@ fn write_markdown_block(block: &MarkdownBlock, markdown: &mut String) {
                 markdown.push_str(line);
             }
         }
-        MarkdownBlock::List { ordered, start, items } => {
+        MarkdownBlock::List {
+            ordered,
+            start,
+            items,
+        } => {
             for (index, item) in items.iter().enumerate() {
-                let marker = if *ordered { format!("{}. ", start + index) } else { "- ".to_string() };
+                let marker = if *ordered {
+                    format!("{}. ", start + index)
+                } else {
+                    "- ".to_string()
+                };
                 let mut item_markdown = String::new();
                 for (block_index, block) in item.iter().enumerate() {
-                    if block_index > 0 { item_markdown.push_str("\n\n"); }
+                    if block_index > 0 {
+                        item_markdown.push_str("\n\n");
+                    }
                     write_markdown_block(block, &mut item_markdown);
                 }
                 let mut lines = item_markdown.lines();
@@ -456,7 +567,11 @@ fn write_markdown_block(block: &MarkdownBlock, markdown: &mut String) {
                 }
             }
         }
-        MarkdownBlock::Table { alignments, header, rows } => {
+        MarkdownBlock::Table {
+            alignments,
+            header,
+            rows,
+        } => {
             write_table_row_markdown(header, markdown);
             markdown.push('\n');
             markdown.push('|');
@@ -510,7 +625,10 @@ fn write_markdown_inlines(inlines: &[MarkdownInline], markdown: &mut String) {
                 write_markdown_inlines(content, markdown);
                 markdown.push_str("**");
             }
-            MarkdownInline::Link { content, destination } => {
+            MarkdownInline::Link {
+                content,
+                destination,
+            } => {
                 markdown.push('[');
                 write_markdown_inlines(content, markdown);
                 markdown.push_str("](");

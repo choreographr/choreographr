@@ -98,7 +98,11 @@ fn render_session_message(message: SessionMessage) -> Element {
             is_error,
             ..
         } => {
-            let label = if is_error { "tool error" } else { "tool result" };
+            let label = if is_error {
+                "tool error"
+            } else {
+                "tool result"
+            };
             render_labeled_plain_message(
                 label,
                 format!("{name}: {content}"),
@@ -123,7 +127,8 @@ fn render_labeled_plain_message(
 }
 
 fn render_streaming_entry(entry: StreamingEntry) -> Element {
-    let answer_html = (!entry.answer.trim().is_empty()).then(|| render_markdown_html(&entry.answer));
+    let answer_html =
+        (!entry.answer.trim().is_empty()).then(|| render_markdown_html(&entry.answer));
     rsx! {
         div { class: "history-item stream-item",
             div { class: "request-id", "[{entry.request_id}]" }

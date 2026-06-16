@@ -3,9 +3,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use dioxus::prelude::{Readable, Signal, Writable};
 use std::io;
 use tai_client_core::{ShellCommand, parse_input_line};
-use tai_proto::{
-    ClientMessage, DaemonMessage, read_message, socket_path, write_message,
-};
+use tai_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
 use tokio::{
     net::UnixStream,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -182,7 +180,9 @@ pub(crate) fn apply_daemon_message(
             tool_name,
             output,
         } => {
-            state.push_text(format!("[{request_id}] tool {tool_name}#{call_id} ok: {output}"));
+            state.push_text(format!(
+                "[{request_id}] tool {tool_name}#{call_id} ok: {output}"
+            ));
         }
         DaemonMessage::ToolCallFailed {
             request_id,
@@ -214,7 +214,9 @@ pub(crate) fn apply_daemon_message(
             image_id,
             data,
         } => {
-            state.pending_images.push_chunk(request_id, image_id, &data)?;
+            state
+                .pending_images
+                .push_chunk(request_id, image_id, &data)?;
         }
         DaemonMessage::ImageEnd {
             request_id,

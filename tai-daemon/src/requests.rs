@@ -75,7 +75,10 @@ pub(crate) async fn execute_chat_tool_request(
             let guard = session.lock().await;
             build_chat_request_messages(&guard.messages)
         };
-        match client.chat_completion_turn(model, &messages, &tools).await? {
+        match client
+            .chat_completion_turn(model, &messages, &tools)
+            .await?
+        {
             ChatTurnResult::FinalText(content) => {
                 broadcast_to_session(
                     session,

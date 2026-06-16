@@ -65,15 +65,31 @@ pub(crate) async fn run_app() -> io::Result<()> {
 
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+    crossterm::execute!(
+        stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(socket_path.clone(), picker_protocol);
     let mut assembler = ImageAssembler::new();
-    client_tx.send(ClientMessage::ListSessions).await.map_err(channel_closed)?;
+    client_tx
+        .send(ClientMessage::ListSessions)
+        .await
+        .map_err(channel_closed)?;
 
-    let result = run_ui_loop(&mut terminal, &mut app, &picker, &mut assembler, &client_tx, &mut ui_rx, &active).await;
+    let result = run_ui_loop(
+        &mut terminal,
+        &mut app,
+        &picker,
+        &mut assembler,
+        &client_tx,
+        &mut ui_rx,
+        &active,
+    )
+    .await;
 
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
@@ -122,7 +138,8 @@ pub(crate) async fn run_ui_loop(
         while let Ok(message) = ui_rx.try_recv() {
             match message {
                 UiEvent::Daemon(message) => {
-                    handle_daemon_message(message, app, picker, assembler, active, client_tx).await?;
+                    handle_daemon_message(message, app, picker, assembler, active, client_tx)
+                        .await?;
                 }
                 UiEvent::ReaderClosed => {
                     app.push_text("daemon connection closed");
@@ -156,7 +173,11 @@ pub(crate) async fn handle_terminal_event(
                 return Ok(());
             }
             match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                KeyCode::Char('c')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
                     app.should_quit = true;
                 }
                 KeyCode::Char('q') if app.input.is_empty() => app.should_quit = true,
@@ -166,7 +187,9 @@ pub(crate) async fn handle_terminal_event(
                     app.input.clear();
                     match parse_input_line(&line, &mut app.next_request_id) {
                         ShellCommand::Empty => {}
-                        ShellCommand::InvalidCancel(value) => app.push_text(format!("invalid request id: {value}")),
+                        ShellCommand::InvalidCancel(value) => {
+                            app.push_text(format!("invalid request id: {value}"))
+                        }
                         ShellCommand::Send(message) => {
                             match &message {
                                 ClientMessage::RunInput { request_id, input } => {
@@ -183,20 +206,26 @@ pub(crate) async fn handle_terminal_event(
                         }
                     }
                 }
-                KeyCode::Backspace => { app.input.pop(); }
-                KeyCode::Char(c) => { app.input.push(c); }
-                KeyCode::PageUp => { app.scroll_up(3); }
-                KeyCode::PageDown => { app.scroll_down(3); }
+                KeyCode::Backspace => {
+                    app.input.pop();
+                }
+                KeyCode::Char(c) => {
+                    app.input.push(c);
+                }
+                KeyCode::PageUp => {
+                    app.scroll_up(3);
+                }
+                KeyCode::PageDown => {
+                    app.scroll_down(3);
+                }
                 _ => {}
             }
         }
-        Event::Mouse(mouse) if mouse_in_history_box(mouse.column, mouse.row) => {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => app.scroll_up(1),
-                MouseEventKind::ScrollDown => app.scroll_down(1),
-                _ => {}
-            }
-        }
+        Event::Mouse(mouse) if mouse_in_history_box(mouse.column, mouse.row) => match mouse.kind {
+            MouseEventKind::ScrollUp => app.scroll_up(1),
+            MouseEventKind::ScrollDown => app.scroll_down(1),
+            _ => {}
+        },
         Event::Mouse(_) => {}
         _ => {}
     }
@@ -218,31 +247,90 @@ pub(crate) async fn handle_daemon_message(
         }
         DaemonMessage::Sessions { sessions } => {
             if let Some(session) = sessions.first() {
-                client_tx.send(ClientMessage::AttachSession { session_id: session.session_id }).await.map_err(channel_closed)?;
+                client_tx
+                    .send(ClientMessage::AttachSession {
+                        session_id: session.session_id,
+                    })
+                    .await
+                    .map_err(channel_closed)?;
             } else {
-                client_tx.send(ClientMessage::CreateSession { title: Some("default".to_string()) }).await.map_err(channel_closed)?;
+                client_tx
+                    .send(ClientMessage::CreateSession {
+                        title: Some("default".to_string()),
+                    })
+                    .await
+                    .map_err(channel_closed)?;
             }
         }
-        DaemonMessage::SessionAttached { session_id } => app.push_text(format!("[daemon] attached session: {session_id}")),
-        DaemonMessage::SessionState { session_id, title, selected_model, messages } => {
+        DaemonMessage::SessionAttached { session_id } => {
+            app.push_text(format!("[daemon] attached session: {session_id}"))
+        }
+        DaemonMessage::SessionState {
+            session_id,
+            title,
+            selected_model,
+            messages,
+        } => {
             let title = title.unwrap_or_else(|| "untitled".to_string());
             app.push_text(format!("[daemon] session {session_id}: {title}"));
-            if let Some(model) = selected_model { app.push_text(format!("[daemon] selected model: {model}")); }
-            for message in messages { app.push_session_message(message); }
+            if let Some(model) = selected_model {
+                app.push_text(format!("[daemon] selected model: {model}"));
+            }
+            for message in messages {
+                app.push_session_message(message);
+            }
         }
-        DaemonMessage::SessionFailed { operation, error } => app.push_text(format!("[daemon] {operation} failed: {error}")),
+        DaemonMessage::SessionFailed { operation, error } => {
+            app.push_text(format!("[daemon] {operation} failed: {error}"))
+        }
         DaemonMessage::SessionMessageAppended { message } => app.push_session_message(message),
         DaemonMessage::Started { request_id } => app.begin_stream(request_id),
-        DaemonMessage::ToolCallStarted { request_id, call_id, tool_name, arguments_json } => app.push_text(format!("[{request_id}] tool {tool_name}#{call_id} start {arguments_json}")),
-        DaemonMessage::ToolCallFinished { request_id, call_id, tool_name, output } => app.push_text(format!("[{request_id}] tool {tool_name}#{call_id} ok: {output}")),
-        DaemonMessage::ToolCallFailed { request_id, call_id, tool_name, error } => app.push_text(format!("[{request_id}] tool {tool_name}#{call_id} failed: {error}")),
-        DaemonMessage::OutputChunk { request_id, stream, data } => {
-            let text = String::from_utf8(data).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        DaemonMessage::ToolCallStarted {
+            request_id,
+            call_id,
+            tool_name,
+            arguments_json,
+        } => app.push_text(format!(
+            "[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"
+        )),
+        DaemonMessage::ToolCallFinished {
+            request_id,
+            call_id,
+            tool_name,
+            output,
+        } => app.push_text(format!(
+            "[{request_id}] tool {tool_name}#{call_id} ok: {output}"
+        )),
+        DaemonMessage::ToolCallFailed {
+            request_id,
+            call_id,
+            tool_name,
+            error,
+        } => app.push_text(format!(
+            "[{request_id}] tool {tool_name}#{call_id} failed: {error}"
+        )),
+        DaemonMessage::OutputChunk {
+            request_id,
+            stream,
+            data,
+        } => {
+            let text = String::from_utf8(data)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             app.append_stream_text(request_id, stream, &text);
         }
-        DaemonMessage::ImageStart { request_id, metadata } => assembler.start(request_id, metadata)?,
-        DaemonMessage::ImageChunk { request_id, image_id, data } => assembler.push_chunk(request_id, image_id, &data)?,
-        DaemonMessage::ImageEnd { request_id, image_id } => {
+        DaemonMessage::ImageStart {
+            request_id,
+            metadata,
+        } => assembler.start(request_id, metadata)?,
+        DaemonMessage::ImageChunk {
+            request_id,
+            image_id,
+            data,
+        } => assembler.push_chunk(request_id, image_id, &data)?,
+        DaemonMessage::ImageEnd {
+            request_id,
+            image_id,
+        } => {
             let (metadata, data) = assembler.finish(request_id, image_id)?;
             let rendered = build_rendered_image(picker, metadata, data)?;
             app.push_image(rendered);
@@ -269,19 +357,33 @@ pub(crate) async fn handle_daemon_message(
             app.drop_request(request_id);
         }
         DaemonMessage::Pong => app.push_text("[daemon] pong".to_string()),
-        DaemonMessage::Models { models, selected_model } => {
-            if models.is_empty() { app.push_text("[daemon] no models available".to_string()); }
-            else {
+        DaemonMessage::Models {
+            models,
+            selected_model,
+        } => {
+            if models.is_empty() {
+                app.push_text("[daemon] no models available".to_string());
+            } else {
                 app.push_text(format!("[daemon] supported models ({})", models.len()));
                 for model in models {
-                    let prefix = if selected_model.as_deref() == Some(model.as_str()) { "*" } else { "-" };
+                    let prefix = if selected_model.as_deref() == Some(model.as_str()) {
+                        "*"
+                    } else {
+                        "-"
+                    };
                     app.push_text(format!("{prefix} {model}"));
                 }
             }
         }
-        DaemonMessage::ModelsFailed { error } => app.push_text(format!("[daemon] models failed: {error}")),
-        DaemonMessage::ModelSelected { model } => app.push_text(format!("[daemon] selected model: {model}")),
-        DaemonMessage::ModelSelectionFailed { model, error } => app.push_text(format!("[daemon] failed to select model {model}: {error}")),
+        DaemonMessage::ModelsFailed { error } => {
+            app.push_text(format!("[daemon] models failed: {error}"))
+        }
+        DaemonMessage::ModelSelected { model } => {
+            app.push_text(format!("[daemon] selected model: {model}"))
+        }
+        DaemonMessage::ModelSelectionFailed { model, error } => {
+            app.push_text(format!("[daemon] failed to select model {model}: {error}"))
+        }
     }
     Ok(())
 }
