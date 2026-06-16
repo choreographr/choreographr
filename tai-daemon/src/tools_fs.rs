@@ -37,6 +37,43 @@ struct ReadFileRangeArgs {
     max_lines: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct LineCountArgs {
+    path: String,
+}
+
+pub(crate) async fn execute_line_count_tool(arguments_json: &str) -> ToolResult {
+    let args = match serde_json::from_str::<LineCountArgs>(arguments_json) {
+        Ok(args) if !args.path.trim().is_empty() => args,
+        Ok(_) => {
+            return ToolResult {
+                content: "missing required string argument: path".to_string(),
+                is_error: true,
+            };
+        }
+        Err(error) => {
+            return ToolResult {
+                content: format!("invalid arguments: {error}"),
+                is_error: true,
+            };
+        }
+    };
+
+    match tokio::fs::read_to_string(&args.path).await {
+        Ok(content) => {
+            let line_count = content.lines().count();
+            ToolResult {
+                content: format!("{}: {} lines", args.path, line_count),
+                is_error: false,
+            }
+        }
+        Err(error) => ToolResult {
+            content: format!("failed to read {}: {}", args.path, error),
+            is_error: true,
+        },
+    }
+}
+
 pub(crate) async fn execute_read_file_tool(arguments_json: &str) -> ToolResult {
     let path = match serde_json::from_str::<serde_json::Value>(arguments_json)
         .ok()

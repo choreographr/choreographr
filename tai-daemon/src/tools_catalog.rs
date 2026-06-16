@@ -59,6 +59,21 @@ pub(crate) fn available_tools() -> Vec<ChatToolDefinition> {
             }),
         ),
         ChatToolDefinition::function(
+            "line_count",
+            "Count the number of lines in a UTF-8 text file.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative or absolute path to a text file"
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        ChatToolDefinition::function(
             "http_request",
             "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests.",
             serde_json::json!({

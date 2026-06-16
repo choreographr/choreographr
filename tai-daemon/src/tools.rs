@@ -69,6 +69,10 @@ pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecution
             result: fs_tools::execute_list_files_tool(&tool_call.arguments_json).await,
             image: None,
         },
+        "line_count" => ToolExecutionOutput {
+            result: fs_tools::execute_line_count_tool(&tool_call.arguments_json).await,
+            image: None,
+        },
         "http_request" => ToolExecutionOutput {
             result: http_tools::execute_http_request_tool(&tool_call.arguments_json).await,
             image: None,
