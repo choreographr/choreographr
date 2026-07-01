@@ -278,6 +278,18 @@ pub(crate) fn apply_daemon_message(
         DaemonMessage::LockedError { error } => {
             state.push_text(format!("[daemon] locked: {error}"));
         }
+        DaemonMessage::CredentialAdded { service } => {
+            state.push_text(format!("[daemon] credential added: {service}"));
+        }
+        DaemonMessage::CredentialAddFailed { service, error } => {
+            state.push_text(format!("[daemon] credential add failed ({service}): {error}"));
+        }
+        DaemonMessage::CredentialRemoved { service } => {
+            state.push_text(format!("[daemon] credential removed: {service}"));
+        }
+        DaemonMessage::CredentialRemoveFailed { service, error } => {
+            state.push_text(format!("[daemon] credential remove failed ({service}): {error}"));
+        }
     }
     Ok(())
 }

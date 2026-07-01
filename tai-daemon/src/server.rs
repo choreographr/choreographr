@@ -7,7 +7,7 @@ use crate::sessions::{
 };
 use crate::tools::x;
 use std::{collections::HashMap, io, path::Path, sync::Arc};
-use tai_keystore::{Keystore, keystore_path};
+use tai_keystore::{Keystore, ServiceCredential, keystore_path};
 use tai_proto::{ClientMessage, DaemonMessage, SessionMessage, read_message, write_message};
 use tokio::{
     io::AsyncWriteExt,
@@ -521,6 +521,123 @@ pub async fn handle_client(
                         drop(guard);
                         x::clear_x_credentials();
                         let _ = tx.send(DaemonMessage::Locked).await;
+                    }
+                    ClientMessage::AddApiKey { service, passphrase, key } => {
+                        let svc = service.clone();
+                        let ks_path = match keystore_path() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                    service: svc,
+                                    error: format!("failed to determine keystore path: {e}"),
+                                }).await;
+                                continue;
+                            }
+                        };
+                        match Keystore::load(&ks_path, &passphrase) {
+                            Ok(mut keystore) => {
+                                keystore.add(svc.clone(), ServiceCredential::ApiKey { key });
+                                match keystore.save(&ks_path, &passphrase) {
+                                    Ok(()) => {
+                                        let _ = tx.send(DaemonMessage::CredentialAdded { service }).await;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                            service: svc,
+                                            error: format!("failed to save keystore: {e}"),
+                                        }).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                    service: svc,
+                                    error: format!("failed to unlock keystore: {e}"),
+                                }).await;
+                            }
+                        }
+                    }
+                    ClientMessage::AddXCredential { service, passphrase, api_key, api_key_secret, access_token, access_token_secret, bearer_token } => {
+                        let svc = service.clone();
+                        let ks_path = match keystore_path() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                    service: svc,
+                                    error: format!("failed to determine keystore path: {e}"),
+                                }).await;
+                                continue;
+                            }
+                        };
+                        match Keystore::load(&ks_path, &passphrase) {
+                            Ok(mut keystore) => {
+                                keystore.add(svc.clone(), ServiceCredential::X {
+                                    api_key,
+                                    api_key_secret,
+                                    access_token,
+                                    access_token_secret,
+                                    bearer_token,
+                                });
+                                match keystore.save(&ks_path, &passphrase) {
+                                    Ok(()) => {
+                                        let _ = tx.send(DaemonMessage::CredentialAdded { service }).await;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                            service: svc,
+                                            error: format!("failed to save keystore: {e}"),
+                                        }).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                    service: svc,
+                                    error: format!("failed to unlock keystore: {e}"),
+                                }).await;
+                            }
+                        }
+                    }
+                    ClientMessage::RemoveCredential { service, passphrase } => {
+                        let svc = service.clone();
+                        let ks_path = match keystore_path() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let _ = tx.send(DaemonMessage::CredentialRemoveFailed {
+                                    service: svc,
+                                    error: format!("failed to determine keystore path: {e}"),
+                                }).await;
+                                continue;
+                            }
+                        };
+                        match Keystore::load(&ks_path, &passphrase) {
+                            Ok(mut keystore) => {
+                                if keystore.remove(&svc) {
+                                    match keystore.save(&ks_path, &passphrase) {
+                                        Ok(()) => {
+                                            let _ = tx.send(DaemonMessage::CredentialRemoved { service }).await;
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(DaemonMessage::CredentialRemoveFailed {
+                                                service: svc,
+                                                error: format!("failed to save keystore: {e}"),
+                                            }).await;
+                                        }
+                                    }
+                                } else {
+                                    let _ = tx.send(DaemonMessage::CredentialRemoveFailed {
+                                        service: svc,
+                                        error: "service not found in keystore".to_string(),
+                                    }).await;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(DaemonMessage::CredentialRemoveFailed {
+                                    service: svc,
+                                    error: format!("failed to unlock keystore: {e}"),
+                                }).await;
+                            }
+                        }
                     }
                 }
             }

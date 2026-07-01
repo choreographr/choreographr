@@ -87,7 +87,8 @@ Defines all shared message types and framing. No dependencies on other workspace
 
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
-`TestImage`, `Cancel`, `Ping`, `ListModels`, `SetModel`, `Unlock`, `Lock`
+`TestImage`, `Cancel`, `Ping`, `ListModels`, `SetModel`, `Unlock`, `Lock`,
+`AddApiKey`, `AddXCredential`, `RemoveCredential`
 
 `DaemonMessage` variants:
 - Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionMessageAppended`, `SessionFailed`
@@ -96,6 +97,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 - Image streaming: `ImageStart`, `ImageChunk`, `ImageEnd`
 - Model management: `Models`, `ModelsFailed`, `ModelSelected`, `ModelSelectionFailed`
 - Locking: `Unlocked`, `Locked`, `LockedError`
+- Credential management: `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`
 - Misc: `Pong`
 
 **Wire format:**
@@ -132,7 +134,10 @@ passphrase ──► argon2 KDF ──► 256-bit key ──► AES-256-GCM encr
 **Credential types:** `ApiKey` (OpenAI), `X` (Twitter OAuth 1.0a credentials)
 
 **CLI binary (`tai-keystore`):** `init`, `add`, `remove`, `list` subcommands.
-Stored at `~/.config/tai-daemon/credentials.enc`.
+Stored at `~/.config/tai-daemon/credentials.enc`. Override path via `TAI_KEYSTORE_PATH` env var.
+Credentials can also be managed at runtime via `/add-key`, `/add-x`, and `/remove-key` shell
+commands, which require the keystore passphrase as a parameter and do not depend on daemon
+lock state.
 
 
 ### `tai-client-core` — Shared client logic

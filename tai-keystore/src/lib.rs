@@ -216,6 +216,9 @@ fn derive_key(passphrase: &str, salt: &[u8; SALT_LEN]) -> [u8; KEY_LEN] {
 }
 
 pub fn keystore_path() -> io::Result<PathBuf> {
+    if let Ok(override_path) = std::env::var("TAI_KEYSTORE_PATH") {
+        return Ok(PathBuf::from(override_path));
+    }
     let config_dir = dirs::config_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,

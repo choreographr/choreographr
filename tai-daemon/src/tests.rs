@@ -11,6 +11,10 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+use tai_keystore::Keystore;
+
+static CREDENTIAL_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn test_service_config() -> ServiceConfig {
     ServiceConfig {
         base_url: "https://example.com/v1".to_string(),
@@ -1150,4 +1154,225 @@ async fn set_model_fails_when_provider_unreachable() {
 
     drop(client);
     server_task.await.expect("join").expect("server ok");
+}
+
+fn test_keystore_path() -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    std::env::temp_dir().join(format!("tai-test-keystore-{unique}.enc"))
+}
+
+#[tokio::test]
+async fn add_api_key_round_trip() {
+    let _guard = CREDENTIAL_TEST_MUTEX.lock().await;
+    let ks_path = test_keystore_path();
+    unsafe { std::env::set_var("TAI_KEYSTORE_PATH", ks_path.to_str().unwrap()) };
+    let passphrase = "test-passphrase";
+
+    Keystore::init(&ks_path, passphrase).expect("init keystore");
+
+    let (server, mut client) = UnixStream::pair().expect("pair");
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
+
+    write_message(
+        &mut client,
+        &ClientMessage::AddApiKey {
+            service: "openai".to_string(),
+            passphrase: passphrase.to_string(),
+            key: "sk-test-key".to_string(),
+        },
+    )
+    .await
+    .expect("write add-api-key");
+
+    match recv(&mut client).await {
+        DaemonMessage::CredentialAdded { service } => {
+            assert_eq!(service, "openai");
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    let loaded = Keystore::load(&ks_path, passphrase).expect("reload keystore");
+    assert_eq!(loaded.get_api_key("openai"), Some("sk-test-key"));
+
+    drop(client);
+    server_task.await.expect("join").expect("server ok");
+
+    let _ = std::fs::remove_file(&ks_path);
+}
+
+#[tokio::test]
+async fn add_api_key_rejects_wrong_passphrase() {
+    let _guard = CREDENTIAL_TEST_MUTEX.lock().await;
+    let ks_path = test_keystore_path();
+    unsafe { std::env::set_var("TAI_KEYSTORE_PATH", ks_path.to_str().unwrap()) };
+
+    Keystore::init(&ks_path, "correct").expect("init keystore");
+
+    let (server, mut client) = UnixStream::pair().expect("pair");
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
+
+    write_message(
+        &mut client,
+        &ClientMessage::AddApiKey {
+            service: "openai".to_string(),
+            passphrase: "wrong".to_string(),
+            key: "sk-test-key".to_string(),
+        },
+    )
+    .await
+    .expect("write add-api-key");
+
+    match recv(&mut client).await {
+        DaemonMessage::CredentialAddFailed { service, error } => {
+            assert_eq!(service, "openai");
+            assert!(error.contains("failed to unlock keystore"));
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    drop(client);
+    server_task.await.expect("join").expect("server ok");
+
+    let _ = std::fs::remove_file(&ks_path);
+}
+
+#[tokio::test]
+async fn add_x_credential_round_trip() {
+    let _guard = CREDENTIAL_TEST_MUTEX.lock().await;
+    let ks_path = test_keystore_path();
+    unsafe { std::env::set_var("TAI_KEYSTORE_PATH", ks_path.to_str().unwrap()) };
+    let passphrase = "x-passphrase";
+
+    Keystore::init(&ks_path, passphrase).expect("init keystore");
+
+    let (server, mut client) = UnixStream::pair().expect("pair");
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
+
+    write_message(
+        &mut client,
+        &ClientMessage::AddXCredential {
+            service: "twitter".to_string(),
+            passphrase: passphrase.to_string(),
+            api_key: "ck".to_string(),
+            api_key_secret: "cs".to_string(),
+            access_token: "at".to_string(),
+            access_token_secret: "ats".to_string(),
+            bearer_token: Some("bearer123".to_string()),
+        },
+    )
+    .await
+    .expect("write add-x-credential");
+
+    match recv(&mut client).await {
+        DaemonMessage::CredentialAdded { service } => {
+            assert_eq!(service, "twitter");
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    let loaded = Keystore::load(&ks_path, passphrase).expect("reload keystore");
+    let x = loaded.get_x_credentials("twitter").expect("x creds");
+    assert_eq!(x.api_key, "ck");
+    assert_eq!(x.api_key_secret, "cs");
+    assert_eq!(x.access_token, "at");
+    assert_eq!(x.access_token_secret, "ats");
+    assert_eq!(x.bearer_token, Some("bearer123".to_string()));
+
+    drop(client);
+    server_task.await.expect("join").expect("server ok");
+
+    let _ = std::fs::remove_file(&ks_path);
+}
+
+#[tokio::test]
+async fn remove_credential_round_trip() {
+    let _guard = CREDENTIAL_TEST_MUTEX.lock().await;
+    let ks_path = test_keystore_path();
+    unsafe { std::env::set_var("TAI_KEYSTORE_PATH", ks_path.to_str().unwrap()) };
+    let passphrase = "remove-passphrase";
+
+    Keystore::init(&ks_path, passphrase).expect("init keystore");
+
+    {
+        let mut keystore = Keystore::load(&ks_path, passphrase).expect("load");
+        keystore.add(
+            "openai".to_string(),
+            tai_keystore::ServiceCredential::ApiKey {
+                key: "sk-to-remove".to_string(),
+            },
+        );
+        keystore.save(&ks_path, passphrase).expect("save");
+    }
+
+    let (server, mut client) = UnixStream::pair().expect("pair");
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
+
+    write_message(
+        &mut client,
+        &ClientMessage::RemoveCredential {
+            service: "openai".to_string(),
+            passphrase: passphrase.to_string(),
+        },
+    )
+    .await
+    .expect("write remove-credential");
+
+    match recv(&mut client).await {
+        DaemonMessage::CredentialRemoved { service } => {
+            assert_eq!(service, "openai");
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    let loaded = Keystore::load(&ks_path, passphrase).expect("reload keystore");
+    assert!(loaded.get_api_key("openai").is_none());
+
+    drop(client);
+    server_task.await.expect("join").expect("server ok");
+
+    let _ = std::fs::remove_file(&ks_path);
+}
+
+#[tokio::test]
+async fn remove_credential_fails_for_missing_service() {
+    let _guard = CREDENTIAL_TEST_MUTEX.lock().await;
+    let ks_path = test_keystore_path();
+    unsafe { std::env::set_var("TAI_KEYSTORE_PATH", ks_path.to_str().unwrap()) };
+    let passphrase = "remove-missing";
+
+    Keystore::init(&ks_path, passphrase).expect("init keystore");
+
+    let (server, mut client) = UnixStream::pair().expect("pair");
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
+
+    write_message(
+        &mut client,
+        &ClientMessage::RemoveCredential {
+            service: "nonexistent".to_string(),
+            passphrase: passphrase.to_string(),
+        },
+    )
+    .await
+    .expect("write remove-credential");
+
+    match recv(&mut client).await {
+        DaemonMessage::CredentialRemoveFailed { service, error } => {
+            assert_eq!(service, "nonexistent");
+            assert!(error.contains("service not found"));
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+
+    drop(client);
+    server_task.await.expect("join").expect("server ok");
+
+    let _ = std::fs::remove_file(&ks_path);
 }

@@ -229,6 +229,11 @@ Inside `tai-sh`:
 - `/models` — list available models and show the selected one
 - `/models <model-id>` — select a model
 - `/cancel <request-id>` — cancel an active request
+- `/unlock <passphrase>` — unlock the encrypted keystore
+- `/lock` — lock the daemon, clearing credentials from memory
+- `/add-key <service> <api_key> <passphrase>` — add an API key credential to the keystore
+- `/add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ <passphrase>` — add an X credential
+- `/remove-key <service> <passphrase>` — remove a credential from the keystore
 - any other non-empty line — send that line as a prompt
 
 ## Example session

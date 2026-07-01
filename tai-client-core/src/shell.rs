@@ -54,6 +54,60 @@ fn parse_command(rest: &str, next_request_id: &mut u32) -> ShellCommand {
         return ShellCommand::Send(ClientMessage::Lock);
     }
 
+    if let Some(args) = rest.strip_prefix("add-key ") {
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.len() < 3 {
+            return ShellCommand::UnknownCommand(
+                "usage: /add-key <service> <api_key> <passphrase>".to_string(),
+            );
+        }
+        let service = parts[0].to_string();
+        let key = parts[1].to_string();
+        let passphrase = parts[2..].join(" ");
+        return ShellCommand::Send(ClientMessage::AddApiKey { service, passphrase, key });
+    }
+
+    if let Some(args) = rest.strip_prefix("add-x ") {
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.len() < 7 {
+            return ShellCommand::UnknownCommand(
+                "usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ <passphrase>".to_string(),
+            );
+        }
+        let service = parts[0].to_string();
+        let api_key = parts[1].to_string();
+        let api_key_secret = parts[2].to_string();
+        let access_token = parts[3].to_string();
+        let access_token_secret = parts[4].to_string();
+        let bearer_token = if parts[5] == "-" {
+            None
+        } else {
+            Some(parts[5].to_string())
+        };
+        let passphrase = parts[6..].join(" ");
+        return ShellCommand::Send(ClientMessage::AddXCredential {
+            service,
+            passphrase,
+            api_key,
+            api_key_secret,
+            access_token,
+            access_token_secret,
+            bearer_token,
+        });
+    }
+
+    if let Some(args) = rest.strip_prefix("remove-key ") {
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.len() < 2 {
+            return ShellCommand::UnknownCommand(
+                "usage: /remove-key <service> <passphrase>".to_string(),
+            );
+        }
+        let service = parts[0].to_string();
+        let passphrase = parts[1..].join(" ");
+        return ShellCommand::Send(ClientMessage::RemoveCredential { service, passphrase });
+    }
+
     if rest == "image" {
         let request_id = *next_request_id;
         *next_request_id = next_request_id.wrapping_add(1);

@@ -101,6 +101,9 @@ pub enum ClientMessage {
     SetModel { model: String },
     Unlock { passphrase: String },
     Lock,
+    AddApiKey { service: String, passphrase: String, key: String },
+    AddXCredential { service: String, passphrase: String, api_key: String, api_key_secret: String, access_token: String, access_token_secret: String, bearer_token: Option<String> },
+    RemoveCredential { service: String, passphrase: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,6 +214,20 @@ pub enum DaemonMessage {
     Unlocked,
     Locked,
     LockedError {
+        error: String,
+    },
+    CredentialAdded {
+        service: String,
+    },
+    CredentialAddFailed {
+        service: String,
+        error: String,
+    },
+    CredentialRemoved {
+        service: String,
+    },
+    CredentialRemoveFailed {
+        service: String,
         error: String,
     },
 }
