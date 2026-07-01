@@ -1,5 +1,6 @@
 use crate::tools::{ToolExecutionOutput, ToolResult};
 use async_trait::async_trait;
+use rand::RngExt;
 use reqwest::Client;
 use sha1::Sha1;
 use std::sync::RwLock;
@@ -41,7 +42,7 @@ fn urlencode(s: &str) -> String {
 
 #[allow(deprecated)]
 fn hmac_sha1(key: &[u8], data: &str) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     type HmacSha1 = Hmac<Sha1>;
     let mut mac = HmacSha1::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
@@ -65,7 +66,7 @@ fn build_oauth1_header(
 
     let nonce: String = (0..32)
         .map(|_| {
-            let b: u8 = rand::random();
+            let b: u8 = rand::rng().random();
             format!("{:02x}", b)
         })
         .collect();

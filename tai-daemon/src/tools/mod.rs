@@ -145,7 +145,7 @@ pub(crate) async fn execute_http_request_tool(arguments_json: &str) -> ToolResul
 
 pub(crate) fn sha256_hex(content: &str) -> String {
     let digest = Sha256::digest(content.as_bytes());
-    format!("{digest:x}")
+    hex::encode(digest)
 }
 
 pub(crate) fn truncate_tool_output(content: &str) -> String {

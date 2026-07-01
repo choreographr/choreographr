@@ -3,7 +3,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
 };
 use argon2::Argon2;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -114,13 +114,13 @@ impl Keystore {
 
         let salt: [u8; SALT_LEN] = {
             let mut buf = [0u8; SALT_LEN];
-            rand::thread_rng().fill(&mut buf);
+            rand::rng().fill(&mut buf);
             buf
         };
         let key = derive_key(passphrase, &salt);
         let nonce_bytes: [u8; NONCE_LEN] = {
             let mut buf = [0u8; NONCE_LEN];
-            rand::thread_rng().fill(&mut buf);
+            rand::rng().fill(&mut buf);
             buf
         };
         let nonce = Nonce::from_slice(&nonce_bytes);
