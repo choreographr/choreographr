@@ -18,7 +18,7 @@ fn prompt_passphrase(label: &str) -> io::Result<String> {
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: tai-credential <init|add|remove|list> [args...]");
+        eprintln!("usage: tai-keystore <init|add|remove|list> [args...]");
         std::process::exit(1);
     }
 
@@ -41,7 +41,7 @@ fn main() -> io::Result<()> {
         }
         "add" => {
             if args.len() < 4 {
-                eprintln!("usage: tai-credential add <service> <type>");
+                eprintln!("usage: tai-keystore add <service> <type>");
                 eprintln!("  types: api_key, x");
                 std::process::exit(1);
             }
@@ -81,7 +81,7 @@ fn main() -> io::Result<()> {
         }
         "remove" => {
             if args.len() < 3 {
-                eprintln!("usage: tai-credential remove <service>");
+                eprintln!("usage: tai-keystore remove <service>");
                 std::process::exit(1);
             }
             let service = &args[2];
@@ -97,7 +97,7 @@ fn main() -> io::Result<()> {
         }
         "list" => {
             if !path.exists() {
-                eprintln!("keystore does not exist, run 'tai-credential init' first");
+                eprintln!("keystore does not exist, run 'tai-keystore init' first");
                 std::process::exit(1);
             }
             let passphrase = prompt_passphrase("keystore")?;
@@ -115,7 +115,7 @@ fn main() -> io::Result<()> {
         }
         other => {
             eprintln!("unknown command: {other}");
-            eprintln!("usage: tai-credential <init|add|remove|list> [args...]");
+            eprintln!("usage: tai-keystore <init|add|remove|list> [args...]");
             std::process::exit(1);
         }
     }

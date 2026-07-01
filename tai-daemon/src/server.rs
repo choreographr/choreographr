@@ -461,7 +461,7 @@ pub async fn handle_client(
                         if !ks_path.exists() {
                             let _ = tx
                                 .send(DaemonMessage::LockedError {
-                                    error: "keystore does not exist. run 'tai-credential init' to create one.".to_string(),
+                                    error: "keystore does not exist. run 'tai-keystore init' to create one.".to_string(),
                                 })
                                 .await;
                             continue;

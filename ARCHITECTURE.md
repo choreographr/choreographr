@@ -131,7 +131,7 @@ passphrase ──► argon2 KDF ──► 256-bit key ──► AES-256-GCM encr
 
 **Credential types:** `ApiKey` (OpenAI), `X` (Twitter OAuth 1.0a credentials)
 
-**CLI binary (`tai-credential`):** `init`, `add`, `remove`, `list` subcommands.
+**CLI binary (`tai-keystore`):** `init`, `add`, `remove`, `list` subcommands.
 Stored at `~/.config/tai-daemon/credentials.enc`.
 
 
@@ -306,7 +306,7 @@ gpt-5 = "responses"
 big-model = 4096
 ```
 
-**Credential storage:** `~/.config/tai-daemon/credentials.enc` (encrypted, managed via `tai-credential` CLI)
+**Credential storage:** `~/.config/tai-daemon/credentials.enc` (encrypted, managed via `tai-keystore` CLI)
 
 **Socket path:** `/tmp/tai.sock` (override via `TAI_SOCKET_PATH` env var)
 
