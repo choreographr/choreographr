@@ -8,14 +8,14 @@ mod http;
 mod image;
 mod fff;
 mod evm;
-mod git;
+pub(crate) mod git;
 mod subxt;
 pub(crate) mod x;
 
 #[derive(Debug, Clone)]
-pub(crate) struct ToolResult {
-    pub(crate) content: String,
-    pub(crate) is_error: bool,
+pub struct ToolResult {
+    pub content: String,
+    pub is_error: bool,
 }
 
 #[derive(Debug)]

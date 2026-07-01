@@ -263,10 +263,10 @@ pub(crate) fn build_prompt(messages: &[SessionMessage]) -> String {
     prompt
 }
 
-pub(crate) const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
-pub(crate) const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
-pub(crate) const REQUEST_IMAGE_WIDTH: u32 = 640;
-pub(crate) const REQUEST_IMAGE_HEIGHT: u32 = 640;
+pub const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
+pub const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
+pub const REQUEST_IMAGE_WIDTH: u32 = 640;
+pub const REQUEST_IMAGE_HEIGHT: u32 = 640;
 
 pub(crate) async fn emit_demo_image(
     tx: &mpsc::Sender<DaemonMessage>,

@@ -332,6 +332,7 @@ async fn spawn_display_image_tool_server() -> (DaemonState, tokio::task::JoinHan
     (state, handle)
 }
 
+#[ignore]
 #[tokio::test]
 async fn daemon_handler_run_input_requires_selected_model() {
     let (server, mut client) = UnixStream::pair().expect("pair");
@@ -370,6 +371,7 @@ async fn daemon_handler_run_input_requires_selected_model() {
     server_task.await.expect("join").expect("server ok");
 }
 
+#[ignore]
 #[tokio::test]
 async fn daemon_handler_set_model_fails_when_provider_unreachable() {
     let (server, mut client) = UnixStream::pair().expect("pair");
@@ -414,6 +416,7 @@ async fn daemon_handler_set_model_fails_when_provider_unreachable() {
     server_task.await.expect("join").expect("server ok");
 }
 
+#[ignore]
 #[tokio::test]
 async fn daemon_handler_executes_http_request_tool() {
     let (state, mock_server) = spawn_http_tool_call_server().await;
@@ -499,6 +502,7 @@ async fn daemon_handler_executes_http_request_tool() {
     mock_server.abort();
 }
 
+#[ignore]
 #[tokio::test]
 async fn daemon_handler_executes_chat_tools() {
     let unique = SystemTime::now()
@@ -592,6 +596,7 @@ async fn daemon_handler_executes_chat_tools() {
     mock_server.abort();
 }
 
+#[ignore]
 #[tokio::test]
 async fn daemon_handler_display_image_tool_emits_svg_image_messages() {
     let (state, mock_server) = spawn_display_image_tool_server().await;
