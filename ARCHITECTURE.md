@@ -141,7 +141,7 @@ Used by both `tai-sh` and `tai-dioxus`.
 
 | Module | Purpose |
 |---|---|
-| `shell.rs` | Parses terminal input into `ShellCommand`: `:ping`, `/models`, `:cancel`, `:unlock`, `:lock`, `/image`, or `RunInput(prompt)` |
+| `shell.rs` | Parses terminal input into `ShellCommand`: `/ping`, `/models`, `/model` (alias), `/cancel`, `/unlock`, `/lock`, `/image`, or `RunInput(prompt)`. All commands use `/` prefix exclusively; `parse_command()` is the single dispatch point. |
 | `markdown.rs` | Parses markdown into structured `MarkdownDocument` (paragraphs, headings, code blocks, lists, tables) via `pulldown-cmark`; `render_markdown_html()` sanitizes via `ammonia` |
 | `image.rs` | `ImageAssembler` reconstructs images from chunked stream protocol (`ImageStart` → `ImageChunk`* → `ImageEnd`), validating byte count |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text) |
@@ -231,10 +231,10 @@ async reader/writer tasks inside the Dioxus runtime.
 ### Lock/Unlock flow
 
 The daemon starts in a **locked** state. No OpenAI client is constructed until
-a client sends `:unlock <passphrase>`.
+a client sends `/unlock <passphrase>`.
 
 ```
-startup                    :unlock <passphrase>
+startup                    /unlock <passphrase>
    │                              │
    │  locked                      │  decrypt keystore
    │  (no OpenAI client)          │  extract API key
@@ -246,7 +246,7 @@ startup                    :unlock <passphrase>
 
 - Credentials never appear in config files, environment variables, or command-line args
 - The keystore uses argon2 + AES-256-GCM for authenticated encryption
-- `:lock` destroys the in-memory OpenAiClient, returning to locked state
+- `/lock` destroys the in-memory OpenAiClient, returning to locked state
 - `LockedError` is sent if any client attempts a request while locked
 
 

@@ -225,10 +225,10 @@ If startup succeeds, the daemon will validate your config against the provider b
 
 Inside `tai-sh`:
 
-- `:ping` — ask the daemon for a health-style pong response
+- `/ping` — ask the daemon for a health-style pong response
 - `/models` — list available models and show the selected one
 - `/models <model-id>` — select a model
-- `:cancel <request-id>` — cancel an active request
+- `/cancel <request-id>` — cancel an active request
 - any other non-empty line — send that line as a prompt
 
 ## Example session
@@ -237,7 +237,7 @@ Inside `tai-sh`:
 /models
 /models gpt-5.4-nano
 Write a haiku about terminals
-:cancel 3
+/cancel 3
 ```
 
 ## Protocol overview

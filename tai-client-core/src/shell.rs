@@ -4,6 +4,7 @@ use tai_proto::{ClientMessage, OutputStream};
 pub enum ShellCommand {
     Send(ClientMessage),
     InvalidCancel(String),
+    UnknownCommand(String),
     Empty,
 }
 
@@ -13,41 +14,8 @@ pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> ShellCommand {
         return ShellCommand::Empty;
     }
 
-    if let Some(rest) = line.strip_prefix(":cancel ") {
-        return match rest.trim().parse::<u32>() {
-            Ok(request_id) => ShellCommand::Send(ClientMessage::Cancel { request_id }),
-            Err(_) => ShellCommand::InvalidCancel(rest.trim().to_string()),
-        };
-    }
-
-    if line == ":ping" {
-        return ShellCommand::Send(ClientMessage::Ping);
-    }
-
-    if let Some(passphrase) = line.strip_prefix(":unlock ") {
-        return ShellCommand::Send(ClientMessage::Unlock {
-            passphrase: passphrase.trim().to_string(),
-        });
-    }
-
-    if line == ":lock" {
-        return ShellCommand::Send(ClientMessage::Lock);
-    }
-
-    if line == "/image" {
-        let request_id = *next_request_id;
-        *next_request_id = next_request_id.wrapping_add(1);
-        return ShellCommand::Send(ClientMessage::TestImage { request_id });
-    }
-
-    if let Some(rest) = line.strip_prefix("/models") {
-        let model = rest.trim();
-        if model.is_empty() {
-            return ShellCommand::Send(ClientMessage::ListModels);
-        }
-        return ShellCommand::Send(ClientMessage::SetModel {
-            model: model.to_string(),
-        });
+    if let Some(rest) = line.strip_prefix('/') {
+        return parse_command(rest, next_request_id);
     }
 
     let request_id = *next_request_id;
@@ -56,6 +24,71 @@ pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> ShellCommand {
         request_id,
         input: line.as_bytes().to_vec(),
     })
+}
+
+fn parse_command(rest: &str, next_request_id: &mut u32) -> ShellCommand {
+    if let Some(arg) = rest.strip_prefix("cancel ") {
+        return match arg.trim().parse::<u32>() {
+            Ok(request_id) => ShellCommand::Send(ClientMessage::Cancel { request_id }),
+            Err(_) => ShellCommand::InvalidCancel(arg.trim().to_string()),
+        };
+    }
+
+    if rest == "ping" {
+        return ShellCommand::Send(ClientMessage::Ping);
+    }
+
+    if let Some(passphrase) = rest.strip_prefix("unlock ") {
+        return ShellCommand::Send(ClientMessage::Unlock {
+            passphrase: passphrase.trim().to_string(),
+        });
+    }
+
+    if rest == "unlock" {
+        return ShellCommand::UnknownCommand(
+            "usage: /unlock <passphrase>".to_string(),
+        );
+    }
+
+    if rest == "lock" {
+        return ShellCommand::Send(ClientMessage::Lock);
+    }
+
+    if rest == "image" {
+        let request_id = *next_request_id;
+        *next_request_id = next_request_id.wrapping_add(1);
+        return ShellCommand::Send(ClientMessage::TestImage { request_id });
+    }
+
+    if let Some(model) = rest.strip_prefix("models ") {
+        let model = model.trim();
+        if model.is_empty() {
+            return ShellCommand::Send(ClientMessage::ListModels);
+        }
+        return ShellCommand::Send(ClientMessage::SetModel {
+            model: model.to_string(),
+        });
+    }
+
+    if rest == "models" {
+        return ShellCommand::Send(ClientMessage::ListModels);
+    }
+
+    if let Some(model) = rest.strip_prefix("model ") {
+        let model = model.trim();
+        if model.is_empty() {
+            return ShellCommand::Send(ClientMessage::ListModels);
+        }
+        return ShellCommand::Send(ClientMessage::SetModel {
+            model: model.to_string(),
+        });
+    }
+
+    if rest == "model" {
+        return ShellCommand::Send(ClientMessage::ListModels);
+    }
+
+    ShellCommand::UnknownCommand(format!("unknown command: /{rest}"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

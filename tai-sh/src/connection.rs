@@ -184,6 +184,9 @@ pub(crate) async fn handle_terminal_event(
                         ShellCommand::InvalidCancel(value) => {
                             app.push_text(format!("invalid request id: {value}"))
                         }
+                        ShellCommand::UnknownCommand(error) => {
+                            app.push_text(error)
+                        }
                         ShellCommand::Send(message) => {
                             match &message {
                                 ClientMessage::RunInput { request_id, input } => {

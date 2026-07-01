@@ -13,7 +13,7 @@ fn parses_empty_line() {
 fn parses_ping() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line(":ping", &mut next),
+        parse_input_line("/ping", &mut next),
         ShellCommand::Send(ClientMessage::Ping)
     );
     assert_eq!(next, 3);
@@ -23,7 +23,7 @@ fn parses_ping() {
 fn parses_cancel() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line(":cancel 42", &mut next),
+        parse_input_line("/cancel 42", &mut next),
         ShellCommand::Send(ClientMessage::Cancel { request_id: 42 })
     );
     assert_eq!(next, 3);
@@ -33,8 +33,40 @@ fn parses_cancel() {
 fn rejects_invalid_cancel() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line(":cancel nope", &mut next),
+        parse_input_line("/cancel nope", &mut next),
         ShellCommand::InvalidCancel("nope".to_string())
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn parses_unlock() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/unlock mypass", &mut next),
+        ShellCommand::Send(ClientMessage::Unlock {
+            passphrase: "mypass".to_string(),
+        })
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn rejects_unlock_without_passphrase() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/unlock", &mut next),
+        ShellCommand::UnknownCommand("usage: /unlock <passphrase>".to_string())
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn parses_lock() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/lock", &mut next),
+        ShellCommand::Send(ClientMessage::Lock)
     );
     assert_eq!(next, 3);
 }
@@ -69,6 +101,38 @@ fn parses_set_model_command() {
         })
     );
     assert_eq!(next, 10);
+}
+
+#[test]
+fn parses_model_alias_list() {
+    let mut next = 10;
+    assert_eq!(
+        parse_input_line("/model", &mut next),
+        ShellCommand::Send(ClientMessage::ListModels)
+    );
+    assert_eq!(next, 10);
+}
+
+#[test]
+fn parses_model_alias_set() {
+    let mut next = 10;
+    assert_eq!(
+        parse_input_line("/model gpt-5.4-nano", &mut next),
+        ShellCommand::Send(ClientMessage::SetModel {
+            model: "gpt-5.4-nano".to_string(),
+        })
+    );
+    assert_eq!(next, 10);
+}
+
+#[test]
+fn rejects_unknown_command() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/bogus", &mut next),
+        ShellCommand::UnknownCommand("unknown command: /bogus".to_string())
+    );
+    assert_eq!(next, 3);
 }
 
 #[test]

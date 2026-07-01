@@ -12,7 +12,7 @@ async fn main() -> io::Result<()> {
         .with_target(false)
         .init();
 
-    info!("tai-daemon starting (locked) — send :unlock <passphrase> to unlock");
+    info!("tai-daemon starting (locked) — send /unlock <passphrase> to unlock");
     let state = tai_daemon::new_daemon_state();
     let socket_path = socket_path();
     tai_daemon::run_server(&socket_path, state).await

@@ -179,7 +179,7 @@ fn App() -> Element {
             div { class: "composer",
                 textarea {
                     rows: "4",
-                    placeholder: "Enter a prompt, /image, :ping, /models, /models <model>, or :cancel <id>",
+                    placeholder: "Enter a prompt, /image, /ping, /models, /models <model>, or /cancel <id>",
                     value: "{input_value}",
                     oninput: move |event| state.write().input = event.value(),
                     onkeydown: move |event| {

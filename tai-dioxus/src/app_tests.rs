@@ -14,7 +14,7 @@ fn parses_empty_line() {
 fn parses_ping() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line(":ping", &mut next),
+        parse_input_line("/ping", &mut next),
         ShellCommand::Send(ClientMessage::Ping)
     );
     assert_eq!(next, 3);
@@ -24,7 +24,7 @@ fn parses_ping() {
 fn parses_cancel() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line(":cancel 42", &mut next),
+        parse_input_line("/cancel 42", &mut next),
         ShellCommand::Send(ClientMessage::Cancel { request_id: 42 })
     );
     assert_eq!(next, 3);
@@ -34,7 +34,7 @@ fn parses_cancel() {
 fn rejects_invalid_cancel() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line(":cancel nope", &mut next),
+        parse_input_line("/cancel nope", &mut next),
         ShellCommand::InvalidCancel("nope".to_string())
     );
     assert_eq!(next, 3);

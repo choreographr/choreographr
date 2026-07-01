@@ -72,7 +72,7 @@ async fn require_openai_client(
         None => {
             let _ = tx
                 .send(DaemonMessage::LockedError {
-                    error: "daemon is locked. use :unlock <passphrase> to unlock".to_string(),
+                    error: "daemon is locked. use /unlock <passphrase> to unlock".to_string(),
                 })
                 .await;
             Ok(None)
@@ -207,6 +207,19 @@ pub async fn handle_client(
                             continue;
                         }
 
+                        let Some(client) = ({
+                            let guard = state.lock().await;
+                            guard.openai_client.as_ref().map(Arc::clone)
+                        }) else {
+                            let _ = tx
+                                .send(DaemonMessage::LockedError {
+                                    error: "daemon is locked. use /unlock <passphrase> to unlock"
+                                        .to_string(),
+                                })
+                                .await;
+                            continue;
+                        };
+
                         let model = {
                             let mut guard = session.lock().await;
                             if guard.active_requests.contains_key(&request_id) {
@@ -237,19 +250,6 @@ pub async fn handle_client(
                             drop(guard);
                             broadcast_message_appended(&session, message, Some(client_id)).await;
                             model
-                        };
-
-                        let Some(client) = ({
-                            let guard = state.lock().await;
-                            guard.openai_client.as_ref().map(Arc::clone)
-                        }) else {
-                            let _ = tx
-                                .send(DaemonMessage::LockedError {
-                                    error: "daemon is locked. use :unlock <passphrase> to unlock"
-                                        .to_string(),
-                                })
-                                .await;
-                            continue;
                         };
 
                         let request_format = client.config().request_format_for_model(&model);
