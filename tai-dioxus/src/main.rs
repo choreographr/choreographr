@@ -22,31 +22,24 @@ fn main() {
 fn App() -> Element {
     let socket = use_signal(socket_path);
     let mut state = use_signal(|| AppState::new(socket.read().clone()));
-    let daemon_tx = use_signal(|| None::<UnboundedSender<ClientMessage>>);
-    let events_rx = use_signal(|| None::<UnboundedReceiver<UiEvent>>);
+    let mut daemon_tx = use_signal(|| None::<UnboundedSender<ClientMessage>>);
+    let mut events_rx = use_signal(|| None::<UnboundedReceiver<UiEvent>>);
 
-    use_hook({
+    use_hook(move || {
         let socket = socket.read().clone();
-        let mut daemon_tx = daemon_tx;
-        let mut events_rx = events_rx;
-        move || {
-            let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
-            let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiEvent>();
-            let _ = client_tx.send(ClientMessage::ListSessions);
-            daemon_tx.set(Some(client_tx));
-            events_rx.set(Some(ui_rx));
-            tokio::spawn(async move {
-                if let Err(error) = run_client(socket, client_rx, ui_tx.clone()).await {
-                    let _ = ui_tx.send(UiEvent::ReaderFailed(error.to_string()));
-                }
-            });
-        }
+        let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let _ = client_tx.send(ClientMessage::ListSessions);
+        daemon_tx.set(Some(client_tx));
+        events_rx.set(Some(ui_rx));
+        tokio::spawn(async move {
+            if let Err(error) = run_client(socket, client_rx, ui_tx.clone()).await {
+                let _ = ui_tx.send(UiEvent::ReaderFailed(error.to_string()));
+            }
+        });
     });
 
-    use_future({
-        let mut events_rx = events_rx;
-        let mut state = state;
-        move || async move {
+    use_future(move || async move {
             loop {
                 let event = {
                     let mut guard = events_rx.write();
@@ -90,63 +83,48 @@ fn App() -> Element {
                 }
             }
         }
-    });
+    );
 
-    let mut on_submit_keydown = {
-        let mut state = state;
-        move || submit_input(&mut state, daemon_tx.read().clone())
+    let mut on_submit_keydown = move || submit_input(&mut state, daemon_tx.read().clone());
+
+    let mut on_submit_click = move || submit_input(&mut state, daemon_tx.read().clone());
+
+    let on_ping = move |_| {
+        send_client_message(
+            &mut state.write(),
+            daemon_tx.read().clone(),
+            ClientMessage::Ping,
+        )
     };
 
-    let mut on_submit_click = {
-        let mut state = state;
-        move || submit_input(&mut state, daemon_tx.read().clone())
+    let on_models = move |_| {
+        send_client_message(
+            &mut state.write(),
+            daemon_tx.read().clone(),
+            ClientMessage::ListModels,
+        )
     };
 
-    let on_ping = {
-        let mut state = state;
-        move |_| {
-            send_client_message(
-                &mut state.write(),
-                daemon_tx.read().clone(),
-                ClientMessage::Ping,
-            )
+    let on_cancel = move |_| {
+        let request_id_text = state.read().pending_cancel.trim().to_string();
+        if request_id_text.is_empty() {
+            state
+                .write()
+                .push_text("[client] enter a request id to cancel");
+            return;
         }
-    };
-
-    let on_models = {
-        let mut state = state;
-        move |_| {
-            send_client_message(
-                &mut state.write(),
-                daemon_tx.read().clone(),
-                ClientMessage::ListModels,
-            )
-        }
-    };
-
-    let on_cancel = {
-        let mut state = state;
-        move |_| {
-            let request_id_text = state.read().pending_cancel.trim().to_string();
-            if request_id_text.is_empty() {
-                state
-                    .write()
-                    .push_text("[client] enter a request id to cancel");
-                return;
+        match request_id_text.parse::<u32>() {
+            Ok(request_id) => {
+                send_client_message(
+                    &mut state.write(),
+                    daemon_tx.read().clone(),
+                    ClientMessage::Cancel { request_id },
+                );
+                state.write().pending_cancel.clear();
             }
-            match request_id_text.parse::<u32>() {
-                Ok(request_id) => {
-                    send_client_message(
-                        &mut state.write(),
-                        daemon_tx.read().clone(),
-                        ClientMessage::Cancel { request_id },
-                    );
-                    state.write().pending_cancel.clear();
-                }
-                Err(_) => state
-                    .write()
-                    .push_text(format!("invalid request id: {request_id_text}")),
-            }
+            Err(_) => state
+                .write()
+                .push_text(format!("invalid request id: {request_id_text}")),
         }
     };
 

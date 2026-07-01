@@ -1,5 +1,5 @@
 use crate::state::{AppState, UiEvent};
-use dioxus::prelude::{Readable, Signal, Writable};
+use dioxus::prelude::*;
 use std::io;
 use tai_client_core::{ShellCommand, dispatch_daemon_message, parse_input_line, shell_command_echo};
 use tai_proto::{ClientMessage, DaemonMessage, read_message, write_message};

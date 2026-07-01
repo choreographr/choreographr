@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 base64 = "0.22"
-dioxus = { version = "0.6.3", features = ["desktop"] }
+dioxus = { version = "0.7", features = ["desktop"] }
 tai-client-core.workspace = true
 tai-proto.workspace = true
 tokio = { workspace = true, features = ["full"] }
