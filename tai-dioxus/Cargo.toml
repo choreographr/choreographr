@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-base64 = "0.22"
+base64.workspace = true
 dioxus = { version = "0.7", features = ["desktop"] }
 tai-client-core.workspace = true
 tai-proto.workspace = true

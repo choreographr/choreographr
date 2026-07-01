@@ -17,4 +17,11 @@ tai-client-core = { path = "tai-client-core" }
 tai-keystore = { path = "tai-keystore" }
 tai-proto = { path = "tai-proto" }
 tai-im = { path = "tai-im" }
+ammonia = "4"
+base64 = "0.22"
+dirs = "6"
+image = "0.25"
+rand = "0.10"
+resvg = "0.47"
+serde_json = "1"
 tokio = { version = "1" }

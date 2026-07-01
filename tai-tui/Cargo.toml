@@ -6,10 +6,10 @@ edition = "2024"
 [dependencies]
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util.workspace = true
-image = "0.25"
+image.workspace = true
 ratatui = "0.30"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
-resvg = "0.47"
+resvg.workspace = true
 tai-client-core.workspace = true
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
