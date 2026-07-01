@@ -1,6 +1,6 @@
 use std::io;
 use tai_proto::{ClientMessage, ImageMetadata};
-use tai_sh::{ImageAssembler, ShellCommand, parse_input_line};
+use tai_tui::{ImageAssembler, ShellCommand, parse_input_line};
 
 #[test]
 fn shell_parser_handles_full_command_flow() {

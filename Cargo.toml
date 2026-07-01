@@ -4,7 +4,7 @@ members = [
     "tai-daemon",
     "tai-keystore",
     "tai-proto",
-    "tai-sh",
+    "tai-tui",
     "tai-dioxus",
 ]
 resolver = "3"

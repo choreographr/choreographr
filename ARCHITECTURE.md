@@ -9,7 +9,7 @@ length-prefixed binary protocol.
 
 ```
 ┌──────────────┐    Unix socket     ┌──────────────┐    HTTP/SSE     ┌───────────────┐
-│   tai-sh     │◄──────────────────►│              │◄──────────────►│  OpenAI API   │
+│   tai-tui     │◄──────────────────►│              │◄──────────────►│  OpenAI API   │
 │  (terminal)  │                    │  tai-daemon  │                │               │
 ├──────────────┤                    │              │                └───────────────┘
 │ tai-dioxus   │◄──────────────────►│              │
@@ -34,7 +34,7 @@ tai (workspace)
 ├── tai-keystore        Encrypted credential storage (+ CLI binary)
 ├── tai-client-core     Shared client logic (parsing, markdown, images, history)
 ├── tai-daemon          Unix socket server — the core engine
-├── tai-sh              Terminal UI client (ratatui + crossterm)
+├── tai-tui              Terminal UI client (ratatui + crossterm)
 └── tai-dioxus          Desktop GUI client (Dioxus)
 ```
 
@@ -58,7 +58,7 @@ tai (workspace)
      ┌────────┼────────┐     │
      │        │        │     │
 ┌────▼───┐ ┌──▼───┐    │     │
-│tai-sh  │ │tai-  │    │     │
+│tai-tui  │ │tai-  │    │     │
 │        │ │dioxus│    │     │
 └────────┘ └──────┘    │     │
                        │     │
@@ -142,7 +142,7 @@ lock state.
 
 ### `tai-client-core` — Shared client logic
 
-Used by both `tai-sh` and `tai-dioxus`.
+Used by both `tai-tui` and `tai-dioxus`.
 
 | Module | Purpose |
 |---|---|
@@ -190,7 +190,7 @@ RunInput received
         └► stream chunks via SSE → emit OutputChunk per token → Done
 ```
 
-### `tai-sh` — Terminal client
+### `tai-tui` — Terminal client
 
 Entry point: `src/main.rs`
 
@@ -321,12 +321,12 @@ big-model = 4096
 ## Data flow: a prompt from input to response
 
 ```
-1. User types "hello" in tai-sh
+1. User types "hello" in tai-tui
         │
 2. tai-client-core::shell::parse_input_line("hello")
    → ClientMessage::RunInput { request_id: 1, input: "hello" }
         │
-3. tai-sh writer task serializes + frames → Unix socket → tai-daemon
+3. tai-tui writer task serializes + frames → Unix socket → tai-daemon
         │
 4. tai-daemon server.rs handles RunInput:
    - validates session exists and is attached
@@ -341,15 +341,15 @@ big-model = 4096
 6. openai::requests streams SSE chunks
    → per chunk: DaemonMessage::OutputChunk { request_id: 1, stream: true, data: "Hello" }
         │
-7. DaemonMessage is serialized + framed → socket → tai-sh
+7. DaemonMessage is serialized + framed → socket → tai-tui
         │
-8. tai-sh reader task receives OutputChunk
+8. tai-tui reader task receives OutputChunk
    → pushes to UI event stream
         │
 9. UI loop consumes event → updates ClientHistory → re-renders
         │
 10. Final chunk arrives → DaemonMessage::Done { request_id: 1 }
-    tai-sh marks request complete, adds session message
+    tai-tui marks request complete, adds session message
 ```
 
 ### Image flow (tool-triggered)
@@ -397,7 +397,7 @@ Model calls display_image tool
 
 9. **Markdown as the intermediate format** — all text (tool output, assistant text, error
    messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
-   (tai-sh), providing a consistent rendering layer.
+   (tai-tui), providing a consistent rendering layer.
 
 10. **Flexible API format** — the daemon supports both OpenAI Chat Completions and Responses
     endpoints, selectable per-model. This lets users route different models to their best-supported
@@ -414,7 +414,7 @@ Model calls display_image tool
 | Client core | Shell parsing, markdown→HTML, image assembly, history | `tai-client-core/src/tests.rs` |
 | Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `tai-daemon/src/tests.rs`, `tai-daemon/tests/integration.rs` |
 | Daemon OpenAI | SSE parsing, HTTP request construction, config loading | `tai-daemon/src/openai/tests.rs` |
-| tai-sh | SVG rasterization, Unicode width, app state | `tai-sh/src/app_tests.rs`, `tai-sh/src/lib_tests.rs` |
+| tai-tui | SVG rasterization, Unicode width, app state | `tai-tui/src/app_tests.rs`, `tai-tui/src/lib_tests.rs` |
 | tai-dioxus | App state, render helpers | `tai-dioxus/src/app_tests.rs` |
 
 **Test infrastructure:** Tests use `UnixStream::pair()` for socket-less daemon↔client
@@ -441,7 +441,7 @@ cargo build --release
 cargo run -p tai-daemon
 
 # Run terminal client
-cargo run -p tai-sh
+cargo run -p tai-tui
 
 # Run desktop client
 cargo run -p tai-dioxus
@@ -463,9 +463,9 @@ cargo run -p tai-keystore -- list
 | `serde` + `bincode` | proto, daemon, clients | Serialization |
 | `reqwest` (rustls) | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
-| `ratatui` + `crossterm` | tai-sh | Terminal UI |
+| `ratatui` + `crossterm` | tai-tui | Terminal UI |
 | `dioxus` | tai-dioxus | Desktop UI |
-| `image` + `resvg` | daemon, tai-sh | Image decoding, SVG rasterization |
+| `image` + `resvg` | daemon, tai-tui | Image decoding, SVG rasterization |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `gix` | daemon | Git operations |
 | `alloy` | daemon | EVM blockchain tools |

@@ -5,7 +5,7 @@ A small Rust workspace for a local AI terminal interface.
 `tai` is a small Rust workspace with five crates:
 
 - `tai-daemon` — a Unix socket server that validates OpenAI-compatible credentials, manages sessions, accepts requests, runs tools, and returns model output
-- `tai-sh` — a terminal UI client built with `ratatui` and `crossterm`
+- `tai-tui` — a terminal UI client built with `ratatui` and `crossterm`
 - `tai-dioxus` — a minimal desktop app client built with `Dioxus`
 - `tai-client-core` — shared client-side parsing, markdown, and image-assembly logic used by the UI crates
 - `tai-proto` — the shared framed binary protocol used between the client and daemon
@@ -26,7 +26,7 @@ The current implementation is intentionally small and local-first:
 ├── tai-daemon/
 ├── tai-dioxus/
 ├── tai-proto/
-└── tai-sh/
+└── tai-tui/
 ```
 
 ## Architecture
@@ -42,7 +42,7 @@ The workspace is now split into smaller focused modules instead of a few large f
 - `git_tools.rs` — Git-specific tool support
 - `openai.rs` — OpenAI-compatible provider integration
 
-### `tai-sh`
+### `tai-tui`
 
 - `connection.rs` — transport, UI loop, input handling, and daemon message handling
 - `render.rs` — terminal rendering and history/image presentation
@@ -76,7 +76,7 @@ The workspace is now split into smaller focused modules instead of a few large f
 - Lets chat-completions models read, edit, and write local text files through the `read_file`, `edit_file`, and `write_file` tools
 - Lets chat-completions models display PNG, JPEG, and SVG images through the `display_image` tool
 
-### `tai-sh`
+### `tai-tui`
 
 - Full-screen terminal UI
 - Scrollable history pane
@@ -89,7 +89,7 @@ The workspace is now split into smaller focused modules instead of a few large f
 ### `tai-dioxus`
 
 - Minimal desktop app UI
-- Uses the same Unix socket transport and `tai-proto` message types as `tai-sh`
+- Uses the same Unix socket transport and `tai-proto` message types as `tai-tui`
 - Supports prompt input, streaming output, model listing/selection, and cancellation
 - Uses emoji-capable fallback font stacks for better native emoji rendering in the desktop UI
 - Renders image messages with standard `data:` URLs, including SVG
@@ -210,7 +210,7 @@ cargo run -p tai-daemon
 Start the shell in another:
 
 ```bash
-cargo run -p tai-sh
+cargo run -p tai-tui
 ```
 
 Or start the desktop app:
@@ -223,7 +223,7 @@ If startup succeeds, the daemon will validate your config against the provider b
 
 ## Shell commands
 
-Inside `tai-sh`:
+Inside `tai-tui`:
 
 - `/ping` — ask the daemon for a health-style pong response
 - `/models` — list available models and show the selected one
@@ -327,8 +327,8 @@ This workspace includes unit and integration tests for:
 - The daemon supports both chat completions and Responses API requests.
 - Request format is selected by `default_request_format`, with optional per-model overrides in `model_request_formats`.
 - Model selection is per client connection, not global.
-- `tai-sh` currently targets a local daemon over Unix sockets; there is no Windows named-pipe transport.
-- Emoji display in `tai-sh` still depends on your terminal emulator and installed fonts; the client now computes wrapping/alignment using Unicode display width, but it does not render emoji glyphs itself.
+- `tai-tui` currently targets a local daemon over Unix sockets; there is no Windows named-pipe transport.
+- Emoji display in `tai-tui` still depends on your terminal emulator and installed fonts; the client now computes wrapping/alignment using Unicode display width, but it does not render emoji glyphs itself.
 - `tai-dioxus` relies on OS/webview font fallback for emoji glyph rendering.
 - The protocol caps frame sizes at 1 MiB.
 
@@ -337,7 +337,7 @@ This workspace includes unit and integration tests for:
 - `tai-client-core`: shared client parsing, markdown, and image helpers
 - `tai-proto`: shared wire format and socket helpers
 - `tai-daemon`: provider-backed request executor with sessions and tools
-- `tai-sh`: terminal client and image-capable history viewer
+- `tai-tui`: terminal client and image-capable history viewer
 - `tai-dioxus`: minimal Dioxus desktop client
 
 ## License

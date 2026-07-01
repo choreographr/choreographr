@@ -2,7 +2,7 @@ use ratatui::layout::Rect;
 use std::{collections::HashSet, io};
 use tai_client_core::{ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem, MAX_HISTORY_ITEMS};
 use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
-use tai_sh::{
+use tai_tui::{
     MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, RenderedImage,
     StreamingText, build_rendered_image,
 };

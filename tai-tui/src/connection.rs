@@ -5,7 +5,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, time::Duration};
 use tai_client_core::{dispatch_daemon_message, shell_command_echo};
 use tai_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
-use tai_sh::{ShellCommand, build_picker, channel_closed, parse_input_line};
+use tai_tui::{ShellCommand, build_picker, channel_closed, parse_input_line};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
