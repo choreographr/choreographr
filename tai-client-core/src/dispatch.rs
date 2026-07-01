@@ -214,5 +214,6 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             ));
             Ok(None)
         }
+        DaemonMessage::Credential { .. } => Ok(None),
     }
 }

@@ -1,0 +1,11 @@
+[package]
+name = "tai-im"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tai-proto.workspace = true
+tai-client-core.workspace = true
+tokio = { workspace = true, features = ["full"] }
+teloxide = { version = "0.17", features = ["macros"] }
+ammonia = "4"

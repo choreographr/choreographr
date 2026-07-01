@@ -6,6 +6,7 @@ members = [
     "tai-proto",
     "tai-tui",
     "tai-dioxus",
+    "tai-im",
 ]
 resolver = "3"
 
@@ -15,4 +16,5 @@ serde = { version = "1", features = ["derive"] }
 tai-client-core = { path = "tai-client-core" }
 tai-keystore = { path = "tai-keystore" }
 tai-proto = { path = "tai-proto" }
+tai-im = { path = "tai-im" }
 tokio = { version = "1" }

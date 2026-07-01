@@ -3,17 +3,20 @@
 ## Overview
 
 `tai` is a local-first AI assistant built as a Rust workspace. A **daemon** process
-communicates with an OpenAI-compatible HTTP API, while **clients** (terminal and
-desktop) connect to the daemon over a Unix domain socket using a custom
-length-prefixed binary protocol.
+communicates with an OpenAI-compatible HTTP API, while **clients** (terminal,
+desktop, and IM platforms) connect to the daemon over a Unix domain socket using a
+custom length-prefixed binary protocol.
 
 ```
 ┌──────────────┐    Unix socket     ┌──────────────┐    HTTP/SSE     ┌───────────────┐
 │   tai-tui     │◄──────────────────►│              │◄──────────────►│  OpenAI API   │
-│  (terminal)  │                    │  tai-daemon  │                │               │
-├──────────────┤                    │              │                └───────────────┘
+│  (terminal)  │                    │              │                │               │
+├──────────────┤                    │  tai-daemon  │                └───────────────┘
 │ tai-dioxus   │◄──────────────────►│              │
 │  (desktop)   │    Unix socket     │              │
+├──────────────┤                    │              │
+│   tai-im     │◄──────────────────►│              │
+│ (IM bridge)  │    Unix socket     │              │
 └──────────────┘                    └──────┬───────┘
                                           │
                                    ┌──────┴───────┐
@@ -26,7 +29,7 @@ length-prefixed binary protocol.
 
 ## Workspace topology
 
-Six crates in a single Cargo workspace (resolver = "3"):
+Seven crates in a single Cargo workspace (resolver = "3"):
 
 ```
 tai (workspace)
@@ -35,7 +38,8 @@ tai (workspace)
 ├── tai-client-core     Shared client logic (parsing, markdown, images, history)
 ├── tai-daemon          Unix socket server — the core engine
 ├── tai-tui              Terminal UI client (ratatui + crossterm)
-└── tai-dioxus          Desktop GUI client (Dioxus)
+├── tai-dioxus          Desktop GUI client (Dioxus)
+└── tai-im              IM platform bridge (Telegram)
 ```
 
 ### Dependency graph
@@ -55,17 +59,16 @@ tai (workspace)
      │ tai-client-core │     │     │    tai-daemon   │
      └────────┬────────┘     │     └─────────────────┘
               │              │
-     ┌────────┼────────┐     │
-     │        │        │     │
-┌────▼───┐ ┌──▼───┐    │     │
-│tai-tui  │ │tai-  │    │     │
-│        │ │dioxus│    │     │
-└────────┘ └──────┘    │     │
-                       │     │
-                 ┌─────▼─────▼──┐
-                 │  tai-proto    │
-                 │  tai-keystore │
-                 └──────────────┘
+     ┌────────┼────────┬─────┘
+     │        │        │
+┌────▼───┐ ┌──▼───┐ ┌──▼───┐
+│tai-tui  │ │tai-  │ │tai-  │
+│        │ │dioxus│ │im    │
+└────────┘ └──────┘ └──────┘
+                        │
+                  ┌─────▼─────┐
+                  │  tai-proto │
+                  └───────────┘
 ```
 
 ---
@@ -87,8 +90,8 @@ Defines all shared message types and framing. No dependencies on other workspace
 
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
-`TestImage`, `Cancel`, `Ping`, `ListModels`, `SetModel`, `Unlock`, `Lock`,
-`AddApiKey`, `AddXCredential`, `RemoveCredential`
+`TestImage`, `Cancel`, `Ping`, `GetCredential`, `ListModels`, `SetModel`, `Unlock`,
+`Lock`, `AddApiKey`, `AddXCredential`, `RemoveCredential`
 
 `DaemonMessage` variants:
 - Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionMessageAppended`, `SessionFailed`
@@ -97,7 +100,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 - Image streaming: `ImageStart`, `ImageChunk`, `ImageEnd`
 - Model management: `Models`, `ModelsFailed`, `ModelSelected`, `ModelSelectionFailed`
 - Locking: `Unlocked`, `Locked`, `LockedError`
-- Credential management: `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`
+- Credential management: `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`
 - Misc: `Pong`
 
 **Wire format:**
@@ -227,6 +230,36 @@ async reader/writer tasks inside the Dioxus runtime.
 | `state.rs` | `AppState` with input, request tracking, `ClientHistory` |
 | `render.rs` | RSX rendering of history items: markdown → sanitized HTML, images via `data:` URLs |
 | `main.rs` | Dioxus `App` component, toolbar, history pane, textarea composer, CSS |
+
+
+### `tai-im` — IM platform bridge
+
+Entry point: `src/main.rs`
+
+Single binary (`tai-im`) that bridges IM platforms to the daemon.
+The binary accepts a platform subcommand: `tai-im telegram`.
+
+**Credentials:** The daemon serves platform credentials via the `GetCredential` wire
+message, so `tai-im` does not depend on `tai-keystore`. The admin first stores the
+bot token in the keystore (`tai-keystore add telegram <token>`) and unlocks the daemon.
+
+**Module breakdown:**
+
+| Module | Purpose |
+|---|---|
+| `main.rs` | CLI entry, daemon handshake (Unlock, GetCredential), platform dispatch |
+| `bridge.rs` | `DaemonBridge` — Unix socket read/write tasks, text buffering, image assembly, `BridgeEvent` enum |
+| `telegram.rs` | Telegram bot: teloxide polling, admin-only filter, command dispatch, HTML formatting |
+
+**Data flow:**
+
+```
+Telegram user → teloxide polling → handle_message()
+  → parse_input_line() → ClientMessage → bridge.send()
+  → daemon
+  → DaemonMessage → bridge reader task → BridgeEvent
+  → send_daemon_event() → Telegram HTML/photo
+```
 
 
 ---
@@ -450,6 +483,9 @@ cargo run -p tai-dioxus
 cargo run -p tai-keystore -- init
 cargo run -p tai-keystore -- add openai
 cargo run -p tai-keystore -- list
+
+# Run IM bridge (Telegram)
+cargo run -p tai-im -- telegram
 ```
 
 
@@ -470,4 +506,5 @@ cargo run -p tai-keystore -- list
 | `gix` | daemon | Git operations |
 | `alloy` | daemon | EVM blockchain tools |
 | `subxt` | daemon | Substrate blockchain tools |
+| `teloxide` | tai-im | Telegram Bot API client |
 | `tracing` | daemon | Structured logging |

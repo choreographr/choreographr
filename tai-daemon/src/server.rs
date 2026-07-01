@@ -521,6 +521,14 @@ pub async fn handle_client(
                         x::clear_x_credentials();
                         let _ = tx.send(DaemonMessage::Locked).await;
                     }
+                    ClientMessage::GetCredential { service } => {
+                        let key = {
+                            let guard = state.lock().await;
+                            guard.keystore.as_ref()
+                                .and_then(|ks| ks.get_api_key(&service).map(|k| k.to_string()))
+                        };
+                        let _ = tx.send(DaemonMessage::Credential { service, key }).await;
+                    }
                     ClientMessage::AddApiKey { service, passphrase, key } => {
                         let svc = service.clone();
                         let ks_path = match keystore_path() {

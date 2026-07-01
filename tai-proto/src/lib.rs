@@ -97,6 +97,7 @@ pub enum ClientMessage {
     TestImage { request_id: u32 },
     Cancel { request_id: u32 },
     Ping,
+    GetCredential { service: String },
     ListModels,
     SetModel { model: String },
     Unlock { passphrase: String },
@@ -229,6 +230,10 @@ pub enum DaemonMessage {
     CredentialRemoveFailed {
         service: String,
         error: String,
+    },
+    Credential {
+        service: String,
+        key: Option<String>,
     },
 }
 
