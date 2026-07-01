@@ -1,10 +1,10 @@
 use ratatui::layout::Rect;
-use std::collections::HashSet;
-use tai_client_core::{ClientHistory, HistoryItem as SharedHistoryItem, MAX_HISTORY_ITEMS};
-use tai_proto::{OutputStream, SessionMessage};
+use std::{collections::HashSet, io};
+use tai_client_core::{ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem, MAX_HISTORY_ITEMS};
+use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
 use tai_sh::{
     MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, RenderedImage,
-    StreamingText,
+    StreamingText, build_rendered_image,
 };
 
 pub(crate) struct App {
@@ -15,6 +15,7 @@ pub(crate) struct App {
     pub(crate) history_scroll: HistoryScrollState,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
+    pub(crate) picker: Option<ratatui_image::picker::Picker>,
 }
 
 #[derive(Clone, Copy)]
@@ -177,6 +178,7 @@ impl App {
             history_scroll: HistoryScrollState::new(),
             history_viewport: HistoryViewport::new(),
             should_quit: false,
+            picker: None,
         }
     }
 
@@ -286,11 +288,6 @@ impl App {
             .scroll_down(amount, self.max_scroll_offset());
     }
 
-    pub(crate) fn drop_request(&mut self, request_id: u32) {
-        self.active.remove(&request_id);
-        self.finalize_stream(request_id);
-    }
-
     fn trimmed_height_on_append(&self) -> usize {
         if self.client.history.len() < MAX_HISTORY_ITEMS || self.history_scroll.follow_output() {
             return 0;
@@ -305,6 +302,52 @@ impl App {
     fn account_for_trimmed_height(&mut self, trimmed_height: usize) {
         self.history_scroll
             .account_for_trimmed_height(trimmed_height, self.max_scroll_offset());
+    }
+}
+
+impl DaemonMessageHandler for App {
+    fn push_text(&mut self, text: String) {
+        self.push_text(text);
+    }
+
+    fn push_session_message(&mut self, message: SessionMessage) {
+        self.push_session_message(message);
+    }
+
+    fn begin_stream(&mut self, request_id: u32) {
+        self.begin_stream(request_id);
+    }
+
+    fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
+        self.append_stream_text(request_id, stream, chunk);
+    }
+
+    fn finalize_stream(&mut self, request_id: u32) {
+        self.finalize_stream(request_id);
+    }
+
+    fn drop_request(&mut self, request_id: u32) {
+        self.active.remove(&request_id);
+        self.client.in_progress.remove(&request_id);
+        self.client.pending_images.drop_request(request_id);
+    }
+
+    fn handle_image_start(&mut self, request_id: u32, metadata: ImageMetadata) -> io::Result<()> {
+        self.client.start_image(request_id, metadata)
+    }
+
+    fn handle_image_chunk(&mut self, request_id: u32, image_id: u32, data: &[u8]) -> io::Result<()> {
+        self.client.push_image_chunk(request_id, image_id, data)
+    }
+
+    fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> io::Result<()> {
+        let (metadata, data) = self.client.finish_image(request_id, image_id)?;
+        let picker = self.picker.as_ref().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "image picker not set")
+        })?;
+        let rendered = build_rendered_image(picker, metadata, data)?;
+        self.push_image(rendered);
+        Ok(())
     }
 }
 

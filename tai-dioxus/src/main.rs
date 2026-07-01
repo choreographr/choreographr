@@ -3,13 +3,13 @@ mod render;
 mod state;
 
 use crate::client::{
-    apply_daemon_message, initial_socket_path, run_client, send_client_message, submit_input,
+    apply_daemon_message, run_client, send_client_message, submit_input,
 };
 use crate::render::render_history_item;
 use crate::state::{AppState, UiEvent};
 use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
-use tai_proto::ClientMessage;
+use tai_proto::{ClientMessage, socket_path};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 fn main() {
@@ -20,7 +20,7 @@ fn main() {
 
 #[component]
 fn App() -> Element {
-    let socket = use_signal(initial_socket_path);
+    let socket = use_signal(socket_path);
     let mut state = use_signal(|| AppState::new(socket.read().clone()));
     let daemon_tx = use_signal(|| None::<UnboundedSender<ClientMessage>>);
     let events_rx = use_signal(|| None::<UnboundedReceiver<UiEvent>>);

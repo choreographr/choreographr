@@ -517,7 +517,6 @@ pub async fn handle_client(
                         let mut guard = state.lock().await;
                         guard.openai_client = None;
                         guard.keystore = None;
-                        guard.x_credentials = None;
                         drop(guard);
                         x::clear_x_credentials();
                         let _ = tx.send(DaemonMessage::Locked).await;

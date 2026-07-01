@@ -2,13 +2,14 @@ use crate::render::{mouse_in_history_box, render};
 use crate::state::{App, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::{collections::HashSet, io, sync::Arc, time::Duration};
+use std::{io, time::Duration};
+use tai_client_core::{dispatch_daemon_message, shell_command_echo};
 use tai_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
-use tai_sh::{ShellCommand, build_picker, build_rendered_image, channel_closed, parse_input_line};
+use tai_sh::{ShellCommand, build_picker, channel_closed, parse_input_line};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
-    sync::{Mutex, mpsc},
+    sync::mpsc,
 };
 
 pub(crate) async fn run_app() -> io::Result<()> {
@@ -17,7 +18,6 @@ pub(crate) async fn run_app() -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (client_tx, mut client_rx) = mpsc::channel::<ClientMessage>(128);
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(128);
-    let active = Arc::new(Mutex::new(HashSet::<u32>::new()));
 
     let picker = build_picker();
     let picker_protocol = format!("{:?}", picker.protocol_type());
@@ -82,7 +82,6 @@ pub(crate) async fn run_app() -> io::Result<()> {
         &picker,
         &client_tx,
         &mut ui_rx,
-        &active,
     )
     .await;
 
@@ -119,7 +118,6 @@ pub(crate) async fn run_ui_loop(
     picker: &ratatui_image::picker::Picker,
     client_tx: &mpsc::Sender<ClientMessage>,
     ui_rx: &mut mpsc::Receiver<UiEvent>,
-    active: &Arc<Mutex<HashSet<u32>>>,
 ) -> io::Result<()> {
     while !app.should_quit {
         while let Ok(event) = event::poll(Duration::from_millis(0)) {
@@ -132,7 +130,7 @@ pub(crate) async fn run_ui_loop(
         while let Ok(message) = ui_rx.try_recv() {
             match message {
                 UiEvent::Daemon(message) => {
-                    handle_daemon_message(message, app, picker, active, client_tx)
+                    handle_daemon_message(message, app, picker, client_tx)
                         .await?;
                 }
                 UiEvent::ReaderClosed => {
@@ -188,14 +186,13 @@ pub(crate) async fn handle_terminal_event(
                             app.push_text(error)
                         }
                         ShellCommand::Send(message) => {
+                            if let Some(echo) = shell_command_echo(&ShellCommand::Send(message.clone())) {
+                                app.push_text(echo);
+                            }
                             match &message {
-                                ClientMessage::RunInput { request_id, input } => {
+                                ClientMessage::RunInput { request_id, .. }
+                                | ClientMessage::TestImage { request_id } => {
                                     app.active.insert(*request_id);
-                                    app.push_text(format!("> {}", String::from_utf8_lossy(input)));
-                                }
-                                ClientMessage::TestImage { request_id } => {
-                                    app.active.insert(*request_id);
-                                    app.push_text("> /image".to_string());
                                 }
                                 _ => {}
                             }
@@ -233,171 +230,12 @@ pub(crate) async fn handle_daemon_message(
     message: DaemonMessage,
     app: &mut App,
     picker: &ratatui_image::picker::Picker,
-    active: &Arc<Mutex<HashSet<u32>>>,
     client_tx: &mpsc::Sender<ClientMessage>,
 ) -> io::Result<()> {
-    match message {
-        DaemonMessage::SessionCreated { session_id, title } => {
-            let label = title.unwrap_or_else(|| "untitled".to_string());
-            app.push_text(format!("[daemon] created session {session_id}: {label}"));
-        }
-        DaemonMessage::Sessions { sessions } => {
-            if let Some(session) = sessions.first() {
-                client_tx
-                    .send(ClientMessage::AttachSession {
-                        session_id: session.session_id,
-                    })
-                    .await
-                    .map_err(channel_closed)?;
-            } else {
-                client_tx
-                    .send(ClientMessage::CreateSession {
-                        title: Some("default".to_string()),
-                    })
-                    .await
-                    .map_err(channel_closed)?;
-            }
-        }
-        DaemonMessage::SessionAttached { session_id } => {
-            app.push_text(format!("[daemon] attached session: {session_id}"))
-        }
-        DaemonMessage::SessionState {
-            session_id,
-            title,
-            selected_model,
-            messages,
-        } => {
-            let title = title.unwrap_or_else(|| "untitled".to_string());
-            app.push_text(format!("[daemon] session {session_id}: {title}"));
-            if let Some(model) = selected_model {
-                app.push_text(format!("[daemon] selected model: {model}"));
-            }
-            for message in messages {
-                app.push_session_message(message);
-            }
-        }
-        DaemonMessage::SessionFailed { operation, error } => {
-            app.push_text(format!("[daemon] {operation} failed: {error}"))
-        }
-        DaemonMessage::SessionMessageAppended { message } => app.push_session_message(message),
-        DaemonMessage::Started { request_id } => app.begin_stream(request_id),
-        DaemonMessage::ToolCallStarted {
-            request_id,
-            call_id,
-            tool_name,
-            arguments_json,
-        } => app.push_text(format!(
-            "[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"
-        )),
-        DaemonMessage::ToolCallFinished {
-            request_id,
-            call_id,
-            tool_name,
-            output,
-        } => app.push_text(format!(
-            "[{request_id}] tool {tool_name}#{call_id} ok: {output}"
-        )),
-        DaemonMessage::ToolCallFailed {
-            request_id,
-            call_id,
-            tool_name,
-            error,
-        } => app.push_text(format!(
-            "[{request_id}] tool {tool_name}#{call_id} failed: {error}"
-        )),
-        DaemonMessage::OutputChunk {
-            request_id,
-            stream,
-            data,
-        } => {
-            let text = String::from_utf8(data)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            app.append_stream_text(request_id, stream, &text);
-        }
-        DaemonMessage::ImageStart {
-            request_id,
-            metadata,
-        } => app.client.start_image(request_id, metadata)?,
-        DaemonMessage::ImageChunk {
-            request_id,
-            image_id,
-            data,
-        } => app.client.push_image_chunk(request_id, image_id, &data)?,
-        DaemonMessage::ImageEnd {
-            request_id,
-            image_id,
-        } => {
-            let (metadata, data) = app.client.finish_image(request_id, image_id)?;
-            let rendered = build_rendered_image(picker, metadata, data)?;
-            app.push_image(rendered);
-        }
-        DaemonMessage::Done { request_id } => {
-            app.finalize_stream(request_id);
-            app.push_text(format!("[{request_id}] done"));
-            active.lock().await.remove(&request_id);
-            app.drop_request(request_id);
-        }
-        DaemonMessage::Failed { request_id, error } => {
-            app.finalize_stream(request_id);
-            app.push_text(format!("[{request_id}] failed: {error}"));
-            active.lock().await.remove(&request_id);
-            app.drop_request(request_id);
-        }
-        DaemonMessage::Cancelled { request_id } => {
-            app.finalize_stream(request_id);
-            app.push_text(format!("[{request_id}] cancelled"));
-            active.lock().await.remove(&request_id);
-            app.drop_request(request_id);
-        }
-        DaemonMessage::Pong => app.push_text("[daemon] pong".to_string()),
-        DaemonMessage::Models {
-            models,
-            selected_model,
-        } => {
-            if models.is_empty() {
-                app.push_text("[daemon] no models available".to_string());
-            } else {
-                app.push_text(format!("[daemon] supported models ({})", models.len()));
-                for model in models {
-                    let prefix = if selected_model.as_deref() == Some(model.as_str()) {
-                        "*"
-                    } else {
-                        "-"
-                    };
-                    app.push_text(format!("{prefix} {model}"));
-                }
-            }
-        }
-        DaemonMessage::ModelsFailed { error } => {
-            app.push_text(format!("[daemon] models failed: {error}"))
-        }
-        DaemonMessage::ModelSelected { model } => {
-            app.push_text(format!("[daemon] selected model: {model}"))
-        }
-        DaemonMessage::ModelSelectionFailed { model, error } => {
-            app.push_text(format!("[daemon] failed to select model {model}: {error}"))
-        }
-        DaemonMessage::Unlocked => {
-            app.push_text("[daemon] keystore unlocked, credentials available".to_string());
-        }
-        DaemonMessage::Locked => {
-            app.push_text("[daemon] keystore locked, credentials cleared".to_string());
-        }
-        DaemonMessage::LockedError { error } => {
-            app.push_text(format!("[daemon] locked: {error}"))
-        }
-        DaemonMessage::CredentialAdded { service } => {
-            app.push_text(format!("[daemon] credential added: {service}"))
-        }
-        DaemonMessage::CredentialAddFailed { service, error } => {
-            app.push_text(format!("[daemon] credential add failed ({service}): {error}"))
-        }
-        DaemonMessage::CredentialRemoved { service } => {
-            app.push_text(format!("[daemon] credential removed: {service}"))
-        }
-        DaemonMessage::CredentialRemoveFailed { service, error } => {
-            app.push_text(format!("[daemon] credential remove failed ({service}): {error}"))
-        }
+    app.picker = Some(picker.clone());
+    let response = dispatch_daemon_message(app, message)?;
+    if let Some(msg) = response {
+        client_tx.send(msg).await.map_err(channel_closed)?;
     }
     Ok(())
 }

@@ -1,6 +1,7 @@
 use crate::connection::handle_terminal_event;
 use crate::state::*;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use tai_client_core::DaemonMessageHandler;
 use tai_proto::{ClientMessage, OutputStream};
 use tokio::sync::mpsc;
 

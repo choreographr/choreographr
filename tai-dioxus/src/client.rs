@@ -1,9 +1,8 @@
-use crate::state::{AppState, DisplayImage, UiEvent};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use crate::state::{AppState, UiEvent};
 use dioxus::prelude::{Readable, Signal, Writable};
 use std::io;
-use tai_client_core::{ShellCommand, parse_input_line};
-use tai_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
+use tai_client_core::{ShellCommand, dispatch_daemon_message, parse_input_line, shell_command_echo};
+use tai_proto::{ClientMessage, DaemonMessage, read_message, write_message};
 use tokio::{
     net::UnixStream,
     sync::mpsc::{UnboundedReceiver, UnboundedSender},
@@ -103,12 +102,8 @@ pub(crate) fn send_client_message(
         return;
     };
 
-    match &message {
-        ClientMessage::RunInput { input, .. } => {
-            state.push_text(format!("> {}", String::from_utf8_lossy(input)));
-        }
-        ClientMessage::TestImage { .. } => state.push_text("> /image"),
-        _ => {}
+    if let Some(echo) = shell_command_echo(&ShellCommand::Send(message.clone())) {
+        state.push_text(echo);
     }
 
     if let Err(error) = sender.send(message) {
@@ -121,179 +116,11 @@ pub(crate) fn apply_daemon_message(
     message: DaemonMessage,
     daemon_tx: Option<UnboundedSender<ClientMessage>>,
 ) -> io::Result<()> {
-    match message {
-        DaemonMessage::SessionCreated { session_id, title } => {
-            let label = title.unwrap_or_else(|| "untitled".to_string());
-            state.push_text(format!("[daemon] created session {session_id}: {label}"));
-        }
-        DaemonMessage::Sessions { sessions } => {
-            if let Some(sender) = daemon_tx {
-                let message = if let Some(session) = sessions.first() {
-                    ClientMessage::AttachSession {
-                        session_id: session.session_id,
-                    }
-                } else {
-                    ClientMessage::CreateSession {
-                        title: Some("default".to_string()),
-                    }
-                };
-                let _ = sender.send(message);
-            }
-        }
-        DaemonMessage::SessionAttached { session_id } => {
-            state.push_text(format!("[daemon] attached session: {session_id}"));
-        }
-        DaemonMessage::SessionState {
-            session_id,
-            title,
-            selected_model,
-            messages,
-        } => {
-            let title = title.unwrap_or_else(|| "untitled".to_string());
-            state.push_text(format!("[daemon] session {session_id}: {title}"));
-            if let Some(model) = selected_model {
-                state.push_text(format!("[daemon] selected model: {model}"));
-            }
-            for message in messages {
-                state.push_session_message(message);
-            }
-        }
-        DaemonMessage::SessionFailed { operation, error } => {
-            state.push_text(format!("[daemon] {operation} failed: {error}"));
-        }
-        DaemonMessage::SessionMessageAppended { message } => {
-            state.push_session_message(message);
-        }
-        DaemonMessage::Started { request_id } => {
-            state.begin_stream(request_id);
-        }
-        DaemonMessage::ToolCallStarted {
-            request_id,
-            call_id,
-            tool_name,
-            arguments_json,
-        } => {
-            state.push_text(format!(
-                "[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"
-            ));
-        }
-        DaemonMessage::ToolCallFinished {
-            request_id,
-            call_id,
-            tool_name,
-            output,
-        } => {
-            state.push_text(format!(
-                "[{request_id}] tool {tool_name}#{call_id} ok: {output}"
-            ));
-        }
-        DaemonMessage::ToolCallFailed {
-            request_id,
-            call_id,
-            tool_name,
-            error,
-        } => {
-            state.push_text(format!(
-                "[{request_id}] tool {tool_name}#{call_id} failed: {error}"
-            ));
-        }
-        DaemonMessage::OutputChunk {
-            request_id,
-            stream,
-            data,
-        } => {
-            let text = String::from_utf8(data)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            state.append_stream(request_id, stream, &text);
-        }
-        DaemonMessage::ImageStart {
-            request_id,
-            metadata,
-        } => {
-            state.client.start_image(request_id, metadata)?;
-        }
-        DaemonMessage::ImageChunk {
-            request_id,
-            image_id,
-            data,
-        } => {
-            state.client.push_image_chunk(request_id, image_id, &data)?;
-        }
-        DaemonMessage::ImageEnd {
-            request_id,
-            image_id,
-        } => {
-            let (metadata, data) = state.client.finish_image(request_id, image_id)?;
-            state.push_image(DisplayImage {
-                data_url: format!("data:{};base64,{}", metadata.mime_type, BASE64.encode(data)),
-                metadata,
-            });
-        }
-        DaemonMessage::Done { request_id } => {
-            state.finalize_stream(request_id);
-            state.push_text(format!("[{request_id}] done"));
-        }
-        DaemonMessage::Failed { request_id, error } => {
-            state.finalize_stream(request_id);
-            state.push_text(format!("[{request_id}] failed: {error}"));
-        }
-        DaemonMessage::Cancelled { request_id } => {
-            state.finalize_stream(request_id);
-            state.push_text(format!("[{request_id}] cancelled"));
-        }
-        DaemonMessage::Pong => state.push_text("[daemon] pong"),
-        DaemonMessage::Models {
-            models,
-            selected_model,
-        } => {
-            if models.is_empty() {
-                state.push_text("[daemon] no models available");
-            } else {
-                state.push_text(format!("[daemon] supported models ({})", models.len()));
-                for model in models {
-                    let prefix = if selected_model.as_deref() == Some(model.as_str()) {
-                        "*"
-                    } else {
-                        "-"
-                    };
-                    state.push_text(format!("{prefix} {model}"));
-                }
-            }
-        }
-        DaemonMessage::ModelsFailed { error } => {
-            state.push_text(format!("[daemon] models failed: {error}"));
-        }
-        DaemonMessage::ModelSelected { model } => {
-            state.push_text(format!("[daemon] selected model: {model}"));
-        }
-        DaemonMessage::ModelSelectionFailed { model, error } => {
-            state.push_text(format!("[daemon] failed to select model {model}: {error}"));
-        }
-        DaemonMessage::Unlocked => {
-            state.push_text("[daemon] keystore unlocked, credentials available");
-        }
-        DaemonMessage::Locked => {
-            state.push_text("[daemon] keystore locked, credentials cleared");
-        }
-        DaemonMessage::LockedError { error } => {
-            state.push_text(format!("[daemon] locked: {error}"));
-        }
-        DaemonMessage::CredentialAdded { service } => {
-            state.push_text(format!("[daemon] credential added: {service}"));
-        }
-        DaemonMessage::CredentialAddFailed { service, error } => {
-            state.push_text(format!("[daemon] credential add failed ({service}): {error}"));
-        }
-        DaemonMessage::CredentialRemoved { service } => {
-            state.push_text(format!("[daemon] credential removed: {service}"));
-        }
-        DaemonMessage::CredentialRemoveFailed { service, error } => {
-            state.push_text(format!("[daemon] credential remove failed ({service}): {error}"));
-        }
+    let response = dispatch_daemon_message(state, message)?;
+    if let Some(msg) = response
+        && let Some(sender) = daemon_tx
+    {
+        let _ = sender.send(msg);
     }
     Ok(())
-}
-
-pub(crate) fn initial_socket_path() -> String {
-    socket_path()
 }

@@ -145,6 +145,19 @@ fn parse_command(rest: &str, next_request_id: &mut u32) -> ShellCommand {
     ShellCommand::UnknownCommand(format!("unknown command: /{rest}"))
 }
 
+pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
+    match command {
+        ShellCommand::Send(message) => match message {
+            ClientMessage::RunInput { input, .. } => {
+                Some(format!("> {}", String::from_utf8_lossy(input)))
+            }
+            ClientMessage::TestImage { .. } => Some("> /image".to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamingText {
     pub request_id: u32,
