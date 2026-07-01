@@ -6,7 +6,7 @@ mod tests;
 
 pub(crate) use config::endpoint_url;
 pub use config::{
-    AuthConfig, auth_config_path, completion, load_auth_config, validate_and_list_models,
+    ServiceConfig, completion, config_path, load_service_config, validate_and_list_models,
 };
 #[cfg(test)]
 pub(crate) use sse::build_sse_event;
@@ -210,19 +210,24 @@ impl ChatToolDefinition {
 
 #[derive(Clone)]
 pub struct OpenAiClient {
-    config: AuthConfig,
+    config: ServiceConfig,
+    api_key: String,
     http: reqwest::Client,
 }
 
 impl OpenAiClient {
-    pub fn new(config: AuthConfig) -> io::Result<Self> {
+    pub fn new(config: ServiceConfig, api_key: String) -> io::Result<Self> {
         let http = reqwest::Client::builder()
             .build()
             .map_err(io::Error::other)?;
-        Ok(Self { config, http })
+        Ok(Self { config, api_key, http })
     }
 
-    pub fn config(&self) -> &AuthConfig {
+    pub fn config(&self) -> &ServiceConfig {
         &self.config
+    }
+
+    pub fn api_key(&self) -> &str {
+        &self.api_key
     }
 }

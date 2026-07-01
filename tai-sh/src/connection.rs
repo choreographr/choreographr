@@ -374,6 +374,15 @@ pub(crate) async fn handle_daemon_message(
         DaemonMessage::ModelSelectionFailed { model, error } => {
             app.push_text(format!("[daemon] failed to select model {model}: {error}"))
         }
+        DaemonMessage::Unlocked => {
+            app.push_text("[daemon] keystore unlocked, credentials available".to_string());
+        }
+        DaemonMessage::Locked => {
+            app.push_text("[daemon] keystore locked, credentials cleared".to_string());
+        }
+        DaemonMessage::LockedError { error } => {
+            app.push_text(format!("[daemon] locked: {error}"))
+        }
     }
     Ok(())
 }

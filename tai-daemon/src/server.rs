@@ -1,11 +1,13 @@
-use crate::openai::{AuthConfig, OpenAiClient, RequestFormat};
+use crate::openai::{OpenAiClient, RequestFormat, load_service_config};
 use crate::requests::{emit_demo_image, execute_chat_tool_request, execute_plain_request};
 use crate::sessions::{
     ActiveRequest, DaemonState, SessionState, broadcast_message_appended, broadcast_to_session,
-    default_session_id, list_sessions, new_daemon_state, require_attached_session, session_by_id,
+    default_session_id, list_sessions, require_attached_session, session_by_id,
     session_snapshot, update_subscription,
 };
+use crate::tools::x;
 use std::{collections::HashMap, io, path::Path, sync::Arc};
+use tai_keystore::{Keystore, keystore_path};
 use tai_proto::{ClientMessage, DaemonMessage, SessionMessage, read_message, write_message};
 use tokio::{
     io::AsyncWriteExt,
@@ -24,15 +26,13 @@ async fn wait_for_shutdown() {
     }
 }
 
-pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Result<()> {
+pub async fn run_server(socket_path: &str, state: DaemonState) -> io::Result<()> {
     if Path::new(socket_path).exists() {
         info!(%socket_path, "removing stale socket");
         std::fs::remove_file(socket_path)?;
     }
 
     let listener = UnixListener::bind(socket_path)?;
-    let client = Arc::new(OpenAiClient::new(auth_config)?);
-    let state = new_daemon_state();
     info!(%socket_path, "tai-daemon listening");
 
     let result = loop {
@@ -40,10 +40,9 @@ pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Resul
             accept_result = listener.accept() => {
                 let (stream, _) = accept_result?;
                 debug!("accepted client connection");
-                let client = Arc::clone(&client);
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, client, state).await {
+                    if let Err(error) = handle_client(stream, state).await {
                         error!(error = %error, "client error");
                     }
                 });
@@ -60,9 +59,29 @@ pub async fn run_server(socket_path: &str, auth_config: AuthConfig) -> io::Resul
     result
 }
 
+async fn require_openai_client(
+    state: &DaemonState,
+    tx: &mpsc::Sender<DaemonMessage>,
+) -> io::Result<Option<Arc<OpenAiClient>>> {
+    let client = {
+        let guard = state.lock().await;
+        guard.openai_client.as_ref().map(Arc::clone)
+    };
+    match client {
+        Some(c) => Ok(Some(c)),
+        None => {
+            let _ = tx
+                .send(DaemonMessage::LockedError {
+                    error: "daemon is locked. use :unlock <passphrase> to unlock".to_string(),
+                })
+                .await;
+            Ok(None)
+        }
+    }
+}
+
 pub async fn handle_client(
     stream: UnixStream,
-    client: Arc<OpenAiClient>,
     state: DaemonState,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
@@ -220,9 +239,21 @@ pub async fn handle_client(
                             model
                         };
 
+                        let Some(client) = ({
+                            let guard = state.lock().await;
+                            guard.openai_client.as_ref().map(Arc::clone)
+                        }) else {
+                            let _ = tx
+                                .send(DaemonMessage::LockedError {
+                                    error: "daemon is locked. use :unlock <passphrase> to unlock"
+                                        .to_string(),
+                                })
+                                .await;
+                            continue;
+                        };
+
                         let request_format = client.config().request_format_for_model(&model);
                         info!(request_id, session_id, input_len = input.len(), selected_model = %model, ?request_format, "starting request");
-                        let client_clone = Arc::clone(&client);
                         let session_clone = Arc::clone(&session);
                         let handle = tokio::spawn(async move {
                             broadcast_to_session(
@@ -235,7 +266,7 @@ pub async fn handle_client(
                             let result = match request_format {
                                 RequestFormat::Responses => {
                                     execute_plain_request(
-                                        &client_clone,
+                                        &client,
                                         &session_clone,
                                         &model,
                                         request_id,
@@ -244,7 +275,7 @@ pub async fn handle_client(
                                 }
                                 RequestFormat::ChatCompletions => {
                                     execute_chat_tool_request(
-                                        &client_clone,
+                                        &client,
                                         &session_clone,
                                         &model,
                                         request_id,
@@ -345,6 +376,9 @@ pub async fn handle_client(
                         let _ = tx.send(DaemonMessage::Pong).await;
                     }
                     ClientMessage::ListModels => {
+                        let Some(client) = require_openai_client(&state, &tx).await? else {
+                            continue;
+                        };
                         let config = client.config();
                         debug!(base_url = %config.base_url, model_list_path = %config.model_list_path, responses_path = %config.responses_path, "listing configured models");
                         let selected_model = match attached_session_id {
@@ -378,6 +412,9 @@ pub async fn handle_client(
                         else {
                             continue;
                         };
+                        let Some(client) = require_openai_client(&state, &tx).await? else {
+                            continue;
+                        };
                         let config = client.config();
                         debug!(base_url = %config.base_url, model_list_path = %config.model_list_path, responses_path = %config.responses_path, requested_model = %model, session_id, "setting selected model");
                         match client.validate_and_list_models().await {
@@ -408,6 +445,82 @@ pub async fn handle_client(
                                     .await;
                             }
                         }
+                    }
+                    ClientMessage::Unlock { passphrase } => {
+                        let ks_path = match keystore_path() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let _ = tx
+                                    .send(DaemonMessage::LockedError {
+                                        error: format!("failed to determine keystore path: {e}"),
+                                    })
+                                    .await;
+                                continue;
+                            }
+                        };
+                        if !ks_path.exists() {
+                            let _ = tx
+                                .send(DaemonMessage::LockedError {
+                                    error: "keystore does not exist. run 'tai-credential init' to create one.".to_string(),
+                                })
+                                .await;
+                            continue;
+                        }
+                        match Keystore::load(&ks_path, &passphrase) {
+                            Ok(ks) => {
+                                let keystore = Arc::new(ks);
+                                let mut guard = state.lock().await;
+                                match keystore.get_api_key("openai") {
+                                    Some(api_key) => {
+                                        let service_config = load_service_config()
+                                            .unwrap_or_default();
+                                        match OpenAiClient::new(service_config, api_key.to_string()) {
+                                            Ok(client) => {
+                                                guard.openai_client = Some(Arc::new(client));
+                                                if let Some(x_creds) = keystore.get_x_credentials("twitter") {
+                                                    x::set_x_credentials(x_creds);
+                                                }
+                                                guard.keystore = Some(keystore);
+                                                drop(guard);
+                                                let _ = tx.send(DaemonMessage::Unlocked).await;
+                                            }
+                                            Err(e) => {
+                                                drop(guard);
+                                                let _ = tx
+                                                    .send(DaemonMessage::LockedError {
+                                                        error: format!("failed to create OpenAI client: {e}"),
+                                                    })
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        drop(guard);
+                                        let _ = tx
+                                            .send(DaemonMessage::LockedError {
+                                                error: "no 'openai' credential found in keystore".to_string(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(DaemonMessage::LockedError {
+                                        error: format!("failed to unlock keystore: {e}"),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    ClientMessage::Lock => {
+                        let mut guard = state.lock().await;
+                        guard.openai_client = None;
+                        guard.keystore = None;
+                        guard.x_credentials = None;
+                        drop(guard);
+                        x::clear_x_credentials();
+                        let _ = tx.send(DaemonMessage::Locked).await;
                     }
                 }
             }

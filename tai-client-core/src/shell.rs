@@ -24,6 +24,16 @@ pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> ShellCommand {
         return ShellCommand::Send(ClientMessage::Ping);
     }
 
+    if let Some(passphrase) = line.strip_prefix(":unlock ") {
+        return ShellCommand::Send(ClientMessage::Unlock {
+            passphrase: passphrase.trim().to_string(),
+        });
+    }
+
+    if line == ":lock" {
+        return ShellCommand::Send(ClientMessage::Lock);
+    }
+
     if line == "/image" {
         let request_id = *next_request_id;
         *next_request_id = next_request_id.wrapping_add(1);

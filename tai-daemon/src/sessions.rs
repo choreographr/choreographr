@@ -1,4 +1,7 @@
+use crate::openai::OpenAiClient;
 use std::{collections::HashMap, io, sync::Arc};
+use tai_keystore::Keystore;
+use tai_keystore::XCredentials;
 use tai_proto::{DaemonMessage, SessionMessage, SessionSummary};
 use tokio::{
     sync::{Mutex, mpsc},
@@ -21,6 +24,9 @@ pub struct DaemonStateInner {
     pub(crate) next_session_id: u64,
     pub(crate) next_client_id: u64,
     pub(crate) sessions: HashMap<u64, Arc<Mutex<SessionState>>>,
+    pub openai_client: Option<Arc<OpenAiClient>>,
+    pub keystore: Option<Arc<Keystore>>,
+    pub x_credentials: Option<XCredentials>,
 }
 
 pub type DaemonState = Arc<Mutex<DaemonStateInner>>;
@@ -41,6 +47,9 @@ pub fn new_daemon_state() -> DaemonState {
         next_session_id: 2,
         next_client_id: 1,
         sessions,
+        openai_client: None,
+        keystore: None,
+        x_credentials: None,
     }))
 }
 

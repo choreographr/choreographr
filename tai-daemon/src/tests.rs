@@ -1,5 +1,5 @@
 use super::*;
-use crate::openai::{AuthConfig, OpenAiClient};
+use crate::openai::{OpenAiClient, ServiceConfig};
 use crate::requests::{
     REQUEST_IMAGE_BYTES, REQUEST_IMAGE_HEIGHT, REQUEST_IMAGE_MIME_TYPE, REQUEST_IMAGE_WIDTH,
 };
@@ -11,9 +11,8 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-fn test_auth_config() -> AuthConfig {
-    AuthConfig {
-        api_key: "test-key".to_string(),
+fn test_service_config() -> ServiceConfig {
+    ServiceConfig {
         base_url: "https://example.com/v1".to_string(),
         model_list_path: "/models".to_string(),
         responses_path: "/responses".to_string(),
@@ -26,10 +25,20 @@ fn test_auth_config() -> AuthConfig {
     }
 }
 
+fn test_client() -> Arc<OpenAiClient> {
+    Arc::new(OpenAiClient::new(test_service_config(), "test-key".to_string()).expect("client"))
+}
+
+fn test_state_with_client() -> DaemonState {
+    let state = new_daemon_state();
+    state.try_lock().unwrap().openai_client = Some(test_client());
+    state
+}
+
 async fn spawn_mock_openai_server(
     chat_response: Option<&'static str>,
     chat_stream: Option<&'static [&'static str]>,
-) -> (Arc<OpenAiClient>, tokio::task::JoinHandle<()>) {
+) -> (DaemonState, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock server");
@@ -117,8 +126,7 @@ async fn spawn_mock_openai_server(
             });
         }
     });
-    let config = AuthConfig {
-        api_key: "test-key".to_string(),
+    let config = ServiceConfig {
         base_url: format!("http://{}/v1", addr),
         model_list_path: "/models".to_string(),
         responses_path: "/responses".to_string(),
@@ -129,7 +137,14 @@ async fn spawn_mock_openai_server(
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    (Arc::new(OpenAiClient::new(config).expect("client")), handle)
+    let state = new_daemon_state();
+    {
+        let mut guard = state.lock().await;
+        guard.openai_client = Some(Arc::new(
+            OpenAiClient::new(config, "test-key".to_string()).expect("client"),
+        ));
+    }
+    (state, handle)
 }
 
 async fn set_selected_model(client: &mut UnixStream, model: &str) {
@@ -717,11 +732,8 @@ async fn http_request_tool_supports_post_body() {
 #[tokio::test]
 async fn ping_round_trip() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(
-        server,
-        Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
-        new_daemon_state(),
-    ));
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(&mut client, &ClientMessage::Ping)
         .await
@@ -734,10 +746,10 @@ async fn ping_round_trip() {
 
 #[tokio::test]
 async fn concurrent_requests_complete_independently() {
-    let (client_impl, mock_server) =
+    let (state, mock_server) =
         spawn_mock_openai_server(Some("mock completion"), Some(&["mock ", "completion"])).await;
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
+    let server_task = tokio::spawn(handle_client(server, state));
 
     set_selected_model(&mut client, "gpt-5.4-nano").await;
     assert!(matches!(
@@ -806,9 +818,9 @@ async fn concurrent_requests_complete_independently() {
 
 #[tokio::test]
 async fn duplicate_request_id_is_rejected() {
-    let (client_impl, mock_server) = spawn_mock_openai_server(None, None).await;
+    let (state, mock_server) = spawn_mock_openai_server(None, None).await;
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
+    let server_task = tokio::spawn(handle_client(server, state));
 
     set_selected_model(&mut client, "gpt-5.4-nano").await;
     assert!(matches!(
@@ -855,9 +867,9 @@ async fn duplicate_request_id_is_rejected() {
 
 #[tokio::test]
 async fn cancel_stops_active_request() {
-    let (client_impl, mock_server) = spawn_mock_openai_server(None, None).await;
+    let (state, mock_server) = spawn_mock_openai_server(None, None).await;
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
+    let server_task = tokio::spawn(handle_client(server, state));
 
     set_selected_model(&mut client, "gpt-5.4-nano").await;
     assert!(matches!(
@@ -898,11 +910,8 @@ async fn cancel_stops_active_request() {
 #[tokio::test]
 async fn test_image_emits_complete_sequence() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(
-        server,
-        Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
-        new_daemon_state(),
-    ));
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(&mut client, &ClientMessage::TestImage { request_id: 12 })
         .await
@@ -967,11 +976,8 @@ async fn test_image_emits_complete_sequence() {
 #[tokio::test]
 async fn run_input_fails_when_no_model_selected() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(
-        server,
-        Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
-        new_daemon_state(),
-    ));
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
         &mut client,
@@ -1008,11 +1014,8 @@ async fn run_input_fails_when_no_model_selected() {
 #[tokio::test]
 async fn empty_input_fails_request() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(
-        server,
-        Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
-        new_daemon_state(),
-    ));
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
         &mut client,
@@ -1048,11 +1051,8 @@ async fn empty_input_fails_request() {
 #[tokio::test]
 async fn cancel_inactive_request_fails() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(
-        server,
-        Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
-        new_daemon_state(),
-    ));
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(&mut client, &ClientMessage::Cancel { request_id: 99 })
         .await
@@ -1071,10 +1071,9 @@ async fn cancel_inactive_request_fails() {
 }
 
 #[tokio::test]
-async fn list_models_reports_failure_when_provider_unreachable() {
+async fn list_models_fails_when_provider_unreachable() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let auth_config = AuthConfig {
-        api_key: "test-key".to_string(),
+    let config = ServiceConfig {
         base_url: "http://127.0.0.1:9/v1".to_string(),
         model_list_path: "/models".to_string(),
         responses_path: "/responses".to_string(),
@@ -1085,11 +1084,14 @@ async fn list_models_reports_failure_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let server_task = tokio::spawn(handle_client(
-        server,
-        Arc::new(OpenAiClient::new(auth_config).expect("client")),
-        new_daemon_state(),
-    ));
+    let state = new_daemon_state();
+    {
+        let mut guard = state.lock().await;
+        guard.openai_client = Some(Arc::new(
+            OpenAiClient::new(config, "test-key".to_string()).expect("client"),
+        ));
+    }
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(&mut client, &ClientMessage::ListModels)
         .await
@@ -1107,10 +1109,9 @@ async fn list_models_reports_failure_when_provider_unreachable() {
 }
 
 #[tokio::test]
-async fn set_model_reports_failure_when_provider_unreachable() {
+async fn set_model_fails_when_provider_unreachable() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let auth_config = AuthConfig {
-        api_key: "test-key".to_string(),
+    let config = ServiceConfig {
         base_url: "http://127.0.0.1:9/v1".to_string(),
         model_list_path: "/models".to_string(),
         responses_path: "/responses".to_string(),
@@ -1121,11 +1122,14 @@ async fn set_model_reports_failure_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let server_task = tokio::spawn(handle_client(
-        server,
-        Arc::new(OpenAiClient::new(auth_config).expect("client")),
-        new_daemon_state(),
-    ));
+    let state = new_daemon_state();
+    {
+        let mut guard = state.lock().await;
+        guard.openai_client = Some(Arc::new(
+            OpenAiClient::new(config, "test-key".to_string()).expect("client"),
+        ));
+    }
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
         &mut client,

@@ -10,6 +10,7 @@ mod fff;
 mod evm;
 mod git;
 mod subxt;
+pub(crate) mod x;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolResult {
@@ -78,6 +79,9 @@ impl ToolRegistry {
         reg.register(evm::EvmLogs);
         reg.register(evm::EvmNonce);
         reg.register(evm::EvmResolve);
+        reg.register(x::XPost);
+        reg.register(x::XSearchRecent);
+        reg.register(x::XUserLookup);
         reg
     }
 

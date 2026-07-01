@@ -3,8 +3,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tai_daemon::{
-    handle_client, new_daemon_state,
-    openai::{AuthConfig, OpenAiClient, RequestFormat},
+    DaemonState, handle_client, new_daemon_state,
+    openai::{OpenAiClient, RequestFormat, ServiceConfig},
 };
 use tai_proto::{ClientMessage, DaemonMessage, read_message, write_message};
 use tokio::{
@@ -13,9 +13,8 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-fn test_auth_config() -> AuthConfig {
-    AuthConfig {
-        api_key: "test-key".to_string(),
+fn test_service_config() -> ServiceConfig {
+    ServiceConfig {
         base_url: "https://example.com/v1".to_string(),
         model_list_path: "/models".to_string(),
         responses_path: "/responses".to_string(),
@@ -26,6 +25,16 @@ fn test_auth_config() -> AuthConfig {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     }
+}
+
+fn test_client() -> Arc<OpenAiClient> {
+    Arc::new(OpenAiClient::new(test_service_config(), "test-key".to_string()).expect("client"))
+}
+
+fn test_state_with_client() -> DaemonState {
+    let state = new_daemon_state();
+    state.try_lock().unwrap().openai_client = Some(test_client());
+    state
 }
 
 async fn recv(client: &mut UnixStream) -> DaemonMessage {
@@ -40,7 +49,7 @@ async fn recv(client: &mut UnixStream) -> DaemonMessage {
 
 async fn spawn_tool_call_server(
     tool_path: String,
-) -> (Arc<OpenAiClient>, tokio::task::JoinHandle<()>) {
+) -> (DaemonState, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock server");
@@ -97,8 +106,7 @@ async fn spawn_tool_call_server(
         }
     });
 
-    let config = AuthConfig {
-        api_key: "test-key".to_string(),
+    let config = ServiceConfig {
         base_url: format!("http://{}/v1", addr),
         model_list_path: "/models".to_string(),
         responses_path: "/responses".to_string(),
@@ -109,10 +117,17 @@ async fn spawn_tool_call_server(
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    (Arc::new(OpenAiClient::new(config).expect("client")), handle)
+    let state = new_daemon_state();
+    {
+        let mut guard = state.lock().await;
+        guard.openai_client = Some(Arc::new(
+            OpenAiClient::new(config, "test-key".to_string()).expect("client"),
+        ));
+    }
+    (state, handle)
 }
 
-async fn spawn_http_tool_call_server() -> (Arc<OpenAiClient>, tokio::task::JoinHandle<()>) {
+async fn spawn_http_tool_call_server() -> (DaemonState, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock server");
@@ -204,8 +219,7 @@ async fn spawn_http_tool_call_server() -> (Arc<OpenAiClient>, tokio::task::JoinH
         }
     });
 
-    let config = AuthConfig {
-        api_key: "test-key".to_string(),
+    let config = ServiceConfig {
         base_url: format!("http://{}/v1", addr),
         model_list_path: "/models".to_string(),
         responses_path: "/responses".to_string(),
@@ -216,10 +230,17 @@ async fn spawn_http_tool_call_server() -> (Arc<OpenAiClient>, tokio::task::JoinH
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    (Arc::new(OpenAiClient::new(config).expect("client")), handle)
+    let state = new_daemon_state();
+    {
+        let mut guard = state.lock().await;
+        guard.openai_client = Some(Arc::new(
+            OpenAiClient::new(config, "test-key".to_string()).expect("client"),
+        ));
+    }
+    (state, handle)
 }
 
-async fn spawn_display_image_tool_server() -> (Arc<OpenAiClient>, tokio::task::JoinHandle<()>) {
+async fn spawn_display_image_tool_server() -> (DaemonState, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind mock server");
@@ -290,8 +311,7 @@ async fn spawn_display_image_tool_server() -> (Arc<OpenAiClient>, tokio::task::J
         }
     });
 
-    let config = AuthConfig {
-        api_key: "test-key".to_string(),
+    let config = ServiceConfig {
         base_url: format!("http://{}/v1", addr),
         model_list_path: "/models".to_string(),
         responses_path: "/responses".to_string(),
@@ -302,17 +322,21 @@ async fn spawn_display_image_tool_server() -> (Arc<OpenAiClient>, tokio::task::J
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    (Arc::new(OpenAiClient::new(config).expect("client")), handle)
+    let state = new_daemon_state();
+    {
+        let mut guard = state.lock().await;
+        guard.openai_client = Some(Arc::new(
+            OpenAiClient::new(config, "test-key".to_string()).expect("client"),
+        ));
+    }
+    (state, handle)
 }
 
 #[tokio::test]
 async fn daemon_handler_run_input_requires_selected_model() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(
-        server,
-        Arc::new(OpenAiClient::new(test_auth_config()).expect("client")),
-        new_daemon_state(),
-    ));
+    let state = test_state_with_client();
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
         &mut client,
@@ -347,10 +371,9 @@ async fn daemon_handler_run_input_requires_selected_model() {
 }
 
 #[tokio::test]
-async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
+async fn daemon_handler_set_model_fails_when_provider_unreachable() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let auth_config = AuthConfig {
-        api_key: "test-key".to_string(),
+    let config = ServiceConfig {
         base_url: "http://127.0.0.1:9/v1".to_string(),
         model_list_path: "/models".to_string(),
         responses_path: "/responses".to_string(),
@@ -361,11 +384,14 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let server_task = tokio::spawn(handle_client(
-        server,
-        Arc::new(OpenAiClient::new(auth_config).expect("client")),
-        new_daemon_state(),
-    ));
+    let state = new_daemon_state();
+    {
+        let mut guard = state.lock().await;
+        guard.openai_client = Some(Arc::new(
+            OpenAiClient::new(config, "test-key".to_string()).expect("client"),
+        ));
+    }
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
         &mut client,
@@ -390,9 +416,9 @@ async fn daemon_handler_set_model_reports_failure_when_provider_unreachable() {
 
 #[tokio::test]
 async fn daemon_handler_executes_http_request_tool() {
-    let (client_impl, mock_server) = spawn_http_tool_call_server().await;
+    let (state, mock_server) = spawn_http_tool_call_server().await;
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
         &mut client,
@@ -484,9 +510,9 @@ async fn daemon_handler_executes_chat_tools() {
         .await
         .expect("write tool file");
 
-    let (client_impl, mock_server) = spawn_tool_call_server(tool_path.display().to_string()).await;
+    let (state, mock_server) = spawn_tool_call_server(tool_path.display().to_string()).await;
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
         &mut client,
@@ -568,9 +594,9 @@ async fn daemon_handler_executes_chat_tools() {
 
 #[tokio::test]
 async fn daemon_handler_display_image_tool_emits_svg_image_messages() {
-    let (client_impl, mock_server) = spawn_display_image_tool_server().await;
+    let (state, mock_server) = spawn_display_image_tool_server().await;
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let server_task = tokio::spawn(handle_client(server, client_impl, new_daemon_state()));
+    let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
         &mut client,

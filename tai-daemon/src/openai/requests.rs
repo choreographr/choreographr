@@ -1,5 +1,5 @@
 use super::{
-    AuthConfig, ChatAssistantToolUse, ChatCompletionsRequest, ChatCompletionsResponse,
+    ServiceConfig, ChatAssistantToolUse, ChatCompletionsRequest, ChatCompletionsResponse,
     ChatCompletionsStreamOptions, ChatCompletionsStreamResponse, ChatRequestMessage, ChatToolCall,
     ChatToolDefinition, ChatTurnResult, CompletionChunkKind, ModelListResponse, OpenAiClient,
     RequestFormat, ResponsesRequest, ResponsesResponse, SseReader, endpoint_url,
@@ -39,7 +39,7 @@ enum MaxTokensField {
     MaxCompletionTokens,
 }
 
-fn chat_completions_max_tokens_field(config: &AuthConfig, model: &str) -> MaxTokensField {
+fn chat_completions_max_tokens_field(config: &ServiceConfig, model: &str) -> MaxTokensField {
     if config.base_url.contains("opencode.ai") || model == "big-pickle" {
         MaxTokensField::MaxTokens
     } else {
@@ -51,17 +51,17 @@ impl OpenAiClient {
     pub async fn validate_and_list_models(&self) -> io::Result<Vec<String>> {
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
         let payload: ModelListResponse =
-            send_request(self.http.get(&url).bearer_auth(self.config.api_key.trim())).await?;
+            send_request(self.http.get(&url).bearer_auth(self.api_key.trim())).await?;
         Ok(payload.data.into_iter().map(|model| model.id).collect())
     }
 
     pub async fn completion(&self, model: &str, prompt: &str) -> io::Result<String> {
         match self.config.request_format_for_model(model) {
             RequestFormat::Responses => {
-                responses_request(&self.http, &self.config, model, prompt).await
+                responses_request(&self.http, &self.config, &self.api_key, model, prompt).await
             }
             RequestFormat::ChatCompletions => {
-                chat_completions_request(&self.http, &self.config, model, prompt).await
+                chat_completions_request(&self.http, &self.config, &self.api_key, model, prompt).await
             }
         }
     }
@@ -86,13 +86,14 @@ impl OpenAiClient {
 
         match self.config.request_format_for_model(model) {
             RequestFormat::Responses => {
-                responses_request_streaming(&self.http, &self.config, model, prompt, &mut on_chunk)
+                responses_request_streaming(&self.http, &self.config, &self.api_key, model, prompt, &mut on_chunk)
                     .await
             }
             RequestFormat::ChatCompletions => {
                 chat_completions_request_streaming(
                     &self.http,
                     &self.config,
+                    &self.api_key,
                     model,
                     prompt,
                     &mut on_chunk,
@@ -108,19 +109,20 @@ impl OpenAiClient {
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
     ) -> io::Result<ChatTurnResult> {
-        chat_completions_request_with_tools(&self.http, &self.config, model, messages, tools).await
+        chat_completions_request_with_tools(&self.http, &self.config, &self.api_key, model, messages, tools).await
     }
 }
 
 async fn responses_request(
     client: &reqwest::Client,
-    config: &AuthConfig,
+    config: &ServiceConfig,
+    api_key: &str,
     model: &str,
     prompt: &str,
 ) -> io::Result<String> {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
     let payload: ResponsesResponse =
-        send_request(client.post(&url).bearer_auth(config.api_key.trim()).json(
+        send_request(client.post(&url).bearer_auth(api_key.trim()).json(
             &ResponsesRequest {
                 model,
                 input: prompt,
@@ -150,7 +152,8 @@ async fn responses_request(
 
 async fn chat_completions_request(
     client: &reqwest::Client,
-    config: &AuthConfig,
+    config: &ServiceConfig,
+    api_key: &str,
     model: &str,
     prompt: &str,
 ) -> io::Result<String> {
@@ -162,7 +165,7 @@ async fn chat_completions_request(
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let payload: ChatCompletionsResponse =
-        send_request(client.post(&url).bearer_auth(config.api_key.trim()).json(
+        send_request(client.post(&url).bearer_auth(api_key.trim()).json(
             &ChatCompletionsRequest {
                 model,
                 messages: vec![ChatRequestMessage {
@@ -204,7 +207,8 @@ async fn chat_completions_request(
 
 async fn chat_completions_request_with_tools(
     client: &reqwest::Client,
-    config: &AuthConfig,
+    config: &ServiceConfig,
+    api_key: &str,
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
@@ -217,7 +221,7 @@ async fn chat_completions_request_with_tools(
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let payload: ChatCompletionsResponse =
-        send_request(client.post(&url).bearer_auth(config.api_key.trim()).json(
+        send_request(client.post(&url).bearer_auth(api_key.trim()).json(
             &ChatCompletionsRequest {
                 model,
                 messages: messages.to_vec(),
@@ -274,7 +278,8 @@ async fn chat_completions_request_with_tools(
 
 async fn chat_completions_request_streaming<F, Fut>(
     client: &reqwest::Client,
-    config: &AuthConfig,
+    config: &ServiceConfig,
+    api_key: &str,
     model: &str,
     prompt: &str,
     on_chunk: &mut F,
@@ -290,7 +295,7 @@ where
             MaxTokensField::MaxTokens => (max_tokens, None),
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
-    let response = send_request_raw(client.post(&url).bearer_auth(config.api_key.trim()).json(
+    let response = send_request_raw(client.post(&url).bearer_auth(api_key.trim()).json(
         &ChatCompletionsRequest {
             model,
             messages: vec![ChatRequestMessage {
@@ -354,7 +359,8 @@ where
 
 async fn responses_request_streaming<F, Fut>(
     client: &reqwest::Client,
-    config: &AuthConfig,
+    config: &ServiceConfig,
+    api_key: &str,
     model: &str,
     prompt: &str,
     on_chunk: &mut F,
@@ -364,7 +370,7 @@ where
     Fut: Future<Output = io::Result<()>>,
 {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
-    let response = send_request_raw(client.post(&url).bearer_auth(config.api_key.trim()).json(
+    let response = send_request_raw(client.post(&url).bearer_auth(api_key.trim()).json(
         &ResponsesRequest {
             model,
             input: prompt,

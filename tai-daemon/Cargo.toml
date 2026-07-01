@@ -12,15 +12,19 @@ fff-search = "0.9.4"
 hex = "0.4"
 futures-util.workspace = true
 gix = { version = "0.84", features = ["tree-editor"] }
+hmac = "0.12"
 image = "0.25"
+rand = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 resvg = "0.45"
 serde.workspace = true
 serde_json = "1"
+sha1 = "0.10"
 sha2 = "0.10"
 alloy = { version = "2.1", features = ["full"] }
 url = "2"
 subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
+tai-keystore.workspace = true
 tai-proto.workspace = true
 tokio = { workspace = true, features = ["full"] }
 toml = "1.1"

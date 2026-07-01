@@ -99,6 +99,8 @@ pub enum ClientMessage {
     Ping,
     ListModels,
     SetModel { model: String },
+    Unlock { passphrase: String },
+    Lock,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,6 +206,11 @@ pub enum DaemonMessage {
     },
     ModelSelectionFailed {
         model: String,
+        error: String,
+    },
+    Unlocked,
+    Locked,
+    LockedError {
         error: String,
     },
 }
