@@ -1,129 +1,44 @@
 # tai
 
-A small Rust workspace for a local AI terminal interface.
+A local AI terminal interface in Rust. Connects to an OpenAI-compatible API, runs tools, and streams responses over a Unix socket.
 
-`tai` is a small Rust workspace with five crates:
+## Crates
 
-- `tai-daemon` — a Unix socket server that validates OpenAI-compatible credentials, manages sessions, accepts requests, runs tools, and returns model output
-- `tai-tui` — a terminal UI client built with `ratatui` and `crossterm`
-- `tai-dioxus` — a minimal desktop app client built with `Dioxus`
-- `tai-client-core` — shared client-side parsing, markdown, and image-assembly logic used by the UI crates
-- `tai-proto` — the shared framed binary protocol used between the client and daemon
+| Crate | Description |
+|---|---|
+| `tai-daemon` | Unix socket server that validates credentials, manages sessions, runs requests with tool-call loop, and streams responses |
+| `tai-tui` | Full-screen terminal UI client (ratatui + crossterm) |
+| `tai-dioxus` | Minimal desktop GUI client |
+| `tai-im` | Instant messaging bridge (Telegram) that connects to the daemon |
+| `tai-client-core` | Shared parsing, markdown, and image assembly for UI clients |
+| `tai-proto` | Framed binary protocol used between client and daemon |
+| `tai-keystore` | Encrypted credential keystore used by the daemon |
 
-The current implementation is intentionally small and local-first:
+## Build
 
-- communication happens over a Unix domain socket
-- the daemon speaks to an OpenAI-compatible HTTP API
-- the shell lets you list/select models and submit prompts interactively
-- the daemon streams text responses incrementally when the provider supports SSE/token streaming
-- the protocol supports streamed image messages, and chat-completions models can trigger image display via the `display_image` tool
-
-## Workspace layout
-
-```text
-.
-├── tai-client-core/
-├── tai-daemon/
-├── tai-dioxus/
-├── tai-proto/
-└── tai-tui/
+```bash
+cargo build
 ```
 
-## Architecture
+## Run
 
-The workspace is now split into smaller focused modules instead of a few large files.
+Start the daemon:
 
-### `tai-daemon`
+```bash
+cargo run -p tai-daemon
+```
 
-- `server.rs` — socket lifecycle and client message handling
-- `sessions.rs` — session state, snapshots, subscriptions, and lookup helpers
-- `requests.rs` — prompt construction, request execution, tool-call loop, and demo image flow
-- `tools.rs` — file, HTTP, image, and generic tool execution helpers
-- `git_tools.rs` — Git-specific tool support
-- `openai.rs` — OpenAI-compatible provider integration
+Then a client:
 
-### `tai-tui`
-
-- `connection.rs` — transport, UI loop, input handling, and daemon message handling
-- `render.rs` — terminal rendering and history/image presentation
-- `state.rs` — application state, scrolling, and markdown-to-terminal text shaping
-
-### `tai-dioxus`
-
-- `client.rs` — transport and daemon event handling
-- `render.rs` — history and markdown/image rendering helpers
-- `state.rs` — UI state and history modeling
-
-### `tai-client-core`
-
-- `shell.rs` — shell command parsing and streaming text helpers
-- `markdown.rs` — markdown parsing and safe HTML rendering
-- `image.rs` — streamed image assembly helpers
-
-## Features
-
-### `tai-daemon`
-
-- Loads auth/config from `auth.toml`
-- Validates provider credentials on startup by listing models
-- Serves multiple concurrent client requests
-- Tracks request IDs and rejects duplicate active IDs
-- Supports cancellation for active requests
-- Exposes model discovery and model selection
-- Uses structured logging via `tracing`
-- Reuses a shared HTTP client for model listing and completions
-- Streams text tokens/chunks to clients when enabled
-- Lets chat-completions models read, edit, and write local text files through the `read_file`, `edit_file`, and `write_file` tools
-- Lets chat-completions models display PNG, JPEG, and SVG images through the `display_image` tool
-
-### `tai-tui`
-
-- Full-screen terminal UI
-- Scrollable history pane
-- Interactive command input
-- Displays daemon status, request lifecycle events, and model information
-- Uses Unicode-aware terminal width calculations so emoji and other wide graphemes wrap and align more accurately
-- Includes image rendering support through `ratatui-image` for protocol messages that carry images
-- Rasterizes SVG image messages for terminal display
-
-### `tai-dioxus`
-
-- Minimal desktop app UI
-- Uses the same Unix socket transport and `tai-proto` message types as `tai-tui`
-- Supports prompt input, streaming output, model listing/selection, and cancellation
-- Uses emoji-capable fallback font stacks for better native emoji rendering in the desktop UI
-- Renders image messages with standard `data:` URLs, including SVG
-
-### `tai-client-core`
-
-- Shared shell command parsing
-- Shared streaming text model
-- Shared markdown parsing and safe HTML rendering
-- Shared image assembly for streamed protocol images
-
-### `tai-proto`
-
-- Length-prefixed framed protocol
-- Versioned message format
-- Shared client/daemon message enums
-- Session, streaming, tool-call, and image message support
-- Limits frame size to avoid unbounded payloads
-
-## Requirements
-
-- Rust toolchain with Cargo
-- Unix-like OS with Unix domain socket support
-- An OpenAI-compatible API endpoint
-- For best emoji rendering in `tai-dioxus` on Linux, an installed color emoji font such as `Noto Color Emoji` (`fonts-noto-color-emoji` on Debian/Ubuntu)
+```bash
+cargo run -p tai-tui     # terminal UI
+cargo run -p tai-dioxus  # desktop app
+cargo run -p tai-im      # IM bridge
+```
 
 ## Configuration
 
-`tai-daemon` reads its auth config from:
-
-- Linux: `~/.config/tai-daemon/auth.toml`
-- more generally: `dirs::config_dir()/tai-daemon/auth.toml`
-
-Example:
+The daemon reads auth config from `~/.config/tai-daemon/auth.toml`:
 
 ```toml
 api_key = "sk-..."
@@ -137,208 +52,32 @@ streaming = true
 
 [model_request_formats]
 gpt-5 = "responses"
-gpt-5-mini = "responses"
-legacy-model = "chat_completions"
 
 [model_max_tokens]
 big-pickle = 4096
 ```
 
-Only `api_key` is required if you want the default OpenAI endpoints.
-
-### Migration note
-
-If you already have a `~/.config/tai-daemon/auth.toml`, you can now configure both request formats, choose a default, and control streaming:
-
-```toml
-responses_path = "/responses"
-chat_completions_path = "/chat/completions"
-default_request_format = "chat_completions"
-chat_completions_max_tokens = 4096
-streaming = true
-
-[model_request_formats]
-gpt-5 = "responses"
-
-[model_max_tokens]
-big-pickle = 4096
-```
-
-Supported request format values are `"chat_completions"` and `"responses"`.
-
-### Config fields
-
-- `api_key` — bearer token sent to the provider
-- `base_url` — base URL for the OpenAI-compatible API
-- `model_list_path` — path used for model listing
-- `responses_path` — path used for Responses API requests
-- `chat_completions_path` — path used for chat completions requests
-- `default_request_format` — default request format for models not explicitly overridden
-- `model_request_formats` — per-model request format overrides
-- `chat_completions_max_tokens` — default max token cap sent on chat completions requests
-- `model_max_tokens` — per-model max token caps for chat completions requests
-- `streaming` — enable streaming completions via SSE when the provider supports it; falls back to one-shot requests when false
-
-## Socket path
-
-By default the client and daemon use:
-
-```text
-/tmp/tai.sock
-```
-
-You can override it with:
-
-```bash
-export TAI_SOCKET_PATH=/tmp/custom-tai.sock
-```
-
-## Build
-
-```bash
-cargo build
-```
-
-## Run
-
-Start the daemon in one terminal:
-
-```bash
-cargo run -p tai-daemon
-```
-
-Start the shell in another:
-
-```bash
-cargo run -p tai-tui
-```
-
-Or start the desktop app:
-
-```bash
-cargo run -p tai-dioxus
-```
-
-If startup succeeds, the daemon will validate your config against the provider before listening for requests.
+Only `api_key` is required. The socket path defaults to `/tmp/tai.sock` and can be overridden via `TAI_SOCKET_PATH`.
 
 ## Shell commands
 
-Inside `tai-tui`:
+In `tai-tui`:
 
-- `/ping` — ask the daemon for a health-style pong response
-- `/models` — list available models and show the selected one
-- `/models <model-id>` — select a model
-- `/cancel <request-id>` — cancel an active request
+- `/ping` — health check
+- `/models` — list and select models
+- `/cancel <request-id>` — cancel a running request
 - `/unlock <passphrase>` — unlock the encrypted keystore
 - `/lock` — lock the daemon, clearing credentials from memory
-- `/add-key <service> <api_key> <passphrase>` — add an API key credential to the keystore
-- `/add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ <passphrase>` — add an X credential
+- `/add-key <service> <api_key> <passphrase>` — add an API key to the keystore
 - `/remove-key <service> <passphrase>` — remove a credential from the keystore
-- any other non-empty line — send that line as a prompt
-
-## Example session
-
-```text
-/models
-/models gpt-5.4-nano
-Write a haiku about terminals
-/cancel 3
-```
-
-## Protocol overview
-
-The protocol is a length-prefixed binary frame:
-
-- 4-byte big-endian payload length
-- bincode-encoded `(protocol_version, message)` tuple
-
-Current protocol version:
-
-```text
-1
-```
-
-### Client messages
-
-- `CreateSession { title }`
-- `ListSessions`
-- `AttachSession { session_id }`
-- `GetSessionState { session_id }`
-- `RunInput { request_id, input }`
-- `TestImage { request_id }`
-- `Cancel { request_id }`
-- `Ping`
-- `ListModels`
-- `SetModel { model }`
-
-### Daemon messages
-
-- session lifecycle and state messages:
-  - `SessionCreated { ... }`
-  - `Sessions { ... }`
-  - `SessionAttached { ... }`
-  - `SessionState { ... }`
-  - `SessionMessageAppended { ... }`
-  - `SessionFailed { ... }`
-- request lifecycle messages:
-  - `Started { request_id }`
-  - `OutputChunk { request_id, stream, data }` — emitted incrementally for streamed text and once for non-streaming text
-  - `Done { request_id }`
-  - `Failed { request_id, error }`
-  - `Cancelled { request_id }`
-- tool lifecycle messages:
-  - `ToolCallStarted { ... }`
-  - `ToolCallFinished { ... }`
-  - `ToolCallFailed { ... }`
-- image messages:
-  - `ImageStart { ... }`
-  - `ImageChunk { ... }`
-  - `ImageEnd { ... }`
-- misc messages:
-  - `Pong`
-  - `Models { models, selected_model }`
-  - `ModelsFailed { error }`
-  - `ModelSelected { model }`
-  - `ModelSelectionFailed { model, error }`
+- any other input — sent as a prompt
 
 ## Testing
 
-Run all tests with:
-
 ```bash
-cargo test
+cargo test                  # unit tests
+cargo test -- --ignored     # integration tests
 ```
-
-This workspace includes unit and integration tests for:
-
-- protocol framing and version handling
-- shell command parsing
-- markdown parsing and HTML sanitization
-- image assembly logic
-- daemon request lifecycle behavior
-- session creation, attachment, and snapshot behavior
-- model-listing and selection failure cases
-- cancellation and duplicate request handling
-- tool-call and image-delivery flows
-
-## Notes and current limitations
-
-- `display_image` is currently exposed only through chat-completions tool calls; plain Responses API requests still return text-only output.
-- The daemon supports both chat completions and Responses API requests.
-- Request format is selected by `default_request_format`, with optional per-model overrides in `model_request_formats`.
-- Model selection is per client connection, not global.
-- `tai-tui` currently targets a local daemon over Unix sockets; there is no Windows named-pipe transport.
-- Emoji display in `tai-tui` still depends on your terminal emulator and installed fonts; the client now computes wrapping/alignment using Unicode display width, but it does not render emoji glyphs itself.
-- `tai-dioxus` relies on OS/webview font fallback for emoji glyph rendering.
-- The protocol caps frame sizes at 1 MiB.
-
-## Crate summary
-
-- `tai-client-core`: shared client parsing, markdown, and image helpers
-- `tai-proto`: shared wire format and socket helpers
-- `tai-daemon`: provider-backed request executor with sessions and tools
-- `tai-tui`: terminal client and image-capable history viewer
-- `tai-dioxus`: minimal Dioxus desktop client
 
 ## License
 
