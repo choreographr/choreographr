@@ -16,11 +16,8 @@ When making changes, ensure [ARCHITECTURE.md](./ARCHITECTURE.md) is kept up to d
 
 ## Dependency Management
 
-Always use the latest stable version of crates where possible, and avoid introducing duplicate versions of the same crate. When adding or upgrading a dependency:
+Always use the latest stable version of crates where possible. When adding or upgrading a dependency:
 
-1. Check `cargo tree --duplicates` to understand the current duplication landscape before making changes.
-2. Use the latest stable semver-compatible release for each crate (check `cargo search <name> --limit 1` for the current version).
-3. Match the version already used by the workspace's major upstream crates (alloy, subxt, dioxus, reqwest, gix). Prefer the higher version when both old and new are present.
-4. If a dependency is locked to an older version upstream, accept the duplication rather than patching — upstream issues should resolve naturally over time.
-5. After adding or upgrading a dependency, run `cargo tree --duplicates` to verify no new duplication was introduced.
-6. If a dependency is used by two or more workspace members, declare it in `[workspace.dependencies]` and reference it with `dep.workspace = true` in member crates. This is not optional — when adding a crate-level dependency that already exists (or is being introduced simultaneously) in another workspace member, promote it to the workspace and update both crates in the same change.
+1. Use the latest stable semver-compatible release for each crate (check `cargo search <name> --limit 1` for the current version).
+2. If a dependency is locked to an older version upstream, accept the duplication rather than patching — upstream issues should resolve naturally over time.
+3. If a dependency is used by two or more workspace members, declare it in `[workspace.dependencies]` and reference it with `dep.workspace = true` in member crates. This is not optional — when adding a crate-level dependency that already exists (or is being introduced simultaneously) in another workspace member, promote it to the workspace and update both crates in the same change.
