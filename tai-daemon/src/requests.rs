@@ -5,6 +5,7 @@ use crate::openai::{
 use crate::sessions::{SessionState, broadcast_to_session};
 use crate::tools::{available_tools, emit_prepared_image, execute_tool_call};
 use std::{io, sync::Arc};
+use tai_keystore::XCredentials;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
     SessionMessage,
@@ -67,6 +68,7 @@ pub(crate) async fn execute_chat_tool_request(
     session: &Arc<Mutex<SessionState>>,
     model: &str,
     request_id: u32,
+    x_credentials: Option<XCredentials>,
 ) -> io::Result<()> {
     let tools = available_tools();
     let mut next_image_id = 1;
@@ -111,7 +113,7 @@ pub(crate) async fn execute_chat_tool_request(
                         None,
                     )
                     .await;
-                    let output = execute_tool_call(&tool_call).await;
+                    let output = execute_tool_call(&tool_call, x_credentials.as_ref()).await;
                     if let Some(image) = output.image {
                         emit_prepared_image(session, request_id, next_image_id, image).await;
                         next_image_id = next_image_id.wrapping_add(1);

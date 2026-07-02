@@ -11,8 +11,9 @@ use tokio::{
 use tracing::{debug, error};
 
 pub async fn handle_client(stream: UnixStream, state: DaemonState) -> anyhow::Result<()> {
+    const PER_CLIENT_MESSAGE_CHANNEL_SIZE: usize = 128;
     let (mut reader, mut writer) = stream.into_split();
-    let (tx, mut rx) = mpsc::channel::<DaemonMessage>(128);
+    let (tx, mut rx) = mpsc::channel::<DaemonMessage>(PER_CLIENT_MESSAGE_CHANNEL_SIZE);
     let client_id = {
         let mut guard = state.lock().await;
         let client_id = guard.next_client_id;

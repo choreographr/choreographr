@@ -16,13 +16,17 @@ pub(crate) async fn run_client(
     let result = run_daemon_connection(
         &socket_path,
         |message| {
-            let _ = ui_tx.send(UiEvent::Daemon(message));
+            if let Err(e) = ui_tx.send(UiEvent::Daemon(message)) {
+                eprintln!("[tai-dioxus] failed to send Daemon UI event: {e}");
+            }
         },
         client_rx,
     )
     .await;
     if result.is_ok() {
-        let _ = ui_tx.send(UiEvent::ReaderClosed);
+        if let Err(e) = ui_tx.send(UiEvent::ReaderClosed) {
+            eprintln!("[tai-dioxus] failed to send ReaderClosed UI event: {e}");
+        }
     }
     result.map_err(io::Error::from)
 }
@@ -85,7 +89,9 @@ pub(crate) fn apply_daemon_message(
     if let Some(msg) = response
         && let Some(sender) = daemon_tx
     {
-        let _ = sender.send(msg);
+        if let Err(e) = sender.send(msg) {
+            eprintln!("[tai-dioxus] failed to send daemon response: {e}");
+        }
     }
     Ok(())
 }

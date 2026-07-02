@@ -8,6 +8,10 @@ use std::{
 };
 use fff_search::*;
 
+const FFF_SCAN_TIMEOUT_SECS: u64 = 60;
+const FFF_DEFAULT_MAX_RESULTS: usize = 50;
+const FFF_MAX_RESULTS_CAP: usize = 100;
+
 #[derive(Debug, Deserialize)]
 struct FffArgs {
     query: String,
@@ -60,7 +64,7 @@ fn init_new_state(abs_path: &Path) -> std::result::Result<FffState, ToolError> {
     )
     .map_err(|e| ToolError::Other(format!("create file picker: {e}")))?;
 
-    shared_picker.wait_for_scan(Duration::from_secs(60));
+    shared_picker.wait_for_scan(Duration::from_secs(FFF_SCAN_TIMEOUT_SECS));
 
     Ok(FffState { shared_picker, _shared_frecency: shared_frecency })
 }
@@ -143,7 +147,7 @@ async fn execute_fff_inner(arguments_json: &str) -> std::result::Result<String, 
         .ok_or_else(|| ToolError::Other("fff picker not yet initialized (scan may still be in progress)".to_string()))?;
 
     let mode = args.mode.as_deref().unwrap_or("grep");
-    let max_results = args.max_results.unwrap_or(50).min(100);
+    let max_results = args.max_results.unwrap_or(FFF_DEFAULT_MAX_RESULTS).min(FFF_MAX_RESULTS_CAP);
 
     match mode {
         "files" => {

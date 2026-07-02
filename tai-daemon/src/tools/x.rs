@@ -1,26 +1,11 @@
 use crate::tools::{ToolExecutionOutput, tool_err, tool_ok, truncate_tool_output};
 use async_trait::async_trait;
-use rand::RngExt;
 use reqwest::Client;
 use sha1::Sha1;
-use std::sync::RwLock;
 use tai_keystore::XCredentials;
 
-static X_CREDENTIALS: std::sync::OnceLock<RwLock<Option<XCredentials>>> = std::sync::OnceLock::new();
-
-pub(crate) fn set_x_credentials(creds: XCredentials) {
-    let lock = X_CREDENTIALS.get_or_init(|| RwLock::new(None));
-    *lock.write().unwrap() = Some(creds);
-}
-
-pub(crate) fn clear_x_credentials() {
-    if let Some(lock) = X_CREDENTIALS.get() {
-        *lock.write().unwrap() = None;
-    }
-}
-
-fn get_x_credentials() -> Option<XCredentials> {
-    X_CREDENTIALS.get()?.read().unwrap().clone()
+fn get_x_credentials(x_credentials: Option<&XCredentials>) -> Option<XCredentials> {
+    x_credentials.cloned()
 }
 
 const X_API_BASE: &str = "https://api.twitter.com";
@@ -40,11 +25,9 @@ fn urlencode(s: &str) -> String {
     result
 }
 
-#[allow(deprecated)]
 fn hmac_sha1(key: &[u8], data: &str) -> String {
     use hmac::{Hmac, KeyInit, Mac};
-    type HmacSha1 = Hmac<Sha1>;
-    let mut mac = HmacSha1::new_from_slice(key).expect("HMAC can take key of any size");
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     let result = mac.finalize();
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, result.into_bytes().as_slice())
@@ -66,7 +49,7 @@ fn build_oauth1_header(
 
     let nonce: String = (0..32)
         .map(|_| {
-            let b: u8 = rand::rng().random();
+            let b: u8 = rand::random();
             format!("{:02x}", b)
         })
         .collect();
@@ -137,8 +120,8 @@ fn build_oauth1_header(
     format!("OAuth {header_value}")
 }
 
-async fn x_api_get(path: &str, params: &[(&str, &str)]) -> Result<String, String> {
-    let creds = get_x_credentials().ok_or("X credentials not configured")?;
+async fn x_api_get(path: &str, params: &[(&str, &str)], x_credentials: Option<&XCredentials>) -> Result<String, String> {
+    let creds = get_x_credentials(x_credentials).ok_or("X credentials not configured")?;
     let url = format!("{X_API_BASE}{path}");
     let auth_header = build_oauth1_header("GET", &url, &creds, params);
 
@@ -160,8 +143,8 @@ async fn x_api_get(path: &str, params: &[(&str, &str)]) -> Result<String, String
     Ok(body)
 }
 
-async fn x_api_post(path: &str, body_json: &str) -> Result<String, String> {
-    let creds = get_x_credentials().ok_or("X credentials not configured")?;
+async fn x_api_post(path: &str, body_json: &str, x_credentials: Option<&XCredentials>) -> Result<String, String> {
+    let creds = get_x_credentials(x_credentials).ok_or("X credentials not configured")?;
     let url = format!("{X_API_BASE}{path}");
     let auth_header = build_oauth1_header("POST", &url, &creds, &[]);
 
@@ -210,7 +193,7 @@ impl super::Tool for XPost {
         })
     }
 
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -231,7 +214,7 @@ impl super::Tool for XPost {
 
         let body = serde_json::json!({ "text": text }).to_string();
 
-        match x_api_post("/2/tweets", &body).await {
+        match x_api_post("/2/tweets", &body, x_credentials).await {
             Ok(response) => {
                 let formatted = match serde_json::from_str::<serde_json::Value>(&response) {
                     Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(response),
@@ -281,7 +264,7 @@ impl super::Tool for XSearchRecent {
         })
     }
 
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -312,7 +295,7 @@ impl super::Tool for XSearchRecent {
             ("tweet.fields", "created_at,author_id,public_metrics"),
         ];
 
-        match x_api_get("/2/tweets/search/recent", &params).await {
+        match x_api_get("/2/tweets/search/recent", &params, x_credentials).await {
             Ok(response) => {
                 let formatted = match serde_json::from_str::<serde_json::Value>(&response) {
                     Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(response),
@@ -358,7 +341,7 @@ impl super::Tool for XUserLookup {
         })
     }
 
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -379,7 +362,7 @@ impl super::Tool for XUserLookup {
 
         let params = vec![("user.fields", "description,public_metrics,created_at")];
 
-        match x_api_get(&format!("/2/users/by/username/{username}"), &params).await {
+        match x_api_get(&format!("/2/users/by/username/{username}"), &params, x_credentials).await {
             Ok(response) => {
                 let formatted = match serde_json::from_str::<serde_json::Value>(&response) {
                     Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(response),

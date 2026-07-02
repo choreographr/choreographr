@@ -70,6 +70,10 @@ pub(crate) async fn handle_run_input(
     };
 
     let request_format = client.config().request_format_for_model(&model);
+    let x_credentials = {
+        let guard = state.lock().await;
+        guard.x_credentials.clone()
+    };
     info!(request_id, session_id, input_len = input.len(), selected_model = %model, ?request_format, "starting request");
     let session_clone = Arc::clone(&session);
     let handle = tokio::spawn(async move {
@@ -88,7 +92,7 @@ pub(crate) async fn handle_run_input(
                         execute_plain_request(&client, &session_clone, &model, request_id).await
                     }
                     RequestFormat::ChatCompletions => {
-                        execute_chat_tool_request(&client, &session_clone, &model, request_id)
+                        execute_chat_tool_request(&client, &session_clone, &model, request_id, x_credentials)
                             .await
                     }
                 }

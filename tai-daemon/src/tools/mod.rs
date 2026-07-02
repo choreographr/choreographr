@@ -1,19 +1,21 @@
 use crate::openai::{ChatToolCall, ChatToolDefinition};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::OnceLock;
+use tai_keystore::XCredentials;
 
 #[macro_export]
 macro_rules! define_tool {
     ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr) => {
         pub(crate) struct $struct;
         #[::async_trait::async_trait]
-        impl super::Tool for $struct {
+        impl $crate::tools::Tool for $struct {
             fn name(&self) -> &'static str { $name }
             fn description(&self) -> &'static str { $desc }
             fn schema(&self) -> serde_json::Value { $schema }
-            async fn execute(&self, args: &str) -> super::ToolExecutionOutput {
-                super::ToolExecutionOutput {
+            async fn execute(&self, args: &str, _x_credentials: Option<&tai_keystore::XCredentials>) -> $crate::tools::ToolExecutionOutput {
+                $crate::tools::ToolExecutionOutput {
                     result: $exec_fn(args).await,
                     image: None,
                 }
@@ -62,16 +64,16 @@ pub(crate) trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn schema(&self) -> serde_json::Value;
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput;
+    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput;
 }
 
 pub(crate) struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: HashMap<&'static str, Box<dyn Tool>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        let mut reg = Self { tools: Vec::new() };
+        let mut reg = Self { tools: HashMap::new() };
         reg.register(fs::ReadFile);
         reg.register(fs::ReadFileRange);
         reg.register(fs::ListFiles);
@@ -108,12 +110,13 @@ impl ToolRegistry {
     }
 
     fn register(&mut self, tool: impl Tool + 'static) {
-        self.tools.push(Box::new(tool));
+        let name = tool.name();
+        self.tools.insert(name, Box::new(tool));
     }
 
-    pub async fn execute(&self, tool_call: &ChatToolCall) -> ToolExecutionOutput {
-        match self.tools.iter().find(|t| t.name() == tool_call.name) {
-            Some(tool) => tool.execute(&tool_call.arguments_json).await,
+    pub async fn execute(&self, tool_call: &ChatToolCall, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput {
+        match self.tools.get(tool_call.name.as_str()) {
+            Some(tool) => tool.execute(&tool_call.arguments_json, x_credentials).await,
             None => ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("unknown tool: {}", tool_call.name),
@@ -126,7 +129,7 @@ impl ToolRegistry {
 
     pub fn available_definitions(&self) -> Vec<ChatToolDefinition> {
         self.tools
-            .iter()
+            .values()
             .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
             .collect()
     }
@@ -137,8 +140,8 @@ fn global_registry() -> &'static ToolRegistry {
     REGISTRY.get_or_init(ToolRegistry::new)
 }
 
-pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall) -> ToolExecutionOutput {
-    global_registry().execute(tool_call).await
+pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput {
+    global_registry().execute(tool_call, x_credentials).await
 }
 
 pub(crate) fn available_tools() -> Vec<ChatToolDefinition> {

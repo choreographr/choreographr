@@ -29,26 +29,38 @@ fn App() -> Element {
         let socket = socket.read().clone();
         let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
         let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiEvent>();
-        let _ = client_tx.send(ClientMessage::ListSessions);
+        if let Err(e) = client_tx.send(ClientMessage::ListSessions) {
+            eprintln!("[tai-dioxus] failed to send ListSessions: {e}");
+        }
         daemon_tx.set(Some(client_tx));
         events_rx.set(Some(ui_rx));
         let reader_tx = ui_tx.clone();
         let handle = tokio::spawn(async move {
             if let Err(error) = run_client(socket, client_rx, reader_tx.clone()).await {
-                let _ = reader_tx.send(UiEvent::ReaderFailed(error.to_string()));
+                if let Err(e) = reader_tx.send(UiEvent::ReaderFailed(error.to_string())) {
+                    eprintln!("[tai-dioxus] failed to send ReaderFailed: {e}");
+                }
             }
         });
         let monitor_tx = ui_tx.clone();
         tokio::spawn(async move {
             if let Err(e) = handle.await && e.is_panic() {
-                let _ = monitor_tx.send(UiEvent::ReaderFailed(
+                if let Err(e) = monitor_tx.send(UiEvent::ReaderFailed(
                     "client reader task panicked".to_string(),
-                ));
+                )) {
+                    eprintln!("[tai-dioxus] failed to send panic notification: {e}");
+                }
             }
         });
     });
 
-    use_future(move || async move {
+    let tx = daemon_tx.read().clone();
+
+    use_future({
+        let tx = tx.clone();
+        move || {
+            let tx = tx.clone();
+            async move {
             loop {
                 let event = {
                     let mut guard = events_rx.write();
@@ -68,7 +80,7 @@ fn App() -> Element {
                     UiEvent::Daemon(message) => {
                         let result = {
                             let mut app_state = state.write();
-                            apply_daemon_message(&mut app_state, message, daemon_tx.read().clone())
+                            apply_daemon_message(&mut app_state, message, tx.clone())
                         };
                         if let Err(error) = result {
                             state.write().push_text(format!(
@@ -87,48 +99,58 @@ fn App() -> Element {
                 }
             }
         }
-    );
-
-    let mut on_submit_keydown = move || submit_input(&mut state, daemon_tx.read().clone());
-
-    let mut on_submit_click = move || submit_input(&mut state, daemon_tx.read().clone());
-
-    let on_ping = move |_| {
-        send_client_message(
-            &mut state.write(),
-            daemon_tx.read().clone(),
-            ClientMessage::Ping,
-        )
-    };
-
-    let on_models = move |_| {
-        send_client_message(
-            &mut state.write(),
-            daemon_tx.read().clone(),
-            ClientMessage::ListModels,
-        )
-    };
-
-    let on_cancel = move |_| {
-        let request_id_text = state.read().pending_cancel.trim().to_string();
-        if request_id_text.is_empty() {
-            state
-                .write()
-                .push_text("[client] enter a request id to cancel");
-            return;
         }
-        match request_id_text.parse::<u32>() {
-            Ok(request_id) => {
-                send_client_message(
-                    &mut state.write(),
-                    daemon_tx.read().clone(),
-                    ClientMessage::Cancel { request_id },
-                );
-                state.write().pending_cancel.clear();
+    });
+
+    let mut on_submit_keydown = { let t = tx.clone(); move || submit_input(&mut state, t.clone()) };
+
+    let mut on_submit_click = { let t = tx.clone(); move || submit_input(&mut state, t.clone()) };
+
+    let on_ping = {
+        let t = tx.clone();
+        move |_| {
+            send_client_message(
+                &mut state.write(),
+                t.clone(),
+                ClientMessage::Ping,
+            )
+        }
+    };
+
+    let on_models = {
+        let t = tx.clone();
+        move |_| {
+            send_client_message(
+                &mut state.write(),
+                t.clone(),
+                ClientMessage::ListModels,
+            )
+        }
+    };
+
+    let on_cancel = {
+        let t = tx.clone();
+        move |_| {
+            let request_id_text = state.read().pending_cancel.trim().to_string();
+            if request_id_text.is_empty() {
+                state
+                    .write()
+                    .push_text("[client] enter a request id to cancel");
+                return;
             }
-            Err(_) => state
-                .write()
-                .push_text(format!("invalid request id: {request_id_text}")),
+            match request_id_text.parse::<u32>() {
+                Ok(request_id) => {
+                    send_client_message(
+                        &mut state.write(),
+                        t.clone(),
+                        ClientMessage::Cancel { request_id },
+                    );
+                    state.write().pending_cancel.clear();
+                }
+                Err(_) => state
+                    .write()
+                    .push_text(format!("invalid request id: {request_id_text}")),
+            }
         }
     };
 

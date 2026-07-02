@@ -92,18 +92,24 @@ async fn handle_message(
         ShellCommand::Send(client_msg) => {
             if let ClientMessage::RunInput { input, .. } = &client_msg {
                 let echo = format!("> {}", String::from_utf8_lossy(input));
-                let _ = bot.send_message(msg.chat.id, echo).await;
+                if let Err(e) = bot.send_message(msg.chat.id, echo).await {
+                    warn!("failed to send echo to telegram: {e}");
+                }
             }
             debug!(request_id, "sending command to bridge");
-            state
+            if let Err(e) = state
                 .bridge_tx
                 .send(DaemonBridgeCommand::SendMessage(client_msg))
                 .await
-                .ok();
+            {
+                warn!("failed to send command to bridge: {e}");
+            }
         }
         ShellCommand::UnknownCommand(err) => {
             warn!(%err, "unknown command from user");
-            let _ = bot.send_message(msg.chat.id, err).await;
+            if let Err(e) = bot.send_message(msg.chat.id, err).await {
+                warn!("failed to send error message to telegram: {e}");
+            }
         }
         ShellCommand::Empty | ShellCommand::InvalidCancel(_) => {}
     }
@@ -129,26 +135,35 @@ async fn send_daemon_event(bot: &Bot, chat_id: ChatId, event: BridgeEvent) {
             name,
             arguments_json,
         } => {
-            let _ = bot
+            if let Err(e) = bot
                 .send_message(
                     chat_id,
                     format!("<i>Running {name} {arguments_json}</i>"),
                 )
                 .parse_mode(ParseMode::Html)
-                .await;
+                .await
+            {
+                warn!("failed to send tool call started message: {e}");
+            }
         }
         BridgeEvent::ToolCallFinished { name, output } => {
-            let _ = bot
+            if let Err(e) = bot
                 .send_message(chat_id, format!("<b>{name}</b>: {output}"))
                 .parse_mode(ParseMode::Html)
-                .await;
+                .await
+            {
+                warn!("failed to send tool call finished message: {e}");
+            }
         }
         BridgeEvent::ToolCallFailed { name, error: error_msg } => {
             error!(%name, %error_msg, "tool call failed");
-            let _ = bot
+            if let Err(e) = bot
                 .send_message(chat_id, format!("<b>{name}</b> failed: {error_msg}"))
                 .parse_mode(ParseMode::Html)
-                .await;
+                .await
+            {
+                warn!("failed to send tool call failed message: {e}");
+            }
         }
         BridgeEvent::Image { data, .. } => {
             let input = InputFile::memory(data);
@@ -158,7 +173,9 @@ async fn send_daemon_event(bot: &Bot, chat_id: ChatId, event: BridgeEvent) {
         }
         BridgeEvent::Error(msg) => {
             error!(%msg, "sending error to telegram");
-            let _ = bot.send_message(chat_id, msg).await;
+            if let Err(e) = bot.send_message(chat_id, msg).await {
+                warn!("failed to send error event to telegram: {e}");
+            }
         }
         BridgeEvent::Models { models, selected } => {
             let mut text = String::from("Models:\n");
@@ -170,19 +187,29 @@ async fn send_daemon_event(bot: &Bot, chat_id: ChatId, event: BridgeEvent) {
                 };
                 text.push_str(&format!("  {marker} {model}\n"));
             }
-            let _ = bot.send_message(chat_id, text).await;
+            if let Err(e) = bot.send_message(chat_id, text).await {
+                warn!("failed to send models list to telegram: {e}");
+            }
         }
         BridgeEvent::ModelSelected(model) => {
-            let _ = bot.send_message(chat_id, format!("Model: {model}")).await;
+            if let Err(e) = bot.send_message(chat_id, format!("Model: {model}")).await {
+                warn!("failed to send model selected to telegram: {e}");
+            }
         }
         BridgeEvent::Unlocked => {
-            let _ = bot.send_message(chat_id, "Unlocked").await;
+            if let Err(e) = bot.send_message(chat_id, "Unlocked").await {
+                warn!("failed to send unlocked message to telegram: {e}");
+            }
         }
         BridgeEvent::Locked => {
-            let _ = bot.send_message(chat_id, "Locked").await;
+            if let Err(e) = bot.send_message(chat_id, "Locked").await {
+                warn!("failed to send locked message to telegram: {e}");
+            }
         }
         BridgeEvent::Pong => {
-            let _ = bot.send_message(chat_id, "pong").await;
+            if let Err(e) = bot.send_message(chat_id, "pong").await {
+                warn!("failed to send pong to telegram: {e}");
+            }
         }
     }
 }
@@ -194,4 +221,36 @@ fn to_telegram_html(html: &str) -> String {
     ]);
     cleaner.add_generic_attributes(&["href"]);
     cleaner.clean(html).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_allowed_tags_preserved() {
+        let result = to_telegram_html("<b>bold</b>");
+        assert!(result.contains("<b>bold</b>"));
+    }
+
+    #[test]
+    fn test_disallowed_tags_stripped() {
+        let result = to_telegram_html("<script>alert(1)</script>");
+        // ammonia strips <script> tags entirely — tag and text content are both removed
+        assert!(!result.contains("<script>"));
+        assert!(!result.contains("alert"));
+    }
+
+    #[test]
+    fn test_allowed_attributes_preserved() {
+        let result = to_telegram_html(r#"<a href="https://example.com">link</a>"#);
+        assert!(result.contains(r#"href="https://example.com""#));
+    }
+
+    #[test]
+    fn test_disallowed_attributes_stripped() {
+        let result = to_telegram_html(r#"<a onclick="evil()">click</a>"#);
+        assert!(result.contains("<a"));
+        assert!(!result.contains("onclick"));
+    }
 }

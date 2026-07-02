@@ -1,6 +1,6 @@
 use crate::openai::OpenAiClient;
 use std::{collections::HashMap, sync::Arc};
-use tai_keystore::Keystore;
+use tai_keystore::{Keystore, XCredentials};
 use tai_proto::{DaemonMessage, SessionMessage, SessionSummary};
 use tokio::{
     sync::{Mutex, mpsc},
@@ -26,6 +26,7 @@ pub struct DaemonStateInner {
     pub(crate) sessions: HashMap<u64, Arc<Mutex<SessionState>>>,
     pub openai_client: Option<Arc<OpenAiClient>>,
     pub keystore: Option<Arc<Keystore>>,
+    pub x_credentials: Option<XCredentials>,
 }
 
 pub type DaemonState = Arc<Mutex<DaemonStateInner>>;
@@ -48,6 +49,7 @@ pub fn new_daemon_state() -> DaemonState {
         sessions,
         openai_client: None,
         keystore: None,
+        x_credentials: None,
     }))
 }
 
@@ -178,21 +180,27 @@ pub(crate) async fn require_attached_session(
     tx: &mpsc::Sender<DaemonMessage>,
 ) -> anyhow::Result<Option<(u64, Arc<Mutex<SessionState>>)>> {
     let Some(session_id) = attached_session_id else {
-        let _ = tx
+        if let Err(e) = tx
             .send(DaemonMessage::SessionFailed {
                 operation: "require_attached_session".to_string(),
                 error: "no session attached".to_string(),
             })
-            .await;
+            .await
+        {
+            warn!("failed to notify subscriber of session failure: {e}");
+        }
         return Ok(None);
     };
     let Some(session) = session_by_id(state, session_id).await else {
-        let _ = tx
+        if let Err(e) = tx
             .send(DaemonMessage::SessionFailed {
                 operation: "require_attached_session".to_string(),
                 error: format!("unknown session: {session_id}"),
             })
-            .await;
+            .await
+        {
+            warn!("failed to notify subscriber of session failure: {e}");
+        }
         return Ok(None);
     };
     Ok(Some((session_id, session)))

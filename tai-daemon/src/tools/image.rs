@@ -22,6 +22,7 @@ struct DisplayImageArgs {
 
 const MAX_DISPLAY_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const SUPPORTED_IMAGE_MIME_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/svg+xml"];
+const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
 
 pub(crate) async fn execute_display_image_tool(arguments_json: &str) -> ToolExecutionOutput {
     match prepare_image_result(arguments_json).await {
@@ -131,7 +132,7 @@ async fn fetch_image_bytes(url: &str, expected_mime_type: &str) -> io::Result<Ve
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(IMAGE_FETCH_TIMEOUT_SECS))
         .build()
         .map_err(io::Error::other)?;
     let response = client.get(url).send().await.map_err(io::Error::other)?;
@@ -264,7 +265,7 @@ impl Tool for DisplayImage {
             "additionalProperties": false
         })
     }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
+    async fn execute(&self, arguments_json: &str, _x_credentials: Option<&tai_keystore::XCredentials>) -> ToolExecutionOutput {
         execute_display_image_tool(arguments_json).await
     }
 }

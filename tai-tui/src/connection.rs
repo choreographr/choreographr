@@ -8,11 +8,14 @@ use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
+const UI_EVENT_CHANNEL_SIZE: usize = 128;
+const UI_FRAME_POLL_MS: u64 = 16;
+
 pub(crate) async fn run_app() -> io::Result<()> {
     let socket_path = socket_path();
     let app_socket_path = socket_path.clone();
     let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
-    let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(128);
+    let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
 
     let picker = build_picker();
     let picker_protocol = format!("{:?}", picker.protocol_type());
@@ -22,13 +25,17 @@ pub(crate) async fn run_app() -> io::Result<()> {
         let result = run_daemon_connection(
             &socket_path,
             |message| {
-                let _ = connection_ui_tx.send(UiEvent::Daemon(message));
+                if let Err(e) = connection_ui_tx.try_send(UiEvent::Daemon(message)) {
+                    eprintln!("[tai-tui] failed to send Daemon UI event: {e}");
+                }
             },
             client_rx,
         )
         .await;
         if result.is_ok() {
-            let _ = connection_ui_tx.send(UiEvent::ReaderClosed);
+            if let Err(e) = connection_ui_tx.try_send(UiEvent::ReaderClosed) {
+                eprintln!("[tai-tui] failed to send ReaderClosed UI event: {e}");
+            }
         }
         result
     });
@@ -36,7 +43,9 @@ pub(crate) async fn run_app() -> io::Result<()> {
     let signal_ui_tx = ui_tx.clone();
     let signal_task = tokio::spawn(async move {
         tokio::signal::ctrl_c().await.map_err(io::Error::other)?;
-        let _ = signal_ui_tx.send(UiEvent::Interrupt).await;
+        if let Err(e) = signal_ui_tx.send(UiEvent::Interrupt).await {
+            eprintln!("[tai-tui] failed to send Interrupt UI event: {e}");
+        }
         Ok::<(), io::Error>(())
     });
 
@@ -122,7 +131,7 @@ pub(crate) async fn run_ui_loop(
 
         terminal.draw(|frame| render(frame, app))?;
 
-        if event::poll(Duration::from_millis(16))? {
+        if event::poll(Duration::from_millis(UI_FRAME_POLL_MS))? {
             handle_terminal_event(event::read()?, app, client_tx)?;
         }
     }

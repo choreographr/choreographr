@@ -1,6 +1,5 @@
 use crate::openai::{OpenAiClient, load_service_config};
 use crate::server::try_keystore_path;
-use crate::tools::x;
 use std::sync::Arc;
 use tai_keystore::{Keystore, ServiceCredential};
 use tai_proto::DaemonMessage;
@@ -43,7 +42,7 @@ pub(crate) async fn handle_unlock(
                         Ok(client) => {
                             guard.openai_client = Some(Arc::new(client));
                             if let Some(x_creds) = keystore.get_x_credentials("twitter") {
-                                x::set_x_credentials(x_creds);
+                                guard.x_credentials = Some(x_creds);
                             }
                             guard.keystore = Some(keystore);
                             drop(guard);
@@ -81,8 +80,8 @@ pub(crate) async fn handle_lock(
     let mut guard = state.lock().await;
     guard.openai_client = None;
     guard.keystore = None;
+    guard.x_credentials = None;
     drop(guard);
-    x::clear_x_credentials();
     send_or_warn(tx, DaemonMessage::Locked).await;
     Ok(())
 }

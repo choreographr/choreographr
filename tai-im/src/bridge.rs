@@ -66,16 +66,21 @@ impl DaemonBridge {
                         debug!(?msg, "sending message to daemon");
                         if let Err(e) = write_message(&mut writer, &msg).await {
                             error!(%e, "write error, bridge writer shutting down");
-                            let _ = writer_event_tx
+                            if let Err(send_err) = writer_event_tx
                                 .send(BridgeEvent::Error(format!("write error: {e}")))
-                                .await;
+                                .await
+                            {
+                                warn!("failed to send write error event: {send_err}");
+                            }
                             break;
                         }
                     }
                 }
             }
             info!("bridge writer task finished");
-            let _ = writer.shutdown().await;
+            if let Err(e) = writer.shutdown().await {
+                debug!("writer shutdown returned error (harmless): {e}");
+            }
         });
 
         tokio::spawn(async move {
@@ -103,16 +108,22 @@ impl DaemonBridge {
                         ) =>
                     {
                         error!(%e, "daemon disconnected");
-                        let _ = event_tx
+                        if let Err(send_err) = event_tx
                             .send(BridgeEvent::Error("daemon disconnected".into()))
-                            .await;
+                            .await
+                        {
+                            warn!("failed to send disconnect error event: {send_err}");
+                        }
                         return;
                     }
                     Err(e) => {
                         error!(%e, "daemon read error, reader task exiting");
-                        let _ = event_tx
+                        if let Err(send_err) = event_tx
                             .send(BridgeEvent::Error(format!("daemon error: {e}")))
-                            .await;
+                            .await
+                        {
+                            warn!("failed to send daemon error event: {send_err}");
+                        }
                         return;
                     }
                 }
@@ -197,14 +208,18 @@ fn daemon_to_bridge_events(
             request_id,
             metadata,
         } => {
-            let _ = assembler.start(request_id, metadata);
+            if let Err(e) = assembler.start(request_id, metadata) {
+                warn!("failed to start image assembly: {e}");
+            }
         }
         DaemonMessage::ImageChunk {
             request_id,
             image_id,
             data,
         } => {
-            let _ = assembler.push_chunk(request_id, image_id, &data);
+            if let Err(e) = assembler.push_chunk(request_id, image_id, &data) {
+                warn!("failed to push image chunk: {e}");
+            }
         }
         DaemonMessage::ImageEnd {
             request_id,
@@ -252,4 +267,342 @@ fn daemon_to_bridge_events(
     }
 
     events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tai_client_core::ImageAssembler;
+    use tai_proto::{DaemonMessage, ImageMetadata, OutputStream};
+
+    #[test]
+    fn test_output_chunk_buffering() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        let events1 = daemon_to_bridge_events(
+            DaemonMessage::OutputChunk {
+                request_id: 1,
+                stream: OutputStream::Answer,
+                data: b"hello ".to_vec(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert!(events1.is_empty());
+
+        let events2 = daemon_to_bridge_events(
+            DaemonMessage::OutputChunk {
+                request_id: 1,
+                stream: OutputStream::Answer,
+                data: b"world".to_vec(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert!(events2.is_empty());
+
+        let events3 = daemon_to_bridge_events(
+            DaemonMessage::Done { request_id: 1 },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert_eq!(events3.len(), 1);
+        match &events3[0] {
+            BridgeEvent::Text(text) => assert_eq!(text, "hello world"),
+            other => panic!("expected Text event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_done_no_chunks() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        let events = daemon_to_bridge_events(
+            DaemonMessage::Done { request_id: 999 },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_failed_clears_buffer() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        daemon_to_bridge_events(
+            DaemonMessage::OutputChunk {
+                request_id: 1,
+                stream: OutputStream::Answer,
+                data: b"data".to_vec(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+
+        let events = daemon_to_bridge_events(
+            DaemonMessage::Failed {
+                request_id: 1,
+                error: "oops".into(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], BridgeEvent::Error(msg) if msg == "oops"));
+
+        let events2 = daemon_to_bridge_events(
+            DaemonMessage::Done { request_id: 1 },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert!(events2.is_empty());
+    }
+
+    #[test]
+    fn test_cancelled_clears_buffer() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        daemon_to_bridge_events(
+            DaemonMessage::OutputChunk {
+                request_id: 2,
+                stream: OutputStream::Answer,
+                data: b"data".to_vec(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+
+        let events = daemon_to_bridge_events(
+            DaemonMessage::Cancelled { request_id: 2 },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], BridgeEvent::Error(msg) if msg == "cancelled"));
+
+        let events2 = daemon_to_bridge_events(
+            DaemonMessage::Done { request_id: 2 },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert!(events2.is_empty());
+    }
+
+    #[test]
+    fn test_tool_call_events() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        let events = daemon_to_bridge_events(
+            DaemonMessage::ToolCallStarted {
+                request_id: 1,
+                call_id: "call_1".into(),
+                tool_name: "read".into(),
+                arguments_json: r#"{"path":"/tmp"}"#.into(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            BridgeEvent::ToolCallStarted {
+                name,
+                arguments_json,
+            } => {
+                assert_eq!(name, "read");
+                assert_eq!(arguments_json, r#"{"path":"/tmp"}"#);
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tool_call_finished() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        let events = daemon_to_bridge_events(
+            DaemonMessage::ToolCallFinished {
+                request_id: 1,
+                call_id: "call_1".into(),
+                tool_name: "read".into(),
+                output: "file contents".into(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            BridgeEvent::ToolCallFinished { name, output } => {
+                assert_eq!(name, "read");
+                assert_eq!(output, "file contents");
+            }
+            other => panic!("expected ToolCallFinished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tool_call_failed() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        let events = daemon_to_bridge_events(
+            DaemonMessage::ToolCallFailed {
+                request_id: 1,
+                call_id: "call_1".into(),
+                tool_name: "read".into(),
+                error: "permission denied".into(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            BridgeEvent::ToolCallFailed { name, error } => {
+                assert_eq!(name, "read");
+                assert_eq!(error, "permission denied");
+            }
+            other => panic!("expected ToolCallFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_image_stream() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        let metadata = ImageMetadata {
+            image_id: 1,
+            mime_type: "image/png".into(),
+            width: 100,
+            height: 100,
+            byte_len: 5,
+            alt: None,
+        };
+
+        let events1 = daemon_to_bridge_events(
+            DaemonMessage::ImageStart {
+                request_id: 1,
+                metadata: metadata.clone(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert!(events1.is_empty());
+
+        let events2 = daemon_to_bridge_events(
+            DaemonMessage::ImageChunk {
+                request_id: 1,
+                image_id: 1,
+                data: b"hello".to_vec(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert!(events2.is_empty());
+
+        let events3 = daemon_to_bridge_events(
+            DaemonMessage::ImageEnd {
+                request_id: 1,
+                image_id: 1,
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert_eq!(events3.len(), 1);
+        match &events3[0] {
+            BridgeEvent::Image { _mime, data } => {
+                assert_eq!(_mime, "image/png");
+                assert_eq!(data, b"hello");
+            }
+            other => panic!("expected Image event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_models_event() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        let events = daemon_to_bridge_events(
+            DaemonMessage::Models {
+                models: vec!["gpt-4".into(), "claude".into()],
+                selected_model: Some("claude".into()),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            BridgeEvent::Models { models, selected } => {
+                assert_eq!(models, &vec!["gpt-4".to_string(), "claude".to_string()]);
+                assert_eq!(selected, &Some("claude".to_string()));
+            }
+            other => panic!("expected Models, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_models_failed_event() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        let events = daemon_to_bridge_events(
+            DaemonMessage::ModelsFailed {
+                error: "network error".into(),
+            },
+            &mut assembler,
+            &mut buffers,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            BridgeEvent::Error(msg) => assert_eq!(msg, "network error"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pong_event() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        let events = daemon_to_bridge_events(
+            DaemonMessage::Pong,
+            &mut assembler,
+            &mut buffers,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], BridgeEvent::Pong));
+    }
+
+    #[test]
+    fn test_error_variants() {
+        let mut assembler = ImageAssembler::new();
+        let mut buffers = HashMap::new();
+
+        let cases = vec![
+            DaemonMessage::SessionFailed {
+                operation: "attach".into(),
+                error: "session error".into(),
+            },
+            DaemonMessage::LockedError {
+                error: "already locked".into(),
+            },
+            DaemonMessage::ModelSelectionFailed {
+                model: "gpt-4".into(),
+                error: "not available".into(),
+            },
+        ];
+
+        for msg in cases {
+            let events = daemon_to_bridge_events(msg, &mut assembler, &mut buffers);
+            assert_eq!(events.len(), 1);
+            assert!(matches!(&events[0], BridgeEvent::Error(_)));
+        }
+    }
 }

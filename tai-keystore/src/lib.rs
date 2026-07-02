@@ -7,7 +7,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
 };
 use argon2::Argon2;
-use rand::RngExt;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -110,20 +110,19 @@ impl Keystore {
         }
     }
 
-    #[allow(deprecated)]
     pub fn save(&self, path: &Path, passphrase: &str) -> Result<(), KeystoreError> {
         let store = self.to_store();
         let plaintext = serde_json::to_vec(&store)?;
 
         let salt: [u8; SALT_LEN] = {
             let mut buf = [0u8; SALT_LEN];
-            rand::rng().fill(&mut buf);
+            rand::rng().fill_bytes(&mut buf);
             buf
         };
         let key = derive_key(passphrase, &salt);
         let nonce_bytes: [u8; NONCE_LEN] = {
             let mut buf = [0u8; NONCE_LEN];
-            rand::rng().fill(&mut buf);
+            rand::rng().fill_bytes(&mut buf);
             buf
         };
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -150,7 +149,6 @@ impl Keystore {
         Ok(())
     }
 
-    #[allow(deprecated)]
     pub fn load(path: &Path, passphrase: &str) -> Result<Self, KeystoreError> {
         let data = fs::read(path)?;
         if data.len() < 4 + 1 + SALT_LEN + NONCE_LEN + 16 {
