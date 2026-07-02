@@ -11043,6 +11043,8 @@ dependencies = [
  "tai-proto",
  "teloxide",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -6,6 +6,7 @@ use tai_proto::{
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 
 pub struct DaemonBridge {
     client_tx: mpsc::Sender<DaemonBridgeCommand>,
@@ -56,12 +57,16 @@ impl DaemonBridge {
         let (event_tx, event_rx) = mpsc::channel::<BridgeEvent>(128);
         let writer_event_tx = event_tx.clone();
 
+        info!("spawning daemon bridge tasks");
+
         tokio::spawn(async move {
             let mut writer = writer;
             while let Some(cmd) = client_rx.recv().await {
                 match cmd {
                     DaemonBridgeCommand::SendMessage(msg) => {
+                        debug!(?msg, "sending message to daemon");
                         if let Err(e) = write_message(&mut writer, &msg).await {
+                            error!(%e, "write error, bridge writer shutting down");
                             let _ = writer_event_tx
                                 .send(BridgeEvent::Error(format!("write error: {e}")))
                                 .await;
@@ -70,6 +75,7 @@ impl DaemonBridge {
                     }
                 }
             }
+            info!("bridge writer task finished");
             let _ = writer.shutdown().await;
         });
 
@@ -81,10 +87,12 @@ impl DaemonBridge {
             loop {
                 match read_message::<_, DaemonMessage>(&mut reader).await {
                     Ok(msg) => {
+                        debug!(?msg, "received daemon message");
                         for event in
                             daemon_to_bridge_events(msg, &mut assembler, &mut buffers)
                         {
                             if event_tx.send(event).await.is_err() {
+                                warn!("bridge event receiver dropped, reader task exiting");
                                 return;
                             }
                         }
@@ -95,12 +103,14 @@ impl DaemonBridge {
                             io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
                         ) =>
                     {
+                        error!(%e, "daemon disconnected");
                         let _ = event_tx
                             .send(BridgeEvent::Error("daemon disconnected".into()))
                             .await;
                         return;
                     }
                     Err(e) => {
+                        error!(%e, "daemon read error, reader task exiting");
                         let _ = event_tx
                             .send(BridgeEvent::Error(format!("daemon error: {e}")))
                             .await;

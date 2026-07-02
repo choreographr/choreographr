@@ -5,6 +5,7 @@ use tai_proto::ClientMessage;
 use teloxide::{dispatching::UpdateFilterExt, prelude::*};
 use teloxide::types::{ChatId, InputFile, ParseMode};
 use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, error, info, warn};
 
 use crate::bridge::{BridgeEvent, DaemonBridgeCommand};
 
@@ -23,11 +24,15 @@ pub async fn run(
         let chat_id = chat_id.clone();
         tokio::spawn(async move {
             while let Some(event) = bridge_rx.recv().await {
+                debug!(?event, "bridge event received");
                 let cid = *chat_id.lock().await;
                 if let Some(cid) = cid {
                     send_daemon_event(&bot, cid, event).await;
+                } else {
+                    warn!("no chat id set, dropping bridge event");
                 }
             }
+            info!("bridge event stream ended");
         });
     }
 
@@ -47,12 +52,14 @@ pub async fn run(
             .endpoint(handle_message),
     );
 
+    info!("starting telegram bot dispatcher");
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
         .build()
         .dispatch()
         .await;
+    info!("telegram bot dispatcher stopped");
 }
 
 struct TelegramState {
@@ -72,6 +79,9 @@ async fn handle_message(
         None => return Ok(()),
     };
 
+    let user_id = msg.chat.id.0;
+    debug!(%user_id, input = %text, "received telegram message");
+
     *state.chat_id.lock().await = Some(msg.chat.id);
 
     let mut request_id = *state.request_id.lock().await;
@@ -84,6 +94,7 @@ async fn handle_message(
                 let echo = format!("> {}", String::from_utf8_lossy(input));
                 let _ = bot.send_message(msg.chat.id, echo).await;
             }
+            debug!(request_id, "sending command to bridge");
             state
                 .bridge_tx
                 .send(DaemonBridgeCommand::SendMessage(client_msg))
@@ -91,6 +102,7 @@ async fn handle_message(
                 .ok();
         }
         ShellCommand::UnknownCommand(err) => {
+            warn!(%err, "unknown command from user");
             let _ = bot.send_message(msg.chat.id, err).await;
         }
         ShellCommand::Empty | ShellCommand::InvalidCancel(_) => {}
@@ -104,11 +116,13 @@ async fn send_daemon_event(bot: &Bot, chat_id: ChatId, event: BridgeEvent) {
         BridgeEvent::Text(text) => {
             let html = render_markdown_html(&text);
             let tg_html = to_telegram_html(&html);
-            if !tg_html.is_empty() {
-                let _ = bot
+            if !tg_html.is_empty()
+                && let Err(e) = bot
                     .send_message(chat_id, tg_html)
                     .parse_mode(ParseMode::Html)
-                    .await;
+                    .await
+            {
+                error!(%e, "failed to send text message to telegram");
             }
         }
         BridgeEvent::ToolCallStarted {
@@ -129,17 +143,21 @@ async fn send_daemon_event(bot: &Bot, chat_id: ChatId, event: BridgeEvent) {
                 .parse_mode(ParseMode::Html)
                 .await;
         }
-        BridgeEvent::ToolCallFailed { name, error } => {
+        BridgeEvent::ToolCallFailed { name, error: error_msg } => {
+            error!(%name, %error_msg, "tool call failed");
             let _ = bot
-                .send_message(chat_id, format!("<b>{name}</b> failed: {error}"))
+                .send_message(chat_id, format!("<b>{name}</b> failed: {error_msg}"))
                 .parse_mode(ParseMode::Html)
                 .await;
         }
         BridgeEvent::Image { data, .. } => {
             let input = InputFile::memory(data);
-            let _ = bot.send_photo(chat_id, input).await;
+            if let Err(e) = bot.send_photo(chat_id, input).await {
+                error!(%e, "failed to send image to telegram");
+            }
         }
         BridgeEvent::Error(msg) => {
+            error!(%msg, "sending error to telegram");
             let _ = bot.send_message(chat_id, msg).await;
         }
         BridgeEvent::Models { models, selected } => {

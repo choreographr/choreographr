@@ -3,18 +3,27 @@ use std::io;
 use std::process;
 use tai_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
 use tokio::net::UnixStream;
+use tracing::{error, info};
+use tracing_subscriber::{EnvFilter, fmt};
 
 mod bridge;
 mod telegram;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
     let mut args = env::args().skip(1);
 
     let platform = match args.next().as_deref() {
         Some(p) => p.to_string(),
         None => {
-            eprintln!("usage: tai-im telegram");
+            error!("usage: tai-im telegram");
             process::exit(1);
         }
     };
@@ -25,6 +34,7 @@ async fn main() -> io::Result<()> {
     let mut stream = UnixStream::connect(&path).await?;
 
     if let Some(ref passphrase) = unlock_passphrase {
+        info!("unlocking daemon keystore");
         write_message(
             &mut stream,
             &ClientMessage::Unlock {
@@ -33,22 +43,25 @@ async fn main() -> io::Result<()> {
         )
         .await?;
         match read_message::<_, DaemonMessage>(&mut stream).await {
-            Ok(DaemonMessage::Unlocked) => {}
-            Ok(DaemonMessage::LockedError { error }) => {
-                eprintln!("unlock failed: {error}");
+            Ok(DaemonMessage::Unlocked) => {
+                info!("daemon keystore unlocked");
+            }
+            Ok(DaemonMessage::LockedError { error: unlock_err }) => {
+                error!(%unlock_err, "unlock failed");
                 process::exit(1);
             }
             Ok(other) => {
-                eprintln!("unexpected response to unlock: {other:?}");
+                error!(?other, "unexpected response to unlock");
                 process::exit(1);
             }
             Err(e) => {
-                eprintln!("failed to read unlock response: {e}");
+                error!(%e, "failed to read unlock response");
                 process::exit(1);
             }
         }
     }
 
+    info!(%platform, "requesting credential from daemon");
     write_message(
         &mut stream,
         &ClientMessage::GetCredential {
@@ -61,22 +74,23 @@ async fn main() -> io::Result<()> {
             key: Some(bot_token),
             ..
         }) => {
+            info!(%platform, "got credential, starting platform bridge");
             run_platform(&platform, bot_token, stream).await;
         }
         Ok(DaemonMessage::Credential { key: None, .. }) => {
             if unlock_passphrase.is_none() {
-                eprintln!("daemon is locked. unlock the daemon via TUI first, or set TAI_KEYSTORE_PASSPHRASE env var");
+                error!("daemon is locked. unlock the daemon via TUI first, or set TAI_KEYSTORE_PASSPHRASE env var");
             } else {
-                eprintln!("no '{}' credential found in keystore", platform);
+                error!("no '{platform}' credential found in keystore");
             }
             process::exit(1);
         }
         Ok(other) => {
-            eprintln!("unexpected response to GetCredential: {other:?}");
+            error!(?other, "unexpected response to GetCredential");
             process::exit(1);
         }
         Err(e) => {
-            eprintln!("failed to read credential response: {e}");
+            error!(%e, "failed to read credential response");
             process::exit(1);
         }
     }
@@ -94,11 +108,12 @@ async fn run_platform(platform: &str, bot_token: String, stream: UnixStream) {
                 .collect();
 
             if admin_ids.is_empty() {
-                eprintln!(
-                    "TAI_TELEGRAM_USER_IDS must be set to a comma-separated list of Telegram user IDs"
-                );
+                error!("TAI_TELEGRAM_USER_IDS must be set to a comma-separated list of Telegram user IDs");
                 process::exit(1);
             }
+
+            let admin_count = admin_ids.len();
+            info!(admin_count, "starting telegram bridge");
 
             let (reader, writer) = stream.into_split();
             let bridge = bridge::DaemonBridge::spawn(reader, writer);
@@ -107,7 +122,7 @@ async fn run_platform(platform: &str, bot_token: String, stream: UnixStream) {
             telegram::run(bot_token, admin_ids, tx, rx).await;
         }
         other => {
-            eprintln!("unknown platform: {other}");
+            error!(platform = %other, "unknown platform");
             process::exit(1);
         }
     }

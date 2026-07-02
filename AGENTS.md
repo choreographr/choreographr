@@ -23,4 +23,4 @@ Always use the latest stable version of crates where possible, and avoid introdu
 3. Match the version already used by the workspace's major upstream crates (alloy, subxt, dioxus, reqwest, gix). Prefer the higher version when both old and new are present.
 4. If a dependency is locked to an older version upstream, accept the duplication rather than patching — upstream issues should resolve naturally over time.
 5. After adding or upgrading a dependency, run `cargo tree --duplicates` to verify no new duplication was introduced.
-6. If a dependency is used by two or more workspace members, declare it in `[workspace.dependencies]` and reference it with `dep.workspace = true` in member crates.
+6. If a dependency is used by two or more workspace members, declare it in `[workspace.dependencies]` and reference it with `dep.workspace = true` in member crates. This is not optional — when adding a crate-level dependency that already exists (or is being introduced simultaneously) in another workspace member, promote it to the workspace and update both crates in the same change.
