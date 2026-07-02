@@ -125,11 +125,12 @@ impl Keystore {
             rand::rng().fill_bytes(&mut buf);
             buf
         };
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::try_from(&nonce_bytes[..])
+            .map_err(|_| KeystoreError::EncryptionFailed)?;
         let cipher =
             Aes256Gcm::new_from_slice(&key).map_err(|_| KeystoreError::InvalidKeyLength)?;
         let ciphertext = cipher
-            .encrypt(nonce, plaintext.as_ref())
+            .encrypt(&nonce, plaintext.as_ref())
             .map_err(|_| KeystoreError::EncryptionFailed)?;
 
         let mut data = Vec::with_capacity(4 + 1 + SALT_LEN + NONCE_LEN + ciphertext.len());
@@ -173,11 +174,12 @@ impl Keystore {
         let ciphertext = &data[5 + SALT_LEN + NONCE_LEN..];
 
         let key = derive_key(passphrase, &salt);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::try_from(&nonce_bytes[..])
+            .map_err(|_| KeystoreError::DecryptionFailed)?;
         let cipher =
             Aes256Gcm::new_from_slice(&key).map_err(|_| KeystoreError::InvalidKeyLength)?;
         let plaintext = cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|_| KeystoreError::DecryptionFailed)?;
 
         let store: CredentialStore = serde_json::from_slice(&plaintext)?;

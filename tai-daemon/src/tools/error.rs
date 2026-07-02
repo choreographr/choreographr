@@ -15,16 +15,8 @@ pub(crate) enum ToolError {
     InvalidHeader { name: String, error: String },
     #[error("request failed: {0}")]
     RequestFailed(String),
-    #[error("read response failed: {0}")]
-    ReadResponseFailed(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("path not found: {0}")]
-    PathNotFound(String),
-    #[error("not a directory: {0}")]
-    NotADirectory(String),
-    #[error("path is not a regular file: {0}")]
-    NotAFile(String),
     #[error("{0}")]
     Other(String),
 }
