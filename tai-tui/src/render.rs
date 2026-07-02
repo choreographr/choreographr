@@ -1,7 +1,5 @@
-use crate::state::{
-    App, HistoryItem, display_width, image_block_height, lines_height, session_message_lines,
-    streaming_text_lines,
-};
+use crate::markdown_render::{display_width, lines_height, session_message_lines, streaming_text_lines};
+use crate::state::{App, HistoryItem, history_text_height, image_block_height};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -135,7 +133,7 @@ fn render_history_text(
     y: &mut u16,
     rows_to_skip: &mut usize,
 ) {
-    let wrapped = super::state::history_text_height(text, area.width).max(1);
+    let wrapped = history_text_height(text, area.width).max(1);
     if *rows_to_skip >= wrapped {
         *rows_to_skip -= wrapped;
         return;

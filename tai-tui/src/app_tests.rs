@@ -1,4 +1,5 @@
 use crate::connection::handle_terminal_event;
+use crate::markdown_render::*;
 use crate::state::*;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tai_client_core::DaemonMessageHandler;

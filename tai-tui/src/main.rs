@@ -1,4 +1,5 @@
 mod connection;
+mod markdown_render;
 mod render;
 mod state;
 
