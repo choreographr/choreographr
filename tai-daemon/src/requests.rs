@@ -182,32 +182,14 @@ pub(crate) fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<Ch
     messages
         .iter()
         .map(|message| match message {
-            SessionMessage::SystemText { content } => ChatRequestMessage {
-                role: "system",
-                content: Some(content.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_content: None,
-                reasoning: None,
-                reasoning_text: None,
-            },
-            SessionMessage::UserText { content } => ChatRequestMessage {
-                role: "user",
-                content: Some(content.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_content: None,
-                reasoning: None,
-                reasoning_text: None,
-            },
-            SessionMessage::AssistantText { content } => ChatRequestMessage {
-                role: "assistant",
-                content: Some(content.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_content: None,
-                reasoning: None,
-                reasoning_text: None,
+            SessionMessage::SystemText { content } => {
+                ChatRequestMessage::simple("system", content.clone())
+            }
+            SessionMessage::UserText { content } => {
+                ChatRequestMessage::simple("user", content.clone())
+            }
+            SessionMessage::AssistantText { content } => {
+                ChatRequestMessage::simple("assistant", content.clone())
             },
             SessionMessage::AssistantToolUse {
                 content,

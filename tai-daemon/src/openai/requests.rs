@@ -168,15 +168,7 @@ async fn chat_completions_request(
         send_request(client.post(&url).bearer_auth(api_key.trim()).json(
             &ChatCompletionsRequest {
                 model,
-                messages: vec![ChatRequestMessage {
-                    role: "user",
-                    content: Some(prompt.to_string()),
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning_content: None,
-                    reasoning: None,
-                    reasoning_text: None,
-                }],
+                messages: vec![ChatRequestMessage::simple("user", prompt.to_string())],
                 tools: None,
                 stream: false,
                 stream_options: None,
@@ -298,15 +290,7 @@ where
     let response = send_request_raw(client.post(&url).bearer_auth(api_key.trim()).json(
         &ChatCompletionsRequest {
             model,
-            messages: vec![ChatRequestMessage {
-                role: "user",
-                content: Some(prompt.to_string()),
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_content: None,
-                reasoning: None,
-                reasoning_text: None,
-            }],
+            messages: vec![ChatRequestMessage::simple("user", prompt.to_string())],
             tools: None,
             stream: true,
             stream_options: Some(ChatCompletionsStreamOptions {

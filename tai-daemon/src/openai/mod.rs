@@ -111,6 +111,20 @@ pub struct ChatRequestMessage {
     pub reasoning_text: Option<String>,
 }
 
+impl ChatRequestMessage {
+    pub fn simple(role: &'static str, content: String) -> Self {
+        ChatRequestMessage {
+            role,
+            content: Some(content),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_text: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantToolCall {
     pub id: String,

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::io;
-use tai_client_core::ImageAssembler;
+use tai_client_core::{ImageAssembler, StreamingText};
 use tai_proto::{
-    ClientMessage, DaemonMessage, ImageMetadata, OutputStream, read_message, write_message,
+    ClientMessage, DaemonMessage, ImageMetadata, read_message, write_message,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -82,7 +82,7 @@ impl DaemonBridge {
         tokio::spawn(async move {
             let mut reader = reader;
             let mut assembler = ImageAssembler::new();
-            let mut buffers: HashMap<u32, Vec<u8>> = HashMap::new();
+            let mut buffers: HashMap<u32, StreamingText> = HashMap::new();
 
             loop {
                 match read_message::<_, DaemonMessage>(&mut reader).await {
@@ -134,7 +134,7 @@ impl DaemonBridge {
 fn daemon_to_bridge_events(
     msg: DaemonMessage,
     assembler: &mut ImageAssembler,
-    buffers: &mut HashMap<u32, Vec<u8>>,
+    buffers: &mut HashMap<u32, StreamingText>,
 ) -> Vec<BridgeEvent> {
     let mut events = Vec::new();
 
@@ -144,17 +144,23 @@ fn daemon_to_bridge_events(
             stream,
             data,
         } => {
-            if matches!(stream, OutputStream::Answer) {
-                buffers.entry(request_id).or_default().extend_from_slice(&data);
-            }
+            let text = String::from_utf8_lossy(&data);
+            let entry = buffers.entry(request_id).or_insert_with(|| StreamingText::new(request_id));
+            entry.append(stream, &text);
         }
         DaemonMessage::Done { request_id } => {
-            let text = String::from_utf8_lossy(
-                buffers.remove(&request_id).as_deref().unwrap_or_default(),
-            )
-            .into_owned();
-            if !text.is_empty() {
-                events.push(BridgeEvent::Text(text));
+            if let Some(entry) = buffers.remove(&request_id) {
+                let mut text = String::new();
+                if !entry.reasoning.is_empty() {
+                    text.push_str("[reasoning]\n");
+                    text.push_str(&entry.reasoning);
+                    text.push_str("\n\n");
+                }
+                text.push_str(&entry.answer);
+                let trimmed = text.trim().to_string();
+                if !trimmed.is_empty() {
+                    events.push(BridgeEvent::Text(trimmed));
+                }
             }
         }
         DaemonMessage::Failed {

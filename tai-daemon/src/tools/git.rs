@@ -991,7 +991,7 @@ impl Tool for GitAdd {
     fn name(&self) -> &'static str { "git_add" }
     fn description(&self) -> &'static str { "Stage a file or pathspec in Git." }
     fn schema(&self) -> serde_json::Value {
-        serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"pathspec":{"type":"string","description":"File or pathspec to stage"}},"required":["pathspec"],"additionalProperties":false})
+        serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"pathspec":{"type":"array","items":{"type":"string"},"description":"Files or pathspecs to stage"}},"required":["pathspec"],"additionalProperties":false})
     }
     async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
         ToolExecutionOutput { result: execute_git_add_tool(arguments_json).await, image: None }
@@ -1019,7 +1019,7 @@ impl Tool for GitPush {
     fn name(&self) -> &'static str { "git_push" }
     fn description(&self) -> &'static str { "Push to a Git remote branch." }
     fn schema(&self) -> serde_json::Value {
-        serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"remote":{"type":"string","description":"Remote name","default":"origin"},"branch":{"type":"string","description":"Remote branch name"},"force":{"type":"boolean","description":"Force push","default":false}},"required":["branch"],"additionalProperties":false})
+        serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"remote":{"type":"string","description":"Remote name","default":"origin"},"branch":{"type":"string","description":"Remote branch name"},"set_upstream":{"type":"boolean","description":"Set upstream tracking reference","default":false},"force_with_lease":{"type":"boolean","description":"Force push with lease (safe force push)","default":false},"dry_run":{"type":"boolean","description":"Simulate push without sending data","default":false}},"required":[],"additionalProperties":false})
     }
     async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
         ToolExecutionOutput { result: execute_git_push_tool(arguments_json).await, image: None }

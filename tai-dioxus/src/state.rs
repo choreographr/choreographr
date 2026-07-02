@@ -92,6 +92,11 @@ impl DaemonMessageHandler for AppState {
         self.finalize_stream(request_id);
     }
 
+    fn drop_request(&mut self, request_id: u32) {
+        self.client.finalize_stream(request_id);
+        self.client.pending_images.drop_request(request_id);
+    }
+
     fn handle_image_start(&mut self, request_id: u32, metadata: ImageMetadata) -> io::Result<()> {
         self.client.start_image(request_id, metadata)
     }
