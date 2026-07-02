@@ -21,7 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha1 = "0.11"
 sha2 = "0.11"
-alloy = { version = "2.1", features = ["full"] }
+alloy = { version = "2.1", features = ["providers", "rpc-types-eth", "sol-types"] }
 url = "2"
 subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
 tai-keystore.workspace = true

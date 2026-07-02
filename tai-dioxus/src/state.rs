@@ -18,7 +18,6 @@ pub(crate) enum UiEvent {
     Daemon(tai_proto::DaemonMessage),
     ReaderClosed,
     ReaderFailed(String),
-    WriterFailed(String),
 }
 
 #[derive(Debug, Clone)]

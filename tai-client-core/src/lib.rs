@@ -1,9 +1,11 @@
+mod connection;
 mod dispatch;
 mod history;
 mod image;
 mod markdown;
 mod shell;
 
+pub use connection::run_daemon_connection;
 pub use dispatch::{DaemonMessageHandler, dispatch_daemon_message};
 pub use history::{ClientHistory, HistoryItem, MAX_HISTORY_ITEMS};
 pub use image::{ImageAssembler, PendingImage};

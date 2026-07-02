@@ -1,65 +1,30 @@
 use crate::state::{AppState, UiEvent};
 use dioxus::prelude::*;
 use std::io;
-use tai_client_core::{ShellCommand, dispatch_daemon_message, parse_input_line, shell_command_echo};
-use tai_proto::{ClientMessage, DaemonMessage, read_message, write_message};
-use tokio::{
-    net::UnixStream,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender},
+use tai_client_core::{
+    ShellCommand, dispatch_daemon_message, parse_input_line, run_daemon_connection,
+    shell_command_echo,
 };
+use tai_proto::{ClientMessage, DaemonMessage};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub(crate) async fn run_client(
     socket_path: String,
-    mut client_rx: UnboundedReceiver<ClientMessage>,
+    client_rx: UnboundedReceiver<ClientMessage>,
     ui_tx: UnboundedSender<UiEvent>,
 ) -> io::Result<()> {
-    let stream = UnixStream::connect(&socket_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
-
-    let writer_ui_tx = ui_tx.clone();
-    let writer_task = tokio::spawn(async move {
-        while let Some(message) = client_rx.recv().await {
-            if let Err(error) = write_message(&mut writer, &message).await {
-                let _ = writer_ui_tx.send(UiEvent::WriterFailed(error.to_string()));
-                return Err(error);
-            }
-        }
-        Ok::<(), io::Error>(())
-    });
-
-    loop {
-        match read_message::<_, DaemonMessage>(&mut reader).await {
-            Ok(message) => {
-                if ui_tx.send(UiEvent::Daemon(message)).is_err() {
-                    break;
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                let _ = ui_tx.send(UiEvent::ReaderClosed);
-                break;
-            }
-            Err(error) => {
-                writer_task.abort();
-                match writer_task.await {
-                    Ok(Ok(())) | Err(_) => {}
-                    Ok(Err(writer_error)) => return Err(writer_error),
-                }
-                return Err(error);
-            }
-        }
+    let result = run_daemon_connection(
+        &socket_path,
+        |message| {
+            let _ = ui_tx.send(UiEvent::Daemon(message));
+        },
+        client_rx,
+    )
+    .await;
+    if result.is_ok() {
+        let _ = ui_tx.send(UiEvent::ReaderClosed);
     }
-
-    match writer_task.await {
-        Ok(Ok(())) | Err(_) => {}
-        Ok(Err(error)) => return Err(error),
-    }
-
-    Ok(())
+    result
 }
 
 pub(crate) fn submit_input(

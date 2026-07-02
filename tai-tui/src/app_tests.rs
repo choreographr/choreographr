@@ -186,21 +186,19 @@ fn image_history_height_caps_to_twelve_rows() {
 #[tokio::test]
 async fn terminal_event_appends_characters() {
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
-    let (tx, mut rx) = mpsc::channel(1);
+    let (tx, mut rx) = mpsc::unbounded_channel();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .await
     .expect("handle key");
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .await
     .expect("handle key");
 
     assert_eq!(app.input, "hi");
@@ -211,14 +209,13 @@ async fn terminal_event_appends_characters() {
 async fn terminal_event_submits_run_input() {
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     app.input = "hello".to_string();
-    let (tx, mut rx) = mpsc::channel(1);
+    let (tx, mut rx) = mpsc::unbounded_channel();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .await
     .expect("handle enter");
 
     assert!(app.input.is_empty());
@@ -234,7 +231,7 @@ async fn terminal_event_submits_run_input() {
 
 #[tokio::test]
 async fn terminal_event_quits_only_when_input_empty() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = mpsc::unbounded_channel();
 
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     handle_terminal_event(
@@ -242,7 +239,6 @@ async fn terminal_event_quits_only_when_input_empty() {
         &mut app,
         &tx,
     )
-    .await
     .expect("handle q");
     assert!(app.should_quit);
 
@@ -253,7 +249,6 @@ async fn terminal_event_quits_only_when_input_empty() {
         &mut app,
         &tx,
     )
-    .await
     .expect("handle q");
     assert!(!app.should_quit);
     assert_eq!(app.input, "qq");
@@ -261,7 +256,7 @@ async fn terminal_event_quits_only_when_input_empty() {
 
 #[tokio::test]
 async fn terminal_event_ctrl_c_quits() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
 
     handle_terminal_event(
@@ -269,7 +264,6 @@ async fn terminal_event_ctrl_c_quits() {
         &mut app,
         &tx,
     )
-    .await
     .expect("handle ctrl+c");
 
     assert!(app.should_quit);
@@ -277,7 +271,7 @@ async fn terminal_event_ctrl_c_quits() {
 
 #[tokio::test]
 async fn mouse_scroll_outside_history_box_does_not_change_scroll() {
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = mpsc::unbounded_channel();
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     app.history_viewport.height = 1;
     for index in 0..8 {
@@ -297,7 +291,6 @@ async fn mouse_scroll_outside_history_box_does_not_change_scroll() {
         &mut app,
         &tx,
     )
-    .await
     .expect("handle mouse");
 
     assert_eq!(app.history_scroll.scroll(), 5);

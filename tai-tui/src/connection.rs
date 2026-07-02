@@ -3,54 +3,34 @@ use crate::state::{App, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, time::Duration};
-use tai_client_core::{dispatch_daemon_message, shell_command_echo};
-use tai_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
-use tai_tui::{ShellCommand, build_picker, channel_closed, parse_input_line};
-use tokio::{
-    io::AsyncWriteExt,
-    net::UnixStream,
-    sync::mpsc,
-};
+use tai_client_core::{dispatch_daemon_message, run_daemon_connection, shell_command_echo};
+use tai_proto::{ClientMessage, DaemonMessage, socket_path};
+use tai_tui::{ShellCommand, build_picker, parse_input_line};
+use tokio::sync::mpsc::{self, UnboundedSender};
 
 pub(crate) async fn run_app() -> io::Result<()> {
     let socket_path = socket_path();
-    let stream = UnixStream::connect(&socket_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
-    let (client_tx, mut client_rx) = mpsc::channel::<ClientMessage>(128);
+    let app_socket_path = socket_path.clone();
+    let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(128);
 
     let picker = build_picker();
     let picker_protocol = format!("{:?}", picker.protocol_type());
 
-    let writer_task = tokio::spawn(async move {
-        while let Some(message) = client_rx.recv().await {
-            write_message(&mut writer, &message).await?;
+    let connection_ui_tx = ui_tx.clone();
+    let connection_task = tokio::spawn(async move {
+        let result = run_daemon_connection(
+            &socket_path,
+            |message| {
+                let _ = connection_ui_tx.send(UiEvent::Daemon(message));
+            },
+            client_rx,
+        )
+        .await;
+        if result.is_ok() {
+            let _ = connection_ui_tx.send(UiEvent::ReaderClosed);
         }
-        writer.shutdown().await
-    });
-
-    let reader_ui_tx = ui_tx.clone();
-    let reader_task = tokio::spawn(async move {
-        loop {
-            match read_message::<_, DaemonMessage>(&mut reader).await {
-                Ok(message) => {
-                    if reader_ui_tx.send(UiEvent::Daemon(message)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                    ) =>
-                {
-                    let _ = reader_ui_tx.send(UiEvent::ReaderClosed).await;
-                    break;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Ok::<(), io::Error>(())
+        result
     });
 
     let signal_ui_tx = ui_tx.clone();
@@ -70,12 +50,10 @@ pub(crate) async fn run_app() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(socket_path.clone(), picker_protocol);
+    let mut app = App::new(app_socket_path, picker_protocol);
     client_tx
         .send(ClientMessage::ListSessions)
-        .await
-        .map_err(channel_closed)?;
-
+        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
     let result = run_ui_loop(
         &mut terminal,
         &mut app,
@@ -94,18 +72,16 @@ pub(crate) async fn run_app() -> io::Result<()> {
     terminal.show_cursor()?;
 
     drop(client_tx);
-    writer_task.await.map_err(io::Error::other)??;
+    match connection_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error),
+        Err(error) => return Err(io::Error::other(error)),
+    }
     signal_task.abort();
     match signal_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(error),
         Err(error) if error.is_cancelled() => {}
-        Err(error) => return Err(io::Error::other(error)),
-    }
-
-    match reader_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return Err(error),
         Err(error) => return Err(io::Error::other(error)),
     }
 
@@ -116,7 +92,7 @@ pub(crate) async fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     picker: &ratatui_image::picker::Picker,
-    client_tx: &mpsc::Sender<ClientMessage>,
+    client_tx: &UnboundedSender<ClientMessage>,
     ui_rx: &mut mpsc::Receiver<UiEvent>,
 ) -> io::Result<()> {
     while !app.should_quit {
@@ -124,14 +100,13 @@ pub(crate) async fn run_ui_loop(
             if !event {
                 break;
             }
-            handle_terminal_event(event::read()?, app, client_tx).await?;
+            handle_terminal_event(event::read()?, app, client_tx)?;
         }
 
         while let Ok(message) = ui_rx.try_recv() {
             match message {
                 UiEvent::Daemon(message) => {
-                    handle_daemon_message(message, app, picker, client_tx)
-                        .await?;
+                    handle_daemon_message(message, app, picker, client_tx)?;
                 }
                 UiEvent::ReaderClosed => {
                     app.push_text("daemon connection closed");
@@ -147,17 +122,17 @@ pub(crate) async fn run_ui_loop(
         terminal.draw(|frame| render(frame, app))?;
 
         if event::poll(Duration::from_millis(16))? {
-            handle_terminal_event(event::read()?, app, client_tx).await?;
+            handle_terminal_event(event::read()?, app, client_tx)?;
         }
     }
 
     Ok(())
 }
 
-pub(crate) async fn handle_terminal_event(
+pub(crate) fn handle_terminal_event(
     event: Event,
     app: &mut App,
-    client_tx: &mpsc::Sender<ClientMessage>,
+    client_tx: &UnboundedSender<ClientMessage>,
 ) -> io::Result<()> {
     match event {
         Event::Key(key) => {
@@ -196,7 +171,7 @@ pub(crate) async fn handle_terminal_event(
                                 }
                                 _ => {}
                             }
-                            client_tx.send(message).await.map_err(channel_closed)?;
+                            client_tx.send(message).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
                         }
                     }
                 }
@@ -226,16 +201,16 @@ pub(crate) async fn handle_terminal_event(
     Ok(())
 }
 
-pub(crate) async fn handle_daemon_message(
+pub(crate) fn handle_daemon_message(
     message: DaemonMessage,
     app: &mut App,
     picker: &ratatui_image::picker::Picker,
-    client_tx: &mpsc::Sender<ClientMessage>,
+    client_tx: &UnboundedSender<ClientMessage>,
 ) -> io::Result<()> {
     app.picker = Some(picker.clone());
     let response = dispatch_daemon_message(app, message)?;
     if let Some(msg) = response {
-        client_tx.send(msg).await.map_err(channel_closed)?;
+        client_tx.send(msg).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
     }
     Ok(())
 }

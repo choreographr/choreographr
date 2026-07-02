@@ -84,11 +84,6 @@ fn App() -> Element {
                             .write()
                             .push_text(format!("[client] connection error: {error}"));
                     }
-                    UiEvent::WriterFailed(error) => {
-                        state
-                            .write()
-                            .push_text(format!("[client] write error: {error}"));
-                    }
                 }
             }
         }
