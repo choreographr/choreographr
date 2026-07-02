@@ -1,13 +1,17 @@
 use crate::openai::RequestFormat;
 use crate::requests::{emit_demo_image, execute_chat_tool_request, execute_plain_request};
 use crate::server::{
-    send_or_warn, try_client, try_session, REQUEST_TIMEOUT_SECS,
+    try_client, try_session, REQUEST_TIMEOUT_SECS,
 };
 use crate::sessions::{ActiveRequest, broadcast_message_appended, broadcast_to_session};
-use std::{io, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tai_proto::{DaemonMessage, SessionMessage};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+async fn send_or_warn(tx: &mpsc::Sender<DaemonMessage>, msg: DaemonMessage) {
+    crate::server::send_or_warn(tx, msg).await;
+}
 
 pub(crate) async fn handle_run_input(
     state: &crate::DaemonState,
@@ -16,17 +20,17 @@ pub(crate) async fn handle_run_input(
     attached_session_id: Option<u64>,
     request_id: u32,
     input: Vec<u8>,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     let (session_id, session) = try_session!(state, attached_session_id, tx);
 
     let text = String::from_utf8_lossy(&input).trim().to_string();
     if text.is_empty() {
         warn!(request_id, "request failed: empty input");
-        send_or_warn!(tx, DaemonMessage::Started { request_id });
-        send_or_warn!(tx, DaemonMessage::Failed {
+        send_or_warn(tx, DaemonMessage::Started { request_id }).await;
+        send_or_warn(tx, DaemonMessage::Failed {
             request_id,
             error: "empty input".to_string(),
-        });
+        }).await;
         return Ok(());
     }
 
@@ -40,20 +44,20 @@ pub(crate) async fn handle_run_input(
             } else {
                 warn!(request_id, session_id, "duplicate request id rejected");
                 drop(guard);
-                send_or_warn!(tx, DaemonMessage::Failed {
+                send_or_warn(tx, DaemonMessage::Failed {
                     request_id,
                     error: "request id already active".to_string(),
-                });
+                }).await;
                 return Ok(());
             }
         }
         let Some(model) = guard.selected_model.clone() else {
             warn!(request_id, session_id, "request failed: no model selected");
-            send_or_warn!(tx, DaemonMessage::Started { request_id });
-            send_or_warn!(tx, DaemonMessage::Failed {
+            send_or_warn(tx, DaemonMessage::Started { request_id }).await;
+            send_or_warn(tx, DaemonMessage::Failed {
                 request_id,
                 error: "no model selected".to_string(),
-            });
+            }).await;
             return Ok(());
         };
         let message = SessionMessage::UserText {
@@ -147,18 +151,18 @@ pub(crate) async fn handle_test_image(
     tx: &mpsc::Sender<DaemonMessage>,
     attached_session_id: Option<u64>,
     request_id: u32,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     try_session!(state, attached_session_id, tx);
     info!(request_id, "sending demo image");
-    send_or_warn!(tx, DaemonMessage::Started { request_id });
+    send_or_warn(tx, DaemonMessage::Started { request_id }).await;
     match emit_demo_image(tx, request_id, 1).await {
         Ok(()) => {
-            send_or_warn!(tx, DaemonMessage::Done { request_id });
+            send_or_warn(tx, DaemonMessage::Done { request_id }).await;
         }
         Err(e) => {
             warn!(
                 request_id,
-                error = %e,
+                error = %anyhow::Error::from(e),
                 "client disconnected before image could be delivered"
             );
         }
@@ -172,12 +176,12 @@ pub(crate) async fn handle_cancel(
     client_id: u64,
     attached_session_id: Option<u64>,
     request_id: u32,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     let (session_id, session) = try_session!(state, attached_session_id, tx);
     if let Some(active_request) = session.lock().await.active_requests.remove(&request_id) {
         info!(request_id, session_id, "cancelling active request");
         active_request.handle.abort();
-        send_or_warn!(tx, DaemonMessage::Cancelled { request_id });
+        send_or_warn(tx, DaemonMessage::Cancelled { request_id }).await;
         broadcast_to_session(
             &session,
             DaemonMessage::Cancelled { request_id },
@@ -189,10 +193,10 @@ pub(crate) async fn handle_cancel(
             request_id,
             session_id, "cancel requested for inactive request"
         );
-        send_or_warn!(tx, DaemonMessage::Failed {
+        send_or_warn(tx, DaemonMessage::Failed {
             request_id,
             error: "request id not active".to_string(),
-        });
+        }).await;
     }
     Ok(())
 }

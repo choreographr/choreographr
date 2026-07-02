@@ -1,5 +1,6 @@
+use crate::error::ClientError;
 use crate::{ImageAssembler, StreamingText};
-use std::{collections::HashMap, io};
+use std::collections::HashMap;
 use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
 
 pub const MAX_HISTORY_ITEMS: usize = 500;
@@ -87,7 +88,7 @@ impl<TImage> ClientHistory<TImage> {
         self.pending_images.drop_request(request_id);
     }
 
-    pub fn start_image(&mut self, request_id: u32, metadata: ImageMetadata) -> io::Result<()> {
+    pub fn start_image(&mut self, request_id: u32, metadata: ImageMetadata) -> Result<(), ClientError> {
         self.pending_images.start(request_id, metadata)
     }
 
@@ -96,11 +97,11 @@ impl<TImage> ClientHistory<TImage> {
         request_id: u32,
         image_id: u32,
         data: &[u8],
-    ) -> io::Result<()> {
+    ) -> Result<(), ClientError> {
         self.pending_images.push_chunk(request_id, image_id, data)
     }
 
-    pub fn finish_image(&mut self, request_id: u32, image_id: u32) -> io::Result<(ImageMetadata, Vec<u8>)> {
+    pub fn finish_image(&mut self, request_id: u32, image_id: u32) -> Result<(ImageMetadata, Vec<u8>), ClientError> {
         self.pending_images.finish(request_id, image_id)
     }
 

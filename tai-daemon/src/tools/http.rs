@@ -1,4 +1,4 @@
-use super::{ToolResult, truncate_tool_output};
+use super::{ToolError, ToolResult, tool_ok, truncate_tool_output};
 use reqwest::{
     Method, StatusCode, Url,
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -17,70 +17,35 @@ struct HttpRequestArgs {
 }
 
 pub(crate) async fn execute_http_request_tool(arguments_json: &str) -> ToolResult {
-    let args = match serde_json::from_str::<HttpRequestArgs>(arguments_json) {
-        Ok(args) => args,
-        Err(error) => {
-            return ToolResult {
-                content: format!("invalid arguments: {error}"),
-                is_error: true,
-            };
-        }
-    };
+    match execute_http_request_tool_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_http_request_tool_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: HttpRequestArgs = serde_json::from_str(arguments_json)?;
 
     let method = match args.method.as_str() {
         "GET" => Method::GET,
         "POST" => Method::POST,
         "HEAD" => Method::HEAD,
-        other => {
-            return ToolResult {
-                content: format!("unsupported method: {other}"),
-                is_error: true,
-            };
-        }
+        other => return Err(ToolError::UnsupportedMethod(other.to_string())),
     };
 
-    let url = match Url::parse(&args.url) {
-        Ok(url) => url,
-        Err(error) => {
-            return ToolResult {
-                content: format!("invalid url: {error}"),
-                is_error: true,
-            };
-        }
-    };
+    let url = Url::parse(&args.url).map_err(|e| ToolError::InvalidUrl(e.to_string()))?;
     match url.scheme() {
         "http" | "https" => {}
-        other => {
-            return ToolResult {
-                content: format!("unsupported URL scheme: {other}"),
-                is_error: true,
-            };
-        }
+        other => return Err(ToolError::UnsupportedUrlScheme(other.to_string())),
     }
 
     let timeout_secs = args.timeout_secs.unwrap_or(10).clamp(1, 30);
-    let client = match reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .build()
-    {
-        Ok(client) => client,
-        Err(error) => {
-            return ToolResult {
-                content: format!("failed to build http client: {error}"),
-                is_error: true,
-            };
-        }
-    };
+        .map_err(|e| ToolError::Other(format!("failed to build http client: {e}")))?;
 
-    let headers = match build_http_request_headers(args.headers) {
-        Ok(headers) => headers,
-        Err(error) => {
-            return ToolResult {
-                content: error,
-                is_error: true,
-            };
-        }
-    };
+    let headers = build_http_request_headers(args.headers)?;
 
     let mut request = client.request(method.clone(), url).headers(headers);
     if method != Method::GET
@@ -90,15 +55,10 @@ pub(crate) async fn execute_http_request_tool(arguments_json: &str) -> ToolResul
         request = request.body(body);
     }
 
-    let response = match request.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            return ToolResult {
-                content: format!("http request failed: {error}"),
-                is_error: true,
-            };
-        }
-    };
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ToolError::RequestFailed(e.to_string()))?;
 
     let status = response.status();
     let headers = response.headers().clone();
@@ -118,19 +78,16 @@ pub(crate) async fn execute_http_request_tool(arguments_json: &str) -> ToolResul
         "body omitted: non-text response".to_string()
     };
 
-    ToolResult {
-        content: format_http_response(status, &headers, &body),
-        is_error: false,
-    }
+    Ok(format_http_response(status, &headers, &body))
 }
 
-fn build_http_request_headers(headers: HashMap<String, String>) -> Result<HeaderMap, String> {
+fn build_http_request_headers(headers: HashMap<String, String>) -> Result<HeaderMap, ToolError> {
     let mut request_headers = HeaderMap::new();
     for (name, value) in headers {
         let header_name = HeaderName::try_from(name.as_str())
-            .map_err(|error| format!("invalid header name: {name}: {error}"))?;
+            .map_err(|error| ToolError::InvalidHeader { name: name.clone(), error: error.to_string() })?;
         let header_value = HeaderValue::from_str(&value)
-            .map_err(|error| format!("invalid header value for {name}: {error}"))?;
+            .map_err(|error| ToolError::InvalidHeader { name: name.clone(), error: error.to_string() })?;
         request_headers.insert(header_name, header_value);
     }
     Ok(request_headers)

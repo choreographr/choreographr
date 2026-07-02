@@ -10786,6 +10786,7 @@ dependencies = [
  "ammonia",
  "pulldown-cmark",
  "tai-proto",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -10794,6 +10795,7 @@ name = "tai-daemon"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "anyhow",
  "async-trait",
  "base64",
  "bytes",
@@ -10814,6 +10816,7 @@ dependencies = [
  "subxt",
  "tai-keystore",
  "tai-proto",
+ "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
@@ -10825,6 +10828,7 @@ dependencies = [
 name = "tai-dioxus"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64",
  "dioxus",
  "tai-client-core",
@@ -10837,6 +10841,7 @@ name = "tai-im"
 version = "0.1.0"
 dependencies = [
  "ammonia",
+ "anyhow",
  "tai-client-core",
  "tai-proto",
  "teloxide",
@@ -10850,12 +10855,14 @@ name = "tai-keystore"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "anyhow",
  "argon2",
  "base64",
  "dirs 6.0.0",
  "rand 0.10.1",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "zeroize",
 ]
 
@@ -10865,6 +10872,7 @@ version = "0.1.0"
 dependencies = [
  "bincode 2.0.1",
  "serde",
+ "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -10872,6 +10880,7 @@ dependencies = [
 name = "tai-tui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "crossterm",
  "futures-util",
  "image",

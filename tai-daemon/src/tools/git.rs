@@ -1,4 +1,4 @@
-use crate::{ToolResult, truncate_tool_output};
+use super::{ToolError, ToolResult, tool_ok, truncate_tool_output};
 use gix::{
     ObjectId,
     bstr::{BStr, BString, ByteSlice},
@@ -52,124 +52,118 @@ struct GitPushArgs {
 }
 
 pub async fn execute_git_status_tool(arguments_json: &str) -> ToolResult {
-    let args = match serde_json::from_str::<GitRepoArgs>(arguments_json) {
-        Ok(args) => args,
-        Err(error) => return invalid_arguments(error),
-    };
+    match execute_git_status_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
 
-    map_io_result(git_status_impl(args.repo_path.as_deref()))
+async fn execute_git_status_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: GitRepoArgs = serde_json::from_str(arguments_json)?;
+    let output = git_status_impl(args.repo_path.as_deref())?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub async fn execute_git_diff_tool(arguments_json: &str) -> ToolResult {
-    let args = match serde_json::from_str::<GitDiffArgs>(arguments_json) {
-        Ok(args) => args,
-        Err(error) => return invalid_arguments(error),
-    };
+    match execute_git_diff_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
 
-    map_io_result(git_diff_impl(
+async fn execute_git_diff_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: GitDiffArgs = serde_json::from_str(arguments_json)?;
+    let output = git_diff_impl(
         args.repo_path.as_deref(),
         args.cached.unwrap_or(false),
         args.pathspec.unwrap_or_default(),
-    ))
+    )?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub async fn execute_git_log_tool(arguments_json: &str) -> ToolResult {
-    let args = match serde_json::from_str::<GitLogArgs>(arguments_json) {
-        Ok(args) => args,
-        Err(error) => return invalid_arguments(error),
-    };
+    match execute_git_log_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
 
-    map_io_result(git_log_impl(
+async fn execute_git_log_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: GitLogArgs = serde_json::from_str(arguments_json)?;
+    let output = git_log_impl(
         args.repo_path.as_deref(),
         args.limit.unwrap_or(10).clamp(1, 100),
-    ))
+    )?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub async fn execute_git_add_tool(arguments_json: &str) -> ToolResult {
-    let args = match serde_json::from_str::<GitAddArgs>(arguments_json) {
-        Ok(args) => args,
-        Err(error) => return invalid_arguments(error),
-    };
+    match execute_git_add_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
 
-    let pathspec = match normalize_pathspecs(args.pathspec) {
-        Ok(pathspec) => pathspec,
-        Err(error) => {
-            return ToolResult {
-                content: error.to_string(),
-                is_error: true,
-            };
-        }
-    };
-
-    map_io_result(git_add_impl(args.repo_path.as_deref(), pathspec))
+async fn execute_git_add_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: GitAddArgs = serde_json::from_str(arguments_json)?;
+    let pathspec = normalize_pathspecs(args.pathspec)?;
+    let output = git_add_impl(args.repo_path.as_deref(), pathspec)?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub async fn execute_git_commit_tool(arguments_json: &str) -> ToolResult {
-    let args = match serde_json::from_str::<GitCommitArgs>(arguments_json) {
-        Ok(args) => args,
-        Err(error) => return invalid_arguments(error),
-    };
+    match execute_git_commit_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
 
-    map_io_result(git_commit_impl(
+async fn execute_git_commit_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: GitCommitArgs = serde_json::from_str(arguments_json)?;
+    let output = git_commit_impl(
         args.repo_path.as_deref(),
         &args.message,
         args.allow_empty.unwrap_or(false),
-    ))
+    )?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub async fn execute_git_push_tool(arguments_json: &str) -> ToolResult {
-    let args = match serde_json::from_str::<GitPushArgs>(arguments_json) {
-        Ok(args) => args,
-        Err(error) => return invalid_arguments(error),
-    };
+    match execute_git_push_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
 
-    map_io_result(git_push_impl(
+async fn execute_git_push_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: GitPushArgs = serde_json::from_str(arguments_json)?;
+    let output = git_push_impl(
         args.repo_path.as_deref(),
         &args.remote,
         args.branch.as_deref(),
         args.set_upstream.unwrap_or(false),
         args.force_with_lease.unwrap_or(false),
         args.dry_run.unwrap_or(false),
-    ))
+    )?;
+    Ok(truncate_tool_output(&output))
 }
 
-fn invalid_arguments(error: serde_json::Error) -> ToolResult {
-    ToolResult {
-        content: format!("invalid arguments: {error}"),
-        is_error: true,
-    }
-}
-
-fn map_io_result(result: io::Result<String>) -> ToolResult {
-    match result {
-        Ok(content) => ToolResult {
-            content: truncate_tool_output(&content),
-            is_error: false,
-        },
-        Err(error) => ToolResult {
-            content: error.to_string(),
-            is_error: true,
-        },
-    }
-}
-
-fn normalize_pathspecs(pathspec: Vec<String>) -> io::Result<Vec<String>> {
+fn normalize_pathspecs(pathspec: Vec<String>) -> Result<Vec<String>, ToolError> {
     let normalized = pathspec
         .into_iter()
         .map(|spec| spec.trim().to_string())
         .filter(|spec| !spec.is_empty())
         .collect::<Vec<_>>();
     if normalized.is_empty() {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "pathspec must contain at least one non-empty entry",
+        Err(ToolError::Other(
+            "pathspec must contain at least one non-empty entry".to_string(),
         ))
     } else {
         Ok(normalized)
     }
 }
 
-fn git_status_impl(repo_path: Option<&str>) -> io::Result<String> {
+fn git_status_impl(repo_path: Option<&str>) -> Result<String, ToolError> {
     let repo = open_repo(repo_path)?;
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
@@ -217,7 +211,7 @@ fn git_diff_impl(
     repo_path: Option<&str>,
     cached: bool,
     pathspec: Vec<String>,
-) -> io::Result<String> {
+) -> Result<String, ToolError> {
     let repo = open_repo(repo_path)?;
     let mut lines = if cached {
         collect_cached_diff_lines(&repo, &pathspec)?
@@ -247,7 +241,7 @@ fn git_diff_impl(
     Ok(out.trim_end().to_string())
 }
 
-fn git_log_impl(repo_path: Option<&str>, limit: usize) -> io::Result<String> {
+fn git_log_impl(repo_path: Option<&str>, limit: usize) -> Result<String, ToolError> {
     let repo = open_repo(repo_path)?;
     let head = match repo.head_id() {
         Ok(head) => head,
@@ -292,19 +286,16 @@ fn git_log_impl(repo_path: Option<&str>, limit: usize) -> io::Result<String> {
     Ok(out.trim_end().to_string())
 }
 
-fn git_add_impl(repo_path: Option<&str>, pathspec: Vec<String>) -> io::Result<String> {
+fn git_add_impl(repo_path: Option<&str>, pathspec: Vec<String>) -> Result<String, ToolError> {
     let repo = open_repo(repo_path)?;
     let effective_pathspec = prefix_pathspecs(&repo, repo_path, &pathspec)?;
     let mut index = load_mutable_index(&repo)?;
     let paths = collect_paths_to_stage(&repo, &index, &effective_pathspec)?;
     if paths.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "pathspec did not match any tracked or untracked paths: {}",
-                pathspec.join(", ")
-            ),
-        ));
+        return Err(ToolError::Other(format!(
+            "pathspec did not match any tracked or untracked paths: {}",
+            pathspec.join(", ")
+        )));
     }
 
     let (mut pipeline, _) = repo.filter_pipeline(None).map_err(io::Error::other)?;
@@ -335,13 +326,12 @@ fn git_commit_impl(
     repo_path: Option<&str>,
     message: &str,
     allow_empty: bool,
-) -> io::Result<String> {
+) -> Result<String, ToolError> {
     let repo = open_repo(repo_path)?;
     let message = message.trim();
     if message.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "commit message must not be empty",
+        return Err(ToolError::Other(
+            "commit message must not be empty".to_string(),
         ));
     }
 
@@ -349,9 +339,8 @@ fn git_commit_impl(
     ensure_index_has_no_conflicts(&index)?;
 
     if !allow_empty && collect_cached_diff_lines(&repo, &[] as &[String])?.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no staged changes to commit",
+        return Err(ToolError::Other(
+            "no staged changes to commit".to_string(),
         ));
     }
     let tree_id = write_tree_from_index(&repo, &index)?;
@@ -370,7 +359,7 @@ fn git_push_impl(
     set_upstream: bool,
     force_with_lease: bool,
     dry_run: bool,
-) -> io::Result<String> {
+) -> Result<String, ToolError> {
     let repo = open_repo(repo_path)?;
     let remote = normalize_nonempty_argument(remote, "remote")?;
     let branch = match branch {
@@ -407,7 +396,7 @@ fn git_push_impl(
         writeln!(&mut out, "result: push failed").ok();
         append_command_output(&mut out, "stdout", &stdout);
         append_command_output(&mut out, "stderr", &stderr);
-        return Err(io::Error::other(out.trim_end().to_string()));
+        return Err(ToolError::Other(out.trim_end().to_string()));
     }
 
     let mut out = String::new();
@@ -433,42 +422,36 @@ fn git_push_impl(
     Ok(out.trim_end().to_string())
 }
 
-fn open_repo(repo_path: Option<&str>) -> io::Result<gix::Repository> {
+fn open_repo(repo_path: Option<&str>) -> Result<gix::Repository, ToolError> {
     let path = repo_path.unwrap_or(".").trim();
     let path = if path.is_empty() { "." } else { path };
     gix::discover(path).map_err(|error| {
-        io::Error::other(format!(
+        ToolError::Other(format!(
             "failed to open git repository from {}: {error}",
             Path::new(path).display()
         ))
     })
 }
 
-fn normalize_nonempty_argument<'a>(value: &'a str, name: &str) -> io::Result<&'a str> {
+fn normalize_nonempty_argument<'a>(value: &'a str, name: &str) -> Result<&'a str, ToolError> {
     let value = value.trim();
     if value.is_empty() {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{name} must not be empty"),
-        ))
+        Err(ToolError::Other(format!("{name} must not be empty")))
     } else {
         Ok(value)
     }
 }
 
-fn current_branch_name(repo: &gix::Repository) -> io::Result<String> {
+fn current_branch_name(repo: &gix::Repository) -> Result<String, ToolError> {
     repo.head_name()
         .map_err(io::Error::other)?
         .map(|name| name.shorten().to_string())
         .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "branch must be provided when HEAD is detached",
-            )
+            ToolError::Other("branch must be provided when HEAD is detached".to_string())
         })
 }
 
-fn describe_head(repo: &gix::Repository) -> io::Result<String> {
+fn describe_head(repo: &gix::Repository) -> Result<String, ToolError> {
     if let Some(name) = repo.head_name().map_err(io::Error::other)? {
         return Ok(name.shorten().to_string());
     }
@@ -478,7 +461,7 @@ fn describe_head(repo: &gix::Repository) -> io::Result<String> {
     }
 }
 
-fn shorten_id(repo: &gix::Repository, id: ObjectId) -> io::Result<String> {
+fn shorten_id(repo: &gix::Repository, id: ObjectId) -> Result<String, ToolError> {
     Ok(id
         .attach(repo)
         .shorten()
@@ -494,12 +477,17 @@ fn repo_work_dir_display(repo: &gix::Repository) -> String {
     repo_work_dir(repo).display().to_string()
 }
 
-fn run_git_command(repo: &gix::Repository, args: &[String]) -> io::Result<std::process::Output> {
+fn run_git_command(repo: &gix::Repository, args: &[String]) -> Result<std::process::Output, ToolError> {
     std::process::Command::new("git")
         .args(args)
         .current_dir(repo_work_dir(repo))
         .output()
-        .map_err(|error| io::Error::other(format!("failed to run git {}: {error}", args.join(" "))))
+        .map_err(|error| {
+            ToolError::Other(format!(
+                "failed to run git {}: {error}",
+                args.join(" ")
+            ))
+        })
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -518,7 +506,7 @@ fn append_command_output(out: &mut String, label: &str, content: &str) {
 fn collect_worktree_diff_lines(
     repo: &gix::Repository,
     pathspec: &[String],
-) -> io::Result<Vec<String>> {
+) -> Result<Vec<String>, ToolError> {
     let patterns = pathspec_patterns(pathspec);
     let iter = repo
         .status(Discard)
@@ -538,7 +526,7 @@ fn collect_worktree_diff_lines(
 fn collect_cached_diff_lines(
     repo: &gix::Repository,
     pathspec: &[String],
-) -> io::Result<Vec<String>> {
+) -> Result<Vec<String>, ToolError> {
     let iter = repo
         .status(Discard)
         .map_err(io::Error::other)?
@@ -559,7 +547,7 @@ fn collect_cached_diff_lines(
     Ok(lines)
 }
 
-fn load_mutable_index(repo: &gix::Repository) -> io::Result<gix::index::File> {
+fn load_mutable_index(repo: &gix::Repository) -> Result<gix::index::File, ToolError> {
     match repo
         .index_or_load_from_head_or_empty()
         .map_err(io::Error::other)?
@@ -580,7 +568,7 @@ fn collect_paths_to_stage(
     repo: &gix::Repository,
     index: &gix::index::File,
     pathspec: &[String],
-) -> io::Result<Vec<BString>> {
+) -> Result<Vec<BString>, ToolError> {
     let mut paths = BTreeSet::<BString>::new();
 
     let patterns = pathspec_patterns(pathspec);
@@ -620,7 +608,7 @@ fn stage_path(
     pipeline: &mut gix::filter::Pipeline<'_>,
     index: &mut gix::index::File,
     path: &BStr,
-) -> io::Result<bool> {
+) -> Result<bool, ToolError> {
     let previous = current_entry_snapshot(index, path);
     remove_entries_for_path(index, path);
 
@@ -661,7 +649,7 @@ fn prefix_pathspecs(
     repo: &gix::Repository,
     repo_path: Option<&str>,
     pathspec: &[String],
-) -> io::Result<Vec<String>> {
+) -> Result<Vec<String>, ToolError> {
     let Some(workdir) = repo.workdir() else {
         return Ok(pathspec.to_vec());
     };
@@ -678,7 +666,7 @@ fn prefix_pathspecs(
     let absolute = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
-        std::env::current_dir()?.join(candidate)
+        std::env::current_dir().map_err(ToolError::Io)?.join(candidate)
     };
 
     let Ok(prefix) = absolute.strip_prefix(workdir) else {
@@ -705,57 +693,51 @@ fn prefix_pathspecs(
         .collect())
 }
 
-fn worktree_metadata(repo: &gix::Repository, path: &BStr) -> io::Result<gix::index::fs::Metadata> {
+fn worktree_metadata(repo: &gix::Repository, path: &BStr) -> Result<gix::index::fs::Metadata, ToolError> {
     let workdir = repo
         .workdir()
-        .ok_or_else(|| io::Error::other("repository has no worktree"))?;
+        .ok_or_else(|| ToolError::Other("repository has no worktree".to_string()))?;
     gix::index::fs::Metadata::from_path_no_follow(&workdir.join(gix::path::from_bstr(path)))
-        .map_err(io::Error::other)
+        .map_err(|e| ToolError::Io(e.into()))
 }
 
-fn finalize_index(index: &mut gix::index::File) -> io::Result<()> {
+fn finalize_index(index: &mut gix::index::File) -> Result<(), ToolError> {
     index.sort_entries();
     let _ = index.remove_tree();
-    index.write(Default::default()).map_err(io::Error::other)
+    index.write(Default::default()).map_err(io::Error::other)?;
+    Ok(())
 }
 
-fn ensure_index_has_no_conflicts(index: &gix::index::File) -> io::Result<()> {
+fn ensure_index_has_no_conflicts(index: &gix::index::File) -> Result<(), ToolError> {
     if let Some(path) = index
         .entries()
         .iter()
         .find(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
         .map(|entry| path_from_bytes(entry.path(index).as_ref()))
     {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("cannot commit with unresolved index conflicts at {path}"),
-        ))
+        Err(ToolError::Other(format!(
+            "cannot commit with unresolved index conflicts at {path}"
+        )))
     } else {
         Ok(())
     }
 }
 
-fn write_tree_from_index(repo: &gix::Repository, index: &gix::index::File) -> io::Result<ObjectId> {
+fn write_tree_from_index(repo: &gix::Repository, index: &gix::index::File) -> Result<ObjectId, ToolError> {
     let mut editor = repo.empty_tree().edit().map_err(io::Error::other)?;
     for entry in index.entries() {
         if entry.stage() != gix::index::entry::Stage::Unconflicted {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "cannot write tree with conflicted index entry at {}",
-                    path_from_bytes(entry.path(index).as_ref())
-                ),
-            ));
+            return Err(ToolError::Other(format!(
+                "cannot write tree with conflicted index entry at {}",
+                path_from_bytes(entry.path(index).as_ref())
+            )));
         }
         let kind = entry.mode.to_tree_entry_mode().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported index entry mode {} at {}",
-                    entry.mode.bits(),
-                    path_from_bytes(entry.path(index).as_ref())
-                ),
-            )
+            ToolError::Other(format!(
+                "unsupported index entry mode {} at {}",
+                entry.mode.bits(),
+                path_from_bytes(entry.path(index).as_ref())
+            ))
         })?;
         editor
             .upsert(entry.path(index).to_owned(), kind.into(), entry.id)
@@ -765,9 +747,10 @@ fn write_tree_from_index(repo: &gix::Repository, index: &gix::index::File) -> io
         .write()
         .map(|id| id.detach())
         .map_err(io::Error::other)
+        .map_err(ToolError::from)
 }
 
-fn current_head_parents(repo: &gix::Repository) -> io::Result<Vec<ObjectId>> {
+fn current_head_parents(repo: &gix::Repository) -> Result<Vec<ObjectId>, ToolError> {
     match repo.head_id() {
         Ok(head) => Ok(vec![head.detach()]),
         Err(_) => Ok(Vec::new()),
@@ -976,4 +959,3 @@ define_tool!(GitPush, "git_push",
     execute_git_push_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"remote":{"type":"string","description":"Remote name","default":"origin"},"branch":{"type":"string","description":"Remote branch name"},"set_upstream":{"type":"boolean","description":"Set upstream tracking reference","default":false},"force_with_lease":{"type":"boolean","description":"Force push with lease (safe force push)","default":false},"dry_run":{"type":"boolean","description":"Simulate push without sending data","default":false}},"required":[],"additionalProperties":false})
 );
-

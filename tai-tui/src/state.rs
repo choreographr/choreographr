@@ -1,6 +1,6 @@
 use ratatui::layout::Rect;
-use std::{collections::HashSet, io};
-use tai_client_core::{ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem, MAX_HISTORY_ITEMS};
+use std::collections::HashSet;
+use tai_client_core::{ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem, MAX_HISTORY_ITEMS};
 use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
 use tai_tui::{RenderedImage, StreamingText, build_rendered_image};
 
@@ -347,18 +347,18 @@ impl DaemonMessageHandler for App {
         self.client.pending_images.drop_request(request_id);
     }
 
-    fn handle_image_start(&mut self, request_id: u32, metadata: ImageMetadata) -> io::Result<()> {
+    fn handle_image_start(&mut self, request_id: u32, metadata: ImageMetadata) -> Result<(), ClientError> {
         self.client.start_image(request_id, metadata)
     }
 
-    fn handle_image_chunk(&mut self, request_id: u32, image_id: u32, data: &[u8]) -> io::Result<()> {
+    fn handle_image_chunk(&mut self, request_id: u32, image_id: u32, data: &[u8]) -> Result<(), ClientError> {
         self.client.push_image_chunk(request_id, image_id, data)
     }
 
-    fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> io::Result<()> {
+    fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError> {
         let (metadata, data) = self.client.finish_image(request_id, image_id)?;
         let picker = self.picker.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "image picker not set")
+            ClientError::Io(std::io::Error::new(std::io::ErrorKind::Other, "image picker not set"))
         })?;
         let rendered = build_rendered_image(picker, metadata, data)?;
         self.push_image(rendered);

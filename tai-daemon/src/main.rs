@@ -1,10 +1,10 @@
-use std::io;
+use anyhow::Context;
 use tai_proto::socket_path;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> anyhow::Result<()> {
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -13,12 +13,16 @@ async fn main() -> io::Result<()> {
         .init();
 
     info!("tai-daemon starting (locked) — send /unlock <passphrase> to unlock");
-    let config_path =
-        tai_daemon::openai::config_path().map_or_else(|_| "?".into(), |p| p.display().to_string());
-    let keystore_path =
-        tai_keystore::keystore_path().map_or_else(|_| "?".into(), |p| p.display().to_string());
+    let config_path = tai_daemon::openai::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("<error: {e}>"));
+    let keystore_path = tai_keystore::keystore_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("<error: {e}>"));
     info!(%config_path, %keystore_path, "daemon paths");
     let state = tai_daemon::new_daemon_state();
     let socket_path = socket_path();
-    tai_daemon::run_server(&socket_path, state).await
+    tai_daemon::run_server(&socket_path, state)
+        .await
+        .context("failed to run server")
 }

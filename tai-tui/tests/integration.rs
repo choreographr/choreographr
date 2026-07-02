@@ -1,4 +1,4 @@
-use std::io;
+use tai_client_core::ClientError;
 use tai_proto::{ClientMessage, ImageMetadata};
 use tai_tui::{ImageAssembler, ShellCommand, parse_input_line};
 
@@ -64,5 +64,5 @@ fn image_assembler_rejects_oversized_chunks() {
     let error = assembler
         .push_chunk(1, 3, &[1, 2, 3])
         .expect_err("should fail");
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(matches!(error, ClientError::ImageExceedsSize { image_id: 3 }));
 }

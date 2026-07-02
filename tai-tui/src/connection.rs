@@ -3,7 +3,7 @@ use crate::state::{App, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, time::Duration};
-use tai_client_core::{dispatch_daemon_message, run_daemon_connection, shell_command_echo};
+use tai_client_core::{ClientError, dispatch_daemon_message, run_daemon_connection, shell_command_echo};
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
 use tokio::sync::mpsc::{self, UnboundedSender};
@@ -61,7 +61,8 @@ pub(crate) async fn run_app() -> io::Result<()> {
         &client_tx,
         &mut ui_rx,
     )
-    .await;
+    .await
+    .map_err(io::Error::from);
 
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
@@ -74,7 +75,7 @@ pub(crate) async fn run_app() -> io::Result<()> {
     drop(client_tx);
     match connection_task.await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => return Err(error),
+        Ok(Err(error)) => return Err(error.into()),
         Err(error) => return Err(io::Error::other(error)),
     }
     signal_task.abort();
@@ -85,7 +86,7 @@ pub(crate) async fn run_app() -> io::Result<()> {
         Err(error) => return Err(io::Error::other(error)),
     }
 
-    result
+    result.map_err(io::Error::from)
 }
 
 pub(crate) async fn run_ui_loop(
@@ -94,7 +95,7 @@ pub(crate) async fn run_ui_loop(
     picker: &ratatui_image::picker::Picker,
     client_tx: &UnboundedSender<ClientMessage>,
     ui_rx: &mut mpsc::Receiver<UiEvent>,
-) -> io::Result<()> {
+) -> Result<(), ClientError> {
     while !app.should_quit {
         while let Ok(event) = event::poll(Duration::from_millis(0)) {
             if !event {
@@ -133,7 +134,7 @@ pub(crate) fn handle_terminal_event(
     event: Event,
     app: &mut App,
     client_tx: &UnboundedSender<ClientMessage>,
-) -> io::Result<()> {
+) -> Result<(), ClientError> {
     match event {
         Event::Key(key) => {
             if key.kind != KeyEventKind::Press {
@@ -171,7 +172,7 @@ pub(crate) fn handle_terminal_event(
                                 }
                                 _ => {}
                             }
-                            client_tx.send(message).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
+                            client_tx.send(message).map_err(|e| ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())))?;
                         }
                     }
                 }
@@ -206,11 +207,11 @@ pub(crate) fn handle_daemon_message(
     app: &mut App,
     picker: &ratatui_image::picker::Picker,
     client_tx: &UnboundedSender<ClientMessage>,
-) -> io::Result<()> {
+) -> Result<(), ClientError> {
     app.picker = Some(picker.clone());
     let response = dispatch_daemon_message(app, message)?;
     if let Some(msg) = response {
-        client_tx.send(msg).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
+        client_tx.send(msg).map_err(|e| ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())))?;
     }
     Ok(())
 }

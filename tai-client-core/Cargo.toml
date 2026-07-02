@@ -7,4 +7,5 @@ edition = "2024"
 ammonia.workspace = true
 pulldown-cmark = "0.13"
 tai-proto.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync"] }

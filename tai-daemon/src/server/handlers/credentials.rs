@@ -1,25 +1,29 @@
 use crate::openai::{OpenAiClient, load_service_config};
-use crate::server::{send_or_warn, try_keystore_path};
+use crate::server::try_keystore_path;
 use crate::tools::x;
-use std::{io, sync::Arc};
+use std::sync::Arc;
 use tai_keystore::{Keystore, ServiceCredential};
 use tai_proto::DaemonMessage;
 use tokio::sync::mpsc;
 use tracing::warn;
 
+async fn send_or_warn(tx: &mpsc::Sender<DaemonMessage>, msg: DaemonMessage) {
+    crate::server::send_or_warn(tx, msg).await;
+}
+
 pub(crate) async fn handle_unlock(
     state: &crate::DaemonState,
     tx: &mpsc::Sender<DaemonMessage>,
     passphrase: String,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     let Some(ks_path) = try_keystore_path(tx, |e| DaemonMessage::LockedError { error: e }).await?
     else {
         return Ok(());
     };
     if !ks_path.exists() {
-        send_or_warn!(tx, DaemonMessage::LockedError {
+        send_or_warn(tx, DaemonMessage::LockedError {
             error: "keystore does not exist. run 'tai-keystore init' to create one.".to_string(),
-        });
+        }).await;
         return Ok(());
     }
     match Keystore::load(&ks_path, &passphrase) {
@@ -31,7 +35,7 @@ pub(crate) async fn handle_unlock(
                     let service_config = match load_service_config() {
                         Ok(cfg) => cfg,
                         Err(e) => {
-                            warn!(error = %e, "failed to load service config, using defaults — check config.toml");
+                            warn!(error = %anyhow::Error::from(e), "failed to load service config, using defaults — check config.toml");
                             Default::default()
                         }
                     };
@@ -43,28 +47,28 @@ pub(crate) async fn handle_unlock(
                             }
                             guard.keystore = Some(keystore);
                             drop(guard);
-                            send_or_warn!(tx, DaemonMessage::Unlocked);
+                            send_or_warn(tx, DaemonMessage::Unlocked).await;
                         }
                         Err(e) => {
                             drop(guard);
-                            send_or_warn!(tx, DaemonMessage::LockedError {
+                            send_or_warn(tx, DaemonMessage::LockedError {
                                 error: format!("failed to create OpenAI client: {e}"),
-                            });
+                            }).await;
                         }
                     }
                 }
                 None => {
                     drop(guard);
-                    send_or_warn!(tx, DaemonMessage::LockedError {
+                    send_or_warn(tx, DaemonMessage::LockedError {
                         error: "no 'openai' credential found in keystore".to_string(),
-                    });
+                    }).await;
                 }
             }
         }
         Err(e) => {
-            send_or_warn!(tx, DaemonMessage::LockedError {
+            send_or_warn(tx, DaemonMessage::LockedError {
                 error: format!("failed to unlock keystore: {e}"),
-            });
+            }).await;
         }
     }
     Ok(())
@@ -73,13 +77,13 @@ pub(crate) async fn handle_unlock(
 pub(crate) async fn handle_lock(
     state: &crate::DaemonState,
     tx: &mpsc::Sender<DaemonMessage>,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     let mut guard = state.lock().await;
     guard.openai_client = None;
     guard.keystore = None;
     drop(guard);
     x::clear_x_credentials();
-    send_or_warn!(tx, DaemonMessage::Locked);
+    send_or_warn(tx, DaemonMessage::Locked).await;
     Ok(())
 }
 
@@ -87,7 +91,7 @@ pub(crate) async fn handle_get_credential(
     state: &crate::DaemonState,
     tx: &mpsc::Sender<DaemonMessage>,
     service: String,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     let key = {
         let guard = state.lock().await;
         guard
@@ -95,7 +99,7 @@ pub(crate) async fn handle_get_credential(
             .as_ref()
             .and_then(|ks| ks.get_api_key(&service).map(|k| k.to_string()))
     };
-    send_or_warn!(tx, DaemonMessage::Credential { service, key });
+    send_or_warn(tx, DaemonMessage::Credential { service, key }).await;
     Ok(())
 }
 
@@ -104,7 +108,7 @@ pub(crate) async fn handle_add_api_key(
     service: String,
     passphrase: String,
     key: String,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     let svc = service.clone();
     let Some(ks_path) = try_keystore_path(tx, |e| DaemonMessage::CredentialAddFailed {
         service: svc.clone(),
@@ -119,21 +123,21 @@ pub(crate) async fn handle_add_api_key(
             keystore.add(svc.clone(), ServiceCredential::ApiKey { key });
             match keystore.save(&ks_path, &passphrase) {
                 Ok(()) => {
-                    send_or_warn!(tx, DaemonMessage::CredentialAdded { service: svc });
+                    send_or_warn(tx, DaemonMessage::CredentialAdded { service: svc }).await;
                 }
                 Err(e) => {
-                    send_or_warn!(tx, DaemonMessage::CredentialAddFailed {
+                    send_or_warn(tx, DaemonMessage::CredentialAddFailed {
                         service: svc,
                         error: format!("failed to save keystore: {e}"),
-                    });
+                    }).await;
                 }
             }
         }
         Err(e) => {
-            send_or_warn!(tx, DaemonMessage::CredentialAddFailed {
+            send_or_warn(tx, DaemonMessage::CredentialAddFailed {
                 service: svc,
                 error: format!("failed to unlock keystore: {e}"),
-            });
+            }).await;
         }
     }
     Ok(())
@@ -148,7 +152,7 @@ pub(crate) async fn handle_add_x_credential(
     access_token: String,
     access_token_secret: String,
     bearer_token: Option<String>,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     let svc = service.clone();
     let Some(ks_path) = try_keystore_path(tx, |e| DaemonMessage::CredentialAddFailed {
         service: svc.clone(),
@@ -172,21 +176,21 @@ pub(crate) async fn handle_add_x_credential(
             );
             match keystore.save(&ks_path, &passphrase) {
                 Ok(()) => {
-                    send_or_warn!(tx, DaemonMessage::CredentialAdded { service: svc });
+                    send_or_warn(tx, DaemonMessage::CredentialAdded { service: svc }).await;
                 }
                 Err(e) => {
-                    send_or_warn!(tx, DaemonMessage::CredentialAddFailed {
+                    send_or_warn(tx, DaemonMessage::CredentialAddFailed {
                         service: svc,
                         error: format!("failed to save keystore: {e}"),
-                    });
+                    }).await;
                 }
             }
         }
         Err(e) => {
-            send_or_warn!(tx, DaemonMessage::CredentialAddFailed {
+            send_or_warn(tx, DaemonMessage::CredentialAddFailed {
                 service: svc,
                 error: format!("failed to unlock keystore: {e}"),
-            });
+            }).await;
         }
     }
     Ok(())
@@ -196,7 +200,7 @@ pub(crate) async fn handle_remove_credential(
     tx: &mpsc::Sender<DaemonMessage>,
     service: String,
     passphrase: String,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     let svc = service.clone();
     let Some(ks_path) = try_keystore_path(tx, |e| DaemonMessage::CredentialRemoveFailed {
         service: svc.clone(),
@@ -211,27 +215,27 @@ pub(crate) async fn handle_remove_credential(
             if keystore.remove(&svc) {
                 match keystore.save(&ks_path, &passphrase) {
                     Ok(()) => {
-                        send_or_warn!(tx, DaemonMessage::CredentialRemoved { service: svc });
+                        send_or_warn(tx, DaemonMessage::CredentialRemoved { service: svc }).await;
                     }
                     Err(e) => {
-                        send_or_warn!(tx, DaemonMessage::CredentialRemoveFailed {
+                        send_or_warn(tx, DaemonMessage::CredentialRemoveFailed {
                             service: svc,
                             error: format!("failed to save keystore: {e}"),
-                        });
+                        }).await;
                     }
                 }
             } else {
-                send_or_warn!(tx, DaemonMessage::CredentialRemoveFailed {
+                send_or_warn(tx, DaemonMessage::CredentialRemoveFailed {
                     service: svc,
                     error: "service not found in keystore".to_string(),
-                });
+                }).await;
             }
         }
         Err(e) => {
-            send_or_warn!(tx, DaemonMessage::CredentialRemoveFailed {
+            send_or_warn(tx, DaemonMessage::CredentialRemoveFailed {
                 service: svc,
                 error: format!("failed to unlock keystore: {e}"),
-            });
+            }).await;
         }
     }
     Ok(())

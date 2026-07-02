@@ -1,4 +1,4 @@
-use std::io;
+use crate::error::ClientError;
 use tai_proto::{ClientMessage, DaemonMessage, ImageMetadata, OutputStream, SessionMessage};
 
 pub trait DaemonMessageHandler {
@@ -13,15 +13,15 @@ pub trait DaemonMessageHandler {
     fn drop_request(&mut self, request_id: u32) {
         self.finalize_stream(request_id);
     }
-    fn handle_image_start(&mut self, request_id: u32, metadata: ImageMetadata) -> io::Result<()>;
-    fn handle_image_chunk(&mut self, request_id: u32, image_id: u32, data: &[u8]) -> io::Result<()>;
-    fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> io::Result<()>;
+    fn handle_image_start(&mut self, request_id: u32, metadata: ImageMetadata) -> Result<(), ClientError>;
+    fn handle_image_chunk(&mut self, request_id: u32, image_id: u32, data: &[u8]) -> Result<(), ClientError>;
+    fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError>;
 }
 
 pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
     handler: &mut H,
     message: DaemonMessage,
-) -> io::Result<Option<ClientMessage>> {
+) -> Result<Option<ClientMessage>, ClientError> {
     match message {
         DaemonMessage::SessionCreated { session_id, title } => {
             let label = title.unwrap_or_else(|| "untitled".to_string());
@@ -108,8 +108,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             stream,
             data,
         } => {
-            let text = String::from_utf8(data)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let text = String::from_utf8(data)?;
             handler.append_stream(request_id, stream, &text);
             Ok(None)
         }

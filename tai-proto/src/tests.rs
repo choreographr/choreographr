@@ -18,7 +18,7 @@ fn decode_rejects_trailing_bytes() {
     let mut frame = encode_frame(&message).expect("encode");
     frame.extend_from_slice(&[1, 2, 3]);
     let err = decode_frame::<ClientMessage>(&frame[4..]).expect_err("should fail");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(matches!(err, ProtoError::TrailingBytes));
 }
 
 #[test]
@@ -29,7 +29,7 @@ fn decode_rejects_wrong_version() {
     )
     .expect("encode");
     let err = decode_frame::<ClientMessage>(&payload).expect_err("should fail");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(matches!(err, ProtoError::UnsupportedVersion { .. }));
 }
 
 #[tokio::test]
@@ -69,7 +69,7 @@ async fn read_payload_rejects_oversized_frame() {
 
     let err = read_payload(&mut reader).await.expect_err("should fail");
     write_task.await.expect("join");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(matches!(err, ProtoError::FrameTooLarge));
 }
 
 #[test]
@@ -90,5 +90,5 @@ fn encode_rejects_oversized_message() {
         input: vec![0; MAX_FRAME_SIZE],
     };
     let err = encode_frame(&message).expect_err("should fail");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(matches!(err, ProtoError::FrameTooLarge));
 }

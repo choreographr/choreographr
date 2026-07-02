@@ -1,4 +1,4 @@
-use crate::tools::{ToolExecutionOutput, ToolResult};
+use crate::tools::{ToolExecutionOutput, tool_err, tool_ok, truncate_tool_output};
 use async_trait::async_trait;
 use rand::RngExt;
 use reqwest::Client;
@@ -215,10 +215,7 @@ impl super::Tool for XPost {
             Ok(v) => v,
             Err(e) => {
                 return ToolExecutionOutput {
-                    result: ToolResult {
-                        content: format!("invalid arguments: {e}"),
-                        is_error: true,
-                    },
+                    result: tool_err(format!("invalid arguments: {e}")),
                     image: None,
                 };
             }
@@ -227,10 +224,7 @@ impl super::Tool for XPost {
         let text = args["text"].as_str().unwrap_or_default();
         if text.is_empty() {
             return ToolExecutionOutput {
-                result: ToolResult {
-                    content: "text must not be empty".to_string(),
-                    is_error: true,
-                },
+                result: tool_err("text must not be empty"),
                 image: None,
             };
         }
@@ -244,20 +238,14 @@ impl super::Tool for XPost {
                     Err(_) => response,
                 };
                 ToolExecutionOutput {
-                    result: ToolResult {
-                        content: crate::tools::truncate_tool_output(&format!(
-                            "tweet posted successfully:\n{formatted}"
-                        )),
-                        is_error: false,
-                    },
+                    result: tool_ok(truncate_tool_output(&format!(
+                        "tweet posted successfully:\n{formatted}"
+                    ))),
                     image: None,
                 }
             }
             Err(e) => ToolExecutionOutput {
-                result: ToolResult {
-                    content: crate::tools::truncate_tool_output(&e),
-                    is_error: true,
-                },
+                result: tool_err(truncate_tool_output(&e)),
                 image: None,
             },
         }
@@ -298,10 +286,7 @@ impl super::Tool for XSearchRecent {
             Ok(v) => v,
             Err(e) => {
                 return ToolExecutionOutput {
-                    result: ToolResult {
-                        content: format!("invalid arguments: {e}"),
-                        is_error: true,
-                    },
+                    result: tool_err(format!("invalid arguments: {e}")),
                     image: None,
                 };
             }
@@ -310,10 +295,7 @@ impl super::Tool for XSearchRecent {
         let query = args["query"].as_str().unwrap_or_default();
         if query.is_empty() {
             return ToolExecutionOutput {
-                result: ToolResult {
-                    content: "query must not be empty".to_string(),
-                    is_error: true,
-                },
+                result: tool_err("query must not be empty"),
                 image: None,
             };
         }
@@ -337,20 +319,14 @@ impl super::Tool for XSearchRecent {
                     Err(_) => response,
                 };
                 ToolExecutionOutput {
-                    result: ToolResult {
-                        content: crate::tools::truncate_tool_output(&format!(
-                            "search results for '{query}':\n{formatted}"
-                        )),
-                        is_error: false,
-                    },
+                    result: tool_ok(truncate_tool_output(&format!(
+                        "search results for '{query}':\n{formatted}"
+                    ))),
                     image: None,
                 }
             }
             Err(e) => ToolExecutionOutput {
-                result: ToolResult {
-                    content: crate::tools::truncate_tool_output(&e),
-                    is_error: true,
-                },
+                result: tool_err(truncate_tool_output(&e)),
                 image: None,
             },
         }
@@ -387,10 +363,7 @@ impl super::Tool for XUserLookup {
             Ok(v) => v,
             Err(e) => {
                 return ToolExecutionOutput {
-                    result: ToolResult {
-                        content: format!("invalid arguments: {e}"),
-                        is_error: true,
-                    },
+                    result: tool_err(format!("invalid arguments: {e}")),
                     image: None,
                 };
             }
@@ -399,10 +372,7 @@ impl super::Tool for XUserLookup {
         let username = args["username"].as_str().unwrap_or_default();
         if username.is_empty() {
             return ToolExecutionOutput {
-                result: ToolResult {
-                    content: "username must not be empty".to_string(),
-                    is_error: true,
-                },
+                result: tool_err("username must not be empty"),
                 image: None,
             };
         }
@@ -416,20 +386,14 @@ impl super::Tool for XUserLookup {
                     Err(_) => response,
                 };
                 ToolExecutionOutput {
-                    result: ToolResult {
-                        content: crate::tools::truncate_tool_output(&format!(
-                            "user lookup for @{username}:\n{formatted}"
-                        )),
-                        is_error: false,
-                    },
+                    result: tool_ok(truncate_tool_output(&format!(
+                        "user lookup for @{username}:\n{formatted}"
+                    ))),
                     image: None,
                 }
             }
             Err(e) => ToolExecutionOutput {
-                result: ToolResult {
-                    content: crate::tools::truncate_tool_output(&e),
-                    is_error: true,
-                },
+                result: tool_err(truncate_tool_output(&e)),
                 image: None,
             },
         }

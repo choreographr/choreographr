@@ -1,4 +1,4 @@
-use super::{ToolResult, sha256_hex, truncate_tool_output};
+use super::{ToolError, ToolResult, tool_ok, truncate_tool_output};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -30,23 +30,23 @@ fn frecency_db_path(path_hash: &str) -> PathBuf {
     data_dir.join("fff").join(path_hash).join("frecency")
 }
 
-fn init_new_state(abs_path: &Path) -> std::result::Result<FffState, String> {
-    let path_str = abs_path.to_str().ok_or("non-utf8 path")?;
-    let hash = sha256_hex(path_str);
+fn init_new_state(abs_path: &Path) -> std::result::Result<FffState, ToolError> {
+    let path_str = abs_path.to_str().ok_or_else(|| ToolError::Other("non-utf8 path".to_string()))?;
+    let hash = super::sha256_hex(path_str);
     let frecency_path = frecency_db_path(&hash);
 
     std::fs::create_dir_all(&frecency_path)
-        .map_err(|e| format!("create frecency dir {}: {e}", frecency_path.display()))?;
+        .map_err(|e| ToolError::Other(format!("create frecency dir {}: {e}", frecency_path.display())))?;
 
     let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     let frecency = FrecencyTracker::open(&frecency_path)
-        .map_err(|e| format!("open frecency db: {e}"))?;
+        .map_err(|e| ToolError::Other(format!("open frecency db: {e}")))?;
 
     shared_frecency
         .init(frecency)
-        .map_err(|e| format!("init frecency: {e}"))?;
+        .map_err(|e| ToolError::Other(format!("init frecency: {e}")))?;
 
     FilePicker::new_with_shared_state(
         shared_picker.clone(),
@@ -58,21 +58,21 @@ fn init_new_state(abs_path: &Path) -> std::result::Result<FffState, String> {
             ..Default::default()
         },
     )
-    .map_err(|e| format!("create file picker: {e}"))?;
+    .map_err(|e| ToolError::Other(format!("create file picker: {e}")))?;
 
     shared_picker.wait_for_scan(Duration::from_secs(60));
 
     Ok(FffState { shared_picker, _shared_frecency: shared_frecency })
 }
 
-fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, String> {
+fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, ToolError> {
     static CACHE: OnceLock<RwLock<HashMap<PathBuf, Arc<FffState>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
 
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
 
     {
-        let guard = cache.read().map_err(|e| format!("cache lock: {e}"))?;
+        let guard = cache.read().map_err(|e| ToolError::Other(format!("cache lock: {e}")))?;
         if let Some(state) = guard.get(&abs) {
             return Ok(state.clone());
         }
@@ -81,7 +81,7 @@ fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, String> {
     let state = Arc::new(init_new_state(&abs)?);
     cache
         .write()
-        .map_err(|e| format!("cache lock: {e}"))?
+        .map_err(|e| ToolError::Other(format!("cache lock: {e}")))?
         .insert(abs, state.clone());
     Ok(state)
 }
@@ -125,46 +125,22 @@ define_tool!(Fff, "fff",
 );
 
 pub(crate) async fn execute_fff_tool(arguments_json: &str) -> ToolResult {
-    let args: FffArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => {
-            return ToolResult {
-                content: format!("invalid arguments: {e}"),
-                is_error: true,
-            }
-        }
-    };
+    match execute_fff_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_fff_inner(arguments_json: &str) -> std::result::Result<String, ToolError> {
+    let args: FffArgs = serde_json::from_str(arguments_json)?;
 
     let path = args.path.as_deref().unwrap_or(".");
-    let state = match get_or_init_state(path) {
-        Ok(s) => s,
-        Err(e) => {
-            return ToolResult {
-                content: e,
-                is_error: true,
-            }
-        }
-    };
+    let state = get_or_init_state(path)?;
 
-    let guard = match state.shared_picker.read() {
-        Ok(g) => g,
-        Err(e) => {
-            return ToolResult {
-                content: format!("picker lock error: {e}"),
-                is_error: true,
-            }
-        }
-    };
-    let picker = match guard.as_ref() {
-        Some(p) => p,
-        None => {
-            return ToolResult {
-                content: "fff picker not yet initialized (scan may still be in progress)"
-                    .to_string(),
-                is_error: true,
-            }
-        }
-    };
+    let guard = state.shared_picker.read()
+        .map_err(|e| ToolError::Other(format!("picker lock error: {e}")))?;
+    let picker = guard.as_ref()
+        .ok_or_else(|| ToolError::Other("fff picker not yet initialized (scan may still be in progress)".to_string()))?;
 
     let mode = args.mode.as_deref().unwrap_or("grep");
     let max_results = args.max_results.unwrap_or(50).min(100);
@@ -187,10 +163,7 @@ pub(crate) async fn execute_fff_tool(arguments_json: &str) -> ToolResult {
             );
 
             if result.items.is_empty() {
-                return ToolResult {
-                    content: String::new(),
-                    is_error: false,
-                };
+                return Ok(String::new());
             }
 
             let mut lines: Vec<String> = Vec::with_capacity(result.items.len());
@@ -198,10 +171,7 @@ pub(crate) async fn execute_fff_tool(arguments_json: &str) -> ToolResult {
                 lines.push(item.relative_path(picker));
             }
 
-            ToolResult {
-                content: truncate_tool_output(&lines.join("\n")),
-                is_error: false,
-            }
+            Ok(truncate_tool_output(&lines.join("\n")))
         }
         _ => {
             let parser = QueryParser::new(AiGrepConfig);
@@ -225,10 +195,7 @@ pub(crate) async fn execute_fff_tool(arguments_json: &str) -> ToolResult {
             );
 
             if result.matches.is_empty() {
-                return ToolResult {
-                    content: String::new(),
-                    is_error: false,
-                };
+                return Ok(String::new());
             }
 
             let mut lines: Vec<String> = Vec::with_capacity(result.matches.len());
@@ -243,10 +210,7 @@ pub(crate) async fn execute_fff_tool(arguments_json: &str) -> ToolResult {
                 }
             }
 
-            ToolResult {
-                content: truncate_tool_output(&lines.join("\n")),
-                is_error: false,
-            }
+            Ok(truncate_tool_output(&lines.join("\n")))
         }
     }
 }

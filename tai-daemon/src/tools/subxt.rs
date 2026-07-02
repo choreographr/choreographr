@@ -1,4 +1,4 @@
-use crate::{ToolResult, truncate_tool_output};
+use super::{ToolError, ToolResult, tool_ok, truncate_tool_output};
 use serde::Deserialize;
 use std::str::FromStr;
 use subxt::rpcs::RpcClient as SubxtRpcClient;
@@ -33,109 +33,108 @@ struct SubxtBlockArgs {
 }
 
 pub(crate) async fn execute_subxt_chain_tool(arguments_json: &str) -> ToolResult {
-    let args: WsUrlArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
+    match execute_subxt_chain_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_subxt_chain_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: WsUrlArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    map_result(subxt_chain_impl(&ws_url).await)
+    let output = subxt_chain_impl(&ws_url).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_subxt_balance_tool(arguments_json: &str) -> ToolResult {
-    let args: SubxtBalanceArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
+    match execute_subxt_balance_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_subxt_balance_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: SubxtBalanceArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    map_result(subxt_balance_impl(&ws_url, &args.address).await)
+    let output = subxt_balance_impl(&ws_url, &args.address).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_subxt_query_tool(arguments_json: &str) -> ToolResult {
-    let args: SubxtQueryArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
+    match execute_subxt_query_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_subxt_query_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: SubxtQueryArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    map_result(
-        subxt_query_impl(&ws_url, &args.pallet, &args.storage_item, args.key.as_deref()).await,
-    )
+    let output =
+        subxt_query_impl(&ws_url, &args.pallet, &args.storage_item, args.key.as_deref()).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_subxt_block_tool(arguments_json: &str) -> ToolResult {
-    let args: SubxtBlockArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
+    match execute_subxt_block_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_subxt_block_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: SubxtBlockArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    map_result(subxt_block_impl(&ws_url, args.block_number).await)
+    let output = subxt_block_impl(&ws_url, args.block_number).await?;
+    Ok(truncate_tool_output(&output))
 }
 
-fn invalid_arguments(error: serde_json::Error) -> ToolResult {
-    ToolResult {
-        content: format!("invalid arguments: {error}"),
-        is_error: true,
-    }
+fn subxt_err(e: impl std::fmt::Display) -> ToolError {
+    ToolError::Other(format!("subxt error: {e}"))
 }
 
-fn map_result(result: Result<String, String>) -> ToolResult {
-    match result {
-        Ok(content) => ToolResult {
-            content: truncate_tool_output(&content),
-            is_error: false,
-        },
-        Err(error) => ToolResult {
-            content: error,
-            is_error: true,
-        },
-    }
-}
-
-fn map_err(e: impl std::fmt::Display) -> String {
-    format!("subxt error: {e}")
-}
-
-async fn connect_client(ws_url: &str) -> Result<SubxtClient, String> {
+async fn connect_client(ws_url: &str) -> Result<SubxtClient, ToolError> {
     SubxtClient::from_insecure_url(ws_url)
         .await
-        .map_err(map_err)
+        .map_err(subxt_err)
 }
 
-async fn connect_rpc(ws_url: &str) -> Result<SubxtRpcClient, String> {
+async fn connect_rpc(ws_url: &str) -> Result<SubxtRpcClient, ToolError> {
     SubxtRpcClient::from_insecure_url(ws_url)
         .await
-        .map_err(map_err)
+        .map_err(subxt_err)
 }
 
-async fn subxt_chain_impl(ws_url: &str) -> Result<String, String> {
+async fn subxt_chain_impl(ws_url: &str) -> Result<String, ToolError> {
     let rpc = connect_rpc(ws_url).await?;
     let client = connect_client(ws_url).await?;
 
-    let chain: String = rpc.request("system_chain", subxt::rpcs::rpc_params![]).await.map_err(map_err)?;
-    let name: String = rpc.request("system_name", subxt::rpcs::rpc_params![]).await.map_err(map_err)?;
+    let chain: String = rpc.request("system_chain", subxt::rpcs::rpc_params![]).await.map_err(subxt_err)?;
+    let name: String = rpc.request("system_name", subxt::rpcs::rpc_params![]).await.map_err(subxt_err)?;
     let version: String = rpc
         .request("system_version", subxt::rpcs::rpc_params![])
         .await
-        .map_err(map_err)?;
+        .map_err(subxt_err)?;
     let chain_type: String = rpc
         .request("system_chainType", subxt::rpcs::rpc_params![])
         .await
-        .map_err(map_err)?;
+        .map_err(subxt_err)?;
     let props: serde_json::Value = rpc
         .request("system_properties", subxt::rpcs::rpc_params![])
         .await
-        .map_err(map_err)?;
+        .map_err(subxt_err)?;
     let health: serde_json::Value = rpc
         .request("system_health", subxt::rpcs::rpc_params![])
         .await
-        .map_err(map_err)?;
+        .map_err(subxt_err)?;
     let finalized_hash: String = rpc
         .request("chain_getFinalizedHead", subxt::rpcs::rpc_params![])
         .await
-        .map_err(map_err)?;
+        .map_err(subxt_err)?;
 
     let genesis_hash = client.genesis_hash();
 
-    let at = client.at_current_block().await.map_err(map_err)?;
+    let at = client.at_current_block().await.map_err(subxt_err)?;
     let best_number = at.block_number();
     let best_hash = at.block_hash();
 
@@ -152,12 +151,12 @@ async fn subxt_chain_impl(ws_url: &str) -> Result<String, String> {
     Ok(out)
 }
 
-async fn subxt_balance_impl(ws_url: &str, address: &str) -> Result<String, String> {
+async fn subxt_balance_impl(ws_url: &str, address: &str) -> Result<String, ToolError> {
     let account_id = subxt::utils::AccountId32::from_str(address)
-        .map_err(|e| format!("invalid SS58 address: {e}"))?;
+        .map_err(|e| ToolError::Other(format!("invalid SS58 address: {e}")))?;
 
     let client = connect_client(ws_url).await?;
-    let at = client.at_current_block().await.map_err(map_err)?;
+    let at = client.at_current_block().await.map_err(subxt_err)?;
 
     let addr = subxt::storage::dynamic("System", "Account");
     let key = subxt::dynamic::Value::from_bytes(account_id.0);
@@ -165,11 +164,11 @@ async fn subxt_balance_impl(ws_url: &str, address: &str) -> Result<String, Strin
         .storage()
         .try_fetch(addr, vec![key])
         .await
-        .map_err(map_err)?;
+        .map_err(subxt_err)?;
 
     match result {
         Some(storage_value) => {
-            let decoded: subxt::dynamic::Value = storage_value.decode().map_err(map_err)?;
+            let decoded: subxt::dynamic::Value = storage_value.decode().map_err(subxt_err)?;
             Ok(format_balance_value(&decoded, address))
         }
         None => Ok(format!("address {address}: account does not exist on chain")),
@@ -186,15 +185,15 @@ async fn subxt_query_impl(
     pallet: &str,
     storage_item: &str,
     key_hex: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, ToolError> {
     let client = connect_client(ws_url).await?;
-    let at = client.at_current_block().await.map_err(map_err)?;
+    let at = client.at_current_block().await.map_err(subxt_err)?;
 
     let addr = subxt::storage::dynamic(pallet, storage_item);
 
     let key_parts: Vec<subxt::dynamic::Value> = match key_hex {
         Some(hex) => {
-            let bytes = hex::decode(hex).map_err(|e| format!("invalid hex key: {e}"))?;
+            let bytes = hex::decode(hex).map_err(|e| ToolError::Other(format!("invalid hex key: {e}")))?;
             vec![subxt::dynamic::Value::from_bytes(bytes)]
         }
         None => vec![],
@@ -204,11 +203,11 @@ async fn subxt_query_impl(
         .storage()
         .try_fetch(addr, key_parts)
         .await
-        .map_err(map_err)?;
+        .map_err(subxt_err)?;
 
     match result {
         Some(storage_value) => {
-            let decoded: subxt::dynamic::Value = storage_value.decode().map_err(map_err)?;
+            let decoded: subxt::dynamic::Value = storage_value.decode().map_err(subxt_err)?;
             let json = serde_json::to_string_pretty(&decoded)
                 .unwrap_or_else(|_| format!("{decoded:?}"));
             Ok(json)
@@ -217,17 +216,17 @@ async fn subxt_query_impl(
     }
 }
 
-async fn subxt_block_impl(ws_url: &str, block_number: Option<u64>) -> Result<String, String> {
+async fn subxt_block_impl(ws_url: &str, block_number: Option<u64>) -> Result<String, ToolError> {
     let client = connect_client(ws_url).await?;
 
     let at = match block_number {
-        Some(num) => client.at_block(num).await.map_err(map_err)?,
-        None => client.at_current_block().await.map_err(map_err)?,
+        Some(num) => client.at_block(num).await.map_err(subxt_err)?,
+        None => client.at_current_block().await.map_err(subxt_err)?,
     };
 
     let number = at.block_number();
     let hash = at.block_hash();
-    let header = at.block_header().await.map_err(map_err)?;
+    let header = at.block_header().await.map_err(subxt_err)?;
     let spec_version = at.spec_version();
 
     let rpc = connect_rpc(ws_url).await?;
@@ -237,7 +236,7 @@ async fn subxt_block_impl(ws_url: &str, block_number: Option<u64>) -> Result<Str
             subxt::rpcs::rpc_params![serde_json::json!(format!("{hash:#x}"))],
         )
         .await
-        .map_err(map_err)?;
+        .map_err(subxt_err)?;
 
     let mut out = String::new();
     out.push_str(&format!("block: #{number} ({hash:#x})\n"));

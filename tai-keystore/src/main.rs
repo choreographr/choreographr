@@ -1,3 +1,4 @@
+use anyhow::{Context, bail};
 use std::io::{self, BufRead, Write};
 use tai_keystore::{Keystore, ServiceCredential, keystore_path};
 
@@ -15,41 +16,40 @@ fn prompt_passphrase(label: &str) -> io::Result<String> {
     prompt(&format!("{label} passphrase:"))
 }
 
-fn main() -> io::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("usage: tai-keystore <init|add|remove|list> [args...]");
-        std::process::exit(1);
+        bail!("usage: tai-keystore <init|add|remove|list> [args...]");
     }
 
-    let path = keystore_path()?;
+    let path = keystore_path().context("failed to determine keystore path")?;
 
     match args[1].as_str() {
         "init" => {
             if path.exists() {
                 eprintln!("keystore already exists at {}", path.display());
-                std::process::exit(1);
+                bail!("keystore already exists at {}", path.display());
             }
             let passphrase = prompt_passphrase("new")?;
             let passphrase2 = prompt_passphrase("confirm")?;
             if passphrase != passphrase2 {
-                eprintln!("passphrases do not match");
-                std::process::exit(1);
+                bail!("passphrases do not match");
             }
-            Keystore::init(&path, &passphrase)?;
+            Keystore::init(&path, &passphrase).context("failed to initialize keystore")?;
             println!("created encrypted keystore at {}", path.display());
         }
         "add" => {
             if args.len() < 4 {
                 eprintln!("usage: tai-keystore add <service> <type>");
                 eprintln!("  types: api_key, x");
-                std::process::exit(1);
+                bail!("missing arguments");
             }
             let service = args[2].clone();
             let cred_type = args[3].as_str();
             let passphrase = prompt_passphrase("keystore")?;
 
-            let mut keystore = Keystore::load(&path, &passphrase)?;
+            let mut keystore = Keystore::load(&path, &passphrase).context("failed to load keystore")?;
             match cred_type {
                 "api_key" => {
                     let key = prompt("API key:")?;
@@ -73,35 +73,35 @@ fn main() -> io::Result<()> {
                 other => {
                     eprintln!("unknown credential type: {other}");
                     eprintln!("  supported: api_key, x");
-                    std::process::exit(1);
+                    bail!("unknown credential type: {other}");
                 }
             }
-            keystore.save(&path, &passphrase)?;
+            keystore.save(&path, &passphrase).context("failed to save keystore")?;
             println!("added credential for service '{service}'");
         }
         "remove" => {
             if args.len() < 3 {
                 eprintln!("usage: tai-keystore remove <service>");
-                std::process::exit(1);
+                bail!("missing arguments");
             }
             let service = &args[2];
             let passphrase = prompt_passphrase("keystore")?;
-            let mut keystore = Keystore::load(&path, &passphrase)?;
+            let mut keystore = Keystore::load(&path, &passphrase).context("failed to load keystore")?;
             if keystore.remove(service) {
-                keystore.save(&path, &passphrase)?;
+                keystore.save(&path, &passphrase).context("failed to save keystore")?;
                 println!("removed credential for service '{service}'");
             } else {
                 eprintln!("service '{service}' not found");
-                std::process::exit(1);
+                bail!("service '{service}' not found");
             }
         }
         "list" => {
             if !path.exists() {
                 eprintln!("keystore does not exist, run 'tai-keystore init' first");
-                std::process::exit(1);
+                bail!("keystore does not exist");
             }
             let passphrase = prompt_passphrase("keystore")?;
-            let keystore = Keystore::load(&path, &passphrase)?;
+            let keystore = Keystore::load(&path, &passphrase).context("failed to load keystore")?;
             let mut names: Vec<&String> = keystore.service_names().collect();
             names.sort();
             if names.is_empty() {
@@ -116,7 +116,7 @@ fn main() -> io::Result<()> {
         other => {
             eprintln!("unknown command: {other}");
             eprintln!("usage: tai-keystore <init|add|remove|list> [args...]");
-            std::process::exit(1);
+            bail!("unknown command: {other}");
         }
     }
 

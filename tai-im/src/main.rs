@@ -1,6 +1,5 @@
+use anyhow::{Context, bail};
 use std::env;
-use std::io;
-use std::process;
 use tai_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
 use tokio::net::UnixStream;
 use tracing::{error, info};
@@ -10,7 +9,7 @@ mod bridge;
 mod telegram;
 
 #[tokio::main]
-async fn main() -> io::Result<()> {
+async fn main() -> anyhow::Result<()> {
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -24,14 +23,16 @@ async fn main() -> io::Result<()> {
         Some(p) => p.to_string(),
         None => {
             error!("usage: tai-im telegram");
-            process::exit(1);
+            bail!("usage: tai-im telegram");
         }
     };
 
     let unlock_passphrase = env::var("TAI_KEYSTORE_PASSPHRASE").ok();
 
     let path = socket_path();
-    let mut stream = UnixStream::connect(&path).await?;
+    let mut stream = UnixStream::connect(&path)
+        .await
+        .context("failed to connect to daemon")?;
 
     if let Some(ref passphrase) = unlock_passphrase {
         info!("unlocking daemon keystore");
@@ -41,22 +42,23 @@ async fn main() -> io::Result<()> {
                 passphrase: passphrase.clone(),
             },
         )
-        .await?;
+        .await
+        .context("failed to send unlock message")?;
         match read_message::<_, DaemonMessage>(&mut stream).await {
             Ok(DaemonMessage::Unlocked) => {
                 info!("daemon keystore unlocked");
             }
             Ok(DaemonMessage::LockedError { error: unlock_err }) => {
                 error!(%unlock_err, "unlock failed");
-                process::exit(1);
+                bail!("unlock failed: {unlock_err}");
             }
             Ok(other) => {
                 error!(?other, "unexpected response to unlock");
-                process::exit(1);
+                bail!("unexpected response to unlock: {other:?}");
             }
             Err(e) => {
                 error!(%e, "failed to read unlock response");
-                process::exit(1);
+                bail!("failed to read unlock response: {e}");
             }
         }
     }
@@ -68,7 +70,8 @@ async fn main() -> io::Result<()> {
             service: platform.clone(),
         },
     )
-    .await?;
+    .await
+    .context("failed to send credential request")?;
     match read_message::<_, DaemonMessage>(&mut stream).await {
         Ok(DaemonMessage::Credential {
             key: Some(bot_token),
@@ -79,19 +82,18 @@ async fn main() -> io::Result<()> {
         }
         Ok(DaemonMessage::Credential { key: None, .. }) => {
             if unlock_passphrase.is_none() {
-                error!("daemon is locked. unlock the daemon via TUI first, or set TAI_KEYSTORE_PASSPHRASE env var");
+                bail!("daemon is locked. unlock the daemon via TUI first, or set TAI_KEYSTORE_PASSPHRASE env var");
             } else {
-                error!("no '{platform}' credential found in keystore");
+                bail!("no '{platform}' credential found in keystore");
             }
-            process::exit(1);
         }
         Ok(other) => {
             error!(?other, "unexpected response to GetCredential");
-            process::exit(1);
+            bail!("unexpected response to GetCredential: {other:?}");
         }
         Err(e) => {
             error!(%e, "failed to read credential response");
-            process::exit(1);
+            bail!("failed to read credential response: {e}");
         }
     }
 
@@ -109,7 +111,7 @@ async fn run_platform(platform: &str, bot_token: String, stream: UnixStream) {
 
             if admin_ids.is_empty() {
                 error!("TAI_TELEGRAM_USER_IDS must be set to a comma-separated list of Telegram user IDs");
-                process::exit(1);
+                return;
             }
 
             let admin_count = admin_ids.len();
@@ -123,7 +125,7 @@ async fn run_platform(platform: &str, bot_token: String, stream: UnixStream) {
         }
         other => {
             error!(platform = %other, "unknown platform");
-            process::exit(1);
+            std::process::exit(1);
         }
     }
 }

@@ -108,7 +108,7 @@ fn image_assembler_tracks_lifecycle() {
 fn image_assembler_rejects_unknown_chunk() {
     let mut assembler = ImageAssembler::new();
     let error = assembler.push_chunk(1, 2, &[3]).expect_err("should fail");
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(matches!(error, ClientError::UnknownImage { image_id: 2, request_id: 1 }));
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn image_assembler_rejects_duplicate_start() {
 
     assembler.start(1, metadata.clone()).expect("first start");
     let error = assembler.start(1, metadata).expect_err("should fail");
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(matches!(error, ClientError::DuplicateImage { image_id: 2, request_id: 1 }));
 }
 
 #[test]
@@ -147,7 +147,7 @@ fn image_assembler_rejects_wrong_final_size() {
     assembler.push_chunk(1, 9, &[1, 2]).expect("chunk");
 
     let error = assembler.finish(1, 9).expect_err("should fail");
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(matches!(error, ClientError::ImageSizeMismatch { image_id: 9, request_id: 1, expected: 3, actual: 2 }));
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn image_assembler_drop_request_clears_pending_images() {
 
     assembler.drop_request(4);
     let error = assembler.finish(4, 7).expect_err("should fail");
-    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(matches!(error, ClientError::UnknownImage { image_id: 7, request_id: 4 }));
 }
 
 #[test]

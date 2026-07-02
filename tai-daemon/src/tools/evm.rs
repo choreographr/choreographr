@@ -1,4 +1,4 @@
-use crate::{ToolResult, truncate_tool_output};
+use super::{ToolError, ToolResult, tool_ok, truncate_tool_output};
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, Bytes};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -82,14 +82,14 @@ struct EvmResolveArgs {
     name_or_address: String,
 }
 
-fn connect(rpc_url: &str) -> Result<impl Provider, String> {
+fn connect(rpc_url: &str) -> Result<impl Provider, ToolError> {
     let url: Url = rpc_url
         .parse()
-        .map_err(|e: url::ParseError| format!("invalid RPC URL: {e}"))?;
+        .map_err(|e| ToolError::InvalidUrl(format!("invalid RPC URL: {e}")))?;
     Ok(ProviderBuilder::default().connect_http(url))
 }
 
-fn parse_block_tag(tag: &str) -> Result<BlockNumberOrTag, String> {
+fn parse_block_tag(tag: &str) -> Result<BlockNumberOrTag, ToolError> {
     match tag.to_lowercase().as_str() {
         "latest" => Ok(BlockNumberOrTag::Latest),
         "finalized" => Ok(BlockNumberOrTag::Finalized),
@@ -102,145 +102,171 @@ fn parse_block_tag(tag: &str) -> Result<BlockNumberOrTag, String> {
                 .or_else(|| hex_or_dec.strip_prefix("0X"))
             {
                 let n = u64::from_str_radix(hex, 16)
-                    .map_err(|e| format!("invalid hex block number: {e}"))?;
+                    .map_err(|e| ToolError::Other(format!("invalid hex block number: {e}")))?;
                 Ok(BlockNumberOrTag::Number(n))
             } else if let Ok(n) = hex_or_dec.parse::<u64>() {
                 Ok(BlockNumberOrTag::Number(n))
             } else {
-                Err(format!("invalid block tag: {tag}"))
+                Err(ToolError::Other(format!("invalid block tag: {tag}")))
             }
         }
     }
 }
 
-fn invalid_arguments(error: serde_json::Error) -> ToolResult {
-    ToolResult {
-        content: format!("invalid arguments: {error}"),
-        is_error: true,
-    }
-}
-
-fn map_result(result: Result<String, String>) -> ToolResult {
-    match result {
-        Ok(content) => ToolResult {
-            content: truncate_tool_output(&content),
-            is_error: false,
-        },
-        Err(error) => ToolResult {
-            content: error,
-            is_error: true,
-        },
-    }
-}
-
-fn map_err(e: impl std::fmt::Display) -> String {
-    format!("alloy error: {e}")
+fn alloy_err(e: impl std::fmt::Display) -> ToolError {
+    ToolError::Other(format!("alloy error: {e}"))
 }
 
 pub(crate) async fn execute_evm_chain_tool(arguments_json: &str) -> ToolResult {
-    let args: RpcUrlArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
-    map_result(evm_chain_impl(&args.rpc_url).await)
+    match execute_evm_chain_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_evm_chain_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: RpcUrlArgs = serde_json::from_str(arguments_json)?;
+    let output = evm_chain_impl(&args.rpc_url).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_evm_balance_tool(arguments_json: &str) -> ToolResult {
-    let args: EvmBalanceArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
-    map_result(evm_balance_impl(&args.rpc_url, &args.address).await)
+    match execute_evm_balance_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_evm_balance_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: EvmBalanceArgs = serde_json::from_str(arguments_json)?;
+    let output = evm_balance_impl(&args.rpc_url, &args.address).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_evm_token_balance_tool(arguments_json: &str) -> ToolResult {
-    let args: EvmTokenBalanceArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
-    map_result(
-        evm_token_balance_impl(&args.rpc_url, &args.token_address, &args.address).await,
-    )
+    match execute_evm_token_balance_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_evm_token_balance_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: EvmTokenBalanceArgs = serde_json::from_str(arguments_json)?;
+    let output =
+        evm_token_balance_impl(&args.rpc_url, &args.token_address, &args.address).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_evm_block_tool(arguments_json: &str) -> ToolResult {
-    let args: EvmBlockArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
-    map_result(evm_block_impl(&args.rpc_url, args.block_tag.as_deref()).await)
+    match execute_evm_block_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_evm_block_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: EvmBlockArgs = serde_json::from_str(arguments_json)?;
+    let output = evm_block_impl(&args.rpc_url, args.block_tag.as_deref()).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_evm_transaction_tool(arguments_json: &str) -> ToolResult {
-    let args: EvmTransactionArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
-    map_result(evm_transaction_impl(&args.rpc_url, &args.tx_hash).await)
+    match execute_evm_transaction_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_evm_transaction_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: EvmTransactionArgs = serde_json::from_str(arguments_json)?;
+    let output = evm_transaction_impl(&args.rpc_url, &args.tx_hash).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_evm_call_tool(arguments_json: &str) -> ToolResult {
-    let args: EvmCallArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
-    map_result(
-        evm_call_impl(&args.rpc_url, &args.to, &args.data, args.block_tag.as_deref()).await,
-    )
+    match execute_evm_call_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_evm_call_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: EvmCallArgs = serde_json::from_str(arguments_json)?;
+    let output =
+        evm_call_impl(&args.rpc_url, &args.to, &args.data, args.block_tag.as_deref()).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_evm_gas_tool(arguments_json: &str) -> ToolResult {
-    let args: RpcUrlArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
-    map_result(evm_gas_impl(&args.rpc_url).await)
+    match execute_evm_gas_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_evm_gas_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: RpcUrlArgs = serde_json::from_str(arguments_json)?;
+    let output = evm_gas_impl(&args.rpc_url).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_evm_logs_tool(arguments_json: &str) -> ToolResult {
-    let args: EvmLogsArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
-    map_result(
-        evm_logs_impl(
-            &args.rpc_url,
-            args.address.as_deref(),
-            args.topic0.as_deref(),
-            args.from_block.as_deref(),
-            args.to_block.as_deref(),
-        )
-        .await,
+    match execute_evm_logs_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_evm_logs_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: EvmLogsArgs = serde_json::from_str(arguments_json)?;
+    let output = evm_logs_impl(
+        &args.rpc_url,
+        args.address.as_deref(),
+        args.topic0.as_deref(),
+        args.from_block.as_deref(),
+        args.to_block.as_deref(),
     )
+    .await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_evm_nonce_tool(arguments_json: &str) -> ToolResult {
-    let args: EvmNonceArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
-    map_result(evm_nonce_impl(&args.rpc_url, &args.address).await)
+    match execute_evm_nonce_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
+}
+
+async fn execute_evm_nonce_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: EvmNonceArgs = serde_json::from_str(arguments_json)?;
+    let output = evm_nonce_impl(&args.rpc_url, &args.address).await?;
+    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) async fn execute_evm_resolve_tool(arguments_json: &str) -> ToolResult {
-    let args: EvmResolveArgs = match serde_json::from_str(arguments_json) {
-        Ok(a) => a,
-        Err(e) => return invalid_arguments(e),
-    };
-    map_result(evm_resolve_impl(&args.rpc_url, &args.name_or_address).await)
+    match execute_evm_resolve_inner(arguments_json).await {
+        Ok(content) => tool_ok(content),
+        Err(error) => error.into(),
+    }
 }
 
-async fn evm_chain_impl(rpc_url: &str) -> Result<String, String> {
+async fn execute_evm_resolve_inner(arguments_json: &str) -> Result<String, ToolError> {
+    let args: EvmResolveArgs = serde_json::from_str(arguments_json)?;
+    let output = evm_resolve_impl(&args.rpc_url, &args.name_or_address).await?;
+    Ok(truncate_tool_output(&output))
+}
+
+async fn evm_chain_impl(rpc_url: &str) -> Result<String, ToolError> {
     let provider = connect(rpc_url)?;
 
-    let chain_id = provider.get_chain_id().await.map_err(map_err)?;
-    let block_number = provider.get_block_number().await.map_err(map_err)?;
-    let gas_price = provider.get_gas_price().await.map_err(map_err)?;
-    let client_version = provider.get_client_version().await.map_err(map_err)?;
+    let chain_id = provider.get_chain_id().await.map_err(alloy_err)?;
+    let block_number = provider.get_block_number().await.map_err(alloy_err)?;
+    let gas_price = provider.get_gas_price().await.map_err(alloy_err)?;
+    let client_version = provider.get_client_version().await.map_err(alloy_err)?;
     let max_priority_fee = provider
         .get_max_priority_fee_per_gas()
         .await
-        .map_err(map_err)?;
+        .map_err(alloy_err)?;
 
     let mut out = String::new();
     out.push_str(&format!("chain_id: {chain_id}\n"));
@@ -251,12 +277,12 @@ async fn evm_chain_impl(rpc_url: &str) -> Result<String, String> {
     Ok(out)
 }
 
-async fn evm_balance_impl(rpc_url: &str, address_str: &str) -> Result<String, String> {
+async fn evm_balance_impl(rpc_url: &str, address_str: &str) -> Result<String, ToolError> {
     let provider = connect(rpc_url)?;
     let address =
-        Address::from_str(address_str).map_err(|e| format!("invalid address: {e}"))?;
+        Address::from_str(address_str).map_err(|e| ToolError::Other(format!("invalid address: {e}")))?;
 
-    let balance = provider.get_balance(address).await.map_err(map_err)?;
+    let balance = provider.get_balance(address).await.map_err(alloy_err)?;
 
     Ok(format!("address: {address_str}\nbalance: {balance} wei"))
 }
@@ -265,12 +291,12 @@ async fn evm_token_balance_impl(
     rpc_url: &str,
     token_address_str: &str,
     address_str: &str,
-) -> Result<String, String> {
+) -> Result<String, ToolError> {
     let provider = connect(rpc_url)?;
     let token_address = Address::from_str(token_address_str)
-        .map_err(|e| format!("invalid token address: {e}"))?;
+        .map_err(|e| ToolError::Other(format!("invalid token address: {e}")))?;
     let owner_address =
-        Address::from_str(address_str).map_err(|e| format!("invalid owner address: {e}"))?;
+        Address::from_str(address_str).map_err(|e| ToolError::Other(format!("invalid owner address: {e}")))?;
 
     let call = balanceOfCall {
         account: owner_address,
@@ -280,9 +306,9 @@ async fn evm_token_balance_impl(
         .with_to(token_address)
         .with_input(call_data);
 
-    let result: Bytes = provider.call(tx).await.map_err(map_err)?;
+    let result: Bytes = provider.call(tx).await.map_err(alloy_err)?;
     let return_data =
-        balanceOfCall::abi_decode_returns(&result).map_err(map_err)?;
+        balanceOfCall::abi_decode_returns(&result).map_err(alloy_err)?;
     let balance = return_data;
 
     let mut out = String::new();
@@ -304,7 +330,7 @@ async fn evm_token_balance_impl(
     Ok(out)
 }
 
-async fn evm_block_impl(rpc_url: &str, block_tag: Option<&str>) -> Result<String, String> {
+async fn evm_block_impl(rpc_url: &str, block_tag: Option<&str>) -> Result<String, ToolError> {
     let provider = connect(rpc_url)?;
 
     let block_num = match block_tag {
@@ -315,8 +341,8 @@ async fn evm_block_impl(rpc_url: &str, block_tag: Option<&str>) -> Result<String
     let block = provider
         .get_block_by_number(block_num)
         .await
-        .map_err(map_err)?
-        .ok_or("block not found")?;
+        .map_err(alloy_err)?
+        .ok_or_else(|| ToolError::Other("block not found".to_string()))?;
 
     let number = block.header.number;
     let hash = block.header.hash;
@@ -337,20 +363,20 @@ async fn evm_block_impl(rpc_url: &str, block_tag: Option<&str>) -> Result<String
     Ok(out)
 }
 
-async fn evm_transaction_impl(rpc_url: &str, tx_hash_str: &str) -> Result<String, String> {
+async fn evm_transaction_impl(rpc_url: &str, tx_hash_str: &str) -> Result<String, ToolError> {
     let provider = connect(rpc_url)?;
 
     let stripped = tx_hash_str
         .strip_prefix("0x")
         .or_else(|| tx_hash_str.strip_prefix("0X"))
         .unwrap_or(tx_hash_str);
-    let hash = B256::from_str(stripped).map_err(|e| format!("invalid tx hash: {e}"))?;
+    let hash = B256::from_str(stripped).map_err(|e| ToolError::Other(format!("invalid tx hash: {e}")))?;
 
     let receipt = provider
         .get_transaction_receipt(hash)
         .await
-        .map_err(map_err)?
-        .ok_or("transaction not found")?;
+        .map_err(alloy_err)?
+        .ok_or_else(|| ToolError::Other("transaction not found".to_string()))?;
 
     let tx_hash = receipt.transaction_hash;
     let block_number = receipt.block_number.unwrap_or(0);
@@ -379,21 +405,21 @@ async fn evm_call_impl(
     to_str: &str,
     data_str: &str,
     _block_tag: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, ToolError> {
     let provider = connect(rpc_url)?;
-    let to = Address::from_str(to_str).map_err(|e| format!("invalid 'to' address: {e}"))?;
+    let to = Address::from_str(to_str).map_err(|e| ToolError::Other(format!("invalid 'to' address: {e}")))?;
 
     let data_hex = data_str
         .strip_prefix("0x")
         .or_else(|| data_str.strip_prefix("0X"))
         .unwrap_or(data_str);
     let input_data =
-        hex::decode(data_hex).map_err(|e| format!("invalid hex data: {e}"))?;
+        hex::decode(data_hex).map_err(|e| ToolError::Other(format!("invalid hex data: {e}")))?;
     let tx = TransactionRequest::default()
         .with_to(to)
         .with_input(input_data);
 
-    let result: Bytes = provider.call(tx).await.map_err(map_err)?;
+    let result: Bytes = provider.call(tx).await.map_err(alloy_err)?;
 
     Ok(format!(
         "to: {to_str}\ndata: {data_str}\nresult: 0x{}",
@@ -401,18 +427,18 @@ async fn evm_call_impl(
     ))
 }
 
-async fn evm_gas_impl(rpc_url: &str) -> Result<String, String> {
+async fn evm_gas_impl(rpc_url: &str) -> Result<String, ToolError> {
     let provider = connect(rpc_url)?;
 
-    let gas_price = provider.get_gas_price().await.map_err(map_err)?;
+    let gas_price = provider.get_gas_price().await.map_err(alloy_err)?;
     let max_priority_fee = provider
         .get_max_priority_fee_per_gas()
         .await
-        .map_err(map_err)?;
+        .map_err(alloy_err)?;
     let estimation = provider
         .estimate_eip1559_fees()
         .await
-        .map_err(map_err)?;
+        .map_err(alloy_err)?;
 
     let mut out = String::new();
     out.push_str(&format!("gas_price: {gas_price} wei\n"));
@@ -434,21 +460,21 @@ async fn evm_logs_impl(
     topic0_str: Option<&str>,
     from_block_str: Option<&str>,
     to_block_str: Option<&str>,
-) -> Result<String, String> {
+) -> Result<String, ToolError> {
     let provider = connect(rpc_url)?;
 
     let mut filter = Filter::new();
 
     if let Some(addr) = address_str {
         let address =
-            Address::from_str(addr).map_err(|e| format!("invalid address: {e}"))?;
+            Address::from_str(addr).map_err(|e| ToolError::Other(format!("invalid address: {e}")))?;
         filter = filter.address(address);
     }
 
     if let Some(t0) = topic0_str {
         let stripped = t0.strip_prefix("0x").unwrap_or(t0);
         let topic =
-            B256::from_str(stripped).map_err(|e| format!("invalid topic0: {e}"))?;
+            B256::from_str(stripped).map_err(|e| ToolError::Other(format!("invalid topic0: {e}")))?;
         filter = filter.event_signature(topic);
     }
 
@@ -460,7 +486,7 @@ async fn evm_logs_impl(
         filter = filter.to_block(parse_block_tag(tb)?);
     }
 
-    let logs = provider.get_logs(&filter).await.map_err(map_err)?;
+    let logs = provider.get_logs(&filter).await.map_err(alloy_err)?;
 
     if logs.is_empty() {
         return Ok("no logs found for this filter".to_string());
@@ -483,22 +509,22 @@ async fn evm_logs_impl(
     Ok(out)
 }
 
-async fn evm_nonce_impl(rpc_url: &str, address_str: &str) -> Result<String, String> {
+async fn evm_nonce_impl(rpc_url: &str, address_str: &str) -> Result<String, ToolError> {
     let provider = connect(rpc_url)?;
     let address =
-        Address::from_str(address_str).map_err(|e| format!("invalid address: {e}"))?;
+        Address::from_str(address_str).map_err(|e| ToolError::Other(format!("invalid address: {e}")))?;
 
     let nonce = provider
         .get_transaction_count(address)
         .await
-        .map_err(map_err)?;
+        .map_err(alloy_err)?;
 
     Ok(format!(
         "address: {address_str}\ntransaction_count (nonce): {nonce}"
     ))
 }
 
-async fn evm_resolve_impl(rpc_url: &str, name_or_address: &str) -> Result<String, String> {
+async fn evm_resolve_impl(rpc_url: &str, name_or_address: &str) -> Result<String, ToolError> {
     let provider = connect(rpc_url)?;
 
     if name_or_address.ends_with(".eth") {
@@ -511,11 +537,11 @@ async fn evm_resolve_impl(rpc_url: &str, name_or_address: &str) -> Result<String
             .map_err(|_| format!("ENS resolution failed for {name_or_address}"));
         match result {
             Ok(addr) => Ok(format!("name: {name_or_address}\naddress: {addr:#x}")),
-            Err(e) => Err(e),
+            Err(e) => Err(ToolError::Other(e)),
         }
     } else {
         let address = Address::from_str(name_or_address)
-            .map_err(|e| format!("invalid address: {e}"))?;
+            .map_err(|e| ToolError::Other(format!("invalid address: {e}")))?;
         let result: Result<String, String> = provider
             .raw_request(
                 std::borrow::Cow::Borrowed("ens_reverse"),
@@ -525,7 +551,7 @@ async fn evm_resolve_impl(rpc_url: &str, name_or_address: &str) -> Result<String
             .map_err(|_| format!("reverse ENS lookup failed for {name_or_address}"));
         match result {
             Ok(name) => Ok(format!("address: {name_or_address}\nname: {name}")),
-            Err(e) => Err(e),
+            Err(e) => Err(ToolError::Other(e)),
         }
     }
 }
@@ -593,6 +619,7 @@ define_tool!(EvmResolve, "evm_resolve",
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::tool_err;
 
     #[test]
     fn test_parse_block_tag_latest() {
@@ -619,23 +646,24 @@ mod tests {
 
     #[test]
     fn test_invalid_arguments() {
-        let result = invalid_arguments(
+        let result: ToolResult = ToolError::InvalidArguments(
             serde_json::from_str::<serde_json::Value>("").unwrap_err(),
-        );
+        )
+        .into();
         assert!(result.is_error);
         assert!(result.content.contains("invalid arguments"));
     }
 
     #[test]
-    fn test_map_result_ok() {
-        let result = map_result(Ok("hello".to_string()));
+    fn test_tool_ok() {
+        let result = tool_ok("hello".to_string());
         assert!(!result.is_error);
         assert_eq!(result.content, "hello");
     }
 
     #[test]
-    fn test_map_result_err() {
-        let result = map_result(Err("oops".to_string()));
+    fn test_tool_err() {
+        let result = tool_err("oops");
         assert!(result.is_error);
         assert_eq!(result.content, "oops");
     }

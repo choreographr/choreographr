@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::io;
 use tai_client_core::{ImageAssembler, StreamingText};
 use tai_proto::{
-    ClientMessage, DaemonMessage, ImageMetadata, read_message, write_message,
+    ClientMessage, DaemonMessage, ImageMetadata, ProtoError, read_message, write_message,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -97,10 +96,10 @@ impl DaemonBridge {
                             }
                         }
                     }
-                    Err(e)
+                    Err(ProtoError::Io(e))
                         if matches!(
                             e.kind(),
-                            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
                         ) =>
                     {
                         error!(%e, "daemon disconnected");

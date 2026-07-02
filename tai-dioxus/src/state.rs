@@ -1,6 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use std::io;
-use tai_client_core::{ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem, StreamingText};
+use tai_client_core::{ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem, StreamingText};
 use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
 
 pub(crate) type StreamingEntry = StreamingText;
@@ -100,15 +99,15 @@ impl DaemonMessageHandler for AppState {
         self.client.pending_images.drop_request(request_id);
     }
 
-    fn handle_image_start(&mut self, request_id: u32, metadata: ImageMetadata) -> io::Result<()> {
+    fn handle_image_start(&mut self, request_id: u32, metadata: ImageMetadata) -> Result<(), ClientError> {
         self.client.start_image(request_id, metadata)
     }
 
-    fn handle_image_chunk(&mut self, request_id: u32, image_id: u32, data: &[u8]) -> io::Result<()> {
+    fn handle_image_chunk(&mut self, request_id: u32, image_id: u32, data: &[u8]) -> Result<(), ClientError> {
         self.client.push_image_chunk(request_id, image_id, data)
     }
 
-    fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> io::Result<()> {
+    fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError> {
         let (metadata, data) = self.client.finish_image(request_id, image_id)?;
         self.push_image(DisplayImage {
             data_url: format!("data:{};base64,{}", metadata.mime_type, BASE64.encode(data)),

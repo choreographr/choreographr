@@ -2,7 +2,7 @@ use crate::state::{AppState, UiEvent};
 use dioxus::prelude::*;
 use std::io;
 use tai_client_core::{
-    ShellCommand, dispatch_daemon_message, parse_input_line, run_daemon_connection,
+    ClientError, ShellCommand, dispatch_daemon_message, parse_input_line, run_daemon_connection,
     shell_command_echo,
 };
 use tai_proto::{ClientMessage, DaemonMessage};
@@ -24,7 +24,7 @@ pub(crate) async fn run_client(
     if result.is_ok() {
         let _ = ui_tx.send(UiEvent::ReaderClosed);
     }
-    result
+    result.map_err(io::Error::from)
 }
 
 pub(crate) fn submit_input(
@@ -80,7 +80,7 @@ pub(crate) fn apply_daemon_message(
     state: &mut AppState,
     message: DaemonMessage,
     daemon_tx: Option<UnboundedSender<ClientMessage>>,
-) -> io::Result<()> {
+) -> Result<(), ClientError> {
     let response = dispatch_daemon_message(state, message)?;
     if let Some(msg) = response
         && let Some(sender) = daemon_tx

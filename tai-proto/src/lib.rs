@@ -1,5 +1,8 @@
+mod error;
+
+pub use error::ProtoError;
+
 use serde::{Deserialize, Serialize};
-use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -237,16 +240,13 @@ pub enum DaemonMessage {
     },
 }
 
-pub fn encode_frame<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
+pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
     let payload =
         bincode::serde::encode_to_vec((PROTOCOL_VERSION, message), bincode::config::standard())
-            .map_err(io::Error::other)?;
+            .map_err(|e| ProtoError::Bincode(e.to_string()))?;
 
     if payload.len() > MAX_FRAME_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too large",
-        ));
+        return Err(ProtoError::FrameTooLarge);
     }
 
     let mut frame = Vec::with_capacity(4 + payload.len());
@@ -255,26 +255,20 @@ pub fn encode_frame<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
     Ok(frame)
 }
 
-pub fn decode_frame<T>(payload: &[u8]) -> io::Result<T>
+pub fn decode_frame<T>(payload: &[u8]) -> Result<T, ProtoError>
 where
     T: for<'de> Deserialize<'de>,
 {
     let ((version, message), consumed): ((u8, T), usize) =
         bincode::serde::decode_from_slice(payload, bincode::config::standard())
-            .map_err(io::Error::other)?;
+            .map_err(|e| ProtoError::Bincode(e.to_string()))?;
 
     if consumed != payload.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "trailing bytes in frame",
-        ));
+        return Err(ProtoError::TrailingBytes);
     }
 
     if version != PROTOCOL_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported protocol version: {version}"),
-        ));
+        return Err(ProtoError::UnsupportedVersion { version });
     }
 
     Ok(message)
@@ -284,16 +278,17 @@ pub fn socket_path() -> String {
     std::env::var(SOCKET_PATH_ENV).unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string())
 }
 
-pub async fn write_message<W, T>(writer: &mut W, message: &T) -> io::Result<()>
+pub async fn write_message<W, T>(writer: &mut W, message: &T) -> Result<(), ProtoError>
 where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
     let frame = encode_frame(message)?;
-    writer.write_all(&frame).await
+    writer.write_all(&frame).await?;
+    Ok(())
 }
 
-pub async fn read_message<R, T>(reader: &mut R) -> io::Result<T>
+pub async fn read_message<R, T>(reader: &mut R) -> Result<T, ProtoError>
 where
     R: AsyncRead + Unpin,
     T: for<'de> Deserialize<'de>,
@@ -302,7 +297,7 @@ where
     decode_frame(&payload)
 }
 
-pub async fn read_payload<R>(reader: &mut R) -> io::Result<Vec<u8>>
+pub async fn read_payload<R>(reader: &mut R) -> Result<Vec<u8>, ProtoError>
 where
     R: AsyncRead + Unpin,
 {
@@ -310,10 +305,7 @@ where
     reader.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_FRAME_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "frame too large",
-        ));
+        return Err(ProtoError::FrameTooLarge);
     }
 
     let mut payload = vec![0_u8; len];

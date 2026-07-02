@@ -1,4 +1,4 @@
-use super::{PreparedImage, Tool, ToolExecutionOutput, ToolResult};
+use super::{PreparedImage, Tool, ToolExecutionOutput, tool_err, tool_ok};
 use async_trait::async_trait;
 use crate::{SessionState, broadcast_to_session};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -24,43 +24,30 @@ const MAX_DISPLAY_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const SUPPORTED_IMAGE_MIME_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/svg+xml"];
 
 pub(crate) async fn execute_display_image_tool(arguments_json: &str) -> ToolExecutionOutput {
-    let args = match serde_json::from_str::<DisplayImageArgs>(arguments_json) {
-        Ok(args) => args,
-        Err(error) => {
-            return ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!("invalid arguments: {error}"),
-                    is_error: true,
-                },
-                image: None,
-            };
-        }
-    };
-
-    match prepare_image(args).await {
+    match prepare_image_result(arguments_json).await {
         Ok(image) => {
             let mime_type = image.mime_type.clone();
             let width = image.width;
             let height = image.height;
             let byte_len = image.data.len();
             ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!(
-                        "displayed image ({mime_type}, {width}x{height}, {byte_len} bytes)"
-                    ),
-                    is_error: false,
-                },
+                result: tool_ok(format!(
+                    "displayed image ({mime_type}, {width}x{height}, {byte_len} bytes)"
+                )),
                 image: Some(image),
             }
         }
         Err(error) => ToolExecutionOutput {
-            result: ToolResult {
-                content: error.to_string(),
-                is_error: true,
-            },
+            result: tool_err(error),
             image: None,
         },
     }
+}
+
+async fn prepare_image_result(arguments_json: &str) -> Result<PreparedImage, String> {
+    let args: DisplayImageArgs = serde_json::from_str(arguments_json)
+        .map_err(|e| format!("invalid arguments: {e}"))?;
+    prepare_image(args).await.map_err(|e| e.to_string())
 }
 
 async fn prepare_image(args: DisplayImageArgs) -> io::Result<PreparedImage> {

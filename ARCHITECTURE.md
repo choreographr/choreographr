@@ -115,6 +115,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 - Protocol version: `1`
 - Max frame size: 1 MiB
 - Framing functions: `encode_frame`, `decode_frame`, `read_message`, `write_message`
+- **Error type**: `ProtoError` (thiserror enum) — `Bincode`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io`
 
 
 ### `tai-keystore` — Credential storage
@@ -135,6 +136,7 @@ passphrase ──► argon2 KDF ──► 256-bit key ──► AES-256-GCM encr
 ```
 
 **Credential types:** `ApiKey` (OpenAI), `X` (Twitter OAuth 1.0a credentials)
+**Error type:** `KeystoreError` (thiserror enum) — `Io`, `TooShort`, `InvalidMagic`, `UnsupportedVersion`, `InvalidKeyLength`, `EncryptionFailed`, `DecryptionFailed`, `InvalidData`, `AlreadyExists`, `ConfigDirNotFound`
 
 **CLI binary (`tai-keystore`):** `init`, `add`, `remove`, `list` subcommands.
 Stored at `~/.config/tai-daemon/credentials.enc`. Override path via `TAI_KEYSTORE_PATH` env var.
@@ -153,6 +155,8 @@ Used by both `tai-tui` and `tai-dioxus`.
 | `markdown.rs` | Parses markdown into structured `MarkdownDocument` (paragraphs, headings, code blocks, lists, tables) via `pulldown-cmark`; `render_markdown_html()` sanitizes via `ammonia` |
 | `image.rs` | `ImageAssembler` reconstructs images from chunked stream protocol (`ImageStart` → `ImageChunk`* → `ImageEnd`), validating byte count |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text) |
+
+`DaemonMessageHandler` trait uses `ClientError` (thiserror enum) — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`.
 
 
 ### `tai-daemon` — Core server
@@ -503,6 +507,43 @@ cargo run -p tai-im -- telegram
 | `dioxus` | tai-dioxus | Desktop UI |
 | `image` + `resvg` | daemon, tai-tui | Image decoding, SVG rasterization |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
+| `thiserror` | proto, keystore, client-core, daemon | Structured library error types |
+| `anyhow` | daemon, tui, dioxus, im, keystore | Application error context & propagation |
+
+
+---
+
+## Error handling strategy
+
+### Library crates — `thiserror`
+
+Each library crate defines a structured error enum:
+
+| Crate | Error type | Key variants |
+|---|---|---|
+| `tai-proto` | `ProtoError` | `Bincode`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io` |
+| `tai-keystore` | `KeystoreError` | `Io`, `TooShort`, `InvalidMagic`, `DecryptionFailed`, `AlreadyExists`, `ConfigDirNotFound`, … |
+| `tai-client-core` | `ClientError` | `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch` |
+
+Every library error type implements `From<ErrorType> for io::Error` for backward compatibility
+with code that still uses `io::Result`. Binary crates convert library errors to `anyhow::Error`
+automatically via the blanket `From<E: Error> for anyhow::Error` impl.
+
+### Binary crates — `anyhow`
+
+All binary `main()` functions return `anyhow::Result<()>`. Key boundaries (socket bind,
+keystore load, config parse) use `.context()` to attach meaningful messages. Internal
+functions use domain error types (`io::Result`, `ProtoError`, etc.) and `?` auto-converts to
+`anyhow::Error`.
+
+The `send_or_warn` fire-and-forget broadcast helper uses `anyhow::Error` formatting for
+warning logs when a subscriber is disconnected.
+
+### Tool errors
+
+The `ToolError` enum (thiserror) covers common tool failure modes: invalid arguments, I/O
+errors, network failures, etc. Tools return `Result<String, ToolError>` and convert to
+`ToolResult` at the `Tool::execute()` boundary via `From<ToolError> for ToolResult`.
 | `gix` | daemon | Git operations |
 | `alloy` | daemon | EVM blockchain tools |
 | `subxt` | daemon | Substrate blockchain tools |

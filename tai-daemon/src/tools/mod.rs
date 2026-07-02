@@ -22,6 +22,9 @@ macro_rules! define_tool {
     };
 }
 
+mod error;
+pub(crate) use error::{ToolError, tool_err, tool_ok};
+
 mod fs;
 mod http;
 mod image;

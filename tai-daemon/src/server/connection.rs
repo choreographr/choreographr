@@ -2,7 +2,7 @@ use crate::server::handle_client_message;
 use crate::sessions::{default_session_id, update_subscription};
 use crate::DaemonState;
 use std::io;
-use tai_proto::{ClientMessage, DaemonMessage, read_message, write_message};
+use tai_proto::{ClientMessage, DaemonMessage, ProtoError, read_message, write_message};
 use tokio::{
     io::AsyncWriteExt,
     net::UnixStream,
@@ -10,7 +10,7 @@ use tokio::{
 };
 use tracing::{debug, error};
 
-pub async fn handle_client(stream: UnixStream, state: DaemonState) -> io::Result<()> {
+pub async fn handle_client(stream: UnixStream, state: DaemonState) -> anyhow::Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     let (tx, mut rx) = mpsc::channel::<DaemonMessage>(128);
     let client_id = {
@@ -32,7 +32,7 @@ pub async fn handle_client(stream: UnixStream, state: DaemonState) -> io::Result
             write_message(&mut writer, &message).await?;
         }
         debug!("writer task shutting down");
-        writer.shutdown().await
+        Ok::<(), ProtoError>(writer.shutdown().await.map_err(ProtoError::from)?)
     });
 
     loop {
@@ -48,7 +48,7 @@ pub async fn handle_client(stream: UnixStream, state: DaemonState) -> io::Result
                 )
                 .await?;
             }
-            Err(error)
+            Err(ProtoError::Io(error))
                 if matches!(
                     error.kind(),
                     io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
@@ -59,7 +59,7 @@ pub async fn handle_client(stream: UnixStream, state: DaemonState) -> io::Result
             }
             Err(error) => {
                 error!(error = %error, "failed to read client message");
-                return Err(error);
+                return Err(error.into());
             }
         }
     }
@@ -69,7 +69,7 @@ pub async fn handle_client(stream: UnixStream, state: DaemonState) -> io::Result
     writer_task.abort();
     match writer_task.await {
         Ok(Ok(())) => {}
-        Ok(Err(error))
+        Ok(Err(ProtoError::Io(error)))
             if matches!(
                 error.kind(),
                 io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
@@ -77,9 +77,9 @@ pub async fn handle_client(stream: UnixStream, state: DaemonState) -> io::Result
         {
             debug!(error = %error, "writer task ended after client disconnect");
         }
-        Ok(Err(error)) => return Err(error),
+        Ok(Err(error)) => return Err(error.into()),
         Err(error) if error.is_cancelled() => {}
-        Err(error) => return Err(io::Error::other(error)),
+        Err(error) => return Err(anyhow::Error::from(error)),
     }
     debug!("client handler finished");
     Ok(())

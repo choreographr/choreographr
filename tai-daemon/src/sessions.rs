@@ -1,5 +1,5 @@
 use crate::openai::OpenAiClient;
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use tai_keystore::Keystore;
 use tai_proto::{DaemonMessage, SessionMessage, SessionSummary};
 use tokio::{
@@ -176,7 +176,7 @@ pub(crate) async fn require_attached_session(
     state: &DaemonState,
     attached_session_id: Option<u64>,
     tx: &mpsc::Sender<DaemonMessage>,
-) -> io::Result<Option<(u64, Arc<Mutex<SessionState>>)>> {
+) -> anyhow::Result<Option<(u64, Arc<Mutex<SessionState>>)>> {
     let Some(session_id) = attached_session_id else {
         let _ = tx
             .send(DaemonMessage::SessionFailed {

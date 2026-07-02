@@ -1,8 +1,11 @@
 use crate::sessions::{SessionState, session_snapshot, update_subscription};
-use crate::server::send_or_warn;
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use tai_proto::DaemonMessage;
 use tokio::sync::{Mutex, mpsc};
+
+async fn send_or_warn(tx: &mpsc::Sender<DaemonMessage>, msg: DaemonMessage) {
+    crate::server::send_or_warn(tx, msg).await;
+}
 
 pub(crate) async fn handle_create_session(
     state: &crate::DaemonState,
@@ -10,7 +13,7 @@ pub(crate) async fn handle_create_session(
     client_id: u64,
     attached_session_id: &mut Option<u64>,
     title: Option<String>,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     let (session_id, session) = {
         let mut guard = state.lock().await;
         let session_id = guard.next_session_id;
@@ -34,13 +37,13 @@ pub(crate) async fn handle_create_session(
     )
     .await;
     *attached_session_id = Some(session_id);
-    send_or_warn!(tx, DaemonMessage::SessionCreated {
+    send_or_warn(tx, DaemonMessage::SessionCreated {
         session_id,
         title: title.clone(),
-    });
-    send_or_warn!(tx, DaemonMessage::SessionAttached { session_id });
+    }).await;
+    send_or_warn(tx, DaemonMessage::SessionAttached { session_id }).await;
     let snapshot = session_snapshot(session_id, &session).await;
-    send_or_warn!(tx, snapshot);
+    send_or_warn(tx, snapshot).await;
     Ok(())
 }
 
@@ -50,12 +53,12 @@ pub(crate) async fn handle_attach_session(
     client_id: u64,
     attached_session_id: &mut Option<u64>,
     session_id: u64,
-) -> io::Result<()> {
+) -> anyhow::Result<()> {
     let Some(session) = crate::sessions::session_by_id(state, session_id).await else {
-        send_or_warn!(tx, DaemonMessage::SessionFailed {
+        send_or_warn(tx, DaemonMessage::SessionFailed {
             operation: "attach_session".to_string(),
             error: format!("unknown session: {session_id}"),
-        });
+        }).await;
         return Ok(());
     };
     update_subscription(
@@ -67,8 +70,8 @@ pub(crate) async fn handle_attach_session(
     )
     .await;
     *attached_session_id = Some(session_id);
-    send_or_warn!(tx, DaemonMessage::SessionAttached { session_id });
+    send_or_warn(tx, DaemonMessage::SessionAttached { session_id }).await;
     let snapshot = session_snapshot(session_id, &session).await;
-    send_or_warn!(tx, snapshot);
+    send_or_warn(tx, snapshot).await;
     Ok(())
 }
