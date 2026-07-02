@@ -3,6 +3,9 @@ use tai_proto::{ClientMessage, DaemonMessage, ImageMetadata, OutputStream, Sessi
 
 pub trait DaemonMessageHandler {
     fn push_text(&mut self, text: String);
+    fn push_tool_text(&mut self, _request_id: u32, text: String) {
+        self.push_text(text);
+    }
     fn push_session_message(&mut self, message: SessionMessage);
     fn begin_stream(&mut self, request_id: u32);
     fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str);
@@ -70,9 +73,10 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             tool_name,
             arguments_json,
         } => {
-            handler.push_text(format!(
-                "[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"
-            ));
+            handler.push_tool_text(
+                request_id,
+                format!("[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"),
+            );
             Ok(None)
         }
         DaemonMessage::ToolCallFinished {
@@ -81,9 +85,10 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             tool_name,
             output,
         } => {
-            handler.push_text(format!(
-                "[{request_id}] tool {tool_name}#{call_id} ok: {output}"
-            ));
+            handler.push_tool_text(
+                request_id,
+                format!("[{request_id}] tool {tool_name}#{call_id} ok: {output}"),
+            );
             Ok(None)
         }
         DaemonMessage::ToolCallFailed {
@@ -92,9 +97,10 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             tool_name,
             error,
         } => {
-            handler.push_text(format!(
-                "[{request_id}] tool {tool_name}#{call_id} failed: {error}"
-            ));
+            handler.push_tool_text(
+                request_id,
+                format!("[{request_id}] tool {tool_name}#{call_id} failed: {error}"),
+            );
             Ok(None)
         }
         DaemonMessage::OutputChunk {

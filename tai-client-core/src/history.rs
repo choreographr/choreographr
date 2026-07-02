@@ -45,6 +45,21 @@ impl<TImage> ClientHistory<TImage> {
         self.trim_history();
     }
 
+    pub fn insert_text_before_stream(&mut self, request_id: u32, text: impl Into<String>) {
+        if let Some(&index) = self.in_progress.get(&request_id) {
+            self.history
+                .insert(index, HistoryItem::Text(text.into()));
+            for idx in self.in_progress.values_mut() {
+                if *idx >= index {
+                    *idx += 1;
+                }
+            }
+            self.trim_history();
+        } else {
+            self.push_text(text);
+        }
+    }
+
     pub fn begin_stream(&mut self, request_id: u32) {
         if self.in_progress.contains_key(&request_id) {
             return;

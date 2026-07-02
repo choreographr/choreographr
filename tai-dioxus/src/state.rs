@@ -76,6 +76,10 @@ impl DaemonMessageHandler for AppState {
         self.push_text(text);
     }
 
+    fn push_tool_text(&mut self, request_id: u32, text: String) {
+        self.client.insert_text_before_stream(request_id, text);
+    }
+
     fn push_session_message(&mut self, message: SessionMessage) {
         self.push_session_message(message);
     }

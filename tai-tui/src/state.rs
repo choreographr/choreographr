@@ -214,6 +214,18 @@ impl App {
         self.push_history_item(HistoryItem::Text(line.into()));
     }
 
+    pub(crate) fn push_tool_text(&mut self, request_id: u32, text: impl Into<String>) {
+        let text = text.into();
+        let item = HistoryItem::Text(text.clone());
+        let added_height = self.history_viewport.item_height(&item);
+        let trimmed_height = self.trimmed_height_on_append();
+        self.client.insert_text_before_stream(request_id, text);
+        self.history_scroll
+            .on_item_appended(added_height, self.max_scroll_offset());
+        self.account_for_trimmed_height(trimmed_height);
+        self.clamp_scroll_state();
+    }
+
     pub(crate) fn push_session_message(&mut self, message: SessionMessage) {
         self.push_history_item(HistoryItem::SessionMessage(message));
     }
@@ -308,6 +320,10 @@ impl App {
 impl DaemonMessageHandler for App {
     fn push_text(&mut self, text: String) {
         self.push_text(text);
+    }
+
+    fn push_tool_text(&mut self, request_id: u32, text: String) {
+        self.push_tool_text(request_id, text);
     }
 
     fn push_session_message(&mut self, message: SessionMessage) {
