@@ -32,9 +32,18 @@ fn App() -> Element {
         let _ = client_tx.send(ClientMessage::ListSessions);
         daemon_tx.set(Some(client_tx));
         events_rx.set(Some(ui_rx));
+        let reader_tx = ui_tx.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(error) = run_client(socket, client_rx, reader_tx.clone()).await {
+                let _ = reader_tx.send(UiEvent::ReaderFailed(error.to_string()));
+            }
+        });
+        let monitor_tx = ui_tx.clone();
         tokio::spawn(async move {
-            if let Err(error) = run_client(socket, client_rx, ui_tx.clone()).await {
-                let _ = ui_tx.send(UiEvent::ReaderFailed(error.to_string()));
+            if let Err(e) = handle.await && e.is_panic() {
+                let _ = monitor_tx.send(UiEvent::ReaderFailed(
+                    "client reader task panicked".to_string(),
+                ));
             }
         });
     });

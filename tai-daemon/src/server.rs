@@ -6,7 +6,7 @@ use crate::sessions::{
     session_snapshot, update_subscription,
 };
 use crate::tools::x;
-use std::{collections::HashMap, io, path::Path, sync::Arc};
+use std::{collections::HashMap, io, path::Path, sync::Arc, time::Duration};
 use tai_keystore::{Keystore, ServiceCredential, keystore_path};
 use tai_proto::{ClientMessage, DaemonMessage, SessionMessage, read_message, write_message};
 use tokio::{
@@ -14,8 +14,19 @@ use tokio::{
     net::{UnixListener, UnixStream},
     signal::unix::{signal, SignalKind},
     sync::{Mutex, mpsc},
+    task::JoinSet,
 };
 use tracing::{debug, error, info, warn};
+
+const REQUEST_TIMEOUT_SECS: u64 = 300;
+
+macro_rules! send_or_warn {
+    ($tx:expr, $msg:expr) => {
+        if let Err(e) = $tx.send($msg).await {
+            warn!(error = %e, "failed to send daemon message, client likely disconnected");
+        }
+    };
+}
 
 async fn wait_for_shutdown() {
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
@@ -26,6 +37,8 @@ async fn wait_for_shutdown() {
     }
 }
 
+const SHUTDOWN_DRAIN_SECS: u64 = 10;
+
 pub async fn run_server(socket_path: &str, state: DaemonState) -> io::Result<()> {
     if Path::new(socket_path).exists() {
         info!(%socket_path, "removing stale socket");
@@ -35,13 +48,15 @@ pub async fn run_server(socket_path: &str, state: DaemonState) -> io::Result<()>
     let listener = UnixListener::bind(socket_path)?;
     info!(%socket_path, "tai-daemon listening");
 
+    let mut client_handles = JoinSet::new();
+
     let result = loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 let (stream, _) = accept_result?;
                 debug!("accepted client connection");
                 let state = Arc::clone(&state);
-                tokio::spawn(async move {
+                client_handles.spawn(async move {
                     if let Err(error) = handle_client(stream, state).await {
                         error!(error = %error, "client error");
                     }
@@ -50,6 +65,24 @@ pub async fn run_server(socket_path: &str, state: DaemonState) -> io::Result<()>
             _ = wait_for_shutdown() => break Ok(()),
         }
     };
+
+    info!("draining active client connections ({}s timeout)...", SHUTDOWN_DRAIN_SECS);
+    let drained = tokio::time::timeout(
+        Duration::from_secs(SHUTDOWN_DRAIN_SECS),
+        async {
+            while let Some(result) = client_handles.join_next().await {
+                if let Err(e) = result && !e.is_cancelled() {
+                    warn!(error = %e, "client handler panicked during drain");
+                }
+            }
+        },
+    )
+    .await;
+
+    if drained.is_err() {
+        warn!("shutdown drain timed out, aborting remaining client handlers");
+        client_handles.abort_all();
+    }
 
     if Path::new(socket_path).exists() {
         info!(%socket_path, "removing socket");
@@ -70,11 +103,12 @@ async fn require_openai_client(
     match client {
         Some(c) => Ok(Some(c)),
         None => {
-            let _ = tx
-                .send(DaemonMessage::LockedError {
+            send_or_warn!(
+                tx,
+                DaemonMessage::LockedError {
                     error: "daemon is locked. use /unlock <passphrase> to unlock".to_string(),
-                })
-                .await;
+                }
+            );
             Ok(None)
         }
     }
@@ -137,28 +171,24 @@ pub async fn handle_client(
                         )
                         .await;
                         attached_session_id = Some(session_id);
-                        let _ = tx
-                            .send(DaemonMessage::SessionCreated {
+                        send_or_warn!(tx, DaemonMessage::SessionCreated {
                                 session_id,
                                 title: title.clone(),
-                            })
-                            .await;
-                        let _ = tx.send(DaemonMessage::SessionAttached { session_id }).await;
+                            });
+                        send_or_warn!(tx, DaemonMessage::SessionAttached { session_id });
                         let snapshot = session_snapshot(session_id, &session).await;
-                        let _ = tx.send(snapshot).await;
+                        send_or_warn!(tx, snapshot);
                     }
                     ClientMessage::ListSessions => {
                         let sessions = list_sessions(&state).await;
-                        let _ = tx.send(DaemonMessage::Sessions { sessions }).await;
+                        send_or_warn!(tx, DaemonMessage::Sessions { sessions });
                     }
                     ClientMessage::AttachSession { session_id } => {
                         let Some(session) = session_by_id(&state, session_id).await else {
-                            let _ = tx
-                                .send(DaemonMessage::SessionFailed {
+                            send_or_warn!(tx, DaemonMessage::SessionFailed {
                                     operation: "attach_session".to_string(),
                                     error: format!("unknown session: {session_id}"),
-                                })
-                                .await;
+                                });
                             continue;
                         };
                         update_subscription(
@@ -170,22 +200,20 @@ pub async fn handle_client(
                         )
                         .await;
                         attached_session_id = Some(session_id);
-                        let _ = tx.send(DaemonMessage::SessionAttached { session_id }).await;
+                        send_or_warn!(tx, DaemonMessage::SessionAttached { session_id });
                         let snapshot = session_snapshot(session_id, &session).await;
-                        let _ = tx.send(snapshot).await;
+                        send_or_warn!(tx, snapshot);
                     }
                     ClientMessage::GetSessionState { session_id } => {
                         let Some(session) = session_by_id(&state, session_id).await else {
-                            let _ = tx
-                                .send(DaemonMessage::SessionFailed {
+                            send_or_warn!(tx, DaemonMessage::SessionFailed {
                                     operation: "get_session_state".to_string(),
                                     error: format!("unknown session: {session_id}"),
-                                })
-                                .await;
+                                });
                             continue;
                         };
                         let snapshot = session_snapshot(session_id, &session).await;
-                        let _ = tx.send(snapshot).await;
+                        send_or_warn!(tx, snapshot);
                     }
                     ClientMessage::RunInput { request_id, input } => {
                         let Some((session_id, session)) =
@@ -197,13 +225,11 @@ pub async fn handle_client(
                         let text = String::from_utf8_lossy(&input).trim().to_string();
                         if text.is_empty() {
                             warn!(request_id, "request failed: empty input");
-                            let _ = tx.send(DaemonMessage::Started { request_id }).await;
-                            let _ = tx
-                                .send(DaemonMessage::Failed {
+                            send_or_warn!(tx, DaemonMessage::Started { request_id });
+                            send_or_warn!(tx, DaemonMessage::Failed {
                                     request_id,
                                     error: "empty input".to_string(),
-                                })
-                                .await;
+                                });
                             continue;
                         }
 
@@ -211,12 +237,10 @@ pub async fn handle_client(
                             let guard = state.lock().await;
                             guard.openai_client.as_ref().map(Arc::clone)
                         }) else {
-                            let _ = tx
-                                .send(DaemonMessage::LockedError {
+                            send_or_warn!(tx, DaemonMessage::LockedError {
                                     error: "daemon is locked. use /unlock <passphrase> to unlock"
                                         .to_string(),
-                                })
-                                .await;
+                                });
                             continue;
                         };
 
@@ -224,23 +248,19 @@ pub async fn handle_client(
                             let mut guard = session.lock().await;
                             if guard.active_requests.contains_key(&request_id) {
                                 warn!(request_id, session_id, "duplicate request id rejected");
-                                let _ = tx
-                                    .send(DaemonMessage::Failed {
+                                send_or_warn!(tx, DaemonMessage::Failed {
                                         request_id,
                                         error: "request id already active".to_string(),
-                                    })
-                                    .await;
+                                    });
                                 continue;
                             }
                             let Some(model) = guard.selected_model.clone() else {
                                 warn!(request_id, session_id, "request failed: no model selected");
-                                let _ = tx.send(DaemonMessage::Started { request_id }).await;
-                                let _ = tx
-                                    .send(DaemonMessage::Failed {
+                                send_or_warn!(tx, DaemonMessage::Started { request_id });
+                                send_or_warn!(tx, DaemonMessage::Failed {
                                         request_id,
                                         error: "no model selected".to_string(),
-                                    })
-                                    .await;
+                                    });
                                 continue;
                             };
                             let message = SessionMessage::UserText {
@@ -263,28 +283,56 @@ pub async fn handle_client(
                             )
                             .await;
 
-                            let result = match request_format {
-                                RequestFormat::Responses => {
-                                    execute_plain_request(
-                                        &client,
+                            let result = tokio::time::timeout(
+                                Duration::from_secs(REQUEST_TIMEOUT_SECS),
+                                async {
+                                    match request_format {
+                                        RequestFormat::Responses => {
+                                            execute_plain_request(
+                                                &client,
+                                                &session_clone,
+                                                &model,
+                                                request_id,
+                                            )
+                                            .await
+                                        }
+                                        RequestFormat::ChatCompletions => {
+                                            execute_chat_tool_request(
+                                                &client,
+                                                &session_clone,
+                                                &model,
+                                                request_id,
+                                            )
+                                            .await
+                                        }
+                                    }
+                                },
+                            )
+                            .await;
+
+                            let inner_result = match result {
+                                Ok(inner) => inner,
+                                Err(_elapsed) => {
+                                    warn!(request_id, session_id, "request timed out");
+                                    broadcast_to_session(
                                         &session_clone,
-                                        &model,
-                                        request_id,
+                                        DaemonMessage::Failed {
+                                            request_id,
+                                            error: format!("request timed out after {REQUEST_TIMEOUT_SECS}s"),
+                                        },
+                                        None,
                                     )
-                                    .await
-                                }
-                                RequestFormat::ChatCompletions => {
-                                    execute_chat_tool_request(
-                                        &client,
-                                        &session_clone,
-                                        &model,
-                                        request_id,
-                                    )
-                                    .await
+                                    .await;
+                                    session_clone
+                                        .lock()
+                                        .await
+                                        .active_requests
+                                        .remove(&request_id);
+                                    return;
                                 }
                             };
 
-                            match result {
+                            match inner_result {
                                 Ok(()) => {
                                     info!(request_id, session_id, "request completed");
                                     broadcast_to_session(
@@ -327,10 +375,10 @@ pub async fn handle_client(
                             continue;
                         };
                         info!(request_id, "sending demo image");
-                        let _ = tx.send(DaemonMessage::Started { request_id }).await;
+                        send_or_warn!(tx, DaemonMessage::Started { request_id });
                         match emit_demo_image(&tx, request_id, 1).await {
                             Ok(()) => {
-                                let _ = tx.send(DaemonMessage::Done { request_id }).await;
+                                send_or_warn!(tx, DaemonMessage::Done { request_id });
                             }
                             Err(_) => {
                                 warn!(
@@ -351,7 +399,7 @@ pub async fn handle_client(
                         {
                             info!(request_id, session_id, "cancelling active request");
                             active_request.handle.abort();
-                            let _ = tx.send(DaemonMessage::Cancelled { request_id }).await;
+                            send_or_warn!(tx, DaemonMessage::Cancelled { request_id });
                             broadcast_to_session(
                                 &session,
                                 DaemonMessage::Cancelled { request_id },
@@ -363,17 +411,15 @@ pub async fn handle_client(
                                 request_id,
                                 session_id, "cancel requested for inactive request"
                             );
-                            let _ = tx
-                                .send(DaemonMessage::Failed {
+                            send_or_warn!(tx, DaemonMessage::Failed {
                                     request_id,
                                     error: "request id not active".to_string(),
-                                })
-                                .await;
+                                });
                         }
                     }
                     ClientMessage::Ping => {
                         debug!("responding to ping");
-                        let _ = tx.send(DaemonMessage::Pong).await;
+                        send_or_warn!(tx, DaemonMessage::Pong);
                     }
                     ClientMessage::ListModels => {
                         let Some(client) = require_openai_client(&state, &tx).await? else {
@@ -390,19 +436,15 @@ pub async fn handle_client(
                         };
                         match client.validate_and_list_models().await {
                             Ok(models) => {
-                                let _ = tx
-                                    .send(DaemonMessage::Models {
+                                send_or_warn!(tx, DaemonMessage::Models {
                                         models,
                                         selected_model,
-                                    })
-                                    .await;
+                                    });
                             }
                             Err(error) => {
-                                let _ = tx
-                                    .send(DaemonMessage::ModelsFailed {
+                                send_or_warn!(tx, DaemonMessage::ModelsFailed {
                                         error: format!("failed to list models: {error}"),
-                                    })
-                                    .await;
+                                    });
                             }
                         }
                     }
@@ -428,21 +470,17 @@ pub async fn handle_client(
                                     )
                                     .await;
                                 } else {
-                                    let _ = tx
-                                        .send(DaemonMessage::ModelSelectionFailed {
+                                    send_or_warn!(tx, DaemonMessage::ModelSelectionFailed {
                                             model: model.clone(),
                                             error: format!("unknown model: {model}"),
-                                        })
-                                        .await;
+                                        });
                                 }
                             }
                             Err(error) => {
-                                let _ = tx
-                                    .send(DaemonMessage::ModelSelectionFailed {
+                                send_or_warn!(tx, DaemonMessage::ModelSelectionFailed {
                                         model,
                                         error: format!("failed to list models: {error}"),
-                                    })
-                                    .await;
+                                    });
                             }
                         }
                     }
@@ -450,20 +488,16 @@ pub async fn handle_client(
                         let ks_path = match keystore_path() {
                             Ok(p) => p,
                             Err(e) => {
-                                let _ = tx
-                                    .send(DaemonMessage::LockedError {
+                                send_or_warn!(tx, DaemonMessage::LockedError {
                                         error: format!("failed to determine keystore path: {e}"),
-                                    })
-                                    .await;
+                                    });
                                 continue;
                             }
                         };
                         if !ks_path.exists() {
-                            let _ = tx
-                                .send(DaemonMessage::LockedError {
+                            send_or_warn!(tx, DaemonMessage::LockedError {
                                     error: "keystore does not exist. run 'tai-keystore init' to create one.".to_string(),
-                                })
-                                .await;
+                                });
                             continue;
                         }
                         match Keystore::load(&ks_path, &passphrase) {
@@ -472,8 +506,13 @@ pub async fn handle_client(
                                 let mut guard = state.lock().await;
                                 match keystore.get_api_key("openai") {
                                     Some(api_key) => {
-                                        let service_config = load_service_config()
-                                            .unwrap_or_default();
+                                        let service_config = match load_service_config() {
+                                            Ok(cfg) => cfg,
+                                            Err(e) => {
+                                                warn!(error = %e, "failed to load service config, using defaults — check config.toml");
+                                                Default::default()
+                                            }
+                                        };
                                         match OpenAiClient::new(service_config, api_key.to_string()) {
                                             Ok(client) => {
                                                 guard.openai_client = Some(Arc::new(client));
@@ -482,34 +521,28 @@ pub async fn handle_client(
                                                 }
                                                 guard.keystore = Some(keystore);
                                                 drop(guard);
-                                                let _ = tx.send(DaemonMessage::Unlocked).await;
+                                                send_or_warn!(tx, DaemonMessage::Unlocked);
                                             }
                                             Err(e) => {
                                                 drop(guard);
-                                                let _ = tx
-                                                    .send(DaemonMessage::LockedError {
+                                                send_or_warn!(tx, DaemonMessage::LockedError {
                                                         error: format!("failed to create OpenAI client: {e}"),
-                                                    })
-                                                    .await;
+                                                    });
                                             }
                                         }
                                     }
                                     None => {
                                         drop(guard);
-                                        let _ = tx
-                                            .send(DaemonMessage::LockedError {
+                                        send_or_warn!(tx, DaemonMessage::LockedError {
                                                 error: "no 'openai' credential found in keystore".to_string(),
-                                            })
-                                            .await;
+                                            });
                                     }
                                 }
                             }
                             Err(e) => {
-                                let _ = tx
-                                    .send(DaemonMessage::LockedError {
+                                send_or_warn!(tx, DaemonMessage::LockedError {
                                         error: format!("failed to unlock keystore: {e}"),
-                                    })
-                                    .await;
+                                    });
                             }
                         }
                     }
@@ -519,7 +552,7 @@ pub async fn handle_client(
                         guard.keystore = None;
                         drop(guard);
                         x::clear_x_credentials();
-                        let _ = tx.send(DaemonMessage::Locked).await;
+                        send_or_warn!(tx, DaemonMessage::Locked);
                     }
                     ClientMessage::GetCredential { service } => {
                         let key = {
@@ -527,17 +560,17 @@ pub async fn handle_client(
                             guard.keystore.as_ref()
                                 .and_then(|ks| ks.get_api_key(&service).map(|k| k.to_string()))
                         };
-                        let _ = tx.send(DaemonMessage::Credential { service, key }).await;
+                        send_or_warn!(tx, DaemonMessage::Credential { service, key });
                     }
                     ClientMessage::AddApiKey { service, passphrase, key } => {
                         let svc = service.clone();
                         let ks_path = match keystore_path() {
                             Ok(p) => p,
                             Err(e) => {
-                                let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                send_or_warn!(tx, DaemonMessage::CredentialAddFailed {
                                     service: svc,
                                     error: format!("failed to determine keystore path: {e}"),
-                                }).await;
+                                });
                                 continue;
                             }
                         };
@@ -546,21 +579,21 @@ pub async fn handle_client(
                                 keystore.add(svc.clone(), ServiceCredential::ApiKey { key });
                                 match keystore.save(&ks_path, &passphrase) {
                                     Ok(()) => {
-                                        let _ = tx.send(DaemonMessage::CredentialAdded { service }).await;
+                                        send_or_warn!(tx, DaemonMessage::CredentialAdded { service });
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                        send_or_warn!(tx, DaemonMessage::CredentialAddFailed {
                                             service: svc,
                                             error: format!("failed to save keystore: {e}"),
-                                        }).await;
+                                        });
                                     }
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                send_or_warn!(tx, DaemonMessage::CredentialAddFailed {
                                     service: svc,
                                     error: format!("failed to unlock keystore: {e}"),
-                                }).await;
+                                });
                             }
                         }
                     }
@@ -569,10 +602,10 @@ pub async fn handle_client(
                         let ks_path = match keystore_path() {
                             Ok(p) => p,
                             Err(e) => {
-                                let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                send_or_warn!(tx, DaemonMessage::CredentialAddFailed {
                                     service: svc,
                                     error: format!("failed to determine keystore path: {e}"),
-                                }).await;
+                                });
                                 continue;
                             }
                         };
@@ -587,21 +620,21 @@ pub async fn handle_client(
                                 });
                                 match keystore.save(&ks_path, &passphrase) {
                                     Ok(()) => {
-                                        let _ = tx.send(DaemonMessage::CredentialAdded { service }).await;
+                                        send_or_warn!(tx, DaemonMessage::CredentialAdded { service });
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                        send_or_warn!(tx, DaemonMessage::CredentialAddFailed {
                                             service: svc,
                                             error: format!("failed to save keystore: {e}"),
-                                        }).await;
+                                        });
                                     }
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.send(DaemonMessage::CredentialAddFailed {
+                                send_or_warn!(tx, DaemonMessage::CredentialAddFailed {
                                     service: svc,
                                     error: format!("failed to unlock keystore: {e}"),
-                                }).await;
+                                });
                             }
                         }
                     }
@@ -610,10 +643,10 @@ pub async fn handle_client(
                         let ks_path = match keystore_path() {
                             Ok(p) => p,
                             Err(e) => {
-                                let _ = tx.send(DaemonMessage::CredentialRemoveFailed {
+                                send_or_warn!(tx, DaemonMessage::CredentialRemoveFailed {
                                     service: svc,
                                     error: format!("failed to determine keystore path: {e}"),
-                                }).await;
+                                });
                                 continue;
                             }
                         };
@@ -622,27 +655,27 @@ pub async fn handle_client(
                                 if keystore.remove(&svc) {
                                     match keystore.save(&ks_path, &passphrase) {
                                         Ok(()) => {
-                                            let _ = tx.send(DaemonMessage::CredentialRemoved { service }).await;
+                                            send_or_warn!(tx, DaemonMessage::CredentialRemoved { service });
                                         }
                                         Err(e) => {
-                                            let _ = tx.send(DaemonMessage::CredentialRemoveFailed {
+                                            send_or_warn!(tx, DaemonMessage::CredentialRemoveFailed {
                                                 service: svc,
                                                 error: format!("failed to save keystore: {e}"),
-                                            }).await;
+                                            });
                                         }
                                     }
                                 } else {
-                                    let _ = tx.send(DaemonMessage::CredentialRemoveFailed {
+                                    send_or_warn!(tx, DaemonMessage::CredentialRemoveFailed {
                                         service: svc,
                                         error: "service not found in keystore".to_string(),
-                                    }).await;
+                                    });
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.send(DaemonMessage::CredentialRemoveFailed {
+                                send_or_warn!(tx, DaemonMessage::CredentialRemoveFailed {
                                     service: svc,
                                     error: format!("failed to unlock keystore: {e}"),
-                                }).await;
+                                });
                             }
                         }
                     }

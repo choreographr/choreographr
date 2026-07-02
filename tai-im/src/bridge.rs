@@ -229,7 +229,21 @@ fn daemon_to_bridge_events(
         | DaemonMessage::ModelSelectionFailed { error, .. } => {
             events.push(BridgeEvent::Error(error));
         }
-        _ => {}
+        DaemonMessage::Started { .. } => {
+            debug!("bridge ignoring Started event");
+        }
+        DaemonMessage::SessionCreated { .. }
+        | DaemonMessage::Sessions { .. }
+        | DaemonMessage::SessionAttached { .. }
+        | DaemonMessage::SessionState { .. }
+        | DaemonMessage::SessionMessageAppended { .. }
+        | DaemonMessage::CredentialAdded { .. }
+        | DaemonMessage::CredentialAddFailed { .. }
+        | DaemonMessage::CredentialRemoved { .. }
+        | DaemonMessage::CredentialRemoveFailed { .. }
+        | DaemonMessage::Credential { .. } => {
+            warn!(?msg, "unhandled daemon message variant in bridge");
+        }
     }
 
     events

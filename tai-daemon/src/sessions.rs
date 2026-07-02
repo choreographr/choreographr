@@ -6,6 +6,7 @@ use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
 };
+use tracing::warn;
 
 pub(crate) struct ActiveRequest {
     pub(crate) handle: JoinHandle<()>,
@@ -97,7 +98,9 @@ pub(crate) async fn broadcast_to_session(
             .collect::<Vec<_>>()
     };
     for tx in subscribers {
-        let _ = tx.send(message.clone()).await;
+        if let Err(e) = tx.send(message.clone()).await {
+            warn!(error = %e, "failed to send broadcast message, subscriber disconnected");
+        }
     }
 }
 
@@ -116,11 +119,14 @@ pub(crate) async fn broadcast_message_appended(
             .collect::<Vec<_>>()
     };
     for tx in subscribers {
-        let _ = tx
+        if let Err(e) = tx
             .send(DaemonMessage::SessionMessageAppended {
                 message: message.clone(),
             })
-            .await;
+            .await
+        {
+            warn!(error = %e, "failed to send broadcast message_appended, subscriber disconnected");
+        }
     }
 }
 
