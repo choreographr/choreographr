@@ -503,246 +503,156 @@ fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) ->
     )
 }
 
-pub(crate) struct ReadFile;
+define_tool!(ReadFile, "read_file",
+    "Read a UTF-8 text file from the local workspace.",
+    execute_read_file_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative or absolute path to a text file"
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    })
+);
 
-#[async_trait::async_trait]
-impl super::Tool for ReadFile {
-    fn name(&self) -> &'static str {
-        "read_file"
-    }
-    fn description(&self) -> &'static str {
-        "Read a UTF-8 text file from the local workspace."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative or absolute path to a text file"
-                }
+define_tool!(ReadFileRange, "read_file_range",
+    "Read a line range from a UTF-8 text file in the local workspace.",
+    execute_read_file_range_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative or absolute path to a text file"
             },
-            "required": ["path"],
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> super::ToolExecutionOutput {
-        super::ToolExecutionOutput {
-            result: execute_read_file_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
-
-pub(crate) struct ReadFileRange;
-
-#[async_trait::async_trait]
-impl super::Tool for ReadFileRange {
-    fn name(&self) -> &'static str {
-        "read_file_range"
-    }
-    fn description(&self) -> &'static str {
-        "Read a line range from a UTF-8 text file in the local workspace."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative or absolute path to a text file"
-                },
-                "start_line": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "1-based inclusive start line"
-                },
-                "max_lines": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 200,
-                    "description": "Maximum number of lines to return"
-                }
+            "start_line": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based inclusive start line"
             },
-            "required": ["path", "start_line", "max_lines"],
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> super::ToolExecutionOutput {
-        super::ToolExecutionOutput {
-            result: execute_read_file_range_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
+            "max_lines": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": "Maximum number of lines to return"
+            }
+        },
+        "required": ["path", "start_line", "max_lines"],
+        "additionalProperties": false
+    })
+);
 
-pub(crate) struct ListFiles;
+define_tool!(ListFiles, "list_files",
+    "List files in a local directory.",
+    execute_list_files_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative or absolute path to a directory",
+                "default": "."
+            }
+        },
+        "additionalProperties": false
+    })
+);
 
-#[async_trait::async_trait]
-impl super::Tool for ListFiles {
-    fn name(&self) -> &'static str {
-        "list_files"
-    }
-    fn description(&self) -> &'static str {
-        "List files in a local directory."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative or absolute path to a directory",
-                    "default": "."
-                }
+define_tool!(LineCount, "line_count",
+    "Count the number of lines in a UTF-8 text file.",
+    execute_line_count_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative or absolute path to a text file"
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    })
+);
+
+define_tool!(WriteFile, "write_file",
+    "Write a UTF-8 text file to the local workspace.",
+    execute_write_file_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative or absolute path to the file to write"
             },
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> super::ToolExecutionOutput {
-        super::ToolExecutionOutput {
-            result: execute_list_files_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
-
-pub(crate) struct LineCount;
-
-#[async_trait::async_trait]
-impl super::Tool for LineCount {
-    fn name(&self) -> &'static str {
-        "line_count"
-    }
-    fn description(&self) -> &'static str {
-        "Count the number of lines in a UTF-8 text file."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative or absolute path to a text file"
-                }
+            "content": {
+                "type": "string",
+                "description": "Full UTF-8 file contents to write"
             },
-            "required": ["path"],
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> super::ToolExecutionOutput {
-        super::ToolExecutionOutput {
-            result: execute_line_count_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
-
-pub(crate) struct WriteFile;
-
-#[async_trait::async_trait]
-impl super::Tool for WriteFile {
-    fn name(&self) -> &'static str {
-        "write_file"
-    }
-    fn description(&self) -> &'static str {
-        "Write a UTF-8 text file to the local workspace."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative or absolute path to the file to write"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full UTF-8 file contents to write"
-                },
-                "overwrite": {
-                    "type": "boolean",
-                    "description": "Whether to overwrite an existing file",
-                    "default": true
-                },
-                "create_parents": {
-                    "type": "boolean",
-                    "description": "Whether to create missing parent directories",
-                    "default": true
-                }
+            "overwrite": {
+                "type": "boolean",
+                "description": "Whether to overwrite an existing file",
+                "default": true
             },
-            "required": ["path", "content"],
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> super::ToolExecutionOutput {
-        super::ToolExecutionOutput {
-            result: execute_write_file_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
+            "create_parents": {
+                "type": "boolean",
+                "description": "Whether to create missing parent directories",
+                "default": true
+            }
+        },
+        "required": ["path", "content"],
+        "additionalProperties": false
+    })
+);
 
-pub(crate) struct EditFile;
-
-#[async_trait::async_trait]
-impl super::Tool for EditFile {
-    fn name(&self) -> &'static str {
-        "edit_file"
-    }
-    fn description(&self) -> &'static str {
-        "Edit a UTF-8 text file by applying one or more exact text replacements. Each edit must match at least once; non-replace_all edits must match exactly once."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Relative or absolute path to the file to edit"
-                },
-                "edits": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "old_text": {
-                                "type": "string",
-                                "description": "Exact text to replace"
-                            },
-                            "new_text": {
-                                "type": "string",
-                                "description": "Replacement text"
-                            },
-                            "replace_all": {
-                                "type": "boolean",
-                                "description": "When true, replace all exact matches instead of requiring exactly one match",
-                                "default": false
-                            }
+define_tool!(EditFile, "edit_file",
+    "Edit a UTF-8 text file by applying one or more exact text replacements. Each edit must match at least once; non-replace_all edits must match exactly once.",
+    execute_edit_file_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative or absolute path to the file to edit"
+            },
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_text": {
+                            "type": "string",
+                            "description": "Exact text to replace"
                         },
-                        "required": ["old_text", "new_text"],
-                        "additionalProperties": false
-                    }
-                },
-                "expected_sha256": {
-                    "type": "string",
-                    "description": "Optional lowercase hex SHA-256 of the file before editing"
-                },
-                "dry_run": {
-                    "type": "boolean",
-                    "description": "When true, validate and preview the edit without writing the file",
-                    "default": false
+                        "new_text": {
+                            "type": "string",
+                            "description": "Replacement text"
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "When true, replace all exact matches instead of requiring exactly one match",
+                            "default": false
+                        }
+                    },
+                    "required": ["old_text", "new_text"],
+                    "additionalProperties": false
                 }
             },
-            "required": ["path", "edits"],
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> super::ToolExecutionOutput {
-        super::ToolExecutionOutput {
-            result: execute_edit_file_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
+            "expected_sha256": {
+                "type": "string",
+                "description": "Optional lowercase hex SHA-256 of the file before editing"
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "When true, validate and preview the edit without writing the file",
+                "default": false
+            }
+        },
+        "required": ["path", "edits"],
+        "additionalProperties": false
+    })
+);

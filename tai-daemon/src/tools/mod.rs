@@ -3,6 +3,25 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
+#[macro_export]
+macro_rules! define_tool {
+    ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr) => {
+        pub(crate) struct $struct;
+        #[::async_trait::async_trait]
+        impl super::Tool for $struct {
+            fn name(&self) -> &'static str { $name }
+            fn description(&self) -> &'static str { $desc }
+            fn schema(&self) -> serde_json::Value { $schema }
+            async fn execute(&self, args: &str) -> super::ToolExecutionOutput {
+                super::ToolExecutionOutput {
+                    result: $exec_fn(args).await,
+                    image: None,
+                }
+            }
+        }
+    };
+}
+
 mod fs;
 mod http;
 mod image;

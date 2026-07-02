@@ -1,5 +1,4 @@
-use crate::{Tool, ToolExecutionOutput, ToolResult, truncate_tool_output};
-use async_trait::async_trait;
+use crate::{ToolResult, truncate_tool_output};
 use serde::Deserialize;
 use std::str::FromStr;
 use subxt::rpcs::RpcClient as SubxtRpcClient;
@@ -263,148 +262,88 @@ async fn subxt_block_impl(ws_url: &str, block_number: Option<u64>) -> Result<Str
     Ok(out)
 }
 
-pub(crate) struct SubxtChain;
+define_tool!(SubxtChain, "subxt_chain",
+    "Query information about a Substrate/Polkadot blockchain node: chain name, chain type, node name/version, genesis hash, best block, finalized head, system properties, and health.",
+    execute_subxt_chain_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "ws_url": {
+                "type": "string",
+                "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
+                "default": "wss://rpc.polkadot.io"
+            }
+        },
+        "additionalProperties": false
+    })
+);
 
-#[async_trait]
-impl Tool for SubxtChain {
-    fn name(&self) -> &'static str {
-        "subxt_chain"
-    }
-    fn description(&self) -> &'static str {
-        "Query information about a Substrate/Polkadot blockchain node: chain name, chain type, node name/version, genesis hash, best block, finalized head, system properties, and health."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "ws_url": {
-                    "type": "string",
-                    "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
-                    "default": "wss://rpc.polkadot.io"
-                }
+define_tool!(SubxtBalance, "subxt_balance",
+    "Query the balance of an account on a Substrate/Polkadot blockchain. Returns the System.Account info (free, reserved, frozen balances).",
+    execute_subxt_balance_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "address": {
+                "type": "string",
+                "description": "SS58-encoded account address"
             },
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput {
-            result: execute_subxt_chain_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
+            "ws_url": {
+                "type": "string",
+                "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
+                "default": "wss://rpc.polkadot.io"
+            }
+        },
+        "required": ["address"],
+        "additionalProperties": false
+    })
+);
 
-pub(crate) struct SubxtBalance;
-
-#[async_trait]
-impl Tool for SubxtBalance {
-    fn name(&self) -> &'static str {
-        "subxt_balance"
-    }
-    fn description(&self) -> &'static str {
-        "Query the balance of an account on a Substrate/Polkadot blockchain. Returns the System.Account info (free, reserved, frozen balances)."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "address": {
-                    "type": "string",
-                    "description": "SS58-encoded account address"
-                },
-                "ws_url": {
-                    "type": "string",
-                    "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
-                    "default": "wss://rpc.polkadot.io"
-                }
+define_tool!(SubxtQuery, "subxt_query",
+    "Query a storage value from a Substrate/Polkadot blockchain by pallet and storage item name. Returns the decoded SCALE value as JSON.",
+    execute_subxt_query_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "pallet": {
+                "type": "string",
+                "description": "Pallet name (e.g., System, Balances, Staking)"
             },
-            "required": ["address"],
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput {
-            result: execute_subxt_balance_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
-
-pub(crate) struct SubxtQuery;
-
-#[async_trait]
-impl Tool for SubxtQuery {
-    fn name(&self) -> &'static str {
-        "subxt_query"
-    }
-    fn description(&self) -> &'static str {
-        "Query a storage value from a Substrate/Polkadot blockchain by pallet and storage item name. Returns the decoded SCALE value as JSON."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pallet": {
-                    "type": "string",
-                    "description": "Pallet name (e.g., System, Balances, Staking)"
-                },
-                "storage_item": {
-                    "type": "string",
-                    "description": "Storage item name (e.g., Account, TotalIssuance, Validators)"
-                },
-                "key": {
-                    "type": "string",
-                    "description": "Optional hex-encoded storage key bytes (without 0x prefix)"
-                },
-                "ws_url": {
-                    "type": "string",
-                    "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
-                    "default": "wss://rpc.polkadot.io"
-                }
+            "storage_item": {
+                "type": "string",
+                "description": "Storage item name (e.g., Account, TotalIssuance, Validators)"
             },
-            "required": ["pallet", "storage_item"],
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput {
-            result: execute_subxt_query_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
-
-pub(crate) struct SubxtBlock;
-
-#[async_trait]
-impl Tool for SubxtBlock {
-    fn name(&self) -> &'static str {
-        "subxt_block"
-    }
-    fn description(&self) -> &'static str {
-        "Get details about a block on a Substrate/Polkadot blockchain: block number, hash, parent hash, state root, extrinsics root, and full block JSON."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "block_number": {
-                    "type": "integer",
-                    "description": "Optional block number (if omitted, gets the latest finalized block)"
-                },
-                "ws_url": {
-                    "type": "string",
-                    "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
-                    "default": "wss://rpc.polkadot.io"
-                }
+            "key": {
+                "type": "string",
+                "description": "Optional hex-encoded storage key bytes (without 0x prefix)"
             },
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput {
-            result: execute_subxt_block_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
+            "ws_url": {
+                "type": "string",
+                "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
+                "default": "wss://rpc.polkadot.io"
+            }
+        },
+        "required": ["pallet", "storage_item"],
+        "additionalProperties": false
+    })
+);
+
+define_tool!(SubxtBlock, "subxt_block",
+    "Get details about a block on a Substrate/Polkadot blockchain: block number, hash, parent hash, state root, extrinsics root, and full block JSON.",
+    execute_subxt_block_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "block_number": {
+                "type": "integer",
+                "description": "Optional block number (if omitted, gets the latest finalized block)"
+            },
+            "ws_url": {
+                "type": "string",
+                "description": "WebSocket URL of the Substrate node (e.g., wss://rpc.polkadot.io)",
+                "default": "wss://rpc.polkadot.io"
+            }
+        },
+        "additionalProperties": false
+    })
+);

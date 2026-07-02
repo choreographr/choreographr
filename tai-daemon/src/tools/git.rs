@@ -1,5 +1,4 @@
-use crate::{Tool, ToolExecutionOutput, ToolResult, truncate_tool_output};
-use async_trait::async_trait;
+use crate::{ToolResult, truncate_tool_output};
 use gix::{
     ObjectId,
     bstr::{BStr, BString, ByteSlice},
@@ -942,87 +941,39 @@ fn write_section(out: &mut String, title: &str, lines: &[String]) {
     }
 }
 
-pub(crate) struct GitStatus;
+define_tool!(GitStatus, "git_status",
+    "Show the status of the Git repository containing the given path.",
+    execute_git_status_tool,
+    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."}},"additionalProperties":false})
+);
 
-#[async_trait]
-impl Tool for GitStatus {
-    fn name(&self) -> &'static str { "git_status" }
-    fn description(&self) -> &'static str { "Show the status of the Git repository containing the given path." }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."}},"additionalProperties":false})
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput { result: execute_git_status_tool(arguments_json).await, image: None }
-    }
-}
+define_tool!(GitDiff, "git_diff",
+    "Show the diff for a file or repository.",
+    execute_git_diff_tool,
+    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"cached":{"type":"boolean","description":"Show staged (cached) changes instead of worktree changes","default":false},"pathspec":{"type":"array","items":{"type":"string"},"description":"Optional pathspecs to filter"},"additionalProperties":false}})
+);
 
-pub(crate) struct GitDiff;
+define_tool!(GitLog, "git_log",
+    "Show recent Git commits for the repository containing the given path.",
+    execute_git_log_tool,
+    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"max_count":{"type":"integer","minimum":1,"maximum":100,"default":10}},"additionalProperties":false})
+);
 
-#[async_trait]
-impl Tool for GitDiff {
-    fn name(&self) -> &'static str { "git_diff" }
-    fn description(&self) -> &'static str { "Show the diff for a file or repository." }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"cached":{"type":"boolean","description":"Show staged (cached) changes instead of worktree changes","default":false},"pathspec":{"type":"array","items":{"type":"string"},"description":"Optional pathspecs to filter"},"additionalProperties":false}})
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput { result: execute_git_diff_tool(arguments_json).await, image: None }
-    }
-}
+define_tool!(GitAdd, "git_add",
+    "Stage a file or pathspec in Git.",
+    execute_git_add_tool,
+    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"pathspec":{"type":"array","items":{"type":"string"},"description":"Files or pathspecs to stage"}},"required":["pathspec"],"additionalProperties":false})
+);
 
-pub(crate) struct GitLog;
+define_tool!(GitCommit, "git_commit",
+    "Create a Git commit from the current index.",
+    execute_git_commit_tool,
+    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"message":{"type":"string","description":"Commit message"}},"required":["message"],"additionalProperties":false})
+);
 
-#[async_trait]
-impl Tool for GitLog {
-    fn name(&self) -> &'static str { "git_log" }
-    fn description(&self) -> &'static str { "Show recent Git commits for the repository containing the given path." }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"max_count":{"type":"integer","minimum":1,"maximum":100,"default":10}},"additionalProperties":false})
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput { result: execute_git_log_tool(arguments_json).await, image: None }
-    }
-}
-
-pub(crate) struct GitAdd;
-
-#[async_trait]
-impl Tool for GitAdd {
-    fn name(&self) -> &'static str { "git_add" }
-    fn description(&self) -> &'static str { "Stage a file or pathspec in Git." }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"pathspec":{"type":"array","items":{"type":"string"},"description":"Files or pathspecs to stage"}},"required":["pathspec"],"additionalProperties":false})
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput { result: execute_git_add_tool(arguments_json).await, image: None }
-    }
-}
-
-pub(crate) struct GitCommit;
-
-#[async_trait]
-impl Tool for GitCommit {
-    fn name(&self) -> &'static str { "git_commit" }
-    fn description(&self) -> &'static str { "Create a Git commit from the current index." }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"message":{"type":"string","description":"Commit message"}},"required":["message"],"additionalProperties":false})
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput { result: execute_git_commit_tool(arguments_json).await, image: None }
-    }
-}
-
-pub(crate) struct GitPush;
-
-#[async_trait]
-impl Tool for GitPush {
-    fn name(&self) -> &'static str { "git_push" }
-    fn description(&self) -> &'static str { "Push to a Git remote branch." }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"remote":{"type":"string","description":"Remote name","default":"origin"},"branch":{"type":"string","description":"Remote branch name"},"set_upstream":{"type":"boolean","description":"Set upstream tracking reference","default":false},"force_with_lease":{"type":"boolean","description":"Force push with lease (safe force push)","default":false},"dry_run":{"type":"boolean","description":"Simulate push without sending data","default":false}},"required":[],"additionalProperties":false})
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput { result: execute_git_push_tool(arguments_json).await, image: None }
-    }
-}
+define_tool!(GitPush, "git_push",
+    "Push to a Git remote branch.",
+    execute_git_push_tool,
+    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"remote":{"type":"string","description":"Remote name","default":"origin"},"branch":{"type":"string","description":"Remote branch name"},"set_upstream":{"type":"boolean","description":"Set upstream tracking reference","default":false},"force_with_lease":{"type":"boolean","description":"Force push with lease (safe force push)","default":false},"dry_run":{"type":"boolean","description":"Simulate push without sending data","default":false}},"required":[],"additionalProperties":false})
+);
 

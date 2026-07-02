@@ -1,5 +1,4 @@
-use super::{Tool, ToolExecutionOutput, ToolResult, truncate_tool_output};
-use async_trait::async_trait;
+use super::{ToolResult, truncate_tool_output};
 use reqwest::{
     Method, StatusCode, Url,
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -184,54 +183,39 @@ fn format_http_response(status: StatusCode, headers: &HeaderMap, body: &str) -> 
     output
 }
 
-pub(crate) struct HttpRequest;
-
-#[async_trait]
-impl Tool for HttpRequest {
-    fn name(&self) -> &'static str {
-        "http_request"
-    }
-    fn description(&self) -> &'static str {
-        "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "method": {
-                    "type": "string",
-                    "enum": ["GET", "POST", "HEAD"]
-                },
-                "url": {
-                    "type": "string",
-                    "description": "Absolute http or https URL"
-                },
-                "headers": {
-                    "type": "object",
-                    "description": "Optional request headers, including Range",
-                    "additionalProperties": {
-                        "type": "string"
-                    }
-                },
-                "body": {
-                    "type": "string",
-                    "description": "Optional UTF-8 request body"
-                },
-                "timeout_secs": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 30,
-                    "default": 10
+define_tool!(HttpRequest, "http_request",
+    "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests.",
+    execute_http_request_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "method": {
+                "type": "string",
+                "enum": ["GET", "POST", "HEAD"]
+            },
+            "url": {
+                "type": "string",
+                "description": "Absolute http or https URL"
+            },
+            "headers": {
+                "type": "object",
+                "description": "Optional request headers, including Range",
+                "additionalProperties": {
+                    "type": "string"
                 }
             },
-            "required": ["method", "url"],
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput {
-            result: execute_http_request_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
+            "body": {
+                "type": "string",
+                "description": "Optional UTF-8 request body"
+            },
+            "timeout_secs": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 30,
+                "default": 10
+            }
+        },
+        "required": ["method", "url"],
+        "additionalProperties": false
+    })
+);

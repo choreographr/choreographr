@@ -1,5 +1,4 @@
-use super::{Tool, ToolExecutionOutput, ToolResult, sha256_hex, truncate_tool_output};
-use async_trait::async_trait;
+use super::{ToolResult, sha256_hex, truncate_tool_output};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -87,58 +86,43 @@ fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, String> {
     Ok(state)
 }
 
-pub(crate) struct Fff;
-
-#[async_trait]
-impl Tool for Fff {
-    fn name(&self) -> &'static str {
-        "fff"
-    }
-    fn description(&self) -> &'static str {
-        "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes."
-    }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query. Supports advanced syntax like 'ext:rs my_function' or 'path:src/**'. For file name search, this is a fuzzy pattern."
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["grep", "files"],
-                    "description": "Search mode: 'grep' for content search (default), 'files' for file name fuzzy search",
-                    "default": "grep"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Root path for the search (default: current directory)"
-                },
-                "pattern_type": {
-                    "type": "string",
-                    "enum": ["plain", "regex", "fuzzy"],
-                    "description": "Pattern matching mode for grep: 'plain' (default), 'regex', or 'fuzzy'",
-                    "default": "plain"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                    "default": 50
-                }
+define_tool!(Fff, "fff",
+    "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes.",
+    execute_fff_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query. Supports advanced syntax like 'ext:rs my_function' or 'path:src/**'. For file name search, this is a fuzzy pattern."
             },
-            "required": ["query"],
-            "additionalProperties": false
-        })
-    }
-    async fn execute(&self, arguments_json: &str) -> ToolExecutionOutput {
-        ToolExecutionOutput {
-            result: execute_fff_tool(arguments_json).await,
-            image: None,
-        }
-    }
-}
+            "mode": {
+                "type": "string",
+                "enum": ["grep", "files"],
+                "description": "Search mode: 'grep' for content search (default), 'files' for file name fuzzy search",
+                "default": "grep"
+            },
+            "path": {
+                "type": "string",
+                "description": "Root path for the search (default: current directory)"
+            },
+            "pattern_type": {
+                "type": "string",
+                "enum": ["plain", "regex", "fuzzy"],
+                "description": "Pattern matching mode for grep: 'plain' (default), 'regex', or 'fuzzy'",
+                "default": "plain"
+            },
+            "max_results": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 50
+            }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+    })
+);
 
 pub(crate) async fn execute_fff_tool(arguments_json: &str) -> ToolResult {
     let args: FffArgs = match serde_json::from_str(arguments_json) {
