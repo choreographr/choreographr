@@ -312,8 +312,9 @@ trait Tool {
 
 ### Registry
 
-Tools are registered in a `ToolRegistry` backed by a global `OnceLock<ToolRegistry>` singleton.
-The daemon retrieves the global registry at startup and passes tool definitions to the model.
+Tools are registered in a `ToolRegistry` owned by `DaemonStateInner`, constructed once
+at daemon startup. The agent loop extracts an `Arc<ToolRegistry>` from the daemon state to
+list available tool definitions and dispatch tool execution.
 
 Each tool receives an optional `cwd: Option<&Path>` parameter that represents the session's
 working directory. Filesystem and Git tools resolve relative paths against this CWD.

@@ -42,6 +42,7 @@ pub struct DaemonStateInner {
     pub keystore: Option<Arc<Keystore>>,
     pub x_credentials: Option<XCredentials>,
     pub db: Arc<redb::Database>,
+    pub(crate) tool_registry: Arc<crate::tools::ToolRegistry>,
 }
 
 pub type DaemonState = Arc<Mutex<DaemonStateInner>>;
@@ -117,6 +118,7 @@ pub async fn new_daemon_state(db: redb::Database, max_turns: u32) -> DaemonState
         keystore: None,
         x_credentials: None,
         db,
+        tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
     }))
 }
 

@@ -2,7 +2,6 @@ use crate::openai::{ChatToolCall, ChatToolDefinition};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use tai_keystore::XCredentials;
 
 #[macro_export]
@@ -162,15 +161,6 @@ impl ToolRegistry {
     }
 }
 
-fn global_registry() -> &'static ToolRegistry {
-    static REGISTRY: OnceLock<ToolRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(ToolRegistry::new)
-}
-
-pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall, x_credentials: Option<&XCredentials>, cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
-    global_registry().execute(tool_call, x_credentials, cwd).await
-}
-
 pub(crate) fn resolve_path(path: &str, cwd: Option<&std::path::Path>) -> std::path::PathBuf {
     let p = std::path::Path::new(path);
     if p.is_absolute() {
@@ -181,10 +171,6 @@ pub(crate) fn resolve_path(path: &str, cwd: Option<&std::path::Path>) -> std::pa
     } else {
         p.to_path_buf()
     }
-}
-
-pub(crate) fn available_tools() -> Vec<ChatToolDefinition> {
-    global_registry().available_definitions()
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use crate::openai::{
     OpenAiClient,
 };
 use crate::sessions::{append_message_and_persist, broadcast_to_session, SessionState};
-use crate::tools::{available_tools, emit_prepared_image, execute_tool_call, ToolExecutionOutput, ToolResult};
+use crate::tools::{emit_prepared_image, ToolExecutionOutput, ToolResult};
 use std::{io, sync::Arc, time::Duration};
 use tokio::time::timeout;
 use tai_keystore::XCredentials;
@@ -82,7 +82,11 @@ pub(crate) async fn run_agent_loop(
     cwd: Option<&std::path::Path>,
     state: &crate::DaemonState,
 ) -> io::Result<()> {
-    let tools = available_tools();
+    let tool_registry = {
+        let guard = state.lock().await;
+        Arc::clone(&guard.tool_registry)
+    };
+    let tools = tool_registry.available_definitions();
     let mut next_image_id = 1;
 
     let max_turns = match session.lock().await.max_turns {
@@ -183,7 +187,7 @@ pub(crate) async fn run_agent_loop(
                                     session, session_id, db, cwd, &tool_call.arguments_json,
                                 ).await
                             } else {
-                                execute_tool_call(&tool_call, x_credentials, cwd).await
+                                tool_registry.execute(&tool_call, x_credentials, cwd).await
                             }
                         }
                     ).await {
