@@ -21,14 +21,20 @@ pub use crate::tools::git::{
     execute_git_status_tool,
 };
 
-#[allow(unused_imports)]
+#[cfg(test)]
 pub(crate) use crate::tools::{
+    sha256_hex,
+};
+
+#[cfg(test)]
+pub(crate) use crate::tools::fs::{
     execute_read_file_range_tool,
     execute_write_file_tool,
     execute_edit_file_tool,
-    execute_http_request_tool,
-    sha256_hex,
 };
+
+#[cfg(test)]
+pub(crate) use crate::tools::http::execute_http_request_tool;
 
 #[cfg(test)]
 mod tests;

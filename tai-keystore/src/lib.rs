@@ -48,6 +48,12 @@ pub struct Keystore {
     services: HashMap<String, ServiceCredential>,
 }
 
+impl Default for Keystore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Keystore {
     pub fn new() -> Self {
         Self {
@@ -220,4 +226,145 @@ pub struct XCredentials {
     pub access_token: String,
     pub access_token_secret: String,
     pub bearer_token: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_keystore_is_empty() {
+        let ks = Keystore::new();
+        assert!(ks.get("any").is_none());
+        assert_eq!(ks.service_names().count(), 0);
+    }
+
+    #[test]
+    fn add_and_get_api_key() {
+        let mut ks = Keystore::new();
+        ks.add("openai".to_string(), ServiceCredential::ApiKey { key: "sk-test".to_string() });
+        assert_eq!(ks.service_names().count(), 1);
+        assert_eq!(ks.get_api_key("openai"), Some("sk-test"));
+        assert!(ks.get_x_credentials("openai").is_none());
+    }
+
+    #[test]
+    fn add_and_get_x_credentials() {
+        let mut ks = Keystore::new();
+        ks.add("twitter".to_string(), ServiceCredential::X {
+            api_key: "ak".into(),
+            api_key_secret: "aks".into(),
+            access_token: "at".into(),
+            access_token_secret: "ats".into(),
+            bearer_token: Some("bt".into()),
+        });
+        assert!(ks.get_api_key("twitter").is_none());
+        let creds = ks.get_x_credentials("twitter").unwrap();
+        assert_eq!(creds.api_key, "ak");
+        assert_eq!(creds.api_key_secret, "aks");
+        assert_eq!(creds.access_token, "at");
+        assert_eq!(creds.access_token_secret, "ats");
+        assert_eq!(creds.bearer_token, Some("bt".to_string()));
+    }
+
+    #[test]
+    fn remove_credential() {
+        let mut ks = Keystore::new();
+        ks.add("svc".to_string(), ServiceCredential::ApiKey { key: "k".into() });
+        assert!(ks.remove("svc"));
+        assert!(!ks.remove("svc"));
+        assert!(ks.get("svc").is_none());
+    }
+
+    #[test]
+    fn service_names_iterates_all_services() {
+        let mut ks = Keystore::new();
+        ks.add("a".to_string(), ServiceCredential::ApiKey { key: "1".into() });
+        ks.add("b".to_string(), ServiceCredential::ApiKey { key: "2".into() });
+        let mut names: Vec<_> = ks.service_names().collect();
+        names.sort();
+        assert_eq!(names, vec![&"a".to_string(), &"b".to_string()]);
+    }
+
+    #[test]
+    fn to_store_from_store_round_trip() {
+        let mut ks = Keystore::new();
+        ks.add("s1".to_string(), ServiceCredential::ApiKey { key: "api-key".into() });
+        ks.add("s2".to_string(), ServiceCredential::X {
+            api_key: "a".into(),
+            api_key_secret: "as".into(),
+            access_token: "at".into(),
+            access_token_secret: "ats".into(),
+            bearer_token: None,
+        });
+
+        let store = ks.to_store();
+        let restored = Keystore::from_store(store);
+
+        assert_eq!(restored.get_api_key("s1"), Some("api-key"));
+        let x = restored.get_x_credentials("s2").unwrap();
+        assert_eq!(x.api_key, "a");
+        assert_eq!(x.bearer_token, None);
+        assert_eq!(restored.service_names().count(), 2);
+    }
+
+    #[test]
+    fn derive_key_is_deterministic() {
+        let salt = [0xAAu8; SALT_LEN];
+        let k1 = derive_key("passphrase", &salt);
+        let k2 = derive_key("passphrase", &salt);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn derive_key_different_salt_produces_different_output() {
+        let salt1 = [0x01u8; SALT_LEN];
+        let salt2 = [0x02u8; SALT_LEN];
+        let k1 = derive_key("passphrase", &salt1);
+        let k2 = derive_key("passphrase", &salt2);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn derive_key_different_passphrase_produces_different_output() {
+        let salt = [0xFFu8; SALT_LEN];
+        let k1 = derive_key("alpha", &salt);
+        let k2 = derive_key("beta", &salt);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn credential_store_serialization_round_trip() {
+        let store = CredentialStore {
+            version: 1,
+            services: {
+                let mut m = std::collections::HashMap::new();
+                m.insert("test".to_string(), ServiceCredential::ApiKey { key: "val".into() });
+                m
+            },
+        };
+        let json = serde_json::to_vec(&store).unwrap();
+        let restored: CredentialStore = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restored.version, 1);
+        let key = restored.services.get("test").unwrap();
+        assert!(matches!(key, ServiceCredential::ApiKey { key } if key == "val"));
+    }
+
+    #[test]
+    fn credential_store_json_round_trip() {
+        let json = r#"{"version":1,"services":{"x":{"type":"api_key","key":"secret"}}}"#;
+        let store: CredentialStore = serde_json::from_str(json).unwrap();
+        assert_eq!(store.version, 1);
+        assert!(matches!(
+            store.services.get("x"),
+            Some(ServiceCredential::ApiKey { key }) if key == "secret"
+        ));
+        let re_serialized = serde_json::to_string(&store).unwrap();
+        let re_deserialized: CredentialStore = serde_json::from_str(&re_serialized).unwrap();
+        assert_eq!(re_deserialized.version, 1);
+        assert!(matches!(
+            re_deserialized.services.get("x"),
+            Some(ServiceCredential::ApiKey { key }) if key == "secret"
+        ));
+    }
 }

@@ -512,19 +512,6 @@ pub(crate) fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<Ch
         .collect()
 }
 
-#[allow(dead_code)]
-pub(crate) fn build_prompt(messages: &[SessionMessage]) -> String {
-    let mut prompt = String::new();
-    for message in messages {
-        let line = message.render_line();
-        if !prompt.is_empty() {
-            prompt.push_str("\n\n");
-        }
-        prompt.push_str(line.trim());
-    }
-    prompt
-}
-
 pub const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
 pub const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
 pub const REQUEST_IMAGE_WIDTH: u32 = 640;

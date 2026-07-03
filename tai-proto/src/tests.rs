@@ -1,8 +1,5 @@
 use super::*;
 use std::io::Cursor;
-use std::sync::Mutex;
-
-static SOCKET_PATH_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 #[test]
 fn encode_decode_round_trip_client_message() {
@@ -65,16 +62,15 @@ fn read_payload_rejects_oversized_frame() {
 
 #[test]
 fn socket_path_uses_env_override() {
-    let _guard = SOCKET_PATH_TEST_MUTEX.lock().unwrap();
-    let original = std::env::var(SOCKET_PATH_ENV).ok();
-    unsafe {
-        std::env::set_var(SOCKET_PATH_ENV, "/tmp/custom-tai.sock");
-    }
-    assert_eq!(socket_path(), "/tmp/custom-tai.sock");
-    match original {
-        Some(value) => unsafe { std::env::set_var(SOCKET_PATH_ENV, value) },
-        None => unsafe { std::env::remove_var(SOCKET_PATH_ENV) },
-    }
+    assert_eq!(
+        socket_path_impl(|| Some("/tmp/custom-tai.sock".to_string())),
+        "/tmp/custom-tai.sock"
+    );
+}
+
+#[test]
+fn socket_path_default_when_env_not_set() {
+    assert_eq!(socket_path_impl(|| None), DEFAULT_SOCKET_PATH);
 }
 
 #[test]

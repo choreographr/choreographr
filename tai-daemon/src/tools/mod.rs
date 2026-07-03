@@ -42,8 +42,8 @@ macro_rules! define_tool_with_cwd {
 mod error;
 pub(crate) use error::{ToolError, tool_err, tool_ok};
 
-mod fs;
-mod http;
+pub(crate) mod fs;
+pub(crate) mod http;
 mod image;
 mod fff;
 mod evm;
@@ -183,10 +183,5 @@ pub(crate) fn truncate_tool_output(content: &str) -> String {
         .collect::<String>();
     format!("{truncated}\n...[truncated]")
 }
-
-pub(crate) use fs::execute_read_file_range_tool;
-pub(crate) use fs::execute_write_file_tool;
-pub(crate) use fs::execute_edit_file_tool;
-pub(crate) use http::execute_http_request_tool;
 
 

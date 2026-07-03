@@ -43,7 +43,7 @@ impl From<KeystoreError> for io::Error {
             KeystoreError::ConfigDirNotFound => {
                 io::Error::new(io::ErrorKind::NotFound, error)
             }
-            _ => io::Error::new(io::ErrorKind::Other, error),
+            _ => io::Error::other(error),
         }
     }
 }

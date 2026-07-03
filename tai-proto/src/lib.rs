@@ -284,7 +284,11 @@ where
 }
 
 pub fn socket_path() -> String {
-    std::env::var(SOCKET_PATH_ENV).unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string())
+    socket_path_impl(|| std::env::var(SOCKET_PATH_ENV).ok())
+}
+
+fn socket_path_impl(get_env: impl Fn() -> Option<String>) -> String {
+    get_env().unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string())
 }
 
 pub fn write_message_sync<W, T>(writer: &mut W, message: &T) -> Result<(), ProtoError>

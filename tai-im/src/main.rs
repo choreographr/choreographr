@@ -6,8 +6,8 @@ use tai_proto::{ClientMessage, DaemonMessage, read_message_sync, socket_path, wr
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
-mod bridge;
-mod telegram;
+use tai_im::bridge;
+use tai_im::telegram;
 
 fn main() -> anyhow::Result<()> {
     fmt()
