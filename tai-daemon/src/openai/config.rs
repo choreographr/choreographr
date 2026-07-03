@@ -1,4 +1,5 @@
 use super::{OpenAiClient, RequestFormat};
+use crate::context::ContextConfig;
 use serde::Deserialize;
 use std::{collections::HashMap, fs, io, path::PathBuf};
 
@@ -29,6 +30,8 @@ pub struct ServiceConfig {
     pub streaming: bool,
     #[serde(default)]
     pub max_turns: Option<u32>,
+    #[serde(default)]
+    pub context: ContextConfig,
 }
 
 impl Default for ServiceConfig {
@@ -44,6 +47,7 @@ impl Default for ServiceConfig {
             model_max_tokens: HashMap::new(),
             streaming: default_streaming(),
             max_turns: None,
+            context: ContextConfig::default(),
         }
     }
 }

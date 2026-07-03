@@ -1,5 +1,6 @@
 pub mod db;
 pub mod openai;
+pub mod context;
 mod requests;
 mod server;
 mod sessions;

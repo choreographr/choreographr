@@ -89,6 +89,32 @@ pub(crate) async fn run_agent_loop(
     };
 
     for _ in 0..max_turns {
+        {
+            let mut guard = session.lock().await;
+            if let Some(ref session_cwd) = guard.cwd {
+                let context_config = client.config().context.clone();
+                if let Some(old_fp) = guard.context_fingerprint {
+                    if let Some(idx) = guard.context_message_index {
+                        if let Ok(Some(new_bundle)) =
+                            crate::context::recheck_context(session_cwd, &context_config, old_fp)
+                        {
+                            let new_content = crate::context::assemble_context(&new_bundle);
+                            if !new_content.is_empty() {
+                                guard.messages[idx] =
+                                    SessionMessage::SystemText { content: new_content };
+                            }
+                            guard.context_fingerprint = Some(new_bundle.fingerprint);
+                            guard.context_file_paths = new_bundle
+                                .files
+                                .iter()
+                                .map(|f| f.path.clone())
+                                .collect();
+                        }
+                    }
+                }
+            }
+        }
+
         let messages = {
             let guard = session.lock().await;
             build_chat_request_messages(&guard.messages)
@@ -132,7 +158,7 @@ pub(crate) async fn run_agent_loop(
                     )
                     .await;
 
-                    let output = if tool_call.name == "spawn_subsession" {
+                    let mut output = if tool_call.name == "spawn_subsession" {
                         crate::tools::subsession::execute_spawn_subsession(
                             client, state, session, session_id, db, model,
                             &tool_call, x_credentials, cwd,
@@ -141,9 +167,26 @@ pub(crate) async fn run_agent_loop(
                         crate::tools::sessions::execute_list_sessions(state).await
                     } else if tool_call.name == "get_session" {
                         crate::tools::sessions::execute_get_session(state, &tool_call.arguments_json).await
+                    } else if tool_call.name == "load_skill" {
+                        crate::tools::skill::execute_load_skill(
+                            session, session_id, db, cwd, &tool_call.arguments_json,
+                        ).await
                     } else {
                         execute_tool_call(&tool_call, x_credentials, cwd).await
                     };
+
+                    // Inject subdirectory hints into tool result content
+                    {
+                        let guard = session.lock().await;
+                        let cwd_ref = guard.cwd.clone();
+                        let known = guard.context_file_paths.clone();
+                        drop(guard);
+                        if let Some(hint) = crate::context::subdirectory_hints(
+                            &tool_call.name, &tool_call.arguments_json, cwd_ref.as_deref(), &known,
+                        ) {
+                            output.result.content = format!("{}\n\n---\n{}", output.result.content, hint);
+                        }
+                    }
 
                     if let Some(image) = output.image {
                         emit_prepared_image(session, request_id, next_image_id, image).await;

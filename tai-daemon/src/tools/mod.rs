@@ -56,6 +56,7 @@ mod subxt;
 pub(crate) mod x;
 pub(crate) mod sessions;
 pub(crate) mod subsession;
+pub(crate) mod skill;
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -156,6 +157,7 @@ impl ToolRegistry {
         defs.push(subsession::spawn_subsession_definition());
         defs.push(sessions::list_sessions_definition());
         defs.push(sessions::get_session_definition());
+        defs.push(skill::load_skill_definition());
         defs
     }
 }

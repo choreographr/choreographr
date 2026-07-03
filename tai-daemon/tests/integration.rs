@@ -30,6 +30,7 @@ fn test_service_config() -> ServiceConfig {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        context: Default::default(),
     }
 }
 
@@ -123,6 +124,7 @@ async fn spawn_tool_call_server(
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;
     {
@@ -237,6 +239,7 @@ async fn spawn_http_tool_call_server() -> (DaemonState, tokio::task::JoinHandle<
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;
     {
@@ -330,6 +333,7 @@ async fn spawn_display_image_tool_server() -> (DaemonState, tokio::task::JoinHan
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;
     {
@@ -395,6 +399,7 @@ async fn daemon_handler_set_model_fails_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;
     {

@@ -31,6 +31,7 @@ fn test_service_config() -> ServiceConfig {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        context: Default::default(),
     }
 }
 
@@ -144,6 +145,7 @@ async fn spawn_mock_openai_server(
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;
     {
@@ -548,6 +550,7 @@ async fn list_models_fails_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;
     {
@@ -588,6 +591,7 @@ async fn set_model_fails_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;
     {

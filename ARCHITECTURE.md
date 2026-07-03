@@ -170,8 +170,10 @@ Entry point: `src/main.rs` → initializes tracing, creates `DaemonState`, runs 
 | `server.rs` | Accepts Unix connections, spawns per-client `handle_client` tasks. Dispatches all `ClientMessage` variants. Implements lock/unlock flow. |
 | `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
+| `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
-| `tools/` | Tool trait, registry, and 28 registered tools. |
+| `context.rs` | Context file discovery, skills, fingerprint-based refresh |
+| `tools/` | Tool trait, registry, and 29 registered tools. |
 
 **Per-client architecture (async tasks):**
 
@@ -188,10 +190,11 @@ handle_client(socket)
 RunInput received
   └► extract/validate session, check active requests
      └► if chat_completions + tools:
-        └► tool-call loop (max 8 iterations):
+        └► tool-call loop (max configurable iterations, default 25):
+           0.5. re-check context fingerprint, rebuild volatile context if changed
            1. send messages + tools → model
            2. receive response
-           3. if tool_call → execute Tool → append ToolResult → goto 1
+           3. if tool_call → execute Tool → append subdirectory hints to ToolResult → goto 0.5
            4. else → emit final text, Done
      └► if responses or chat_completions (no tools):
         └► stream chunks via SSE → emit OutputChunk per token → Done
@@ -328,6 +331,7 @@ working directory. Filesystem and Git tools resolve relative paths against this 
 | **File search** | `fff` (file finding) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
 | **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
+| **Skills** | `load_skill` (loads the full instructions for a skill by name, following the Agent Skills standard) |
 
 ### spawn_subsession
 
@@ -527,9 +531,113 @@ Model calls display_image tool
     endpoint.
 
 
+
+
 ---
 
-## Testing strategy
+## Context file discovery
+
+The daemon automatically discovers and injects project-specific context files
+(`AGENTS.md`, `CLAUDE.md`) and skills at session creation, and refreshes them
+before every model call.
+
+### Split-tier system prompt
+
+Each session starts with two `SystemText` messages:
+
+```
+messages[0] = stable base prompt (identity, tool guidance, skill metadata)
+messages[1] = volatile project context (AGENTS.md, CLAUDE.md, etc.)
+```
+
+- `messages[0]` never changes within a session — fully cacheable by the model provider.
+- `messages[1]` is re-checked before every tool-loop iteration. If any context file
+  changed on disk (new file, deletion, or modified mtime), it is rebuilt in-place
+  without touching the stable tier.
+
+### Discovery algorithm
+
+1. **Global files** (loaded first, prepended):
+   - `~/.config/tai-daemon/AGENTS.md`
+   - `~/.claude/CLAUDE.md` (unless `disable_claude_code_prompt` is set)
+   - `~/.agents/AGENTS.md`
+2. **Project files** (walking from session CWD up to the git repository root):
+   - At each ancestor directory, checks `AGENTS.md` first, then `CLAUDE.md`.
+   - Only one file per directory (first match in the configured `context_file_names` list).
+   - Collected bottom-up (outermost first), then rendered in reverse order so
+     closer-to-CWD instructions appear last.
+
+### Subdirectory hints
+
+When filesystem tools (`read_file`, `list_files`, `fff`, etc.) access a file
+in a subdirectory below the session CWD, the daemon walks up from that file's
+parent toward CWD and checks for `AGENTS.md`/`CLAUDE.md` files not already in
+the main context. Any found hint content is appended to the tool result message
+(not the system prompt), preserving prompt cache stability.
+
+### Skills (Agent Skills standard)
+
+Skills are discovered from:
+- `~/.agents/skills/<name>/SKILL.md` (global)
+- `.agents/skills/<name>/SKILL.md` (project, relative to session CWD)
+
+Each `SKILL.md` must have YAML frontmatter with `name` and `description`.
+
+**Progressive disclosure:** At session start, only metadata (name + description)
+is included in the stable prompt (`messages[0]`). When the model calls the
+`load_skill` tool with a skill name, the full `SKILL.md` body is loaded and
+injected as a new `SystemText` message.
+
+### Fingerprint-based refresh
+
+Before each turn in the tool-call loop, the daemon computes a SHA-256 fingerprint
+of all known context file paths and their mtimes. If the fingerprint matches the
+stored value, nothing changes. If it differs (file added, removed, or modified),
+`messages[1]` is rebuilt with the new content and the fingerprint is updated.
+
+### Configuration
+
+```toml
+# ~/.config/tai-daemon/config.toml
+[context]
+context_file_names = ["AGENTS.md", "CLAUDE.md"]   # ordered list; first match per directory
+context_file_max_bytes = 32768                     # max combined context size
+disable_claude_code_prompt = false                 # skip ~/.claude/CLAUDE.md
+```
+
+### User system prompt override
+
+The stable base prompt (`messages[0]`) is loaded from
+`~/.config/tai-daemon/system.md` if it exists. Otherwise, a built-in default is
+used. The default lives at `tai-daemon/system.md` in the repository and is
+embedded at compile time via `include_str!`.
+
+### Module
+
+Implementation lives in `tai-daemon/src/context.rs`. Key entry points:
+
+| Function | Purpose |
+|---|---|
+| `discover_context(cwd, config)` | Walk filesystem, return `ContextBundle` with all discovered files |
+| `discover_skills(cwd)` | Scan Agent Skills directories, return `Vec<SkillMeta>` |
+| `assemble_context(bundle)` | Render discovered files into an XML-like format for injection |
+| `build_base_prompt(skills)` | Build the stable system prompt (identity + skill metadata) |
+| `recheck_context(cwd, config, old_fp)` | Re-discover and compare fingerprints |
+| `subdirectory_hints(tool_name, args, cwd, known)` | Return subdirectory hint content for tool results |
+| `load_skill_body(name, cwd)` | Load the full body of a SKILL.md, stripping YAML frontmatter |
+
+### New tool: `load_skill`
+
+Registered alongside other tools in the tool loop. When the model calls
+`load_skill(name)`, the daemon:
+
+1. Finds the matching `SKILL.md` from `~/.agents/skills/` or `.agents/skills/`
+2. Strips the YAML frontmatter
+3. Appends a `SystemText` message with the skill body to the session
+4. Returns `"Loaded skill: <name>"` as the tool result
+
+The skill body is available to the model on all subsequent turns.
+
 
 | Layer | What's tested | Location |
 |---|---|---|

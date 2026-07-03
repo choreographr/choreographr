@@ -1,6 +1,8 @@
 use crate::openai::OpenAiClient;
+use crate::openai::load_service_config;
 use std::{
     collections::HashMap,
+    path::Path,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -26,6 +28,9 @@ pub(crate) struct SessionState {
     pub(crate) messages: Vec<SessionMessage>,
     pub(crate) active_requests: HashMap<u32, ActiveRequest>,
     pub(crate) subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>,
+    pub(crate) context_fingerprint: Option<u64>,
+    pub(crate) context_file_paths: Vec<std::path::PathBuf>,
+    pub(crate) context_message_index: Option<usize>,
 }
 
 pub struct DaemonStateInner {
@@ -70,6 +75,9 @@ pub async fn new_daemon_state(db: redb::Database, max_turns: u32) -> DaemonState
                 messages,
                 active_requests: HashMap::new(),
                 subscribers: HashMap::new(),
+                context_fingerprint: None,
+                context_file_paths: Vec::new(),
+                context_message_index: None,
             })),
         );
         max_id = max_id.max(id);
@@ -92,6 +100,9 @@ pub async fn new_daemon_state(db: redb::Database, max_turns: u32) -> DaemonState
                 messages: Vec::new(),
                 active_requests: HashMap::new(),
                 subscribers: HashMap::new(),
+                context_fingerprint: None,
+                context_file_paths: Vec::new(),
+                context_message_index: None,
             })),
         );
         max_id = 1;
@@ -320,6 +331,9 @@ pub(crate) async fn create_session_internal(
             messages: Vec::new(),
             active_requests: HashMap::new(),
             subscribers: HashMap::new(),
+            context_fingerprint: None,
+            context_file_paths: Vec::new(),
+            context_message_index: None,
         }));
 
         guard.sessions.insert(session_id, Arc::clone(&session));
@@ -330,13 +344,54 @@ pub(crate) async fn create_session_internal(
         title,
         selected_model: None,
         parent_session_id,
-        cwd: resolved_cwd.map(|p| p.display().to_string()),
+        cwd: resolved_cwd.as_ref().map(|p| p.display().to_string()),
         max_turns: resolved_max_turns,
         message_count: 0,
         created_at,
     };
     if let Err(e) = crate::db::write_session(&db, session_id, &record) {
         warn!(session_id, error = %e, "failed to persist new session to DB");
+    }
+
+    // Inject context messages (stable base + volatile project context)
+    {
+        let context_config = load_service_config()
+            .map(|c| c.context)
+            .unwrap_or_default();
+        let effective_cwd = resolved_cwd.as_deref().unwrap_or_else(|| Path::new("."));
+        let skills = crate::context::discover_skills(effective_cwd);
+        let base_prompt = crate::context::build_base_prompt(&skills);
+
+        append_message_and_persist(
+            &session,
+            &db,
+            session_id,
+            SessionMessage::SystemText {
+                content: base_prompt,
+            },
+        )
+        .await;
+
+        if let Ok(bundle) = crate::context::discover_context(effective_cwd, &context_config) {
+            let context_str = crate::context::assemble_context(&bundle);
+            if !context_str.is_empty() {
+                append_message_and_persist(
+                    &session,
+                    &db,
+                    session_id,
+                    SessionMessage::SystemText {
+                        content: context_str,
+                    },
+                )
+                .await;
+
+                let mut guard = session.lock().await;
+                guard.context_fingerprint = Some(bundle.fingerprint);
+                guard.context_file_paths =
+                    bundle.files.iter().map(|f| f.path.clone()).collect();
+                guard.context_message_index = Some(1);
+            }
+        }
     }
 
     Ok((session_id, session))

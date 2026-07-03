@@ -26,6 +26,7 @@ fn test_service_config() -> ServiceConfig {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        context: Default::default(),
     }
 }
 
