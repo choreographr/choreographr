@@ -13,6 +13,11 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+fn test_db() -> redb::Database {
+    let dir = tempfile::tempdir().unwrap();
+    redb::Database::create(dir.path().join("state.redb")).unwrap()
+}
+
 fn test_service_config() -> ServiceConfig {
     ServiceConfig {
         base_url: "https://example.com/v1".to_string(),
@@ -32,7 +37,7 @@ fn test_client() -> Arc<OpenAiClient> {
 }
 
 fn test_state_with_client() -> DaemonState {
-    let state = new_daemon_state();
+    let state = new_daemon_state(test_db());
     state.try_lock().unwrap().openai_client = Some(test_client());
     state
 }
@@ -117,7 +122,7 @@ async fn spawn_tool_call_server(
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state();
+    let state = new_daemon_state(test_db());
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -230,7 +235,7 @@ async fn spawn_http_tool_call_server() -> (DaemonState, tokio::task::JoinHandle<
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state();
+    let state = new_daemon_state(test_db());
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -322,7 +327,7 @@ async fn spawn_display_image_tool_server() -> (DaemonState, tokio::task::JoinHan
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state();
+    let state = new_daemon_state(test_db());
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -386,7 +391,7 @@ async fn daemon_handler_set_model_fails_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state();
+    let state = new_daemon_state(test_db());
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(

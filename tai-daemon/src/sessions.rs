@@ -27,11 +27,12 @@ pub struct DaemonStateInner {
     pub openai_client: Option<Arc<OpenAiClient>>,
     pub keystore: Option<Arc<Keystore>>,
     pub x_credentials: Option<XCredentials>,
+    pub db: Arc<redb::Database>,
 }
 
 pub type DaemonState = Arc<Mutex<DaemonStateInner>>;
 
-pub fn new_daemon_state() -> DaemonState {
+pub fn new_daemon_state(db: redb::Database) -> DaemonState {
     let mut sessions = HashMap::new();
     sessions.insert(
         1,
@@ -50,6 +51,7 @@ pub fn new_daemon_state() -> DaemonState {
         openai_client: None,
         keystore: None,
         x_credentials: None,
+        db: Arc::new(db),
     }))
 }
 

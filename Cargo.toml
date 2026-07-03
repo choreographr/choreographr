@@ -22,6 +22,7 @@ tai-im = { path = "tai-im" }
 ammonia = "4"
 base64 = "0.22"
 dirs = "6"
+redb = "4"
 image = "0.25"
 rand = "0.10"
 resvg = "0.47"

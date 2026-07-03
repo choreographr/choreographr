@@ -1,3 +1,4 @@
+pub mod db;
 pub mod openai;
 mod requests;
 mod server;

@@ -16,6 +16,7 @@ gix = { version = "0.85", features = ["tree-editor"] }
 hmac = "0.13"
 image.workspace = true
 rand.workspace = true
+redb.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 resvg.workspace = true
 serde.workspace = true
@@ -32,3 +33,6 @@ tokio = { workspace = true, features = ["full"] }
 toml = "1.1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

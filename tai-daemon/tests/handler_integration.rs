@@ -12,6 +12,11 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+fn test_db() -> redb::Database {
+    let dir = tempfile::tempdir().unwrap();
+    redb::Database::create(dir.path().join("state.redb")).unwrap()
+}
+
 static CREDENTIAL_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn test_service_config() -> ServiceConfig {
@@ -33,7 +38,7 @@ fn test_client() -> Arc<OpenAiClient> {
 }
 
 fn test_state_with_client() -> DaemonState {
-    let state = new_daemon_state();
+    let state = new_daemon_state(test_db());
     state.try_lock().unwrap().openai_client = Some(test_client());
     state
 }
@@ -138,7 +143,7 @@ async fn spawn_mock_openai_server(
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state();
+    let state = new_daemon_state(test_db());
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -541,7 +546,7 @@ async fn list_models_fails_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state();
+    let state = new_daemon_state(test_db());
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -580,7 +585,7 @@ async fn set_model_fails_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state();
+    let state = new_daemon_state(test_db());
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
