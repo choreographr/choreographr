@@ -1,3 +1,4 @@
+use std::fs;
 use std::io;
 use std::path::PathBuf;
 
@@ -33,7 +34,11 @@ pub fn db_path() -> io::Result<PathBuf> {
 }
 
 pub fn open_db() -> io::Result<redb::Database> {
-    redb::Database::create(db_path()?).map_err(|e| {
+    let path = db_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    redb::Database::create(path).map_err(|e| {
         io::Error::new(
             io::ErrorKind::Other,
             format!("failed to open database: {e}"),
