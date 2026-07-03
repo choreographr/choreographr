@@ -4,7 +4,6 @@ use crate::state::*;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use tai_client_core::DaemonMessageHandler;
 use tai_proto::{ClientMessage, OutputStream};
-use tokio::sync::mpsc;
 
 #[test]
 fn app_push_text_trims_history_to_limit() {
@@ -186,7 +185,7 @@ fn image_history_height_caps_to_twelve_rows() {
 #[tokio::test]
 async fn terminal_event_appends_characters() {
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
@@ -209,7 +208,7 @@ async fn terminal_event_appends_characters() {
 async fn terminal_event_submits_run_input() {
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     app.input = "hello".to_string();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -219,7 +218,7 @@ async fn terminal_event_submits_run_input() {
     .expect("handle enter");
 
     assert!(app.input.is_empty());
-    let message = rx.recv().await.expect("sent message");
+    let message = rx.recv().expect("sent message");
     assert_eq!(
         message,
         ClientMessage::RunInput {
@@ -231,7 +230,7 @@ async fn terminal_event_submits_run_input() {
 
 #[tokio::test]
 async fn terminal_event_quits_only_when_input_empty() {
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = std::sync::mpsc::channel();
 
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     handle_terminal_event(
@@ -256,7 +255,7 @@ async fn terminal_event_quits_only_when_input_empty() {
 
 #[tokio::test]
 async fn terminal_event_ctrl_c_quits() {
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
 
     handle_terminal_event(
@@ -271,7 +270,7 @@ async fn terminal_event_ctrl_c_quits() {
 
 #[tokio::test]
 async fn mouse_scroll_outside_history_box_does_not_change_scroll() {
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     app.history_viewport.height = 1;
     for index in 0..8 {

@@ -3,7 +3,6 @@ mod error;
 pub use error::ProtoError;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
@@ -286,41 +285,6 @@ where
 
 pub fn socket_path() -> String {
     std::env::var(SOCKET_PATH_ENV).unwrap_or_else(|_| DEFAULT_SOCKET_PATH.to_string())
-}
-
-pub async fn write_message<W, T>(writer: &mut W, message: &T) -> Result<(), ProtoError>
-where
-    W: AsyncWrite + Unpin,
-    T: Serialize,
-{
-    let frame = encode_frame(message)?;
-    writer.write_all(&frame).await?;
-    Ok(())
-}
-
-pub async fn read_message<R, T>(reader: &mut R) -> Result<T, ProtoError>
-where
-    R: AsyncRead + Unpin,
-    T: for<'de> Deserialize<'de>,
-{
-    let payload = read_payload(reader).await?;
-    decode_frame(&payload)
-}
-
-pub async fn read_payload<R>(reader: &mut R) -> Result<Vec<u8>, ProtoError>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut len_buf = [0_u8; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_SIZE {
-        return Err(ProtoError::FrameTooLarge);
-    }
-
-    let mut payload = vec![0_u8; len];
-    reader.read_exact(&mut payload).await?;
-    Ok(payload)
 }
 
 pub fn write_message_sync<W, T>(writer: &mut W, message: &T) -> Result<(), ProtoError>

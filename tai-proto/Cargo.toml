@@ -7,7 +7,3 @@ edition = "2024"
 serde.workspace = true
 thiserror.workspace = true
 bincode.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "rt", "macros"] }

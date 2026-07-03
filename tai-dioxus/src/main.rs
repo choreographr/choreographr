@@ -10,7 +10,7 @@ use crate::state::{AppState, UiEvent};
 use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
 use tai_proto::{ClientMessage, socket_path};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 
 fn main() {
     dioxus::LaunchBuilder::desktop()
@@ -22,12 +22,12 @@ fn main() {
 fn App() -> Element {
     let socket = use_signal(socket_path);
     let mut state = use_signal(|| AppState::new(socket.read().clone()));
-    let mut daemon_tx = use_signal(|| None::<UnboundedSender<ClientMessage>>);
+    let mut daemon_tx = use_signal(|| None::<std::sync::mpsc::Sender<ClientMessage>>);
     let mut events_rx = use_signal(|| None::<UnboundedReceiver<UiEvent>>);
 
     use_hook(move || {
         let socket = socket.read().clone();
-        let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
+        let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
         let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiEvent>();
         if let Err(e) = client_tx.send(ClientMessage::ListSessions) {
             eprintln!("[tai-dioxus] failed to send ListSessions: {e}");
@@ -35,8 +35,8 @@ fn App() -> Element {
         daemon_tx.set(Some(client_tx));
         events_rx.set(Some(ui_rx));
         let reader_tx = ui_tx.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(error) = run_client(socket, client_rx, reader_tx.clone()).await {
+        let handle = tokio::task::spawn_blocking(move || {
+            if let Err(error) = run_client(socket, client_rx, reader_tx.clone()) {
                 if let Err(e) = reader_tx.send(UiEvent::ReaderFailed(error.to_string())) {
                     eprintln!("[tai-dioxus] failed to send ReaderFailed: {e}");
                 }

@@ -1,6 +1,6 @@
 use super::*;
+use std::io::Cursor;
 use std::sync::Mutex;
-use tokio::io::duplex;
 
 static SOCKET_PATH_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -35,9 +35,8 @@ fn decode_rejects_wrong_version() {
     assert!(matches!(err, ProtoError::UnsupportedVersion { .. }));
 }
 
-#[tokio::test]
-async fn async_read_write_round_trip() {
-    let (mut writer, mut reader) = duplex(1024);
+#[test]
+fn sync_read_write_round_trip() {
     let expected = DaemonMessage::ImageStart {
         request_id: 5,
         metadata: ImageMetadata {
@@ -50,28 +49,17 @@ async fn async_read_write_round_trip() {
         },
     };
 
-    let expected_for_writer = expected.clone();
-    let write_task =
-        tokio::spawn(async move { write_message(&mut writer, &expected_for_writer).await });
-    let actual = read_message::<_, DaemonMessage>(&mut reader)
-        .await
-        .expect("read");
-    write_task.await.expect("join").expect("write");
+    let frame = encode_frame(&expected).expect("encode");
+    let mut cursor = Cursor::new(&frame[..]);
+    let actual = read_message_sync::<_, DaemonMessage>(&mut cursor).expect("read");
     assert_eq!(actual, expected);
 }
 
-#[tokio::test]
-async fn read_payload_rejects_oversized_frame() {
-    let (mut writer, mut reader) = duplex(16);
-    let write_task = tokio::spawn(async move {
-        writer
-            .write_all(&((MAX_FRAME_SIZE as u32) + 1).to_be_bytes())
-            .await
-            .expect("write header");
-    });
-
-    let err = read_payload(&mut reader).await.expect_err("should fail");
-    write_task.await.expect("join");
+#[test]
+fn read_payload_rejects_oversized_frame() {
+    let oversized_len = (MAX_FRAME_SIZE as u32) + 1;
+    let mut cursor = Cursor::new(oversized_len.to_be_bytes().to_vec());
+    let err = read_payload_sync(&mut cursor).expect_err("should fail");
     assert!(matches!(err, ProtoError::FrameTooLarge));
 }
 

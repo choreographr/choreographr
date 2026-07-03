@@ -1,29 +1,30 @@
 use crate::error::ClientError;
-use tai_proto::{ClientMessage, DaemonMessage, ProtoError, read_message, write_message};
-use tokio::{
-    io::AsyncWriteExt,
-    net::UnixStream,
-    sync::mpsc::UnboundedReceiver,
-};
+use tai_proto::{DaemonMessage, ProtoError, read_message_sync, write_message_sync};
+use std::io::{BufReader, BufWriter, Write};
+use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
 
-pub async fn run_daemon_connection(
+pub fn run_daemon_connection(
     socket_path: &str,
     mut handle_daemon_message: impl FnMut(DaemonMessage),
-    from_ui: UnboundedReceiver<ClientMessage>,
+    from_ui: mpsc::Receiver<tai_proto::ClientMessage>,
 ) -> Result<(), ClientError> {
-    let stream = UnixStream::connect(socket_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
+    let stream = UnixStream::connect(socket_path)?;
+    let reader = BufReader::new(stream.try_clone()?);
+    let mut writer = BufWriter::new(stream);
 
-    let writer_task = tokio::spawn(async move {
-        let mut from_ui = from_ui;
-        while let Some(message) = from_ui.recv().await {
-            write_message(&mut writer, &message).await?;
+    std::thread::spawn(move || {
+        for msg in from_ui {
+            if write_message_sync(&mut writer, &msg).is_err() {
+                break;
+            }
+            let _ = writer.flush();
         }
-        Ok::<(), ProtoError>(writer.shutdown().await.map_err(ProtoError::from)?)
     });
 
+    let mut reader = reader;
     loop {
-        match read_message::<_, DaemonMessage>(&mut reader).await {
+        match read_message_sync::<_, DaemonMessage>(&mut reader) {
             Ok(message) => handle_daemon_message(message),
             Err(ProtoError::Io(error))
                 if matches!(
@@ -37,9 +38,5 @@ pub async fn run_daemon_connection(
         }
     }
 
-    match writer_task.await {
-        Ok(Ok(())) | Err(_) => {}
-        Ok(Err(error)) => return Err(error.into()),
-    }
     Ok(())
 }

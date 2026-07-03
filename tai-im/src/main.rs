@@ -1,15 +1,15 @@
 use anyhow::{Context, bail};
 use std::env;
-use tai_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
-use tokio::net::UnixStream;
+use std::io::{BufReader, BufWriter, Write};
+use std::os::unix::net::UnixStream;
+use tai_proto::{ClientMessage, DaemonMessage, read_message_sync, socket_path, write_message_sync};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod bridge;
 mod telegram;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -30,21 +30,23 @@ async fn main() -> anyhow::Result<()> {
     let unlock_passphrase = env::var("TAI_KEYSTORE_PASSPHRASE").ok();
 
     let path = socket_path();
-    let mut stream = UnixStream::connect(&path)
-        .await
+    let stream = UnixStream::connect(&path)
         .context("failed to connect to daemon")?;
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut writer = BufWriter::new(stream);
 
     if let Some(ref passphrase) = unlock_passphrase {
         info!("unlocking daemon keystore");
-        write_message(
-            &mut stream,
+        write_message_sync(
+            &mut writer,
             &ClientMessage::Unlock {
                 passphrase: passphrase.clone(),
             },
         )
-        .await
         .context("failed to send unlock message")?;
-        match read_message::<_, DaemonMessage>(&mut stream).await {
+        writer.flush().context("failed to flush unlock message")?;
+        match read_message_sync::<_, DaemonMessage>(&mut reader) {
             Ok(DaemonMessage::Unlocked) => {
                 info!("daemon keystore unlocked");
             }
@@ -64,21 +66,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!(%platform, "requesting credential from daemon");
-    write_message(
-        &mut stream,
+    write_message_sync(
+        &mut writer,
         &ClientMessage::GetCredential {
             service: platform.clone(),
         },
     )
-    .await
     .context("failed to send credential request")?;
-    match read_message::<_, DaemonMessage>(&mut stream).await {
+    writer.flush().context("failed to flush credential request")?;
+    match read_message_sync::<_, DaemonMessage>(&mut reader) {
         Ok(DaemonMessage::Credential {
             key: Some(bot_token),
             ..
         }) => {
             info!(%platform, "got credential, starting platform bridge");
-            run_platform(&platform, bot_token, stream).await;
+            run_platform(&platform, bot_token, reader, writer);
         }
         Ok(DaemonMessage::Credential { key: None, .. }) => {
             if unlock_passphrase.is_none() {
@@ -100,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_platform(platform: &str, bot_token: String, stream: UnixStream) {
+fn run_platform(platform: &str, bot_token: String, reader: BufReader<UnixStream>, writer: BufWriter<UnixStream>) {
     match platform {
         "telegram" => {
             let admin_ids_str = env::var("TAI_TELEGRAM_USER_IDS").unwrap_or_default();
@@ -117,11 +119,17 @@ async fn run_platform(platform: &str, bot_token: String, stream: UnixStream) {
             let admin_count = admin_ids.len();
             info!(admin_count, "starting telegram bridge");
 
-            let (reader, writer) = stream.into_split();
+            // Start the bridge on background threads since the teloxide dispatcher runs on the
+            // main (tokio) runtime.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime for tai-im bridge");
+
             let bridge = bridge::DaemonBridge::spawn(reader, writer);
             let (tx, rx) = bridge.into_parts();
 
-            telegram::run(bot_token, admin_ids, tx, rx).await;
+            rt.block_on(telegram::run(bot_token, admin_ids, tx, rx));
         }
         other => {
             error!(platform = %other, "unknown platform");

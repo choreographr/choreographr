@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::io::{BufReader, BufWriter, Write};
+use std::os::unix::net::UnixStream;
 use tai_client_core::{ImageAssembler, StreamingText};
 use tai_proto::{
-    ClientMessage, DaemonMessage, ImageMetadata, ProtoError, read_message, write_message,
+    ClientMessage, DaemonMessage, ImageMetadata, ProtoError, read_message_sync, write_message_sync,
 };
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -47,55 +48,49 @@ pub enum BridgeEvent {
 }
 
 impl DaemonBridge {
-    pub fn spawn<R, W>(reader: R, writer: W) -> Self
-    where
-        R: tokio::io::AsyncRead + Send + Unpin + 'static,
-        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
-    {
-        let (client_tx, mut client_rx) = mpsc::channel::<DaemonBridgeCommand>(128);
+    pub fn spawn(reader: BufReader<UnixStream>, writer: BufWriter<UnixStream>) -> Self {
+        let (client_tx, client_rx) = mpsc::channel::<DaemonBridgeCommand>(128);
         let (event_tx, event_rx) = mpsc::channel::<BridgeEvent>(128);
         let writer_event_tx = event_tx.clone();
 
         info!("spawning daemon bridge tasks");
 
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             let mut writer = writer;
-            while let Some(cmd) = client_rx.recv().await {
+            let mut client_rx = client_rx;
+            while let Some(cmd) = client_rx.blocking_recv() {
                 match cmd {
                     DaemonBridgeCommand::SendMessage(msg) => {
                         debug!(?msg, "sending message to daemon");
-                        if let Err(e) = write_message(&mut writer, &msg).await {
+                        if let Err(e) = write_message_sync(&mut writer, &msg) {
                             error!(%e, "write error, bridge writer shutting down");
                             if let Err(send_err) = writer_event_tx
-                                .send(BridgeEvent::Error(format!("write error: {e}")))
-                                .await
+                                .blocking_send(BridgeEvent::Error(format!("write error: {e}")))
                             {
                                 warn!("failed to send write error event: {send_err}");
                             }
                             break;
                         }
+                        let _ = writer.flush();
                     }
                 }
             }
             info!("bridge writer task finished");
-            if let Err(e) = writer.shutdown().await {
-                debug!("writer shutdown returned error (harmless): {e}");
-            }
         });
 
-        tokio::spawn(async move {
+        std::thread::spawn(move || {
             let mut reader = reader;
             let mut assembler = ImageAssembler::new();
             let mut buffers: HashMap<u32, StreamingText> = HashMap::new();
 
             loop {
-                match read_message::<_, DaemonMessage>(&mut reader).await {
+                match read_message_sync::<_, DaemonMessage>(&mut reader) {
                     Ok(msg) => {
                         debug!(?msg, "received daemon message");
                         for event in
                             daemon_to_bridge_events(msg, &mut assembler, &mut buffers)
                         {
-                            if event_tx.send(event).await.is_err() {
+                            if event_tx.blocking_send(event).is_err() {
                                 warn!("bridge event receiver dropped, reader task exiting");
                                 return;
                             }
@@ -109,8 +104,7 @@ impl DaemonBridge {
                     {
                         error!(%e, "daemon disconnected");
                         if let Err(send_err) = event_tx
-                            .send(BridgeEvent::Error("daemon disconnected".into()))
-                            .await
+                            .blocking_send(BridgeEvent::Error("daemon disconnected".into()))
                         {
                             warn!("failed to send disconnect error event: {send_err}");
                         }
@@ -119,8 +113,7 @@ impl DaemonBridge {
                     Err(e) => {
                         error!(%e, "daemon read error, reader task exiting");
                         if let Err(send_err) = event_tx
-                            .send(BridgeEvent::Error(format!("daemon error: {e}")))
-                            .await
+                            .blocking_send(BridgeEvent::Error(format!("daemon error: {e}")))
                         {
                             warn!("failed to send daemon error event: {send_err}");
                         }

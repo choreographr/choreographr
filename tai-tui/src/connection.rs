@@ -6,7 +6,7 @@ use std::{io, time::Duration};
 use tai_client_core::{ClientError, dispatch_daemon_message, run_daemon_connection, shell_command_echo};
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc;
 
 const UI_EVENT_CHANNEL_SIZE: usize = 128;
 const UI_FRAME_POLL_MS: u64 = 16;
@@ -14,14 +14,14 @@ const UI_FRAME_POLL_MS: u64 = 16;
 pub(crate) async fn run_app() -> io::Result<()> {
     let socket_path = socket_path();
     let app_socket_path = socket_path.clone();
-    let (client_tx, client_rx) = mpsc::unbounded_channel::<ClientMessage>();
+    let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
 
     let picker = build_picker();
     let picker_protocol = format!("{:?}", picker.protocol_type());
 
     let connection_ui_tx = ui_tx.clone();
-    let connection_task = tokio::spawn(async move {
+    let connection_task = tokio::task::spawn_blocking(move || {
         let result = run_daemon_connection(
             &socket_path,
             |message| {
@@ -30,8 +30,7 @@ pub(crate) async fn run_app() -> io::Result<()> {
                 }
             },
             client_rx,
-        )
-        .await;
+        );
         if result.is_ok() {
             if let Err(e) = connection_ui_tx.try_send(UiEvent::ReaderClosed) {
                 eprintln!("[tai-tui] failed to send ReaderClosed UI event: {e}");
@@ -102,7 +101,7 @@ pub(crate) async fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     picker: &ratatui_image::picker::Picker,
-    client_tx: &UnboundedSender<ClientMessage>,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
     ui_rx: &mut mpsc::Receiver<UiEvent>,
 ) -> Result<(), ClientError> {
     while !app.should_quit {
@@ -142,7 +141,7 @@ pub(crate) async fn run_ui_loop(
 pub(crate) fn handle_terminal_event(
     event: Event,
     app: &mut App,
-    client_tx: &UnboundedSender<ClientMessage>,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match event {
         Event::Key(key) => {
@@ -215,7 +214,7 @@ pub(crate) fn handle_daemon_message(
     message: DaemonMessage,
     app: &mut App,
     picker: &ratatui_image::picker::Picker,
-    client_tx: &UnboundedSender<ClientMessage>,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     app.picker = Some(picker.clone());
 

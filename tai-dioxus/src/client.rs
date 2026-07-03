@@ -6,11 +6,11 @@ use tai_client_core::{
     shell_command_echo,
 };
 use tai_proto::{ClientMessage, DaemonMessage};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedSender;
 
-pub(crate) async fn run_client(
+pub(crate) fn run_client(
     socket_path: String,
-    client_rx: UnboundedReceiver<ClientMessage>,
+    client_rx: std::sync::mpsc::Receiver<ClientMessage>,
     ui_tx: UnboundedSender<UiEvent>,
 ) -> io::Result<()> {
     let result = run_daemon_connection(
@@ -21,8 +21,7 @@ pub(crate) async fn run_client(
             }
         },
         client_rx,
-    )
-    .await;
+    );
     if result.is_ok() {
         if let Err(e) = ui_tx.send(UiEvent::ReaderClosed) {
             eprintln!("[tai-dioxus] failed to send ReaderClosed UI event: {e}");
@@ -33,7 +32,7 @@ pub(crate) async fn run_client(
 
 pub(crate) fn submit_input(
     state: &mut Signal<AppState>,
-    daemon_tx: Option<UnboundedSender<ClientMessage>>,
+    daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
 ) {
     let line = state.read().input.trim().to_string();
     state.write().input.clear();
@@ -47,7 +46,7 @@ pub(crate) fn submit_input(
 
 pub(crate) fn handle_shell_command(
     state: &mut AppState,
-    daemon_tx: Option<UnboundedSender<ClientMessage>>,
+    daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
     command: ShellCommand,
 ) {
     match command {
@@ -64,7 +63,7 @@ pub(crate) fn handle_shell_command(
 
 pub(crate) fn send_client_message(
     state: &mut AppState,
-    daemon_tx: Option<UnboundedSender<ClientMessage>>,
+    daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
     message: ClientMessage,
 ) {
     let Some(sender) = daemon_tx else {
@@ -84,7 +83,7 @@ pub(crate) fn send_client_message(
 pub(crate) fn apply_daemon_message(
     state: &mut AppState,
     message: DaemonMessage,
-    daemon_tx: Option<UnboundedSender<ClientMessage>>,
+    daemon_tx: Option<std::sync::mpsc::Sender<ClientMessage>>,
 ) -> Result<(), ClientError> {
     match &message {
         DaemonMessage::SessionCreated { session_id, .. }
