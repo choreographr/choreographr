@@ -29,14 +29,17 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             Ok(None)
         }
         DaemonMessage::Sessions { sessions } => {
-            Ok(sessions.first().map(|session| ClientMessage::AttachSession {
-                session_id: session.session_id,
-            }).or(Some(ClientMessage::CreateSession {
-                title: Some("default".to_string()),
-                parent_session_id: None,
-                cwd: None,
-                max_turns: None,
-            })))
+            if sessions.is_empty() {
+                handler.push_text("[daemon] no sessions".to_string());
+            } else {
+                handler.push_text(format!("[daemon] sessions ({})", sessions.len()));
+                for session in &sessions {
+                    let title = session.title.as_deref().unwrap_or("untitled");
+                    let model = session.selected_model.as_deref().unwrap_or("-");
+                    handler.push_text(format!("  {}: \"{title}\" ({model}) — {} messages", session.session_id, session.message_count));
+                }
+            }
+            Ok(None)
         }
         DaemonMessage::SessionAttached { session_id } => {
             handler.push_text(format!("[daemon] attached session: {session_id}"));
@@ -46,14 +49,26 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             session_id,
             title,
             selected_model,
+            parent_session_id,
+            cwd,
+            max_turns,
             messages,
-            ..
         } => {
             let title = title.unwrap_or_else(|| "untitled".to_string());
             handler.push_text(format!("[daemon] session {session_id}: {title}"));
-            if let Some(model) = selected_model {
-                handler.push_text(format!("[daemon] selected model: {model}"));
+            if let Some(model) = &selected_model {
+                handler.push_text(format!("[daemon]   model: {model}"));
             }
+            if let Some(parent) = parent_session_id {
+                handler.push_text(format!("[daemon]   parent: {parent}"));
+            }
+            if let Some(cwd) = &cwd {
+                handler.push_text(format!("[daemon]   cwd: {cwd}"));
+            }
+            if let Some(mt) = max_turns {
+                handler.push_text(format!("[daemon]   max-turns: {mt}"));
+            }
+            handler.push_text(format!("[daemon]   {} messages", messages.len()));
             for message in messages {
                 handler.push_session_message(message);
             }

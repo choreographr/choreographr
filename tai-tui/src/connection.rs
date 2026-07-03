@@ -162,7 +162,7 @@ pub(crate) fn handle_terminal_event(
                 KeyCode::Enter => {
                     let line = app.input.trim().to_string();
                     app.input.clear();
-                    match parse_input_line(&line, &mut app.next_request_id) {
+                    match parse_input_line(&line, &mut app.next_request_id, app.attached_session_id) {
                         ShellCommand::Empty => {}
                         ShellCommand::InvalidCancel(value) => {
                             app.push_text(format!("invalid request id: {value}"))
@@ -218,6 +218,61 @@ pub(crate) fn handle_daemon_message(
     client_tx: &UnboundedSender<ClientMessage>,
 ) -> Result<(), ClientError> {
     app.picker = Some(picker.clone());
+
+    match &message {
+        DaemonMessage::SessionCreated { session_id, .. }
+        | DaemonMessage::SessionAttached { session_id } => {
+            app.attached_session_id = Some(*session_id);
+        }
+        DaemonMessage::Sessions { sessions } => {
+            if sessions.is_empty() {
+                app.push_text("[daemon] no sessions");
+            } else {
+                app.push_text(format!("[daemon] sessions ({})", sessions.len()));
+                for session in sessions {
+                    let prefix =
+                        if Some(session.session_id) == app.attached_session_id { "*" } else { " " };
+                    let title = session.title.as_deref().unwrap_or("untitled");
+                    let model = session.selected_model.as_deref().unwrap_or("-");
+                    app.push_text(format!(
+                        "{} {}: \"{title}\" ({model}) — {} messages",
+                        prefix, session.session_id, session.message_count,
+                    ));
+                }
+            }
+            if app.attached_session_id.is_none() {
+                if let Some(first) = sessions.first() {
+                    client_tx
+                        .send(ClientMessage::AttachSession {
+                            session_id: first.session_id,
+                        })
+                        .map_err(|e| {
+                            ClientError::Io(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                e.to_string(),
+                            ))
+                        })?;
+                } else {
+                    client_tx
+                        .send(ClientMessage::CreateSession {
+                            title: Some("default".to_string()),
+                            parent_session_id: None,
+                            cwd: None,
+                            max_turns: None,
+                        })
+                        .map_err(|e| {
+                            ClientError::Io(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                e.to_string(),
+                            ))
+                        })?;
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let response = dispatch_daemon_message(app, message)?;
     if let Some(msg) = response {
         client_tx.send(msg).map_err(|e| ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())))?;

@@ -39,7 +39,8 @@ pub(crate) fn submit_input(
     state.write().input.clear();
     let command = {
         let mut guard = state.write();
-        parse_input_line(&line, &mut guard.next_request_id)
+        let attached = guard.attached_session_id;
+        parse_input_line(&line, &mut guard.next_request_id, attached)
     };
     handle_shell_command(&mut state.write(), daemon_tx, command);
 }
@@ -85,6 +86,51 @@ pub(crate) fn apply_daemon_message(
     message: DaemonMessage,
     daemon_tx: Option<UnboundedSender<ClientMessage>>,
 ) -> Result<(), ClientError> {
+    match &message {
+        DaemonMessage::SessionCreated { session_id, .. }
+        | DaemonMessage::SessionAttached { session_id } => {
+            state.attached_session_id = Some(*session_id);
+        }
+        DaemonMessage::Sessions { sessions } => {
+            if sessions.is_empty() {
+                state.push_text("[daemon] no sessions");
+            } else {
+                state.push_text(format!("[daemon] sessions ({})", sessions.len()));
+                for session in sessions {
+                    let prefix = if Some(session.session_id) == state.attached_session_id {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    let title = session.title.as_deref().unwrap_or("untitled");
+                    let model = session.selected_model.as_deref().unwrap_or("-");
+                    state.push_text(format!(
+                        "{} {}: \"{title}\" ({model}) — {} messages",
+                        prefix, session.session_id, session.message_count,
+                    ));
+                }
+            }
+            if state.attached_session_id.is_none() {
+                if let Some(sender) = &daemon_tx {
+                    if let Some(first) = sessions.first() {
+                        let _ = sender.send(ClientMessage::AttachSession {
+                            session_id: first.session_id,
+                        });
+                    } else {
+                        let _ = sender.send(ClientMessage::CreateSession {
+                            title: Some("default".to_string()),
+                            parent_session_id: None,
+                            cwd: None,
+                            max_turns: None,
+                        });
+                    }
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let response = dispatch_daemon_message(state, message)?;
     if let Some(msg) = response
         && let Some(sender) = daemon_tx

@@ -65,6 +65,11 @@ In `tai-tui`:
 
 - `/ping` — health check
 - `/models` — list and select models
+- `/session` — show current session info
+- `/session list` — list all sessions
+- `/session new [title]` — create a new session
+- `/session switch <id>` — switch to a different session
+- `/session info <id>` — show info for a specific session
 - `/cancel <request-id>` — cancel a running request
 - `/unlock <passphrase>` — unlock the encrypted keystore
 - `/lock` — lock the daemon, clearing credentials from memory

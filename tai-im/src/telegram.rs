@@ -85,7 +85,7 @@ async fn handle_message(
     *state.chat_id.lock().await = Some(msg.chat.id);
 
     let mut request_id = *state.request_id.lock().await;
-    let command = parse_input_line(&text, &mut request_id);
+    let command = parse_input_line(&text, &mut request_id, None);
     *state.request_id.lock().await = request_id;
 
     match command {

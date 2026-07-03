@@ -8,14 +8,14 @@ pub enum ShellCommand {
     Empty,
 }
 
-pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> ShellCommand {
+pub fn parse_input_line(line: &str, next_request_id: &mut u32, attached_session_id: Option<u64>) -> ShellCommand {
     let line = line.trim();
     if line.is_empty() {
         return ShellCommand::Empty;
     }
 
     if let Some(rest) = line.strip_prefix('/') {
-        return parse_command(rest, next_request_id);
+        return parse_command(rest, next_request_id, attached_session_id);
     }
 
     let request_id = *next_request_id;
@@ -26,7 +26,7 @@ pub fn parse_input_line(line: &str, next_request_id: &mut u32) -> ShellCommand {
     })
 }
 
-fn parse_command(rest: &str, next_request_id: &mut u32) -> ShellCommand {
+fn parse_command(rest: &str, next_request_id: &mut u32, attached_session_id: Option<u64>) -> ShellCommand {
     if let Some(arg) = rest.strip_prefix("cancel ") {
         return match arg.trim().parse::<u32>() {
             Ok(request_id) => ShellCommand::Send(ClientMessage::Cancel { request_id }),
@@ -112,6 +112,59 @@ fn parse_command(rest: &str, next_request_id: &mut u32) -> ShellCommand {
         let request_id = *next_request_id;
         *next_request_id = next_request_id.wrapping_add(1);
         return ShellCommand::Send(ClientMessage::TestImage { request_id });
+    }
+
+    if let Some(sub) = rest.strip_prefix("session ") {
+        let sub = sub.trim();
+        if let Some(session_id) = sub.strip_prefix("switch ") {
+            return match session_id.trim().parse::<u64>() {
+                Ok(id) => ShellCommand::Send(ClientMessage::AttachSession { session_id: id }),
+                Err(_) => ShellCommand::UnknownCommand(
+                    "usage: /session switch <id>".to_string(),
+                ),
+            };
+        }
+        if let Some(session_id) = sub.strip_prefix("info ") {
+            return match session_id.trim().parse::<u64>() {
+                Ok(id) => ShellCommand::Send(ClientMessage::GetSessionState { session_id: id }),
+                Err(_) => ShellCommand::UnknownCommand(
+                    "usage: /session info <id>".to_string(),
+                ),
+            };
+        }
+        if let Some(title) = sub.strip_prefix("new ") {
+            let title = title.trim();
+            let title = if title.is_empty() { None } else { Some(title.to_string()) };
+            return ShellCommand::Send(ClientMessage::CreateSession {
+                title,
+                parent_session_id: None,
+                cwd: None,
+                max_turns: None,
+            });
+        }
+        if sub == "new" {
+            return ShellCommand::Send(ClientMessage::CreateSession {
+                title: None,
+                parent_session_id: None,
+                cwd: None,
+                max_turns: None,
+            });
+        }
+        if sub == "list" {
+            return ShellCommand::Send(ClientMessage::ListSessions);
+        }
+        return ShellCommand::UnknownCommand(
+            "session subcommands: list, new [title], switch <id>, info <id>".to_string(),
+        );
+    }
+
+    if rest == "session" {
+        return match attached_session_id {
+            Some(id) => ShellCommand::Send(ClientMessage::GetSessionState { session_id: id }),
+            None => ShellCommand::UnknownCommand(
+                "no session attached. use /session switch <id> to attach".to_string(),
+            ),
+        };
     }
 
     if let Some(model) = rest.strip_prefix("models ") {

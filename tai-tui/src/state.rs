@@ -15,6 +15,7 @@ pub(crate) struct App {
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
     pub(crate) picker: Option<ratatui_image::picker::Picker>,
+    pub(crate) attached_session_id: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -178,6 +179,7 @@ impl App {
             history_viewport: HistoryViewport::new(),
             should_quit: false,
             picker: None,
+            attached_session_id: None,
         }
     }
 

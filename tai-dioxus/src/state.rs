@@ -25,6 +25,7 @@ pub(crate) struct AppState {
     pub(crate) next_request_id: u32,
     pub(crate) client: ClientHistory<DisplayImage>,
     pub(crate) pending_cancel: String,
+    pub(crate) attached_session_id: Option<u64>,
 }
 
 impl AppState {
@@ -36,6 +37,7 @@ impl AppState {
                 "Connected to tai-daemon at {socket_path}"
             ))]),
             pending_cancel: String::new(),
+            attached_session_id: None,
         }
     }
 
