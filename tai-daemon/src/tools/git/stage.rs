@@ -17,14 +17,14 @@ struct GitAddArgs {
     pathspec: Vec<String>,
 }
 
-pub async fn execute_git_add_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_git_add_inner(arguments_json, cwd).await {
+pub fn execute_git_add_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_git_add_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-pub(super) async fn execute_git_add_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+pub(super) fn execute_git_add_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: GitAddArgs = serde_json::from_str(arguments_json)?;
     let pathspec = normalize_pathspecs(args.pathspec)?;
     let output = git_add_impl(args.repo_path.as_deref(), pathspec, cwd)?;

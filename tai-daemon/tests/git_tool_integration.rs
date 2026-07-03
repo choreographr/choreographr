@@ -74,8 +74,8 @@ fn git_output_result(repo: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_status_reports_staged_unstaged_and_untracked_changes() {
+#[test]
+fn git_status_reports_staged_unstaged_and_untracked_changes() {
     let repo = init_repo();
     std::fs::write(repo.join("tracked.txt"), "one\n").expect("write tracked");
     git(&repo, &["add", "tracked.txt"]);
@@ -87,7 +87,7 @@ async fn git_status_reports_staged_unstaged_and_untracked_changes() {
     git(&repo, &["add", "staged.txt"]);
 
     let result =
-        execute_git_status_tool(&serde_json::json!({ "repo_path": repo }).to_string(), None).await;
+        execute_git_status_tool(&serde_json::json!({ "repo_path": repo }).to_string(), None);
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("head: main"));
@@ -102,8 +102,8 @@ async fn git_status_reports_staged_unstaged_and_untracked_changes() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_diff_reports_worktree_and_cached_changes() {
+#[test]
+fn git_diff_reports_worktree_and_cached_changes() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
     git(&repo, &["add", "file.txt"]);
@@ -116,7 +116,7 @@ async fn git_diff_reports_worktree_and_cached_changes() {
     let worktree = execute_git_diff_tool(
         &serde_json::json!({ "repo_path": repo, "cached": false }).to_string(), None,
     )
-    .await;
+    ;
     assert!(!worktree.is_error, "{}", worktree.content);
     assert!(worktree.content.contains("mode: working tree"));
     assert!(worktree.content.contains("M file.txt"));
@@ -124,7 +124,7 @@ async fn git_diff_reports_worktree_and_cached_changes() {
     let cached = execute_git_diff_tool(
         &serde_json::json!({ "repo_path": repo, "cached": true }).to_string(), None,
     )
-    .await;
+    ;
     assert!(!cached.is_error, "{}", cached.content);
     assert!(cached.content.contains("mode: staged"));
     assert!(cached.content.contains("A added.txt"));
@@ -133,8 +133,8 @@ async fn git_diff_reports_worktree_and_cached_changes() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_log_reports_recent_commits() {
+#[test]
+fn git_log_reports_recent_commits() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
     git(&repo, &["add", "file.txt"]);
@@ -144,7 +144,7 @@ async fn git_log_reports_recent_commits() {
 
     let result =
         execute_git_log_tool(&serde_json::json!({ "repo_path": repo, "limit": 2 }).to_string(), None)
-            .await;
+            ;
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("head: main"));
@@ -163,8 +163,8 @@ async fn git_log_reports_recent_commits() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_add_stages_modified_untracked_and_deleted_paths() {
+#[test]
+fn git_add_stages_modified_untracked_and_deleted_paths() {
     let repo = init_repo();
     std::fs::write(repo.join("tracked.txt"), "one\n").expect("write tracked");
     std::fs::write(repo.join("delete-me.txt"), "gone\n").expect("write delete me");
@@ -182,7 +182,7 @@ async fn git_add_stages_modified_untracked_and_deleted_paths() {
         })
         .to_string(), None,
     )
-    .await;
+    ;
 
     assert!(!result.is_error, "{}", result.content);
     let cached = git_output(&repo, &["diff", "--cached", "--name-status"]);
@@ -194,8 +194,8 @@ async fn git_add_stages_modified_untracked_and_deleted_paths() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_add_accepts_clean_tracked_paths_as_noop() {
+#[test]
+fn git_add_accepts_clean_tracked_paths_as_noop() {
     let repo = init_repo();
     std::fs::write(repo.join("tracked.txt"), "one\n").expect("write tracked");
     git(&repo, &["add", "tracked.txt"]);
@@ -204,7 +204,7 @@ async fn git_add_accepts_clean_tracked_paths_as_noop() {
     let result = execute_git_add_tool(
         &serde_json::json!({ "repo_path": repo, "pathspec": ["tracked.txt"] }).to_string(), None,
     )
-    .await;
+    ;
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("index_changed: no"));
@@ -214,8 +214,8 @@ async fn git_add_accepts_clean_tracked_paths_as_noop() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_add_works_from_subdirectory_repo_path() {
+#[test]
+fn git_add_works_from_subdirectory_repo_path() {
     let repo = init_repo();
     std::fs::create_dir_all(repo.join("src")).expect("create src");
     std::fs::write(repo.join("src/lib.rs"), "pub fn one() {}\n").expect("write file");
@@ -224,7 +224,7 @@ async fn git_add_works_from_subdirectory_repo_path() {
     let result = execute_git_add_tool(
         &serde_json::json!({ "repo_path": subdir, "pathspec": ["lib.rs"] }).to_string(), None,
     )
-    .await;
+    ;
 
     assert!(!result.is_error, "{}", result.content);
     let cached = git_output(&repo, &["diff", "--cached", "--name-status"]);
@@ -234,14 +234,14 @@ async fn git_add_works_from_subdirectory_repo_path() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_add_rejects_empty_and_unmatched_pathspecs() {
+#[test]
+fn git_add_rejects_empty_and_unmatched_pathspecs() {
     let repo = init_repo();
 
     let empty = execute_git_add_tool(
         &serde_json::json!({ "repo_path": repo, "pathspec": ["", "  "] }).to_string(), None,
     )
-    .await;
+    ;
     assert!(empty.is_error);
     assert!(
         empty
@@ -252,7 +252,7 @@ async fn git_add_rejects_empty_and_unmatched_pathspecs() {
     let unmatched = execute_git_add_tool(
         &serde_json::json!({ "repo_path": repo, "pathspec": ["missing.txt"] }).to_string(), None,
     )
-    .await;
+    ;
     assert!(unmatched.is_error);
     assert!(
         unmatched
@@ -264,19 +264,19 @@ async fn git_add_rejects_empty_and_unmatched_pathspecs() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_commit_creates_commit_from_staged_index() {
+#[test]
+fn git_commit_creates_commit_from_staged_index() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
     execute_git_add_tool(
         &serde_json::json!({ "repo_path": repo, "pathspec": ["file.txt"] }).to_string(), None,
     )
-    .await;
+    ;
 
     let result = execute_git_commit_tool(
         &serde_json::json!({ "repo_path": repo, "message": "Add file" }).to_string(), None,
     )
-    .await;
+    ;
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("head: main"));
@@ -292,8 +292,8 @@ async fn git_commit_creates_commit_from_staged_index() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_commit_supports_multiline_messages_and_allow_empty() {
+#[test]
+fn git_commit_supports_multiline_messages_and_allow_empty() {
     let repo = init_repo();
 
     let empty_commit = execute_git_commit_tool(
@@ -304,7 +304,7 @@ async fn git_commit_supports_multiline_messages_and_allow_empty() {
         })
         .to_string(), None,
     )
-    .await;
+    ;
     assert!(!empty_commit.is_error, "{}", empty_commit.content);
     assert!(empty_commit.content.contains("Initial empty"));
 
@@ -315,21 +315,21 @@ async fn git_commit_supports_multiline_messages_and_allow_empty() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_commit_rejects_blank_message_and_missing_staged_changes() {
+#[test]
+fn git_commit_rejects_blank_message_and_missing_staged_changes() {
     let repo = init_repo();
 
     let blank = execute_git_commit_tool(
         &serde_json::json!({ "repo_path": repo, "message": "   " }).to_string(), None,
     )
-    .await;
+    ;
     assert!(blank.is_error);
     assert!(blank.content.contains("commit message must not be empty"));
 
     let no_changes = execute_git_commit_tool(
         &serde_json::json!({ "repo_path": repo, "message": "Nothing" }).to_string(), None,
     )
-    .await;
+    ;
     assert!(no_changes.is_error);
     assert!(no_changes.content.contains("no staged changes to commit"));
 
@@ -337,8 +337,8 @@ async fn git_commit_rejects_blank_message_and_missing_staged_changes() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_commit_rejects_conflicted_index() {
+#[test]
+fn git_commit_rejects_conflicted_index() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
     git(&repo, &["add", "file.txt"]);
@@ -362,7 +362,7 @@ async fn git_commit_rejects_conflicted_index() {
     let result = execute_git_commit_tool(
         &serde_json::json!({ "repo_path": repo, "message": "should fail" }).to_string(), None,
     )
-    .await;
+    ;
     assert!(result.is_error);
     assert!(result.content.contains("unresolved index conflicts"));
 
@@ -370,8 +370,8 @@ async fn git_commit_rejects_conflicted_index() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_push_pushes_branch_to_remote_and_sets_upstream() {
+#[test]
+fn git_push_pushes_branch_to_remote_and_sets_upstream() {
     let repo = init_repo();
     let remote = init_bare_remote();
     git(
@@ -395,7 +395,7 @@ async fn git_push_pushes_branch_to_remote_and_sets_upstream() {
         })
         .to_string(), None,
     )
-    .await;
+    ;
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("remote: origin"));
@@ -416,8 +416,8 @@ async fn git_push_pushes_branch_to_remote_and_sets_upstream() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_push_supports_dry_run() {
+#[test]
+fn git_push_supports_dry_run() {
     let repo = init_repo();
     let remote = init_bare_remote();
     git(
@@ -442,7 +442,7 @@ async fn git_push_supports_dry_run() {
         })
         .to_string(), None,
     )
-    .await;
+    ;
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("dry_run: yes"));
@@ -458,8 +458,8 @@ async fn git_push_supports_dry_run() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_push_rejects_detached_head_without_branch() {
+#[test]
+fn git_push_rejects_detached_head_without_branch() {
     let repo = init_repo();
     let remote = init_bare_remote();
     git(
@@ -480,7 +480,7 @@ async fn git_push_rejects_detached_head_without_branch() {
     let result = execute_git_push_tool(
         &serde_json::json!({ "repo_path": repo, "remote": "origin" }).to_string(), None,
     )
-    .await;
+    ;
 
     assert!(result.is_error);
     assert!(
@@ -494,8 +494,8 @@ async fn git_push_rejects_detached_head_without_branch() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn git_push_reports_push_failure() {
+#[test]
+fn git_push_reports_push_failure() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
     git(&repo, &["add", "file.txt"]);
@@ -509,7 +509,7 @@ async fn git_push_reports_push_failure() {
         })
         .to_string(), None,
     )
-    .await;
+    ;
 
     assert!(result.is_error);
     assert!(result.content.contains("result: push failed"));

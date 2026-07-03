@@ -6,19 +6,17 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 bincode.workspace = true
-async-trait = "0.1"
 base64.workspace = true
-bytes = "1"
 dirs.workspace = true
 fff-search = "0.9"
 hex = "0.4"
-futures-util.workspace = true
+
 gix = { version = "0.85", features = ["tree-editor"] }
 hmac = "0.13"
 image.workspace = true
 rand.workspace = true
 redb.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "blocking"] }
 resvg.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,7 +29,7 @@ url = "2"
 subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
 tai-keystore.workspace = true
 tai-proto.workspace = true
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros"] }
 toml = "1.1"
 tracing.workspace = true
 tracing-subscriber.workspace = true

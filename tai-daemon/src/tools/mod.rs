@@ -1,5 +1,4 @@
 use crate::openai::{ChatToolCall, ChatToolDefinition};
-use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use tai_keystore::XCredentials;
@@ -8,14 +7,13 @@ use tai_keystore::XCredentials;
 macro_rules! define_tool {
     ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr) => {
         pub(crate) struct $struct;
-        #[::async_trait::async_trait]
         impl $crate::tools::Tool for $struct {
             fn name(&self) -> &'static str { $name }
             fn description(&self) -> &'static str { $desc }
             fn schema(&self) -> serde_json::Value { $schema }
-            async fn execute(&self, args: &str, _x_credentials: Option<&tai_keystore::XCredentials>, _cwd: Option<&std::path::Path>) -> $crate::tools::ToolExecutionOutput {
+            fn execute(&self, args: &str, _x_credentials: Option<&tai_keystore::XCredentials>, _cwd: Option<&std::path::Path>) -> $crate::tools::ToolExecutionOutput {
                 $crate::tools::ToolExecutionOutput {
-                    result: $exec_fn(args).await,
+                    result: $exec_fn(args),
                     image: None,
                 }
             }
@@ -27,14 +25,13 @@ macro_rules! define_tool {
 macro_rules! define_tool_with_cwd {
     ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr) => {
         pub(crate) struct $struct;
-        #[::async_trait::async_trait]
         impl $crate::tools::Tool for $struct {
             fn name(&self) -> &'static str { $name }
             fn description(&self) -> &'static str { $desc }
             fn schema(&self) -> serde_json::Value { $schema }
-            async fn execute(&self, args: &str, _x_credentials: Option<&tai_keystore::XCredentials>, cwd: Option<&std::path::Path>) -> $crate::tools::ToolExecutionOutput {
+            fn execute(&self, args: &str, _x_credentials: Option<&tai_keystore::XCredentials>, cwd: Option<&std::path::Path>) -> $crate::tools::ToolExecutionOutput {
                 $crate::tools::ToolExecutionOutput {
-                    result: $exec_fn(args, cwd).await,
+                    result: $exec_fn(args, cwd),
                     image: None,
                 }
             }
@@ -64,7 +61,7 @@ pub struct ToolResult {
 }
 
 #[derive(Debug)]
-pub(crate) struct ToolExecutionOutput {
+pub struct ToolExecutionOutput {
     pub(crate) result: ToolResult,
     pub(crate) image: Option<PreparedImage>,
 }
@@ -78,17 +75,14 @@ pub(crate) struct PreparedImage {
     pub(crate) alt: Option<String>,
 }
 
-pub(crate) use image::emit_prepared_image;
-
-#[async_trait]
-pub(crate) trait Tool: Send + Sync {
+pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn schema(&self) -> serde_json::Value;
-    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, cwd: Option<&std::path::Path>) -> ToolExecutionOutput;
+    fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, cwd: Option<&std::path::Path>) -> ToolExecutionOutput;
 }
 
-pub(crate) struct ToolRegistry {
+pub struct ToolRegistry {
     tools: HashMap<&'static str, Box<dyn Tool>>,
 }
 
@@ -135,9 +129,9 @@ impl ToolRegistry {
         self.tools.insert(name, Box::new(tool));
     }
 
-    pub async fn execute(&self, tool_call: &ChatToolCall, x_credentials: Option<&XCredentials>, cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
+    pub fn execute(&self, tool_call: &ChatToolCall, x_credentials: Option<&XCredentials>, cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
-            Some(tool) => tool.execute(&tool_call.arguments_json, x_credentials, cwd).await,
+            Some(tool) => tool.execute(&tool_call.arguments_json, x_credentials, cwd),
             None => ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("unknown tool: {}", tool_call.name),
@@ -173,26 +167,6 @@ pub(crate) fn resolve_path(path: &str, cwd: Option<&std::path::Path>) -> std::pa
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn execute_read_file_range_tool(arguments_json: &str) -> ToolResult {
-    fs::execute_read_file_range_tool(arguments_json, None).await
-}
-
-#[cfg(test)]
-pub(crate) async fn execute_write_file_tool(arguments_json: &str) -> ToolResult {
-    fs::execute_write_file_tool(arguments_json, None).await
-}
-
-#[cfg(test)]
-pub(crate) async fn execute_edit_file_tool(arguments_json: &str) -> ToolResult {
-    fs::execute_edit_file_tool(arguments_json, None).await
-}
-
-#[cfg(test)]
-pub(crate) async fn execute_http_request_tool(arguments_json: &str) -> ToolResult {
-    http::execute_http_request_tool(arguments_json).await
-}
-
 pub(crate) fn sha256_hex(content: &str) -> String {
     let digest = Sha256::digest(content.as_bytes());
     hex::encode(digest)
@@ -209,3 +183,10 @@ pub(crate) fn truncate_tool_output(content: &str) -> String {
         .collect::<String>();
     format!("{truncated}\n...[truncated]")
 }
+
+pub(crate) use fs::execute_read_file_range_tool;
+pub(crate) use fs::execute_write_file_tool;
+pub(crate) use fs::execute_edit_file_tool;
+pub(crate) use http::execute_http_request_tool;
+
+

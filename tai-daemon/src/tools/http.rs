@@ -16,14 +16,14 @@ struct HttpRequestArgs {
     timeout_secs: Option<u64>,
 }
 
-pub(crate) async fn execute_http_request_tool(arguments_json: &str) -> ToolResult {
-    match execute_http_request_tool_inner(arguments_json).await {
+pub(crate) fn execute_http_request_tool(arguments_json: &str) -> ToolResult {
+    match execute_http_request_tool_inner(arguments_json) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_http_request_tool_inner(arguments_json: &str) -> Result<String, ToolError> {
+fn execute_http_request_tool_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: HttpRequestArgs = serde_json::from_str(arguments_json)?;
 
     let method = match args.method.as_str() {
@@ -40,7 +40,7 @@ async fn execute_http_request_tool_inner(arguments_json: &str) -> Result<String,
     }
 
     let timeout_secs = args.timeout_secs.unwrap_or(10).clamp(1, 30);
-    let client = reqwest::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .build()
         .map_err(|e| ToolError::Other(format!("failed to build http client: {e}")))?;
@@ -57,7 +57,6 @@ async fn execute_http_request_tool_inner(arguments_json: &str) -> Result<String,
 
     let response = request
         .send()
-        .await
         .map_err(|e| ToolError::RequestFailed(e.to_string()))?;
 
     let status = response.status();
@@ -70,7 +69,7 @@ async fn execute_http_request_tool_inner(arguments_json: &str) -> Result<String,
     let body = if method == Method::HEAD {
         String::new()
     } else if is_text_content_type(&content_type) {
-        match response.text().await {
+        match response.text() {
             Ok(text) => truncate_tool_output(&text),
             Err(error) => format!("body omitted: failed to decode response text: {error}"),
         }

@@ -8,17 +8,18 @@ use std::str::FromStr;
 
 use super::{EvmTokenBalanceArgs, alloy_err, balanceOfCall, connect, symbolCall};
 
-pub(crate) async fn execute_evm_token_balance_tool(arguments_json: &str) -> ToolResult {
-    match execute_evm_token_balance_inner(arguments_json).await {
+pub(crate) fn execute_evm_token_balance_tool(arguments_json: &str) -> ToolResult {
+    match execute_evm_token_balance_inner(arguments_json) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_evm_token_balance_inner(arguments_json: &str) -> Result<String, ToolError> {
+fn execute_evm_token_balance_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmTokenBalanceArgs = serde_json::from_str(arguments_json)?;
-    let output =
-        evm_token_balance_impl(&args.rpc_url, &args.token_address, &args.address).await?;
+    let output = tokio::runtime::Handle::current().block_on(
+        evm_token_balance_impl(&args.rpc_url, &args.token_address, &args.address),
+    )?;
     Ok(truncate_tool_output(&output))
 }
 

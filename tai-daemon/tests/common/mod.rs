@@ -1,14 +1,15 @@
 use std::sync::Arc;
 use tai_daemon::DaemonState;
-use tai_daemon::new_daemon_state;
 use tai_daemon::openai::{OpenAiClient, RequestFormat, ServiceConfig};
+use tokio::sync::mpsc;
 
 pub fn test_db() -> redb::Database {
     let dir = tempfile::tempdir().unwrap();
     redb::Database::create(dir.path().join("state.redb")).unwrap()
 }
 
-pub fn test_service_config() -> ServiceConfig {
+    #[allow(dead_code)]
+    pub fn test_service_config() -> ServiceConfig {
     ServiceConfig {
         base_url: "https://example.com/v1".to_string(),
         model_list_path: "/models".to_string(),
@@ -29,12 +30,25 @@ pub fn test_service_config() -> ServiceConfig {
     }
 }
 
-pub fn test_client() -> Arc<OpenAiClient> {
+    #[allow(dead_code)]
+    pub fn test_client() -> Arc<OpenAiClient> {
     Arc::new(OpenAiClient::new(test_service_config(), "test-key".to_string()).expect("client"))
 }
 
-pub async fn test_state_with_client() -> DaemonState {
-    let state = new_daemon_state(test_db(), 25).await;
-    state.lock().await.openai_client = Some(test_client());
-    state
+    #[allow(dead_code)]
+    pub fn test_state_with_client() -> DaemonState {
+    let db = Arc::new(test_db());
+    let (daemon_tx, _) = mpsc::unbounded_channel();
+    DaemonState {
+        next_session_id: 1,
+        max_turns: 25,
+        active_sessions: std::collections::HashMap::new(),
+        session_metadata: std::collections::HashMap::new(),
+        openai_client: Some(test_client()),
+        keystore: None,
+        x_credentials: None,
+        db,
+        tool_registry: Arc::new(tai_daemon::tools::ToolRegistry::new()),
+        daemon_tx,
+    }
 }

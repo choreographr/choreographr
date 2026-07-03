@@ -253,12 +253,12 @@ impl ChatToolDefinition {
 pub struct OpenAiClient {
     config: ServiceConfig,
     api_key: String,
-    http: reqwest::Client,
+    http: reqwest::blocking::Client,
 }
 
 impl OpenAiClient {
     pub fn new(config: ServiceConfig, api_key: String) -> io::Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .build()

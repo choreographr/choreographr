@@ -1,420 +1,356 @@
+use crate::context;
+use crate::db::{self, SessionRecord, write_message_retry, write_session_retry};
 use crate::openai::OpenAiClient;
-use crate::openai::load_service_config;
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
-use tai_keystore::{Keystore, XCredentials};
+use crate::requests::run_agent_loop;
+use crate::tools::ToolRegistry;
+use crate::daemon::DaemonCommand;
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::task::JoinHandle;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tai_proto::{DaemonMessage, SessionMessage, SessionSummary};
-use tokio::{
-    sync::{Mutex, mpsc},
-    task::JoinHandle,
-};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
-pub(crate) struct ActiveRequest {
-    pub(crate) handle: JoinHandle<()>,
+pub enum SessionCommand {
+    RunInput {
+        request_id: u32,
+        input: Vec<u8>,
+    },
+    RunChildInput {
+        request_id: u32,
+        input_tokens: Vec<u8>,
+        reply: std::sync::mpsc::Sender<io::Result<ChildResult>>,
+    },
+    Cancel {
+        request_id: u32,
+    },
+    SetModel {
+        model: String,
+    },
+    Attach {
+        client_id: u64,
+        tx: std::sync::mpsc::Sender<DaemonMessage>,
+    },
+    Detach {
+        client_id: u64,
+    },
+    GetSummary {
+        reply: std::sync::mpsc::Sender<SessionSummary>,
+    },
+    AppendMessage {
+        message: SessionMessage,
+    },
+    Shutdown,
 }
 
-pub(crate) struct SessionState {
-    pub(crate) title: Option<String>,
-    pub(crate) selected_model: Option<String>,
-    pub(crate) parent_session_id: Option<u64>,
-    pub(crate) cwd: Option<std::path::PathBuf>,
-    pub(crate) max_turns: Option<u32>,
-    pub(crate) created_at: i64,
-    pub(crate) messages: Vec<SessionMessage>,
-    pub(crate) active_requests: HashMap<u32, ActiveRequest>,
-    pub(crate) subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>,
-    pub(crate) context_fingerprint: Option<u64>,
-    pub(crate) context_file_paths: Vec<std::path::PathBuf>,
-    pub(crate) context_message_index: Option<usize>,
+pub struct ChildResult {
+    pub output: String,
+    pub is_error: bool,
 }
 
-pub struct DaemonStateInner {
-    pub(crate) next_session_id: u64,
-    pub(crate) next_client_id: u64,
-    pub(crate) max_turns: u32,
-    pub(crate) sessions: HashMap<u64, Arc<Mutex<SessionState>>>,
-    pub openai_client: Option<Arc<OpenAiClient>>,
-    pub keystore: Option<Arc<Keystore>>,
-    pub x_credentials: Option<XCredentials>,
-    pub db: Arc<redb::Database>,
-    pub(crate) tool_registry: Arc<crate::tools::ToolRegistry>,
+#[derive(Debug, Clone)]
+pub struct SessionMetadata {
+    pub title: Option<String>,
+    pub selected_model: Option<String>,
+    pub parent_session_id: Option<u64>,
+    pub cwd: Option<String>,
+    pub created_at: i64,
+    pub message_count: u32,
+    pub max_turns: Option<u32>,
 }
 
-pub type DaemonState = Arc<Mutex<DaemonStateInner>>;
-
-pub async fn new_daemon_state(db: redb::Database, max_turns: u32) -> DaemonState {
-    let db = Arc::new(db);
-
-    let stored_sessions =
-        crate::db::read_all_sessions(&db).unwrap_or_else(|e| {
-            warn!(error = %e, "failed to read sessions from DB, starting fresh");
-            Vec::new()
-        });
-
-    let mut sessions: HashMap<u64, Arc<Mutex<SessionState>>> = HashMap::new();
-    let mut max_id: u64 = 0;
-
-    for (id, record) in stored_sessions {
-        let messages = crate::db::read_messages(&db, id).unwrap_or_else(|e| {
-            warn!(session_id = id, error = %e, "failed to read messages for session, using empty");
-            Vec::new()
-        });
-        sessions.insert(
-            id,
-            Arc::new(Mutex::new(SessionState {
-                title: record.title,
-                selected_model: record.selected_model,
-                parent_session_id: record.parent_session_id,
-                cwd: record.cwd.map(std::path::PathBuf::from),
-                max_turns: record.max_turns,
-                created_at: record.created_at,
-                messages,
-                active_requests: HashMap::new(),
-                subscribers: HashMap::new(),
-                context_fingerprint: None,
-                context_file_paths: Vec::new(),
-                context_message_index: None,
-            })),
-        );
-        max_id = max_id.max(id);
-    }
-
-    if sessions.is_empty() {
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        sessions.insert(
-            1,
-            Arc::new(Mutex::new(SessionState {
-                title: Some("default".into()),
-                selected_model: None,
-                parent_session_id: None,
-                cwd: None,
-                max_turns: None,
-                created_at,
-                messages: Vec::new(),
-                active_requests: HashMap::new(),
-                subscribers: HashMap::new(),
-                context_fingerprint: None,
-                context_file_paths: Vec::new(),
-                context_message_index: None,
-            })),
-        );
-        max_id = 1;
-    }
-
-    Arc::new(Mutex::new(DaemonStateInner {
-        next_session_id: max_id.wrapping_add(1),
-        next_client_id: 1,
-        max_turns,
-        sessions,
-        openai_client: None,
-        keystore: None,
-        x_credentials: None,
-        db,
-        tool_registry: Arc::new(crate::tools::ToolRegistry::new()),
-    }))
+pub struct ActiveSessionEntry {
+    pub cmd_tx: std::sync::mpsc::Sender<SessionCommand>,
+    pub handle: JoinHandle<()>,
 }
 
-pub(crate) async fn default_session_id(state: &DaemonState) -> Option<u64> {
-    state.lock().await.sessions.keys().min().copied()
+pub struct SessionState {
+    pub title: Option<String>,
+    pub selected_model: Option<String>,
+    pub parent_session_id: Option<u64>,
+    pub cwd: Option<PathBuf>,
+    pub max_turns: Option<u32>,
+    pub created_at: i64,
+    pub messages: Vec<SessionMessage>,
+    pub subscribers: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
+    pub context_fingerprint: Option<u64>,
+    pub context_file_paths: Vec<PathBuf>,
+    pub context_message_index: Option<usize>,
 }
 
-pub(crate) async fn update_subscription(
-    state: &DaemonState,
-    client_id: u64,
-    previous_session_id: Option<u64>,
-    next_session_id: Option<u64>,
-    tx: &mpsc::Sender<DaemonMessage>,
-) {
-    if previous_session_id == next_session_id {
-        return;
-    }
-
-    if let Some(session_id) = previous_session_id
-        && let Some(session) = session_by_id(state, session_id).await
-    {
-        session.lock().await.subscribers.remove(&client_id);
-    }
-
-    if let Some(session_id) = next_session_id
-        && let Some(session) = session_by_id(state, session_id).await
-    {
-        session
-            .lock()
-            .await
-            .subscribers
-            .insert(client_id, tx.clone());
-    }
-}
-
-pub(crate) async fn broadcast_to_session(
-    session: &Arc<Mutex<SessionState>>,
-    message: DaemonMessage,
-    exclude_client_id: Option<u64>,
-) {
-    let subscribers = {
-        let guard = session.lock().await;
-        guard
-            .subscribers
-            .iter()
-            .filter(|(client_id, _)| Some(**client_id) != exclude_client_id)
-            .map(|(_, tx)| tx.clone())
-            .collect::<Vec<_>>()
-    };
-    for tx in subscribers {
-        if let Err(e) = tx.send(message.clone()).await {
-            warn!(error = %e, "failed to send broadcast message, subscriber disconnected");
+fn broadcast(subscribers: &HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>, message: DaemonMessage) {
+    for tx in subscribers.values() {
+        if let Err(e) = tx.send(message.clone()) {
+            warn!("failed to broadcast, subscriber disconnected: {e}");
         }
     }
 }
 
-pub(crate) async fn broadcast_message_appended(
-    session: &Arc<Mutex<SessionState>>,
-    message: SessionMessage,
-    exclude_client_id: Option<u64>,
-) {
-    let subscribers = {
-        let guard = session.lock().await;
-        guard
-            .subscribers
-            .iter()
-            .filter(|(client_id, _)| Some(**client_id) != exclude_client_id)
-            .map(|(_, tx)| tx.clone())
-            .collect::<Vec<_>>()
-    };
-    for tx in subscribers {
-        if let Err(e) = tx
-            .send(DaemonMessage::SessionMessageAppended {
-                message: message.clone(),
-            })
-            .await
-        {
-            warn!(error = %e, "failed to send broadcast message_appended, subscriber disconnected");
-        }
-    }
-}
-
-pub(crate) async fn session_by_id(
-    state: &DaemonState,
+pub fn session_main(
+    rx: std::sync::mpsc::Receiver<SessionCommand>,
     session_id: u64,
-) -> Option<Arc<Mutex<SessionState>>> {
-    state.lock().await.sessions.get(&session_id).cloned()
-}
-
-pub(crate) async fn list_sessions(state: &DaemonState) -> Vec<SessionSummary> {
-    let sessions: Vec<(u64, Arc<Mutex<SessionState>>)> = state
-        .lock()
-        .await
-        .sessions
-        .iter()
-        .map(|(session_id, session)| (*session_id, Arc::clone(session)))
-        .collect();
-    let mut summaries = Vec::with_capacity(sessions.len());
-    for (session_id, session) in sessions {
-        let guard = session.lock().await;
-        summaries.push(SessionSummary {
-            session_id,
-            title: guard.title.clone(),
-            selected_model: guard.selected_model.clone(),
-            parent_session_id: guard.parent_session_id,
-            cwd: guard.cwd.as_ref().map(|p| p.display().to_string()),
-            created_at: guard.created_at,
-            message_count: guard.messages.len() as u32,
-            max_turns: guard.max_turns,
-        });
-    }
-    summaries.sort_by_key(|summary| summary.session_id);
-    summaries
-}
-
-pub(crate) async fn session_snapshot(
-    session_id: u64,
-    session: &Arc<Mutex<SessionState>>,
-) -> DaemonMessage {
-    let guard = session.lock().await;
-    DaemonMessage::SessionState {
-        session_id,
-        title: guard.title.clone(),
-        selected_model: guard.selected_model.clone(),
-        parent_session_id: guard.parent_session_id,
-        cwd: guard.cwd.as_ref().map(|p| p.display().to_string()),
-        max_turns: guard.max_turns,
-        messages: guard.messages.clone(),
-    }
-}
-
-pub(crate) async fn require_attached_session(
-    state: &DaemonState,
-    attached_session_id: Option<u64>,
-    tx: &mpsc::Sender<DaemonMessage>,
-) -> anyhow::Result<Option<(u64, Arc<Mutex<SessionState>>)>> {
-    let Some(session_id) = attached_session_id else {
-        if let Err(e) = tx
-            .send(DaemonMessage::SessionFailed {
-                operation: "require_attached_session".to_string(),
-                error: "no session attached".to_string(),
-            })
-            .await
-        {
-            warn!("failed to notify subscriber of session failure: {e}");
-        }
-        return Ok(None);
-    };
-    let Some(session) = session_by_id(state, session_id).await else {
-        if let Err(e) = tx
-            .send(DaemonMessage::SessionFailed {
-                operation: "require_attached_session".to_string(),
-                error: format!("unknown session: {session_id}"),
-            })
-            .await
-        {
-            warn!("failed to notify subscriber of session failure: {e}");
-        }
-        return Ok(None);
-    };
-    Ok(Some((session_id, session)))
-}
-
-pub(crate) async fn create_session_internal(
-    state: &DaemonState,
-    title: Option<String>,
-    parent_session_id: Option<u64>,
-    cwd: Option<std::path::PathBuf>,
-    max_turns: Option<u32>,
-) -> anyhow::Result<(u64, Arc<Mutex<SessionState>>)> {
-    let resolved_cwd = if cwd.is_some() {
-        cwd
-    } else if let Some(parent_id) = parent_session_id {
-        if let Some(parent) = session_by_id(state, parent_id).await {
-            parent.lock().await.cwd.clone()
-        } else {
-            None
-        }
-    } else {
-        None
+    db: Arc<redb::Database>,
+    client: Option<Arc<OpenAiClient>>,
+    tool_registry: Arc<ToolRegistry>,
+    daemon_tx: UnboundedSender<DaemonCommand>,
+    init_record: Option<SessionRecord>,
+    max_turns_default: u32,
+) {
+    let mut state = SessionState {
+        title: init_record.as_ref().and_then(|r| r.title.clone()),
+        selected_model: init_record.as_ref().and_then(|r| r.selected_model.clone()),
+        parent_session_id: init_record.as_ref().and_then(|r| r.parent_session_id),
+        cwd: init_record.as_ref().and_then(|r| r.cwd.as_ref().map(PathBuf::from)),
+        max_turns: init_record.as_ref().and_then(|r| r.max_turns),
+        created_at: init_record.as_ref().map(|r| r.created_at).unwrap_or_else(|| {
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+        }),
+        messages: Vec::new(),
+        subscribers: HashMap::new(),
+        context_fingerprint: None,
+        context_file_paths: Vec::new(),
+        context_message_index: None,
     };
 
-    let resolved_max_turns = if max_turns.is_some() {
-        max_turns
-    } else if let Some(parent_id) = parent_session_id {
-        if let Some(parent) = session_by_id(state, parent_id).await {
-            parent.lock().await.max_turns
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-
-    let (session_id, session, db) = {
-        let mut guard = state.lock().await;
-        let session_id = guard.next_session_id;
-        guard.next_session_id = guard.next_session_id.wrapping_add(1);
-
-        let session = Arc::new(Mutex::new(SessionState {
-            title: title.clone(),
-            selected_model: None,
-            parent_session_id,
-            cwd: resolved_cwd.clone(),
-            max_turns: resolved_max_turns,
-            created_at,
-            messages: Vec::new(),
-            active_requests: HashMap::new(),
-            subscribers: HashMap::new(),
-            context_fingerprint: None,
-            context_file_paths: Vec::new(),
-            context_message_index: None,
-        }));
-
-        guard.sessions.insert(session_id, Arc::clone(&session));
-        (session_id, session, Arc::clone(&guard.db))
-    };
-
-    let record = crate::db::SessionRecord {
-        title,
-        selected_model: None,
-        parent_session_id,
-        cwd: resolved_cwd.as_ref().map(|p| p.display().to_string()),
-        max_turns: resolved_max_turns,
-        message_count: 0,
-        created_at,
-    };
-    if let Err(e) = crate::db::write_session(&db, session_id, &record) {
-        warn!(session_id, error = %e, "failed to persist new session to DB");
+    match db::read_messages(&db, session_id) {
+        Ok(msgs) => state.messages = msgs,
+        Err(e) => warn!(session_id, error = %e, "failed to load messages from DB"),
     }
 
-    // Inject context messages (stable base + volatile project context)
-    {
-        let context_config = load_service_config()
-            .map(|c| c.context)
-            .unwrap_or_default();
-        let effective_cwd = resolved_cwd.as_deref().unwrap_or_else(|| Path::new("."));
-        let skills = crate::context::discover_skills(effective_cwd);
-        let base_prompt = crate::context::build_base_prompt(&skills);
+    if init_record.is_none() || state.messages.is_empty() {
+        let effective_cwd = state.cwd.as_deref().unwrap_or_else(|| Path::new("."));
+        let skills = context::discover_skills(effective_cwd);
+        let base_prompt = context::build_base_prompt(&skills);
+        state.messages.push(SessionMessage::SystemText { content: base_prompt });
+        write_message_retry(&db, session_id, 0, &state.messages[0]).ok();
 
-        append_message_and_persist(
-            &session,
-            &db,
-            session_id,
-            SessionMessage::SystemText {
-                content: base_prompt,
-            },
-        )
-        .await;
-
-        if let Ok(bundle) = crate::context::discover_context(effective_cwd, &context_config) {
-            let context_str = crate::context::assemble_context(&bundle);
+        if let Ok(bundle) = context::discover_context(effective_cwd, &Default::default()) {
+            let context_str = context::assemble_context(&bundle);
             if !context_str.is_empty() {
-                append_message_and_persist(
-                    &session,
-                    &db,
-                    session_id,
-                    SessionMessage::SystemText {
-                        content: context_str,
-                    },
-                )
-                .await;
-
-                let mut guard = session.lock().await;
-                guard.context_fingerprint = Some(bundle.fingerprint);
-                guard.context_file_paths =
-                    bundle.files.iter().map(|f| f.path.clone()).collect();
-                guard.context_message_index = Some(1);
+                state.messages.push(SessionMessage::SystemText { content: context_str });
+                write_message_retry(&db, session_id, 1, &state.messages[1]).ok();
+                state.context_fingerprint = Some(bundle.fingerprint);
+                state.context_file_paths = bundle.files.iter().map(|f| f.path.clone()).collect();
+                state.context_message_index = Some(1);
             }
         }
     }
 
-    Ok((session_id, session))
+    let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
+        session_id,
+        metadata: SessionMetadata {
+            title: state.title.clone(),
+            selected_model: state.selected_model.clone(),
+            parent_session_id: state.parent_session_id,
+            cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
+            created_at: state.created_at,
+            message_count: state.messages.len() as u32,
+            max_turns: state.max_turns,
+        },
+    });
+
+    let cancel = AtomicBool::new(false);
+
+    loop {
+        if state.subscribers.is_empty() {
+            match rx.recv() {
+                Ok(cmd) => {
+                    process_command(cmd, &mut state, session_id, &db, client.as_deref(), &tool_registry, &daemon_tx, &cancel, max_turns_default);
+                    if state.subscribers.is_empty() {
+                        persist_and_exit(&state, &db, session_id, &daemon_tx);
+                        return;
+                    }
+                }
+                Err(_) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(cmd) => {
+                    process_command(cmd, &mut state, session_id, &db, client.as_deref(), &tool_registry, &daemon_tx, &cancel, max_turns_default);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    persist_and_exit(&state, &db, session_id, &daemon_tx);
 }
 
-pub(crate) async fn append_message_and_persist(
-    session: &Arc<Mutex<SessionState>>,
-    db: &Arc<redb::Database>,
+fn process_command(
+    cmd: SessionCommand,
+    state: &mut SessionState,
     session_id: u64,
-    message: SessionMessage,
-) -> u32 {
-    let index;
-    {
-        let mut guard = session.lock().await;
-        index = guard.messages.len() as u32;
-        guard.messages.push(message.clone());
+    db: &Arc<redb::Database>,
+    client: Option<&OpenAiClient>,
+    tool_registry: &Arc<ToolRegistry>,
+    daemon_tx: &UnboundedSender<DaemonCommand>,
+    cancel: &AtomicBool,
+    max_turns_default: u32,
+) {
+    match cmd {
+        SessionCommand::RunInput { request_id, input } => {
+            let text = String::from_utf8_lossy(&input).trim().to_string();
+            if text.is_empty() {
+                broadcast(&state.subscribers, DaemonMessage::Started { request_id });
+                broadcast(&state.subscribers, DaemonMessage::Failed { request_id, error: "empty input".to_string() });
+                return;
+            }
+            let Some(client) = client else {
+                broadcast(&state.subscribers, DaemonMessage::Started { request_id });
+                broadcast(&state.subscribers, DaemonMessage::Failed { request_id, error: "daemon is locked".to_string() });
+                return;
+            };
+            let model = match &state.selected_model {
+                Some(m) => m.clone(),
+                None => {
+                    broadcast(&state.subscribers, DaemonMessage::Started { request_id });
+                    broadcast(&state.subscribers, DaemonMessage::Failed { request_id, error: "no model selected".to_string() });
+                    return;
+                }
+            };
+
+            let user_msg = SessionMessage::UserText { content: text.clone() };
+            let msg_idx = state.messages.len() as u32;
+            state.messages.push(user_msg.clone());
+            write_message_retry(db, session_id, msg_idx, &user_msg).ok();
+            broadcast(&state.subscribers, DaemonMessage::SessionMessageAppended { message: user_msg });
+
+            broadcast(&state.subscribers, DaemonMessage::Started { request_id });
+            cancel.store(false, Ordering::SeqCst);
+
+            let cwd = state.cwd.clone();
+            let result = run_agent_loop(
+                client,
+                state,
+                session_id,
+                db,
+                &model,
+                request_id,
+                cwd.as_deref(),
+                cancel,
+                tool_registry,
+                daemon_tx,
+                max_turns_default,
+            );
+
+            match result {
+                Ok(()) => {
+                    broadcast(&state.subscribers, DaemonMessage::Done { request_id });
+                }
+                Err(e) => {
+                    broadcast(&state.subscribers, DaemonMessage::Failed { request_id, error: e.to_string() });
+                }
+            }
+
+            let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
+                session_id,
+                metadata: SessionMetadata {
+                    title: state.title.clone(),
+                    selected_model: state.selected_model.clone(),
+                    parent_session_id: state.parent_session_id,
+                    cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
+                    created_at: state.created_at,
+                    message_count: state.messages.len() as u32,
+                    max_turns: state.max_turns,
+                },
+            });
+        }
+        SessionCommand::RunChildInput { request_id, input_tokens: _, reply } => {
+            let Some(client) = client else {
+                let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "daemon locked")));
+                return;
+            };
+            let model = state.selected_model.clone().unwrap_or_default();
+            broadcast(&state.subscribers, DaemonMessage::Started { request_id });
+            cancel.store(false, Ordering::SeqCst);
+            let cwd = state.cwd.clone();
+            let result = run_agent_loop(
+                client, state, session_id, db, &model, request_id,
+                cwd.as_deref(), cancel, tool_registry, daemon_tx, max_turns_default,
+            );
+            match result {
+                Ok(()) => {
+                    let output = state.messages.iter()
+                        .filter_map(|m| match m {
+                            SessionMessage::AssistantText { content } => Some(content.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    broadcast(&state.subscribers, DaemonMessage::Done { request_id });
+                    let _ = reply.send(Ok(ChildResult { output, is_error: false }));
+                }
+                Err(e) => {
+                    broadcast(&state.subscribers, DaemonMessage::Failed { request_id, error: e.to_string() });
+                    let _ = reply.send(Ok(ChildResult { output: e.to_string(), is_error: true }));
+                }
+            }
+        }
+        SessionCommand::Cancel { request_id: _ } => {
+            cancel.store(true, Ordering::SeqCst);
+            broadcast(&state.subscribers, DaemonMessage::Cancelled { request_id: 0 });
+        }
+        SessionCommand::SetModel { model } => {
+            state.selected_model = Some(model.clone());
+        }
+        SessionCommand::Attach { client_id, tx } => {
+            state.subscribers.insert(client_id, tx);
+            let snapshot = DaemonMessage::SessionState {
+                session_id,
+                title: state.title.clone(),
+                selected_model: state.selected_model.clone(),
+                parent_session_id: state.parent_session_id,
+                cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
+                max_turns: state.max_turns,
+                messages: state.messages.clone(),
+            };
+            if let Some(tx) = state.subscribers.get(&client_id) {
+                let _ = tx.send(snapshot);
+            }
+        }
+        SessionCommand::Detach { client_id } => {
+            state.subscribers.remove(&client_id);
+        }
+        SessionCommand::GetSummary { reply } => {
+            let _ = reply.send(SessionSummary {
+                session_id,
+                title: state.title.clone(),
+                selected_model: state.selected_model.clone(),
+                parent_session_id: state.parent_session_id,
+                cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
+                created_at: state.created_at,
+                message_count: state.messages.len() as u32,
+                max_turns: state.max_turns,
+            });
+        }
+        SessionCommand::AppendMessage { message } => {
+            let idx = state.messages.len() as u32;
+            state.messages.push(message.clone());
+            write_message_retry(db, session_id, idx, &message).ok();
+        }
+        SessionCommand::Shutdown => {}
     }
-    if let Err(e) = crate::db::write_message(db, session_id, index, &message) {
-        warn!(session_id, index, error = %e, "failed to persist message to DB");
-    }
-    index
 }
 
-
+fn persist_and_exit(
+    state: &SessionState,
+    db: &redb::Database,
+    session_id: u64,
+    daemon_tx: &UnboundedSender<DaemonCommand>,
+) {
+    let record = SessionRecord {
+        title: state.title.clone(),
+        selected_model: state.selected_model.clone(),
+        parent_session_id: state.parent_session_id,
+        cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
+        max_turns: state.max_turns,
+        message_count: state.messages.len() as u32,
+        created_at: state.created_at,
+    };
+    write_session_retry(db, session_id, &record).ok();
+    let _ = daemon_tx.send(DaemonCommand::SessionExited { session_id });
+}

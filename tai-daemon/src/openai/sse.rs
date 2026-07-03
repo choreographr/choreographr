@@ -1,25 +1,23 @@
-use bytes::Bytes;
-use futures_util::{StreamExt, stream::BoxStream};
-use std::io;
+use std::io::{self, BufReader, Cursor, Read};
 
 pub(crate) struct SseReader {
-    stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    reader: BufReader<Box<dyn Read + Send>>,
     pending: Vec<u8>,
     event_lines: Vec<String>,
     finished: bool,
 }
 
 impl SseReader {
-    pub(crate) fn new(response: reqwest::Response) -> Self {
+    pub(crate) fn new(body: Vec<u8>) -> Self {
         Self {
-            stream: response.bytes_stream().boxed(),
+            reader: BufReader::new(Box::new(Cursor::new(body))),
             pending: Vec::new(),
             event_lines: Vec::new(),
             finished: false,
         }
     }
 
-    pub(crate) async fn next_event(&mut self) -> io::Result<Option<String>> {
+    pub(crate) fn next_event(&mut self) -> io::Result<Option<String>> {
         if self.finished {
             return Ok(None);
         }
@@ -29,20 +27,20 @@ impl SseReader {
                 return Ok(Some(event));
             }
 
-            match self.stream.next().await {
-                Some(chunk) => {
-                    let chunk = chunk.map_err(io::Error::other)?;
-                    self.pending.extend_from_slice(&chunk);
-                }
-                None => {
+            let mut buf = [0u8; 4096];
+            match self.reader.read(&mut buf)? {
+                0 => {
+                    self.finished = true;
                     if !self.pending.is_empty() {
                         let line = String::from_utf8(std::mem::take(&mut self.pending))
                             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                         self.event_lines
                             .push(line.trim_end_matches('\r').to_string());
                     }
-                    self.finished = true;
                     return self.finish_event();
+                }
+                n => {
+                    self.pending.extend_from_slice(&buf[..n]);
                 }
             }
         }

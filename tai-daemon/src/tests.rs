@@ -1,22 +1,18 @@
 use super::*;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 
-async fn spawn_http_tool_server() -> (String, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind http tool server");
+fn spawn_http_tool_server() -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind http tool server");
     let addr = listener.local_addr().expect("http tool server addr");
-    let handle = tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
                 break;
             };
-            tokio::spawn(async move {
+            std::thread::spawn(move || {
                 let mut buffer = vec![0_u8; 32 * 1024];
-                let Ok(read_len) = stream.read(&mut buffer).await else {
+                let Ok(read_len) = stream.read(&mut buffer) else {
                     return;
                 };
                 if read_len == 0 {
@@ -27,8 +23,8 @@ async fn spawn_http_tool_server() -> (String, tokio::task::JoinHandle<()>) {
 
                 if first_line.starts_with("HEAD /meta ") {
                     let response = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 42\r\naccept-ranges: bytes\r\nconnection: close\r\n\r\n";
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
                     return;
                 }
 
@@ -46,8 +42,8 @@ async fn spawn_http_tool_server() -> (String, tokio::task::JoinHandle<()>) {
                         body
                     );
                     assert_eq!(range, "bytes=0-9");
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
                     return;
                 }
 
@@ -57,9 +53,9 @@ async fn spawn_http_tool_server() -> (String, tokio::task::JoinHandle<()>) {
                         "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         body.len()
                     );
-                    let _ = stream.write_all(header.as_bytes()).await;
-                    let _ = stream.write_all(&body).await;
-                    let _ = stream.shutdown().await;
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&body);
+                    let _ = stream.flush();
                     return;
                 }
 
@@ -70,8 +66,8 @@ async fn spawn_http_tool_server() -> (String, tokio::task::JoinHandle<()>) {
                         body.len(),
                         body
                     );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
                     return;
                 }
 
@@ -86,8 +82,8 @@ async fn spawn_http_tool_server() -> (String, tokio::task::JoinHandle<()>) {
                         response_body.len(),
                         response_body
                     );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
                     return;
                 }
 
@@ -97,8 +93,8 @@ async fn spawn_http_tool_server() -> (String, tokio::task::JoinHandle<()>) {
                     body.len(),
                     body
                 );
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
             });
         }
     });
@@ -113,12 +109,10 @@ fn test_temp_path(prefix: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{unique}.txt"))
 }
 
-#[tokio::test]
-async fn read_file_range_tool_reads_numbered_line_chunks() {
+#[test]
+fn read_file_range_tool_reads_numbered_line_chunks() {
     let path = test_temp_path("tai-read-range-tool");
-    tokio::fs::write(&path, "alpha\nbeta\ngamma\ndelta\n")
-        .await
-        .expect("seed file");
+    std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\n").expect("seed file");
 
     let result = execute_read_file_range_tool(
         &serde_json::json!({
@@ -127,23 +121,21 @@ async fn read_file_range_tool_reads_numbered_line_chunks() {
             "max_lines": 2
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("lines: 2-3 of 4"));
     assert!(result.content.contains("2 | beta"));
     assert!(result.content.contains("3 | gamma"));
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn read_file_range_tool_clamps_to_eof() {
+#[test]
+fn read_file_range_tool_clamps_to_eof() {
     let path = test_temp_path("tai-read-range-eof-tool");
-    tokio::fs::write(&path, "alpha\nbeta\ngamma\n")
-        .await
-        .expect("seed file");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("seed file");
 
     let result = execute_read_file_range_tool(
         &serde_json::json!({
@@ -152,23 +144,21 @@ async fn read_file_range_tool_clamps_to_eof() {
             "max_lines": 10
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("lines: 2-3 of 3"));
     assert!(result.content.contains("2 | beta"));
     assert!(result.content.contains("3 | gamma"));
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn read_file_range_tool_rejects_start_line_past_eof() {
+#[test]
+fn read_file_range_tool_rejects_start_line_past_eof() {
     let path = test_temp_path("tai-read-range-past-eof-tool");
-    tokio::fs::write(&path, "alpha\nbeta\n")
-        .await
-        .expect("seed file");
+    std::fs::write(&path, "alpha\nbeta\n").expect("seed file");
 
     let result = execute_read_file_range_tool(
         &serde_json::json!({
@@ -177,19 +167,19 @@ async fn read_file_range_tool_rejects_start_line_past_eof() {
             "max_lines": 1
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(result.is_error, "{}", result.content);
     assert!(result.content.contains("past end of file"));
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn read_file_range_tool_rejects_excessive_max_lines() {
+#[test]
+fn read_file_range_tool_rejects_excessive_max_lines() {
     let path = test_temp_path("tai-read-range-max-lines-tool");
-    tokio::fs::write(&path, "alpha\n").await.expect("seed file");
+    std::fs::write(&path, "alpha\n").expect("seed file");
 
     let result = execute_read_file_range_tool(
         &serde_json::json!({
@@ -198,17 +188,17 @@ async fn read_file_range_tool_rejects_excessive_max_lines() {
             "max_lines": 201
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(result.is_error, "{}", result.content);
     assert!(result.content.contains("max_lines must be <= 200"));
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn write_file_tool_writes_new_file() {
+#[test]
+fn write_file_tool_writes_new_file() {
     let path = test_temp_path("tai-write-tool");
 
     let result = execute_write_file_tool(
@@ -217,24 +207,22 @@ async fn write_file_tool_writes_new_file() {
             "content": "hello from write tool\n"
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert_eq!(
-        tokio::fs::read_to_string(&path).await.expect("read file"),
+        std::fs::read_to_string(&path).expect("read file"),
         "hello from write tool\n"
     );
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn write_file_tool_refuses_overwrite_when_disabled() {
+#[test]
+fn write_file_tool_refuses_overwrite_when_disabled() {
     let path = test_temp_path("tai-write-tool-existing");
-    tokio::fs::write(&path, "original\n")
-        .await
-        .expect("seed file");
+    std::fs::write(&path, "original\n").expect("seed file");
 
     let result = execute_write_file_tool(
         &serde_json::json!({
@@ -243,8 +231,8 @@ async fn write_file_tool_refuses_overwrite_when_disabled() {
             "overwrite": false
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(result.is_error, "{}", result.content);
     assert!(
@@ -253,15 +241,15 @@ async fn write_file_tool_refuses_overwrite_when_disabled() {
             .contains("refusing to overwrite existing file")
     );
     assert_eq!(
-        tokio::fs::read_to_string(&path).await.expect("read file"),
+        std::fs::read_to_string(&path).expect("read file"),
         "original\n"
     );
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn write_file_tool_creates_parent_directories() {
+#[test]
+fn write_file_tool_creates_parent_directories() {
     let dir = test_temp_path("tai-write-tool-dir").with_extension("");
     let path = dir.join("nested/output.txt");
 
@@ -272,24 +260,22 @@ async fn write_file_tool_creates_parent_directories() {
             "create_parents": true
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert_eq!(
-        tokio::fs::read_to_string(&path).await.expect("read file"),
+        std::fs::read_to_string(&path).expect("read file"),
         "nested hello\n"
     );
 
-    let _ = tokio::fs::remove_dir_all(&dir).await;
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
-async fn edit_file_tool_replaces_single_unique_match() {
+#[test]
+fn edit_file_tool_replaces_single_unique_match() {
     let path = test_temp_path("tai-edit-tool-single");
-    tokio::fs::write(&path, "alpha\nbeta\ngamma\n")
-        .await
-        .expect("seed file");
+    std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("seed file");
 
     let result = execute_edit_file_tool(
         &serde_json::json!({
@@ -302,25 +288,23 @@ async fn edit_file_tool_replaces_single_unique_match() {
             ]
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("edited file:"));
     assert_eq!(
-        tokio::fs::read_to_string(&path).await.expect("read file"),
+        std::fs::read_to_string(&path).expect("read file"),
         "alpha\ndelta\ngamma\n"
     );
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn edit_file_tool_fails_when_old_text_is_missing() {
+#[test]
+fn edit_file_tool_fails_when_old_text_is_missing() {
     let path = test_temp_path("tai-edit-tool-missing");
-    tokio::fs::write(&path, "hello\nworld\n")
-        .await
-        .expect("seed file");
+    std::fs::write(&path, "hello\nworld\n").expect("seed file");
 
     let result = execute_edit_file_tool(
         &serde_json::json!({
@@ -333,25 +317,23 @@ async fn edit_file_tool_fails_when_old_text_is_missing() {
             ]
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(result.is_error, "{}", result.content);
     assert!(result.content.contains("old_text not found"));
     assert_eq!(
-        tokio::fs::read_to_string(&path).await.expect("read file"),
+        std::fs::read_to_string(&path).expect("read file"),
         "hello\nworld\n"
     );
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn edit_file_tool_fails_on_ambiguous_non_replace_all_edit() {
+#[test]
+fn edit_file_tool_fails_on_ambiguous_non_replace_all_edit() {
     let path = test_temp_path("tai-edit-tool-ambiguous");
-    tokio::fs::write(&path, "repeat\nrepeat\n")
-        .await
-        .expect("seed file");
+    std::fs::write(&path, "repeat\nrepeat\n").expect("seed file");
 
     let result = execute_edit_file_tool(
         &serde_json::json!({
@@ -364,25 +346,23 @@ async fn edit_file_tool_fails_on_ambiguous_non_replace_all_edit() {
             ]
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(result.is_error, "{}", result.content);
     assert!(result.content.contains("matched 2 locations"));
     assert_eq!(
-        tokio::fs::read_to_string(&path).await.expect("read file"),
+        std::fs::read_to_string(&path).expect("read file"),
         "repeat\nrepeat\n"
     );
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn edit_file_tool_supports_replace_all_and_dry_run() {
+#[test]
+fn edit_file_tool_supports_replace_all_and_dry_run() {
     let path = test_temp_path("tai-edit-tool-replace-all");
-    tokio::fs::write(&path, "foo\nfoo\n")
-        .await
-        .expect("seed file");
+    std::fs::write(&path, "foo\nfoo\n").expect("seed file");
 
     let result = execute_edit_file_tool(
         &serde_json::json!({
@@ -397,25 +377,25 @@ async fn edit_file_tool_supports_replace_all_and_dry_run() {
             ]
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("would edit file:"));
     assert!(result.content.contains("2 replacements"));
     assert_eq!(
-        tokio::fs::read_to_string(&path).await.expect("read file"),
+        std::fs::read_to_string(&path).expect("read file"),
         "foo\nfoo\n"
     );
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn edit_file_tool_validates_expected_sha256() {
+#[test]
+fn edit_file_tool_validates_expected_sha256() {
     let path = test_temp_path("tai-edit-tool-sha");
     let original = "red\nblue\n";
-    tokio::fs::write(&path, original).await.expect("seed file");
+    std::fs::write(&path, original).expect("seed file");
     let expected_sha256 = sha256_hex(original);
 
     let success = execute_edit_file_tool(
@@ -430,11 +410,11 @@ async fn edit_file_tool_validates_expected_sha256() {
             ]
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
     assert!(!success.is_error, "{}", success.content);
     assert_eq!(
-        tokio::fs::read_to_string(&path).await.expect("read file"),
+        std::fs::read_to_string(&path).expect("read file"),
         "red\ngreen\n"
     );
 
@@ -450,21 +430,21 @@ async fn edit_file_tool_validates_expected_sha256() {
             ]
         })
         .to_string(),
-    )
-    .await;
+    None,
+    );
     assert!(failure.is_error, "{}", failure.content);
     assert!(failure.content.contains("expected_sha256 mismatch"));
     assert_eq!(
-        tokio::fs::read_to_string(&path).await.expect("read file"),
+        std::fs::read_to_string(&path).expect("read file"),
         "red\ngreen\n"
     );
 
-    let _ = tokio::fs::remove_file(&path).await;
+    let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn http_request_tool_supports_range_header() {
-    let (base_url, server) = spawn_http_tool_server().await;
+#[test]
+fn http_request_tool_supports_range_header() {
+    let (base_url, server) = spawn_http_tool_server();
     let result = execute_http_request_tool(
         &serde_json::json!({
             "method": "GET",
@@ -474,48 +454,45 @@ async fn http_request_tool_supports_range_header() {
             }
         })
         .to_string(),
-    )
-    .await;
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("status: 206 Partial Content"));
     assert!(result.content.contains("content-range: bytes 0-9/100"));
     assert!(result.content.ends_with("abcdefghij"));
 
-    server.abort();
+    drop(server);
 }
 
-#[tokio::test]
-async fn http_request_tool_supports_head_requests() {
-    let (base_url, server) = spawn_http_tool_server().await;
+#[test]
+fn http_request_tool_supports_head_requests() {
+    let (base_url, server) = spawn_http_tool_server();
     let result = execute_http_request_tool(
         &serde_json::json!({
             "method": "HEAD",
             "url": format!("{base_url}/meta")
         })
         .to_string(),
-    )
-    .await;
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("status: 200 OK"));
     assert!(result.content.contains("accept-ranges: bytes"));
     assert!(result.content.ends_with("\n\n"));
 
-    server.abort();
+    drop(server);
 }
 
-#[tokio::test]
-async fn http_request_tool_summarizes_non_text_responses() {
-    let (base_url, server) = spawn_http_tool_server().await;
+#[test]
+fn http_request_tool_summarizes_non_text_responses() {
+    let (base_url, server) = spawn_http_tool_server();
     let result = execute_http_request_tool(
         &serde_json::json!({
             "method": "GET",
             "url": format!("{base_url}/binary")
         })
         .to_string(),
-    )
-    .await;
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(
@@ -525,30 +502,29 @@ async fn http_request_tool_summarizes_non_text_responses() {
     );
     assert!(result.content.ends_with("body omitted: non-text response"));
 
-    server.abort();
+    drop(server);
 }
 
-#[tokio::test]
-async fn http_request_tool_truncates_large_text_responses() {
-    let (base_url, server) = spawn_http_tool_server().await;
+#[test]
+fn http_request_tool_truncates_large_text_responses() {
+    let (base_url, server) = spawn_http_tool_server();
     let result = execute_http_request_tool(
         &serde_json::json!({
             "method": "GET",
             "url": format!("{base_url}/long")
         })
         .to_string(),
-    )
-    .await;
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("...[truncated]"));
 
-    server.abort();
+    drop(server);
 }
 
-#[tokio::test]
-async fn http_request_tool_supports_post_body() {
-    let (base_url, server) = spawn_http_tool_server().await;
+#[test]
+fn http_request_tool_supports_post_body() {
+    let (base_url, server) = spawn_http_tool_server();
     let result = execute_http_request_tool(
         &serde_json::json!({
             "method": "POST",
@@ -556,11 +532,10 @@ async fn http_request_tool_supports_post_body() {
             "body": "hello"
         })
         .to_string(),
-    )
-    .await;
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.ends_with("echo:hello"));
 
-    server.abort();
+    drop(server);
 }

@@ -7,17 +7,18 @@ use std::str::FromStr;
 
 use super::{EvmCallArgs, alloy_err, connect};
 
-pub(crate) async fn execute_evm_call_tool(arguments_json: &str) -> ToolResult {
-    match execute_evm_call_inner(arguments_json).await {
+pub(crate) fn execute_evm_call_tool(arguments_json: &str) -> ToolResult {
+    match execute_evm_call_inner(arguments_json) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_evm_call_inner(arguments_json: &str) -> Result<String, ToolError> {
+fn execute_evm_call_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmCallArgs = serde_json::from_str(arguments_json)?;
-    let output =
-        evm_call_impl(&args.rpc_url, &args.to, &args.data, args.block_tag.as_deref()).await?;
+    let output = tokio::runtime::Handle::current().block_on(
+        evm_call_impl(&args.rpc_url, &args.to, &args.data, args.block_tag.as_deref()),
+    )?;
     Ok(truncate_tool_output(&output))
 }
 

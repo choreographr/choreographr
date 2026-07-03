@@ -1,6 +1,5 @@
 use crate::tools::{ToolExecutionOutput, tool_err, tool_ok, truncate_tool_output};
-use async_trait::async_trait;
-use reqwest::Client;
+use reqwest::blocking::Client;
 use sha1::Sha1;
 use tai_keystore::XCredentials;
 
@@ -120,7 +119,7 @@ fn build_oauth1_header(
     format!("OAuth {header_value}")
 }
 
-async fn x_api_get(path: &str, params: &[(&str, &str)], x_credentials: Option<&XCredentials>) -> Result<String, String> {
+fn x_api_get(path: &str, params: &[(&str, &str)], x_credentials: Option<&XCredentials>) -> Result<String, String> {
     let creds = get_x_credentials(x_credentials).ok_or("X credentials not configured")?;
     let url = format!("{X_API_BASE}{path}");
     let auth_header = build_oauth1_header("GET", &url, &creds, params);
@@ -130,11 +129,10 @@ async fn x_api_get(path: &str, params: &[(&str, &str)], x_credentials: Option<&X
         .get(&url)
         .header("Authorization", &auth_header)
         .send()
-        .await
         .map_err(|e| format!("X API request failed: {e}"))?;
 
     let status = response.status();
-    let body = response.text().await.map_err(|e| format!("failed to read response: {e}"))?;
+    let body = response.text().map_err(|e| format!("failed to read response: {e}"))?;
 
     if !status.is_success() {
         return Err(format!("X API error (status {status}): {body}"));
@@ -143,7 +141,7 @@ async fn x_api_get(path: &str, params: &[(&str, &str)], x_credentials: Option<&X
     Ok(body)
 }
 
-async fn x_api_post(path: &str, body_json: &str, x_credentials: Option<&XCredentials>) -> Result<String, String> {
+fn x_api_post(path: &str, body_json: &str, x_credentials: Option<&XCredentials>) -> Result<String, String> {
     let creds = get_x_credentials(x_credentials).ok_or("X credentials not configured")?;
     let url = format!("{X_API_BASE}{path}");
     let auth_header = build_oauth1_header("POST", &url, &creds, &[]);
@@ -155,11 +153,10 @@ async fn x_api_post(path: &str, body_json: &str, x_credentials: Option<&XCredent
         .header("Content-Type", "application/json")
         .body(body_json.to_string())
         .send()
-        .await
         .map_err(|e| format!("X API request failed: {e}"))?;
 
     let status = response.status();
-    let body = response.text().await.map_err(|e| format!("failed to read response: {e}"))?;
+    let body = response.text().map_err(|e| format!("failed to read response: {e}"))?;
 
     if !status.is_success() {
         return Err(format!("X API error (status {status}): {body}"));
@@ -170,7 +167,6 @@ async fn x_api_post(path: &str, body_json: &str, x_credentials: Option<&XCredent
 
 pub(crate) struct XPost;
 
-#[async_trait]
 impl super::Tool for XPost {
     fn name(&self) -> &'static str {
         "x_post"
@@ -193,7 +189,7 @@ impl super::Tool for XPost {
         })
     }
 
-    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
+    fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -214,7 +210,7 @@ impl super::Tool for XPost {
 
         let body = serde_json::json!({ "text": text }).to_string();
 
-        match x_api_post("/2/tweets", &body, x_credentials).await {
+        match x_api_post("/2/tweets", &body, x_credentials) {
             Ok(response) => {
                 let formatted = match serde_json::from_str::<serde_json::Value>(&response) {
                     Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(response),
@@ -237,7 +233,6 @@ impl super::Tool for XPost {
 
 pub(crate) struct XSearchRecent;
 
-#[async_trait]
 impl super::Tool for XSearchRecent {
     fn name(&self) -> &'static str {
         "x_search_recent"
@@ -264,7 +259,7 @@ impl super::Tool for XSearchRecent {
         })
     }
 
-    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
+    fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -295,7 +290,7 @@ impl super::Tool for XSearchRecent {
             ("tweet.fields", "created_at,author_id,public_metrics"),
         ];
 
-        match x_api_get("/2/tweets/search/recent", &params, x_credentials).await {
+        match x_api_get("/2/tweets/search/recent", &params, x_credentials) {
             Ok(response) => {
                 let formatted = match serde_json::from_str::<serde_json::Value>(&response) {
                     Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(response),
@@ -318,7 +313,6 @@ impl super::Tool for XSearchRecent {
 
 pub(crate) struct XUserLookup;
 
-#[async_trait]
 impl super::Tool for XUserLookup {
     fn name(&self) -> &'static str {
         "x_user_lookup"
@@ -341,7 +335,7 @@ impl super::Tool for XUserLookup {
         })
     }
 
-    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
+    fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -362,7 +356,7 @@ impl super::Tool for XUserLookup {
 
         let params = vec![("user.fields", "description,public_metrics,created_at")];
 
-        match x_api_get(&format!("/2/users/by/username/{username}"), &params, x_credentials).await {
+        match x_api_get(&format!("/2/users/by/username/{username}"), &params, x_credentials) {
             Ok(response) => {
                 let formatted = match serde_json::from_str::<serde_json::Value>(&response) {
                     Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(response),

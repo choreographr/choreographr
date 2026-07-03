@@ -1,14 +1,10 @@
-use super::{PreparedImage, Tool, ToolExecutionOutput, tool_err, tool_ok};
-use async_trait::async_trait;
-use crate::{SessionState, broadcast_to_session};
+use super::{PreparedImage, ToolExecutionOutput, tool_err, tool_ok};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::GenericImageView;
 use reqwest::{Url, header::CONTENT_TYPE};
 use resvg::usvg;
 use serde::Deserialize;
-use std::{io, sync::Arc, time::Duration};
-use tai_proto::{DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE};
-use tokio::sync::Mutex;
+use std::{io, time::Duration};
 
 #[derive(Debug, Deserialize)]
 struct DisplayImageArgs {
@@ -24,8 +20,8 @@ const MAX_DISPLAY_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const SUPPORTED_IMAGE_MIME_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/svg+xml"];
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
 
-pub(crate) async fn execute_display_image_tool(arguments_json: &str) -> ToolExecutionOutput {
-    match prepare_image_result(arguments_json).await {
+pub(crate) fn execute_display_image_tool(arguments_json: &str) -> ToolExecutionOutput {
+    match prepare_image_result(arguments_json) {
         Ok(image) => {
             let mime_type = image.mime_type.clone();
             let width = image.width;
@@ -45,13 +41,13 @@ pub(crate) async fn execute_display_image_tool(arguments_json: &str) -> ToolExec
     }
 }
 
-async fn prepare_image_result(arguments_json: &str) -> Result<PreparedImage, String> {
+fn prepare_image_result(arguments_json: &str) -> Result<PreparedImage, String> {
     let args: DisplayImageArgs = serde_json::from_str(arguments_json)
         .map_err(|e| format!("invalid arguments: {e}"))?;
-    prepare_image(args).await.map_err(|e| e.to_string())
+    prepare_image(args).map_err(|e| e.to_string())
 }
 
-async fn prepare_image(args: DisplayImageArgs) -> io::Result<PreparedImage> {
+fn prepare_image(args: DisplayImageArgs) -> io::Result<PreparedImage> {
     let mime_type = normalize_image_mime_type(&args.mime_type)?;
     let selected_sources = [
         args.path.as_ref().map(|_| "path"),
@@ -70,9 +66,9 @@ async fn prepare_image(args: DisplayImageArgs) -> io::Result<PreparedImage> {
     }
 
     let data = if let Some(path) = args.path {
-        tokio::fs::read(path.trim()).await?
+        std::fs::read(path.trim())?
     } else if let Some(url) = args.url {
-        fetch_image_bytes(url.trim(), mime_type).await?
+        fetch_image_bytes(url.trim(), mime_type)?
     } else if let Some(base64_data) = args.base64_data {
         BASE64.decode(base64_data.trim()).map_err(|error| {
             io::Error::new(
@@ -118,7 +114,7 @@ fn normalize_image_mime_type(mime_type: &str) -> io::Result<&str> {
     }
 }
 
-async fn fetch_image_bytes(url: &str, expected_mime_type: &str) -> io::Result<Vec<u8>> {
+fn fetch_image_bytes(url: &str, expected_mime_type: &str) -> io::Result<Vec<u8>> {
     let url =
         Url::parse(url).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     match url.scheme() {
@@ -131,11 +127,11 @@ async fn fetch_image_bytes(url: &str, expected_mime_type: &str) -> io::Result<Ve
         }
     }
 
-    let client = reqwest::Client::builder()
+    let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(IMAGE_FETCH_TIMEOUT_SECS))
         .build()
         .map_err(io::Error::other)?;
-    let response = client.get(url).send().await.map_err(io::Error::other)?;
+    let response = client.get(url).send().map_err(io::Error::other)?;
     let status = response.status();
     if !status.is_success() {
         return Err(io::Error::other(format!(
@@ -153,7 +149,7 @@ async fn fetch_image_bytes(url: &str, expected_mime_type: &str) -> io::Result<Ve
             ),
         ));
     }
-    let bytes = response.bytes().await.map_err(io::Error::other)?;
+    let bytes = response.bytes().map_err(io::Error::other)?;
     Ok(bytes.to_vec())
 }
 
@@ -176,56 +172,9 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
     }
 }
 
-pub(crate) async fn emit_prepared_image(
-    session: &Arc<Mutex<SessionState>>,
-    request_id: u32,
-    image_id: u32,
-    image: PreparedImage,
-) {
-    let metadata = ImageMetadata {
-        image_id,
-        mime_type: image.mime_type,
-        width: image.width,
-        height: image.height,
-        byte_len: image.data.len() as u64,
-        alt: image.alt,
-    };
-    broadcast_to_session(
-        session,
-        DaemonMessage::ImageStart {
-            request_id,
-            metadata,
-        },
-        None,
-    )
-    .await;
-    for data in image.data.chunks(MAX_IMAGE_CHUNK_SIZE) {
-        broadcast_to_session(
-            session,
-            DaemonMessage::ImageChunk {
-                request_id,
-                image_id,
-                data: data.to_vec(),
-            },
-            None,
-        )
-        .await;
-    }
-    broadcast_to_session(
-        session,
-        DaemonMessage::ImageEnd {
-            request_id,
-            image_id,
-        },
-        None,
-    )
-    .await;
-}
-
 pub(crate) struct DisplayImage;
 
-#[async_trait]
-impl Tool for DisplayImage {
+impl super::Tool for DisplayImage {
     fn name(&self) -> &'static str {
         "display_image"
     }
@@ -265,7 +214,7 @@ impl Tool for DisplayImage {
             "additionalProperties": false
         })
     }
-    async fn execute(&self, arguments_json: &str, _x_credentials: Option<&tai_keystore::XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
-        execute_display_image_tool(arguments_json).await
+    fn execute(&self, arguments_json: &str, _x_credentials: Option<&tai_keystore::XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
+        execute_display_image_tool(arguments_json)
     }
 }

@@ -15,14 +15,14 @@ struct GitDiffArgs {
     pathspec: Option<Vec<String>>,
 }
 
-pub async fn execute_git_diff_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_git_diff_inner(arguments_json, cwd).await {
+pub fn execute_git_diff_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_git_diff_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_git_diff_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_git_diff_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: GitDiffArgs = serde_json::from_str(arguments_json)?;
     let output = git_diff_impl(
         args.repo_path.as_deref(),

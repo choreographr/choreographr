@@ -153,6 +153,42 @@ pub fn next_session_id(db: &redb::Database) -> io::Result<u64> {
     Ok(current)
 }
 
+pub fn write_message_retry(db: &redb::Database, session_id: u64, index: u32, message: &SessionMessage) -> io::Result<()> {
+    let mut attempts = 0;
+    loop {
+        match write_message(db, session_id, index, message) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("database is busy") && attempts < 3 {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+pub fn write_session_retry(db: &redb::Database, session_id: u64, record: &SessionRecord) -> io::Result<()> {
+    let mut attempts = 0;
+    loop {
+        match write_session(db, session_id, record) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("database is busy") && attempts < 3 {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

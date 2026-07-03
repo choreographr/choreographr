@@ -1,235 +1,151 @@
 use crate::openai::{
-    self, ChatAssistantToolUse, ChatRequestMessage, ChatTurnResult, CompletionChunkKind,
-    OpenAiClient,
+    ChatAssistantToolUse, ChatRequestMessage, ChatTurnResult,
+    OpenAiClient, AssistantToolCall, AssistantToolFunction,
 };
-use crate::sessions::{append_message_and_persist, broadcast_to_session, SessionState};
-use crate::tools::{emit_prepared_image, ToolExecutionOutput, ToolResult};
-use std::{io, sync::Arc, time::Duration};
-use tokio::time::timeout;
+use crate::context;
+use crate::db::write_message_retry;
+use crate::sessions::SessionState;
+use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
+use std::io;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tai_keystore::XCredentials;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
     SessionMessage,
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc::UnboundedSender;
 
-const TOOL_TIMEOUT_SECS: u64 = 60;
-const SUBSESSION_TIMEOUT_SECS: u64 = 120;
-
-pub(crate) async fn execute_plain_request(
-    client: &OpenAiClient,
-    session: &Arc<Mutex<SessionState>>,
-    session_id: u64,
-    db: &Arc<redb::Database>,
-    model: &str,
-    request_id: u32,
-) -> io::Result<()> {
-    let prompt = {
-        let guard = session.lock().await;
-        build_prompt(&guard.messages)
-    };
-    let answer = Arc::new(Mutex::new(String::new()));
-    let answer_clone = Arc::clone(&answer);
-    client
-        .completion_stream(model, &prompt, |kind, chunk| {
-            let answer = Arc::clone(&answer_clone);
-            let session_for_chunk = Arc::clone(session);
-            async move {
-                if matches!(kind, CompletionChunkKind::Answer) {
-                    answer.lock().await.push_str(&chunk);
-                }
-                broadcast_to_session(
-                    &session_for_chunk,
-                    DaemonMessage::OutputChunk {
-                        request_id,
-                        stream: match kind {
-                            CompletionChunkKind::Answer => OutputStream::Answer,
-                            CompletionChunkKind::Reasoning => OutputStream::Reasoning,
-                        },
-                        data: chunk.into_bytes(),
-                    },
-                    None,
-                )
-                .await;
-                Ok(())
-            }
-        })
-        .await?;
-
-    let final_answer = answer.lock().await.trim().to_string();
-    if !final_answer.is_empty() {
-        append_message_and_persist(
-            session,
-            db,
-            session_id,
-            SessionMessage::AssistantText {
-                content: final_answer,
-            },
-        )
-        .await;
+fn broadcast_to_session(session: &SessionState, message: DaemonMessage) {
+    for tx in session.subscribers.values() {
+        let _ = tx.send(message.clone());
     }
-    Ok(())
 }
 
-pub(crate) async fn run_agent_loop(
+fn emit_prepared_image_sync(
+    session: &SessionState,
+    request_id: u32,
+    image_id: u32,
+    image: PreparedImage,
+) {
+    let metadata = ImageMetadata {
+        image_id,
+        mime_type: image.mime_type,
+        width: image.width,
+        height: image.height,
+        byte_len: image.data.len() as u64,
+        alt: image.alt,
+    };
+    broadcast_to_session(session, DaemonMessage::ImageStart { request_id, metadata });
+    for chunk in image.data.chunks(MAX_IMAGE_CHUNK_SIZE) {
+        broadcast_to_session(session, DaemonMessage::ImageChunk {
+            request_id, image_id, data: chunk.to_vec(),
+        });
+    }
+    broadcast_to_session(session, DaemonMessage::ImageEnd { request_id, image_id });
+}
+
+pub(crate) fn run_agent_loop(
     client: &OpenAiClient,
-    session: &Arc<Mutex<SessionState>>,
+    session: &mut SessionState,
     session_id: u64,
     db: &Arc<redb::Database>,
     model: &str,
     request_id: u32,
-    x_credentials: Option<&XCredentials>,
-    cwd: Option<&std::path::Path>,
-    state: &crate::DaemonState,
+    cwd: Option<&Path>,
+    cancel: &AtomicBool,
+    tool_registry: &Arc<ToolRegistry>,
+    daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
+    max_turns_default: u32,
 ) -> io::Result<()> {
-    let tool_registry = {
-        let guard = state.lock().await;
-        Arc::clone(&guard.tool_registry)
-    };
     let tools = tool_registry.available_definitions();
-    let mut next_image_id = 1;
-
-    let max_turns = match session.lock().await.max_turns {
-        Some(n) => n,
-        None => state.lock().await.max_turns,
-    };
+    let mut next_image_id = 1u32;
+    let max_turns = session.max_turns.unwrap_or(max_turns_default);
 
     for _ in 0..max_turns {
-        {
-            let mut guard = session.lock().await;
-            if let Some(ref session_cwd) = guard.cwd {
-                let context_config = client.config().context.clone();
-                if let Some(old_fp) = guard.context_fingerprint {
-                    if let Some(idx) = guard.context_message_index {
-                        if let Ok(Some(new_bundle)) =
-                            crate::context::recheck_context(session_cwd, &context_config, old_fp)
-                        {
-                            let new_content = crate::context::assemble_context(&new_bundle);
-                            if !new_content.is_empty() {
-                                guard.messages[idx] =
-                                    SessionMessage::SystemText { content: new_content };
-                            }
-                            guard.context_fingerprint = Some(new_bundle.fingerprint);
-                            guard.context_file_paths = new_bundle
-                                .files
-                                .iter()
-                                .map(|f| f.path.clone())
-                                .collect();
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        if let Some(ref session_cwd) = session.cwd {
+            let context_config = client.config().context.clone();
+            if let Some(old_fp) = session.context_fingerprint {
+                if let Some(idx) = session.context_message_index {
+                    if let Ok(Some(new_bundle)) =
+                        context::recheck_context(session_cwd, &context_config, old_fp)
+                    {
+                        let new_content = context::assemble_context(&new_bundle);
+                        if !new_content.is_empty() {
+                            session.messages[idx] = SessionMessage::SystemText { content: new_content };
                         }
+                        session.context_fingerprint = Some(new_bundle.fingerprint);
+                        session.context_file_paths = new_bundle.files.iter().map(|f| f.path.clone()).collect();
                     }
                 }
             }
         }
 
-        let messages = {
-            let guard = session.lock().await;
-            build_chat_request_messages(&guard.messages)
-        };
-        match client
-            .chat_completion_turn(model, &messages, &tools)
-            .await?
-        {
+        let messages = build_chat_request_messages(&session.messages);
+        match client.chat_completion_turn(model, &messages, &tools)? {
             ChatTurnResult::FinalText(content) => {
-                broadcast_to_session(
-                    session,
-                    DaemonMessage::OutputChunk {
-                        request_id,
-                        stream: OutputStream::Answer,
-                        data: content.clone().into_bytes(),
-                    },
-                    None,
-                )
-                .await;
-                append_message_and_persist(
-                    session,
-                    db,
-                    session_id,
-                    SessionMessage::AssistantText { content },
-                )
-                .await;
+                broadcast_to_session(session, DaemonMessage::OutputChunk {
+                    request_id,
+                    stream: OutputStream::Answer,
+                    data: content.clone().into_bytes(),
+                });
+                let msg = SessionMessage::AssistantText { content };
+                let idx = session.messages.len() as u32;
+                session.messages.push(msg.clone());
+                write_message_retry(db, session_id, idx, &msg).ok();
                 return Ok(());
             }
             ChatTurnResult::ToolUse(tool_use) => {
-                persist_assistant_tool_use(session, session_id, db, &tool_use).await;
+                persist_assistant_tool_use_sync(session, session_id, db, &tool_use);
                 for tool_call in tool_use.tool_calls {
-                    broadcast_to_session(
-                        session,
-                        DaemonMessage::ToolCallStarted {
-                            request_id,
-                            call_id: tool_call.id.clone(),
-                            tool_name: tool_call.name.clone(),
-                            arguments_json: tool_call.arguments_json.clone(),
-                        },
-                        None,
-                    )
-                    .await;
+                    if cancel.load(Ordering::SeqCst) { return Ok(()); }
+
+                    broadcast_to_session(session, DaemonMessage::ToolCallStarted {
+                        request_id,
+                        call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        arguments_json: tool_call.arguments_json.clone(),
+                    });
 
                     let tool_timeout = if tool_call.name == "spawn_subsession" {
-                        Duration::from_secs(SUBSESSION_TIMEOUT_SECS)
+                        Duration::from_secs(120)
                     } else {
-                        Duration::from_secs(TOOL_TIMEOUT_SECS)
+                        Duration::from_secs(60)
                     };
 
-                    let mut output = match timeout(
-                        tool_timeout,
-                        async {
-                            if tool_call.name == "spawn_subsession" {
-                                crate::tools::subsession::execute_spawn_subsession(
-                                    client, state, session, session_id, db, model,
-                                    &tool_call, x_credentials, cwd,
-                                ).await
-                            } else if tool_call.name == "list_sessions" {
-                                crate::tools::sessions::execute_list_sessions(state).await
-                            } else if tool_call.name == "get_session" {
-                                crate::tools::sessions::execute_get_session(state, &tool_call.arguments_json).await
-                            } else if tool_call.name == "load_skill" {
-                                crate::tools::skill::execute_load_skill(
-                                    session, session_id, db, cwd, &tool_call.arguments_json,
-                                ).await
-                            } else {
-                                tool_registry.execute(&tool_call, x_credentials, cwd).await
-                            }
-                        }
-                    ).await {
-                        Ok(result) => result,
-                        Err(_elapsed) => ToolExecutionOutput {
-                            result: ToolResult {
-                                content: format!("tool '{}' timed out after {}s", tool_call.name, tool_timeout.as_secs()),
-                                is_error: true,
-                            },
-                            image: None,
-                        },
-                    };
+                    let mut output = execute_tool_with_timeout(
+                        tool_registry, &tool_call, None, cwd, tool_timeout,
+                        daemon_tx, client, db, session, session_id, model, max_turns_default,
+                    );
 
-                    // Inject subdirectory hints into tool result content
-                    {
-                        let guard = session.lock().await;
-                        let cwd_ref = guard.cwd.clone();
-                        let known = guard.context_file_paths.clone();
-                        drop(guard);
-                        if let Some(hint) = crate::context::subdirectory_hints(
-                            &tool_call.name, &tool_call.arguments_json, cwd_ref.as_deref(), &known,
-                        ) {
-                            output.result.content = format!("{}\n\n---\n{}", output.result.content, hint);
-                        }
+                    if let Some(hint) = context::subdirectory_hints(
+                        &tool_call.name, &tool_call.arguments_json,
+                        session.cwd.as_deref(), &session.context_file_paths,
+                    ) {
+                        output.result.content = format!("{}\n\n---\n{}", output.result.content, hint);
                     }
 
                     if let Some(image) = output.image {
-                        emit_prepared_image(session, request_id, next_image_id, image).await;
+                        emit_prepared_image_sync(session, request_id, next_image_id, image);
                         next_image_id = next_image_id.wrapping_add(1);
                     }
-                    append_message_and_persist(
-                        session,
-                        db,
-                        session_id,
-                        SessionMessage::ToolResult {
-                            call_id: tool_call.id.clone(),
-                            name: tool_call.name.clone(),
-                            content: output.result.content.clone(),
-                            is_error: output.result.is_error,
-                        },
-                    )
-                    .await;
+
+                    let msg = SessionMessage::ToolResult {
+                        call_id: tool_call.id.clone(),
+                        name: tool_call.name.clone(),
+                        content: output.result.content.clone(),
+                        is_error: output.result.is_error,
+                    };
+                    let idx = session.messages.len() as u32;
+                    session.messages.push(msg.clone());
+                    write_message_retry(db, session_id, idx, &msg).ok();
+
                     let event = if output.result.is_error {
                         DaemonMessage::ToolCallFailed {
                             request_id,
@@ -245,62 +161,300 @@ pub(crate) async fn run_agent_loop(
                             output: output.result.content.clone(),
                         }
                     };
-                    broadcast_to_session(session, event, None).await;
+                    broadcast_to_session(session, event);
                 }
             }
         }
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("tool loop exceeded {max_turns} iterations"),
-    ))
+    Err(io::Error::new(io::ErrorKind::InvalidData, format!("tool loop exceeded {max_turns} iterations")))
 }
 
-pub(crate) async fn execute_chat_tool_request(
+fn execute_tool_with_timeout(
+    tool_registry: &Arc<ToolRegistry>,
+    tool_call: &crate::openai::ChatToolCall,
+    x_credentials: Option<&XCredentials>,
+    cwd: Option<&Path>,
+    timeout_dur: Duration,
+    daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
     client: &OpenAiClient,
-    session: &Arc<Mutex<SessionState>>,
+    db: &redb::Database,
+    session: &SessionState,
     session_id: u64,
-    db: &Arc<redb::Database>,
     model: &str,
-    request_id: u32,
-    x_credentials: Option<XCredentials>,
-    cwd: Option<std::path::PathBuf>,
-    state: &crate::DaemonState,
-) -> io::Result<()> {
-    run_agent_loop(
-        client, session, session_id, db, model, request_id,
-        x_credentials.as_ref(), cwd.as_deref(), state,
-    ).await
+    max_turns_default: u32,
+) -> ToolExecutionOutput {
+    if tool_call.name == "list_sessions" {
+        return execute_list_sessions_sync(daemon_tx);
+    }
+    if tool_call.name == "get_session" {
+        return execute_get_session_sync(daemon_tx, &tool_call.arguments_json);
+    }
+    if tool_call.name == "spawn_subsession" {
+        return execute_spawn_subsession_sync(client, daemon_tx, session, session_id, db, model, tool_call, None, cwd, max_turns_default);
+    }
+    if tool_call.name == "load_skill" {
+        return execute_load_skill_sync(session, cwd, &tool_call.arguments_json);
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let tc = tool_call.clone();
+    let tr = Arc::clone(tool_registry);
+    let xc = x_credentials.cloned();
+    let c = cwd.map(|p| p.to_path_buf());
+    std::thread::spawn(move || {
+        let result = tr.execute(&tc, xc.as_ref(), c.as_deref());
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout_dur) {
+        Ok(output) => output,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ToolExecutionOutput {
+            result: ToolResult {
+                content: format!("tool '{}' timed out after {}s", tool_call.name, timeout_dur.as_secs()),
+                is_error: true,
+            },
+            image: None,
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => ToolExecutionOutput {
+            result: ToolResult {
+                content: "tool execution thread panicked".to_string(),
+                is_error: true,
+            },
+            image: None,
+        },
+    }
 }
 
-pub(crate) async fn persist_assistant_tool_use(
-    session: &Arc<Mutex<SessionState>>,
+fn execute_list_sessions_sync(
+    daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
+) -> ToolExecutionOutput {
+    let (reply, rx) = std::sync::mpsc::channel();
+    let _ = daemon_tx.send(crate::daemon::DaemonCommand::ListSessions { reply });
+    match rx.recv() {
+        Ok(sessions) => {
+            if sessions.is_empty() {
+                return ToolExecutionOutput {
+                    result: ToolResult { content: "No sessions found.".to_string(), is_error: false },
+                    image: None,
+                };
+            }
+            let lines: Vec<String> = sessions.iter()
+                .map(|s| {
+                    let title = s.title.as_deref().unwrap_or("(untitled)");
+                    let model = s.selected_model.as_deref().unwrap_or("(no model)");
+                    let parent = s.parent_session_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    let cwd = s.cwd.as_deref().unwrap_or("(none)");
+                    format!("Session {}: \"{}\" | model: {} | messages: {} | parent: {} | cwd: {}",
+                        s.session_id, title, model, s.message_count, parent, cwd)
+                })
+                .collect();
+            ToolExecutionOutput {
+                result: ToolResult { content: crate::tools::truncate_tool_output(&lines.join("\n")), is_error: false },
+                image: None,
+            }
+        }
+        Err(_) => ToolExecutionOutput {
+            result: ToolResult { content: "failed to list sessions".to_string(), is_error: true },
+            image: None,
+        },
+    }
+}
+
+fn execute_get_session_sync(
+    daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
+    arguments_json: &str,
+) -> ToolExecutionOutput {
+    let args: serde_json::Value = match serde_json::from_str(arguments_json) {
+        Ok(a) => a,
+        Err(e) => return ToolExecutionOutput {
+            result: ToolResult { content: format!("invalid arguments: {e}"), is_error: true },
+            image: None,
+        },
+    };
+    let session_id = match args.get("session_id").and_then(|v| v.as_u64()) {
+        Some(id) => id,
+        None => return ToolExecutionOutput {
+            result: ToolResult { content: "missing required argument: session_id".to_string(), is_error: true },
+            image: None,
+        },
+    };
+
+    let (reply, rx) = std::sync::mpsc::channel();
+    let _ = daemon_tx.send(crate::daemon::DaemonCommand::GetSession { session_id, reply });
+    match rx.recv() {
+        Ok(Some(summary)) => {
+            ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!("Session {} ({}) has {} messages.",
+                        session_id,
+                        summary.title.as_deref().unwrap_or("untitled"),
+                        summary.message_count),
+                    is_error: false,
+                },
+                image: None,
+            }
+        }
+        Ok(None) => ToolExecutionOutput {
+            result: ToolResult { content: format!("Session {session_id} not found."), is_error: true },
+            image: None,
+        },
+        Err(_) => ToolExecutionOutput {
+            result: ToolResult { content: "failed to get session".to_string(), is_error: true },
+            image: None,
+        },
+    }
+}
+
+fn execute_spawn_subsession_sync(
+    _client: &OpenAiClient,
+    daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
+    _parent_session: &SessionState,
+    parent_session_id: u64,
+    _db: &redb::Database,
+    _model: &str,
+    tool_call: &crate::openai::ChatToolCall,
+    _x_credentials: Option<&XCredentials>,
+    cwd: Option<&Path>,
+    _max_turns_default: u32,
+) -> ToolExecutionOutput {
+    let args: serde_json::Value = match serde_json::from_str(&tool_call.arguments_json) {
+        Ok(a) => a,
+        Err(e) => return ToolExecutionOutput {
+            result: ToolResult { content: format!("invalid arguments: {e}"), is_error: true },
+            image: None,
+        },
+    };
+    let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return ToolExecutionOutput {
+            result: ToolResult { content: "missing required argument: prompt".to_string(), is_error: true },
+            image: None,
+        },
+    };
+    let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let child_cwd = cwd.map(|p| p.to_path_buf());
+
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let _ = daemon_tx.send(crate::daemon::DaemonCommand::CreateSession {
+        title,
+        parent_session_id: Some(parent_session_id),
+        cwd: child_cwd.clone(),
+        max_turns,
+        reply: reply_tx,
+    });
+
+    match reply_rx.recv() {
+        Ok(Ok((child_id, child_tx))) => {
+            let _ = child_tx.send(crate::sessions::SessionCommand::AppendMessage {
+                message: SessionMessage::SystemText { content: prompt },
+            });
+
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let _ = child_tx.send(crate::sessions::SessionCommand::RunChildInput {
+                request_id: 1,
+                input_tokens: Vec::new(),
+                reply: result_tx,
+            });
+            match result_rx.recv() {
+                Ok(Ok(child_result)) => ToolExecutionOutput {
+                    result: ToolResult {
+                        content: format!("sub-session {child_id} result:\n{}", child_result.output),
+                        is_error: child_result.is_error,
+                    },
+                    image: None,
+                },
+                Ok(Err(e)) => ToolExecutionOutput {
+                    result: ToolResult { content: format!("child session error: {e}"), is_error: true },
+                    image: None,
+                },
+                Err(_) => ToolExecutionOutput {
+                    result: ToolResult { content: format!("sub-session {child_id} exited unexpectedly"), is_error: true },
+                    image: None,
+                },
+            }
+        }
+        Ok(Err(e)) => ToolExecutionOutput {
+            result: ToolResult { content: format!("failed to create sub-session: {e}"), is_error: true },
+            image: None,
+        },
+        Err(_) => ToolExecutionOutput {
+            result: ToolResult { content: "daemon communication failed".to_string(), is_error: true },
+            image: None,
+        },
+    }
+}
+
+fn execute_load_skill_sync(
+    _session: &SessionState,
+    cwd: Option<&Path>,
+    arguments_json: &str,
+) -> ToolExecutionOutput {
+    let v: serde_json::Value = match serde_json::from_str(arguments_json) {
+        Ok(v) => v,
+        Err(e) => return ToolExecutionOutput {
+            result: ToolResult { content: format!("invalid json: {e}"), is_error: true },
+            image: None,
+        },
+    };
+    let name = match v.get("name").and_then(|n| n.as_str()) {
+        Some(n) => n.to_string(),
+        None => return ToolExecutionOutput {
+            result: ToolResult { content: "missing required parameter: name".to_string(), is_error: true },
+            image: None,
+        },
+    };
+
+    let effective_cwd = cwd.unwrap_or_else(|| Path::new("."));
+    let body = match context::load_skill_body(&name, effective_cwd) {
+        Some(b) => b,
+        None => return ToolExecutionOutput {
+            result: ToolResult { content: format!("skill not found: {name}"), is_error: true },
+            image: None,
+        },
+    };
+
+    let skill_message = format!(
+        "The following skill instructions are now active:\n\n<skill name=\"{name}\">\n{body}\n</skill>"
+    );
+
+    // Return the skill content as the result
+    ToolExecutionOutput {
+        result: ToolResult {
+            content: format!("Loaded skill: {name}\n\n---\n{skill_message}"),
+            is_error: false,
+        },
+        image: None,
+    }
+}
+
+fn persist_assistant_tool_use_sync(
+    session: &mut SessionState,
     session_id: u64,
     db: &Arc<redb::Database>,
     tool_use: &ChatAssistantToolUse,
 ) {
-    append_message_and_persist(
-        session,
-        db,
-        session_id,
-        SessionMessage::AssistantToolUse {
-            content: tool_use.content.clone(),
-            tool_calls: tool_use
-                .tool_calls
-                .iter()
-                .map(|tool_call| AssistantToolCallRecord {
-                    call_id: tool_call.id.clone(),
-                    name: tool_call.name.clone(),
-                    arguments_json: tool_call.arguments_json.clone(),
-                })
-                .collect(),
-            reasoning_content: tool_use.reasoning_content.clone(),
-            reasoning: tool_use.reasoning.clone(),
-            reasoning_text: tool_use.reasoning_text.clone(),
-        },
-    )
-    .await;
+    let msg = SessionMessage::AssistantToolUse {
+        content: tool_use.content.clone(),
+        tool_calls: tool_use
+            .tool_calls
+            .iter()
+            .map(|tool_call| AssistantToolCallRecord {
+                call_id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+                arguments_json: tool_call.arguments_json.clone(),
+            })
+            .collect(),
+        reasoning_content: tool_use.reasoning_content.clone(),
+        reasoning: tool_use.reasoning.clone(),
+        reasoning_text: tool_use.reasoning_text.clone(),
+    };
+    let idx = session.messages.len() as u32;
+    session.messages.push(msg.clone());
+    write_message_retry(db, session_id, idx, &msg).ok();
 }
 
 pub(crate) fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMessage> {
@@ -329,10 +483,10 @@ pub(crate) fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<Ch
                 tool_calls: Some(
                     tool_calls
                         .iter()
-                        .map(|tool_call| openai::AssistantToolCall {
+                        .map(|tool_call| AssistantToolCall {
                             id: tool_call.call_id.clone(),
                             kind: "function".to_string(),
-                            function: openai::AssistantToolFunction {
+                            function: AssistantToolFunction {
                                 name: tool_call.name.clone(),
                                 arguments: tool_call.arguments_json.clone(),
                             },
@@ -358,6 +512,7 @@ pub(crate) fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<Ch
         .collect()
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_prompt(messages: &[SessionMessage]) -> String {
     let mut prompt = String::new();
     for message in messages {
@@ -374,36 +529,3 @@ pub const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
 pub const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
 pub const REQUEST_IMAGE_WIDTH: u32 = 640;
 pub const REQUEST_IMAGE_HEIGHT: u32 = 640;
-
-pub(crate) async fn emit_demo_image(
-    tx: &mpsc::Sender<DaemonMessage>,
-    request_id: u32,
-    image_id: u32,
-) -> Result<(), mpsc::error::SendError<DaemonMessage>> {
-    let metadata = ImageMetadata {
-        image_id,
-        mime_type: REQUEST_IMAGE_MIME_TYPE.to_string(),
-        width: REQUEST_IMAGE_WIDTH,
-        height: REQUEST_IMAGE_HEIGHT,
-        byte_len: REQUEST_IMAGE_BYTES.len() as u64,
-        alt: Some("dua".to_string()),
-    };
-    tx.send(DaemonMessage::ImageStart {
-        request_id,
-        metadata,
-    })
-    .await?;
-    for data in REQUEST_IMAGE_BYTES.chunks(MAX_IMAGE_CHUNK_SIZE) {
-        tx.send(DaemonMessage::ImageChunk {
-            request_id,
-            image_id,
-            data: data.to_vec(),
-        })
-        .await?;
-    }
-    tx.send(DaemonMessage::ImageEnd {
-        request_id,
-        image_id,
-    })
-    .await
-}

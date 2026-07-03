@@ -6,23 +6,22 @@ use std::str::FromStr;
 
 use super::{EvmLogsArgs, alloy_err, connect, parse_block_tag};
 
-pub(crate) async fn execute_evm_logs_tool(arguments_json: &str) -> ToolResult {
-    match execute_evm_logs_inner(arguments_json).await {
+pub(crate) fn execute_evm_logs_tool(arguments_json: &str) -> ToolResult {
+    match execute_evm_logs_inner(arguments_json) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_evm_logs_inner(arguments_json: &str) -> Result<String, ToolError> {
+fn execute_evm_logs_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmLogsArgs = serde_json::from_str(arguments_json)?;
-    let output = evm_logs_impl(
+    let output = tokio::runtime::Handle::current().block_on(evm_logs_impl(
         &args.rpc_url,
         args.address.as_deref(),
         args.topic0.as_deref(),
         args.from_block.as_deref(),
         args.to_block.as_deref(),
-    )
-    .await?;
+    ))?;
     Ok(truncate_tool_output(&output))
 }
 

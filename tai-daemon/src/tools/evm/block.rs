@@ -4,16 +4,16 @@ use alloy::rpc::types::eth::BlockNumberOrTag;
 
 use super::{EvmBlockArgs, alloy_err, connect, parse_block_tag};
 
-pub(crate) async fn execute_evm_block_tool(arguments_json: &str) -> ToolResult {
-    match execute_evm_block_inner(arguments_json).await {
+pub(crate) fn execute_evm_block_tool(arguments_json: &str) -> ToolResult {
+    match execute_evm_block_inner(arguments_json) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_evm_block_inner(arguments_json: &str) -> Result<String, ToolError> {
+fn execute_evm_block_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmBlockArgs = serde_json::from_str(arguments_json)?;
-    let output = evm_block_impl(&args.rpc_url, args.block_tag.as_deref()).await?;
+    let output = tokio::runtime::Handle::current().block_on(evm_block_impl(&args.rpc_url, args.block_tag.as_deref()))?;
     Ok(truncate_tool_output(&output))
 }
 

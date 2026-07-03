@@ -128,14 +128,14 @@ define_tool_with_cwd!(Fff, "fff",
     })
 );
 
-pub(crate) async fn execute_fff_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_fff_inner(arguments_json, cwd).await {
+pub(crate) fn execute_fff_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_fff_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_fff_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> std::result::Result<String, ToolError> {
+fn execute_fff_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> std::result::Result<String, ToolError> {
     let args: FffArgs = serde_json::from_str(arguments_json)?;
 
     let path = args.path.as_deref().unwrap_or(".");

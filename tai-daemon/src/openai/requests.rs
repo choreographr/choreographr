@@ -6,8 +6,7 @@ use super::{
     RequestFormat, ResponsesRequest, ResponsesResponse, SseReader, endpoint_url,
     extract_responses_text_delta,
 };
-use serde::Deserialize;
-use std::{future::Future, io, time::Duration};
+use std::{io, time::Duration};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RetryConfig {
@@ -87,22 +86,24 @@ fn status_to_error(
     ))
 }
 
-async fn send_request_raw(
-    request: &reqwest::RequestBuilder,
+fn retry_send(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
     retry: &RetryConfig,
-) -> Result<reqwest::Response, super::OpenAiError> {
+) -> Result<reqwest::blocking::Response, super::OpenAiError> {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
 
-        let req = request.try_clone().ok_or_else(|| {
-            super::OpenAiError::Io(io::Error::new(
-                io::ErrorKind::Other,
-                "request body cannot be cloned for retry",
-            ))
-        })?;
+        let result = client
+            .post(url)
+            .bearer_auth(api_key.trim())
+            .json(body)
+            .send();
 
-        match req.send().await {
+        match result {
             Ok(response) => {
                 let status = response.status();
                 let headers = response.headers().clone();
@@ -112,7 +113,7 @@ async fn send_request_raw(
 
                 if is_retryable_status(status) && attempt < retry.max_attempts {
                     let retry_after = parse_retry_after_secs(response.headers());
-                    let body = response.text().await.unwrap_or_default();
+                    let body_text = response.text().unwrap_or_default();
                     let delay = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                         retry_after
                             .map(Duration::from_secs)
@@ -124,16 +125,16 @@ async fn send_request_raw(
                         attempt,
                         max_attempts = retry.max_attempts,
                         ?status,
-                        %body,
+                        %body_text,
                         delay_ms = delay.as_millis(),
                         "retrying request"
                     );
-                    tokio::time::sleep(delay).await;
+                    std::thread::sleep(delay);
                     continue;
                 }
 
-                let body = response.text().await.unwrap_or_default();
-                let trimmed_body = body.trim();
+                let body_text = response.text().unwrap_or_default();
+                let trimmed_body = body_text.trim();
                 let detail = if trimmed_body.is_empty() {
                     format!("request failed with status {status}")
                 } else {
@@ -151,7 +152,7 @@ async fn send_request_raw(
                         delay_ms = delay.as_millis(),
                         "retrying request after connection/timeout error"
                     );
-                    tokio::time::sleep(delay).await;
+                    std::thread::sleep(delay);
                     continue;
                 }
                 return Err(super::OpenAiError::Io(io::Error::other(error)));
@@ -160,15 +161,74 @@ async fn send_request_raw(
     }
 }
 
-async fn send_request<R>(
-    request: &reqwest::RequestBuilder,
+fn retry_send_get(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    api_key: &str,
     retry: &RetryConfig,
-) -> Result<R, super::OpenAiError>
-where
-    R: for<'de> Deserialize<'de>,
-{
-    let response = send_request_raw(request, retry).await?;
-    response.json().await.map_err(|e| super::OpenAiError::Io(io::Error::other(e)))
+) -> Result<reqwest::blocking::Response, super::OpenAiError> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+
+        let result = client.get(url).bearer_auth(api_key.trim()).send();
+
+        match result {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+                if status.is_success() {
+                    return Ok(response);
+                }
+
+                if is_retryable_status(status) && attempt < retry.max_attempts {
+                    let retry_after = parse_retry_after_secs(response.headers());
+                    let body_text = response.text().unwrap_or_default();
+                    let delay = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        retry_after
+                            .map(Duration::from_secs)
+                            .unwrap_or_else(|| backoff_duration(attempt, retry))
+                    } else {
+                        backoff_duration(attempt, retry)
+                    };
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = retry.max_attempts,
+                        ?status,
+                        %body_text,
+                        delay_ms = delay.as_millis(),
+                        "retrying request"
+                    );
+                    std::thread::sleep(delay);
+                    continue;
+                }
+
+                let body_text = response.text().unwrap_or_default();
+                let trimmed_body = body_text.trim();
+                let detail = if trimmed_body.is_empty() {
+                    format!("request failed with status {status}")
+                } else {
+                    format!("request failed with status {status}: {trimmed_body}")
+                };
+                return Err(status_to_error(status, &detail, &headers));
+            }
+            Err(error) => {
+                if (error.is_connect() || error.is_timeout()) && attempt < retry.max_attempts {
+                    let delay = backoff_duration(attempt, retry);
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = retry.max_attempts,
+                        ?error,
+                        delay_ms = delay.as_millis(),
+                        "retrying request after connection/timeout error"
+                    );
+                    std::thread::sleep(delay);
+                    continue;
+                }
+                return Err(super::OpenAiError::Io(io::Error::other(error)));
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -186,39 +246,38 @@ fn chat_completions_max_tokens_field(config: &ServiceConfig, model: &str) -> Max
 }
 
 impl OpenAiClient {
-    pub async fn validate_and_list_models(&self) -> Result<Vec<String>, super::OpenAiError> {
+    pub fn validate_and_list_models(&self) -> Result<Vec<String>, super::OpenAiError> {
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
         let retry = RetryConfig::from_service_config(&self.config);
-        let request = self.http.get(&url).bearer_auth(self.api_key.trim());
-        let payload: ModelListResponse = send_request(&request, &retry).await?;
+        let response = retry_send_get(&self.http, &url, &self.api_key, &retry)?;
+        let payload: ModelListResponse = response.json().map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
         Ok(payload.data.into_iter().map(|model| model.id).collect())
     }
 
-    pub async fn completion(&self, model: &str, prompt: &str) -> Result<String, super::OpenAiError> {
+    pub fn completion(&self, model: &str, prompt: &str) -> Result<String, super::OpenAiError> {
         match self.config.request_format_for_model(model) {
             RequestFormat::Responses => {
-                responses_request(&self.http, &self.config, &self.api_key, model, prompt).await
+                responses_request(&self.http, &self.config, &self.api_key, model, prompt)
             }
             RequestFormat::ChatCompletions => {
-                chat_completions_request(&self.http, &self.config, &self.api_key, model, prompt).await
+                chat_completions_request(&self.http, &self.config, &self.api_key, model, prompt)
             }
         }
     }
 
-    pub async fn completion_stream<F, Fut>(
+    pub fn completion_stream<F>(
         &self,
         model: &str,
         prompt: &str,
         mut on_chunk: F,
     ) -> Result<(), super::OpenAiError>
     where
-        F: FnMut(CompletionChunkKind, String) -> Fut,
-        Fut: Future<Output = io::Result<()>>,
+        F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
     {
         if !self.config.streaming {
-            let content = self.completion(model, prompt).await?;
+            let content = self.completion(model, prompt)?;
             if !content.is_empty() {
-                on_chunk(CompletionChunkKind::Answer, content).await?;
+                on_chunk(CompletionChunkKind::Answer, content)?;
             }
             return Ok(());
         }
@@ -226,7 +285,6 @@ impl OpenAiClient {
         match self.config.request_format_for_model(model) {
             RequestFormat::Responses => {
                 responses_request_streaming(&self.http, &self.config, &self.api_key, model, prompt, &mut on_chunk)
-                    .await
             }
             RequestFormat::ChatCompletions => {
                 chat_completions_request_streaming(
@@ -237,23 +295,22 @@ impl OpenAiClient {
                     prompt,
                     &mut on_chunk,
                 )
-                .await
             }
         }
     }
 
-    pub async fn chat_completion_turn(
+    pub fn chat_completion_turn(
         &self,
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
     ) -> Result<ChatTurnResult, super::OpenAiError> {
-        chat_completions_request_with_tools(&self.http, &self.config, &self.api_key, model, messages, tools).await
+        chat_completions_request_with_tools(&self.http, &self.config, &self.api_key, model, messages, tools)
     }
 }
 
-async fn responses_request(
-    client: &reqwest::Client,
+fn responses_request(
+    client: &reqwest::blocking::Client,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -261,12 +318,13 @@ async fn responses_request(
 ) -> Result<String, super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
     let retry = RetryConfig::from_service_config(config);
-    let request = client.post(&url).bearer_auth(api_key.trim()).json(&ResponsesRequest {
+    let body = serde_json::to_value(&ResponsesRequest {
         model,
         input: prompt,
         stream: false,
-    });
-    let payload: ResponsesResponse = send_request(&request, &retry).await?;
+    }).map_err(io::Error::other)?;
+    let response = retry_send(client, &url, api_key, &body, &retry)?;
+    let payload: ResponsesResponse = response.json().map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
     let content = payload
         .output
@@ -284,8 +342,8 @@ async fn responses_request(
     Ok(content)
 }
 
-async fn chat_completions_request(
-    client: &reqwest::Client,
+fn chat_completions_request(
+    client: &reqwest::blocking::Client,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -299,7 +357,7 @@ async fn chat_completions_request(
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let retry = RetryConfig::from_service_config(config);
-    let request = client.post(&url).bearer_auth(api_key.trim()).json(&ChatCompletionsRequest {
+    let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
         messages: vec![ChatRequestMessage::simple("user", prompt.to_string())],
         tools: None,
@@ -307,8 +365,9 @@ async fn chat_completions_request(
         stream_options: None,
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
-    });
-    let payload: ChatCompletionsResponse = send_request(&request, &retry).await?;
+    }).map_err(io::Error::other)?;
+    let response = retry_send(client, &url, api_key, &body, &retry)?;
+    let payload: ChatCompletionsResponse = response.json().map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
     let content = payload
         .choices
@@ -326,8 +385,8 @@ async fn chat_completions_request(
     Ok(content)
 }
 
-async fn chat_completions_request_with_tools(
-    client: &reqwest::Client,
+fn chat_completions_request_with_tools(
+    client: &reqwest::blocking::Client,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -342,7 +401,7 @@ async fn chat_completions_request_with_tools(
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let retry = RetryConfig::from_service_config(config);
-    let request = client.post(&url).bearer_auth(api_key.trim()).json(&ChatCompletionsRequest {
+    let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
         messages: messages.to_vec(),
         tools: Some(tools.to_vec()),
@@ -350,8 +409,9 @@ async fn chat_completions_request_with_tools(
         stream_options: None,
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
-    });
-    let payload: ChatCompletionsResponse = send_request(&request, &retry).await?;
+    }).map_err(io::Error::other)?;
+    let response = retry_send(client, &url, api_key, &body, &retry)?;
+    let payload: ChatCompletionsResponse = response.json().map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
     let Some(choice) = payload.choices.into_iter().next() else {
         return Err(super::OpenAiError::EmptyResponse);
@@ -389,8 +449,8 @@ async fn chat_completions_request_with_tools(
     Ok(ChatTurnResult::FinalText(content))
 }
 
-async fn chat_completions_request_streaming<F, Fut>(
-    client: &reqwest::Client,
+fn chat_completions_request_streaming<F>(
+    client: &reqwest::blocking::Client,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -398,8 +458,7 @@ async fn chat_completions_request_streaming<F, Fut>(
     on_chunk: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
-    F: FnMut(CompletionChunkKind, String) -> Fut,
-    Fut: Future<Output = io::Result<()>>,
+    F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
 {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
@@ -409,24 +468,23 @@ where
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let retry = RetryConfig::from_service_config(config);
-    let request = client.post(&url).bearer_auth(api_key.trim()).json(
-        &ChatCompletionsRequest {
-            model,
-            messages: vec![ChatRequestMessage::simple("user", prompt.to_string())],
-            tools: None,
-            stream: true,
-            stream_options: Some(ChatCompletionsStreamOptions {
-                include_usage: true,
-            }),
-            max_tokens: max_tokens_field,
-            max_completion_tokens: max_completion_tokens_field,
-        },
-    );
-    let response = send_request_raw(&request, &retry).await?;
+    let body = serde_json::to_value(&ChatCompletionsRequest {
+        model,
+        messages: vec![ChatRequestMessage::simple("user", prompt.to_string())],
+        tools: None,
+        stream: true,
+        stream_options: Some(ChatCompletionsStreamOptions {
+            include_usage: true,
+        }),
+        max_tokens: max_tokens_field,
+        max_completion_tokens: max_completion_tokens_field,
+    }).map_err(io::Error::other)?;
+    let response = retry_send(client, &url, api_key, &body, &retry)?;
+    let body_bytes = response.bytes().map_err(io::Error::other)?.to_vec();
 
-    let mut reader = SseReader::new(response);
+    let mut reader = SseReader::new(body_bytes);
     let mut saw_text = false;
-    while let Some(data) = reader.next_event().await? {
+    while let Some(data) = reader.next_event()? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
         for choice in payload.choices {
@@ -436,7 +494,7 @@ where
 
             if let Some(content) = delta.content.filter(|content| !content.is_empty()) {
                 saw_text = true;
-                on_chunk(CompletionChunkKind::Answer, content).await?;
+                on_chunk(CompletionChunkKind::Answer, content)?;
             }
             for reasoning in [
                 delta.reasoning_content,
@@ -448,7 +506,7 @@ where
             .filter(|content| !content.is_empty())
             {
                 saw_text = true;
-                on_chunk(CompletionChunkKind::Reasoning, reasoning).await?;
+                on_chunk(CompletionChunkKind::Reasoning, reasoning)?;
             }
         }
     }
@@ -460,8 +518,8 @@ where
     Ok(())
 }
 
-async fn responses_request_streaming<F, Fut>(
-    client: &reqwest::Client,
+fn responses_request_streaming<F>(
+    client: &reqwest::blocking::Client,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -469,26 +527,26 @@ async fn responses_request_streaming<F, Fut>(
     on_chunk: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
-    F: FnMut(CompletionChunkKind, String) -> Fut,
-    Fut: Future<Output = io::Result<()>>,
+    F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
 {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
     let retry = RetryConfig::from_service_config(config);
-    let request = client.post(&url).bearer_auth(api_key.trim()).json(&ResponsesRequest {
+    let body = serde_json::to_value(&ResponsesRequest {
         model,
         input: prompt,
         stream: true,
-    });
-    let response = send_request_raw(&request, &retry).await?;
+    }).map_err(io::Error::other)?;
+    let response = retry_send(client, &url, api_key, &body, &retry)?;
+    let body_bytes = response.bytes().map_err(io::Error::other)?.to_vec();
 
-    let mut reader = SseReader::new(response);
+    let mut reader = SseReader::new(body_bytes);
     let mut saw_text = false;
-    while let Some(data) = reader.next_event().await? {
-        if let Some(delta) = extract_responses_text_delta(&data)?
-            && !delta.is_empty()
-        {
-            saw_text = true;
-            on_chunk(CompletionChunkKind::Answer, delta).await?;
+    while let Some(data) = reader.next_event()? {
+        if let Some(delta) = extract_responses_text_delta(&data)? {
+            if !delta.is_empty() {
+                saw_text = true;
+                on_chunk(CompletionChunkKind::Answer, delta)?;
+            }
         }
     }
 

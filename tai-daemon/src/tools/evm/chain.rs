@@ -3,16 +3,16 @@ use alloy::providers::Provider;
 
 use super::{RpcUrlArgs, alloy_err, connect};
 
-pub(crate) async fn execute_evm_chain_tool(arguments_json: &str) -> ToolResult {
-    match execute_evm_chain_inner(arguments_json).await {
+pub(crate) fn execute_evm_chain_tool(arguments_json: &str) -> ToolResult {
+    match execute_evm_chain_inner(arguments_json) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_evm_chain_inner(arguments_json: &str) -> Result<String, ToolError> {
+fn execute_evm_chain_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: RpcUrlArgs = serde_json::from_str(arguments_json)?;
-    let output = evm_chain_impl(&args.rpc_url).await?;
+    let output = tokio::runtime::Handle::current().block_on(evm_chain_impl(&args.rpc_url))?;
     Ok(truncate_tool_output(&output))
 }
 

@@ -32,60 +32,61 @@ struct SubxtBlockArgs {
     ws_url: Option<String>,
 }
 
-pub(crate) async fn execute_subxt_chain_tool(arguments_json: &str) -> ToolResult {
-    match execute_subxt_chain_inner(arguments_json).await {
+pub(crate) fn execute_subxt_chain_tool(arguments_json: &str) -> ToolResult {
+    match execute_subxt_chain_inner(arguments_json) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_subxt_chain_inner(arguments_json: &str) -> Result<String, ToolError> {
+fn execute_subxt_chain_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: WsUrlArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = subxt_chain_impl(&ws_url).await?;
+    let output = tokio::runtime::Handle::current().block_on(subxt_chain_impl(&ws_url))?;
     Ok(truncate_tool_output(&output))
 }
 
-pub(crate) async fn execute_subxt_balance_tool(arguments_json: &str) -> ToolResult {
-    match execute_subxt_balance_inner(arguments_json).await {
+pub(crate) fn execute_subxt_balance_tool(arguments_json: &str) -> ToolResult {
+    match execute_subxt_balance_inner(arguments_json) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_subxt_balance_inner(arguments_json: &str) -> Result<String, ToolError> {
+fn execute_subxt_balance_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: SubxtBalanceArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = subxt_balance_impl(&ws_url, &args.address).await?;
+    let output = tokio::runtime::Handle::current().block_on(subxt_balance_impl(&ws_url, &args.address))?;
     Ok(truncate_tool_output(&output))
 }
 
-pub(crate) async fn execute_subxt_query_tool(arguments_json: &str) -> ToolResult {
-    match execute_subxt_query_inner(arguments_json).await {
+pub(crate) fn execute_subxt_query_tool(arguments_json: &str) -> ToolResult {
+    match execute_subxt_query_inner(arguments_json) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_subxt_query_inner(arguments_json: &str) -> Result<String, ToolError> {
+fn execute_subxt_query_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: SubxtQueryArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output =
-        subxt_query_impl(&ws_url, &args.pallet, &args.storage_item, args.key.as_deref()).await?;
+    let output = tokio::runtime::Handle::current().block_on(
+        subxt_query_impl(&ws_url, &args.pallet, &args.storage_item, args.key.as_deref()),
+    )?;
     Ok(truncate_tool_output(&output))
 }
 
-pub(crate) async fn execute_subxt_block_tool(arguments_json: &str) -> ToolResult {
-    match execute_subxt_block_inner(arguments_json).await {
+pub(crate) fn execute_subxt_block_tool(arguments_json: &str) -> ToolResult {
+    match execute_subxt_block_inner(arguments_json) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_subxt_block_inner(arguments_json: &str) -> Result<String, ToolError> {
+fn execute_subxt_block_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: SubxtBlockArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = subxt_block_impl(&ws_url, args.block_number).await?;
+    let output = tokio::runtime::Handle::current().block_on(subxt_block_impl(&ws_url, args.block_number))?;
     Ok(truncate_tool_output(&output))
 }
 

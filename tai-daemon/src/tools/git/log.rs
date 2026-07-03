@@ -11,14 +11,14 @@ struct GitLogArgs {
     limit: Option<usize>,
 }
 
-pub async fn execute_git_log_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_git_log_inner(arguments_json, cwd).await {
+pub fn execute_git_log_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_git_log_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_git_log_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_git_log_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: GitLogArgs = serde_json::from_str(arguments_json)?;
     let output = git_log_impl(
         args.repo_path.as_deref(),
