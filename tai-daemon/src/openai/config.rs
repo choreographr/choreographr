@@ -30,6 +30,16 @@ pub struct ServiceConfig {
     pub streaming: bool,
     #[serde(default)]
     pub max_turns: Option<u32>,
+    #[serde(default = "default_retry_max_attempts")]
+    pub retry_max_attempts: u32,
+    #[serde(default = "default_retry_initial_backoff_ms")]
+    pub retry_initial_backoff_ms: u64,
+    #[serde(default = "default_retry_max_backoff_ms")]
+    pub retry_max_backoff_ms: u64,
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
     #[serde(default)]
     pub context: ContextConfig,
 }
@@ -47,6 +57,11 @@ impl Default for ServiceConfig {
             model_max_tokens: HashMap::new(),
             streaming: default_streaming(),
             max_turns: None,
+            retry_max_attempts: default_retry_max_attempts(),
+            retry_initial_backoff_ms: default_retry_initial_backoff_ms(),
+            retry_max_backoff_ms: default_retry_max_backoff_ms(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            request_timeout_secs: default_request_timeout_secs(),
             context: ContextConfig::default(),
         }
     }
@@ -74,6 +89,26 @@ fn default_request_format() -> RequestFormat {
 
 fn default_streaming() -> bool {
     true
+}
+
+fn default_retry_max_attempts() -> u32 {
+    5
+}
+
+fn default_retry_initial_backoff_ms() -> u64 {
+    1000
+}
+
+fn default_retry_max_backoff_ms() -> u64 {
+    30000
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    30
+}
+
+fn default_request_timeout_secs() -> u64 {
+    120
 }
 
 pub fn config_path() -> io::Result<PathBuf> {

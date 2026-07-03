@@ -1,36 +1,148 @@
+use super::ServiceConfig;
 use super::{
-    ServiceConfig, ChatAssistantToolUse, ChatCompletionsRequest, ChatCompletionsResponse,
+    ChatAssistantToolUse, ChatCompletionsRequest, ChatCompletionsResponse,
     ChatCompletionsStreamOptions, ChatCompletionsStreamResponse, ChatRequestMessage, ChatToolCall,
     ChatToolDefinition, ChatTurnResult, CompletionChunkKind, ModelListResponse, OpenAiClient,
     RequestFormat, ResponsesRequest, ResponsesResponse, SseReader, endpoint_url,
     extract_responses_text_delta,
 };
 use serde::Deserialize;
-use std::{future::Future, io};
+use std::{future::Future, io, time::Duration};
 
-async fn send_request<R>(request: reqwest::RequestBuilder) -> io::Result<R>
+#[derive(Debug, Clone)]
+pub(crate) struct RetryConfig {
+    pub(crate) max_attempts: u32,
+    pub(crate) initial_backoff_ms: u64,
+    pub(crate) max_backoff_ms: u64,
+}
+
+impl RetryConfig {
+    fn from_service_config(config: &ServiceConfig) -> Self {
+        Self {
+            max_attempts: config.retry_max_attempts,
+            initial_backoff_ms: config.retry_initial_backoff_ms,
+            max_backoff_ms: config.retry_max_backoff_ms,
+        }
+    }
+}
+
+pub(crate) fn backoff_duration(retry_number: u32, config: &RetryConfig) -> Duration {
+    let multiplier = 2u64.saturating_pow(retry_number.saturating_sub(1));
+    let base = config.initial_backoff_ms.saturating_mul(multiplier);
+    let capped = base.min(config.max_backoff_ms);
+    let jitter: f64 = rand::random_range(0.75..=1.25);
+    Duration::from_millis((capped as f64 * jitter) as u64)
+}
+
+pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+pub(crate) fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+fn status_to_error(status: reqwest::StatusCode, detail: &str) -> io::Error {
+    let kind = match status {
+        s if s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            io::ErrorKind::InvalidInput
+        }
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, detail.to_string())
+}
+
+async fn send_request_raw(
+    request: &reqwest::RequestBuilder,
+    retry: &RetryConfig,
+) -> io::Result<reqwest::Response> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+
+        let req = request.try_clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "request body cannot be cloned for retry",
+            )
+        })?;
+
+        match req.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(response);
+                }
+
+                if is_retryable_status(status) && attempt < retry.max_attempts {
+                    let retry_after = parse_retry_after_secs(response.headers());
+                    let body = response.text().await.unwrap_or_default();
+                    let delay = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                        retry_after
+                            .map(Duration::from_secs)
+                            .unwrap_or_else(|| backoff_duration(attempt, retry))
+                    } else {
+                        backoff_duration(attempt, retry)
+                    };
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = retry.max_attempts,
+                        ?status,
+                        %body,
+                        delay_ms = delay.as_millis(),
+                        "retrying request"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
+                let body = response.text().await.unwrap_or_default();
+                let trimmed_body = body.trim();
+                let detail = if trimmed_body.is_empty() {
+                    format!("request failed with status {status}")
+                } else {
+                    format!("request failed with status {status}: {trimmed_body}")
+                };
+                return Err(status_to_error(status, &detail));
+            }
+            Err(error) => {
+                if (error.is_connect() || error.is_timeout()) && attempt < retry.max_attempts {
+                    let delay = backoff_duration(attempt, retry);
+                    tracing::warn!(
+                        attempt,
+                        max_attempts = retry.max_attempts,
+                        ?error,
+                        delay_ms = delay.as_millis(),
+                        "retrying request after connection/timeout error"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(io::Error::other(error));
+            }
+        }
+    }
+}
+
+async fn send_request<R>(
+    request: &reqwest::RequestBuilder,
+    retry: &RetryConfig,
+) -> io::Result<R>
 where
     R: for<'de> Deserialize<'de>,
 {
-    let response = send_request_raw(request).await?;
+    let response = send_request_raw(request, retry).await?;
     response.json().await.map_err(io::Error::other)
-}
-
-async fn send_request_raw(request: reqwest::RequestBuilder) -> io::Result<reqwest::Response> {
-    let response = request.send().await.map_err(io::Error::other)?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let trimmed_body = body.trim();
-        let detail = if trimmed_body.is_empty() {
-            format!("request failed with status {status}")
-        } else {
-            format!("request failed with status {status}: {trimmed_body}")
-        };
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, detail));
-    }
-
-    Ok(response)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,8 +162,9 @@ fn chat_completions_max_tokens_field(config: &ServiceConfig, model: &str) -> Max
 impl OpenAiClient {
     pub async fn validate_and_list_models(&self) -> io::Result<Vec<String>> {
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
-        let payload: ModelListResponse =
-            send_request(self.http.get(&url).bearer_auth(self.api_key.trim())).await?;
+        let retry = RetryConfig::from_service_config(&self.config);
+        let request = self.http.get(&url).bearer_auth(self.api_key.trim());
+        let payload: ModelListResponse = send_request(&request, &retry).await?;
         Ok(payload.data.into_iter().map(|model| model.id).collect())
     }
 
@@ -121,15 +234,13 @@ async fn responses_request(
     prompt: &str,
 ) -> io::Result<String> {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
-    let payload: ResponsesResponse =
-        send_request(client.post(&url).bearer_auth(api_key.trim()).json(
-            &ResponsesRequest {
-                model,
-                input: prompt,
-                stream: false,
-            },
-        ))
-        .await?;
+    let retry = RetryConfig::from_service_config(config);
+    let request = client.post(&url).bearer_auth(api_key.trim()).json(&ResponsesRequest {
+        model,
+        input: prompt,
+        stream: false,
+    });
+    let payload: ResponsesResponse = send_request(&request, &retry).await?;
 
     let content = payload
         .output
@@ -164,19 +275,17 @@ async fn chat_completions_request(
             MaxTokensField::MaxTokens => (max_tokens, None),
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
-    let payload: ChatCompletionsResponse =
-        send_request(client.post(&url).bearer_auth(api_key.trim()).json(
-            &ChatCompletionsRequest {
-                model,
-                messages: vec![ChatRequestMessage::simple("user", prompt.to_string())],
-                tools: None,
-                stream: false,
-                stream_options: None,
-                max_tokens: max_tokens_field,
-                max_completion_tokens: max_completion_tokens_field,
-            },
-        ))
-        .await?;
+    let retry = RetryConfig::from_service_config(config);
+    let request = client.post(&url).bearer_auth(api_key.trim()).json(&ChatCompletionsRequest {
+        model,
+        messages: vec![ChatRequestMessage::simple("user", prompt.to_string())],
+        tools: None,
+        stream: false,
+        stream_options: None,
+        max_tokens: max_tokens_field,
+        max_completion_tokens: max_completion_tokens_field,
+    });
+    let payload: ChatCompletionsResponse = send_request(&request, &retry).await?;
 
     let content = payload
         .choices
@@ -212,19 +321,17 @@ async fn chat_completions_request_with_tools(
             MaxTokensField::MaxTokens => (max_tokens, None),
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
-    let payload: ChatCompletionsResponse =
-        send_request(client.post(&url).bearer_auth(api_key.trim()).json(
-            &ChatCompletionsRequest {
-                model,
-                messages: messages.to_vec(),
-                tools: Some(tools.to_vec()),
-                stream: false,
-                stream_options: None,
-                max_tokens: max_tokens_field,
-                max_completion_tokens: max_completion_tokens_field,
-            },
-        ))
-        .await?;
+    let retry = RetryConfig::from_service_config(config);
+    let request = client.post(&url).bearer_auth(api_key.trim()).json(&ChatCompletionsRequest {
+        model,
+        messages: messages.to_vec(),
+        tools: Some(tools.to_vec()),
+        stream: false,
+        stream_options: None,
+        max_tokens: max_tokens_field,
+        max_completion_tokens: max_completion_tokens_field,
+    });
+    let payload: ChatCompletionsResponse = send_request(&request, &retry).await?;
 
     let Some(choice) = payload.choices.into_iter().next() else {
         return Err(io::Error::new(
@@ -287,7 +394,8 @@ where
             MaxTokensField::MaxTokens => (max_tokens, None),
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
-    let response = send_request_raw(client.post(&url).bearer_auth(api_key.trim()).json(
+    let retry = RetryConfig::from_service_config(config);
+    let request = client.post(&url).bearer_auth(api_key.trim()).json(
         &ChatCompletionsRequest {
             model,
             messages: vec![ChatRequestMessage::simple("user", prompt.to_string())],
@@ -299,8 +407,8 @@ where
             max_tokens: max_tokens_field,
             max_completion_tokens: max_completion_tokens_field,
         },
-    ))
-    .await?;
+    );
+    let response = send_request_raw(&request, &retry).await?;
 
     let mut reader = SseReader::new(response);
     let mut saw_text = false;
@@ -354,14 +462,13 @@ where
     Fut: Future<Output = io::Result<()>>,
 {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
-    let response = send_request_raw(client.post(&url).bearer_auth(api_key.trim()).json(
-        &ResponsesRequest {
-            model,
-            input: prompt,
-            stream: true,
-        },
-    ))
-    .await?;
+    let retry = RetryConfig::from_service_config(config);
+    let request = client.post(&url).bearer_auth(api_key.trim()).json(&ResponsesRequest {
+        model,
+        input: prompt,
+        stream: true,
+    });
+    let response = send_request_raw(&request, &retry).await?;
 
     let mut reader = SseReader::new(response);
     let mut saw_text = false;

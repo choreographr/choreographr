@@ -30,6 +30,11 @@ fn test_service_config() -> ServiceConfig {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        retry_max_attempts: 5,
+        retry_initial_backoff_ms: 1000,
+        retry_max_backoff_ms: 30000,
+        connect_timeout_secs: 30,
+        request_timeout_secs: 120,
         context: Default::default(),
     }
 }
@@ -124,6 +129,11 @@ async fn spawn_tool_call_server(
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        retry_max_attempts: 5,
+        retry_initial_backoff_ms: 1000,
+        retry_max_backoff_ms: 30000,
+        connect_timeout_secs: 30,
+        request_timeout_secs: 120,
         context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;
@@ -239,6 +249,11 @@ async fn spawn_http_tool_call_server() -> (DaemonState, tokio::task::JoinHandle<
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        retry_max_attempts: 5,
+        retry_initial_backoff_ms: 1000,
+        retry_max_backoff_ms: 30000,
+        connect_timeout_secs: 30,
+        request_timeout_secs: 120,
         context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;
@@ -333,6 +348,11 @@ async fn spawn_display_image_tool_server() -> (DaemonState, tokio::task::JoinHan
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        retry_max_attempts: 5,
+        retry_initial_backoff_ms: 1000,
+        retry_max_backoff_ms: 30000,
+        connect_timeout_secs: 30,
+        request_timeout_secs: 120,
         context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;
@@ -399,6 +419,11 @@ async fn daemon_handler_set_model_fails_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
         max_turns: None,
+        retry_max_attempts: 5,
+        retry_initial_backoff_ms: 1000,
+        retry_max_backoff_ms: 30000,
+        connect_timeout_secs: 30,
+        request_timeout_secs: 120,
         context: Default::default(),
     };
     let state = new_daemon_state(test_db(), 25).await;

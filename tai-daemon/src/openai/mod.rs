@@ -12,8 +12,13 @@ pub use config::{
 pub(crate) use sse::build_sse_event;
 pub(crate) use sse::{SseReader, extract_responses_text_delta};
 
+#[cfg(test)]
+pub(crate) use requests::{
+    RetryConfig, backoff_duration, is_retryable_status, parse_retry_after_secs,
+};
+
 use serde::{Deserialize, Serialize};
-use std::io;
+use std::{io, time::Duration};
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -232,6 +237,8 @@ pub struct OpenAiClient {
 impl OpenAiClient {
     pub fn new(config: ServiceConfig, api_key: String) -> io::Result<Self> {
         let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
             .map_err(io::Error::other)?;
         Ok(Self { config, api_key, http })
