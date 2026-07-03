@@ -193,7 +193,7 @@ impl super::Tool for XPost {
         })
     }
 
-    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput {
+    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -264,7 +264,7 @@ impl super::Tool for XSearchRecent {
         })
     }
 
-    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput {
+    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -341,7 +341,7 @@ impl super::Tool for XUserLookup {
         })
     }
 
-    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput {
+    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {

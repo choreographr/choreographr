@@ -10807,6 +10807,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "bincode 2.0.1",
  "bytes",
  "dirs 6.0.0",
  "fff-search",

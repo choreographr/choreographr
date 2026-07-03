@@ -14,9 +14,28 @@ macro_rules! define_tool {
             fn name(&self) -> &'static str { $name }
             fn description(&self) -> &'static str { $desc }
             fn schema(&self) -> serde_json::Value { $schema }
-            async fn execute(&self, args: &str, _x_credentials: Option<&tai_keystore::XCredentials>) -> $crate::tools::ToolExecutionOutput {
+            async fn execute(&self, args: &str, _x_credentials: Option<&tai_keystore::XCredentials>, _cwd: Option<&std::path::Path>) -> $crate::tools::ToolExecutionOutput {
                 $crate::tools::ToolExecutionOutput {
                     result: $exec_fn(args).await,
+                    image: None,
+                }
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! define_tool_with_cwd {
+    ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr) => {
+        pub(crate) struct $struct;
+        #[::async_trait::async_trait]
+        impl $crate::tools::Tool for $struct {
+            fn name(&self) -> &'static str { $name }
+            fn description(&self) -> &'static str { $desc }
+            fn schema(&self) -> serde_json::Value { $schema }
+            async fn execute(&self, args: &str, _x_credentials: Option<&tai_keystore::XCredentials>, cwd: Option<&std::path::Path>) -> $crate::tools::ToolExecutionOutput {
+                $crate::tools::ToolExecutionOutput {
+                    result: $exec_fn(args, cwd).await,
                     image: None,
                 }
             }
@@ -35,6 +54,7 @@ mod evm;
 pub(crate) mod git;
 mod subxt;
 pub(crate) mod x;
+pub(crate) mod subsession;
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -64,7 +84,7 @@ pub(crate) trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn schema(&self) -> serde_json::Value;
-    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput;
+    async fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, cwd: Option<&std::path::Path>) -> ToolExecutionOutput;
 }
 
 pub(crate) struct ToolRegistry {
@@ -114,9 +134,9 @@ impl ToolRegistry {
         self.tools.insert(name, Box::new(tool));
     }
 
-    pub async fn execute(&self, tool_call: &ChatToolCall, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput {
+    pub async fn execute(&self, tool_call: &ChatToolCall, x_credentials: Option<&XCredentials>, cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
-            Some(tool) => tool.execute(&tool_call.arguments_json, x_credentials).await,
+            Some(tool) => tool.execute(&tool_call.arguments_json, x_credentials, cwd).await,
             None => ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("unknown tool: {}", tool_call.name),
@@ -128,10 +148,12 @@ impl ToolRegistry {
     }
 
     pub fn available_definitions(&self) -> Vec<ChatToolDefinition> {
-        self.tools
+        let mut defs: Vec<_> = self.tools
             .values()
             .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
-            .collect()
+            .collect();
+        defs.push(subsession::spawn_subsession_definition());
+        defs
     }
 }
 
@@ -140,8 +162,20 @@ fn global_registry() -> &'static ToolRegistry {
     REGISTRY.get_or_init(ToolRegistry::new)
 }
 
-pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall, x_credentials: Option<&XCredentials>) -> ToolExecutionOutput {
-    global_registry().execute(tool_call, x_credentials).await
+pub(crate) async fn execute_tool_call(tool_call: &ChatToolCall, x_credentials: Option<&XCredentials>, cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
+    global_registry().execute(tool_call, x_credentials, cwd).await
+}
+
+pub(crate) fn resolve_path(path: &str, cwd: Option<&std::path::Path>) -> std::path::PathBuf {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    if let Some(cwd) = cwd {
+        cwd.join(p)
+    } else {
+        p.to_path_buf()
+    }
 }
 
 pub(crate) fn available_tools() -> Vec<ChatToolDefinition> {
@@ -150,17 +184,17 @@ pub(crate) fn available_tools() -> Vec<ChatToolDefinition> {
 
 #[cfg(test)]
 pub(crate) async fn execute_read_file_range_tool(arguments_json: &str) -> ToolResult {
-    fs::execute_read_file_range_tool(arguments_json).await
+    fs::execute_read_file_range_tool(arguments_json, None).await
 }
 
 #[cfg(test)]
 pub(crate) async fn execute_write_file_tool(arguments_json: &str) -> ToolResult {
-    fs::execute_write_file_tool(arguments_json).await
+    fs::execute_write_file_tool(arguments_json, None).await
 }
 
 #[cfg(test)]
 pub(crate) async fn execute_edit_file_tool(arguments_json: &str) -> ToolResult {
-    fs::execute_edit_file_tool(arguments_json).await
+    fs::execute_edit_file_tool(arguments_json, None).await
 }
 
 #[cfg(test)]

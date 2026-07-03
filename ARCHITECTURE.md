@@ -168,7 +168,7 @@ Entry point: `src/main.rs` → initializes tracing, creates `DaemonState`, runs 
 | Module | Purpose |
 |---|---|
 | `server.rs` | Accepts Unix connections, spawns per-client `handle_client` tasks. Dispatches all `ClientMessage` variants. Implements lock/unlock flow. |
-| `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting. Sessions are stored as `HashMap<u64, Arc<Mutex<SessionState>>>`. |
+| `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
 | `tools/` | Tool trait, registry, and 28 registered tools. |
@@ -312,7 +312,10 @@ trait Tool {
 Tools are registered in a `ToolRegistry` backed by a global `OnceLock<ToolRegistry>` singleton.
 The daemon retrieves the global registry at startup and passes tool definitions to the model.
 
-### Available tools (28 total)
+Each tool receives an optional `cwd: Option<&Path>` parameter that represents the session's
+working directory. Filesystem and Git tools resolve relative paths against this CWD.
+
+### Available tools (29 total)
 
 | Category | Tools |
 |---|---|
@@ -324,11 +327,79 @@ The daemon retrieves the global registry at startup and passes tool definitions 
 | **Substrate** | `subxt_chain`, `subxt_balance`, `subxt_query`, `subxt_block` |
 | **File search** | `fff` (file finding) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
+| **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
+
+### spawn_subsession
+
+`spawn_subsession` is a special tool: it does not implement the `Tool` trait. Instead, it is
+intercepted in `run_agent_loop()` and handled with full access to `DaemonState` and the
+`OpenAiClient`. When invoked:
+
+1. A child session is created via `create_session_internal()` with the parent as
+   `parent_session_id` and inheriting the parent's CWD.
+2. The prompt argument is pushed as a `SystemText` message into the child session.
+3. The child session runs its own `run_agent_loop()` (model → tools → model, up to 8 iterations).
+4. The child's assistant text output is collected and returned to the parent as the tool result.
+5. The child session persists in the database and is listable/attachable like any other session.
 
 
 ---
 
-## Configuration
+## Session architecture
+
+### Data model
+
+Sessions are persisted to a `redb` (v4) embedded key-value store at
+`~/.local/share/tai-daemon/state.redb`. Three tables:
+
+| Table | Key | Value |
+|---|---|---|
+| `sessions` | `u64` session ID | bincode(`SessionRecord`) |
+| `session_messages` | `(u64, u32)` (session ID, index) | bincode(`SessionMessage`) |
+| `meta` | `&str` | `u64` counter |
+
+`SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `cwd`,
+`message_count`, `created_at`.
+
+### Session state (in-memory)
+
+Each active session has a `SessionState` (wrapped in `Arc<Mutex<>>`):
+
+- `title: Option<String>` — display name
+- `selected_model: Option<String>` — AI model for this session
+- `parent_session_id: Option<u64>` — parent session for sub-sessions
+- `cwd: Option<PathBuf>` — working directory for filesystem tools
+- `created_at: i64` — Unix timestamp of creation
+- `messages: Vec<SessionMessage>` — conversation history (also persisted to DB)
+- `active_requests: HashMap<u32, ActiveRequest>` — running request handles
+- `subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>` — attached clients
+
+### Hierarchy and CWD inheritance
+
+Sessions form a tree: a session can have a `parent_session_id` pointing to another
+session. When creating a child session, if no explicit CWD is provided, it inherits
+the parent's CWD. This allows sub-sessions (subagents) to operate in the same
+directory as their parent.
+
+### Persistence lifecycle
+
+- **Startup**: `new_daemon_state()` reads all sessions and messages from the DB,
+  reconstructing the in-memory `HashMap`. If the DB is empty, a default session #1
+  is created.
+- **Session creation**: Writes a `SessionRecord` to the DB immediately.
+- **Message append**: Each `SessionMessage` is written to the DB alongside the
+  in-memory push via `append_message_and_persist()`.
+- **Shutdown**: No explicit shutdown needed; redb commits are durable on write.
+
+### Multiple concurrent sessions
+
+Multiple sessions can have active requests running simultaneously. Each `SessionState`
+tracks its own `active_requests: HashMap<u32, ActiveRequest>`. Tokio tasks spawned for
+requests hold independent `Arc` references to their session, so sessions can run
+concurrently and complete independently.
+
+---
+
 
 **Service config:** `~/.config/tai-daemon/config.toml`
 
@@ -349,6 +420,8 @@ big-model = 4096
 ```
 
 **Credential storage:** `~/.config/tai-daemon/credentials.enc` (encrypted, managed via `tai-keystore` CLI)
+
+**Database:** `~/.local/share/tai-daemon/state.redb` (override via `TAI_DB_PATH` env var)
 
 **Socket path:** `/tmp/tai.sock` (override via `TAI_SOCKET_PATH` env var)
 
@@ -416,27 +489,33 @@ Model calls display_image tool
 3. **Lock/Unlock security** — the daemon starts without credentials in memory. The passphrase is
    never stored. This avoids secrets in env vars, config files, or command-line arguments.
 
-4. **Per-client sessions, not global** — each client connection manages its own sessions via a
-   `HashMap`, isolated from other connections. Model selection is per-connection.
+4. **Sessions, not per-client state** — sessions are independent from client connections. A
+   session has its own model, CWD, and messages. Clients subscribe/unsubscribe from sessions
+   via the broadcast system. Sessions persist in a redb database and survive daemon restarts.
 
-5. **Tool-call loop in the daemon** — the daemon drives multi-turn tool interactions (up to 8
+5. **Session hierarchy** — sessions can have parent sessions (`parent_session_id`), forming a
+   tree. Child sessions inherit their parent's CWD unless explicitly overridden. The
+   `spawn_subsession` tool creates autonomous child sessions that run their own tool-calling
+   loop and report results back to the parent.
+
+6. **Tool-call loop in the daemon** — the daemon drives multi-turn tool interactions (up to 8
    iterations) rather than pushing that complexity to the client or model. The client just sees
    `ToolCallStarted`/`ToolCallFinished` events.
 
-6. **Chunked image streaming** — images are streamed in ≤64 KiB chunks to avoid blocking the
+7. **Chunked image streaming** — images are streamed in ≤64 KiB chunks to avoid blocking the
    socket on large payloads. The client assembles and validates on receipt.
 
-7. **Session subscription model** — multiple clients can subscribe to the same session. Events
+8. **Session subscription model** — multiple clients can subscribe to the same session. Events
    are broadcast to all subscribers except the originator, enabling shared session viewing.
 
-8. **SSE streaming** — a custom `SseReader` (not a library) handles `data:` lines and `[DONE]`,
+9. **SSE streaming** — a custom `SseReader` (not a library) handles `data:` lines and `[DONE]`,
    giving full control over parsing and buffering behavior.
 
-9. **Markdown as the intermediate format** — all text (tool output, assistant text, error
-   messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
-   (tai-tui), providing a consistent rendering layer.
+10. **Markdown as the intermediate format** — all text (tool output, assistant text, error
+    messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
+    (tai-tui), providing a consistent rendering layer.
 
-10. **Flexible API format** — the daemon supports both OpenAI Chat Completions and Responses
+11. **Flexible API format** — the daemon supports both OpenAI Chat Completions and Responses
     endpoints, selectable per-model. This lets users route different models to their best-supported
     endpoint.
 

@@ -21,6 +21,7 @@ tai-proto = { path = "tai-proto" }
 tai-im = { path = "tai-im" }
 ammonia = "4"
 base64 = "0.22"
+bincode = { version = "2", features = ["serde"] }
 dirs = "6"
 redb = "4"
 image = "0.25"

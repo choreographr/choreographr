@@ -16,21 +16,21 @@ struct GitRepoArgs {
     repo_path: Option<String>,
 }
 
-pub async fn execute_git_status_tool(arguments_json: &str) -> ToolResult {
-    match execute_git_status_inner(arguments_json).await {
+pub async fn execute_git_status_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_git_status_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_git_status_inner(arguments_json: &str) -> Result<String, ToolError> {
+async fn execute_git_status_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: GitRepoArgs = serde_json::from_str(arguments_json)?;
-    let output = git_status_impl(args.repo_path.as_deref())?;
+    let output = git_status_impl(args.repo_path.as_deref(), cwd)?;
     Ok(truncate_tool_output(&output))
 }
 
-fn git_status_impl(repo_path: Option<&str>) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path)?;
+fn git_status_impl(repo_path: Option<&str>, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+    let repo = open_repo(repo_path, cwd)?;
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
     let mut untracked = Vec::new();
@@ -73,7 +73,7 @@ fn git_status_impl(repo_path: Option<&str>) -> Result<String, ToolError> {
     Ok(out.trim_end().to_string())
 }
 
-define_tool!(GitStatus, "git_status",
+define_tool_with_cwd!(GitStatus, "git_status",
     "Show the status of the Git repository containing the given path.",
     execute_git_status_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."}},"additionalProperties":false})

@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
-bincode = { version = "2", features = ["serde"] }
+bincode.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [dev-dependencies]

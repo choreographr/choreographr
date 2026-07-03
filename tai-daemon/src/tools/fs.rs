@@ -1,4 +1,4 @@
-use super::{ToolError, ToolResult, sha256_hex, tool_ok, truncate_tool_output};
+use super::{ToolError, ToolResult, resolve_path, sha256_hex, tool_ok, truncate_tool_output};
 use serde::Deserialize;
 use std::{
     io,
@@ -42,31 +42,32 @@ struct LineCountArgs {
     path: String,
 }
 
-pub(crate) async fn execute_line_count_tool(arguments_json: &str) -> ToolResult {
-    match execute_line_count_inner(arguments_json).await {
+pub(crate) async fn execute_line_count_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_line_count_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_line_count_inner(arguments_json: &str) -> Result<String, ToolError> {
+async fn execute_line_count_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: LineCountArgs = serde_json::from_str(arguments_json)?;
     if args.path.trim().is_empty() {
         return Err(ToolError::Other("missing required string argument: path".to_string()));
     }
-    let content = tokio::fs::read_to_string(&args.path).await?;
+    let resolved = resolve_path(&args.path, cwd);
+    let content = tokio::fs::read_to_string(&resolved).await?;
     let line_count = content.lines().count();
-    Ok(format!("{}: {} lines", args.path, line_count))
+    Ok(format!("{}: {} lines", resolved.display(), line_count))
 }
 
-pub(crate) async fn execute_read_file_tool(arguments_json: &str) -> ToolResult {
-    match execute_read_file_inner(arguments_json).await {
+pub(crate) async fn execute_read_file_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_read_file_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_read_file_inner(arguments_json: &str) -> Result<String, ToolError> {
+async fn execute_read_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let path = serde_json::from_str::<serde_json::Value>(arguments_json)
         .ok()
         .and_then(|value| {
@@ -77,18 +78,19 @@ async fn execute_read_file_inner(arguments_json: &str) -> Result<String, ToolErr
         })
         .filter(|p| !p.trim().is_empty())
         .ok_or_else(|| ToolError::Other("missing required string argument: path".to_string()))?;
-    let content = tokio::fs::read_to_string(&path).await?;
+    let resolved = resolve_path(&path, cwd);
+    let content = tokio::fs::read_to_string(&resolved).await?;
     Ok(truncate_tool_output(&content))
 }
 
-pub(crate) async fn execute_read_file_range_tool(arguments_json: &str) -> ToolResult {
-    match execute_read_file_range_inner(arguments_json).await {
+pub(crate) async fn execute_read_file_range_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_read_file_range_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_read_file_range_inner(arguments_json: &str) -> Result<String, ToolError> {
+async fn execute_read_file_range_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     const MAX_READ_FILE_RANGE_LINES: usize = 200;
 
     let args: ReadFileRangeArgs = serde_json::from_str(arguments_json)?;
@@ -108,7 +110,8 @@ async fn execute_read_file_range_inner(arguments_json: &str) -> Result<String, T
         return Err(ToolError::Other(format!("max_lines must be <= {MAX_READ_FILE_RANGE_LINES}")));
     }
 
-    let content = tokio::fs::read_to_string(&args.path).await?;
+    let resolved = resolve_path(&args.path, cwd);
+    let content = tokio::fs::read_to_string(&resolved).await?;
 
     let lines: Vec<&str> = content.lines().collect();
     let total_lines = lines.len();
@@ -126,7 +129,7 @@ async fn execute_read_file_range_inner(arguments_json: &str) -> Result<String, T
 
     let mut output = format!(
         "path: {}\nlines: {}-{} of {}\n\n",
-        args.path, args.start_line, end_line, total_lines
+        resolved.display(), args.start_line, end_line, total_lines
     );
 
     for (index, line) in lines[start_idx..end_idx].iter().enumerate() {
@@ -137,14 +140,14 @@ async fn execute_read_file_range_inner(arguments_json: &str) -> Result<String, T
     Ok(truncate_tool_output(&output))
 }
 
-pub(crate) async fn execute_list_files_tool(arguments_json: &str) -> ToolResult {
-    match execute_list_files_inner(arguments_json).await {
+pub(crate) async fn execute_list_files_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_list_files_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_list_files_inner(arguments_json: &str) -> Result<String, ToolError> {
+async fn execute_list_files_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let path = serde_json::from_str::<serde_json::Value>(arguments_json)
         .ok()
         .and_then(|value| {
@@ -154,7 +157,8 @@ async fn execute_list_files_inner(arguments_json: &str) -> Result<String, ToolEr
                 .map(str::to_string)
         })
         .unwrap_or_else(|| ".".to_string());
-    let mut entries = tokio::fs::read_dir(&path).await?;
+    let resolved = resolve_path(&path, cwd);
+    let mut entries = tokio::fs::read_dir(&resolved).await?;
     let mut names = Vec::new();
     loop {
         match entries.next_entry().await {
@@ -178,26 +182,26 @@ async fn execute_list_files_inner(arguments_json: &str) -> Result<String, ToolEr
     Ok(truncate_tool_output(&names.join("\n")))
 }
 
-pub(crate) async fn execute_write_file_tool(arguments_json: &str) -> ToolResult {
-    match execute_write_file_inner(arguments_json).await {
+pub(crate) async fn execute_write_file_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_write_file_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_write_file_inner(arguments_json: &str) -> Result<String, ToolError> {
+async fn execute_write_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: WriteFileArgs = serde_json::from_str(arguments_json)?;
 
     let path = validate_nonempty_path(&args.path)?;
-    let path_ref = Path::new(&path);
-    ensure_parent_directories(path_ref, args.create_parents.unwrap_or(true)).await?;
+    let resolved = resolve_path(&path, cwd);
+    ensure_parent_directories(&resolved, args.create_parents.unwrap_or(true)).await?;
 
-    match write_text_file(path_ref, &args.content, args.overwrite.unwrap_or(true)).await {
-        Ok(()) => Ok(format!("wrote file: {path}")),
+    match write_text_file(&resolved, &args.content, args.overwrite.unwrap_or(true)).await {
+        Ok(()) => Ok(format!("wrote file: {}", resolved.display())),
         Err(error) => {
             let overwrite = args.overwrite.unwrap_or(true);
             if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
-                Err(ToolError::Other(format!("refusing to overwrite existing file: {path}")))
+                Err(ToolError::Other(format!("refusing to overwrite existing file: {}", resolved.display())))
             } else {
                 Err(ToolError::Io(error))
             }
@@ -205,14 +209,14 @@ async fn execute_write_file_inner(arguments_json: &str) -> Result<String, ToolEr
     }
 }
 
-pub(crate) async fn execute_edit_file_tool(arguments_json: &str) -> ToolResult {
-    match execute_edit_file_inner(arguments_json).await {
+pub(crate) async fn execute_edit_file_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_edit_file_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_edit_file_inner(arguments_json: &str) -> Result<String, ToolError> {
+async fn execute_edit_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: EditFileArgs = serde_json::from_str(arguments_json)?;
 
     let path = validate_nonempty_path(&args.path)?;
@@ -221,14 +225,15 @@ async fn execute_edit_file_inner(arguments_json: &str) -> Result<String, ToolErr
         return Err(ToolError::Other("missing required array argument: edits".to_string()));
     }
 
-    let path_ref = Path::new(&path);
-    let original_content = tokio::fs::read_to_string(path_ref).await?;
+    let resolved = resolve_path(&path, cwd);
+    let original_content = tokio::fs::read_to_string(&resolved).await?;
 
     if let Some(expected_sha256) = args.expected_sha256.as_deref() {
         let actual_sha256 = sha256_hex(&original_content);
         if actual_sha256 != expected_sha256.trim().to_ascii_lowercase() {
             return Err(ToolError::Other(format!(
-                "expected_sha256 mismatch for {path}: expected {}, got {}",
+                "expected_sha256 mismatch for {}: expected {}, got {}",
+                resolved.display(),
                 expected_sha256.trim(),
                 actual_sha256
             )));
@@ -239,11 +244,11 @@ async fn execute_edit_file_inner(arguments_json: &str) -> Result<String, ToolErr
         .map_err(ToolError::Other)?;
 
     if args.dry_run.unwrap_or(false) {
-        return Ok(format_edit_result("would edit", &path, &edit_summary));
+        return Ok(format_edit_result("would edit", &resolved.display().to_string(), &edit_summary));
     }
 
-    match write_text_file(path_ref, &edit_summary.content, true).await {
-        Ok(()) => Ok(format_edit_result("edited", &path, &edit_summary)),
+    match write_text_file(&resolved, &edit_summary.content, true).await {
+        Ok(()) => Ok(format_edit_result("edited", &resolved.display().to_string(), &edit_summary)),
         Err(error) => Err(ToolError::Io(error)),
     }
 }
@@ -390,7 +395,7 @@ fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) ->
     )
 }
 
-define_tool!(ReadFile, "read_file",
+define_tool_with_cwd!(ReadFile, "read_file",
     "Read a UTF-8 text file from the local workspace.",
     execute_read_file_tool,
     serde_json::json!({
@@ -406,7 +411,7 @@ define_tool!(ReadFile, "read_file",
     })
 );
 
-define_tool!(ReadFileRange, "read_file_range",
+define_tool_with_cwd!(ReadFileRange, "read_file_range",
     "Read a line range from a UTF-8 text file in the local workspace.",
     execute_read_file_range_tool,
     serde_json::json!({
@@ -433,7 +438,7 @@ define_tool!(ReadFileRange, "read_file_range",
     })
 );
 
-define_tool!(ListFiles, "list_files",
+define_tool_with_cwd!(ListFiles, "list_files",
     "List files in a local directory.",
     execute_list_files_tool,
     serde_json::json!({
@@ -449,7 +454,7 @@ define_tool!(ListFiles, "list_files",
     })
 );
 
-define_tool!(LineCount, "line_count",
+define_tool_with_cwd!(LineCount, "line_count",
     "Count the number of lines in a UTF-8 text file.",
     execute_line_count_tool,
     serde_json::json!({
@@ -465,7 +470,7 @@ define_tool!(LineCount, "line_count",
     })
 );
 
-define_tool!(WriteFile, "write_file",
+define_tool_with_cwd!(WriteFile, "write_file",
     "Write a UTF-8 text file to the local workspace.",
     execute_write_file_tool,
     serde_json::json!({
@@ -495,7 +500,7 @@ define_tool!(WriteFile, "write_file",
     })
 );
 
-define_tool!(EditFile, "edit_file",
+define_tool_with_cwd!(EditFile, "edit_file",
     "Edit a UTF-8 text file by applying one or more exact text replacements. Each edit must match at least once; non-replace_all edits must match exactly once.",
     execute_edit_file_tool,
     serde_json::json!({

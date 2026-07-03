@@ -30,13 +30,14 @@ pub use stage::execute_git_add_tool;
 pub(crate) use status::GitStatus;
 pub use status::execute_git_status_tool;
 
-pub(crate) fn open_repo(repo_path: Option<&str>) -> Result<gix::Repository, ToolError> {
+pub(crate) fn open_repo(repo_path: Option<&str>, cwd: Option<&std::path::Path>) -> Result<gix::Repository, ToolError> {
     let path = repo_path.unwrap_or(".").trim();
     let path = if path.is_empty() { "." } else { path };
-    gix::discover(path).map_err(|error| {
+    let resolved = super::resolve_path(path, cwd);
+    gix::discover(&resolved).map_err(|error| {
         ToolError::Other(format!(
             "failed to open git repository from {}: {error}",
-            Path::new(path).display()
+            resolved.display()
         ))
     })
 }

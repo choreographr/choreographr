@@ -36,9 +36,9 @@ fn test_client() -> Arc<OpenAiClient> {
     Arc::new(OpenAiClient::new(test_service_config(), "test-key".to_string()).expect("client"))
 }
 
-fn test_state_with_client() -> DaemonState {
-    let state = new_daemon_state(test_db());
-    state.try_lock().unwrap().openai_client = Some(test_client());
+async fn test_state_with_client() -> DaemonState {
+    let state = new_daemon_state(test_db()).await;
+    state.lock().await.openai_client = Some(test_client());
     state
 }
 
@@ -122,7 +122,7 @@ async fn spawn_tool_call_server(
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state(test_db());
+    let state = new_daemon_state(test_db()).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -235,7 +235,7 @@ async fn spawn_http_tool_call_server() -> (DaemonState, tokio::task::JoinHandle<
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state(test_db());
+    let state = new_daemon_state(test_db()).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -327,7 +327,7 @@ async fn spawn_display_image_tool_server() -> (DaemonState, tokio::task::JoinHan
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state(test_db());
+    let state = new_daemon_state(test_db()).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -341,7 +341,7 @@ async fn spawn_display_image_tool_server() -> (DaemonState, tokio::task::JoinHan
 #[tokio::test]
 async fn daemon_handler_run_input_requires_selected_model() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client();
+    let state = test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
@@ -391,7 +391,7 @@ async fn daemon_handler_set_model_fails_when_provider_unreachable() {
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
     };
-    let state = new_daemon_state(test_db());
+    let state = new_daemon_state(test_db()).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(

@@ -14,19 +14,20 @@ struct GitCommitArgs {
     allow_empty: Option<bool>,
 }
 
-pub async fn execute_git_commit_tool(arguments_json: &str) -> ToolResult {
-    match execute_git_commit_inner(arguments_json).await {
+pub async fn execute_git_commit_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_git_commit_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_git_commit_inner(arguments_json: &str) -> Result<String, ToolError> {
+async fn execute_git_commit_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: GitCommitArgs = serde_json::from_str(arguments_json)?;
     let output = git_commit_impl(
         args.repo_path.as_deref(),
         &args.message,
         args.allow_empty.unwrap_or(false),
+        cwd,
     )?;
     Ok(truncate_tool_output(&output))
 }
@@ -35,8 +36,9 @@ fn git_commit_impl(
     repo_path: Option<&str>,
     message: &str,
     allow_empty: bool,
+    cwd: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path)?;
+    let repo = open_repo(repo_path, cwd)?;
     let message = message.trim();
     if message.is_empty() {
         return Err(ToolError::Other(
@@ -60,7 +62,7 @@ fn git_commit_impl(
     repo.commit("HEAD", message, tree_id, parents)
         .map_err(io::Error::other)?;
 
-    super::log::git_log_impl(repo_path, 1)
+    super::log::git_log_impl(repo_path, 1, cwd)
 }
 
 fn ensure_index_has_no_conflicts(index: &gix::index::File) -> Result<(), ToolError> {
@@ -115,7 +117,7 @@ fn current_head_parents(repo: &gix::Repository) -> Result<Vec<ObjectId>, ToolErr
     }
 }
 
-define_tool!(GitCommit, "git_commit",
+define_tool_with_cwd!(GitCommit, "git_commit",
     "Create a Git commit from the current index.",
     execute_git_commit_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"message":{"type":"string","description":"Commit message"}},"required":["message"],"additionalProperties":false})

@@ -265,7 +265,7 @@ impl Tool for DisplayImage {
             "additionalProperties": false
         })
     }
-    async fn execute(&self, arguments_json: &str, _x_credentials: Option<&tai_keystore::XCredentials>) -> ToolExecutionOutput {
+    async fn execute(&self, arguments_json: &str, _x_credentials: Option<&tai_keystore::XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
         execute_display_image_tool(arguments_json).await
     }
 }

@@ -90,7 +90,7 @@ fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, ToolError
     Ok(state)
 }
 
-define_tool!(Fff, "fff",
+define_tool_with_cwd!(Fff, "fff",
     "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes.",
     execute_fff_tool,
     serde_json::json!({
@@ -128,18 +128,19 @@ define_tool!(Fff, "fff",
     })
 );
 
-pub(crate) async fn execute_fff_tool(arguments_json: &str) -> ToolResult {
-    match execute_fff_inner(arguments_json).await {
+pub(crate) async fn execute_fff_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_fff_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_fff_inner(arguments_json: &str) -> std::result::Result<String, ToolError> {
+async fn execute_fff_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> std::result::Result<String, ToolError> {
     let args: FffArgs = serde_json::from_str(arguments_json)?;
 
     let path = args.path.as_deref().unwrap_or(".");
-    let state = get_or_init_state(path)?;
+    let resolved = super::resolve_path(path, cwd);
+    let state = get_or_init_state(&resolved.display().to_string())?;
 
     let guard = state.shared_picker.read()
         .map_err(|e| ToolError::Other(format!("picker lock error: {e}")))?;

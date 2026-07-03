@@ -17,14 +17,14 @@ struct GitPushArgs {
     dry_run: Option<bool>,
 }
 
-pub async fn execute_git_push_tool(arguments_json: &str) -> ToolResult {
-    match execute_git_push_inner(arguments_json).await {
+pub async fn execute_git_push_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_git_push_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_git_push_inner(arguments_json: &str) -> Result<String, ToolError> {
+async fn execute_git_push_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: GitPushArgs = serde_json::from_str(arguments_json)?;
     let output = git_push_impl(
         args.repo_path.as_deref(),
@@ -33,6 +33,7 @@ async fn execute_git_push_inner(arguments_json: &str) -> Result<String, ToolErro
         args.set_upstream.unwrap_or(false),
         args.force_with_lease.unwrap_or(false),
         args.dry_run.unwrap_or(false),
+        cwd,
     )?;
     Ok(truncate_tool_output(&output))
 }
@@ -44,8 +45,9 @@ fn git_push_impl(
     set_upstream: bool,
     force_with_lease: bool,
     dry_run: bool,
+    cwd: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path)?;
+    let repo = open_repo(repo_path, cwd)?;
     let remote = normalize_nonempty_argument(remote, "remote")?;
     let branch = match branch {
         Some(branch) => normalize_nonempty_argument(branch, "branch")?.to_string(),
@@ -107,7 +109,7 @@ fn git_push_impl(
     Ok(out.trim_end().to_string())
 }
 
-define_tool!(GitPush, "git_push",
+define_tool_with_cwd!(GitPush, "git_push",
     "Push to a Git remote branch.",
     execute_git_push_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"remote":{"type":"string","description":"Remote name","default":"origin"},"branch":{"type":"string","description":"Remote branch name"},"set_upstream":{"type":"boolean","description":"Set upstream tracking reference","default":false},"force_with_lease":{"type":"boolean","description":"Force push with lease (safe force push)","default":false},"dry_run":{"type":"boolean","description":"Simulate push without sending data","default":false}},"required":[],"additionalProperties":false})

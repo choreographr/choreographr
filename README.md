@@ -6,7 +6,7 @@ A local AI terminal interface in Rust. Connects to an OpenAI-compatible API, run
 
 | Crate | Description |
 |---|---|
-| `tai-daemon` | Unix socket server that validates credentials, manages sessions, runs requests with tool-call loop, and streams responses |
+| `tai-daemon` | Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and CWD), runs requests with tool-call loop, and streams responses |
 | `tai-tui` | Full-screen terminal UI client (ratatui + crossterm) |
 | `tai-dioxus` | Minimal desktop GUI client |
 | `tai-im` | Instant messaging bridge (Telegram) that connects to the daemon |

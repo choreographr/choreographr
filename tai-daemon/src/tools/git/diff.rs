@@ -15,19 +15,20 @@ struct GitDiffArgs {
     pathspec: Option<Vec<String>>,
 }
 
-pub async fn execute_git_diff_tool(arguments_json: &str) -> ToolResult {
-    match execute_git_diff_inner(arguments_json).await {
+pub async fn execute_git_diff_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_git_diff_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-async fn execute_git_diff_inner(arguments_json: &str) -> Result<String, ToolError> {
+async fn execute_git_diff_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: GitDiffArgs = serde_json::from_str(arguments_json)?;
     let output = git_diff_impl(
         args.repo_path.as_deref(),
         args.cached.unwrap_or(false),
         args.pathspec.unwrap_or_default(),
+        cwd,
     )?;
     Ok(truncate_tool_output(&output))
 }
@@ -36,8 +37,9 @@ pub(crate) fn git_diff_impl(
     repo_path: Option<&str>,
     cached: bool,
     pathspec: Vec<String>,
+    cwd: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path)?;
+    let repo = open_repo(repo_path, cwd)?;
     let mut lines = if cached {
         collect_cached_diff_lines(&repo, &pathspec)?
     } else {
@@ -86,7 +88,7 @@ fn collect_worktree_diff_lines(
     Ok(lines)
 }
 
-define_tool!(GitDiff, "git_diff",
+define_tool_with_cwd!(GitDiff, "git_diff",
     "Show the diff for a file or repository.",
     execute_git_diff_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"cached":{"type":"boolean","description":"Show staged (cached) changes instead of worktree changes","default":false},"pathspec":{"type":"array","items":{"type":"string"},"description":"Optional pathspecs to filter"},"additionalProperties":false}})

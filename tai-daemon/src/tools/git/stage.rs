@@ -17,17 +17,17 @@ struct GitAddArgs {
     pathspec: Vec<String>,
 }
 
-pub async fn execute_git_add_tool(arguments_json: &str) -> ToolResult {
-    match execute_git_add_inner(arguments_json).await {
+pub async fn execute_git_add_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+    match execute_git_add_inner(arguments_json, cwd).await {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-pub(super) async fn execute_git_add_inner(arguments_json: &str) -> Result<String, ToolError> {
+pub(super) async fn execute_git_add_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
     let args: GitAddArgs = serde_json::from_str(arguments_json)?;
     let pathspec = normalize_pathspecs(args.pathspec)?;
-    let output = git_add_impl(args.repo_path.as_deref(), pathspec)?;
+    let output = git_add_impl(args.repo_path.as_deref(), pathspec, cwd)?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -46,8 +46,8 @@ fn normalize_pathspecs(pathspec: Vec<String>) -> Result<Vec<String>, ToolError> 
     }
 }
 
-fn git_add_impl(repo_path: Option<&str>, pathspec: Vec<String>) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path)?;
+fn git_add_impl(repo_path: Option<&str>, pathspec: Vec<String>, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+    let repo = open_repo(repo_path, cwd)?;
     let effective_pathspec = prefix_pathspecs(&repo, repo_path, &pathspec)?;
     let mut index = load_mutable_index(&repo)?;
     let paths = collect_paths_to_stage(&repo, &index, &effective_pathspec)?;
@@ -78,7 +78,7 @@ fn git_add_impl(repo_path: Option<&str>, pathspec: Vec<String>) -> Result<String
         if changed { "yes" } else { "no" }
     )
     .ok();
-    let diff = super::diff::git_diff_impl(repo_path, true, effective_pathspec)?;
+    let diff = super::diff::git_diff_impl(repo_path, true, effective_pathspec, cwd)?;
     writeln!(&mut out).ok();
     writeln!(&mut out, "{diff}").ok();
     Ok(out.trim_end().to_string())
@@ -252,7 +252,7 @@ impl IndexEntrySnapshot {
     }
 }
 
-define_tool!(GitAdd, "git_add",
+define_tool_with_cwd!(GitAdd, "git_add",
     "Stage a file or pathspec in Git.",
     execute_git_add_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"pathspec":{"type":"array","items":{"type":"string"},"description":"Files or pathspecs to stage"}},"required":["pathspec"],"additionalProperties":false})

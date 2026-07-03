@@ -23,7 +23,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
     message: DaemonMessage,
 ) -> Result<Option<ClientMessage>, ClientError> {
     match message {
-        DaemonMessage::SessionCreated { session_id, title } => {
+        DaemonMessage::SessionCreated { session_id, title, .. } => {
             let label = title.unwrap_or_else(|| "untitled".to_string());
             handler.push_text(format!("[daemon] created session {session_id}: {label}"));
             Ok(None)
@@ -33,6 +33,8 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
                 session_id: session.session_id,
             }).or(Some(ClientMessage::CreateSession {
                 title: Some("default".to_string()),
+                parent_session_id: None,
+                cwd: None,
             })))
         }
         DaemonMessage::SessionAttached { session_id } => {
@@ -44,6 +46,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             title,
             selected_model,
             messages,
+            ..
         } => {
             let title = title.unwrap_or_else(|| "untitled".to_string());
             handler.push_text(format!("[daemon] session {session_id}: {title}"));

@@ -87,7 +87,7 @@ async fn git_status_reports_staged_unstaged_and_untracked_changes() {
     git(&repo, &["add", "staged.txt"]);
 
     let result =
-        execute_git_status_tool(&serde_json::json!({ "repo_path": repo }).to_string()).await;
+        execute_git_status_tool(&serde_json::json!({ "repo_path": repo }).to_string(), None).await;
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("head: main"));
@@ -114,7 +114,7 @@ async fn git_diff_reports_worktree_and_cached_changes() {
     git(&repo, &["add", "added.txt"]);
 
     let worktree = execute_git_diff_tool(
-        &serde_json::json!({ "repo_path": repo, "cached": false }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "cached": false }).to_string(), None,
     )
     .await;
     assert!(!worktree.is_error, "{}", worktree.content);
@@ -122,7 +122,7 @@ async fn git_diff_reports_worktree_and_cached_changes() {
     assert!(worktree.content.contains("M file.txt"));
 
     let cached = execute_git_diff_tool(
-        &serde_json::json!({ "repo_path": repo, "cached": true }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "cached": true }).to_string(), None,
     )
     .await;
     assert!(!cached.is_error, "{}", cached.content);
@@ -143,7 +143,7 @@ async fn git_log_reports_recent_commits() {
     git(&repo, &["commit", "-am", "second commit"]);
 
     let result =
-        execute_git_log_tool(&serde_json::json!({ "repo_path": repo, "limit": 2 }).to_string())
+        execute_git_log_tool(&serde_json::json!({ "repo_path": repo, "limit": 2 }).to_string(), None)
             .await;
 
     assert!(!result.is_error, "{}", result.content);
@@ -180,7 +180,7 @@ async fn git_add_stages_modified_untracked_and_deleted_paths() {
             "repo_path": repo,
             "pathspec": ["tracked.txt", "new.txt", "delete-me.txt"]
         })
-        .to_string(),
+        .to_string(), None,
     )
     .await;
 
@@ -202,7 +202,7 @@ async fn git_add_accepts_clean_tracked_paths_as_noop() {
     git(&repo, &["commit", "-m", "initial commit"]);
 
     let result = execute_git_add_tool(
-        &serde_json::json!({ "repo_path": repo, "pathspec": ["tracked.txt"] }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "pathspec": ["tracked.txt"] }).to_string(), None,
     )
     .await;
 
@@ -222,7 +222,7 @@ async fn git_add_works_from_subdirectory_repo_path() {
 
     let subdir = repo.join("src");
     let result = execute_git_add_tool(
-        &serde_json::json!({ "repo_path": subdir, "pathspec": ["lib.rs"] }).to_string(),
+        &serde_json::json!({ "repo_path": subdir, "pathspec": ["lib.rs"] }).to_string(), None,
     )
     .await;
 
@@ -239,7 +239,7 @@ async fn git_add_rejects_empty_and_unmatched_pathspecs() {
     let repo = init_repo();
 
     let empty = execute_git_add_tool(
-        &serde_json::json!({ "repo_path": repo, "pathspec": ["", "  "] }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "pathspec": ["", "  "] }).to_string(), None,
     )
     .await;
     assert!(empty.is_error);
@@ -250,7 +250,7 @@ async fn git_add_rejects_empty_and_unmatched_pathspecs() {
     );
 
     let unmatched = execute_git_add_tool(
-        &serde_json::json!({ "repo_path": repo, "pathspec": ["missing.txt"] }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "pathspec": ["missing.txt"] }).to_string(), None,
     )
     .await;
     assert!(unmatched.is_error);
@@ -269,12 +269,12 @@ async fn git_commit_creates_commit_from_staged_index() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
     execute_git_add_tool(
-        &serde_json::json!({ "repo_path": repo, "pathspec": ["file.txt"] }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "pathspec": ["file.txt"] }).to_string(), None,
     )
     .await;
 
     let result = execute_git_commit_tool(
-        &serde_json::json!({ "repo_path": repo, "message": "Add file" }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "message": "Add file" }).to_string(), None,
     )
     .await;
 
@@ -302,7 +302,7 @@ async fn git_commit_supports_multiline_messages_and_allow_empty() {
             "message": "Initial empty\n\nBody",
             "allow_empty": true
         })
-        .to_string(),
+        .to_string(), None,
     )
     .await;
     assert!(!empty_commit.is_error, "{}", empty_commit.content);
@@ -320,14 +320,14 @@ async fn git_commit_rejects_blank_message_and_missing_staged_changes() {
     let repo = init_repo();
 
     let blank = execute_git_commit_tool(
-        &serde_json::json!({ "repo_path": repo, "message": "   " }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "message": "   " }).to_string(), None,
     )
     .await;
     assert!(blank.is_error);
     assert!(blank.content.contains("commit message must not be empty"));
 
     let no_changes = execute_git_commit_tool(
-        &serde_json::json!({ "repo_path": repo, "message": "Nothing" }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "message": "Nothing" }).to_string(), None,
     )
     .await;
     assert!(no_changes.is_error);
@@ -360,7 +360,7 @@ async fn git_commit_rejects_conflicted_index() {
     assert!(!output.status.success(), "merge unexpectedly succeeded");
 
     let result = execute_git_commit_tool(
-        &serde_json::json!({ "repo_path": repo, "message": "should fail" }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "message": "should fail" }).to_string(), None,
     )
     .await;
     assert!(result.is_error);
@@ -393,7 +393,7 @@ async fn git_push_pushes_branch_to_remote_and_sets_upstream() {
             "remote": "origin",
             "set_upstream": true
         })
-        .to_string(),
+        .to_string(), None,
     )
     .await;
 
@@ -440,7 +440,7 @@ async fn git_push_supports_dry_run() {
             "branch": "main",
             "dry_run": true
         })
-        .to_string(),
+        .to_string(), None,
     )
     .await;
 
@@ -478,7 +478,7 @@ async fn git_push_rejects_detached_head_without_branch() {
     git(&repo, &["checkout", head.trim()]);
 
     let result = execute_git_push_tool(
-        &serde_json::json!({ "repo_path": repo, "remote": "origin" }).to_string(),
+        &serde_json::json!({ "repo_path": repo, "remote": "origin" }).to_string(), None,
     )
     .await;
 
@@ -507,7 +507,7 @@ async fn git_push_reports_push_failure() {
             "remote": "origin",
             "branch": "main"
         })
-        .to_string(),
+        .to_string(), None,
     )
     .await;
 

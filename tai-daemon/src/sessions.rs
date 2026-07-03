@@ -1,5 +1,9 @@
 use crate::openai::OpenAiClient;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tai_keystore::{Keystore, XCredentials};
 use tai_proto::{DaemonMessage, SessionMessage, SessionSummary};
 use tokio::{
@@ -15,6 +19,9 @@ pub(crate) struct ActiveRequest {
 pub(crate) struct SessionState {
     pub(crate) title: Option<String>,
     pub(crate) selected_model: Option<String>,
+    pub(crate) parent_session_id: Option<u64>,
+    pub(crate) cwd: Option<std::path::PathBuf>,
+    pub(crate) created_at: i64,
     pub(crate) messages: Vec<SessionMessage>,
     pub(crate) active_requests: HashMap<u32, ActiveRequest>,
     pub(crate) subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>,
@@ -32,26 +39,68 @@ pub struct DaemonStateInner {
 
 pub type DaemonState = Arc<Mutex<DaemonStateInner>>;
 
-pub fn new_daemon_state(db: redb::Database) -> DaemonState {
-    let mut sessions = HashMap::new();
-    sessions.insert(
-        1,
-        Arc::new(Mutex::new(SessionState {
-            title: Some("default".to_string()),
-            selected_model: None,
-            messages: Vec::new(),
-            active_requests: HashMap::new(),
-            subscribers: HashMap::new(),
-        })),
-    );
+pub async fn new_daemon_state(db: redb::Database) -> DaemonState {
+    let db = Arc::new(db);
+
+    let stored_sessions =
+        crate::db::read_all_sessions(&db).unwrap_or_else(|e| {
+            warn!(error = %e, "failed to read sessions from DB, starting fresh");
+            Vec::new()
+        });
+
+    let mut sessions: HashMap<u64, Arc<Mutex<SessionState>>> = HashMap::new();
+    let mut max_id: u64 = 0;
+
+    for (id, record) in stored_sessions {
+        let messages = crate::db::read_messages(&db, id).unwrap_or_else(|e| {
+            warn!(session_id = id, error = %e, "failed to read messages for session, using empty");
+            Vec::new()
+        });
+        sessions.insert(
+            id,
+            Arc::new(Mutex::new(SessionState {
+                title: record.title,
+                selected_model: record.selected_model,
+                parent_session_id: record.parent_session_id,
+                cwd: record.cwd.map(std::path::PathBuf::from),
+                created_at: record.created_at,
+                messages,
+                active_requests: HashMap::new(),
+                subscribers: HashMap::new(),
+            })),
+        );
+        max_id = max_id.max(id);
+    }
+
+    if sessions.is_empty() {
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        sessions.insert(
+            1,
+            Arc::new(Mutex::new(SessionState {
+                title: Some("default".into()),
+                selected_model: None,
+                parent_session_id: None,
+                cwd: None,
+                created_at,
+                messages: Vec::new(),
+                active_requests: HashMap::new(),
+                subscribers: HashMap::new(),
+            })),
+        );
+        max_id = 1;
+    }
+
     Arc::new(Mutex::new(DaemonStateInner {
-        next_session_id: 2,
+        next_session_id: max_id.wrapping_add(1),
         next_client_id: 1,
         sessions,
         openai_client: None,
         keystore: None,
         x_credentials: None,
-        db: Arc::new(db),
+        db,
     }))
 }
 
@@ -156,6 +205,9 @@ pub(crate) async fn list_sessions(state: &DaemonState) -> Vec<SessionSummary> {
             session_id,
             title: guard.title.clone(),
             selected_model: guard.selected_model.clone(),
+            parent_session_id: guard.parent_session_id,
+            cwd: guard.cwd.as_ref().map(|p| p.display().to_string()),
+            created_at: guard.created_at,
             message_count: guard.messages.len() as u32,
         });
     }
@@ -172,6 +224,8 @@ pub(crate) async fn session_snapshot(
         session_id,
         title: guard.title.clone(),
         selected_model: guard.selected_model.clone(),
+        parent_session_id: guard.parent_session_id,
+        cwd: guard.cwd.as_ref().map(|p| p.display().to_string()),
         messages: guard.messages.clone(),
     }
 }
@@ -207,3 +261,81 @@ pub(crate) async fn require_attached_session(
     };
     Ok(Some((session_id, session)))
 }
+
+pub(crate) async fn create_session_internal(
+    state: &DaemonState,
+    title: Option<String>,
+    parent_session_id: Option<u64>,
+    cwd: Option<std::path::PathBuf>,
+) -> anyhow::Result<(u64, Arc<Mutex<SessionState>>)> {
+    let resolved_cwd = if cwd.is_some() {
+        cwd
+    } else if let Some(parent_id) = parent_session_id {
+        if let Some(parent) = session_by_id(state, parent_id).await {
+            parent.lock().await.cwd.clone()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let (session_id, session, db) = {
+        let mut guard = state.lock().await;
+        let session_id = guard.next_session_id;
+        guard.next_session_id = guard.next_session_id.wrapping_add(1);
+
+        let session = Arc::new(Mutex::new(SessionState {
+            title: title.clone(),
+            selected_model: None,
+            parent_session_id,
+            cwd: resolved_cwd.clone(),
+            created_at,
+            messages: Vec::new(),
+            active_requests: HashMap::new(),
+            subscribers: HashMap::new(),
+        }));
+
+        guard.sessions.insert(session_id, Arc::clone(&session));
+        (session_id, session, Arc::clone(&guard.db))
+    };
+
+    let record = crate::db::SessionRecord {
+        title,
+        selected_model: None,
+        parent_session_id,
+        cwd: resolved_cwd.map(|p| p.display().to_string()),
+        message_count: 0,
+        created_at,
+    };
+    if let Err(e) = crate::db::write_session(&db, session_id, &record) {
+        warn!(session_id, error = %e, "failed to persist new session to DB");
+    }
+
+    Ok((session_id, session))
+}
+
+pub(crate) async fn append_message_and_persist(
+    session: &Arc<Mutex<SessionState>>,
+    db: &Arc<redb::Database>,
+    session_id: u64,
+    message: SessionMessage,
+) -> u32 {
+    let index;
+    {
+        let mut guard = session.lock().await;
+        index = guard.messages.len() as u32;
+        guard.messages.push(message.clone());
+    }
+    if let Err(e) = crate::db::write_message(db, session_id, index, &message) {
+        warn!(session_id, index, error = %e, "failed to persist message to DB");
+    }
+    index
+}
+
+

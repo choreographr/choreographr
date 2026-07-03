@@ -2,7 +2,7 @@ use crate::openai::{
     self, ChatAssistantToolUse, ChatRequestMessage, ChatTurnResult, CompletionChunkKind,
     OpenAiClient,
 };
-use crate::sessions::{SessionState, broadcast_to_session};
+use crate::sessions::{append_message_and_persist, broadcast_to_session, SessionState};
 use crate::tools::{available_tools, emit_prepared_image, execute_tool_call};
 use std::{io, sync::Arc};
 use tai_keystore::XCredentials;
@@ -15,6 +15,8 @@ use tokio::sync::{Mutex, mpsc};
 pub(crate) async fn execute_plain_request(
     client: &OpenAiClient,
     session: &Arc<Mutex<SessionState>>,
+    session_id: u64,
+    db: &Arc<redb::Database>,
     model: &str,
     request_id: u32,
 ) -> io::Result<()> {
@@ -52,23 +54,29 @@ pub(crate) async fn execute_plain_request(
 
     let final_answer = answer.lock().await.trim().to_string();
     if !final_answer.is_empty() {
-        session
-            .lock()
-            .await
-            .messages
-            .push(SessionMessage::AssistantText {
+        append_message_and_persist(
+            session,
+            db,
+            session_id,
+            SessionMessage::AssistantText {
                 content: final_answer,
-            });
+            },
+        )
+        .await;
     }
     Ok(())
 }
 
-pub(crate) async fn execute_chat_tool_request(
+pub(crate) async fn run_agent_loop(
     client: &OpenAiClient,
     session: &Arc<Mutex<SessionState>>,
+    session_id: u64,
+    db: &Arc<redb::Database>,
     model: &str,
     request_id: u32,
-    x_credentials: Option<XCredentials>,
+    x_credentials: Option<&XCredentials>,
+    cwd: Option<&std::path::Path>,
+    state: &crate::DaemonState,
 ) -> io::Result<()> {
     let tools = available_tools();
     let mut next_image_id = 1;
@@ -92,15 +100,17 @@ pub(crate) async fn execute_chat_tool_request(
                     None,
                 )
                 .await;
-                session
-                    .lock()
-                    .await
-                    .messages
-                    .push(SessionMessage::AssistantText { content });
+                append_message_and_persist(
+                    session,
+                    db,
+                    session_id,
+                    SessionMessage::AssistantText { content },
+                )
+                .await;
                 return Ok(());
             }
             ChatTurnResult::ToolUse(tool_use) => {
-                persist_assistant_tool_use(session, &tool_use).await;
+                persist_assistant_tool_use(session, session_id, db, &tool_use).await;
                 for tool_call in tool_use.tool_calls {
                     broadcast_to_session(
                         session,
@@ -113,21 +123,32 @@ pub(crate) async fn execute_chat_tool_request(
                         None,
                     )
                     .await;
-                    let output = execute_tool_call(&tool_call, x_credentials.as_ref()).await;
+
+                    let output = if tool_call.name == "spawn_subsession" {
+                        crate::tools::subsession::execute_spawn_subsession(
+                            client, state, session, session_id, db, model,
+                            &tool_call, x_credentials, cwd,
+                        ).await
+                    } else {
+                        execute_tool_call(&tool_call, x_credentials, cwd).await
+                    };
+
                     if let Some(image) = output.image {
                         emit_prepared_image(session, request_id, next_image_id, image).await;
                         next_image_id = next_image_id.wrapping_add(1);
                     }
-                    session
-                        .lock()
-                        .await
-                        .messages
-                        .push(SessionMessage::ToolResult {
+                    append_message_and_persist(
+                        session,
+                        db,
+                        session_id,
+                        SessionMessage::ToolResult {
                             call_id: tool_call.id.clone(),
                             name: tool_call.name.clone(),
                             content: output.result.content.clone(),
                             is_error: output.result.is_error,
-                        });
+                        },
+                    )
+                    .await;
                     let event = if output.result.is_error {
                         DaemonMessage::ToolCallFailed {
                             request_id,
@@ -155,15 +176,34 @@ pub(crate) async fn execute_chat_tool_request(
     ))
 }
 
+pub(crate) async fn execute_chat_tool_request(
+    client: &OpenAiClient,
+    session: &Arc<Mutex<SessionState>>,
+    session_id: u64,
+    db: &Arc<redb::Database>,
+    model: &str,
+    request_id: u32,
+    x_credentials: Option<XCredentials>,
+    cwd: Option<std::path::PathBuf>,
+    state: &crate::DaemonState,
+) -> io::Result<()> {
+    run_agent_loop(
+        client, session, session_id, db, model, request_id,
+        x_credentials.as_ref(), cwd.as_deref(), state,
+    ).await
+}
+
 pub(crate) async fn persist_assistant_tool_use(
     session: &Arc<Mutex<SessionState>>,
+    session_id: u64,
+    db: &Arc<redb::Database>,
     tool_use: &ChatAssistantToolUse,
 ) {
-    session
-        .lock()
-        .await
-        .messages
-        .push(SessionMessage::AssistantToolUse {
+    append_message_and_persist(
+        session,
+        db,
+        session_id,
+        SessionMessage::AssistantToolUse {
             content: tool_use.content.clone(),
             tool_calls: tool_use
                 .tool_calls
@@ -177,7 +217,9 @@ pub(crate) async fn persist_assistant_tool_use(
             reasoning_content: tool_use.reasoning_content.clone(),
             reasoning: tool_use.reasoning.clone(),
             reasoning_text: tool_use.reasoning_text.clone(),
-        });
+        },
+    )
+    .await;
 }
 
 pub(crate) fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMessage> {

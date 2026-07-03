@@ -3,7 +3,7 @@ use crate::requests::{emit_demo_image, execute_chat_tool_request, execute_plain_
 use crate::server::{
     try_client, try_session, REQUEST_TIMEOUT_SECS,
 };
-use crate::sessions::{ActiveRequest, broadcast_message_appended, broadcast_to_session};
+use crate::sessions::{ActiveRequest, append_message_and_persist, broadcast_message_appended, broadcast_to_session};
 use std::{sync::Arc, time::Duration};
 use tai_proto::{DaemonMessage, SessionMessage};
 use tokio::sync::mpsc;
@@ -36,6 +36,11 @@ pub(crate) async fn handle_run_input(
 
     let client = try_client!(state, tx);
 
+    let (db, x_credentials) = {
+        let guard = state.lock().await;
+        (Arc::clone(&guard.db), guard.x_credentials.clone())
+    };
+
     let model = {
         let mut guard = session.lock().await;
         if let Some(existing) = guard.active_requests.get(&request_id) {
@@ -63,19 +68,21 @@ pub(crate) async fn handle_run_input(
         let message = SessionMessage::UserText {
             content: text.clone(),
         };
-        guard.messages.push(message.clone());
         drop(guard);
+        append_message_and_persist(&session, &db, session_id, message.clone()).await;
         broadcast_message_appended(&session, message, Some(client_id)).await;
         model
     };
 
-    let request_format = client.config().request_format_for_model(&model);
-    let x_credentials = {
-        let guard = state.lock().await;
-        guard.x_credentials.clone()
+    let session_cwd = {
+        let guard = session.lock().await;
+        guard.cwd.clone()
     };
+
+    let request_format = client.config().request_format_for_model(&model);
     info!(request_id, session_id, input_len = input.len(), selected_model = %model, ?request_format, "starting request");
     let session_clone = Arc::clone(&session);
+    let state_clone = Arc::clone(state);
     let handle = tokio::spawn(async move {
         broadcast_to_session(
             &session_clone,
@@ -89,10 +96,10 @@ pub(crate) async fn handle_run_input(
             async {
                 match request_format {
                     RequestFormat::Responses => {
-                        execute_plain_request(&client, &session_clone, &model, request_id).await
+                        execute_plain_request(&client, &session_clone, session_id, &db, &model, request_id).await
                     }
                     RequestFormat::ChatCompletions => {
-                        execute_chat_tool_request(&client, &session_clone, &model, request_id, x_credentials)
+                        execute_chat_tool_request(&client, &session_clone, session_id, &db, &model, request_id, x_credentials, session_cwd.clone(), &state_clone)
                             .await
                     }
                 }

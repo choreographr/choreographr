@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|e| format!("<error: {e}>"));
     info!(%config_path, %keystore_path, %db_path, "daemon paths");
     let db = tai_daemon::db::open_db().context("failed to open database")?;
-    let state = tai_daemon::new_daemon_state(db);
+    let state = tai_daemon::new_daemon_state(db).await;
     let socket_path = socket_path();
     tai_daemon::run_server(&socket_path, state)
         .await
