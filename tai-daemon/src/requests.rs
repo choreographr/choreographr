@@ -80,7 +80,15 @@ pub(crate) async fn run_agent_loop(
 ) -> io::Result<()> {
     let tools = available_tools();
     let mut next_image_id = 1;
-    for _ in 0..8 {
+
+    let max_turns = {
+        let guard = session.lock().await;
+        guard.max_turns.unwrap_or_else(|| {
+            state.blocking_lock().max_turns
+        })
+    };
+
+    for _ in 0..max_turns {
         let messages = {
             let guard = session.lock().await;
             build_chat_request_messages(&guard.messages)
@@ -172,7 +180,7 @@ pub(crate) async fn run_agent_loop(
 
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "tool loop exceeded maximum iterations",
+        format!("tool loop exceeded {max_turns} iterations"),
     ))
 }
 

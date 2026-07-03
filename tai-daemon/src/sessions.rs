@@ -21,6 +21,7 @@ pub(crate) struct SessionState {
     pub(crate) selected_model: Option<String>,
     pub(crate) parent_session_id: Option<u64>,
     pub(crate) cwd: Option<std::path::PathBuf>,
+    pub(crate) max_turns: Option<u32>,
     pub(crate) created_at: i64,
     pub(crate) messages: Vec<SessionMessage>,
     pub(crate) active_requests: HashMap<u32, ActiveRequest>,
@@ -30,6 +31,7 @@ pub(crate) struct SessionState {
 pub struct DaemonStateInner {
     pub(crate) next_session_id: u64,
     pub(crate) next_client_id: u64,
+    pub(crate) max_turns: u32,
     pub(crate) sessions: HashMap<u64, Arc<Mutex<SessionState>>>,
     pub openai_client: Option<Arc<OpenAiClient>>,
     pub keystore: Option<Arc<Keystore>>,
@@ -39,7 +41,7 @@ pub struct DaemonStateInner {
 
 pub type DaemonState = Arc<Mutex<DaemonStateInner>>;
 
-pub async fn new_daemon_state(db: redb::Database) -> DaemonState {
+pub async fn new_daemon_state(db: redb::Database, max_turns: u32) -> DaemonState {
     let db = Arc::new(db);
 
     let stored_sessions =
@@ -63,6 +65,7 @@ pub async fn new_daemon_state(db: redb::Database) -> DaemonState {
                 selected_model: record.selected_model,
                 parent_session_id: record.parent_session_id,
                 cwd: record.cwd.map(std::path::PathBuf::from),
+                max_turns: record.max_turns,
                 created_at: record.created_at,
                 messages,
                 active_requests: HashMap::new(),
@@ -84,6 +87,7 @@ pub async fn new_daemon_state(db: redb::Database) -> DaemonState {
                 selected_model: None,
                 parent_session_id: None,
                 cwd: None,
+                max_turns: None,
                 created_at,
                 messages: Vec::new(),
                 active_requests: HashMap::new(),
@@ -96,6 +100,7 @@ pub async fn new_daemon_state(db: redb::Database) -> DaemonState {
     Arc::new(Mutex::new(DaemonStateInner {
         next_session_id: max_id.wrapping_add(1),
         next_client_id: 1,
+        max_turns,
         sessions,
         openai_client: None,
         keystore: None,
@@ -209,6 +214,7 @@ pub(crate) async fn list_sessions(state: &DaemonState) -> Vec<SessionSummary> {
             cwd: guard.cwd.as_ref().map(|p| p.display().to_string()),
             created_at: guard.created_at,
             message_count: guard.messages.len() as u32,
+            max_turns: guard.max_turns,
         });
     }
     summaries.sort_by_key(|summary| summary.session_id);
@@ -226,6 +232,7 @@ pub(crate) async fn session_snapshot(
         selected_model: guard.selected_model.clone(),
         parent_session_id: guard.parent_session_id,
         cwd: guard.cwd.as_ref().map(|p| p.display().to_string()),
+        max_turns: guard.max_turns,
         messages: guard.messages.clone(),
     }
 }
@@ -267,12 +274,25 @@ pub(crate) async fn create_session_internal(
     title: Option<String>,
     parent_session_id: Option<u64>,
     cwd: Option<std::path::PathBuf>,
+    max_turns: Option<u32>,
 ) -> anyhow::Result<(u64, Arc<Mutex<SessionState>>)> {
     let resolved_cwd = if cwd.is_some() {
         cwd
     } else if let Some(parent_id) = parent_session_id {
         if let Some(parent) = session_by_id(state, parent_id).await {
             parent.lock().await.cwd.clone()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let resolved_max_turns = if max_turns.is_some() {
+        max_turns
+    } else if let Some(parent_id) = parent_session_id {
+        if let Some(parent) = session_by_id(state, parent_id).await {
+            parent.lock().await.max_turns
         } else {
             None
         }
@@ -295,6 +315,7 @@ pub(crate) async fn create_session_internal(
             selected_model: None,
             parent_session_id,
             cwd: resolved_cwd.clone(),
+            max_turns: resolved_max_turns,
             created_at,
             messages: Vec::new(),
             active_requests: HashMap::new(),
@@ -310,6 +331,7 @@ pub(crate) async fn create_session_internal(
         selected_model: None,
         parent_session_id,
         cwd: resolved_cwd.map(|p| p.display().to_string()),
+        max_turns: resolved_max_turns,
         message_count: 0,
         created_at,
     };

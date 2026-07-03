@@ -17,6 +17,7 @@ pub struct SessionRecord {
     pub selected_model: Option<String>,
     pub parent_session_id: Option<u64>,
     pub cwd: Option<String>,
+    pub max_turns: Option<u32>,
     pub message_count: u32,
     pub created_at: i64,
 }
@@ -170,6 +171,7 @@ mod tests {
             selected_model: Some("gpt-4".into()),
             parent_session_id: None,
             cwd: Some("/tmp".into()),
+            max_turns: None,
             message_count: 1,
             created_at: 1234567890,
         };

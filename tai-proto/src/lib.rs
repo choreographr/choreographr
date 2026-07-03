@@ -91,11 +91,12 @@ pub struct SessionSummary {
     pub cwd: Option<String>,
     pub created_at: i64,
     pub message_count: u32,
+    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClientMessage {
-    CreateSession { title: Option<String>, parent_session_id: Option<u64>, cwd: Option<String> },
+    CreateSession { title: Option<String>, parent_session_id: Option<u64>, cwd: Option<String>, max_turns: Option<u32> },
     ListSessions,
     AttachSession { session_id: u64 },
     GetSessionState { session_id: u64 },
@@ -136,6 +137,7 @@ pub enum DaemonMessage {
         title: Option<String>,
         parent_session_id: Option<u64>,
         cwd: Option<String>,
+        max_turns: Option<u32>,
     },
     Sessions {
         sessions: Vec<SessionSummary>,
@@ -149,6 +151,7 @@ pub enum DaemonMessage {
         selected_model: Option<String>,
         parent_session_id: Option<u64>,
         cwd: Option<String>,
+        max_turns: Option<u32>,
         messages: Vec<SessionMessage>,
     },
     SessionMessageAppended {

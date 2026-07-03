@@ -1,12 +1,6 @@
-use crate::sessions::{SessionState, session_by_id, session_snapshot, update_subscription};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use crate::sessions::{create_session_internal, session_snapshot, update_subscription};
 use tai_proto::DaemonMessage;
-use tokio::sync::{Mutex, mpsc};
-use tracing::warn;
+use tokio::sync::mpsc;
 
 async fn send_or_warn(tx: &mpsc::Sender<DaemonMessage>, msg: DaemonMessage) {
     crate::server::send_or_warn(tx, msg).await;
@@ -20,57 +14,18 @@ pub(crate) async fn handle_create_session(
     title: Option<String>,
     parent_session_id: Option<u64>,
     cwd: Option<String>,
+    max_turns: Option<u32>,
 ) -> anyhow::Result<()> {
-    let resolved_cwd = if cwd.is_some() {
-        cwd.map(std::path::PathBuf::from)
-    } else if let Some(parent_id) = parent_session_id {
-        if let Some(parent) = session_by_id(state, parent_id).await {
-            parent.lock().await.cwd.clone()
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let cwd_path = cwd.map(std::path::PathBuf::from);
 
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-
-    let (session_id, session) = {
-        let mut guard = state.lock().await;
-        let session_id = guard.next_session_id;
-        guard.next_session_id = guard.next_session_id.wrapping_add(1);
-        let session = Arc::new(Mutex::new(SessionState {
-            title: title.clone(),
-            selected_model: None,
-            parent_session_id,
-            cwd: resolved_cwd.clone(),
-            created_at,
-            messages: Vec::new(),
-            active_requests: HashMap::new(),
-            subscribers: HashMap::new(),
-        }));
-        guard.sessions.insert(session_id, Arc::clone(&session));
-        (session_id, session)
-    };
-
-    let db = {
-        let guard = state.lock().await;
-        Arc::clone(&guard.db)
-    };
-    let record = crate::db::SessionRecord {
-        title: title.clone(),
-        selected_model: None,
+    let (session_id, session) = create_session_internal(
+        state,
+        title.clone(),
         parent_session_id,
-        cwd: resolved_cwd.as_ref().map(|p| p.display().to_string()),
-        message_count: 0,
-        created_at,
-    };
-    if let Err(e) = crate::db::write_session(&db, session_id, &record) {
-        warn!(session_id, error = %e, "failed to persist new session to DB");
-    }
+        cwd_path,
+        max_turns,
+    )
+    .await?;
 
     update_subscription(
         state,
@@ -81,13 +36,16 @@ pub(crate) async fn handle_create_session(
     )
     .await;
     *attached_session_id = Some(session_id);
+
+    let cwd_display = session.lock().await.cwd.as_ref().map(|p| p.display().to_string());
     send_or_warn(
         tx,
         DaemonMessage::SessionCreated {
             session_id,
             title: title.clone(),
             parent_session_id,
-            cwd: resolved_cwd.map(|p| p.display().to_string()),
+            cwd: cwd_display,
+            max_turns,
         },
     )
     .await;

@@ -25,6 +25,7 @@ fn test_service_config() -> ServiceConfig {
         chat_completions_max_tokens: None,
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
+        max_turns: None,
     }
 }
 
@@ -33,7 +34,7 @@ fn test_client() -> Arc<OpenAiClient> {
 }
 
 async fn test_state_with_client() -> DaemonState {
-    let state = new_daemon_state(test_db()).await;
+    let state = new_daemon_state(test_db(), 25).await;
     state.lock().await.openai_client = Some(test_client());
     state
 }
@@ -62,6 +63,7 @@ async fn create_session_persists_to_db() {
             title: Some("persist-test".to_string()),
             parent_session_id: None,
             cwd: Some("/tmp/test-cwd".to_string()),
+            max_turns: None,
         },
     )
     .await
@@ -73,6 +75,7 @@ async fn create_session_persists_to_db() {
             title,
             parent_session_id,
             cwd,
+            ..
         } => {
             assert!(session_id > 0);
             assert_eq!(title, Some("persist-test".to_string()));
@@ -113,6 +116,7 @@ async fn create_sub_session_inherits_parent_cwd() {
             title: Some("parent".to_string()),
             parent_session_id: None,
             cwd: Some("/tmp/parent-cwd".to_string()),
+            max_turns: None,
         },
     )
     .await
@@ -131,6 +135,7 @@ async fn create_sub_session_inherits_parent_cwd() {
             title: Some("child".to_string()),
             parent_session_id: Some(parent_id),
             cwd: None,
+            max_turns: None,
         },
     )
     .await
@@ -142,6 +147,7 @@ async fn create_sub_session_inherits_parent_cwd() {
             title,
             parent_session_id,
             cwd,
+            ..
         } => {
             assert!(child_id > parent_id);
             assert_eq!(title, Some("child".to_string()));
@@ -168,6 +174,7 @@ async fn list_sessions_includes_new_fields() {
             title: Some("list-test".to_string()),
             parent_session_id: None,
             cwd: Some("/tmp/list-cwd".to_string()),
+            max_turns: None,
         },
     )
     .await
@@ -215,6 +222,7 @@ async fn session_state_snapshot_includes_new_fields() {
             title: Some("snapshot-test".to_string()),
             parent_session_id: Some(42),
             cwd: Some("/tmp/snap-cwd".to_string()),
+            max_turns: None,
         },
     )
     .await
@@ -252,7 +260,7 @@ async fn session_survives_daemon_restart() {
     let session_id = {
         let db = redb::Database::create(&db_path).expect("create db");
         let (server, mut client) = UnixStream::pair().expect("pair");
-        let state = new_daemon_state(db).await;
+        let state = new_daemon_state(db, 25).await;
         let server_task = tokio::spawn(handle_client(server, state));
 
         write_message(
@@ -261,6 +269,7 @@ async fn session_survives_daemon_restart() {
                 title: Some("restart-test".to_string()),
                 parent_session_id: None,
                 cwd: Some("/tmp/restart-cwd".to_string()),
+                max_turns: None,
             },
         )
         .await
@@ -280,7 +289,7 @@ async fn session_survives_daemon_restart() {
 
     let db2 = redb::Database::open(&db_path).expect("reopen db");
     let (server2, mut client2) = UnixStream::pair().expect("pair2");
-    let state2 = new_daemon_state(db2).await;
+    let state2 = new_daemon_state(db2, 25).await;
     let server_task2 = tokio::spawn(handle_client(server2, state2));
 
     write_message(&mut client2, &ClientMessage::ListSessions)

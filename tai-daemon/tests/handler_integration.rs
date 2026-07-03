@@ -30,6 +30,7 @@ fn test_service_config() -> ServiceConfig {
         chat_completions_max_tokens: None,
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
+        max_turns: None,
     }
 }
 
@@ -38,7 +39,7 @@ fn test_client() -> Arc<OpenAiClient> {
 }
 
 async fn test_state_with_client() -> DaemonState {
-    let state = new_daemon_state(test_db()).await;
+    let state = new_daemon_state(test_db(), 25).await;
     state.lock().await.openai_client = Some(test_client());
     state
 }
@@ -142,8 +143,9 @@ async fn spawn_mock_openai_server(
         chat_completions_max_tokens: None,
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
+        max_turns: None,
     };
-    let state = new_daemon_state(test_db()).await;
+    let state = new_daemon_state(test_db(), 25).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -545,8 +547,9 @@ async fn list_models_fails_when_provider_unreachable() {
         chat_completions_max_tokens: None,
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
+        max_turns: None,
     };
-    let state = new_daemon_state(test_db()).await;
+    let state = new_daemon_state(test_db(), 25).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -584,8 +587,9 @@ async fn set_model_fails_when_provider_unreachable() {
         chat_completions_max_tokens: None,
         model_max_tokens: std::collections::HashMap::new(),
         streaming: true,
+        max_turns: None,
     };
-    let state = new_daemon_state(test_db()).await;
+    let state = new_daemon_state(test_db(), 25).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(

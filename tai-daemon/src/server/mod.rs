@@ -94,8 +94,8 @@ pub(crate) async fn handle_client_message(
     attached_session_id: &mut Option<u64>,
 ) -> anyhow::Result<()> {
     match msg {
-        ClientMessage::CreateSession { title, parent_session_id, cwd } => {
-            handle_create_session(state, tx, client_id, attached_session_id, title, parent_session_id, cwd).await
+        ClientMessage::CreateSession { title, parent_session_id, cwd, max_turns } => {
+            handle_create_session(state, tx, client_id, attached_session_id, title, parent_session_id, cwd, max_turns).await
         }
         ClientMessage::ListSessions => {
             let sessions = list_sessions(state).await;

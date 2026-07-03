@@ -35,6 +35,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
                 title: Some("default".to_string()),
                 parent_session_id: None,
                 cwd: None,
+                max_turns: None,
             })))
         }
         DaemonMessage::SessionAttached { session_id } => {

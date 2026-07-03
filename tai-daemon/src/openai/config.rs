@@ -27,6 +27,8 @@ pub struct ServiceConfig {
     pub model_max_tokens: HashMap<String, u32>,
     #[serde(default = "default_streaming")]
     pub streaming: bool,
+    #[serde(default)]
+    pub max_turns: Option<u32>,
 }
 
 impl Default for ServiceConfig {
@@ -41,6 +43,7 @@ impl Default for ServiceConfig {
             chat_completions_max_tokens: None,
             model_max_tokens: HashMap::new(),
             streaming: default_streaming(),
+            max_turns: None,
         }
     }
 }

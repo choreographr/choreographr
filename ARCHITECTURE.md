@@ -369,6 +369,7 @@ Each active session has a `SessionState` (wrapped in `Arc<Mutex<>>`):
 - `selected_model: Option<String>` — AI model for this session
 - `parent_session_id: Option<u64>` — parent session for sub-sessions
 - `cwd: Option<PathBuf>` — working directory for filesystem tools
+- `max_turns: Option<u32>` — per-session tool loop iteration cap (inherits from parent)
 - `created_at: i64` — Unix timestamp of creation
 - `messages: Vec<SessionMessage>` — conversation history (also persisted to DB)
 - `active_requests: HashMap<u32, ActiveRequest>` — running request handles
@@ -377,9 +378,9 @@ Each active session has a `SessionState` (wrapped in `Arc<Mutex<>>`):
 ### Hierarchy and CWD inheritance
 
 Sessions form a tree: a session can have a `parent_session_id` pointing to another
-session. When creating a child session, if no explicit CWD is provided, it inherits
-the parent's CWD. This allows sub-sessions (subagents) to operate in the same
-directory as their parent.
+session. When creating a child session, if no explicit CWD or `max_turns` is provided,
+it inherits the parent's value. This allows sub-sessions (subagents) to operate in the
+same directory as their parent with a default iteration cap.
 
 ### Persistence lifecycle
 
@@ -411,6 +412,7 @@ chat_completions_path = "/chat/completions"
 default_request_format = "chat_completions"     # or "responses"
 chat_completions_max_tokens = 4096
 streaming = true
+max_turns = 25                                   # default tool loop iteration cap
 
 [model_request_formats]                          # per-model overrides
 gpt-5 = "responses"
@@ -424,6 +426,11 @@ big-model = 4096
 **Database:** `~/.local/share/tai-daemon/state.redb` (override via `TAI_DB_PATH` env var)
 
 **Socket path:** `/tmp/tai.sock` (override via `TAI_SOCKET_PATH` env var)
+
+**Tool loop limit:** `TAI_MAX_TURNS` env var overrides `config.toml` `max_turns`. Resolution
+chain: per-session `max_turns` → `TAI_MAX_TURNS` env var → `config.toml` → default 25.
+The `spawn_subsession` tool accepts an optional `max_turns` parameter; if not set, the
+child inherits the parent's value.
 
 
 ---
@@ -498,9 +505,9 @@ Model calls display_image tool
    `spawn_subsession` tool creates autonomous child sessions that run their own tool-calling
    loop and report results back to the parent.
 
-6. **Tool-call loop in the daemon** — the daemon drives multi-turn tool interactions (up to 8
-   iterations) rather than pushing that complexity to the client or model. The client just sees
-   `ToolCallStarted`/`ToolCallFinished` events.
+6. **Tool-call loop in the daemon** — the daemon drives multi-turn tool interactions (up to a
+   configurable `max_turns` per session, default 25) rather than pushing that complexity to
+   the client or model. The client just sees `ToolCallStarted`/`ToolCallFinished` events.
 
 7. **Chunked image streaming** — images are streamed in ≤64 KiB chunks to avoid blocking the
    socket on large payloads. The client assembles and validates on receipt.

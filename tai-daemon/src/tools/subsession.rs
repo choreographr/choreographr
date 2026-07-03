@@ -35,6 +35,7 @@ pub(crate) async fn execute_spawn_subsession(
     };
 
     let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).map(|v| v as u32);
     let child_cwd = cwd.map(|p| p.to_path_buf());
 
     let (child_session_id, child_session) = match create_session_internal(
@@ -42,6 +43,7 @@ pub(crate) async fn execute_spawn_subsession(
         title,
         Some(parent_session_id),
         child_cwd,
+        max_turns,
     ).await {
         Ok(s) => s,
         Err(e) => return ToolExecutionOutput {
@@ -109,6 +111,10 @@ pub(crate) fn spawn_subsession_schema() -> serde_json::Value {
             "title": {
                 "type": "string",
                 "description": "Optional title for the sub-session"
+            },
+            "max_turns": {
+                "type": "integer",
+                "description": "Optional maximum tool-calling iterations for this sub-session. Inherits from parent if not set."
             }
         },
         "required": ["prompt"],
