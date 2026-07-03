@@ -54,6 +54,7 @@ mod evm;
 pub(crate) mod git;
 mod subxt;
 pub(crate) mod x;
+pub(crate) mod sessions;
 pub(crate) mod subsession;
 
 #[derive(Debug, Clone)]
@@ -153,6 +154,8 @@ impl ToolRegistry {
             .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
             .collect();
         defs.push(subsession::spawn_subsession_definition());
+        defs.push(sessions::list_sessions_definition());
+        defs.push(sessions::get_session_definition());
         defs
     }
 }

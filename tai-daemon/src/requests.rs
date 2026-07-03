@@ -137,6 +137,10 @@ pub(crate) async fn run_agent_loop(
                             client, state, session, session_id, db, model,
                             &tool_call, x_credentials, cwd,
                         ).await
+                    } else if tool_call.name == "list_sessions" {
+                        crate::tools::sessions::execute_list_sessions(state).await
+                    } else if tool_call.name == "get_session" {
+                        crate::tools::sessions::execute_get_session(state, &tool_call.arguments_json).await
                     } else {
                         execute_tool_call(&tool_call, x_credentials, cwd).await
                     };
