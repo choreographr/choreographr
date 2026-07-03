@@ -14,6 +14,36 @@ A local AI terminal interface in Rust. Connects to an OpenAI-compatible API, run
 | `tai-proto` | Framed binary protocol used between client and daemon |
 | `tai-keystore` | Encrypted credential keystore used by the daemon |
 
+## Concepts
+
+**Agent loop (harness):** The daemon drives a server-side loop that repeatedly sends
+conversation history and available tools to the LLM, executes any tool calls the model
+requests, appends results back into the conversation, and loops until the model produces a
+final answer or the per-session iteration cap is reached. The client only sees
+`ToolCallStarted`/`ToolCallFinished` lifecycle events, keeping it simple.
+
+**Session / subsession:** A *session* is a persisted conversation with its own message
+history, AI model, working directory, and tool-iteration cap. Sessions form a parent-child
+tree, support multiple concurrent client attachments, and survive daemon restarts via an
+embedded `redb` database. A *subsession* is a child session spawned by the
+`spawn_subsession` tool — it inherits the parent's working directory, runs its own full
+agent loop independently, and returns its output as the parent's tool result. Subsessions
+persist permanently and can be inspected like any other session.
+
+**Tool:** A function the LLM can call to interact with the outside world (read files, make
+HTTP requests, run git commands, query blockchains, post to X, etc.). Tools implement the
+`Tool` trait (name, description, JSON Schema, async execute) and are registered in a
+`ToolRegistry` at daemon startup. The daemon passes all tool definitions to the model with
+each request and executes them on the model's behalf, feeding results back into the
+conversation.
+
+**Skill:** A filesystem-based extension following the Agent Skills standard — a `SKILL.md`
+file with YAML frontmatter (`name`, `description`) placed under `.agents/skills/<name>/`.
+At session creation, skill names and descriptions are listed in the system prompt. When
+the model calls the `load_skill` tool, the full instruction body is injected into the
+conversation (progressive disclosure), giving the model specialized knowledge on demand
+without bloating every request.
+
 ## Build
 
 ```bash
