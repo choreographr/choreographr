@@ -488,11 +488,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_file(tmp.path(), "AGENTS.md", "version 1");
 
+        filetime::set_file_mtime(
+            &tmp.path().join("AGENTS.md"),
+            filetime::FileTime::from_unix_time(0, 0),
+        )
+        .unwrap();
+
         let config = ContextConfig::default();
         let bundle = discover_context(tmp.path(), &config).unwrap();
         let fp = bundle.fingerprint;
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
         write_file(tmp.path(), "AGENTS.md", "version 2");
 
         let result = recheck_context(tmp.path(), &config, fp).unwrap();

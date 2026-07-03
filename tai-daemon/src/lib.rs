@@ -18,8 +18,14 @@ pub use crate::tools::git::{
     execute_git_push_tool,
     execute_git_status_tool,
 };
-#[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use crate::tools::*;
+#[cfg(test)]
+pub(crate) use crate::tools::{
+    execute_read_file_range_tool,
+    execute_write_file_tool,
+    execute_edit_file_tool,
+    execute_http_request_tool,
+    sha256_hex,
+};
 pub use tai_keystore::Keystore;
 
 #[cfg(test)]

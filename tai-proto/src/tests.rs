@@ -1,5 +1,8 @@
 use super::*;
+use std::sync::Mutex;
 use tokio::io::duplex;
+
+static SOCKET_PATH_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 #[test]
 fn encode_decode_round_trip_client_message() {
@@ -74,12 +77,15 @@ async fn read_payload_rejects_oversized_frame() {
 
 #[test]
 fn socket_path_uses_env_override() {
+    let _guard = SOCKET_PATH_TEST_MUTEX.lock().unwrap();
+    let original = std::env::var(SOCKET_PATH_ENV).ok();
     unsafe {
         std::env::set_var(SOCKET_PATH_ENV, "/tmp/custom-tai.sock");
     }
     assert_eq!(socket_path(), "/tmp/custom-tai.sock");
-    unsafe {
-        std::env::remove_var(SOCKET_PATH_ENV);
+    match original {
+        Some(value) => unsafe { std::env::set_var(SOCKET_PATH_ENV, value) },
+        None => unsafe { std::env::remove_var(SOCKET_PATH_ENV) },
     }
 }
 

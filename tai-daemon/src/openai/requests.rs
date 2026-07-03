@@ -52,34 +52,60 @@ pub(crate) fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> Op
         .and_then(|v| v.parse::<u64>().ok())
 }
 
-fn status_to_error(status: reqwest::StatusCode, detail: &str) -> io::Error {
-    let kind = match status {
-        s if s.is_client_error() && s != reqwest::StatusCode::TOO_MANY_REQUESTS => {
-            io::ErrorKind::InvalidInput
-        }
-        _ => io::ErrorKind::Other,
-    };
-    io::Error::new(kind, detail.to_string())
+fn status_to_error(
+    status: reqwest::StatusCode,
+    detail: &str,
+    headers: &reqwest::header::HeaderMap,
+) -> super::OpenAiError {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return super::OpenAiError::Unauthorized {
+            status: status.as_u16(),
+            detail: detail.to_string(),
+        };
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return super::OpenAiError::RateLimited {
+            retry_after_secs: parse_retry_after_secs(headers),
+            detail: detail.to_string(),
+        };
+    }
+    if status.is_server_error() {
+        return super::OpenAiError::ServerError {
+            status: status.as_u16(),
+            detail: detail.to_string(),
+        };
+    }
+    if status.is_client_error() {
+        return super::OpenAiError::ClientError {
+            status: status.as_u16(),
+            detail: detail.to_string(),
+        };
+    }
+    super::OpenAiError::Io(io::Error::new(
+        io::ErrorKind::Other,
+        detail.to_string(),
+    ))
 }
 
 async fn send_request_raw(
     request: &reqwest::RequestBuilder,
     retry: &RetryConfig,
-) -> io::Result<reqwest::Response> {
+) -> Result<reqwest::Response, super::OpenAiError> {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
 
         let req = request.try_clone().ok_or_else(|| {
-            io::Error::new(
+            super::OpenAiError::Io(io::Error::new(
                 io::ErrorKind::Other,
                 "request body cannot be cloned for retry",
-            )
+            ))
         })?;
 
         match req.send().await {
             Ok(response) => {
                 let status = response.status();
+                let headers = response.headers().clone();
                 if status.is_success() {
                     return Ok(response);
                 }
@@ -113,7 +139,7 @@ async fn send_request_raw(
                 } else {
                     format!("request failed with status {status}: {trimmed_body}")
                 };
-                return Err(status_to_error(status, &detail));
+                return Err(status_to_error(status, &detail, &headers));
             }
             Err(error) => {
                 if (error.is_connect() || error.is_timeout()) && attempt < retry.max_attempts {
@@ -128,7 +154,7 @@ async fn send_request_raw(
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                return Err(io::Error::other(error));
+                return Err(super::OpenAiError::Io(io::Error::other(error)));
             }
         }
     }
@@ -137,12 +163,12 @@ async fn send_request_raw(
 async fn send_request<R>(
     request: &reqwest::RequestBuilder,
     retry: &RetryConfig,
-) -> io::Result<R>
+) -> Result<R, super::OpenAiError>
 where
     R: for<'de> Deserialize<'de>,
 {
     let response = send_request_raw(request, retry).await?;
-    response.json().await.map_err(io::Error::other)
+    response.json().await.map_err(|e| super::OpenAiError::Io(io::Error::other(e)))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,7 +186,7 @@ fn chat_completions_max_tokens_field(config: &ServiceConfig, model: &str) -> Max
 }
 
 impl OpenAiClient {
-    pub async fn validate_and_list_models(&self) -> io::Result<Vec<String>> {
+    pub async fn validate_and_list_models(&self) -> Result<Vec<String>, super::OpenAiError> {
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
         let retry = RetryConfig::from_service_config(&self.config);
         let request = self.http.get(&url).bearer_auth(self.api_key.trim());
@@ -168,7 +194,7 @@ impl OpenAiClient {
         Ok(payload.data.into_iter().map(|model| model.id).collect())
     }
 
-    pub async fn completion(&self, model: &str, prompt: &str) -> io::Result<String> {
+    pub async fn completion(&self, model: &str, prompt: &str) -> Result<String, super::OpenAiError> {
         match self.config.request_format_for_model(model) {
             RequestFormat::Responses => {
                 responses_request(&self.http, &self.config, &self.api_key, model, prompt).await
@@ -184,7 +210,7 @@ impl OpenAiClient {
         model: &str,
         prompt: &str,
         mut on_chunk: F,
-    ) -> io::Result<()>
+    ) -> Result<(), super::OpenAiError>
     where
         F: FnMut(CompletionChunkKind, String) -> Fut,
         Fut: Future<Output = io::Result<()>>,
@@ -221,7 +247,7 @@ impl OpenAiClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
-    ) -> io::Result<ChatTurnResult> {
+    ) -> Result<ChatTurnResult, super::OpenAiError> {
         chat_completions_request_with_tools(&self.http, &self.config, &self.api_key, model, messages, tools).await
     }
 }
@@ -232,7 +258,7 @@ async fn responses_request(
     api_key: &str,
     model: &str,
     prompt: &str,
-) -> io::Result<String> {
+) -> Result<String, super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
     let retry = RetryConfig::from_service_config(config);
     let request = client.post(&url).bearer_auth(api_key.trim()).json(&ResponsesRequest {
@@ -252,10 +278,7 @@ async fn responses_request(
         .unwrap_or_default();
 
     if content.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "provider returned an empty response",
-        ));
+        return Err(super::OpenAiError::EmptyResponse);
     }
 
     Ok(content)
@@ -267,7 +290,7 @@ async fn chat_completions_request(
     api_key: &str,
     model: &str,
     prompt: &str,
-) -> io::Result<String> {
+) -> Result<String, super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
     let (max_tokens_field, max_completion_tokens_field) =
@@ -297,10 +320,7 @@ async fn chat_completions_request(
         .to_string();
 
     if content.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "provider returned an empty response",
-        ));
+        return Err(super::OpenAiError::EmptyResponse);
     }
 
     Ok(content)
@@ -313,7 +333,7 @@ async fn chat_completions_request_with_tools(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-) -> io::Result<ChatTurnResult> {
+) -> Result<ChatTurnResult, super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
     let (max_tokens_field, max_completion_tokens_field) =
@@ -334,10 +354,7 @@ async fn chat_completions_request_with_tools(
     let payload: ChatCompletionsResponse = send_request(&request, &retry).await?;
 
     let Some(choice) = payload.choices.into_iter().next() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "provider returned an empty response",
-        ));
+        return Err(super::OpenAiError::EmptyResponse);
     };
 
     if !choice.message.tool_calls.is_empty() {
@@ -366,10 +383,7 @@ async fn chat_completions_request_with_tools(
         .trim()
         .to_string();
     if content.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "provider returned an empty response",
-        ));
+        return Err(super::OpenAiError::EmptyResponse);
     }
 
     Ok(ChatTurnResult::FinalText(content))
@@ -382,7 +396,7 @@ async fn chat_completions_request_streaming<F, Fut>(
     model: &str,
     prompt: &str,
     on_chunk: &mut F,
-) -> io::Result<()>
+) -> Result<(), super::OpenAiError>
 where
     F: FnMut(CompletionChunkKind, String) -> Fut,
     Fut: Future<Output = io::Result<()>>,
@@ -440,10 +454,7 @@ where
     }
 
     if !saw_text {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "provider returned an empty streamed response",
-        ));
+        return Err(super::OpenAiError::EmptyResponse);
     }
 
     Ok(())
@@ -456,7 +467,7 @@ async fn responses_request_streaming<F, Fut>(
     model: &str,
     prompt: &str,
     on_chunk: &mut F,
-) -> io::Result<()>
+) -> Result<(), super::OpenAiError>
 where
     F: FnMut(CompletionChunkKind, String) -> Fut,
     Fut: Future<Output = io::Result<()>>,
@@ -482,10 +493,7 @@ where
     }
 
     if !saw_text {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "provider returned an empty streamed response",
-        ));
+        return Err(super::OpenAiError::EmptyResponse);
     }
 
     Ok(())

@@ -20,6 +20,28 @@ pub(crate) use requests::{
 use serde::{Deserialize, Serialize};
 use std::{io, time::Duration};
 
+#[derive(Debug, thiserror::Error)]
+pub enum OpenAiError {
+    #[error("unauthorized ({status}): {detail}")]
+    Unauthorized { status: u16, detail: String },
+    #[error("rate limited: {detail}")]
+    RateLimited { retry_after_secs: Option<u64>, detail: String },
+    #[error("server error ({status}): {detail}")]
+    ServerError { status: u16, detail: String },
+    #[error("client error ({status}): {detail}")]
+    ClientError { status: u16, detail: String },
+    #[error("provider returned an empty response")]
+    EmptyResponse,
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<OpenAiError> for std::io::Error {
+    fn from(err: OpenAiError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::Other, err.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestFormat {

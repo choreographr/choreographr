@@ -168,13 +168,11 @@ impl ServiceConfig {
 }
 
 pub async fn validate_and_list_models(config: &ServiceConfig, api_key: &str) -> io::Result<Vec<String>> {
-    OpenAiClient::new(config.clone(), api_key.to_string())?
-        .validate_and_list_models()
-        .await
+    let client = OpenAiClient::new(config.clone(), api_key.to_string())?;
+    Ok(client.validate_and_list_models().await?)
 }
 
 pub async fn completion(config: &ServiceConfig, api_key: &str, model: &str, prompt: &str) -> io::Result<String> {
-    OpenAiClient::new(config.clone(), api_key.to_string())?
-        .completion(model, prompt)
-        .await
+    let client = OpenAiClient::new(config.clone(), api_key.to_string())?;
+    Ok(client.completion(model, prompt).await?)
 }

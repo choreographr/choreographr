@@ -12,43 +12,9 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-fn test_db() -> redb::Database {
-    let dir = tempfile::tempdir().unwrap();
-    redb::Database::create(dir.path().join("state.redb")).unwrap()
-}
+mod common;
 
 static CREDENTIAL_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-fn test_service_config() -> ServiceConfig {
-    ServiceConfig {
-        base_url: "https://example.com/v1".to_string(),
-        model_list_path: "/models".to_string(),
-        responses_path: "/responses".to_string(),
-        chat_completions_path: "/chat/completions".to_string(),
-        default_request_format: RequestFormat::ChatCompletions,
-        model_request_formats: std::collections::HashMap::new(),
-        chat_completions_max_tokens: None,
-        model_max_tokens: std::collections::HashMap::new(),
-        streaming: true,
-        max_turns: None,
-        retry_max_attempts: 5,
-        retry_initial_backoff_ms: 1000,
-        retry_max_backoff_ms: 30000,
-        connect_timeout_secs: 30,
-        request_timeout_secs: 120,
-        context: Default::default(),
-    }
-}
-
-fn test_client() -> Arc<OpenAiClient> {
-    Arc::new(OpenAiClient::new(test_service_config(), "test-key".to_string()).expect("client"))
-}
-
-async fn test_state_with_client() -> DaemonState {
-    let state = new_daemon_state(test_db(), 25).await;
-    state.lock().await.openai_client = Some(test_client());
-    state
-}
 
 async fn spawn_mock_openai_server(
     chat_response: Option<&'static str>,
@@ -157,7 +123,7 @@ async fn spawn_mock_openai_server(
         request_timeout_secs: 120,
         context: Default::default(),
     };
-    let state = new_daemon_state(test_db(), 25).await;
+    let state = new_daemon_state(common::test_db(), 25).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -200,7 +166,7 @@ fn test_keystore_path() -> std::path::PathBuf {
 #[tokio::test]
 async fn ping_round_trip() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(&mut client, &ClientMessage::Ping)
@@ -382,7 +348,7 @@ async fn cancel_stops_active_request() {
 #[tokio::test]
 async fn test_image_emits_complete_sequence() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(&mut client, &ClientMessage::TestImage { request_id: 12 })
@@ -449,7 +415,7 @@ async fn test_image_emits_complete_sequence() {
 #[tokio::test]
 async fn run_input_fails_when_no_model_selected() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
@@ -488,7 +454,7 @@ async fn run_input_fails_when_no_model_selected() {
 #[tokio::test]
 async fn empty_input_fails_request() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
@@ -526,7 +492,7 @@ async fn empty_input_fails_request() {
 #[tokio::test]
 async fn cancel_inactive_request_fails() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(&mut client, &ClientMessage::Cancel { request_id: 99 })
@@ -567,7 +533,7 @@ async fn list_models_fails_when_provider_unreachable() {
         request_timeout_secs: 120,
         context: Default::default(),
     };
-    let state = new_daemon_state(test_db(), 25).await;
+    let state = new_daemon_state(common::test_db(), 25).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -613,7 +579,7 @@ async fn set_model_fails_when_provider_unreachable() {
         request_timeout_secs: 120,
         context: Default::default(),
     };
-    let state = new_daemon_state(test_db(), 25).await;
+    let state = new_daemon_state(common::test_db(), 25).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -654,7 +620,7 @@ async fn add_api_key_round_trip() {
     Keystore::init(&ks_path, passphrase).expect("init keystore");
 
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
@@ -694,7 +660,7 @@ async fn add_api_key_rejects_wrong_passphrase() {
     Keystore::init(&ks_path, "correct").expect("init keystore");
 
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
@@ -733,7 +699,7 @@ async fn add_x_credential_round_trip() {
     Keystore::init(&ks_path, passphrase).expect("init keystore");
 
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
@@ -794,7 +760,7 @@ async fn remove_credential_round_trip() {
     }
 
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
@@ -834,7 +800,7 @@ async fn remove_credential_fails_for_missing_service() {
     Keystore::init(&ks_path, passphrase).expect("init keystore");
 
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(

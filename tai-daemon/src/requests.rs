@@ -3,14 +3,18 @@ use crate::openai::{
     OpenAiClient,
 };
 use crate::sessions::{append_message_and_persist, broadcast_to_session, SessionState};
-use crate::tools::{available_tools, emit_prepared_image, execute_tool_call};
-use std::{io, sync::Arc};
+use crate::tools::{available_tools, emit_prepared_image, execute_tool_call, ToolExecutionOutput, ToolResult};
+use std::{io, sync::Arc, time::Duration};
+use tokio::time::timeout;
 use tai_keystore::XCredentials;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
     SessionMessage,
 };
 use tokio::sync::{Mutex, mpsc};
+
+const TOOL_TIMEOUT_SECS: u64 = 60;
+const SUBSESSION_TIMEOUT_SECS: u64 = 120;
 
 pub(crate) async fn execute_plain_request(
     client: &OpenAiClient,
@@ -81,11 +85,9 @@ pub(crate) async fn run_agent_loop(
     let tools = available_tools();
     let mut next_image_id = 1;
 
-    let max_turns = {
-        let guard = session.lock().await;
-        guard.max_turns.unwrap_or_else(|| {
-            state.blocking_lock().max_turns
-        })
+    let max_turns = match session.lock().await.max_turns {
+        Some(n) => n,
+        None => state.lock().await.max_turns,
     };
 
     for _ in 0..max_turns {
@@ -158,21 +160,41 @@ pub(crate) async fn run_agent_loop(
                     )
                     .await;
 
-                    let mut output = if tool_call.name == "spawn_subsession" {
-                        crate::tools::subsession::execute_spawn_subsession(
-                            client, state, session, session_id, db, model,
-                            &tool_call, x_credentials, cwd,
-                        ).await
-                    } else if tool_call.name == "list_sessions" {
-                        crate::tools::sessions::execute_list_sessions(state).await
-                    } else if tool_call.name == "get_session" {
-                        crate::tools::sessions::execute_get_session(state, &tool_call.arguments_json).await
-                    } else if tool_call.name == "load_skill" {
-                        crate::tools::skill::execute_load_skill(
-                            session, session_id, db, cwd, &tool_call.arguments_json,
-                        ).await
+                    let tool_timeout = if tool_call.name == "spawn_subsession" {
+                        Duration::from_secs(SUBSESSION_TIMEOUT_SECS)
                     } else {
-                        execute_tool_call(&tool_call, x_credentials, cwd).await
+                        Duration::from_secs(TOOL_TIMEOUT_SECS)
+                    };
+
+                    let mut output = match timeout(
+                        tool_timeout,
+                        async {
+                            if tool_call.name == "spawn_subsession" {
+                                crate::tools::subsession::execute_spawn_subsession(
+                                    client, state, session, session_id, db, model,
+                                    &tool_call, x_credentials, cwd,
+                                ).await
+                            } else if tool_call.name == "list_sessions" {
+                                crate::tools::sessions::execute_list_sessions(state).await
+                            } else if tool_call.name == "get_session" {
+                                crate::tools::sessions::execute_get_session(state, &tool_call.arguments_json).await
+                            } else if tool_call.name == "load_skill" {
+                                crate::tools::skill::execute_load_skill(
+                                    session, session_id, db, cwd, &tool_call.arguments_json,
+                                ).await
+                            } else {
+                                execute_tool_call(&tool_call, x_credentials, cwd).await
+                            }
+                        }
+                    ).await {
+                        Ok(result) => result,
+                        Err(_elapsed) => ToolExecutionOutput {
+                            result: ToolResult {
+                                content: format!("tool '{}' timed out after {}s", tool_call.name, tool_timeout.as_secs()),
+                                is_error: true,
+                            },
+                            image: None,
+                        },
                     };
 
                     // Inject subdirectory hints into tool result content

@@ -10811,6 +10811,7 @@ dependencies = [
  "bytes",
  "dirs 6.0.0",
  "fff-search",
+ "filetime",
  "futures-util",
  "gix",
  "hex",

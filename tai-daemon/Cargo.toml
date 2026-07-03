@@ -37,4 +37,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+filetime = "0.2"
 tempfile = "3"

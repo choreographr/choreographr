@@ -13,41 +13,7 @@ use tokio::{
     time::{Duration, timeout},
 };
 
-fn test_db() -> redb::Database {
-    let dir = tempfile::tempdir().unwrap();
-    redb::Database::create(dir.path().join("state.redb")).unwrap()
-}
-
-fn test_service_config() -> ServiceConfig {
-    ServiceConfig {
-        base_url: "https://example.com/v1".to_string(),
-        model_list_path: "/models".to_string(),
-        responses_path: "/responses".to_string(),
-        chat_completions_path: "/chat/completions".to_string(),
-        default_request_format: RequestFormat::ChatCompletions,
-        model_request_formats: std::collections::HashMap::new(),
-        chat_completions_max_tokens: None,
-        model_max_tokens: std::collections::HashMap::new(),
-        streaming: true,
-        max_turns: None,
-        retry_max_attempts: 5,
-        retry_initial_backoff_ms: 1000,
-        retry_max_backoff_ms: 30000,
-        connect_timeout_secs: 30,
-        request_timeout_secs: 120,
-        context: Default::default(),
-    }
-}
-
-fn test_client() -> Arc<OpenAiClient> {
-    Arc::new(OpenAiClient::new(test_service_config(), "test-key".to_string()).expect("client"))
-}
-
-async fn test_state_with_client() -> DaemonState {
-    let state = new_daemon_state(test_db(), 25).await;
-    state.lock().await.openai_client = Some(test_client());
-    state
-}
+mod common;
 
 async fn recv(client: &mut UnixStream) -> DaemonMessage {
     timeout(
@@ -136,7 +102,7 @@ async fn spawn_tool_call_server(
         request_timeout_secs: 120,
         context: Default::default(),
     };
-    let state = new_daemon_state(test_db(), 25).await;
+    let state = new_daemon_state(common::test_db(), 25).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -256,7 +222,7 @@ async fn spawn_http_tool_call_server() -> (DaemonState, tokio::task::JoinHandle<
         request_timeout_secs: 120,
         context: Default::default(),
     };
-    let state = new_daemon_state(test_db(), 25).await;
+    let state = new_daemon_state(common::test_db(), 25).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -355,7 +321,7 @@ async fn spawn_display_image_tool_server() -> (DaemonState, tokio::task::JoinHan
         request_timeout_secs: 120,
         context: Default::default(),
     };
-    let state = new_daemon_state(test_db(), 25).await;
+    let state = new_daemon_state(common::test_db(), 25).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
@@ -369,7 +335,7 @@ async fn spawn_display_image_tool_server() -> (DaemonState, tokio::task::JoinHan
 #[tokio::test]
 async fn daemon_handler_run_input_requires_selected_model() {
     let (server, mut client) = UnixStream::pair().expect("pair");
-    let state = test_state_with_client().await;
+    let state = common::test_state_with_client().await;
     let server_task = tokio::spawn(handle_client(server, state));
 
     write_message(
@@ -426,7 +392,7 @@ async fn daemon_handler_set_model_fails_when_provider_unreachable() {
         request_timeout_secs: 120,
         context: Default::default(),
     };
-    let state = new_daemon_state(test_db(), 25).await;
+    let state = new_daemon_state(common::test_db(), 25).await;
     {
         let mut guard = state.lock().await;
         guard.openai_client = Some(Arc::new(
