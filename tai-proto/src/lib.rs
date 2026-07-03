@@ -323,5 +323,40 @@ where
     Ok(payload)
 }
 
+pub fn write_message_sync<W, T>(writer: &mut W, message: &T) -> Result<(), ProtoError>
+where
+    W: std::io::Write,
+    T: Serialize,
+{
+    let frame = encode_frame(message)?;
+    writer.write_all(&frame)?;
+    Ok(())
+}
+
+pub fn read_message_sync<R, T>(reader: &mut R) -> Result<T, ProtoError>
+where
+    R: std::io::Read,
+    T: for<'de> Deserialize<'de>,
+{
+    let payload = read_payload_sync(reader)?;
+    decode_frame(&payload)
+}
+
+pub fn read_payload_sync<R>(reader: &mut R) -> Result<Vec<u8>, ProtoError>
+where
+    R: std::io::Read,
+{
+    let mut len_buf = [0_u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(ProtoError::FrameTooLarge);
+    }
+
+    let mut payload = vec![0_u8; len];
+    reader.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests;
