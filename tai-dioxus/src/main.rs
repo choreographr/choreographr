@@ -8,7 +8,8 @@ use crate::state::{AppState, UiEvent};
 use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
 use tai_proto::{ClientMessage, socket_path};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use futures_channel::mpsc::{self, UnboundedReceiver};
+use futures_util::StreamExt as _;
 
 fn main() {
     dioxus::LaunchBuilder::desktop()
@@ -26,26 +27,26 @@ fn App() -> Element {
     use_hook(move || {
         let socket = socket.read().clone();
         let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
-        let (ui_tx, ui_rx) = mpsc::unbounded_channel::<UiEvent>();
+        let (ui_tx, ui_rx) = mpsc::unbounded::<UiEvent>();
         if let Err(e) = client_tx.send(ClientMessage::ListSessions) {
             eprintln!("[tai-dioxus] failed to send ListSessions: {e}");
         }
         daemon_tx.set(Some(client_tx));
         events_rx.set(Some(ui_rx));
-        let reader_tx = ui_tx.clone();
-        let handle = tokio::task::spawn_blocking(move || {
-            if let Err(error) = run_client(socket, client_rx, reader_tx.clone()) {
-                if let Err(e) = reader_tx.send(UiEvent::ReaderFailed(error.to_string())) {
-                    eprintln!("[tai-dioxus] failed to send ReaderFailed: {e}");
+        let tx = ui_tx.clone();
+        std::thread::spawn(move || {
+            let error_tx = tx.clone();
+            let panic_tx = tx.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                if let Err(error) = run_client(socket, client_rx, tx) {
+                    if let Err(e) = error_tx.unbounded_send(UiEvent::ReaderFailed(error.to_string()))
+                    {
+                        eprintln!("[tai-dioxus] failed to send ReaderFailed: {e}");
+                    }
                 }
-            }
-        });
-        let monitor_tx = ui_tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle.await
-                && e.is_panic()
-            {
-                if let Err(e) = monitor_tx.send(UiEvent::ReaderFailed(
+            }));
+            if result.is_err() {
+                if let Err(e) = panic_tx.unbounded_send(UiEvent::ReaderFailed(
                     "client reader task panicked".to_string(),
                 )) {
                     eprintln!("[tai-dioxus] failed to send panic notification: {e}");
@@ -64,12 +65,8 @@ fn App() -> Element {
                 loop {
                     let event = {
                         let mut guard = events_rx.write();
-                        let Some(rx) = guard.as_mut() else {
-                            drop(guard);
-                            tokio::task::yield_now().await;
-                            continue;
-                        };
-                        rx.recv().await
+                        let rx = guard.as_mut().expect("events_rx populated by use_hook");
+                        rx.next().await
                     };
 
                     let Some(event) = event else {

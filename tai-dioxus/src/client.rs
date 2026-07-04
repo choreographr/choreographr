@@ -6,7 +6,7 @@ use tai_client_core::{
     shell_command_echo,
 };
 use tai_proto::{ClientMessage, DaemonMessage};
-use tokio::sync::mpsc::UnboundedSender;
+use futures_channel::mpsc::UnboundedSender;
 
 pub(crate) fn run_client(
     socket_path: String,
@@ -16,7 +16,7 @@ pub(crate) fn run_client(
     let result = run_daemon_connection(
         &socket_path,
         |message| {
-            if let Err(e) = ui_tx.send(UiEvent::Daemon(message)) {
+            if let Err(e) = ui_tx.unbounded_send(UiEvent::Daemon(message)) {
                 eprintln!("[tai-dioxus] failed to send Daemon UI event: {e}");
             }
         },
@@ -24,7 +24,7 @@ pub(crate) fn run_client(
         None,
     );
     if result.is_ok() {
-        if let Err(e) = ui_tx.send(UiEvent::ReaderClosed) {
+        if let Err(e) = ui_tx.unbounded_send(UiEvent::ReaderClosed) {
             eprintln!("[tai-dioxus] failed to send ReaderClosed UI event: {e}");
         }
     }

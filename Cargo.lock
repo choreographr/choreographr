@@ -10842,9 +10842,10 @@ dependencies = [
  "anyhow",
  "base64",
  "dioxus",
+ "futures-channel",
+ "futures-util",
  "tai-client-core",
  "tai-proto",
- "tokio",
 ]
 
 [[package]]
