@@ -1,6 +1,6 @@
 use crate::render::{mouse_in_history_box, render};
-use crate::state::{App, UiEvent};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind};
+use crate::state::{App, Page, SessionManagerView, UiEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, time::Duration};
 use tai_client_core::{
@@ -143,16 +143,36 @@ pub(crate) fn handle_terminal_event(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    match app.page {
+        Page::SessionManager => handle_session_manager_event(event, app, client_tx),
+        Page::Chat => handle_chat_event(event, app, client_tx),
+    }
+}
+
+fn handle_chat_event(
+    event: Event,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
     match event {
         Event::Key(key) => {
             if key.kind != KeyEventKind::Press {
                 return Ok(());
             }
             match key.code {
+                KeyCode::Char('s')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.page = Page::SessionManager;
+                    client_tx.send(ClientMessage::ListSessions).map_err(|e| {
+                        ClientError::Io(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            e.to_string(),
+                        ))
+                    })?;
+                }
                 KeyCode::Char('c')
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     app.should_quit = true;
                 }
@@ -161,8 +181,11 @@ pub(crate) fn handle_terminal_event(
                 KeyCode::Enter => {
                     let line = app.input.trim().to_string();
                     app.input.clear();
-                    match parse_input_line(&line, &mut app.next_request_id, app.attached_session_id)
-                    {
+                    match parse_input_line(
+                        &line,
+                        &mut app.next_request_id,
+                        app.attached_session_id,
+                    ) {
                         ShellCommand::Empty => {}
                         ShellCommand::InvalidCancel(value) => {
                             app.push_text(format!("invalid request id: {value}"))
@@ -205,12 +228,118 @@ pub(crate) fn handle_terminal_event(
                 _ => {}
             }
         }
-        Event::Mouse(mouse) if mouse_in_history_box(mouse.column, mouse.row) => match mouse.kind {
-            MouseEventKind::ScrollUp => app.scroll_up(1),
-            MouseEventKind::ScrollDown => app.scroll_down(1),
-            _ => {}
-        },
+        Event::Mouse(mouse) if mouse_in_history_box(mouse.column, mouse.row) => {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => app.scroll_up(1),
+                MouseEventKind::ScrollDown => app.scroll_down(1),
+                _ => {}
+            }
+        }
         Event::Mouse(_) => {}
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_session_manager_event(
+    event: Event,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Event::Key(key) = event else {
+        return Ok(());
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+
+    match app.session_mgr.view {
+        SessionManagerView::List => handle_session_list_key(key, app, client_tx),
+        SessionManagerView::Detail => handle_session_detail_key(key, app, client_tx),
+    }
+}
+
+fn handle_session_list_key(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.session_mgr.select_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.session_mgr.select_down(),
+        KeyCode::Enter => {
+            if let Some(sel) = app.session_mgr.selection {
+                if let Some(session) = app.session_mgr.sessions.get(sel) {
+                    app.page = Page::Chat;
+                    app.attached_session_id = Some(session.session_id);
+                    client_tx
+                        .send(ClientMessage::AttachSession {
+                            session_id: session.session_id,
+                        })
+                        .map_err(|e| {
+                            ClientError::Io(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                e.to_string(),
+                            ))
+                        })?;
+                }
+            }
+        }
+        KeyCode::Char('i') => app.session_mgr.enter_detail(),
+        KeyCode::Char('n') => {
+            client_tx
+                .send(ClientMessage::CreateSession {
+                    title: None,
+                    parent_session_id: None,
+                    cwd: None,
+                    max_turns: None,
+                })
+                .map_err(|e| {
+                    ClientError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        e.to_string(),
+                    ))
+                })?;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.page = Page::Chat;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_session_detail_key(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        KeyCode::Char('b') | KeyCode::Esc => {
+            app.session_mgr.leave_detail();
+        }
+        KeyCode::Enter => {
+            if let Some(ref detail) = app.session_mgr.detail_data {
+                app.page = Page::Chat;
+                app.attached_session_id = Some(detail.session_id);
+                client_tx
+                    .send(ClientMessage::AttachSession {
+                        session_id: detail.session_id,
+                    })
+                    .map_err(|e| {
+                        ClientError::Io(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            e.to_string(),
+                        ))
+                    })?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -225,27 +354,36 @@ pub(crate) fn handle_daemon_message(
     app.picker = Some(picker.clone());
 
     match &message {
-        DaemonMessage::SessionCreated { session_id, .. }
-        | DaemonMessage::SessionAttached { session_id } => {
+        DaemonMessage::SessionCreated { session_id, .. } => {
+            app.attached_session_id = Some(*session_id);
+            if app.page == Page::SessionManager {
+                app.page = Page::Chat;
+                let _ = client_tx.send(ClientMessage::ListSessions);
+            }
+        }
+        DaemonMessage::SessionAttached { session_id } => {
             app.attached_session_id = Some(*session_id);
         }
         DaemonMessage::Sessions { sessions } => {
-            if sessions.is_empty() {
-                app.push_text("[daemon] no sessions");
-            } else {
-                app.push_text(format!("[daemon] sessions ({})", sessions.len()));
-                for session in sessions {
-                    let prefix = if Some(session.session_id) == app.attached_session_id {
-                        "*"
-                    } else {
-                        " "
-                    };
-                    let title = session.title.as_deref().unwrap_or("untitled");
-                    let model = session.selected_model.as_deref().unwrap_or("-");
-                    app.push_text(format!(
-                        "{} {}: \"{title}\" ({model}) — {} messages",
-                        prefix, session.session_id, session.message_count,
-                    ));
+            app.session_mgr.set_sessions(sessions.clone());
+            if app.page == Page::Chat {
+                if sessions.is_empty() {
+                    app.push_text("[daemon] no sessions");
+                } else {
+                    app.push_text(format!("[daemon] sessions ({})", sessions.len()));
+                    for session in sessions {
+                        let prefix = if Some(session.session_id) == app.attached_session_id {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        let title = session.title.as_deref().unwrap_or("untitled");
+                        let model = session.selected_model.as_deref().unwrap_or("-");
+                        app.push_text(format!(
+                            "{} {}: \"{title}\" ({model}) — {} messages",
+                            prefix, session.session_id, session.message_count,
+                        ));
+                    }
                 }
             }
             if app.attached_session_id.is_none() {

@@ -397,3 +397,329 @@ fn scrolling_to_top_clamps_without_emptying_history_view() {
     assert_eq!(app.history_scroll.scroll_compensation(), 0);
     assert!(!app.history_scroll.follow_output());
 }
+
+// ── Session Manager tests ─────────────────────────────────────
+
+#[test]
+fn app_starts_in_chat_page() {
+    let app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+    assert_eq!(app.page, Page::Chat);
+}
+
+#[test]
+fn session_manager_state_new_is_empty() {
+    let state = SessionManagerState::new();
+    assert!(state.sessions.is_empty());
+    assert!(state.selection.is_none());
+    assert_eq!(state.view, SessionManagerView::List);
+    assert_eq!(state.scroll, 0);
+    assert!(state.detail_data.is_none());
+}
+
+#[test]
+fn session_manager_set_sessions_empty() {
+    let mut state = SessionManagerState::new();
+    state.set_sessions(vec![]);
+    assert!(state.sessions.is_empty());
+    assert!(state.selection.is_none());
+}
+
+fn make_session(id: u64, title: &str, model: &str, count: u32) -> tai_proto::SessionSummary {
+    tai_proto::SessionSummary {
+        session_id: id,
+        title: Some(title.to_string()),
+        selected_model: Some(model.to_string()),
+        parent_session_id: None,
+        cwd: None,
+        created_at: 1705314000,
+        message_count: count,
+        max_turns: None,
+    }
+}
+
+#[test]
+fn session_manager_set_sessions_selects_first() {
+    let mut state = SessionManagerState::new();
+    state.set_sessions(vec![make_session(1, "a", "m1", 5), make_session(2, "b", "m2", 3)]);
+    assert_eq!(state.sessions.len(), 2);
+    assert_eq!(state.selection, Some(0));
+}
+
+#[test]
+fn session_manager_select_up_down() {
+    let mut state = SessionManagerState::new();
+    state.set_sessions(vec![
+        make_session(1, "a", "m1", 5),
+        make_session(2, "b", "m2", 3),
+        make_session(3, "c", "m3", 7),
+    ]);
+
+    assert_eq!(state.selection, Some(0));
+
+    state.select_down();
+    assert_eq!(state.selection, Some(1));
+
+    state.select_down();
+    assert_eq!(state.selection, Some(2));
+
+    state.select_down();
+    assert_eq!(state.selection, Some(2)); // clamped at max
+
+    state.select_up();
+    assert_eq!(state.selection, Some(1));
+
+    state.select_up();
+    assert_eq!(state.selection, Some(0));
+
+    state.select_up();
+    assert_eq!(state.selection, Some(0)); // clamped at 0
+}
+
+#[test]
+fn session_manager_enter_detail_uses_selected_session() {
+    let mut state = SessionManagerState::new();
+    state.set_sessions(vec![
+        make_session(10, "test-session", "gpt-4", 5),
+        make_session(20, "other", "claude", 3),
+    ]);
+
+    state.enter_detail();
+    assert_eq!(state.view, SessionManagerView::Detail);
+    let detail = state.detail_data.as_ref().expect("detail data");
+    assert_eq!(detail.session_id, 10);
+    assert_eq!(detail.title, "test-session");
+    assert_eq!(detail.selected_model, "gpt-4");
+    assert_eq!(detail.message_count, 5);
+}
+
+#[test]
+fn session_manager_enter_detail_fails_when_no_selection() {
+    let mut state = SessionManagerState::new();
+    state.enter_detail();
+    assert_eq!(state.view, SessionManagerView::List);
+    assert!(state.detail_data.is_none());
+}
+
+#[test]
+fn session_manager_leave_detail_returns_to_list() {
+    let mut state = SessionManagerState::new();
+    state.set_sessions(vec![make_session(1, "a", "m1", 0)]);
+    state.enter_detail();
+    assert_eq!(state.view, SessionManagerView::Detail);
+
+    state.leave_detail();
+    assert_eq!(state.view, SessionManagerView::List);
+    assert!(state.detail_data.is_none());
+}
+
+#[test]
+fn session_manager_set_sessions_preserves_selection_by_id() {
+    let mut state = SessionManagerState::new();
+    state.set_sessions(vec![
+        make_session(1, "a", "m1", 0),
+        make_session(2, "b", "m2", 0),
+        make_session(3, "c", "m3", 0),
+    ]);
+    state.select_down();
+    state.select_down();
+    assert_eq!(state.selection, Some(2));
+
+    // Refresh sessions — should preserve selection on session 3
+    state.set_sessions(vec![
+        make_session(1, "a", "m1", 0),
+        make_session(3, "c", "m3", 5),
+        make_session(4, "d", "m4", 0),
+    ]);
+    assert_eq!(state.selection, Some(1)); // session 3 is now at index 1
+}
+
+#[cfg(test)]
+mod session_manager_key_tests {
+    use super::*;
+    use crate::connection::handle_terminal_event;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn make_sm_app() -> App {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+        app.page = Page::SessionManager;
+        app.session_mgr.set_sessions(vec![
+            make_session(1, "first", "gpt-4", 3),
+            make_session(2, "second", "claude", 5),
+        ]);
+        app
+    }
+
+    #[tokio::test]
+    async fn session_manager_esc_returns_to_chat() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle esc");
+
+        assert_eq!(app.page, Page::Chat);
+    }
+
+    #[tokio::test]
+    async fn session_manager_q_returns_to_chat() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle q");
+
+        assert_eq!(app.page, Page::Chat);
+    }
+
+    #[tokio::test]
+    async fn session_manager_j_moves_selection_down() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+        assert_eq!(app.session_mgr.selection, Some(0));
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle j");
+
+        assert_eq!(app.session_mgr.selection, Some(1));
+    }
+
+    #[tokio::test]
+    async fn session_manager_enter_switches_session_and_returns_to_chat() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle enter");
+
+        assert_eq!(app.page, Page::Chat);
+        assert_eq!(app.attached_session_id, Some(1));
+        let msg = rx.recv().expect("sent message");
+        assert_eq!(msg, ClientMessage::AttachSession { session_id: 1 });
+    }
+
+    #[tokio::test]
+    async fn session_manager_ctrl_c_still_quits() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle ctrl+c");
+
+        assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn chat_ctrl_s_enters_session_manager() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+        assert_eq!(app.page, Page::Chat);
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle ctrl+s");
+
+        assert_eq!(app.page, Page::SessionManager);
+        let msg = rx.recv().expect("sent message");
+        assert_eq!(msg, ClientMessage::ListSessions);
+    }
+
+    #[tokio::test]
+    async fn session_manager_i_enters_detail() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle i");
+
+        assert_eq!(app.session_mgr.view, SessionManagerView::Detail);
+        assert!(app.session_mgr.detail_data.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_manager_detail_b_returns_to_list() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+        app.session_mgr.enter_detail();
+        assert_eq!(app.session_mgr.view, SessionManagerView::Detail);
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle b");
+
+        assert_eq!(app.session_mgr.view, SessionManagerView::List);
+        assert!(app.session_mgr.detail_data.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_manager_detail_enter_switches_session() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = make_sm_app();
+        app.session_mgr.enter_detail();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle enter");
+
+        assert_eq!(app.page, Page::Chat);
+        assert_eq!(app.attached_session_id, Some(1));
+        let msg = rx.recv().expect("sent message");
+        assert_eq!(msg, ClientMessage::AttachSession { session_id: 1 });
+    }
+
+    #[tokio::test]
+    async fn session_manager_n_sends_create_session() {
+        let mut app = make_sm_app();
+        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle n");
+
+        let msg = rx.recv().expect("sent message");
+        assert_eq!(
+            msg,
+            ClientMessage::CreateSession {
+                title: None,
+                parent_session_id: None,
+                cwd: None,
+                max_turns: None,
+            }
+        );
+    }
+}

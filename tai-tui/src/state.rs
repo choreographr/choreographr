@@ -4,10 +4,41 @@ use tai_client_core::{
     ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
     MAX_HISTORY_ITEMS,
 };
-use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
+use tai_proto::{ImageMetadata, OutputStream, SessionMessage, SessionSummary};
 use tai_tui::{RenderedImage, StreamingText, build_rendered_image};
 
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Page {
+    Chat,
+    SessionManager,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionManagerView {
+    List,
+    Detail,
+}
+
+pub(crate) struct SessionDetailData {
+    pub(crate) session_id: u64,
+    pub(crate) title: String,
+    pub(crate) selected_model: String,
+    pub(crate) parent_session_id: Option<u64>,
+    pub(crate) cwd: String,
+    pub(crate) created_at: i64,
+    pub(crate) message_count: u32,
+    pub(crate) max_turns: Option<u32>,
+}
+
+pub(crate) struct SessionManagerState {
+    pub(crate) sessions: Vec<SessionSummary>,
+    pub(crate) view: SessionManagerView,
+    pub(crate) selection: Option<usize>,
+    pub(crate) scroll: usize,
+    pub(crate) detail_data: Option<SessionDetailData>,
+}
 
 pub(crate) struct App {
     pub(crate) input: String,
@@ -19,6 +50,8 @@ pub(crate) struct App {
     pub(crate) should_quit: bool,
     pub(crate) picker: Option<ratatui_image::picker::Picker>,
     pub(crate) attached_session_id: Option<u64>,
+    pub(crate) page: Page,
+    pub(crate) session_mgr: SessionManagerState,
 }
 
 #[derive(Clone, Copy)]
@@ -168,6 +201,83 @@ impl HistoryScrollState {
     }
 }
 
+impl SessionManagerState {
+    pub(crate) fn new() -> Self {
+        Self {
+            sessions: Vec::new(),
+            view: SessionManagerView::List,
+            selection: None,
+            scroll: 0,
+            detail_data: None,
+        }
+    }
+
+    pub(crate) fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        let was_attached = self.selection.and_then(|i| self.sessions.get(i)).map(|s| s.session_id);
+        self.sessions = sessions;
+        self.selection = if self.sessions.is_empty() {
+            None
+        } else {
+            let idx = was_attached
+                .and_then(|id| self.sessions.iter().position(|s| s.session_id == id))
+                .unwrap_or(0);
+            Some(idx)
+        };
+        self.scroll = 0;
+    }
+
+    pub(crate) fn select_up(&mut self) {
+        let sel = self.selection.unwrap_or(0);
+        if sel > 0 {
+            self.selection = Some(sel - 1);
+            if sel - 1 < self.scroll {
+                self.scroll = self.scroll.saturating_sub(1);
+            }
+        }
+    }
+
+    pub(crate) fn select_down(&mut self) {
+        let max = self.sessions.len().saturating_sub(1);
+        let sel = self.selection.unwrap_or(0);
+        if sel < max {
+            self.selection = Some(sel + 1);
+        }
+    }
+
+    pub(crate) fn enter_detail(&mut self) {
+        let sel = self.selection;
+        let sum = sel.and_then(|i| self.sessions.get(i));
+        self.detail_data = sum.map(|s| {
+            let session_id = s.session_id;
+            let title = s.title.clone().unwrap_or_else(|| "untitled".to_string());
+            let selected_model = s.selected_model.clone().unwrap_or_else(|| "-".to_string());
+            let parent_session_id = s.parent_session_id;
+            let cwd = s.cwd.clone().unwrap_or_else(|| "-".to_string());
+            let created_at = s.created_at;
+            let message_count = s.message_count;
+            let max_turns = s.max_turns;
+            SessionDetailData {
+                session_id,
+                title,
+                selected_model,
+                parent_session_id,
+                cwd,
+                created_at,
+                message_count,
+                max_turns,
+            }
+        });
+        if self.detail_data.is_some() {
+            self.view = SessionManagerView::Detail;
+        }
+    }
+
+    pub(crate) fn leave_detail(&mut self) {
+        self.view = SessionManagerView::List;
+        self.detail_data = None;
+    }
+}
+
 impl App {
     pub(crate) fn new(socket_path: String, picker_protocol: String) -> Self {
         Self {
@@ -183,6 +293,8 @@ impl App {
             should_quit: false,
             picker: None,
             attached_session_id: None,
+            page: Page::Chat,
+            session_mgr: SessionManagerState::new(),
         }
     }
 

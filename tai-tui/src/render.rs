@@ -1,10 +1,14 @@
 use crate::markdown_render::{
     display_width, lines_height, session_message_lines, streaming_text_lines,
 };
-use crate::state::{App, HistoryItem, history_text_height, image_block_height};
+use crate::state::{
+    App, HistoryItem, Page, SessionManagerView, history_text_height, image_block_height,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    text::Line,
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
@@ -24,6 +28,13 @@ pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
+    match app.page {
+        Page::Chat => render_chat(frame, app),
+        Page::SessionManager => render_session_manager(frame, app),
+    }
+}
+
+fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(3)])
@@ -203,4 +214,166 @@ fn render_history_lines(
     );
     *rows_remaining -= visible_height;
     *rows_to_skip = 0;
+}
+
+// ── Session Manager ──────────────────────────────────────────
+
+fn render_session_manager(frame: &mut Frame<'_>, app: &mut App) {
+    match app.session_mgr.view {
+        SessionManagerView::List => render_session_list_view(frame, app),
+        SessionManagerView::Detail => render_session_detail_view(frame, app),
+    }
+}
+
+fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let block = Block::default()
+        .title(" Session Manager ")
+        .borders(Borders::ALL);
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
+
+    let scroll = app.session_mgr.scroll;
+    let max_rows = inner.height as usize;
+
+    if app.session_mgr.sessions.is_empty() {
+        let msg = Paragraph::new("No sessions. Press 'n' to create one.");
+        frame.render_widget(msg, inner);
+    } else {
+        let mut lines: Vec<Line> = Vec::new();
+        for i in scroll..app.session_mgr.sessions.len() {
+            if lines.len() >= max_rows {
+                break;
+            }
+            let session = &app.session_mgr.sessions[i];
+            let is_selected = Some(i) == app.session_mgr.selection;
+            let is_attached = Some(session.session_id) == app.attached_session_id;
+
+            let sel = if is_selected { ">" } else { " " };
+            let att = if is_attached { "*" } else { " " };
+            let title = session.title.as_deref().unwrap_or("untitled");
+            let model = session.selected_model.as_deref().unwrap_or("-");
+            let row = format!(
+                "{sel}{att} {:>4}  \"{title}\"  ({model})  — {} messages",
+                session.session_id, session.message_count,
+            );
+
+            let style = if is_selected {
+                Style::default()
+                    .bg(Color::Blue)
+                    .fg(Color::White)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::styled(row, style));
+        }
+
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
+    }
+
+    let status = Paragraph::new(Line::from(format!(
+        " <j/k nav>  <Enter switch>  <i details>  <n new>  <Esc back>  —  {} sessions",
+        app.session_mgr.sessions.len()
+    )));
+    frame.render_widget(status, chunks[1]);
+}
+
+fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let block = Block::default()
+        .title(" Session Details ")
+        .borders(Borders::ALL);
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
+
+    if let Some(ref detail) = app.session_mgr.detail_data {
+        let lines = vec![
+            Line::from(format!("Session ID:    {}", detail.session_id)),
+            Line::from(format!("Title:         {}", detail.title)),
+            Line::from(format!("Model:         {}", detail.selected_model)),
+            Line::from(format!(
+                "Parent:        {}",
+                detail
+                    .parent_session_id
+                    .map_or("none".to_string(), |id| id.to_string())
+            )),
+            Line::from(format!("CWD:           {}", detail.cwd)),
+            Line::from(format!("Created:       {}", format_timestamp(detail.created_at))),
+            Line::from(format!("Message Count: {}", detail.message_count)),
+            Line::from(format!(
+                "Max Turns:     {}",
+                detail
+                    .max_turns
+                    .map_or("unlimited".to_string(), |mt| mt.to_string())
+            )),
+        ];
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
+    }
+
+    let status =
+        Paragraph::new(Line::from(" <b back>  <Enter switch to this session>"));
+    frame.render_widget(status, chunks[1]);
+}
+
+fn format_timestamp(ts: i64) -> String {
+    if ts <= 0 {
+        return "-".to_string();
+    }
+
+    let mut t = ts as u64;
+    let secs = t % 60;
+    t /= 60;
+    let mins = t % 60;
+    t /= 60;
+    let hours = t % 24;
+    t /= 24;
+    let days = t;
+
+    let mut y = 1970i64;
+    let mut d = days as i64;
+    loop {
+        let days_in_year = if is_leap(y) { 366 } else { 365 };
+        if d < days_in_year {
+            break;
+        }
+        d -= days_in_year;
+        y += 1;
+    }
+
+    const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0;
+    for &md in &MONTH_DAYS {
+        let adj = if m == 1 && is_leap(y) { 29 } else { md };
+        if d < adj {
+            break;
+        }
+        d -= adj;
+        m += 1;
+    }
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        y,
+        m + 1,
+        d + 1,
+        hours,
+        mins,
+        secs
+    )
+}
+
+fn is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
