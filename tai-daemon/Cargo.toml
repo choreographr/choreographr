@@ -24,11 +24,9 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 sha1 = "0.11"
 sha2 = "0.11"
-alloy = { version = "2.1", features = ["providers", "rpc-types-eth", "sol-types"] }
 url = "2"
 tai-keystore.workspace = true
 tai-proto.workspace = true
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time"] }
 signal-hook = "0.3"
 toml = "1.1"
 tracing.workspace = true

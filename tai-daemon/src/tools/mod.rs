@@ -64,7 +64,6 @@ macro_rules! define_tool_with_cwd {
 mod error;
 pub(crate) use error::{ToolError, tool_err, tool_ok};
 
-mod evm;
 mod fff;
 pub(crate) mod fs;
 pub(crate) mod git;
@@ -132,16 +131,6 @@ impl ToolRegistry {
         reg.register(git::GitCommit);
         reg.register(git::GitPush);
         reg.register(fff::Fff);
-        reg.register(evm::EvmChain);
-        reg.register(evm::EvmBalance);
-        reg.register(evm::EvmTokenBalance);
-        reg.register(evm::EvmBlock);
-        reg.register(evm::EvmTransaction);
-        reg.register(evm::EvmCall);
-        reg.register(evm::EvmGas);
-        reg.register(evm::EvmLogs);
-        reg.register(evm::EvmNonce);
-        reg.register(evm::EvmResolve);
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);
         reg.register(x::XUserLookup);

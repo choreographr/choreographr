@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use tai_daemon::daemon::DaemonState;
 use tai_daemon::openai::load_service_config;
-use tai_daemon::runtime;
 use tai_proto::socket_path;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -29,8 +28,6 @@ fn resolve_max_turns() -> u32 {
 }
 
 fn main() -> anyhow::Result<()> {
-    runtime::init();
-
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

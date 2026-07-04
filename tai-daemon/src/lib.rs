@@ -3,7 +3,6 @@ pub mod daemon;
 pub mod db;
 pub mod openai;
 mod requests;
-pub mod runtime;
 mod server;
 mod sessions;
 pub mod tools;

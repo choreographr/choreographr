@@ -164,15 +164,12 @@ Used by both `tai-tui` and `tai-dioxus`.
 Entry point: `src/main.rs` → initializes tracing, creates `DaemonState`, runs socket server.
 
 **Concurrency model:** Pure OS threads with message passing (actor model). No async code
-in the daemon's own logic. A single `tokio::runtime::Runtime` is held as a global sidecar
-(via `OnceLock` in `runtime.rs`) only for alloy blockchain libraries that require
-an async runtime. All other I/O uses blocking `std` APIs on dedicated threads.
+in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads.
 
 **Module breakdown:**
 
 | Module | Purpose |
 |---|---|
-| `runtime.rs` | Global `OnceLock<tokio::runtime::Runtime>` sidecar — `init()` called from `main`, `get()` used by blockchain tools to `.block_on()` async library calls. |
 | `server/lifecycle.rs` | Accept loop (non-blocking `UnixListener` + 50ms poll), signal handling (`signal_hook::flag`), shutdown orchestration. |
 | `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking. `DaemonState` is owned by this thread only (no shared state). |
@@ -180,7 +177,7 @@ an async runtime. All other I/O uses blocking `std` APIs on dedicated threads.
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
-| `tools/` | Tool trait, registry, and 29 registered tools. |
+| `tools/` | Tool trait, registry, and 19 registered tools. |
 
 **Per-client architecture (OS threads):**
 
@@ -195,7 +192,6 @@ client_thread(socket)
 
 ```
 main()
-├── runtime::init() — initializes sidecar tokio Runtime
 ├── listener thread — UnixListener accept loop (non-blocking poll)
 │   └── per client: spawns client_thread (std::thread::spawn)
 ├── command thread — DaemonCommand receiver loop (daemon_tx mpsc)
@@ -719,7 +715,7 @@ cargo run -p tai-im -- telegram
 
 | Crate | Used by | Purpose |
 |---|---|---|
-| `tokio` | daemon (sidecar), tui, dioxus, im | Async runtime — daemon uses it only as a sidecar for blockchain libraries |
+| `tokio` | tui, dioxus, im | Async runtime |
 | `serde` + `bincode` | proto, daemon, clients | Serialization |
 | `reqwest` (rustls) | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
@@ -765,6 +761,5 @@ The `ToolError` enum (thiserror) covers common tool failure modes: invalid argum
 errors, network failures, etc. Tools return `Result<String, ToolError>` and convert to
 `ToolResult` at the `Tool::execute()` boundary via `From<ToolError> for ToolResult`.
 | `gix` | daemon | Git operations |
-| `alloy` | daemon | EVM blockchain tools |
 | `teloxide` | tai-im | Telegram Bot API client |
 | `tracing` | daemon | Structured logging |
