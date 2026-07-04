@@ -67,7 +67,6 @@ pub(crate) async fn run_app() -> io::Result<()> {
         .send(ClientMessage::ListSessions)
         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
     let result = run_ui_loop(&mut terminal, &mut app, &picker, &client_tx, &mut ui_rx)
-        .await
         .map_err(io::Error::from);
 
     let _ = shutdown_tx.send(());
@@ -97,7 +96,7 @@ pub(crate) async fn run_app() -> io::Result<()> {
     result.map_err(io::Error::from)
 }
 
-pub(crate) async fn run_ui_loop(
+pub(crate) fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     picker: &ratatui_image::picker::Picker,

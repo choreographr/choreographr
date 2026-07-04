@@ -5,8 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
-crossterm = { version = "0.29", features = ["event-stream"] }
-futures-util.workspace = true
+crossterm = "0.29"
 image.workspace = true
 ratatui = "0.30"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
@@ -15,4 +14,4 @@ tai-client-core.workspace = true
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 tai-proto.workspace = true
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "macros"] }

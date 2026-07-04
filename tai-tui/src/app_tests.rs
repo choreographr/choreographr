@@ -182,8 +182,8 @@ fn image_history_height_caps_to_twelve_rows() {
     assert_eq!(image_block_height(20), 12);
 }
 
-#[tokio::test]
-async fn terminal_event_appends_characters() {
+#[test]
+fn terminal_event_appends_characters() {
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -204,8 +204,8 @@ async fn terminal_event_appends_characters() {
     assert!(rx.try_recv().is_err());
 }
 
-#[tokio::test]
-async fn terminal_event_submits_run_input() {
+#[test]
+fn terminal_event_submits_run_input() {
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     app.input = "hello".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -228,8 +228,8 @@ async fn terminal_event_submits_run_input() {
     );
 }
 
-#[tokio::test]
-async fn terminal_event_quits_only_when_input_empty() {
+#[test]
+fn terminal_event_quits_only_when_input_empty() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
@@ -253,8 +253,8 @@ async fn terminal_event_quits_only_when_input_empty() {
     assert_eq!(app.input, "qq");
 }
 
-#[tokio::test]
-async fn terminal_event_ctrl_c_quits() {
+#[test]
+fn terminal_event_ctrl_c_quits() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
 
@@ -268,8 +268,8 @@ async fn terminal_event_ctrl_c_quits() {
     assert!(app.should_quit);
 }
 
-#[tokio::test]
-async fn mouse_scroll_outside_history_box_does_not_change_scroll() {
+#[test]
+fn mouse_scroll_outside_history_box_does_not_change_scroll() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     app.history_viewport.height = 1;

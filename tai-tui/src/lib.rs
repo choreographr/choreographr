@@ -7,12 +7,6 @@ pub use tai_client_core::{
     MarkdownInline, ShellCommand, StreamingText, parse_input_line,
 };
 use tai_proto::ImageMetadata;
-use tokio::sync::mpsc;
-
-pub fn channel_closed<T>(_: mpsc::error::SendError<T>) -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "connection writer closed")
-}
-
 pub struct RenderedImage {
     pub metadata: ImageMetadata,
     pub protocol: StatefulProtocol,
