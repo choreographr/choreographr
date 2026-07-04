@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tai_proto::{DaemonMessage, SessionMessage, SessionSummary};
+use tai_proto::{DaemonMessage, SessionMessage, SessionStatus, SessionSummary};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
@@ -30,6 +30,7 @@ pub enum SessionCommand {
     SetModel {
         model: String,
     },
+    StatusChanged(SessionStatus),
     Attach {
         client_id: u64,
         tx: std::sync::mpsc::Sender<DaemonMessage>,
@@ -64,6 +65,7 @@ pub struct SessionMetadata {
     pub created_at: i64,
     pub message_count: u32,
     pub max_turns: Option<u32>,
+    pub status: SessionStatus,
 }
 
 #[derive(Clone)]
@@ -78,6 +80,7 @@ pub struct SessionSnapshot {
     pub context_fingerprint: Option<u64>,
     pub context_file_paths: Vec<PathBuf>,
     pub context_message_index: Option<usize>,
+    pub status: SessionStatus,
 }
 
 struct ActiveRequest {
@@ -102,6 +105,7 @@ pub struct SessionState {
     pub context_fingerprint: Option<u64>,
     pub context_file_paths: Vec<PathBuf>,
     pub context_message_index: Option<usize>,
+    pub status: SessionStatus,
 }
 
 impl SessionState {
@@ -117,6 +121,7 @@ impl SessionState {
             context_fingerprint: self.context_fingerprint,
             context_file_paths: self.context_file_paths.clone(),
             context_message_index: self.context_message_index,
+            status: self.status.clone(),
         }
     }
 
@@ -137,6 +142,7 @@ impl SessionState {
             context_fingerprint: snapshot.context_fingerprint,
             context_file_paths: snapshot.context_file_paths,
             context_message_index: snapshot.context_message_index,
+            status: snapshot.status,
         }
     }
 
@@ -151,6 +157,7 @@ impl SessionState {
         self.context_fingerprint = snapshot.context_fingerprint;
         self.context_file_paths = snapshot.context_file_paths;
         self.context_message_index = snapshot.context_message_index;
+        self.status = snapshot.status;
     }
 }
 
@@ -199,6 +206,7 @@ pub fn session_main(
         context_fingerprint: None,
         context_file_paths: Vec::new(),
         context_message_index: None,
+        status: SessionStatus::Inactive,
     };
 
     match db::read_messages(&db, session_id) {
@@ -239,6 +247,7 @@ pub fn session_main(
             created_at: state.created_at,
             message_count: state.messages.len() as u32,
             max_turns: state.max_turns,
+            status: state.status.clone(),
         },
     });
 
@@ -464,6 +473,31 @@ fn process_command(
             state.selected_model = Some(model.clone());
             false
         }
+        SessionCommand::StatusChanged(new_status) => {
+            state.status = new_status.clone();
+            let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
+                session_id,
+                metadata: SessionMetadata {
+                    title: state.title.clone(),
+                    selected_model: state.selected_model.clone(),
+                    parent_session_id: state.parent_session_id,
+                    cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
+                    created_at: state.created_at,
+                    message_count: state.messages.len() as u32,
+                    max_turns: state.max_turns,
+                    status: state.status.clone(),
+                },
+            });
+            broadcast(&state.subscribers, DaemonMessage::SessionStatusChanged {
+                session_id,
+                status: new_status.clone(),
+            });
+            let _ = daemon_tx.send(DaemonCommand::BroadcastSessionStatus {
+                session_id,
+                status: new_status,
+            });
+            false
+        }
         SessionCommand::Attach { client_id, tx } => {
             state.subscribers.insert(client_id, tx);
             let snapshot = DaemonMessage::SessionState {
@@ -495,6 +529,7 @@ fn process_command(
                 created_at: state.created_at,
                 message_count: state.messages.len() as u32,
                 max_turns: state.max_turns,
+                status: state.status.clone(),
             });
             false
         }
@@ -510,6 +545,7 @@ fn process_command(
         } => {
             state.apply_snapshot(snapshot);
             state.active_requests.remove(&request_id);
+            state.status = SessionStatus::Inactive;
             let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
                 session_id,
                 metadata: SessionMetadata {
@@ -520,7 +556,19 @@ fn process_command(
                     created_at: state.created_at,
                     message_count: state.messages.len() as u32,
                     max_turns: state.max_turns,
+                    status: state.status.clone(),
                 },
+            });
+            broadcast(
+                &state.subscribers,
+                DaemonMessage::SessionStatusChanged {
+                    session_id,
+                    status: SessionStatus::Inactive,
+                },
+            );
+            let _ = daemon_tx.send(DaemonCommand::BroadcastSessionStatus {
+                session_id,
+                status: SessionStatus::Inactive,
             });
             state.active_requests.is_empty()
                 && (state.subscribers.is_empty() || *shutdown_requested)
@@ -567,6 +615,7 @@ fn run_request_worker(
             &tool_registry,
             &daemon_tx,
             max_turns_default,
+            &cmd_tx,
         )
     }));
 

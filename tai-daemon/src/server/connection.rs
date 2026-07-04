@@ -112,6 +112,17 @@ pub(crate) fn client_thread(
                             let _ = writer_tx.send(DaemonMessage::Sessions { sessions });
                         }
                     }
+                    ClientMessage::SubscribeSessionsSummary => {
+                        let _ = daemon_tx.send(DaemonCommand::RegisterSummarySubscriber {
+                            client_id,
+                            writer: writer_tx.clone(),
+                        });
+                    }
+                    ClientMessage::UnsubscribeSessionsSummary => {
+                        let _ = daemon_tx.send(DaemonCommand::UnregisterSummarySubscriber {
+                            client_id,
+                        });
+                    }
                     ClientMessage::RunInput { request_id, input } => {
                         if let Some(ref tx) = attached_session_tx {
                             let _ = tx.send(SessionCommand::RunInput { request_id, input });
@@ -166,6 +177,7 @@ pub(crate) fn client_thread(
     if let Some(ref tx) = attached_session_tx {
         let _ = tx.send(SessionCommand::Detach { client_id });
     }
+    let _ = daemon_tx.send(DaemonCommand::UnregisterSummarySubscriber { client_id });
     drop(writer_tx);
     let _ = writer_handle.join();
     Ok(())

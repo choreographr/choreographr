@@ -53,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
         tool_registry: Arc::new(tai_daemon::tools::ToolRegistry::new()),
         daemon_tx: tokio::sync::mpsc::unbounded_channel().0,
         client_streams: Vec::new(),
+        summary_subscribers: std::collections::HashMap::new(),
     };
 
     let socket_path = socket_path();

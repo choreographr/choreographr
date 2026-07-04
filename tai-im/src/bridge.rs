@@ -251,6 +251,7 @@ fn daemon_to_bridge_events(
         | DaemonMessage::SessionAttached { .. }
         | DaemonMessage::SessionState { .. }
         | DaemonMessage::SessionMessageAppended { .. }
+        | DaemonMessage::SessionStatusChanged { .. }
         | DaemonMessage::CredentialAdded { .. }
         | DaemonMessage::CredentialAddFailed { .. }
         | DaemonMessage::CredentialRemoved { .. }

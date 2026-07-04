@@ -170,6 +170,12 @@ fn handle_chat_event(
                             e.to_string(),
                         ))
                     })?;
+                    client_tx.send(ClientMessage::SubscribeSessionsSummary).map_err(|e| {
+                        ClientError::Io(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            e.to_string(),
+                        ))
+                    })?;
                 }
                 KeyCode::Char('c')
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -274,6 +280,7 @@ fn handle_session_list_key(
             if let Some(sel) = app.session_mgr.selection {
                 if let Some(session) = app.session_mgr.sessions.get(sel) {
                     app.page = Page::Chat;
+                    let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
                     app.attached_session_id = Some(session.session_id);
                     client_tx
                         .send(ClientMessage::AttachSession {
@@ -306,6 +313,7 @@ fn handle_session_list_key(
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.page = Page::Chat;
+            let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
         }
         _ => {}
     }
@@ -327,6 +335,7 @@ fn handle_session_detail_key(
         KeyCode::Enter => {
             if let Some(ref detail) = app.session_mgr.detail_data {
                 app.page = Page::Chat;
+                let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
                 app.attached_session_id = Some(detail.session_id);
                 client_tx
                     .send(ClientMessage::AttachSession {
@@ -355,6 +364,9 @@ pub(crate) fn handle_daemon_message(
 
     match &message {
         DaemonMessage::SessionCreated { session_id, .. } => {
+            if app.session_mgr.sessions.iter().any(|s| s.session_id == *session_id) {
+                return Ok(());
+            }
             app.attached_session_id = Some(*session_id);
             if app.page == Page::SessionManager {
                 app.page = Page::Chat;
@@ -363,6 +375,16 @@ pub(crate) fn handle_daemon_message(
         }
         DaemonMessage::SessionAttached { session_id } => {
             app.attached_session_id = Some(*session_id);
+        }
+        DaemonMessage::SessionStatusChanged { session_id, status } => {
+            if let Some(session) = app.session_mgr.sessions.iter_mut().find(|s| s.session_id == *session_id) {
+                session.status = status.clone();
+            }
+            if let Some(ref mut detail) = app.session_mgr.detail_data {
+                if detail.session_id == *session_id {
+                    detail.status = status.clone();
+                }
+            }
         }
         DaemonMessage::Sessions { sessions } => {
             app.session_mgr.set_sessions(sessions.clone());

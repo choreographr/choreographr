@@ -59,6 +59,9 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             handler.push_text(format!("[daemon] attached session: {session_id}"));
             Ok(None)
         }
+        DaemonMessage::SessionStatusChanged { .. } => {
+            Ok(None)
+        }
         DaemonMessage::SessionState {
             session_id,
             title,

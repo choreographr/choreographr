@@ -434,6 +434,7 @@ fn make_session(id: u64, title: &str, model: &str, count: u32) -> tai_proto::Ses
         created_at: 1705314000,
         message_count: count,
         max_turns: None,
+        status: tai_proto::SessionStatus::Inactive,
     }
 }
 
@@ -609,6 +610,8 @@ mod session_manager_key_tests {
 
         assert_eq!(app.page, Page::Chat);
         assert_eq!(app.attached_session_id, Some(1));
+        let msg = rx.recv().expect("sent message (unsub)");
+        assert_eq!(msg, ClientMessage::UnsubscribeSessionsSummary);
         let msg = rx.recv().expect("sent message");
         assert_eq!(msg, ClientMessage::AttachSession { session_id: 1 });
     }
@@ -644,6 +647,8 @@ mod session_manager_key_tests {
         assert_eq!(app.page, Page::SessionManager);
         let msg = rx.recv().expect("sent message");
         assert_eq!(msg, ClientMessage::ListSessions);
+        let msg = rx.recv().expect("sent message");
+        assert_eq!(msg, ClientMessage::SubscribeSessionsSummary);
     }
 
     #[tokio::test]
@@ -695,6 +700,8 @@ mod session_manager_key_tests {
 
         assert_eq!(app.page, Page::Chat);
         assert_eq!(app.attached_session_id, Some(1));
+        let msg = rx.recv().expect("sent message (unsub)");
+        assert_eq!(msg, ClientMessage::UnsubscribeSessionsSummary);
         let msg = rx.recv().expect("sent message");
         assert_eq!(msg, ClientMessage::AttachSession { session_id: 1 });
     }

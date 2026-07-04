@@ -4,7 +4,7 @@ use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatAssistantToolUse, ChatRequestMessage,
     ChatTurnResult, OpenAiClient,
 };
-use crate::sessions::SessionState;
+use crate::sessions::{SessionCommand, SessionState};
 use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
 use std::io;
 use std::path::Path;
@@ -14,7 +14,7 @@ use std::time::Duration;
 use tai_keystore::XCredentials;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
-    SessionMessage,
+    SessionMessage, SessionStatus,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -76,6 +76,7 @@ pub(crate) fn run_agent_loop(
     tool_registry: &Arc<ToolRegistry>,
     daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
     max_turns_default: u32,
+    cmd_tx: &std::sync::mpsc::Sender<SessionCommand>,
 ) -> io::Result<()> {
     let tools = tool_registry.available_definitions();
     let mut next_image_id = 1u32;
@@ -105,6 +106,10 @@ pub(crate) fn run_agent_loop(
                     }
                 }
             }
+        }
+
+        if cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Inference)).is_err() {
+            return Ok(());
         }
 
         let messages = build_chat_request_messages(&session.messages);
@@ -146,6 +151,10 @@ pub(crate) fn run_agent_loop(
                     } else {
                         Duration::from_secs(60)
                     };
+
+                    if cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::ToolCall(tool_call.name.clone()))).is_err() {
+                        return Ok(());
+                    }
 
                     let mut output = execute_tool_with_timeout(
                         tool_registry,

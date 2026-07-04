@@ -5,7 +5,7 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tai_proto::SessionSummary;
+use tai_proto::{DaemonMessage, SessionStatus, SessionSummary};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task;
 
@@ -21,6 +21,7 @@ pub struct DaemonState {
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
     pub daemon_tx: UnboundedSender<DaemonCommand>,
     pub client_streams: Vec<UnixStream>,
+    pub summary_subscribers: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
 }
 
 pub enum DaemonCommand {
@@ -61,6 +62,17 @@ pub enum DaemonCommand {
         service: String,
         reply: std::sync::mpsc::Sender<Option<String>>,
     },
+    RegisterSummarySubscriber {
+        client_id: u64,
+        writer: std::sync::mpsc::Sender<DaemonMessage>,
+    },
+    UnregisterSummarySubscriber {
+        client_id: u64,
+    },
+    BroadcastSessionStatus {
+        session_id: u64,
+        status: SessionStatus,
+    },
 }
 
 impl DaemonState {
@@ -83,11 +95,12 @@ impl DaemonState {
                 let sid = self.next_session_id;
                 self.next_session_id += 1;
 
+                let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
                 let record = SessionRecord {
                     title: title.clone(),
                     selected_model: None,
                     parent_session_id,
-                    cwd: cwd.as_ref().map(|p| p.display().to_string()),
+                    cwd: cwd_str.clone(),
                     max_turns,
                     message_count: 0,
                     created_at: std::time::SystemTime::now()
@@ -134,14 +147,29 @@ impl DaemonState {
                         title: title.clone(),
                         selected_model: None,
                         parent_session_id,
-                        cwd: cwd.map(|p| p.display().to_string()),
+                        cwd: cwd_str.clone(),
                         created_at: record.created_at,
                         message_count: 0,
                         max_turns,
+                        status: SessionStatus::Inactive,
                     },
                 );
 
                 let _ = reply.send(Ok((sid, session_tx)));
+                let created_msg = DaemonMessage::SessionCreated {
+                    session_id: sid,
+                    title,
+                    parent_session_id,
+                    cwd: cwd_str,
+                    max_turns,
+                };
+                let status_msg = DaemonMessage::SessionStatusChanged {
+                    session_id: sid,
+                    status: SessionStatus::Inactive,
+                };
+                self.summary_subscribers.retain(|_id, tx| {
+                    tx.send(created_msg.clone()).is_ok() && tx.send(status_msg.clone()).is_ok()
+                });
             }
             DaemonCommand::AttachSession { session_id, reply } => {
                 if self.openai_client.is_none() {
@@ -213,6 +241,7 @@ impl DaemonState {
                         created_at: meta.created_at,
                         message_count: meta.message_count,
                         max_turns: meta.max_turns,
+                        status: meta.status.clone(),
                     })
                     .collect();
 
@@ -228,6 +257,7 @@ impl DaemonState {
                                 created_at: record.created_at,
                                 message_count: record.message_count,
                                 max_turns: record.max_turns,
+                                status: SessionStatus::Inactive,
                             });
                         }
                     }
@@ -248,6 +278,7 @@ impl DaemonState {
                         created_at: meta.created_at,
                         message_count: meta.message_count,
                         max_turns: meta.max_turns,
+                        status: meta.status.clone(),
                     });
                 let _ = reply.send(summary);
             }
@@ -259,6 +290,13 @@ impl DaemonState {
             }
             DaemonCommand::SessionExited { session_id } => {
                 self.active_sessions.remove(&session_id);
+                let msg = DaemonMessage::SessionStatusChanged {
+                    session_id,
+                    status: SessionStatus::Sleeping,
+                };
+                self.summary_subscribers.retain(|_id, tx| {
+                    tx.send(msg.clone()).is_ok()
+                });
             }
             DaemonCommand::Unlock { passphrase, reply } => {
                 let result = handle_unlock_inner(self, passphrase);
@@ -274,6 +312,18 @@ impl DaemonState {
                     .as_ref()
                     .and_then(|ks| ks.get_api_key(&service).map(|k| k.to_string()));
                 let _ = reply.send(key);
+            }
+            DaemonCommand::RegisterSummarySubscriber { client_id, writer } => {
+                self.summary_subscribers.insert(client_id, writer);
+            }
+            DaemonCommand::UnregisterSummarySubscriber { client_id } => {
+                self.summary_subscribers.remove(&client_id);
+            }
+            DaemonCommand::BroadcastSessionStatus { session_id, status } => {
+                let msg = DaemonMessage::SessionStatusChanged { session_id, status };
+                self.summary_subscribers.retain(|_id, tx| {
+                    tx.send(msg.clone()).is_ok()
+                });
             }
         }
     }

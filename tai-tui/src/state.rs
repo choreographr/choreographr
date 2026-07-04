@@ -4,7 +4,7 @@ use tai_client_core::{
     ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
     MAX_HISTORY_ITEMS,
 };
-use tai_proto::{ImageMetadata, OutputStream, SessionMessage, SessionSummary};
+use tai_proto::{ImageMetadata, OutputStream, SessionMessage, SessionStatus, SessionSummary};
 use tai_tui::{RenderedImage, StreamingText, build_rendered_image};
 
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
@@ -30,6 +30,7 @@ pub(crate) struct SessionDetailData {
     pub(crate) created_at: i64,
     pub(crate) message_count: u32,
     pub(crate) max_turns: Option<u32>,
+    pub(crate) status: SessionStatus,
 }
 
 pub(crate) struct SessionManagerState {
@@ -265,6 +266,7 @@ impl SessionManagerState {
                 created_at,
                 message_count,
                 max_turns,
+                status: s.status.clone(),
             }
         });
         if self.detail_data.is_some() {

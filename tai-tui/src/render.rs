@@ -12,6 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
+use tai_proto::SessionStatus;
 
 pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
     let Ok((width, height)) = crossterm::terminal::size() else {
@@ -258,8 +259,20 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             let att = if is_attached { "*" } else { " " };
             let title = session.title.as_deref().unwrap_or("untitled");
             let model = session.selected_model.as_deref().unwrap_or("-");
+            let status_str = match &session.status {
+                SessionStatus::Sleeping => "sleep",
+                SessionStatus::Inactive => "idle",
+                SessionStatus::Inference => "infer",
+                SessionStatus::ToolCall(name) => &name,
+            };
+            let status_style = match &session.status {
+                SessionStatus::Sleeping => Color::DarkGray,
+                SessionStatus::Inactive => Color::Green,
+                SessionStatus::Inference => Color::Yellow,
+                SessionStatus::ToolCall(_) => Color::Cyan,
+            };
             let row = format!(
-                "{sel}{att} {:>4}  \"{title}\"  ({model})  — {} messages",
+                "{sel}{att} {:>4}  \"{title}\"  ({model})  — {} messages  [",
                 session.session_id, session.message_count,
             );
 
@@ -270,7 +283,11 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             } else {
                 Style::default()
             };
-            lines.push(Line::styled(row, style));
+            let status_label = format!("{}]", status_str);
+            lines.push(Line::from(vec![
+                ratatui::text::Span::styled(row, style),
+                ratatui::text::Span::styled(status_label, Style::default().fg(status_style)),
+            ]));
         }
 
         let paragraph = Paragraph::new(lines);
@@ -317,6 +334,7 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                     .max_turns
                     .map_or("unlimited".to_string(), |mt| mt.to_string())
             )),
+            Line::from(format!("Status:        {}", format_status(&detail.status))),
         ];
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, inner);
@@ -376,4 +394,13 @@ fn format_timestamp(ts: i64) -> String {
 
 fn is_leap(y: i64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn format_status(status: &SessionStatus) -> String {
+    match status {
+        SessionStatus::Sleeping => "sleeping".to_string(),
+        SessionStatus::Inactive => "idle".to_string(),
+        SessionStatus::Inference => "inferring".to_string(),
+        SessionStatus::ToolCall(name) => format!("tool call: {name}"),
+    }
 }

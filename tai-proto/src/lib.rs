@@ -18,6 +18,14 @@ pub struct AssistantToolCallRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionStatus {
+    Sleeping,
+    Inactive,
+    Inference,
+    ToolCall(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SessionMessage {
     SystemText {
         content: String,
@@ -91,6 +99,7 @@ pub struct SessionSummary {
     pub created_at: i64,
     pub message_count: u32,
     pub max_turns: Option<u32>,
+    pub status: SessionStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +111,8 @@ pub enum ClientMessage {
         max_turns: Option<u32>,
     },
     ListSessions,
+    SubscribeSessionsSummary,
+    UnsubscribeSessionsSummary,
     AttachSession {
         session_id: u64,
     },
@@ -192,6 +203,10 @@ pub enum DaemonMessage {
     },
     SessionMessageAppended {
         message: SessionMessage,
+    },
+    SessionStatusChanged {
+        session_id: u64,
+        status: SessionStatus,
     },
     SessionFailed {
         operation: String,
