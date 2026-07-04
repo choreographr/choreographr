@@ -65,16 +65,6 @@ fn rejects_unlock_without_passphrase() {
 }
 
 #[test]
-fn parses_lock() {
-    let mut next = 3;
-    assert_eq!(
-        parse_input_line("/lock", &mut next, None),
-        ShellCommand::Send(ClientMessage::Lock)
-    );
-    assert_eq!(next, 3);
-}
-
-#[test]
 fn parses_test_image_command() {
     let mut next = 10;
     assert_eq!(

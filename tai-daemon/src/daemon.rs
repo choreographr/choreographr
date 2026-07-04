@@ -51,7 +51,6 @@ pub enum DaemonCommand {
         passphrase: String,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
-    Lock,
     ListModels {
         session_id: Option<u64>,
         reply: std::sync::mpsc::Sender<Result<(Vec<String>, Option<String>), String>>,
@@ -72,6 +71,13 @@ impl DaemonState {
                 max_turns,
                 reply,
             } => {
+                if self.openai_client.is_none() {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "daemon is locked",
+                    )));
+                    return;
+                }
                 let sid = self.next_session_id;
                 self.next_session_id += 1;
 
@@ -136,6 +142,13 @@ impl DaemonState {
                 let _ = reply.send(Ok((sid, session_tx)));
             }
             DaemonCommand::AttachSession { session_id, reply } => {
+                if self.openai_client.is_none() {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "daemon is locked",
+                    )));
+                    return;
+                }
                 match self.active_sessions.get(&session_id) {
                     Some(entry) => {
                         let _ = reply.send(Ok(entry.cmd_tx.clone()));
@@ -248,11 +261,6 @@ impl DaemonState {
             DaemonCommand::Unlock { passphrase, reply } => {
                 let result = handle_unlock_inner(self, passphrase);
                 let _ = reply.send(result);
-            }
-            DaemonCommand::Lock => {
-                self.openai_client = None;
-                self.keystore = None;
-                self.x_credentials = None;
             }
             DaemonCommand::ListModels { session_id, reply } => {
                 let result = handle_list_models_inner(self, session_id);

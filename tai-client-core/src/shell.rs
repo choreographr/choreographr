@@ -56,10 +56,6 @@ fn parse_command(
         return ShellCommand::UnknownCommand("usage: /unlock <passphrase>".to_string());
     }
 
-    if rest == "lock" {
-        return ShellCommand::Send(ClientMessage::Lock);
-    }
-
     if let Some(args) = rest.strip_prefix("add-key ") {
         let parts: Vec<&str> = args.split_whitespace().collect();
         if parts.len() < 3 {

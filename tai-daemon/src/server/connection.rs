@@ -133,9 +133,6 @@ pub(crate) fn client_thread(
                     ClientMessage::Unlock { passphrase } => {
                         handle_unlock_sync(&daemon_tx, &writer_tx, passphrase);
                     }
-                    ClientMessage::Lock => {
-                        handle_lock_sync(&daemon_tx, &writer_tx);
-                    }
                     ClientMessage::ListModels => {
                         handle_list_models_sync(&daemon_tx, &writer_tx, attached_session_id);
                     }
@@ -190,14 +187,6 @@ fn handle_unlock_sync(
         }
         Err(_) => {}
     }
-}
-
-fn handle_lock_sync(
-    daemon_tx: &UnboundedSender<DaemonCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
-) {
-    let _ = daemon_tx.send(DaemonCommand::Lock);
-    let _ = writer_tx.send(DaemonMessage::Locked);
 }
 
 fn handle_list_models_sync(
