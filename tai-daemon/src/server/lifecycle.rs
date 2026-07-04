@@ -101,6 +101,7 @@ pub fn run_server(socket_path: &str, mut state: DaemonState) -> io::Result<()> {
         error!("accept thread panicked: {e:?}");
     }
 
+    let _ = daemon_tx.send(DaemonCommand::Shutdown);
     drop(daemon_tx);
     cmd_handle.join().unwrap_or_else(|e| {
         error!("command thread panicked: {e:?}");
