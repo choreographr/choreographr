@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tai_proto::{DaemonMessage, SessionMessage, SessionStatus, SessionSummary};
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::warn;
 
 pub enum SessionCommand {
@@ -89,7 +88,7 @@ struct ActiveRequest {
 
 pub struct ActiveSessionEntry {
     pub cmd_tx: mpsc::Sender<SessionCommand>,
-    pub handle: tokio::task::JoinHandle<()>,
+    pub handle: std::thread::JoinHandle<()>,
 }
 
 pub struct SessionState {
@@ -179,7 +178,7 @@ pub fn session_main(
     db: Arc<redb::Database>,
     client: Option<Arc<OpenAiClient>>,
     tool_registry: Arc<ToolRegistry>,
-    daemon_tx: UnboundedSender<DaemonCommand>,
+    daemon_tx: mpsc::Sender<DaemonCommand>,
     init_record: Option<SessionRecord>,
     max_turns_default: u32,
 ) {
@@ -284,7 +283,7 @@ fn process_command(
     db: &Arc<redb::Database>,
     client: Option<&Arc<OpenAiClient>>,
     tool_registry: &Arc<ToolRegistry>,
-    daemon_tx: &UnboundedSender<DaemonCommand>,
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
     cmd_tx: &mpsc::Sender<SessionCommand>,
     shutdown_requested: &mut bool,
     max_turns_default: u32,
@@ -594,7 +593,7 @@ fn run_request_worker(
     cwd: Option<PathBuf>,
     cancel: Arc<AtomicBool>,
     tool_registry: Arc<ToolRegistry>,
-    daemon_tx: UnboundedSender<DaemonCommand>,
+    daemon_tx: mpsc::Sender<DaemonCommand>,
     subscribers: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
     max_turns_default: u32,
     cmd_tx: mpsc::Sender<SessionCommand>,
@@ -699,7 +698,7 @@ fn persist_and_exit(
     state: &SessionState,
     db: &redb::Database,
     session_id: u64,
-    daemon_tx: &UnboundedSender<DaemonCommand>,
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
 ) {
     let record = SessionRecord {
         title: state.title.clone(),

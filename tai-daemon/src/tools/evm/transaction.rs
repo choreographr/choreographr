@@ -14,8 +14,7 @@ pub(crate) fn execute_evm_transaction_tool(arguments_json: &str) -> ToolResult {
 
 fn execute_evm_transaction_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmTransactionArgs = serde_json::from_str(arguments_json)?;
-    let output = tokio::runtime::Handle::current()
-        .block_on(evm_transaction_impl(&args.rpc_url, &args.tx_hash))?;
+    let output = crate::runtime::get().block_on(evm_transaction_impl(&args.rpc_url, &args.tx_hash))?;
     Ok(truncate_tool_output(&output))
 }
 

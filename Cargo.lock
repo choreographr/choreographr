@@ -10822,6 +10822,7 @@ dependencies = [
  "serde_yaml",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "signal-hook 0.3.18",
  "subxt",
  "tai-keystore",
  "tai-proto",

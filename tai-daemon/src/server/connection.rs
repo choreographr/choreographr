@@ -4,12 +4,11 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use tai_proto::{ClientMessage, DaemonMessage, ProtoError, read_message_sync, write_message_sync};
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error};
 
 pub(crate) fn client_thread(
     stream: UnixStream,
-    daemon_tx: UnboundedSender<DaemonCommand>,
+    daemon_tx: mpsc::Sender<DaemonCommand>,
 ) -> io::Result<()> {
     let reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
@@ -184,7 +183,7 @@ pub(crate) fn client_thread(
 }
 
 fn handle_unlock_sync(
-    daemon_tx: &UnboundedSender<DaemonCommand>,
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
     writer_tx: &mpsc::Sender<DaemonMessage>,
     passphrase: String,
 ) {
@@ -202,7 +201,7 @@ fn handle_unlock_sync(
 }
 
 fn handle_list_models_sync(
-    daemon_tx: &UnboundedSender<DaemonCommand>,
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
     writer_tx: &mpsc::Sender<DaemonMessage>,
     attached_session_id: Option<u64>,
 ) {
@@ -226,7 +225,7 @@ fn handle_list_models_sync(
 }
 
 fn handle_get_credential_sync(
-    daemon_tx: &UnboundedSender<DaemonCommand>,
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
     writer_tx: &mpsc::Sender<DaemonMessage>,
     service: String,
 ) {

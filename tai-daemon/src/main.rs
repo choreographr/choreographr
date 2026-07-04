@@ -1,7 +1,9 @@
 use anyhow::Context;
 use std::sync::Arc;
+use std::sync::mpsc;
 use tai_daemon::daemon::DaemonState;
 use tai_daemon::openai::load_service_config;
+use tai_daemon::runtime;
 use tai_proto::socket_path;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -26,8 +28,9 @@ fn resolve_max_turns() -> u32 {
     DEFAULT_MAX_TURNS
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    runtime::init();
+
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -41,7 +44,9 @@ async fn main() -> anyhow::Result<()> {
 
     let db = Arc::new(tai_daemon::db::open_db().context("failed to open database")?);
 
+    let (daemon_tx, _daemon_rx) = mpsc::channel::<tai_daemon::daemon::DaemonCommand>();
     let state = DaemonState {
+        daemon_tx,
         next_session_id: tai_daemon::db::next_session_id(&db).unwrap_or(1),
         max_turns,
         active_sessions: std::collections::HashMap::new(),
@@ -51,13 +56,11 @@ async fn main() -> anyhow::Result<()> {
         x_credentials: None,
         db,
         tool_registry: Arc::new(tai_daemon::tools::ToolRegistry::new()),
-        daemon_tx: tokio::sync::mpsc::unbounded_channel().0,
         client_streams: Vec::new(),
         summary_subscribers: std::collections::HashMap::new(),
     };
 
     let socket_path = socket_path();
     tai_daemon::run_server(&socket_path, state)
-        .await
         .context("failed to run server")
 }

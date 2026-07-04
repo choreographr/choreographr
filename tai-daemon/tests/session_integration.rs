@@ -2,15 +2,14 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use tai_daemon::{SessionCommand, session_main};
 use tai_proto::DaemonMessage;
-use tokio::sync::mpsc as tokio_mpsc;
 
 mod common;
 
 fn spawn_session(
     db: Arc<redb::Database>,
     session_id: u64,
-) -> (mpsc::Sender<SessionCommand>, tokio::task::JoinHandle<()>) {
-    let (daemon_tx, _daemon_rx) = tokio_mpsc::unbounded_channel();
+) -> (mpsc::Sender<SessionCommand>, std::thread::JoinHandle<()>) {
+    let (daemon_tx, _daemon_rx) = mpsc::channel();
     let (session_tx, session_rx) = mpsc::channel();
 
     let tool_registry = Arc::new(tai_daemon::tools::ToolRegistry::new());
@@ -18,7 +17,7 @@ fn spawn_session(
     let daemon_tx2 = daemon_tx.clone();
     let cmd_tx = session_tx.clone();
 
-    let handle = tokio::task::spawn_blocking(move || {
+    let handle = std::thread::spawn(move || {
         session_main(
             cmd_tx,
             session_rx,
@@ -36,8 +35,8 @@ fn spawn_session(
 }
 
 #[ignore]
-#[tokio::test]
-async fn session_starts_and_accepts_commands() {
+#[test]
+fn session_starts_and_accepts_commands() {
     let db = Arc::new(common::test_db());
     let (session_tx, _handle) = spawn_session(db, 1);
 
@@ -75,13 +74,13 @@ async fn session_starts_and_accepts_commands() {
 }
 
 #[ignore]
-#[tokio::test]
-async fn session_shutdown_exits_without_active_requests() {
+#[test]
+fn session_shutdown_exits_without_active_requests() {
     let db = Arc::new(common::test_db());
     let (session_tx, handle) = spawn_session(db, 1);
 
     session_tx.send(SessionCommand::Shutdown).unwrap();
     drop(session_tx);
 
-    handle.await.unwrap();
+    handle.join().unwrap();
 }

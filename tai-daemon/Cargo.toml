@@ -29,7 +29,8 @@ url = "2"
 subxt = { version = "0.50", default-features = false, features = ["native", "jsonrpsee", "runtime"] }
 tai-keystore.workspace = true
 tai-proto.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time"] }
+signal-hook = "0.3"
 toml = "1.1"
 tracing.workspace = true
 tracing-subscriber.workspace = true

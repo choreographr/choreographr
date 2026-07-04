@@ -14,8 +14,7 @@ pub(crate) fn execute_evm_balance_tool(arguments_json: &str) -> ToolResult {
 
 fn execute_evm_balance_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmBalanceArgs = serde_json::from_str(arguments_json)?;
-    let output = tokio::runtime::Handle::current()
-        .block_on(evm_balance_impl(&args.rpc_url, &args.address))?;
+    let output = crate::runtime::get().block_on(evm_balance_impl(&args.rpc_url, &args.address))?;
     Ok(truncate_tool_output(&output))
 }
 

@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 use tai_proto::{DaemonMessage, SessionStatus, SessionSummary};
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::task;
 
 pub struct DaemonState {
     pub next_session_id: u64,
@@ -19,12 +19,13 @@ pub struct DaemonState {
     pub x_credentials: Option<tai_keystore::XCredentials>,
     pub db: Arc<redb::Database>,
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
-    pub daemon_tx: UnboundedSender<DaemonCommand>,
+    pub daemon_tx: mpsc::Sender<DaemonCommand>,
     pub client_streams: Vec<UnixStream>,
-    pub summary_subscribers: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
+    pub summary_subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>,
 }
 
 pub enum DaemonCommand {
+    Shutdown,
     CreateSession {
         title: Option<String>,
         parent_session_id: Option<u64>,
@@ -120,7 +121,7 @@ impl DaemonState {
                 let cmd_tx = session_tx.clone();
                 let init_record = record.clone();
 
-                let handle = task::spawn_blocking(move || {
+                let handle = thread::spawn(move || {
                     session_main(
                         cmd_tx,
                         session_rx,
@@ -193,7 +194,7 @@ impl DaemonState {
                             let (session_tx, session_rx) = std::sync::mpsc::channel();
                             let cmd_tx = session_tx.clone();
 
-                            let handle = task::spawn_blocking(move || {
+                            let handle = thread::spawn(move || {
                                 session_main(
                                     cmd_tx,
                                     session_rx,
@@ -328,6 +329,7 @@ impl DaemonState {
                     tx.send(msg.clone()).is_ok()
                 });
             }
+            DaemonCommand::Shutdown => unreachable!("handled by command loop"),
         }
     }
 }

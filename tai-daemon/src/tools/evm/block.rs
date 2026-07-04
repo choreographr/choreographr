@@ -13,8 +13,7 @@ pub(crate) fn execute_evm_block_tool(arguments_json: &str) -> ToolResult {
 
 fn execute_evm_block_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmBlockArgs = serde_json::from_str(arguments_json)?;
-    let output = tokio::runtime::Handle::current()
-        .block_on(evm_block_impl(&args.rpc_url, args.block_tag.as_deref()))?;
+    let output = crate::runtime::get().block_on(evm_block_impl(&args.rpc_url, args.block_tag.as_deref()))?;
     Ok(truncate_tool_output(&output))
 }
 

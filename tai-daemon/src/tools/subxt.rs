@@ -42,7 +42,7 @@ pub(crate) fn execute_subxt_chain_tool(arguments_json: &str) -> ToolResult {
 fn execute_subxt_chain_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: WsUrlArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = tokio::runtime::Handle::current().block_on(subxt_chain_impl(&ws_url))?;
+    let output = crate::runtime::get().block_on(subxt_chain_impl(&ws_url))?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -57,7 +57,7 @@ fn execute_subxt_balance_inner(arguments_json: &str) -> Result<String, ToolError
     let args: SubxtBalanceArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
     let output =
-        tokio::runtime::Handle::current().block_on(subxt_balance_impl(&ws_url, &args.address))?;
+        crate::runtime::get().block_on(subxt_balance_impl(&ws_url, &args.address))?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -71,7 +71,7 @@ pub(crate) fn execute_subxt_query_tool(arguments_json: &str) -> ToolResult {
 fn execute_subxt_query_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: SubxtQueryArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = tokio::runtime::Handle::current().block_on(subxt_query_impl(
+    let output = crate::runtime::get().block_on(subxt_query_impl(
         &ws_url,
         &args.pallet,
         &args.storage_item,
@@ -91,7 +91,7 @@ fn execute_subxt_block_inner(arguments_json: &str) -> Result<String, ToolError> 
     let args: SubxtBlockArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
     let output =
-        tokio::runtime::Handle::current().block_on(subxt_block_impl(&ws_url, args.block_number))?;
+        crate::runtime::get().block_on(subxt_block_impl(&ws_url, args.block_number))?;
     Ok(truncate_tool_output(&output))
 }
 

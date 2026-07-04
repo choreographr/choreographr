@@ -16,7 +16,7 @@ pub(crate) fn execute_evm_call_tool(arguments_json: &str) -> ToolResult {
 
 fn execute_evm_call_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmCallArgs = serde_json::from_str(arguments_json)?;
-    let output = tokio::runtime::Handle::current().block_on(evm_call_impl(
+    let output = crate::runtime::get().block_on(evm_call_impl(
         &args.rpc_url,
         &args.to,
         &args.data,

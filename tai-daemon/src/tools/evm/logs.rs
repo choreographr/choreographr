@@ -15,7 +15,7 @@ pub(crate) fn execute_evm_logs_tool(arguments_json: &str) -> ToolResult {
 
 fn execute_evm_logs_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmLogsArgs = serde_json::from_str(arguments_json)?;
-    let output = tokio::runtime::Handle::current().block_on(evm_logs_impl(
+    let output = crate::runtime::get().block_on(evm_logs_impl(
         &args.rpc_url,
         args.address.as_deref(),
         args.topic0.as_deref(),

@@ -33,7 +33,7 @@ persist permanently and can be inspected like any other session.
 
 **Tool:** A function the LLM can call to interact with the outside world (read files, make
 HTTP requests, run git commands, query blockchains, post to X, etc.). Tools implement the
-`Tool` trait (name, description, JSON Schema, async execute) and are registered in a
+`Tool` trait (name, description, JSON Schema, `fn execute`) and are registered in a
 `ToolRegistry` at daemon startup. The daemon passes all tool definitions to the model with
 each request and executes them on the model's behalf, feeding results back into the
 conversation.

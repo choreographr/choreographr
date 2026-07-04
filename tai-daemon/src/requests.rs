@@ -16,7 +16,7 @@ use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
     SessionMessage, SessionStatus,
 };
-use tokio::sync::mpsc::UnboundedSender;
+use std::sync::mpsc;
 
 fn broadcast_to_session(session: &SessionState, message: DaemonMessage) {
     for tx in session.subscribers.values() {
@@ -74,7 +74,7 @@ pub(crate) fn run_agent_loop(
     cwd: Option<&Path>,
     cancel: &AtomicBool,
     tool_registry: &Arc<ToolRegistry>,
-    daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
+    daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
     max_turns_default: u32,
     cmd_tx: &std::sync::mpsc::Sender<SessionCommand>,
 ) -> io::Result<()> {
@@ -230,7 +230,7 @@ fn execute_tool_with_timeout(
     x_credentials: Option<&XCredentials>,
     cwd: Option<&Path>,
     timeout_dur: Duration,
-    daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
+    daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
     client: &OpenAiClient,
     db: &redb::Database,
     session: &SessionState,
@@ -319,7 +319,7 @@ fn execute_tool_with_timeout(
 }
 
 fn execute_list_sessions_sync(
-    daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
+    daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
 ) -> ToolExecutionOutput {
     let (reply, rx) = std::sync::mpsc::channel();
     let _ = daemon_tx.send(crate::daemon::DaemonCommand::ListSessions { reply });
@@ -369,7 +369,7 @@ fn execute_list_sessions_sync(
 }
 
 fn execute_get_session_sync(
-    daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
+    daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
     arguments_json: &str,
 ) -> ToolExecutionOutput {
     let args: serde_json::Value = match serde_json::from_str(arguments_json) {
@@ -431,7 +431,7 @@ fn execute_get_session_sync(
 
 fn execute_spawn_subsession_sync(
     _client: &OpenAiClient,
-    daemon_tx: &UnboundedSender<crate::daemon::DaemonCommand>,
+    daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
     _parent_session: &SessionState,
     parent_session_id: u64,
     _db: &redb::Database,

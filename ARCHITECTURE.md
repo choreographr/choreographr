@@ -163,25 +163,46 @@ Used by both `tai-tui` and `tai-dioxus`.
 
 Entry point: `src/main.rs` → initializes tracing, creates `DaemonState`, runs socket server.
 
+**Concurrency model:** Pure OS threads with message passing (actor model). No async code
+in the daemon's own logic. A single `tokio::runtime::Runtime` is held as a global sidecar
+(via `OnceLock` in `runtime.rs`) only for alloy/subxt blockchain libraries that require
+an async runtime. All other I/O uses blocking `std` APIs on dedicated threads.
+
 **Module breakdown:**
 
 | Module | Purpose |
 |---|---|
-| `server.rs` | Accepts Unix connections, spawns per-client `handle_client` tasks. Dispatches all `ClientMessage` variants. Implements lock/unlock flow. |
+| `runtime.rs` | Global `OnceLock<tokio::runtime::Runtime>` sidecar — `init()` called from `main`, `get()` used by blockchain tools to `.block_on()` async library calls. |
+| `server/lifecycle.rs` | Accept loop (non-blocking `UnixListener` + 50ms poll), signal handling (`signal_hook::flag`), shutdown orchestration. |
+| `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
+| `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking. `DaemonState` is owned by this thread only (no shared state). |
 | `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Each session has a control thread; request work runs on separate worker threads. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
-| `context.rs` | Context file discovery, skills, fingerprint-based refresh |
 | `tools/` | Tool trait, registry, and 29 registered tools. |
 
-**Per-client architecture (async tasks):**
+**Per-client architecture (OS threads):**
 
 ```
-handle_client(socket)
-├── reader task: reads ClientMessages from socket → sends to dispatch
-├── writer task: receives DaemonMessages from mpsc → writes to socket
-└── main loop: dispatches messages, modifies DaemonState, publishes events
+client_thread(socket)
+├── reads ClientMessages from socket via tai-proto read_message_sync
+├── sends DaemonCommands via daemon_tx mpsc channel
+└── receives DaemonMessages via per-client mpsc receiver → writes to socket
+```
+
+**Thread topology:**
+
+```
+main()
+├── runtime::init() — initializes sidecar tokio Runtime
+├── listener thread — UnixListener accept loop (non-blocking poll)
+│   └── per client: spawns client_thread (std::thread::spawn)
+├── command thread — DaemonCommand receiver loop (daemon_tx mpsc)
+│   └── owns DaemonState (exclusive access, no Arc<Mutex>)
+├── per-session threads — spawned on CreateSession, reaped on Shutdown
+│   └── owns SessionState (exclusive access)
+└── main thread — polls shutdown flag every 200ms, orchestrates clean exit
 ```
 
 **Request flow:**
@@ -302,11 +323,11 @@ startup                    /unlock <passphrase>
 ### Tool trait
 
 ```rust
-trait Tool {
+trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> serde_json::Value;       // JSON Schema for the model
-    async fn execute(&self, args: Value) -> ToolResult;
+    fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, cwd: Option<&Path>) -> ToolExecutionOutput;
 }
 ```
 
@@ -530,6 +551,12 @@ Model calls display_image tool
     endpoints, selectable per-model. This lets users route different models to their best-supported
     endpoint.
 
+12. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
+    where third-party libraries (alloy, subxt) require it. A global `OnceLock<tokio::runtime::Runtime>`
+    serves as a sidecar for those async calls via `block_on()`. This simplifies the mental model
+    (each thread owns its data, no `Send` bounds on shared state, no `Pin<Box<dyn Future>>`),
+    improves stack traces, and avoids the complexity of async cancellation.
+
 
 
 
@@ -693,7 +720,7 @@ cargo run -p tai-im -- telegram
 
 | Crate | Used by | Purpose |
 |---|---|---|
-| `tokio` | all | Async runtime |
+| `tokio` | daemon (sidecar), tui, dioxus, im | Async runtime — daemon uses it only as a sidecar for blockchain libraries |
 | `serde` + `bincode` | proto, daemon, clients | Serialization |
 | `reqwest` (rustls) | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
