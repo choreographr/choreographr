@@ -550,8 +550,8 @@ mod session_manager_key_tests {
         app
     }
 
-    #[tokio::test]
-    async fn session_manager_esc_returns_to_chat() {
+    #[test]
+    fn session_manager_esc_returns_to_chat() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
 
@@ -565,8 +565,8 @@ mod session_manager_key_tests {
         assert_eq!(app.page, Page::Chat);
     }
 
-    #[tokio::test]
-    async fn session_manager_q_returns_to_chat() {
+    #[test]
+    fn session_manager_q_returns_to_chat() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
 
@@ -580,8 +580,8 @@ mod session_manager_key_tests {
         assert_eq!(app.page, Page::Chat);
     }
 
-    #[tokio::test]
-    async fn session_manager_j_moves_selection_down() {
+    #[test]
+    fn session_manager_j_moves_selection_down() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
         assert_eq!(app.session_mgr.selection, Some(0));
@@ -596,8 +596,8 @@ mod session_manager_key_tests {
         assert_eq!(app.session_mgr.selection, Some(1));
     }
 
-    #[tokio::test]
-    async fn session_manager_enter_switches_session_and_returns_to_chat() {
+    #[test]
+    fn session_manager_enter_switches_session_and_returns_to_chat() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
 
@@ -616,8 +616,8 @@ mod session_manager_key_tests {
         assert_eq!(msg, ClientMessage::AttachSession { session_id: 1 });
     }
 
-    #[tokio::test]
-    async fn session_manager_ctrl_c_still_quits() {
+    #[test]
+    fn session_manager_ctrl_c_still_quits() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
 
@@ -631,8 +631,8 @@ mod session_manager_key_tests {
         assert!(app.should_quit);
     }
 
-    #[tokio::test]
-    async fn chat_ctrl_s_enters_session_manager() {
+    #[test]
+    fn chat_ctrl_s_enters_session_manager() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
         assert_eq!(app.page, Page::Chat);
@@ -651,8 +651,8 @@ mod session_manager_key_tests {
         assert_eq!(msg, ClientMessage::SubscribeSessionsSummary);
     }
 
-    #[tokio::test]
-    async fn session_manager_i_enters_detail() {
+    #[test]
+    fn session_manager_i_enters_detail() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
 
@@ -667,8 +667,8 @@ mod session_manager_key_tests {
         assert!(app.session_mgr.detail_data.is_some());
     }
 
-    #[tokio::test]
-    async fn session_manager_detail_b_returns_to_list() {
+    #[test]
+    fn session_manager_detail_b_returns_to_list() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
         app.session_mgr.enter_detail();
@@ -685,8 +685,8 @@ mod session_manager_key_tests {
         assert!(app.session_mgr.detail_data.is_none());
     }
 
-    #[tokio::test]
-    async fn session_manager_detail_enter_switches_session() {
+    #[test]
+    fn session_manager_detail_enter_switches_session() {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
         app.session_mgr.enter_detail();
@@ -706,8 +706,8 @@ mod session_manager_key_tests {
         assert_eq!(msg, ClientMessage::AttachSession { session_id: 1 });
     }
 
-    #[tokio::test]
-    async fn session_manager_n_sends_create_session() {
+    #[test]
+    fn session_manager_n_sends_create_session() {
         let mut app = make_sm_app();
         let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
 

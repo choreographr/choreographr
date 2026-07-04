@@ -10896,9 +10896,9 @@ dependencies = [
  "ratatui",
  "ratatui-image",
  "resvg",
+ "signal-hook 0.3.18",
  "tai-client-core",
  "tai-proto",
- "tokio",
  "unicode-segmentation",
  "unicode-width",
 ]

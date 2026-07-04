@@ -14,4 +14,4 @@ tai-client-core.workspace = true
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 tai-proto.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "signal", "macros"] }
+signal-hook.workspace = true

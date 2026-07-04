@@ -2,29 +2,34 @@ use crate::render::{mouse_in_history_box, render};
 use crate::state::{App, Page, SessionManagerView, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
+use signal_hook::consts::SIGINT;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::{io, time::Duration};
 use tai_client_core::{
     ClientError, dispatch_daemon_message, run_daemon_connection, shell_command_echo,
 };
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
-use tokio::sync::mpsc;
 
 const UI_EVENT_CHANNEL_SIZE: usize = 128;
 const UI_FRAME_POLL_MS: u64 = 16;
 
-pub(crate) async fn run_app() -> io::Result<()> {
+pub(crate) fn run_app() -> io::Result<()> {
     let socket_path = socket_path();
     let app_socket_path = socket_path.clone();
     let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
-    let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
+    let (ui_tx, mut ui_rx) = mpsc::sync_channel::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
 
     let picker = build_picker();
     let picker_protocol = format!("{:?}", picker.protocol_type());
 
     let connection_ui_tx = ui_tx.clone();
-    let connection_task = tokio::task::spawn_blocking(move || {
+    let connection_task = std::thread::spawn(move || {
         let result = run_daemon_connection(
             &socket_path,
             |message| {
@@ -43,14 +48,9 @@ pub(crate) async fn run_app() -> io::Result<()> {
         result
     });
 
-    let signal_ui_tx = ui_tx.clone();
-    let signal_task = tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.map_err(io::Error::other)?;
-        if let Err(e) = signal_ui_tx.send(UiEvent::Interrupt).await {
-            eprintln!("[tai-tui] failed to send Interrupt UI event: {e}");
-        }
-        Ok::<(), io::Error>(())
-    });
+    let interrupted = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGINT, Arc::clone(&interrupted))
+        .map_err(io::Error::other)?;
 
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -66,8 +66,15 @@ pub(crate) async fn run_app() -> io::Result<()> {
     client_tx
         .send(ClientMessage::ListSessions)
         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
-    let result = run_ui_loop(&mut terminal, &mut app, &picker, &client_tx, &mut ui_rx)
-        .map_err(io::Error::from);
+    let result = run_ui_loop(
+        &mut terminal,
+        &mut app,
+        &picker,
+        &client_tx,
+        &mut ui_rx,
+        &interrupted,
+    )
+    .map_err(io::Error::from);
 
     let _ = shutdown_tx.send(());
     drop(client_tx);
@@ -80,17 +87,12 @@ pub(crate) async fn run_app() -> io::Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    match connection_task.await {
+    match connection_task.join() {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(error.into()),
-        Err(error) => return Err(io::Error::other(error)),
-    }
-    signal_task.abort();
-    match signal_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return Err(error),
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => return Err(io::Error::other(error)),
+        Err(_) => {
+            return Err(io::Error::other("daemon connection thread panicked"));
+        }
     }
 
     result.map_err(io::Error::from)
@@ -102,8 +104,15 @@ pub(crate) fn run_ui_loop(
     picker: &ratatui_image::picker::Picker,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
     ui_rx: &mut mpsc::Receiver<UiEvent>,
+    interrupted: &AtomicBool,
 ) -> Result<(), ClientError> {
     while !app.should_quit {
+        if interrupted.load(Ordering::Relaxed) {
+            app.push_text("interrupt received");
+            app.should_quit = true;
+            break;
+        }
+
         while let Ok(event) = event::poll(Duration::from_millis(0)) {
             if !event {
                 break;
@@ -120,10 +129,7 @@ pub(crate) fn run_ui_loop(
                     app.push_text("daemon connection closed");
                     app.should_quit = true;
                 }
-                UiEvent::Interrupt => {
-                    app.push_text("interrupt received");
-                    app.should_quit = true;
-                }
+
             }
         }
 

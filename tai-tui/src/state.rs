@@ -74,7 +74,6 @@ pub(crate) type StreamingTextItem = StreamingText;
 pub(crate) enum UiEvent {
     Daemon(tai_proto::DaemonMessage),
     ReaderClosed,
-    Interrupt,
 }
 
 impl HistoryViewport {
