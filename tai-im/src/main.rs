@@ -129,17 +129,10 @@ fn run_platform(
             let admin_count = admin_ids.len();
             info!(admin_count, "starting telegram bridge");
 
-            // Start the bridge on background threads since the teloxide dispatcher runs on the
-            // main (tokio) runtime.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build tokio runtime for tai-im bridge");
-
             let bridge = bridge::DaemonBridge::spawn(reader, writer);
             let (tx, rx) = bridge.into_parts();
 
-            rt.block_on(telegram::run(bot_token, admin_ids, tx, rx));
+            telegram::run(bot_token, admin_ids, tx, rx);
         }
         other => {
             error!(platform = %other, "unknown platform");

@@ -17,9 +17,9 @@ fn connected_bridge() -> (DaemonBridge, BufReader<UnixStream>, BufWriter<UnixStr
 #[test]
 fn bridge_ping_pong() {
     let (bridge, mut daemon_reader, mut daemon_writer) = connected_bridge();
-    let (tx, mut rx) = bridge.into_parts();
+    let (tx, rx) = bridge.into_parts();
 
-    tx.blocking_send(DaemonBridgeCommand::SendMessage(ClientMessage::Ping))
+    tx.send(DaemonBridgeCommand::SendMessage(ClientMessage::Ping))
         .unwrap();
 
     let msg = read_message_sync::<_, ClientMessage>(&mut daemon_reader).unwrap();
@@ -29,7 +29,7 @@ fn bridge_ping_pong() {
     use std::io::Write;
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(matches!(event, BridgeEvent::Pong));
 }
 
@@ -37,9 +37,9 @@ fn bridge_ping_pong() {
 #[test]
 fn bridge_unlock_locked() {
     let (bridge, mut daemon_reader, mut daemon_writer) = connected_bridge();
-    let (tx, mut rx) = bridge.into_parts();
+    let (tx, rx) = bridge.into_parts();
 
-    tx.blocking_send(DaemonBridgeCommand::SendMessage(ClientMessage::Unlock {
+    tx.send(DaemonBridgeCommand::SendMessage(ClientMessage::Unlock {
         passphrase: "secret".into(),
     }))
     .unwrap();
@@ -51,7 +51,7 @@ fn bridge_unlock_locked() {
     use std::io::Write;
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(matches!(event, BridgeEvent::Unlocked));
 }
 
@@ -59,7 +59,7 @@ fn bridge_unlock_locked() {
 #[test]
 fn bridge_text_streaming() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
-    let (_tx, mut rx) = bridge.into_parts();
+    let (_tx, rx) = bridge.into_parts();
 
     write_message_sync(
         &mut daemon_writer,
@@ -85,7 +85,7 @@ fn bridge_text_streaming() {
     use std::io::Write;
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(matches!(&event, BridgeEvent::Text(text) if text == "hello world"));
 }
 
@@ -93,7 +93,7 @@ fn bridge_text_streaming() {
 #[test]
 fn bridge_tool_call_events() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
-    let (_tx, mut rx) = bridge.into_parts();
+    let (_tx, rx) = bridge.into_parts();
 
     write_message_sync(
         &mut daemon_writer,
@@ -108,7 +108,7 @@ fn bridge_tool_call_events() {
     use std::io::Write;
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(
         matches!(&event, BridgeEvent::ToolCallStarted { name, arguments_json }
         if name == "read_file" && arguments_json == r#"{"path":"/tmp"}"#)
@@ -126,7 +126,7 @@ fn bridge_tool_call_events() {
     .unwrap();
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(
         matches!(&event, BridgeEvent::ToolCallFinished { name, output }
         if name == "read_file" && output == "file contents")
@@ -137,7 +137,7 @@ fn bridge_tool_call_events() {
 #[test]
 fn bridge_tool_call_failed() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
-    let (_tx, mut rx) = bridge.into_parts();
+    let (_tx, rx) = bridge.into_parts();
 
     write_message_sync(
         &mut daemon_writer,
@@ -152,7 +152,7 @@ fn bridge_tool_call_failed() {
     use std::io::Write;
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(matches!(&event, BridgeEvent::ToolCallFailed { name, error }
         if name == "read_file" && error == "permission denied"));
 }
@@ -161,7 +161,7 @@ fn bridge_tool_call_failed() {
 #[test]
 fn bridge_image_streaming() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
-    let (_tx, mut rx) = bridge.into_parts();
+    let (_tx, rx) = bridge.into_parts();
 
     let metadata = ImageMetadata {
         image_id: 1,
@@ -202,7 +202,7 @@ fn bridge_image_streaming() {
     use std::io::Write;
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(matches!(&event, BridgeEvent::Image { _mime, data }
         if _mime == "image/png" && data == b"abcd"));
 }
@@ -211,7 +211,7 @@ fn bridge_image_streaming() {
 #[test]
 fn bridge_error_variants() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
-    let (_tx, mut rx) = bridge.into_parts();
+    let (_tx, rx) = bridge.into_parts();
 
     write_message_sync(
         &mut daemon_writer,
@@ -224,7 +224,7 @@ fn bridge_error_variants() {
     use std::io::Write;
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(matches!(&event, BridgeEvent::Error(msg) if msg == "something went wrong"));
 
     write_message_sync(
@@ -236,7 +236,7 @@ fn bridge_error_variants() {
     .unwrap();
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(matches!(&event, BridgeEvent::Error(msg) if msg == "already locked"));
 }
 
@@ -244,7 +244,7 @@ fn bridge_error_variants() {
 #[test]
 fn bridge_models() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
-    let (_tx, mut rx) = bridge.into_parts();
+    let (_tx, rx) = bridge.into_parts();
 
     write_message_sync(
         &mut daemon_writer,
@@ -257,7 +257,7 @@ fn bridge_models() {
     use std::io::Write;
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     match &event {
         BridgeEvent::Models { models, selected } => {
             assert_eq!(models.as_slice(), &["gpt-4".to_string()]);
@@ -275,7 +275,7 @@ fn bridge_models() {
     .unwrap();
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(matches!(&event, BridgeEvent::ModelSelected(model) if model == "claude"));
 }
 
@@ -283,7 +283,7 @@ fn bridge_models() {
 #[test]
 fn bridge_cancelled_clears_buffer() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
-    let (_tx, mut rx) = bridge.into_parts();
+    let (_tx, rx) = bridge.into_parts();
 
     write_message_sync(
         &mut daemon_writer,
@@ -303,6 +303,6 @@ fn bridge_cancelled_clears_buffer() {
     use std::io::Write;
     let _ = daemon_writer.flush();
 
-    let event = rx.blocking_recv().unwrap();
+    let event = rx.recv().unwrap();
     assert!(matches!(&event, BridgeEvent::Error(msg) if msg == "cancelled"));
 }
