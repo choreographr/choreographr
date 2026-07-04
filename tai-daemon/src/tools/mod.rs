@@ -73,7 +73,6 @@ mod image;
 pub(crate) mod sessions;
 pub(crate) mod skill;
 pub(crate) mod subsession;
-mod subxt;
 pub(crate) mod x;
 
 #[derive(Debug, Clone)]
@@ -133,10 +132,6 @@ impl ToolRegistry {
         reg.register(git::GitCommit);
         reg.register(git::GitPush);
         reg.register(fff::Fff);
-        reg.register(subxt::SubxtChain);
-        reg.register(subxt::SubxtBalance);
-        reg.register(subxt::SubxtQuery);
-        reg.register(subxt::SubxtBlock);
         reg.register(evm::EvmChain);
         reg.register(evm::EvmBalance);
         reg.register(evm::EvmTokenBalance);

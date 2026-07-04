@@ -165,7 +165,7 @@ Entry point: `src/main.rs` → initializes tracing, creates `DaemonState`, runs 
 
 **Concurrency model:** Pure OS threads with message passing (actor model). No async code
 in the daemon's own logic. A single `tokio::runtime::Runtime` is held as a global sidecar
-(via `OnceLock` in `runtime.rs`) only for alloy/subxt blockchain libraries that require
+(via `OnceLock` in `runtime.rs`) only for alloy blockchain libraries that require
 an async runtime. All other I/O uses blocking `std` APIs on dedicated threads.
 
 **Module breakdown:**
@@ -349,7 +349,6 @@ working directory. Filesystem and Git tools resolve relative paths against this 
 | **Image** | `display_image` (from path, URL, base64, or SVG text) |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push` |
 | **EVM** | `evm_chain`, `evm_balance`, `evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`, `evm_logs`, `evm_nonce`, `evm_resolve` |
-| **Substrate** | `subxt_chain`, `subxt_balance`, `subxt_query`, `subxt_block` |
 | **File search** | `fff` (file finding) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
 | **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
@@ -552,7 +551,7 @@ Model calls display_image tool
     endpoint.
 
 12. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
-    where third-party libraries (alloy, subxt) require it. A global `OnceLock<tokio::runtime::Runtime>`
+    where third-party libraries (alloy) require it. A global `OnceLock<tokio::runtime::Runtime>`
     serves as a sidecar for those async calls via `block_on()`. This simplifies the mental model
     (each thread owns its data, no `Send` bounds on shared state, no `Pin<Box<dyn Future>>`),
     improves stack traces, and avoids the complexity of async cancellation.
@@ -767,6 +766,5 @@ errors, network failures, etc. Tools return `Result<String, ToolError>` and conv
 `ToolResult` at the `Tool::execute()` boundary via `From<ToolError> for ToolResult`.
 | `gix` | daemon | Git operations |
 | `alloy` | daemon | EVM blockchain tools |
-| `subxt` | daemon | Substrate blockchain tools |
 | `teloxide` | tai-im | Telegram Bot API client |
 | `tracing` | daemon | Structured logging |
