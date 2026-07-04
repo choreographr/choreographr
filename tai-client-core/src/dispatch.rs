@@ -250,5 +250,9 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             Ok(None)
         }
         DaemonMessage::Credential { .. } => Ok(None),
+        DaemonMessage::ShuttingDown => {
+            handler.push_text("[daemon] shutting down".to_string());
+            Ok(None)
+        }
     }
 }

@@ -243,6 +243,9 @@ fn daemon_to_bridge_events(
         DaemonMessage::Started { .. } => {
             debug!("bridge ignoring Started event");
         }
+        DaemonMessage::ShuttingDown => {
+            info!("daemon shutting down");
+        }
         DaemonMessage::SessionCreated { .. }
         | DaemonMessage::Sessions { .. }
         | DaemonMessage::SessionAttached { .. }

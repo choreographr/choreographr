@@ -2,6 +2,7 @@ use crate::db::{self, SessionRecord};
 use crate::sessions::{ActiveSessionEntry, SessionCommand, SessionMetadata, session_main};
 use std::collections::HashMap;
 use std::io;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tai_proto::SessionSummary;
@@ -19,6 +20,7 @@ pub struct DaemonState {
     pub db: Arc<redb::Database>,
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
     pub daemon_tx: UnboundedSender<DaemonCommand>,
+    pub client_streams: Vec<UnixStream>,
 }
 
 pub enum DaemonCommand {

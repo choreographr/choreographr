@@ -284,6 +284,7 @@ pub enum DaemonMessage {
         service: String,
         key: Option<String>,
     },
+    ShuttingDown,
 }
 
 pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
