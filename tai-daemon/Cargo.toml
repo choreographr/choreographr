@@ -31,6 +31,7 @@ signal-hook = "0.3"
 toml = "1.1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ckb-vm = { version = "0.24.14", features = ["asm", "detect-asm"] }
 
 [dev-dependencies]
 filetime = "0.2"
