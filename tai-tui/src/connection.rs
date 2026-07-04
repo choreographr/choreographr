@@ -3,7 +3,9 @@ use crate::state::{App, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{io, time::Duration};
-use tai_client_core::{ClientError, dispatch_daemon_message, run_daemon_connection, shell_command_echo};
+use tai_client_core::{
+    ClientError, dispatch_daemon_message, run_daemon_connection, shell_command_echo,
+};
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
 use tokio::sync::mpsc;
@@ -15,6 +17,7 @@ pub(crate) async fn run_app() -> io::Result<()> {
     let socket_path = socket_path();
     let app_socket_path = socket_path.clone();
     let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
 
     let picker = build_picker();
@@ -30,6 +33,7 @@ pub(crate) async fn run_app() -> io::Result<()> {
                 }
             },
             client_rx,
+            Some(shutdown_rx),
         );
         if result.is_ok() {
             if let Err(e) = connection_ui_tx.try_send(UiEvent::ReaderClosed) {
@@ -62,15 +66,12 @@ pub(crate) async fn run_app() -> io::Result<()> {
     client_tx
         .send(ClientMessage::ListSessions)
         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
-    let result = run_ui_loop(
-        &mut terminal,
-        &mut app,
-        &picker,
-        &client_tx,
-        &mut ui_rx,
-    )
-    .await
-    .map_err(io::Error::from);
+    let result = run_ui_loop(&mut terminal, &mut app, &picker, &client_tx, &mut ui_rx)
+        .await
+        .map_err(io::Error::from);
+
+    let _ = shutdown_tx.send(());
+    drop(client_tx);
 
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
@@ -80,7 +81,6 @@ pub(crate) async fn run_app() -> io::Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    drop(client_tx);
     match connection_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(error.into()),
@@ -161,16 +161,17 @@ pub(crate) fn handle_terminal_event(
                 KeyCode::Enter => {
                     let line = app.input.trim().to_string();
                     app.input.clear();
-                    match parse_input_line(&line, &mut app.next_request_id, app.attached_session_id) {
+                    match parse_input_line(&line, &mut app.next_request_id, app.attached_session_id)
+                    {
                         ShellCommand::Empty => {}
                         ShellCommand::InvalidCancel(value) => {
                             app.push_text(format!("invalid request id: {value}"))
                         }
-                        ShellCommand::UnknownCommand(error) => {
-                            app.push_text(error)
-                        }
+                        ShellCommand::UnknownCommand(error) => app.push_text(error),
                         ShellCommand::Send(message) => {
-                            if let Some(echo) = shell_command_echo(&ShellCommand::Send(message.clone())) {
+                            if let Some(echo) =
+                                shell_command_echo(&ShellCommand::Send(message.clone()))
+                            {
                                 app.push_text(echo);
                             }
                             match &message {
@@ -180,7 +181,12 @@ pub(crate) fn handle_terminal_event(
                                 }
                                 _ => {}
                             }
-                            client_tx.send(message).map_err(|e| ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())))?;
+                            client_tx.send(message).map_err(|e| {
+                                ClientError::Io(io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    e.to_string(),
+                                ))
+                            })?;
                         }
                     }
                 }
@@ -229,8 +235,11 @@ pub(crate) fn handle_daemon_message(
             } else {
                 app.push_text(format!("[daemon] sessions ({})", sessions.len()));
                 for session in sessions {
-                    let prefix =
-                        if Some(session.session_id) == app.attached_session_id { "*" } else { " " };
+                    let prefix = if Some(session.session_id) == app.attached_session_id {
+                        "*"
+                    } else {
+                        " "
+                    };
                     let title = session.title.as_deref().unwrap_or("untitled");
                     let model = session.selected_model.as_deref().unwrap_or("-");
                     app.push_text(format!(
@@ -274,7 +283,9 @@ pub(crate) fn handle_daemon_message(
 
     let response = dispatch_daemon_message(app, message)?;
     if let Some(msg) = response {
-        client_tx.send(msg).map_err(|e| ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string())))?;
+        client_tx.send(msg).map_err(|e| {
+            ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))
+        })?;
     }
     Ok(())
 }

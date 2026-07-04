@@ -131,8 +131,8 @@ impl Keystore {
             rand::rng().fill_bytes(&mut buf);
             buf
         };
-        let nonce = Nonce::try_from(&nonce_bytes[..])
-            .map_err(|_| KeystoreError::EncryptionFailed)?;
+        let nonce =
+            Nonce::try_from(&nonce_bytes[..]).map_err(|_| KeystoreError::EncryptionFailed)?;
         let cipher =
             Aes256Gcm::new_from_slice(&key).map_err(|_| KeystoreError::InvalidKeyLength)?;
         let ciphertext = cipher
@@ -180,8 +180,8 @@ impl Keystore {
         let ciphertext = &data[5 + SALT_LEN + NONCE_LEN..];
 
         let key = derive_key(passphrase, &salt);
-        let nonce = Nonce::try_from(&nonce_bytes[..])
-            .map_err(|_| KeystoreError::DecryptionFailed)?;
+        let nonce =
+            Nonce::try_from(&nonce_bytes[..]).map_err(|_| KeystoreError::DecryptionFailed)?;
         let cipher =
             Aes256Gcm::new_from_slice(&key).map_err(|_| KeystoreError::InvalidKeyLength)?;
         let plaintext = cipher
@@ -242,7 +242,12 @@ mod tests {
     #[test]
     fn add_and_get_api_key() {
         let mut ks = Keystore::new();
-        ks.add("openai".to_string(), ServiceCredential::ApiKey { key: "sk-test".to_string() });
+        ks.add(
+            "openai".to_string(),
+            ServiceCredential::ApiKey {
+                key: "sk-test".to_string(),
+            },
+        );
         assert_eq!(ks.service_names().count(), 1);
         assert_eq!(ks.get_api_key("openai"), Some("sk-test"));
         assert!(ks.get_x_credentials("openai").is_none());
@@ -251,13 +256,16 @@ mod tests {
     #[test]
     fn add_and_get_x_credentials() {
         let mut ks = Keystore::new();
-        ks.add("twitter".to_string(), ServiceCredential::X {
-            api_key: "ak".into(),
-            api_key_secret: "aks".into(),
-            access_token: "at".into(),
-            access_token_secret: "ats".into(),
-            bearer_token: Some("bt".into()),
-        });
+        ks.add(
+            "twitter".to_string(),
+            ServiceCredential::X {
+                api_key: "ak".into(),
+                api_key_secret: "aks".into(),
+                access_token: "at".into(),
+                access_token_secret: "ats".into(),
+                bearer_token: Some("bt".into()),
+            },
+        );
         assert!(ks.get_api_key("twitter").is_none());
         let creds = ks.get_x_credentials("twitter").unwrap();
         assert_eq!(creds.api_key, "ak");
@@ -270,7 +278,10 @@ mod tests {
     #[test]
     fn remove_credential() {
         let mut ks = Keystore::new();
-        ks.add("svc".to_string(), ServiceCredential::ApiKey { key: "k".into() });
+        ks.add(
+            "svc".to_string(),
+            ServiceCredential::ApiKey { key: "k".into() },
+        );
         assert!(ks.remove("svc"));
         assert!(!ks.remove("svc"));
         assert!(ks.get("svc").is_none());
@@ -279,8 +290,14 @@ mod tests {
     #[test]
     fn service_names_iterates_all_services() {
         let mut ks = Keystore::new();
-        ks.add("a".to_string(), ServiceCredential::ApiKey { key: "1".into() });
-        ks.add("b".to_string(), ServiceCredential::ApiKey { key: "2".into() });
+        ks.add(
+            "a".to_string(),
+            ServiceCredential::ApiKey { key: "1".into() },
+        );
+        ks.add(
+            "b".to_string(),
+            ServiceCredential::ApiKey { key: "2".into() },
+        );
         let mut names: Vec<_> = ks.service_names().collect();
         names.sort();
         assert_eq!(names, vec![&"a".to_string(), &"b".to_string()]);
@@ -289,14 +306,22 @@ mod tests {
     #[test]
     fn to_store_from_store_round_trip() {
         let mut ks = Keystore::new();
-        ks.add("s1".to_string(), ServiceCredential::ApiKey { key: "api-key".into() });
-        ks.add("s2".to_string(), ServiceCredential::X {
-            api_key: "a".into(),
-            api_key_secret: "as".into(),
-            access_token: "at".into(),
-            access_token_secret: "ats".into(),
-            bearer_token: None,
-        });
+        ks.add(
+            "s1".to_string(),
+            ServiceCredential::ApiKey {
+                key: "api-key".into(),
+            },
+        );
+        ks.add(
+            "s2".to_string(),
+            ServiceCredential::X {
+                api_key: "a".into(),
+                api_key_secret: "as".into(),
+                access_token: "at".into(),
+                access_token_secret: "ats".into(),
+                bearer_token: None,
+            },
+        );
 
         let store = ks.to_store();
         let restored = Keystore::from_store(store);
@@ -339,7 +364,10 @@ mod tests {
             version: 1,
             services: {
                 let mut m = std::collections::HashMap::new();
-                m.insert("test".to_string(), ServiceCredential::ApiKey { key: "val".into() });
+                m.insert(
+                    "test".to_string(),
+                    ServiceCredential::ApiKey { key: "val".into() },
+                );
                 m
             },
         };

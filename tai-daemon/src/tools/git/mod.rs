@@ -30,7 +30,10 @@ pub use stage::execute_git_add_tool;
 pub(crate) use status::GitStatus;
 pub use status::execute_git_status_tool;
 
-pub(crate) fn open_repo(repo_path: Option<&str>, cwd: Option<&std::path::Path>) -> Result<gix::Repository, ToolError> {
+pub(crate) fn open_repo(
+    repo_path: Option<&str>,
+    cwd: Option<&std::path::Path>,
+) -> Result<gix::Repository, ToolError> {
     let path = repo_path.unwrap_or(".").trim();
     let path = if path.is_empty() { "." } else { path };
     let resolved = super::resolve_path(path, cwd);
@@ -101,20 +104,21 @@ pub(crate) fn append_command_output(out: &mut String, label: &str, content: &str
     let _ = writeln!(out, "{content}");
 }
 
-pub(crate) fn run_git_command(repo: &gix::Repository, args: &[String]) -> Result<std::process::Output, ToolError> {
+pub(crate) fn run_git_command(
+    repo: &gix::Repository,
+    args: &[String],
+) -> Result<std::process::Output, ToolError> {
     std::process::Command::new("git")
         .args(args)
         .current_dir(repo_work_dir(repo))
         .output()
-        .map_err(|error| {
-            ToolError::Other(format!(
-                "failed to run git {}: {error}",
-                args.join(" ")
-            ))
-        })
+        .map_err(|error| ToolError::Other(format!("failed to run git {}: {error}", args.join(" "))))
 }
 
-pub(crate) fn normalize_nonempty_argument<'a>(value: &'a str, name: &str) -> Result<&'a str, ToolError> {
+pub(crate) fn normalize_nonempty_argument<'a>(
+    value: &'a str,
+    name: &str,
+) -> Result<&'a str, ToolError> {
     let value = value.trim();
     if value.is_empty() {
         Err(ToolError::Other(format!("{name} must not be empty")))
@@ -285,7 +289,9 @@ pub(crate) fn format_index_worktree_change(change: &gix::status::index_worktree:
     }
 }
 
-pub(crate) fn worktree_summary_code(summary: gix::status::index_worktree::iter::Summary) -> &'static str {
+pub(crate) fn worktree_summary_code(
+    summary: gix::status::index_worktree::iter::Summary,
+) -> &'static str {
     use gix::status::index_worktree::iter::Summary;
     match summary {
         Summary::Added => "A",

@@ -1,10 +1,10 @@
-use std::sync::Arc;
 use ammonia::Builder as HtmlSanitizer;
+use std::sync::Arc;
 use tai_client_core::{ShellCommand, parse_input_line, render_markdown_html};
 use tai_proto::ClientMessage;
-use teloxide::{dispatching::UpdateFilterExt, prelude::*};
 use teloxide::types::{ChatId, InputFile, ParseMode};
-use tokio::sync::{mpsc, Mutex};
+use teloxide::{dispatching::UpdateFilterExt, prelude::*};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::bridge::{BridgeEvent, DaemonBridgeCommand};
@@ -69,11 +69,7 @@ struct TelegramState {
     chat_id: Arc<Mutex<Option<ChatId>>>,
 }
 
-async fn handle_message(
-    bot: Bot,
-    msg: Message,
-    state: Arc<TelegramState>,
-) -> ResponseResult<()> {
+async fn handle_message(bot: Bot, msg: Message, state: Arc<TelegramState>) -> ResponseResult<()> {
     let text = match msg.text() {
         Some(t) => t.to_string(),
         None => return Ok(()),
@@ -136,10 +132,7 @@ async fn send_daemon_event(bot: &Bot, chat_id: ChatId, event: BridgeEvent) {
             arguments_json,
         } => {
             if let Err(e) = bot
-                .send_message(
-                    chat_id,
-                    format!("<i>Running {name} {arguments_json}</i>"),
-                )
+                .send_message(chat_id, format!("<i>Running {name} {arguments_json}</i>"))
                 .parse_mode(ParseMode::Html)
                 .await
             {
@@ -155,7 +148,10 @@ async fn send_daemon_event(bot: &Bot, chat_id: ChatId, event: BridgeEvent) {
                 warn!("failed to send tool call finished message: {e}");
             }
         }
-        BridgeEvent::ToolCallFailed { name, error: error_msg } => {
+        BridgeEvent::ToolCallFailed {
+            name,
+            error: error_msg,
+        } => {
             error!(%name, %error_msg, "tool call failed");
             if let Err(e) = bot
                 .send_message(chat_id, format!("<b>{name}</b> failed: {error_msg}"))

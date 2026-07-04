@@ -49,7 +49,8 @@ fn main() -> anyhow::Result<()> {
             let cred_type = args[3].as_str();
             let passphrase = prompt_passphrase("keystore")?;
 
-            let mut keystore = Keystore::load(&path, &passphrase).context("failed to load keystore")?;
+            let mut keystore =
+                Keystore::load(&path, &passphrase).context("failed to load keystore")?;
             match cred_type {
                 "api_key" => {
                     let key = prompt("API key:")?;
@@ -61,14 +62,21 @@ fn main() -> anyhow::Result<()> {
                     let access_token = prompt("X access token:")?;
                     let access_token_secret = prompt("X access token secret:")?;
                     let bearer = prompt("X bearer token (optional, press enter to skip):")?;
-                    let bearer_token = if bearer.is_empty() { None } else { Some(bearer) };
-                    keystore.add(service.clone(), ServiceCredential::X {
-                        api_key,
-                        api_key_secret,
-                        access_token,
-                        access_token_secret,
-                        bearer_token,
-                    });
+                    let bearer_token = if bearer.is_empty() {
+                        None
+                    } else {
+                        Some(bearer)
+                    };
+                    keystore.add(
+                        service.clone(),
+                        ServiceCredential::X {
+                            api_key,
+                            api_key_secret,
+                            access_token,
+                            access_token_secret,
+                            bearer_token,
+                        },
+                    );
                 }
                 other => {
                     eprintln!("unknown credential type: {other}");
@@ -76,7 +84,9 @@ fn main() -> anyhow::Result<()> {
                     bail!("unknown credential type: {other}");
                 }
             }
-            keystore.save(&path, &passphrase).context("failed to save keystore")?;
+            keystore
+                .save(&path, &passphrase)
+                .context("failed to save keystore")?;
             println!("added credential for service '{service}'");
         }
         "remove" => {
@@ -86,9 +96,12 @@ fn main() -> anyhow::Result<()> {
             }
             let service = &args[2];
             let passphrase = prompt_passphrase("keystore")?;
-            let mut keystore = Keystore::load(&path, &passphrase).context("failed to load keystore")?;
+            let mut keystore =
+                Keystore::load(&path, &passphrase).context("failed to load keystore")?;
             if keystore.remove(service) {
-                keystore.save(&path, &passphrase).context("failed to save keystore")?;
+                keystore
+                    .save(&path, &passphrase)
+                    .context("failed to save keystore")?;
                 println!("removed credential for service '{service}'");
             } else {
                 eprintln!("service '{service}' not found");

@@ -31,18 +31,12 @@ impl From<KeystoreError> for io::Error {
             KeystoreError::Io(io) => io,
             KeystoreError::TooShort
             | KeystoreError::InvalidMagic
-            | KeystoreError::InvalidData(_) => {
-                io::Error::new(io::ErrorKind::InvalidData, error)
-            }
+            | KeystoreError::InvalidData(_) => io::Error::new(io::ErrorKind::InvalidData, error),
             KeystoreError::DecryptionFailed => {
                 io::Error::new(io::ErrorKind::PermissionDenied, error)
             }
-            KeystoreError::AlreadyExists => {
-                io::Error::new(io::ErrorKind::AlreadyExists, error)
-            }
-            KeystoreError::ConfigDirNotFound => {
-                io::Error::new(io::ErrorKind::NotFound, error)
-            }
+            KeystoreError::AlreadyExists => io::Error::new(io::ErrorKind::AlreadyExists, error),
+            KeystoreError::ConfigDirNotFound => io::Error::new(io::ErrorKind::NotFound, error),
             _ => io::Error::other(error),
         }
     }

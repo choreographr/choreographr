@@ -25,7 +25,10 @@ pub enum OpenAiError {
     #[error("unauthorized ({status}): {detail}")]
     Unauthorized { status: u16, detail: String },
     #[error("rate limited: {detail}")]
-    RateLimited { retry_after_secs: Option<u64>, detail: String },
+    RateLimited {
+        retry_after_secs: Option<u64>,
+        detail: String,
+    },
     #[error("server error ({status}): {detail}")]
     ServerError { status: u16, detail: String },
     #[error("client error ({status}): {detail}")]
@@ -263,7 +266,11 @@ impl OpenAiClient {
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
             .map_err(io::Error::other)?;
-        Ok(Self { config, api_key, http })
+        Ok(Self {
+            config,
+            api_key,
+            http,
+        })
     }
 
     pub fn config(&self) -> &ServiceConfig {

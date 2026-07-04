@@ -3,9 +3,7 @@ use gix::ObjectId;
 use serde::Deserialize;
 use std::io;
 
-use super::{
-    collect_cached_diff_lines, load_mutable_index, open_repo, path_from_bytes,
-};
+use super::{collect_cached_diff_lines, load_mutable_index, open_repo, path_from_bytes};
 
 #[derive(Debug, Deserialize)]
 struct GitCommitArgs {
@@ -21,7 +19,10 @@ pub fn execute_git_commit_tool(arguments_json: &str, cwd: Option<&std::path::Pat
     }
 }
 
-fn execute_git_commit_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_git_commit_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let args: GitCommitArgs = serde_json::from_str(arguments_json)?;
     let output = git_commit_impl(
         args.repo_path.as_deref(),
@@ -49,12 +50,8 @@ fn git_commit_impl(
     let index = load_mutable_index(&repo)?;
     ensure_index_has_no_conflicts(&index)?;
 
-    if !allow_empty
-        && collect_cached_diff_lines(&repo, &[] as &[String])?.is_empty()
-    {
-        return Err(ToolError::Other(
-            "no staged changes to commit".to_string(),
-        ));
+    if !allow_empty && collect_cached_diff_lines(&repo, &[] as &[String])?.is_empty() {
+        return Err(ToolError::Other("no staged changes to commit".to_string()));
     }
     let tree_id = write_tree_from_index(&repo, &index)?;
     let parents = current_head_parents(&repo)?;
@@ -117,7 +114,9 @@ fn current_head_parents(repo: &gix::Repository) -> Result<Vec<ObjectId>, ToolErr
     }
 }
 
-define_tool_with_cwd!(GitCommit, "git_commit",
+define_tool_with_cwd!(
+    GitCommit,
+    "git_commit",
     "Create a Git commit from the current index.",
     execute_git_commit_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"message":{"type":"string","description":"Commit message"}},"required":["message"],"additionalProperties":false})

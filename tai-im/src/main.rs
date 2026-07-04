@@ -30,8 +30,7 @@ fn main() -> anyhow::Result<()> {
     let unlock_passphrase = env::var("TAI_KEYSTORE_PASSPHRASE").ok();
 
     let path = socket_path();
-    let stream = UnixStream::connect(&path)
-        .context("failed to connect to daemon")?;
+    let stream = UnixStream::connect(&path).context("failed to connect to daemon")?;
 
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
@@ -73,7 +72,9 @@ fn main() -> anyhow::Result<()> {
         },
     )
     .context("failed to send credential request")?;
-    writer.flush().context("failed to flush credential request")?;
+    writer
+        .flush()
+        .context("failed to flush credential request")?;
     match read_message_sync::<_, DaemonMessage>(&mut reader) {
         Ok(DaemonMessage::Credential {
             key: Some(bot_token),
@@ -84,7 +85,9 @@ fn main() -> anyhow::Result<()> {
         }
         Ok(DaemonMessage::Credential { key: None, .. }) => {
             if unlock_passphrase.is_none() {
-                bail!("daemon is locked. unlock the daemon via TUI first, or set TAI_KEYSTORE_PASSPHRASE env var");
+                bail!(
+                    "daemon is locked. unlock the daemon via TUI first, or set TAI_KEYSTORE_PASSPHRASE env var"
+                );
             } else {
                 bail!("no '{platform}' credential found in keystore");
             }
@@ -102,7 +105,12 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_platform(platform: &str, bot_token: String, reader: BufReader<UnixStream>, writer: BufWriter<UnixStream>) {
+fn run_platform(
+    platform: &str,
+    bot_token: String,
+    reader: BufReader<UnixStream>,
+    writer: BufWriter<UnixStream>,
+) {
     match platform {
         "telegram" => {
             let admin_ids_str = env::var("TAI_TELEGRAM_USER_IDS").unwrap_or_default();
@@ -112,7 +120,9 @@ fn run_platform(platform: &str, bot_token: String, reader: BufReader<UnixStream>
                 .collect();
 
             if admin_ids.is_empty() {
-                error!("TAI_TELEGRAM_USER_IDS must be set to a comma-separated list of Telegram user IDs");
+                error!(
+                    "TAI_TELEGRAM_USER_IDS must be set to a comma-separated list of Telegram user IDs"
+                );
                 return;
             }
 

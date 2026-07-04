@@ -165,10 +165,9 @@ mod tests {
 
     #[test]
     fn test_invalid_arguments() {
-        let result: ToolResult = ToolError::InvalidArguments(
-            serde_json::from_str::<serde_json::Value>("").unwrap_err(),
-        )
-        .into();
+        let result: ToolResult =
+            ToolError::InvalidArguments(serde_json::from_str::<serde_json::Value>("").unwrap_err())
+                .into();
         assert!(result.is_error);
         assert!(result.content.contains("invalid arguments"));
     }

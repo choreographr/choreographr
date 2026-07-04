@@ -1,5 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use tai_client_core::{ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem, StreamingText};
+use tai_client_core::{
+    ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
+    StreamingText,
+};
 use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
 
 pub(crate) type StreamingEntry = StreamingText;
@@ -53,12 +56,7 @@ impl AppState {
         self.client.begin_stream(request_id);
     }
 
-    pub(crate) fn append_stream(
-        &mut self,
-        request_id: u32,
-        stream: OutputStream,
-        chunk: &str,
-    ) {
+    pub(crate) fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
         self.client.append_stream(request_id, stream, chunk);
     }
 
@@ -101,11 +99,20 @@ impl DaemonMessageHandler for AppState {
         self.client.pending_images.drop_request(request_id);
     }
 
-    fn handle_image_start(&mut self, request_id: u32, metadata: ImageMetadata) -> Result<(), ClientError> {
+    fn handle_image_start(
+        &mut self,
+        request_id: u32,
+        metadata: ImageMetadata,
+    ) -> Result<(), ClientError> {
         self.client.start_image(request_id, metadata)
     }
 
-    fn handle_image_chunk(&mut self, request_id: u32, image_id: u32, data: &[u8]) -> Result<(), ClientError> {
+    fn handle_image_chunk(
+        &mut self,
+        request_id: u32,
+        image_id: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
         self.client.push_image_chunk(request_id, image_id, data)
     }
 

@@ -18,7 +18,10 @@ pub fn execute_git_log_tool(arguments_json: &str, cwd: Option<&std::path::Path>)
     }
 }
 
-fn execute_git_log_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_git_log_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let args: GitLogArgs = serde_json::from_str(arguments_json)?;
     let output = git_log_impl(
         args.repo_path.as_deref(),
@@ -28,7 +31,11 @@ fn execute_git_log_inner(arguments_json: &str, cwd: Option<&std::path::Path>) ->
     Ok(truncate_tool_output(&output))
 }
 
-pub(crate) fn git_log_impl(repo_path: Option<&str>, limit: usize, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+pub(crate) fn git_log_impl(
+    repo_path: Option<&str>,
+    limit: usize,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let repo = open_repo(repo_path, cwd)?;
     let head = match repo.head_id() {
         Ok(head) => head,
@@ -73,7 +80,9 @@ pub(crate) fn git_log_impl(repo_path: Option<&str>, limit: usize, cwd: Option<&s
     Ok(out.trim_end().to_string())
 }
 
-define_tool_with_cwd!(GitLog, "git_log",
+define_tool_with_cwd!(
+    GitLog,
+    "git_log",
     "Show recent Git commits for the repository containing the given path.",
     execute_git_log_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"max_count":{"type":"integer","minimum":1,"maximum":100,"default":10}},"additionalProperties":false})

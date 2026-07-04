@@ -48,8 +48,7 @@ impl<TImage> ClientHistory<TImage> {
 
     pub fn insert_text_before_stream(&mut self, request_id: u32, text: impl Into<String>) {
         if let Some(&index) = self.in_progress.get(&request_id) {
-            self.history
-                .insert(index, HistoryItem::Text(text.into()));
+            self.history.insert(index, HistoryItem::Text(text.into()));
             for idx in self.in_progress.values_mut() {
                 if *idx >= index {
                     *idx += 1;
@@ -88,7 +87,11 @@ impl<TImage> ClientHistory<TImage> {
         self.pending_images.drop_request(request_id);
     }
 
-    pub fn start_image(&mut self, request_id: u32, metadata: ImageMetadata) -> Result<(), ClientError> {
+    pub fn start_image(
+        &mut self,
+        request_id: u32,
+        metadata: ImageMetadata,
+    ) -> Result<(), ClientError> {
         self.pending_images.start(request_id, metadata)
     }
 
@@ -101,7 +104,11 @@ impl<TImage> ClientHistory<TImage> {
         self.pending_images.push_chunk(request_id, image_id, data)
     }
 
-    pub fn finish_image(&mut self, request_id: u32, image_id: u32) -> Result<(ImageMetadata, Vec<u8>), ClientError> {
+    pub fn finish_image(
+        &mut self,
+        request_id: u32,
+        image_id: u32,
+    ) -> Result<(ImageMetadata, Vec<u8>), ClientError> {
         self.pending_images.finish(request_id, image_id)
     }
 
@@ -118,6 +125,7 @@ impl<TImage> ClientHistory<TImage> {
         for index in self.in_progress.values_mut() {
             *index = index.saturating_sub(excess);
         }
-        self.in_progress.retain(|_, index| *index < self.history.len());
+        self.in_progress
+            .retain(|_, index| *index < self.history.len());
     }
 }

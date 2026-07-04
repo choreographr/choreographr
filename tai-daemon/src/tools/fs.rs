@@ -1,11 +1,11 @@
 use super::{ToolError, ToolResult, resolve_path, sha256_hex, tool_ok, truncate_tool_output};
 use serde::Deserialize;
+use std::{fs::OpenOptions, io::Write};
 use std::{
     io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
-use std::{fs::OpenOptions, io::Write};
 
 #[derive(Debug, Deserialize)]
 struct WriteFileArgs {
@@ -42,17 +42,25 @@ struct LineCountArgs {
     path: String,
 }
 
-pub(crate) fn execute_line_count_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+pub(crate) fn execute_line_count_tool(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> ToolResult {
     match execute_line_count_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-fn execute_line_count_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_line_count_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let args: LineCountArgs = serde_json::from_str(arguments_json)?;
     if args.path.trim().is_empty() {
-        return Err(ToolError::Other("missing required string argument: path".to_string()));
+        return Err(ToolError::Other(
+            "missing required string argument: path".to_string(),
+        ));
     }
     let resolved = resolve_path(&args.path, cwd);
     let content = std::fs::read_to_string(&resolved)?;
@@ -60,14 +68,20 @@ fn execute_line_count_inner(arguments_json: &str, cwd: Option<&std::path::Path>)
     Ok(format!("{}: {} lines", resolved.display(), line_count))
 }
 
-pub(crate) fn execute_read_file_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+pub(crate) fn execute_read_file_tool(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> ToolResult {
     match execute_read_file_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-fn execute_read_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_read_file_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let path = serde_json::from_str::<serde_json::Value>(arguments_json)
         .ok()
         .and_then(|value| {
@@ -83,19 +97,27 @@ fn execute_read_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>) 
     Ok(truncate_tool_output(&content))
 }
 
-pub(crate) fn execute_read_file_range_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+pub(crate) fn execute_read_file_range_tool(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> ToolResult {
     match execute_read_file_range_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-fn execute_read_file_range_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_read_file_range_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     const MAX_READ_FILE_RANGE_LINES: usize = 200;
 
     let args: ReadFileRangeArgs = serde_json::from_str(arguments_json)?;
     if args.path.trim().is_empty() {
-        return Err(ToolError::Other("missing required string argument: path".to_string()));
+        return Err(ToolError::Other(
+            "missing required string argument: path".to_string(),
+        ));
     }
 
     if args.start_line == 0 {
@@ -107,7 +129,9 @@ fn execute_read_file_range_inner(arguments_json: &str, cwd: Option<&std::path::P
     }
 
     if args.max_lines > MAX_READ_FILE_RANGE_LINES {
-        return Err(ToolError::Other(format!("max_lines must be <= {MAX_READ_FILE_RANGE_LINES}")));
+        return Err(ToolError::Other(format!(
+            "max_lines must be <= {MAX_READ_FILE_RANGE_LINES}"
+        )));
     }
 
     let resolved = resolve_path(&args.path, cwd);
@@ -129,7 +153,10 @@ fn execute_read_file_range_inner(arguments_json: &str, cwd: Option<&std::path::P
 
     let mut output = format!(
         "path: {}\nlines: {}-{} of {}\n\n",
-        resolved.display(), args.start_line, end_line, total_lines
+        resolved.display(),
+        args.start_line,
+        end_line,
+        total_lines
     );
 
     for (index, line) in lines[start_idx..end_idx].iter().enumerate() {
@@ -140,14 +167,20 @@ fn execute_read_file_range_inner(arguments_json: &str, cwd: Option<&std::path::P
     Ok(truncate_tool_output(&output))
 }
 
-pub(crate) fn execute_list_files_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+pub(crate) fn execute_list_files_tool(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> ToolResult {
     match execute_list_files_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-fn execute_list_files_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_list_files_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let path = serde_json::from_str::<serde_json::Value>(arguments_json)
         .ok()
         .and_then(|value| {
@@ -172,14 +205,20 @@ fn execute_list_files_inner(arguments_json: &str, cwd: Option<&std::path::Path>)
     Ok(truncate_tool_output(&names.join("\n")))
 }
 
-pub(crate) fn execute_write_file_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+pub(crate) fn execute_write_file_tool(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> ToolResult {
     match execute_write_file_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-fn execute_write_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_write_file_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let args: WriteFileArgs = serde_json::from_str(arguments_json)?;
 
     let path = validate_nonempty_path(&args.path)?;
@@ -191,7 +230,10 @@ fn execute_write_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>)
         Err(error) => {
             let overwrite = args.overwrite.unwrap_or(true);
             if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
-                Err(ToolError::Other(format!("refusing to overwrite existing file: {}", resolved.display())))
+                Err(ToolError::Other(format!(
+                    "refusing to overwrite existing file: {}",
+                    resolved.display()
+                )))
             } else {
                 Err(ToolError::Io(error))
             }
@@ -199,20 +241,28 @@ fn execute_write_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>)
     }
 }
 
-pub(crate) fn execute_edit_file_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
+pub(crate) fn execute_edit_file_tool(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> ToolResult {
     match execute_edit_file_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-fn execute_edit_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_edit_file_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let args: EditFileArgs = serde_json::from_str(arguments_json)?;
 
     let path = validate_nonempty_path(&args.path)?;
 
     if args.edits.is_empty() {
-        return Err(ToolError::Other("missing required array argument: edits".to_string()));
+        return Err(ToolError::Other(
+            "missing required array argument: edits".to_string(),
+        ));
     }
 
     let resolved = resolve_path(&path, cwd);
@@ -230,15 +280,23 @@ fn execute_edit_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>) 
         }
     }
 
-    let edit_summary = apply_text_edits(&original_content, &args.edits)
-        .map_err(ToolError::Other)?;
+    let edit_summary =
+        apply_text_edits(&original_content, &args.edits).map_err(ToolError::Other)?;
 
     if args.dry_run.unwrap_or(false) {
-        return Ok(format_edit_result("would edit", &resolved.display().to_string(), &edit_summary));
+        return Ok(format_edit_result(
+            "would edit",
+            &resolved.display().to_string(),
+            &edit_summary,
+        ));
     }
 
     match write_text_file(&resolved, &edit_summary.content, true) {
-        Ok(()) => Ok(format_edit_result("edited", &resolved.display().to_string(), &edit_summary)),
+        Ok(()) => Ok(format_edit_result(
+            "edited",
+            &resolved.display().to_string(),
+            &edit_summary,
+        )),
         Err(error) => Err(ToolError::Io(error)),
     }
 }
@@ -246,7 +304,9 @@ fn execute_edit_file_inner(arguments_json: &str, cwd: Option<&std::path::Path>) 
 fn validate_nonempty_path(path: &str) -> Result<String, ToolError> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
-        Err(ToolError::Other("missing required string argument: path".to_string()))
+        Err(ToolError::Other(
+            "missing required string argument: path".to_string(),
+        ))
     } else {
         Ok(trimmed.to_string())
     }
@@ -383,7 +443,9 @@ fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) ->
     )
 }
 
-define_tool_with_cwd!(ReadFile, "read_file",
+define_tool_with_cwd!(
+    ReadFile,
+    "read_file",
     "Read a UTF-8 text file from the local workspace.",
     execute_read_file_tool,
     serde_json::json!({
@@ -399,7 +461,9 @@ define_tool_with_cwd!(ReadFile, "read_file",
     })
 );
 
-define_tool_with_cwd!(ReadFileRange, "read_file_range",
+define_tool_with_cwd!(
+    ReadFileRange,
+    "read_file_range",
     "Read a line range from a UTF-8 text file in the local workspace.",
     execute_read_file_range_tool,
     serde_json::json!({
@@ -426,7 +490,9 @@ define_tool_with_cwd!(ReadFileRange, "read_file_range",
     })
 );
 
-define_tool_with_cwd!(ListFiles, "list_files",
+define_tool_with_cwd!(
+    ListFiles,
+    "list_files",
     "List files in a local directory.",
     execute_list_files_tool,
     serde_json::json!({
@@ -442,7 +508,9 @@ define_tool_with_cwd!(ListFiles, "list_files",
     })
 );
 
-define_tool_with_cwd!(LineCount, "line_count",
+define_tool_with_cwd!(
+    LineCount,
+    "line_count",
     "Count the number of lines in a UTF-8 text file.",
     execute_line_count_tool,
     serde_json::json!({
@@ -458,7 +526,9 @@ define_tool_with_cwd!(LineCount, "line_count",
     })
 );
 
-define_tool_with_cwd!(WriteFile, "write_file",
+define_tool_with_cwd!(
+    WriteFile,
+    "write_file",
     "Write a UTF-8 text file to the local workspace.",
     execute_write_file_tool,
     serde_json::json!({
@@ -488,7 +558,9 @@ define_tool_with_cwd!(WriteFile, "write_file",
     })
 );
 
-define_tool_with_cwd!(EditFile, "edit_file",
+define_tool_with_cwd!(
+    EditFile,
+    "edit_file",
     "Edit a UTF-8 text file by applying one or more exact text replacements. Each edit must match at least once; non-replace_all edits must match exactly once.",
     execute_edit_file_tool,
     serde_json::json!({

@@ -87,9 +87,7 @@ impl DaemonBridge {
                 match read_message_sync::<_, DaemonMessage>(&mut reader) {
                     Ok(msg) => {
                         debug!(?msg, "received daemon message");
-                        for event in
-                            daemon_to_bridge_events(msg, &mut assembler, &mut buffers)
-                        {
+                        for event in daemon_to_bridge_events(msg, &mut assembler, &mut buffers) {
                             if event_tx.blocking_send(event).is_err() {
                                 warn!("bridge event receiver dropped, reader task exiting");
                                 return;
@@ -103,8 +101,8 @@ impl DaemonBridge {
                         ) =>
                     {
                         error!(%e, "daemon disconnected");
-                        if let Err(send_err) = event_tx
-                            .blocking_send(BridgeEvent::Error("daemon disconnected".into()))
+                        if let Err(send_err) =
+                            event_tx.blocking_send(BridgeEvent::Error("daemon disconnected".into()))
                         {
                             warn!("failed to send disconnect error event: {send_err}");
                         }
@@ -112,8 +110,8 @@ impl DaemonBridge {
                     }
                     Err(e) => {
                         error!(%e, "daemon read error, reader task exiting");
-                        if let Err(send_err) = event_tx
-                            .blocking_send(BridgeEvent::Error(format!("daemon error: {e}")))
+                        if let Err(send_err) =
+                            event_tx.blocking_send(BridgeEvent::Error(format!("daemon error: {e}")))
                         {
                             warn!("failed to send daemon error event: {send_err}");
                         }
@@ -129,7 +127,12 @@ impl DaemonBridge {
         }
     }
 
-    pub fn into_parts(self) -> (mpsc::Sender<DaemonBridgeCommand>, mpsc::Receiver<BridgeEvent>) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        mpsc::Sender<DaemonBridgeCommand>,
+        mpsc::Receiver<BridgeEvent>,
+    ) {
         (self.client_tx, self.event_rx)
     }
 }
@@ -148,7 +151,9 @@ fn daemon_to_bridge_events(
             data,
         } => {
             let text = String::from_utf8_lossy(&data);
-            let entry = buffers.entry(request_id).or_insert_with(|| StreamingText::new(request_id));
+            let entry = buffers
+                .entry(request_id)
+                .or_insert_with(|| StreamingText::new(request_id));
             entry.append(stream, &text);
         }
         DaemonMessage::Done { request_id } => {
@@ -166,16 +171,11 @@ fn daemon_to_bridge_events(
                 }
             }
         }
-        DaemonMessage::Failed {
-            request_id,
-            error,
-        } => {
+        DaemonMessage::Failed { request_id, error } => {
             buffers.remove(&request_id);
             events.push(BridgeEvent::Error(error));
         }
-        DaemonMessage::Cancelled {
-            request_id,
-        } => {
+        DaemonMessage::Cancelled { request_id } => {
             buffers.remove(&request_id);
             events.push(BridgeEvent::Error("cancelled".into()));
         }
@@ -224,9 +224,7 @@ fn daemon_to_bridge_events(
                     data,
                 });
             }
-            Err(e) => events.push(BridgeEvent::Error(format!(
-                "image assembly failed: {e}"
-            ))),
+            Err(e) => events.push(BridgeEvent::Error(format!("image assembly failed: {e}"))),
         },
         DaemonMessage::Models {
             models,
@@ -564,11 +562,7 @@ mod tests {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
 
-        let events = daemon_to_bridge_events(
-            DaemonMessage::Pong,
-            &mut assembler,
-            &mut buffers,
-        );
+        let events = daemon_to_bridge_events(DaemonMessage::Pong, &mut assembler, &mut buffers);
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], BridgeEvent::Pong));
     }

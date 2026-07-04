@@ -2,9 +2,7 @@ mod client;
 mod render;
 mod state;
 
-use crate::client::{
-    apply_daemon_message, run_client, send_client_message, submit_input,
-};
+use crate::client::{apply_daemon_message, run_client, send_client_message, submit_input};
 use crate::render::render_history_item;
 use crate::state::{AppState, UiEvent};
 use dioxus::desktop::{Config, WindowBuilder};
@@ -44,7 +42,9 @@ fn App() -> Element {
         });
         let monitor_tx = ui_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle.await && e.is_panic() {
+            if let Err(e) = handle.await
+                && e.is_panic()
+            {
                 if let Err(e) = monitor_tx.send(UiEvent::ReaderFailed(
                     "client reader task panicked".to_string(),
                 )) {
@@ -61,71 +61,65 @@ fn App() -> Element {
         move || {
             let tx = tx.clone();
             async move {
-            loop {
-                let event = {
-                    let mut guard = events_rx.write();
-                    let Some(rx) = guard.as_mut() else {
-                        drop(guard);
-                        tokio::task::yield_now().await;
-                        continue;
-                    };
-                    rx.recv().await
-                };
-
-                let Some(event) = event else {
-                    break;
-                };
-
-                match event {
-                    UiEvent::Daemon(message) => {
-                        let result = {
-                            let mut app_state = state.write();
-                            apply_daemon_message(&mut app_state, message, tx.clone())
+                loop {
+                    let event = {
+                        let mut guard = events_rx.write();
+                        let Some(rx) = guard.as_mut() else {
+                            drop(guard);
+                            tokio::task::yield_now().await;
+                            continue;
                         };
-                        if let Err(error) = result {
-                            state.write().push_text(format!(
-                                "[client] failed to process daemon message: {error}"
-                            ));
+                        rx.recv().await
+                    };
+
+                    let Some(event) = event else {
+                        break;
+                    };
+
+                    match event {
+                        UiEvent::Daemon(message) => {
+                            let result = {
+                                let mut app_state = state.write();
+                                apply_daemon_message(&mut app_state, message, tx.clone())
+                            };
+                            if let Err(error) = result {
+                                state.write().push_text(format!(
+                                    "[client] failed to process daemon message: {error}"
+                                ));
+                            }
                         }
-                    }
-                    UiEvent::ReaderClosed => {
-                        state.write().push_text("daemon connection closed");
-                    }
-                    UiEvent::ReaderFailed(error) => {
-                        state
-                            .write()
-                            .push_text(format!("[client] connection error: {error}"));
+                        UiEvent::ReaderClosed => {
+                            state.write().push_text("daemon connection closed");
+                        }
+                        UiEvent::ReaderFailed(error) => {
+                            state
+                                .write()
+                                .push_text(format!("[client] connection error: {error}"));
+                        }
                     }
                 }
             }
         }
-        }
     });
 
-    let mut on_submit_keydown = { let t = tx.clone(); move || submit_input(&mut state, t.clone()) };
+    let mut on_submit_keydown = {
+        let t = tx.clone();
+        move || submit_input(&mut state, t.clone())
+    };
 
-    let mut on_submit_click = { let t = tx.clone(); move || submit_input(&mut state, t.clone()) };
+    let mut on_submit_click = {
+        let t = tx.clone();
+        move || submit_input(&mut state, t.clone())
+    };
 
     let on_ping = {
         let t = tx.clone();
-        move |_| {
-            send_client_message(
-                &mut state.write(),
-                t.clone(),
-                ClientMessage::Ping,
-            )
-        }
+        move |_| send_client_message(&mut state.write(), t.clone(), ClientMessage::Ping)
     };
 
     let on_models = {
         let t = tx.clone();
-        move |_| {
-            send_client_message(
-                &mut state.write(),
-                t.clone(),
-                ClientMessage::ListModels,
-            )
-        }
+        move |_| send_client_message(&mut state.write(), t.clone(), ClientMessage::ListModels)
     };
 
     let on_cancel = {

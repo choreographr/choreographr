@@ -37,15 +37,15 @@ async fn evm_logs_impl(
     let mut filter = Filter::new();
 
     if let Some(addr) = address_str {
-        let address =
-            Address::from_str(addr).map_err(|e| ToolError::Other(format!("invalid address: {e}")))?;
+        let address = Address::from_str(addr)
+            .map_err(|e| ToolError::Other(format!("invalid address: {e}")))?;
         filter = filter.address(address);
     }
 
     if let Some(t0) = topic0_str {
         let stripped = t0.strip_prefix("0x").unwrap_or(t0);
-        let topic =
-            B256::from_str(stripped).map_err(|e| ToolError::Other(format!("invalid topic0: {e}")))?;
+        let topic = B256::from_str(stripped)
+            .map_err(|e| ToolError::Other(format!("invalid topic0: {e}")))?;
         filter = filter.event_signature(topic);
     }
 
@@ -80,7 +80,9 @@ async fn evm_logs_impl(
     Ok(out)
 }
 
-define_tool!(EvmLogs, "evm_logs",
+define_tool!(
+    EvmLogs,
+    "evm_logs",
     "Query event logs on an EVM blockchain with optional filters by contract address, topic0, and block range.",
     execute_evm_logs_tool,
     serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"address":{"type":"string","description":"Optional 0x-prefixed contract address to filter logs by"},"topic0":{"type":"string","description":"Optional 0x-prefixed event signature hash (topic0) to filter by"},"from_block":{"type":"string","description":"Optional starting block number or tag (e.g., '0x0', 'latest')"},"to_block":{"type":"string","description":"Optional ending block number or tag (e.g., '0x0', 'latest')"}},"required":["rpc_url"],"additionalProperties":false})

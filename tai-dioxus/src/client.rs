@@ -21,6 +21,7 @@ pub(crate) fn run_client(
             }
         },
         client_rx,
+        None,
     );
     if result.is_ok() {
         if let Err(e) = ui_tx.send(UiEvent::ReaderClosed) {
@@ -54,9 +55,7 @@ pub(crate) fn handle_shell_command(
         ShellCommand::InvalidCancel(value) => {
             state.push_text(format!("invalid request id: {value}"))
         }
-        ShellCommand::UnknownCommand(error) => {
-            state.push_text(error)
-        }
+        ShellCommand::UnknownCommand(error) => state.push_text(error),
         ShellCommand::Send(message) => send_client_message(state, daemon_tx, message),
     }
 }

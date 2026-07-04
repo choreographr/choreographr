@@ -22,7 +22,10 @@ pub fn execute_git_diff_tool(arguments_json: &str, cwd: Option<&std::path::Path>
     }
 }
 
-fn execute_git_diff_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_git_diff_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let args: GitDiffArgs = serde_json::from_str(arguments_json)?;
     let output = git_diff_impl(
         args.repo_path.as_deref(),
@@ -88,7 +91,9 @@ fn collect_worktree_diff_lines(
     Ok(lines)
 }
 
-define_tool_with_cwd!(GitDiff, "git_diff",
+define_tool_with_cwd!(
+    GitDiff,
+    "git_diff",
     "Show the diff for a file or repository.",
     execute_git_diff_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"cached":{"type":"boolean","description":"Show staged (cached) changes instead of worktree changes","default":false},"pathspec":{"type":"array","items":{"type":"string"},"description":"Optional pathspecs to filter"},"additionalProperties":false}})

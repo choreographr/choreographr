@@ -56,7 +56,8 @@ pub(crate) fn execute_subxt_balance_tool(arguments_json: &str) -> ToolResult {
 fn execute_subxt_balance_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: SubxtBalanceArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = tokio::runtime::Handle::current().block_on(subxt_balance_impl(&ws_url, &args.address))?;
+    let output =
+        tokio::runtime::Handle::current().block_on(subxt_balance_impl(&ws_url, &args.address))?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -70,9 +71,12 @@ pub(crate) fn execute_subxt_query_tool(arguments_json: &str) -> ToolResult {
 fn execute_subxt_query_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: SubxtQueryArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = tokio::runtime::Handle::current().block_on(
-        subxt_query_impl(&ws_url, &args.pallet, &args.storage_item, args.key.as_deref()),
-    )?;
+    let output = tokio::runtime::Handle::current().block_on(subxt_query_impl(
+        &ws_url,
+        &args.pallet,
+        &args.storage_item,
+        args.key.as_deref(),
+    ))?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -86,7 +90,8 @@ pub(crate) fn execute_subxt_block_tool(arguments_json: &str) -> ToolResult {
 fn execute_subxt_block_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: SubxtBlockArgs = serde_json::from_str(arguments_json)?;
     let ws_url = args.ws_url.unwrap_or_else(|| DEFAULT_WS_URL.to_string());
-    let output = tokio::runtime::Handle::current().block_on(subxt_block_impl(&ws_url, args.block_number))?;
+    let output =
+        tokio::runtime::Handle::current().block_on(subxt_block_impl(&ws_url, args.block_number))?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -110,8 +115,14 @@ async fn subxt_chain_impl(ws_url: &str) -> Result<String, ToolError> {
     let rpc = connect_rpc(ws_url).await?;
     let client = connect_client(ws_url).await?;
 
-    let chain: String = rpc.request("system_chain", subxt::rpcs::rpc_params![]).await.map_err(subxt_err)?;
-    let name: String = rpc.request("system_name", subxt::rpcs::rpc_params![]).await.map_err(subxt_err)?;
+    let chain: String = rpc
+        .request("system_chain", subxt::rpcs::rpc_params![])
+        .await
+        .map_err(subxt_err)?;
+    let name: String = rpc
+        .request("system_name", subxt::rpcs::rpc_params![])
+        .await
+        .map_err(subxt_err)?;
     let version: String = rpc
         .request("system_version", subxt::rpcs::rpc_params![])
         .await
@@ -172,7 +183,9 @@ async fn subxt_balance_impl(ws_url: &str, address: &str) -> Result<String, ToolE
             let decoded: subxt::dynamic::Value = storage_value.decode().map_err(subxt_err)?;
             Ok(format_balance_value(&decoded, address))
         }
-        None => Ok(format!("address {address}: account does not exist on chain")),
+        None => Ok(format!(
+            "address {address}: account does not exist on chain"
+        )),
     }
 }
 
@@ -194,7 +207,8 @@ async fn subxt_query_impl(
 
     let key_parts: Vec<subxt::dynamic::Value> = match key_hex {
         Some(hex) => {
-            let bytes = hex::decode(hex).map_err(|e| ToolError::Other(format!("invalid hex key: {e}")))?;
+            let bytes =
+                hex::decode(hex).map_err(|e| ToolError::Other(format!("invalid hex key: {e}")))?;
             vec![subxt::dynamic::Value::from_bytes(bytes)]
         }
         None => vec![],
@@ -209,8 +223,8 @@ async fn subxt_query_impl(
     match result {
         Some(storage_value) => {
             let decoded: subxt::dynamic::Value = storage_value.decode().map_err(subxt_err)?;
-            let json = serde_json::to_string_pretty(&decoded)
-                .unwrap_or_else(|_| format!("{decoded:?}"));
+            let json =
+                serde_json::to_string_pretty(&decoded).unwrap_or_else(|_| format!("{decoded:?}"));
             Ok(json)
         }
         None => Ok("storage value: None (no value found at this key)".to_string()),
@@ -262,7 +276,9 @@ async fn subxt_block_impl(ws_url: &str, block_number: Option<u64>) -> Result<Str
     Ok(out)
 }
 
-define_tool!(SubxtChain, "subxt_chain",
+define_tool!(
+    SubxtChain,
+    "subxt_chain",
     "Query information about a Substrate/Polkadot blockchain node: chain name, chain type, node name/version, genesis hash, best block, finalized head, system properties, and health.",
     execute_subxt_chain_tool,
     serde_json::json!({
@@ -278,7 +294,9 @@ define_tool!(SubxtChain, "subxt_chain",
     })
 );
 
-define_tool!(SubxtBalance, "subxt_balance",
+define_tool!(
+    SubxtBalance,
+    "subxt_balance",
     "Query the balance of an account on a Substrate/Polkadot blockchain. Returns the System.Account info (free, reserved, frozen balances).",
     execute_subxt_balance_tool,
     serde_json::json!({
@@ -299,7 +317,9 @@ define_tool!(SubxtBalance, "subxt_balance",
     })
 );
 
-define_tool!(SubxtQuery, "subxt_query",
+define_tool!(
+    SubxtQuery,
+    "subxt_query",
     "Query a storage value from a Substrate/Polkadot blockchain by pallet and storage item name. Returns the decoded SCALE value as JSON.",
     execute_subxt_query_tool,
     serde_json::json!({
@@ -328,7 +348,9 @@ define_tool!(SubxtQuery, "subxt_query",
     })
 );
 
-define_tool!(SubxtBlock, "subxt_block",
+define_tool!(
+    SubxtBlock,
+    "subxt_block",
     "Get details about a block on a Substrate/Polkadot blockchain: block number, hash, parent hash, state root, extrinsics root, and full block JSON.",
     execute_subxt_block_tool,
     serde_json::json!({

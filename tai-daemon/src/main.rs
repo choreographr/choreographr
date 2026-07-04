@@ -1,8 +1,8 @@
 use anyhow::Context;
+use std::sync::Arc;
 use tai_daemon::daemon::DaemonState;
 use tai_daemon::openai::load_service_config;
 use tai_proto::socket_path;
-use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -11,12 +11,16 @@ const DEFAULT_MAX_TURNS: u32 = 25;
 fn resolve_max_turns() -> u32 {
     if let Ok(val) = std::env::var("TAI_MAX_TURNS") {
         if let Ok(n) = val.parse::<u32>() {
-            if n > 0 { return n; }
+            if n > 0 {
+                return n;
+            }
         }
     }
     if let Ok(config) = load_service_config() {
         if let Some(n) = config.max_turns {
-            if n > 0 { return n; }
+            if n > 0 {
+                return n;
+            }
         }
     }
     DEFAULT_MAX_TURNS
@@ -25,7 +29,9 @@ fn resolve_max_turns() -> u32 {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .init();
 
@@ -49,5 +55,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let socket_path = socket_path();
-    tai_daemon::run_server(&socket_path, state).await.context("failed to run server")
+    tai_daemon::run_server(&socket_path, state)
+        .await
+        .context("failed to run server")
 }

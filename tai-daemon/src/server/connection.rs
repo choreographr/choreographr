@@ -7,7 +7,10 @@ use tai_proto::{ClientMessage, DaemonMessage, ProtoError, read_message_sync, wri
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error};
 
-pub(crate) fn client_thread(stream: UnixStream, daemon_tx: UnboundedSender<DaemonCommand>) -> io::Result<()> {
+pub(crate) fn client_thread(
+    stream: UnixStream,
+    daemon_tx: UnboundedSender<DaemonCommand>,
+) -> io::Result<()> {
     let reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
 
@@ -30,7 +33,12 @@ pub(crate) fn client_thread(stream: UnixStream, daemon_tx: UnboundedSender<Daemo
         match read_message_sync::<_, ClientMessage>(&mut reader) {
             Ok(msg) => {
                 match msg {
-                    ClientMessage::CreateSession { title, parent_session_id, cwd, max_turns } => {
+                    ClientMessage::CreateSession {
+                        title,
+                        parent_session_id,
+                        cwd,
+                        max_turns,
+                    } => {
                         let cwd_str = cwd.clone();
                         let (reply, rx) = mpsc::channel();
                         let _ = daemon_tx.send(DaemonCommand::CreateSession {
@@ -57,7 +65,8 @@ pub(crate) fn client_thread(stream: UnixStream, daemon_tx: UnboundedSender<Daemo
                                     cwd: cwd_str,
                                     max_turns,
                                 });
-                                let _ = writer_tx.send(DaemonMessage::SessionAttached { session_id: sid });
+                                let _ = writer_tx
+                                    .send(DaemonMessage::SessionAttached { session_id: sid });
                                 attached_session_tx = Some(session_tx);
                                 attached_session_id = Some(sid);
                             }
@@ -82,7 +91,8 @@ pub(crate) fn client_thread(stream: UnixStream, daemon_tx: UnboundedSender<Daemo
                                     client_id,
                                     tx: writer_tx.clone(),
                                 });
-                                let _ = writer_tx.send(DaemonMessage::SessionAttached { session_id });
+                                let _ =
+                                    writer_tx.send(DaemonMessage::SessionAttached { session_id });
                                 attached_session_tx = Some(session_tx);
                                 attached_session_id = Some(session_id);
                             }
@@ -133,11 +143,19 @@ pub(crate) fn client_thread(stream: UnixStream, daemon_tx: UnboundedSender<Daemo
                         handle_get_credential_sync(&daemon_tx, &writer_tx, service);
                     }
                     _ => {
-                        debug!("unhandled client message: {:?}", std::mem::discriminant(&msg));
+                        debug!(
+                            "unhandled client message: {:?}",
+                            std::mem::discriminant(&msg)
+                        );
                     }
                 }
             }
-            Err(ProtoError::Io(e)) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset) => {
+            Err(ProtoError::Io(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                ) =>
+            {
                 debug!("client disconnected");
                 break;
             }
@@ -188,10 +206,16 @@ fn handle_list_models_sync(
     attached_session_id: Option<u64>,
 ) {
     let (reply, rx) = mpsc::channel();
-    let _ = daemon_tx.send(DaemonCommand::ListModels { session_id: attached_session_id, reply });
+    let _ = daemon_tx.send(DaemonCommand::ListModels {
+        session_id: attached_session_id,
+        reply,
+    });
     match rx.recv() {
         Ok(Ok((models, selected_model))) => {
-            let _ = writer_tx.send(DaemonMessage::Models { models, selected_model });
+            let _ = writer_tx.send(DaemonMessage::Models {
+                models,
+                selected_model,
+            });
         }
         Ok(Err(e)) => {
             let _ = writer_tx.send(DaemonMessage::ModelsFailed { error: e });
@@ -206,10 +230,16 @@ fn handle_get_credential_sync(
     service: String,
 ) {
     let (reply, rx) = mpsc::channel();
-    let _ = daemon_tx.send(DaemonCommand::GetCredential { service: service.clone(), reply });
+    let _ = daemon_tx.send(DaemonCommand::GetCredential {
+        service: service.clone(),
+        reply,
+    });
     match rx.recv() {
         Ok(Some(key)) => {
-            let _ = writer_tx.send(DaemonMessage::Credential { service, key: Some(key) });
+            let _ = writer_tx.send(DaemonMessage::Credential {
+                service,
+                key: Some(key),
+            });
         }
         Ok(None) => {
             let _ = writer_tx.send(DaemonMessage::Credential { service, key: None });

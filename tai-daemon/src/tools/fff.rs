@@ -1,4 +1,5 @@
 use super::{ToolError, ToolResult, tool_ok, truncate_tool_output};
+use fff_search::*;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -6,7 +7,6 @@ use std::{
     sync::{Arc, OnceLock, RwLock},
     time::Duration,
 };
-use fff_search::*;
 
 const FFF_SCAN_TIMEOUT_SECS: u64 = 60;
 const FFF_DEFAULT_MAX_RESULTS: usize = 50;
@@ -35,12 +35,18 @@ fn frecency_db_path(path_hash: &str) -> PathBuf {
 }
 
 fn init_new_state(abs_path: &Path) -> std::result::Result<FffState, ToolError> {
-    let path_str = abs_path.to_str().ok_or_else(|| ToolError::Other("non-utf8 path".to_string()))?;
+    let path_str = abs_path
+        .to_str()
+        .ok_or_else(|| ToolError::Other("non-utf8 path".to_string()))?;
     let hash = super::sha256_hex(path_str);
     let frecency_path = frecency_db_path(&hash);
 
-    std::fs::create_dir_all(&frecency_path)
-        .map_err(|e| ToolError::Other(format!("create frecency dir {}: {e}", frecency_path.display())))?;
+    std::fs::create_dir_all(&frecency_path).map_err(|e| {
+        ToolError::Other(format!(
+            "create frecency dir {}: {e}",
+            frecency_path.display()
+        ))
+    })?;
 
     let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
@@ -66,7 +72,10 @@ fn init_new_state(abs_path: &Path) -> std::result::Result<FffState, ToolError> {
 
     shared_picker.wait_for_scan(Duration::from_secs(FFF_SCAN_TIMEOUT_SECS));
 
-    Ok(FffState { shared_picker, _shared_frecency: shared_frecency })
+    Ok(FffState {
+        shared_picker,
+        _shared_frecency: shared_frecency,
+    })
 }
 
 fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, ToolError> {
@@ -76,7 +85,9 @@ fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, ToolError
     let abs = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
 
     {
-        let guard = cache.read().map_err(|e| ToolError::Other(format!("cache lock: {e}")))?;
+        let guard = cache
+            .read()
+            .map_err(|e| ToolError::Other(format!("cache lock: {e}")))?;
         if let Some(state) = guard.get(&abs) {
             return Ok(state.clone());
         }
@@ -90,7 +101,9 @@ fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, ToolError
     Ok(state)
 }
 
-define_tool_with_cwd!(Fff, "fff",
+define_tool_with_cwd!(
+    Fff,
+    "fff",
     "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes.",
     execute_fff_tool,
     serde_json::json!({
@@ -135,20 +148,31 @@ pub(crate) fn execute_fff_tool(arguments_json: &str, cwd: Option<&std::path::Pat
     }
 }
 
-fn execute_fff_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> std::result::Result<String, ToolError> {
+fn execute_fff_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> std::result::Result<String, ToolError> {
     let args: FffArgs = serde_json::from_str(arguments_json)?;
 
     let path = args.path.as_deref().unwrap_or(".");
     let resolved = super::resolve_path(path, cwd);
     let state = get_or_init_state(&resolved.display().to_string())?;
 
-    let guard = state.shared_picker.read()
+    let guard = state
+        .shared_picker
+        .read()
         .map_err(|e| ToolError::Other(format!("picker lock error: {e}")))?;
-    let picker = guard.as_ref()
-        .ok_or_else(|| ToolError::Other("fff picker not yet initialized (scan may still be in progress)".to_string()))?;
+    let picker = guard.as_ref().ok_or_else(|| {
+        ToolError::Other(
+            "fff picker not yet initialized (scan may still be in progress)".to_string(),
+        )
+    })?;
 
     let mode = args.mode.as_deref().unwrap_or("grep");
-    let max_results = args.max_results.unwrap_or(FFF_DEFAULT_MAX_RESULTS).min(FFF_MAX_RESULTS_CAP);
+    let max_results = args
+        .max_results
+        .unwrap_or(FFF_DEFAULT_MAX_RESULTS)
+        .min(FFF_MAX_RESULTS_CAP);
 
     match mode {
         "files" => {

@@ -80,10 +80,7 @@ fn status_to_error(
             detail: detail.to_string(),
         };
     }
-    super::OpenAiError::Io(io::Error::new(
-        io::ErrorKind::Other,
-        detail.to_string(),
-    ))
+    super::OpenAiError::Io(io::Error::new(io::ErrorKind::Other, detail.to_string()))
 }
 
 fn retry_send(
@@ -250,7 +247,9 @@ impl OpenAiClient {
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
         let retry = RetryConfig::from_service_config(&self.config);
         let response = retry_send_get(&self.http, &url, &self.api_key, &retry)?;
-        let payload: ModelListResponse = response.json().map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+        let payload: ModelListResponse = response
+            .json()
+            .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
         Ok(payload.data.into_iter().map(|model| model.id).collect())
     }
 
@@ -283,19 +282,22 @@ impl OpenAiClient {
         }
 
         match self.config.request_format_for_model(model) {
-            RequestFormat::Responses => {
-                responses_request_streaming(&self.http, &self.config, &self.api_key, model, prompt, &mut on_chunk)
-            }
-            RequestFormat::ChatCompletions => {
-                chat_completions_request_streaming(
-                    &self.http,
-                    &self.config,
-                    &self.api_key,
-                    model,
-                    prompt,
-                    &mut on_chunk,
-                )
-            }
+            RequestFormat::Responses => responses_request_streaming(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                model,
+                prompt,
+                &mut on_chunk,
+            ),
+            RequestFormat::ChatCompletions => chat_completions_request_streaming(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                model,
+                prompt,
+                &mut on_chunk,
+            ),
         }
     }
 
@@ -305,7 +307,14 @@ impl OpenAiClient {
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
     ) -> Result<ChatTurnResult, super::OpenAiError> {
-        chat_completions_request_with_tools(&self.http, &self.config, &self.api_key, model, messages, tools)
+        chat_completions_request_with_tools(
+            &self.http,
+            &self.config,
+            &self.api_key,
+            model,
+            messages,
+            tools,
+        )
     }
 }
 
@@ -322,9 +331,12 @@ fn responses_request(
         model,
         input: prompt,
         stream: false,
-    }).map_err(io::Error::other)?;
+    })
+    .map_err(io::Error::other)?;
     let response = retry_send(client, &url, api_key, &body, &retry)?;
-    let payload: ResponsesResponse = response.json().map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+    let payload: ResponsesResponse = response
+        .json()
+        .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
     let content = payload
         .output
@@ -365,9 +377,12 @@ fn chat_completions_request(
         stream_options: None,
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
-    }).map_err(io::Error::other)?;
+    })
+    .map_err(io::Error::other)?;
     let response = retry_send(client, &url, api_key, &body, &retry)?;
-    let payload: ChatCompletionsResponse = response.json().map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+    let payload: ChatCompletionsResponse = response
+        .json()
+        .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
     let content = payload
         .choices
@@ -409,9 +424,12 @@ fn chat_completions_request_with_tools(
         stream_options: None,
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
-    }).map_err(io::Error::other)?;
+    })
+    .map_err(io::Error::other)?;
     let response = retry_send(client, &url, api_key, &body, &retry)?;
-    let payload: ChatCompletionsResponse = response.json().map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+    let payload: ChatCompletionsResponse = response
+        .json()
+        .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
     let Some(choice) = payload.choices.into_iter().next() else {
         return Err(super::OpenAiError::EmptyResponse);
@@ -478,7 +496,8 @@ where
         }),
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
-    }).map_err(io::Error::other)?;
+    })
+    .map_err(io::Error::other)?;
     let response = retry_send(client, &url, api_key, &body, &retry)?;
     let body_bytes = response.bytes().map_err(io::Error::other)?.to_vec();
 
@@ -535,7 +554,8 @@ where
         model,
         input: prompt,
         stream: true,
-    }).map_err(io::Error::other)?;
+    })
+    .map_err(io::Error::other)?;
     let response = retry_send(client, &url, api_key, &body, &retry)?;
     let body_bytes = response.bytes().map_err(io::Error::other)?.to_vec();
 

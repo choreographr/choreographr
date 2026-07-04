@@ -64,5 +64,8 @@ fn image_assembler_rejects_oversized_chunks() {
     let error = assembler
         .push_chunk(1, 3, &[1, 2, 3])
         .expect_err("should fail");
-    assert!(matches!(error, ClientError::ImageExceedsSize { image_id: 3 }));
+    assert!(matches!(
+        error,
+        ClientError::ImageExceedsSize { image_id: 3 }
+    ));
 }

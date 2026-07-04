@@ -7,8 +7,7 @@ use serde::Deserialize;
 use std::{collections::BTreeSet, fmt::Write as _, io, path::Path};
 
 use super::{
-    describe_head, load_mutable_index, open_repo, pathspec_patterns,
-    repo_work_dir_display,
+    describe_head, load_mutable_index, open_repo, pathspec_patterns, repo_work_dir_display,
 };
 
 #[derive(Debug, Deserialize)]
@@ -24,7 +23,10 @@ pub fn execute_git_add_tool(arguments_json: &str, cwd: Option<&std::path::Path>)
     }
 }
 
-pub(super) fn execute_git_add_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+pub(super) fn execute_git_add_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let args: GitAddArgs = serde_json::from_str(arguments_json)?;
     let pathspec = normalize_pathspecs(args.pathspec)?;
     let output = git_add_impl(args.repo_path.as_deref(), pathspec, cwd)?;
@@ -46,7 +48,11 @@ fn normalize_pathspecs(pathspec: Vec<String>) -> Result<Vec<String>, ToolError> 
     }
 }
 
-fn git_add_impl(repo_path: Option<&str>, pathspec: Vec<String>, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn git_add_impl(
+    repo_path: Option<&str>,
+    pathspec: Vec<String>,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let repo = open_repo(repo_path, cwd)?;
     let effective_pathspec = prefix_pathspecs(&repo, repo_path, &pathspec)?;
     let mut index = load_mutable_index(&repo)?;
@@ -58,9 +64,7 @@ fn git_add_impl(repo_path: Option<&str>, pathspec: Vec<String>, cwd: Option<&std
         )));
     }
 
-    let (mut pipeline, _) = repo
-        .filter_pipeline(None)
-        .map_err(io::Error::other)?;
+    let (mut pipeline, _) = repo.filter_pipeline(None).map_err(io::Error::other)?;
     let mut changed = false;
     for path in &paths {
         changed |= stage_path(&repo, &mut pipeline, &mut index, path.as_bstr())?;
@@ -186,7 +190,9 @@ fn prefix_pathspecs(
     let absolute = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
-        std::env::current_dir().map_err(ToolError::Io)?.join(candidate)
+        std::env::current_dir()
+            .map_err(ToolError::Io)?
+            .join(candidate)
     };
 
     let Ok(prefix) = absolute.strip_prefix(workdir) else {
@@ -252,7 +258,9 @@ impl IndexEntrySnapshot {
     }
 }
 
-define_tool_with_cwd!(GitAdd, "git_add",
+define_tool_with_cwd!(
+    GitAdd,
+    "git_add",
     "Stage a file or pathspec in Git.",
     execute_git_add_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"pathspec":{"type":"array","items":{"type":"string"},"description":"Files or pathspecs to stage"}},"required":["pathspec"],"additionalProperties":false})

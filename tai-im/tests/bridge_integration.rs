@@ -1,15 +1,15 @@
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
 use tai_im::bridge::{BridgeEvent, DaemonBridge, DaemonBridgeCommand};
-use tai_proto::{ClientMessage, DaemonMessage, ImageMetadata, OutputStream, read_message_sync, write_message_sync};
+use tai_proto::{
+    ClientMessage, DaemonMessage, ImageMetadata, OutputStream, read_message_sync,
+    write_message_sync,
+};
 
 fn connected_bridge() -> (DaemonBridge, BufReader<UnixStream>, BufWriter<UnixStream>) {
     let (b_reader, my_writer) = UnixStream::pair().unwrap();
     let (my_reader, b_writer) = UnixStream::pair().unwrap();
-    let bridge = DaemonBridge::spawn(
-        BufReader::new(b_reader),
-        BufWriter::new(b_writer),
-    );
+    let bridge = DaemonBridge::spawn(BufReader::new(b_reader), BufWriter::new(b_writer));
     (bridge, BufReader::new(my_reader), BufWriter::new(my_writer))
 }
 
@@ -19,7 +19,8 @@ fn bridge_ping_pong() {
     let (bridge, mut daemon_reader, mut daemon_writer) = connected_bridge();
     let (tx, mut rx) = bridge.into_parts();
 
-    tx.blocking_send(DaemonBridgeCommand::SendMessage(ClientMessage::Ping)).unwrap();
+    tx.blocking_send(DaemonBridgeCommand::SendMessage(ClientMessage::Ping))
+        .unwrap();
 
     let msg = read_message_sync::<_, ClientMessage>(&mut daemon_reader).unwrap();
     assert!(matches!(msg, ClientMessage::Ping));
@@ -40,7 +41,8 @@ fn bridge_unlock_locked() {
 
     tx.blocking_send(DaemonBridgeCommand::SendMessage(ClientMessage::Unlock {
         passphrase: "secret".into(),
-    })).unwrap();
+    }))
+    .unwrap();
 
     let msg = read_message_sync::<_, ClientMessage>(&mut daemon_reader).unwrap();
     assert!(matches!(msg, ClientMessage::Unlock { .. }));
@@ -59,17 +61,25 @@ fn bridge_text_streaming() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
     let (_tx, mut rx) = bridge.into_parts();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::OutputChunk {
-        request_id: 1,
-        stream: OutputStream::Answer,
-        data: b"hello ".to_vec(),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::OutputChunk {
+            request_id: 1,
+            stream: OutputStream::Answer,
+            data: b"hello ".to_vec(),
+        },
+    )
+    .unwrap();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::OutputChunk {
-        request_id: 1,
-        stream: OutputStream::Answer,
-        data: b"world".to_vec(),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::OutputChunk {
+            request_id: 1,
+            stream: OutputStream::Answer,
+            data: b"world".to_vec(),
+        },
+    )
+    .unwrap();
 
     write_message_sync(&mut daemon_writer, &DaemonMessage::Done { request_id: 1 }).unwrap();
     use std::io::Write;
@@ -85,30 +95,42 @@ fn bridge_tool_call_events() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
     let (_tx, mut rx) = bridge.into_parts();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::ToolCallStarted {
-        request_id: 1,
-        call_id: "call_1".into(),
-        tool_name: "read_file".into(),
-        arguments_json: r#"{"path":"/tmp"}"#.into(),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::ToolCallStarted {
+            request_id: 1,
+            call_id: "call_1".into(),
+            tool_name: "read_file".into(),
+            arguments_json: r#"{"path":"/tmp"}"#.into(),
+        },
+    )
+    .unwrap();
     use std::io::Write;
     let _ = daemon_writer.flush();
 
     let event = rx.blocking_recv().unwrap();
-    assert!(matches!(&event, BridgeEvent::ToolCallStarted { name, arguments_json }
-        if name == "read_file" && arguments_json == r#"{"path":"/tmp"}"#));
+    assert!(
+        matches!(&event, BridgeEvent::ToolCallStarted { name, arguments_json }
+        if name == "read_file" && arguments_json == r#"{"path":"/tmp"}"#)
+    );
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::ToolCallFinished {
-        request_id: 1,
-        call_id: "call_1".into(),
-        tool_name: "read_file".into(),
-        output: "file contents".into(),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::ToolCallFinished {
+            request_id: 1,
+            call_id: "call_1".into(),
+            tool_name: "read_file".into(),
+            output: "file contents".into(),
+        },
+    )
+    .unwrap();
     let _ = daemon_writer.flush();
 
     let event = rx.blocking_recv().unwrap();
-    assert!(matches!(&event, BridgeEvent::ToolCallFinished { name, output }
-        if name == "read_file" && output == "file contents"));
+    assert!(
+        matches!(&event, BridgeEvent::ToolCallFinished { name, output }
+        if name == "read_file" && output == "file contents")
+    );
 }
 
 #[ignore]
@@ -117,12 +139,16 @@ fn bridge_tool_call_failed() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
     let (_tx, mut rx) = bridge.into_parts();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::ToolCallFailed {
-        request_id: 1,
-        call_id: "call_1".into(),
-        tool_name: "read_file".into(),
-        error: "permission denied".into(),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::ToolCallFailed {
+            request_id: 1,
+            call_id: "call_1".into(),
+            tool_name: "read_file".into(),
+            error: "permission denied".into(),
+        },
+    )
+    .unwrap();
     use std::io::Write;
     let _ = daemon_writer.flush();
 
@@ -146,21 +172,33 @@ fn bridge_image_streaming() {
         alt: None,
     };
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::ImageStart {
-        request_id: 1,
-        metadata,
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::ImageStart {
+            request_id: 1,
+            metadata,
+        },
+    )
+    .unwrap();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::ImageChunk {
-        request_id: 1,
-        image_id: 1,
-        data: b"abcd".to_vec(),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::ImageChunk {
+            request_id: 1,
+            image_id: 1,
+            data: b"abcd".to_vec(),
+        },
+    )
+    .unwrap();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::ImageEnd {
-        request_id: 1,
-        image_id: 1,
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::ImageEnd {
+            request_id: 1,
+            image_id: 1,
+        },
+    )
+    .unwrap();
     use std::io::Write;
     let _ = daemon_writer.flush();
 
@@ -175,19 +213,27 @@ fn bridge_error_variants() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
     let (_tx, mut rx) = bridge.into_parts();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::Failed {
-        request_id: 1,
-        error: "something went wrong".into(),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::Failed {
+            request_id: 1,
+            error: "something went wrong".into(),
+        },
+    )
+    .unwrap();
     use std::io::Write;
     let _ = daemon_writer.flush();
 
     let event = rx.blocking_recv().unwrap();
     assert!(matches!(&event, BridgeEvent::Error(msg) if msg == "something went wrong"));
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::LockedError {
-        error: "already locked".into(),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::LockedError {
+            error: "already locked".into(),
+        },
+    )
+    .unwrap();
     let _ = daemon_writer.flush();
 
     let event = rx.blocking_recv().unwrap();
@@ -200,10 +246,14 @@ fn bridge_models() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
     let (_tx, mut rx) = bridge.into_parts();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::Models {
-        models: vec!["gpt-4".into()],
-        selected_model: Some("gpt-4".into()),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::Models {
+            models: vec!["gpt-4".into()],
+            selected_model: Some("gpt-4".into()),
+        },
+    )
+    .unwrap();
     use std::io::Write;
     let _ = daemon_writer.flush();
 
@@ -216,9 +266,13 @@ fn bridge_models() {
         other => panic!("expected Models event, got {other:?}"),
     }
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::ModelSelected {
-        model: "claude".into(),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::ModelSelected {
+            model: "claude".into(),
+        },
+    )
+    .unwrap();
     let _ = daemon_writer.flush();
 
     let event = rx.blocking_recv().unwrap();
@@ -231,13 +285,21 @@ fn bridge_cancelled_clears_buffer() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
     let (_tx, mut rx) = bridge.into_parts();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::OutputChunk {
-        request_id: 42,
-        stream: OutputStream::Answer,
-        data: b"buffered data".to_vec(),
-    }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::OutputChunk {
+            request_id: 42,
+            stream: OutputStream::Answer,
+            data: b"buffered data".to_vec(),
+        },
+    )
+    .unwrap();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::Cancelled { request_id: 42 }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::Cancelled { request_id: 42 },
+    )
+    .unwrap();
     use std::io::Write;
     let _ = daemon_writer.flush();
 

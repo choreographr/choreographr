@@ -291,7 +291,10 @@ fn extract_yaml_frontmatter(content: &str) -> Option<String> {
     if !content.starts_with("---") {
         return None;
     }
-    let rest = content.strip_prefix("---")?.strip_prefix('\n').unwrap_or(content.strip_prefix("---")?);
+    let rest = content
+        .strip_prefix("---")?
+        .strip_prefix('\n')
+        .unwrap_or(content.strip_prefix("---")?);
     let end = rest.find("\n---")?;
     Some(rest[..end].trim().to_string())
 }
@@ -309,14 +312,13 @@ fn extract_skill_body(content: &str) -> Option<String> {
     if !content.starts_with("---") {
         return None;
     }
-    let rest = content.strip_prefix("---")?.strip_prefix('\n').unwrap_or(content.strip_prefix("---")?);
+    let rest = content
+        .strip_prefix("---")?
+        .strip_prefix('\n')
+        .unwrap_or(content.strip_prefix("---")?);
     let end = rest.find("\n---")?;
     let body = rest[end + 4..].trim().to_string();
-    if body.is_empty() {
-        None
-    } else {
-        Some(body)
-    }
+    if body.is_empty() { None } else { Some(body) }
 }
 
 pub fn recheck_context(
@@ -341,7 +343,9 @@ pub fn subdirectory_hints(
     let target_path = extract_tool_path(tool_name, arguments_json)?;
     let resolved = crate::tools::resolve_path(&target_path, cwd);
     let parent = resolved.parent()?;
-    let cwd_canonical = cwd.map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+    let cwd_canonical = cwd
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
     let cwd_canonical = cwd_canonical
         .canonicalize()
         .unwrap_or_else(|_| cwd_canonical.clone());
@@ -435,7 +439,8 @@ mod tests {
 
     #[test]
     fn test_extract_skill_body() {
-        let content = "---\nname: test\ndescription: desc\n---\n\nThis is the body.\nMultiple lines.";
+        let content =
+            "---\nname: test\ndescription: desc\n---\n\nThis is the body.\nMultiple lines.";
         let body = extract_skill_body(content).unwrap();
         assert_eq!(body, "This is the body.\nMultiple lines.");
     }
@@ -469,7 +474,12 @@ mod tests {
 
         let bundle = discover_context(tmp.path(), &ContextConfig::default()).unwrap();
         assert!(!bundle.files.is_empty());
-        assert!(bundle.files.iter().any(|f| f.content.contains("Project rules")));
+        assert!(
+            bundle
+                .files
+                .iter()
+                .any(|f| f.content.contains("Project rules"))
+        );
     }
 
     #[test]
@@ -528,8 +538,7 @@ mod tests {
 
         let file_path = sub.join("file.txt");
         let args = serde_json::json!({"path": file_path.to_str().unwrap()}).to_string();
-        let hints =
-            subdirectory_hints("read_file", &args, Some(tmp.path()), &[]);
+        let hints = subdirectory_hints("read_file", &args, Some(tmp.path()), &[]);
 
         assert!(hints.is_some());
         let hints = hints.unwrap();
@@ -547,12 +556,7 @@ mod tests {
 
         let file_path = sub.join("file.txt");
         let args = serde_json::json!({"path": file_path.to_str().unwrap()}).to_string();
-        let hints = subdirectory_hints(
-            "read_file",
-            &args,
-            Some(tmp.path()),
-            &[agents_path],
-        );
+        let hints = subdirectory_hints("read_file", &args, Some(tmp.path()), &[agents_path]);
         assert!(hints.is_none());
     }
 
@@ -569,9 +573,11 @@ mod tests {
 
         let skills = discover_skills(tmp.path());
         assert!(skills.iter().any(|s| s.name == "test-skill"));
-        assert!(skills
-            .iter()
-            .any(|s| s.description == "A test skill for testing"));
+        assert!(
+            skills
+                .iter()
+                .any(|s| s.description == "A test skill for testing")
+        );
     }
 
     #[test]

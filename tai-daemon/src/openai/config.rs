@@ -172,7 +172,12 @@ pub fn validate_and_list_models(config: &ServiceConfig, api_key: &str) -> io::Re
     Ok(client.validate_and_list_models()?)
 }
 
-pub fn completion(config: &ServiceConfig, api_key: &str, model: &str, prompt: &str) -> io::Result<String> {
+pub fn completion(
+    config: &ServiceConfig,
+    api_key: &str,
+    model: &str,
+    prompt: &str,
+) -> io::Result<String> {
     let client = OpenAiClient::new(config.clone(), api_key.to_string())?;
     Ok(client.completion(model, prompt)?)
 }

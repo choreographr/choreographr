@@ -13,7 +13,8 @@ pub(crate) fn execute_evm_block_tool(arguments_json: &str) -> ToolResult {
 
 fn execute_evm_block_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmBlockArgs = serde_json::from_str(arguments_json)?;
-    let output = tokio::runtime::Handle::current().block_on(evm_block_impl(&args.rpc_url, args.block_tag.as_deref()))?;
+    let output = tokio::runtime::Handle::current()
+        .block_on(evm_block_impl(&args.rpc_url, args.block_tag.as_deref()))?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -50,7 +51,9 @@ async fn evm_block_impl(rpc_url: &str, block_tag: Option<&str>) -> Result<String
     Ok(out)
 }
 
-define_tool!(EvmBlock, "evm_block",
+define_tool!(
+    EvmBlock,
+    "evm_block",
     "Get details about a block on an EVM blockchain: block number, hash, timestamp, transaction count, gas used/limit, and base fee.",
     execute_evm_block_tool,
     serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"block_tag":{"type":"string","description":"Block number (decimal or 0x-hex), or 'latest', 'finalized', 'safe', 'pending', 'earliest'","default":"latest"}},"required":["rpc_url"],"additionalProperties":false})

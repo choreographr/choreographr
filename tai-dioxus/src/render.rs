@@ -1,6 +1,6 @@
 use crate::state::{HistoryItem, StreamingEntry};
-use tai_client_core::HistoryItem as SharedHistoryItem;
 use dioxus::prelude::*;
+use tai_client_core::HistoryItem as SharedHistoryItem;
 use tai_client_core::render_markdown_html;
 use tai_proto::SessionMessage;
 

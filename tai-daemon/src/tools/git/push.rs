@@ -24,7 +24,10 @@ pub fn execute_git_push_tool(arguments_json: &str, cwd: Option<&std::path::Path>
     }
 }
 
-fn execute_git_push_inner(arguments_json: &str, cwd: Option<&std::path::Path>) -> Result<String, ToolError> {
+fn execute_git_push_inner(
+    arguments_json: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<String, ToolError> {
     let args: GitPushArgs = serde_json::from_str(arguments_json)?;
     let output = git_push_impl(
         args.repo_path.as_deref(),
@@ -109,7 +112,9 @@ fn git_push_impl(
     Ok(out.trim_end().to_string())
 }
 
-define_tool_with_cwd!(GitPush, "git_push",
+define_tool_with_cwd!(
+    GitPush,
+    "git_push",
     "Push to a Git remote branch.",
     execute_git_push_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"remote":{"type":"string","description":"Remote name","default":"origin"},"branch":{"type":"string","description":"Remote branch name"},"set_upstream":{"type":"boolean","description":"Set upstream tracking reference","default":false},"force_with_lease":{"type":"boolean","description":"Force push with lease (safe force push)","default":false},"dry_run":{"type":"boolean","description":"Simulate push without sending data","default":false}},"required":[],"additionalProperties":false})

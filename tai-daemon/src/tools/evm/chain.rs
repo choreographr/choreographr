@@ -37,7 +37,9 @@ async fn evm_chain_impl(rpc_url: &str) -> Result<String, ToolError> {
     Ok(out)
 }
 
-define_tool!(EvmChain, "evm_chain",
+define_tool!(
+    EvmChain,
+    "evm_chain",
     "Query information about an EVM blockchain node: chain ID, latest block number, gas price, max priority fee, and client version.",
     execute_evm_chain_tool,
     serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node (e.g., https://ethereum-rpc.publicnode.com)"}},"required":["rpc_url"],"additionalProperties":false})

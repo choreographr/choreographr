@@ -1,9 +1,9 @@
-use crate::openai::{
-    ChatAssistantToolUse, ChatRequestMessage, ChatTurnResult,
-    OpenAiClient, AssistantToolCall, AssistantToolFunction,
-};
 use crate::context;
 use crate::db::write_message_retry;
+use crate::openai::{
+    AssistantToolCall, AssistantToolFunction, ChatAssistantToolUse, ChatRequestMessage,
+    ChatTurnResult, OpenAiClient,
+};
 use crate::sessions::SessionState;
 use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
 use std::io;
@@ -38,13 +38,30 @@ fn emit_prepared_image_sync(
         byte_len: image.data.len() as u64,
         alt: image.alt,
     };
-    broadcast_to_session(session, DaemonMessage::ImageStart { request_id, metadata });
+    broadcast_to_session(
+        session,
+        DaemonMessage::ImageStart {
+            request_id,
+            metadata,
+        },
+    );
     for chunk in image.data.chunks(MAX_IMAGE_CHUNK_SIZE) {
-        broadcast_to_session(session, DaemonMessage::ImageChunk {
-            request_id, image_id, data: chunk.to_vec(),
-        });
+        broadcast_to_session(
+            session,
+            DaemonMessage::ImageChunk {
+                request_id,
+                image_id,
+                data: chunk.to_vec(),
+            },
+        );
     }
-    broadcast_to_session(session, DaemonMessage::ImageEnd { request_id, image_id });
+    broadcast_to_session(
+        session,
+        DaemonMessage::ImageEnd {
+            request_id,
+            image_id,
+        },
+    );
 }
 
 pub(crate) fn run_agent_loop(
@@ -78,10 +95,13 @@ pub(crate) fn run_agent_loop(
                     {
                         let new_content = context::assemble_context(&new_bundle);
                         if !new_content.is_empty() {
-                            session.messages[idx] = SessionMessage::SystemText { content: new_content };
+                            session.messages[idx] = SessionMessage::SystemText {
+                                content: new_content,
+                            };
                         }
                         session.context_fingerprint = Some(new_bundle.fingerprint);
-                        session.context_file_paths = new_bundle.files.iter().map(|f| f.path.clone()).collect();
+                        session.context_file_paths =
+                            new_bundle.files.iter().map(|f| f.path.clone()).collect();
                     }
                 }
             }
@@ -90,11 +110,14 @@ pub(crate) fn run_agent_loop(
         let messages = build_chat_request_messages(&session.messages);
         match client.chat_completion_turn(model, &messages, &tools)? {
             ChatTurnResult::FinalText(content) => {
-                broadcast_to_session(session, DaemonMessage::OutputChunk {
-                    request_id,
-                    stream: OutputStream::Answer,
-                    data: content.clone().into_bytes(),
-                });
+                broadcast_to_session(
+                    session,
+                    DaemonMessage::OutputChunk {
+                        request_id,
+                        stream: OutputStream::Answer,
+                        data: content.clone().into_bytes(),
+                    },
+                );
                 let msg = SessionMessage::AssistantText { content };
                 let idx = session.messages.len() as u32;
                 session.messages.push(msg.clone());
@@ -104,14 +127,19 @@ pub(crate) fn run_agent_loop(
             ChatTurnResult::ToolUse(tool_use) => {
                 persist_assistant_tool_use_sync(session, session_id, db, &tool_use);
                 for tool_call in tool_use.tool_calls {
-                    if cancel.load(Ordering::SeqCst) { return Ok(()); }
+                    if cancel.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
 
-                    broadcast_to_session(session, DaemonMessage::ToolCallStarted {
-                        request_id,
-                        call_id: tool_call.id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        arguments_json: tool_call.arguments_json.clone(),
-                    });
+                    broadcast_to_session(
+                        session,
+                        DaemonMessage::ToolCallStarted {
+                            request_id,
+                            call_id: tool_call.id.clone(),
+                            tool_name: tool_call.name.clone(),
+                            arguments_json: tool_call.arguments_json.clone(),
+                        },
+                    );
 
                     let tool_timeout = if tool_call.name == "spawn_subsession" {
                         Duration::from_secs(120)
@@ -120,15 +148,29 @@ pub(crate) fn run_agent_loop(
                     };
 
                     let mut output = execute_tool_with_timeout(
-                        tool_registry, &tool_call, None, cwd, tool_timeout,
-                        daemon_tx, client, db, session, session_id, model, max_turns_default,
+                        tool_registry,
+                        &tool_call,
+                        None,
+                        cwd,
+                        tool_timeout,
+                        daemon_tx,
+                        client,
+                        db,
+                        session,
+                        session_id,
+                        model,
+                        max_turns_default,
+                        cancel,
                     );
 
                     if let Some(hint) = context::subdirectory_hints(
-                        &tool_call.name, &tool_call.arguments_json,
-                        session.cwd.as_deref(), &session.context_file_paths,
+                        &tool_call.name,
+                        &tool_call.arguments_json,
+                        session.cwd.as_deref(),
+                        &session.context_file_paths,
                     ) {
-                        output.result.content = format!("{}\n\n---\n{}", output.result.content, hint);
+                        output.result.content =
+                            format!("{}\n\n---\n{}", output.result.content, hint);
                     }
 
                     if let Some(image) = output.image {
@@ -167,7 +209,10 @@ pub(crate) fn run_agent_loop(
         }
     }
 
-    Err(io::Error::new(io::ErrorKind::InvalidData, format!("tool loop exceeded {max_turns} iterations")))
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("tool loop exceeded {max_turns} iterations"),
+    ))
 }
 
 fn execute_tool_with_timeout(
@@ -183,6 +228,7 @@ fn execute_tool_with_timeout(
     session_id: u64,
     model: &str,
     max_turns_default: u32,
+    cancel: &AtomicBool,
 ) -> ToolExecutionOutput {
     if tool_call.name == "list_sessions" {
         return execute_list_sessions_sync(daemon_tx);
@@ -191,7 +237,19 @@ fn execute_tool_with_timeout(
         return execute_get_session_sync(daemon_tx, &tool_call.arguments_json);
     }
     if tool_call.name == "spawn_subsession" {
-        return execute_spawn_subsession_sync(client, daemon_tx, session, session_id, db, model, tool_call, None, cwd, max_turns_default);
+        return execute_spawn_subsession_sync(
+            client,
+            daemon_tx,
+            session,
+            session_id,
+            db,
+            model,
+            tool_call,
+            None,
+            cwd,
+            max_turns_default,
+            cancel,
+        );
     }
     if tool_call.name == "load_skill" {
         return execute_load_skill_sync(session, cwd, &tool_call.arguments_json);
@@ -207,22 +265,47 @@ fn execute_tool_with_timeout(
         let _ = tx.send(result);
     });
 
-    match rx.recv_timeout(timeout_dur) {
-        Ok(output) => output,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => ToolExecutionOutput {
-            result: ToolResult {
-                content: format!("tool '{}' timed out after {}s", tool_call.name, timeout_dur.as_secs()),
-                is_error: true,
-            },
-            image: None,
-        },
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => ToolExecutionOutput {
-            result: ToolResult {
-                content: "tool execution thread panicked".to_string(),
-                is_error: true,
-            },
-            image: None,
-        },
+    let start = std::time::Instant::now();
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!("tool '{}' cancelled", tool_call.name),
+                    is_error: true,
+                },
+                image: None,
+            };
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= timeout_dur {
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!(
+                        "tool '{}' timed out after {}s",
+                        tool_call.name,
+                        timeout_dur.as_secs()
+                    ),
+                    is_error: true,
+                },
+                image: None,
+            };
+        }
+
+        let poll = std::cmp::min(Duration::from_millis(100), timeout_dur - elapsed);
+        match rx.recv_timeout(poll) {
+            Ok(output) => return output,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return ToolExecutionOutput {
+                    result: ToolResult {
+                        content: "tool execution thread panicked".to_string(),
+                        is_error: true,
+                    },
+                    image: None,
+                };
+            }
+        }
     }
 }
 
@@ -235,29 +318,42 @@ fn execute_list_sessions_sync(
         Ok(sessions) => {
             if sessions.is_empty() {
                 return ToolExecutionOutput {
-                    result: ToolResult { content: "No sessions found.".to_string(), is_error: false },
+                    result: ToolResult {
+                        content: "No sessions found.".to_string(),
+                        is_error: false,
+                    },
                     image: None,
                 };
             }
-            let lines: Vec<String> = sessions.iter()
+            let lines: Vec<String> = sessions
+                .iter()
                 .map(|s| {
                     let title = s.title.as_deref().unwrap_or("(untitled)");
                     let model = s.selected_model.as_deref().unwrap_or("(no model)");
-                    let parent = s.parent_session_id
+                    let parent = s
+                        .parent_session_id
                         .map(|id| id.to_string())
                         .unwrap_or_else(|| "none".to_string());
                     let cwd = s.cwd.as_deref().unwrap_or("(none)");
-                    format!("Session {}: \"{}\" | model: {} | messages: {} | parent: {} | cwd: {}",
-                        s.session_id, title, model, s.message_count, parent, cwd)
+                    format!(
+                        "Session {}: \"{}\" | model: {} | messages: {} | parent: {} | cwd: {}",
+                        s.session_id, title, model, s.message_count, parent, cwd
+                    )
                 })
                 .collect();
             ToolExecutionOutput {
-                result: ToolResult { content: crate::tools::truncate_tool_output(&lines.join("\n")), is_error: false },
+                result: ToolResult {
+                    content: crate::tools::truncate_tool_output(&lines.join("\n")),
+                    is_error: false,
+                },
                 image: None,
             }
         }
         Err(_) => ToolExecutionOutput {
-            result: ToolResult { content: "failed to list sessions".to_string(), is_error: true },
+            result: ToolResult {
+                content: "failed to list sessions".to_string(),
+                is_error: true,
+            },
             image: None,
         },
     }
@@ -269,40 +365,56 @@ fn execute_get_session_sync(
 ) -> ToolExecutionOutput {
     let args: serde_json::Value = match serde_json::from_str(arguments_json) {
         Ok(a) => a,
-        Err(e) => return ToolExecutionOutput {
-            result: ToolResult { content: format!("invalid arguments: {e}"), is_error: true },
-            image: None,
-        },
+        Err(e) => {
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!("invalid arguments: {e}"),
+                    is_error: true,
+                },
+                image: None,
+            };
+        }
     };
     let session_id = match args.get("session_id").and_then(|v| v.as_u64()) {
         Some(id) => id,
-        None => return ToolExecutionOutput {
-            result: ToolResult { content: "missing required argument: session_id".to_string(), is_error: true },
-            image: None,
-        },
+        None => {
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: "missing required argument: session_id".to_string(),
+                    is_error: true,
+                },
+                image: None,
+            };
+        }
     };
 
     let (reply, rx) = std::sync::mpsc::channel();
     let _ = daemon_tx.send(crate::daemon::DaemonCommand::GetSession { session_id, reply });
     match rx.recv() {
-        Ok(Some(summary)) => {
-            ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!("Session {} ({}) has {} messages.",
-                        session_id,
-                        summary.title.as_deref().unwrap_or("untitled"),
-                        summary.message_count),
-                    is_error: false,
-                },
-                image: None,
-            }
-        }
+        Ok(Some(summary)) => ToolExecutionOutput {
+            result: ToolResult {
+                content: format!(
+                    "Session {} ({}) has {} messages.",
+                    session_id,
+                    summary.title.as_deref().unwrap_or("untitled"),
+                    summary.message_count
+                ),
+                is_error: false,
+            },
+            image: None,
+        },
         Ok(None) => ToolExecutionOutput {
-            result: ToolResult { content: format!("Session {session_id} not found."), is_error: true },
+            result: ToolResult {
+                content: format!("Session {session_id} not found."),
+                is_error: true,
+            },
             image: None,
         },
         Err(_) => ToolExecutionOutput {
-            result: ToolResult { content: "failed to get session".to_string(), is_error: true },
+            result: ToolResult {
+                content: "failed to get session".to_string(),
+                is_error: true,
+            },
             image: None,
         },
     }
@@ -319,23 +431,40 @@ fn execute_spawn_subsession_sync(
     _x_credentials: Option<&XCredentials>,
     cwd: Option<&Path>,
     _max_turns_default: u32,
+    cancel: &AtomicBool,
 ) -> ToolExecutionOutput {
     let args: serde_json::Value = match serde_json::from_str(&tool_call.arguments_json) {
         Ok(a) => a,
-        Err(e) => return ToolExecutionOutput {
-            result: ToolResult { content: format!("invalid arguments: {e}"), is_error: true },
-            image: None,
-        },
+        Err(e) => {
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!("invalid arguments: {e}"),
+                    is_error: true,
+                },
+                image: None,
+            };
+        }
     };
     let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
         Some(p) => p.to_string(),
-        None => return ToolExecutionOutput {
-            result: ToolResult { content: "missing required argument: prompt".to_string(), is_error: true },
-            image: None,
-        },
+        None => {
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: "missing required argument: prompt".to_string(),
+                    is_error: true,
+                },
+                image: None,
+            };
+        }
     };
-    let title = args.get("title").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let max_turns = args
+        .get("max_turns")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
     let child_cwd = cwd.map(|p| p.to_path_buf());
 
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
@@ -359,30 +488,66 @@ fn execute_spawn_subsession_sync(
                 input_tokens: Vec::new(),
                 reply: result_tx,
             });
-            match result_rx.recv() {
-                Ok(Ok(child_result)) => ToolExecutionOutput {
-                    result: ToolResult {
-                        content: format!("sub-session {child_id} result:\n{}", child_result.output),
-                        is_error: child_result.is_error,
-                    },
-                    image: None,
-                },
-                Ok(Err(e)) => ToolExecutionOutput {
-                    result: ToolResult { content: format!("child session error: {e}"), is_error: true },
-                    image: None,
-                },
-                Err(_) => ToolExecutionOutput {
-                    result: ToolResult { content: format!("sub-session {child_id} exited unexpectedly"), is_error: true },
-                    image: None,
-                },
+            loop {
+                if cancel.load(Ordering::SeqCst) {
+                    let _ =
+                        child_tx.send(crate::sessions::SessionCommand::Cancel { request_id: 1 });
+                    return ToolExecutionOutput {
+                        result: ToolResult {
+                            content: format!("sub-session {child_id} cancelled"),
+                            is_error: true,
+                        },
+                        image: None,
+                    };
+                }
+
+                match result_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Ok(child_result)) => {
+                        return ToolExecutionOutput {
+                            result: ToolResult {
+                                content: format!(
+                                    "sub-session {child_id} result:\n{}",
+                                    child_result.output
+                                ),
+                                is_error: child_result.is_error,
+                            },
+                            image: None,
+                        };
+                    }
+                    Ok(Err(e)) => {
+                        return ToolExecutionOutput {
+                            result: ToolResult {
+                                content: format!("child session error: {e}"),
+                                is_error: true,
+                            },
+                            image: None,
+                        };
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return ToolExecutionOutput {
+                            result: ToolResult {
+                                content: format!("sub-session {child_id} exited unexpectedly"),
+                                is_error: true,
+                            },
+                            image: None,
+                        };
+                    }
+                }
             }
         }
         Ok(Err(e)) => ToolExecutionOutput {
-            result: ToolResult { content: format!("failed to create sub-session: {e}"), is_error: true },
+            result: ToolResult {
+                content: format!("failed to create sub-session: {e}"),
+                is_error: true,
+            },
             image: None,
         },
         Err(_) => ToolExecutionOutput {
-            result: ToolResult { content: "daemon communication failed".to_string(), is_error: true },
+            result: ToolResult {
+                content: "daemon communication failed".to_string(),
+                is_error: true,
+            },
             image: None,
         },
     }
@@ -395,26 +560,41 @@ fn execute_load_skill_sync(
 ) -> ToolExecutionOutput {
     let v: serde_json::Value = match serde_json::from_str(arguments_json) {
         Ok(v) => v,
-        Err(e) => return ToolExecutionOutput {
-            result: ToolResult { content: format!("invalid json: {e}"), is_error: true },
-            image: None,
-        },
+        Err(e) => {
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!("invalid json: {e}"),
+                    is_error: true,
+                },
+                image: None,
+            };
+        }
     };
     let name = match v.get("name").and_then(|n| n.as_str()) {
         Some(n) => n.to_string(),
-        None => return ToolExecutionOutput {
-            result: ToolResult { content: "missing required parameter: name".to_string(), is_error: true },
-            image: None,
-        },
+        None => {
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: "missing required parameter: name".to_string(),
+                    is_error: true,
+                },
+                image: None,
+            };
+        }
     };
 
     let effective_cwd = cwd.unwrap_or_else(|| Path::new("."));
     let body = match context::load_skill_body(&name, effective_cwd) {
         Some(b) => b,
-        None => return ToolExecutionOutput {
-            result: ToolResult { content: format!("skill not found: {name}"), is_error: true },
-            image: None,
-        },
+        None => {
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!("skill not found: {name}"),
+                    is_error: true,
+                },
+                image: None,
+            };
+        }
     };
 
     let skill_message = format!(
@@ -469,7 +649,7 @@ pub(crate) fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<Ch
             }
             SessionMessage::AssistantText { content } => {
                 ChatRequestMessage::simple("assistant", content.clone())
-            },
+            }
             SessionMessage::AssistantToolUse {
                 content,
                 tool_calls,

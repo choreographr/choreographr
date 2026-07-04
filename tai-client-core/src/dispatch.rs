@@ -13,8 +13,17 @@ pub trait DaemonMessageHandler {
     fn drop_request(&mut self, request_id: u32) {
         self.finalize_stream(request_id);
     }
-    fn handle_image_start(&mut self, request_id: u32, metadata: ImageMetadata) -> Result<(), ClientError>;
-    fn handle_image_chunk(&mut self, request_id: u32, image_id: u32, data: &[u8]) -> Result<(), ClientError>;
+    fn handle_image_start(
+        &mut self,
+        request_id: u32,
+        metadata: ImageMetadata,
+    ) -> Result<(), ClientError>;
+    fn handle_image_chunk(
+        &mut self,
+        request_id: u32,
+        image_id: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError>;
     fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError>;
 }
 
@@ -23,7 +32,9 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
     message: DaemonMessage,
 ) -> Result<Option<ClientMessage>, ClientError> {
     match message {
-        DaemonMessage::SessionCreated { session_id, title, .. } => {
+        DaemonMessage::SessionCreated {
+            session_id, title, ..
+        } => {
             let label = title.unwrap_or_else(|| "untitled".to_string());
             handler.push_text(format!("[daemon] created session {session_id}: {label}"));
             Ok(None)
@@ -36,7 +47,10 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
                 for session in &sessions {
                     let title = session.title.as_deref().unwrap_or("untitled");
                     let model = session.selected_model.as_deref().unwrap_or("-");
-                    handler.push_text(format!("  {}: \"{title}\" ({model}) — {} messages", session.session_id, session.message_count));
+                    handler.push_text(format!(
+                        "  {}: \"{title}\" ({model}) — {} messages",
+                        session.session_id, session.message_count
+                    ));
                 }
             }
             Ok(None)
@@ -200,14 +214,11 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             Ok(None)
         }
         DaemonMessage::ModelSelectionFailed { model, error } => {
-            handler.push_text(format!(
-                "[daemon] failed to select model {model}: {error}"
-            ));
+            handler.push_text(format!("[daemon] failed to select model {model}: {error}"));
             Ok(None)
         }
         DaemonMessage::Unlocked => {
-            handler
-                .push_text("[daemon] keystore unlocked, credentials available".to_string());
+            handler.push_text("[daemon] keystore unlocked, credentials available".to_string());
             Ok(None)
         }
         DaemonMessage::Locked => {

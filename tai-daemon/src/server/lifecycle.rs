@@ -3,7 +3,7 @@ use crate::sessions::SessionCommand;
 use std::io;
 use std::path::Path;
 use tokio::net::UnixListener;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{error, info};
@@ -11,7 +11,8 @@ use tracing::{error, info};
 fn wait_for_shutdown() -> impl std::future::Future<Output = ()> {
     async {
         let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-        let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
         tokio::select! {
             _ = sigint.recv() => info!("received SIGINT, shutting down tai-daemon"),
             _ = sigterm.recv() => info!("received SIGTERM, shutting down tai-daemon"),
@@ -49,8 +50,13 @@ pub async fn run_server(socket_path: &str, mut state: DaemonState) -> io::Result
         }
     };
 
-    for (_, entry) in &state.active_sessions {
+    let active_sessions = std::mem::take(&mut state.active_sessions);
+    for entry in active_sessions.values() {
         let _ = entry.cmd_tx.send(SessionCommand::Shutdown);
+    }
+
+    for (_, entry) in active_sessions {
+        let _ = entry.handle.await;
     }
 
     if Path::new(socket_path).exists() {

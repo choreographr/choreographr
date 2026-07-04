@@ -95,22 +95,59 @@ pub struct SessionSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClientMessage {
-    CreateSession { title: Option<String>, parent_session_id: Option<u64>, cwd: Option<String>, max_turns: Option<u32> },
+    CreateSession {
+        title: Option<String>,
+        parent_session_id: Option<u64>,
+        cwd: Option<String>,
+        max_turns: Option<u32>,
+    },
     ListSessions,
-    AttachSession { session_id: u64 },
-    GetSessionState { session_id: u64 },
-    RunInput { request_id: u32, input: Vec<u8> },
-    TestImage { request_id: u32 },
-    Cancel { request_id: u32 },
+    AttachSession {
+        session_id: u64,
+    },
+    GetSessionState {
+        session_id: u64,
+    },
+    RunInput {
+        request_id: u32,
+        input: Vec<u8>,
+    },
+    TestImage {
+        request_id: u32,
+    },
+    Cancel {
+        request_id: u32,
+    },
     Ping,
-    GetCredential { service: String },
+    GetCredential {
+        service: String,
+    },
     ListModels,
-    SetModel { model: String },
-    Unlock { passphrase: String },
+    SetModel {
+        model: String,
+    },
+    Unlock {
+        passphrase: String,
+    },
     Lock,
-    AddApiKey { service: String, passphrase: String, key: String },
-    AddXCredential { service: String, passphrase: String, api_key: String, api_key_secret: String, access_token: String, access_token_secret: String, bearer_token: Option<String> },
-    RemoveCredential { service: String, passphrase: String },
+    AddApiKey {
+        service: String,
+        passphrase: String,
+        key: String,
+    },
+    AddXCredential {
+        service: String,
+        passphrase: String,
+        api_key: String,
+        api_key_secret: String,
+        access_token: String,
+        access_token_secret: String,
+        bearer_token: Option<String>,
+    },
+    RemoveCredential {
+        service: String,
+        passphrase: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

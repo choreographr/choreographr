@@ -1,7 +1,5 @@
 use tai_proto::SessionMessage;
-use tai_tui::{
-    MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, StreamingText,
-};
+use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, StreamingText};
 
 pub(crate) fn plain_text_lines(text: &str) -> Vec<String> {
     if text.is_empty() {

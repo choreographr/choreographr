@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::error::ClientError;
+use std::collections::HashMap;
 use tai_proto::ImageMetadata;
 
 #[derive(Debug, Clone)]
@@ -10,7 +10,8 @@ pub struct PendingImage {
 
 impl PendingImage {
     fn new(metadata: ImageMetadata) -> Result<Self, ClientError> {
-        let capacity = usize::try_from(metadata.byte_len).map_err(|_| ClientError::ImageTooLarge)?;
+        let capacity =
+            usize::try_from(metadata.byte_len).map_err(|_| ClientError::ImageTooLarge)?;
         Ok(Self {
             metadata,
             data: Vec::with_capacity(capacity),
@@ -18,7 +19,8 @@ impl PendingImage {
     }
 
     fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), ClientError> {
-        let expected = usize::try_from(self.metadata.byte_len).map_err(|_| ClientError::ImageTooLarge)?;
+        let expected =
+            usize::try_from(self.metadata.byte_len).map_err(|_| ClientError::ImageTooLarge)?;
         let next_len = self.data.len().saturating_add(chunk.len());
         if next_len > expected {
             return Err(ClientError::ImageExceedsSize {
@@ -64,14 +66,19 @@ impl ImageAssembler {
         Ok(())
     }
 
-    pub fn push_chunk(&mut self, request_id: u32, image_id: u32, data: &[u8]) -> Result<(), ClientError> {
-        let pending = self
-            .pending
-            .get_mut(&(request_id, image_id))
-            .ok_or(ClientError::UnknownImage {
-                image_id,
-                request_id,
-            })?;
+    pub fn push_chunk(
+        &mut self,
+        request_id: u32,
+        image_id: u32,
+        data: &[u8],
+    ) -> Result<(), ClientError> {
+        let pending =
+            self.pending
+                .get_mut(&(request_id, image_id))
+                .ok_or(ClientError::UnknownImage {
+                    image_id,
+                    request_id,
+                })?;
         pending.push_chunk(data)
     }
 
@@ -80,13 +87,13 @@ impl ImageAssembler {
         request_id: u32,
         image_id: u32,
     ) -> Result<(ImageMetadata, Vec<u8>), ClientError> {
-        let pending = self
-            .pending
-            .remove(&(request_id, image_id))
-            .ok_or(ClientError::UnknownImage {
-                image_id,
-                request_id,
-            })?;
+        let pending =
+            self.pending
+                .remove(&(request_id, image_id))
+                .ok_or(ClientError::UnknownImage {
+                    image_id,
+                    request_id,
+                })?;
         let (metadata, data) = pending.into_parts();
         let actual_len = u64::try_from(data.len()).map_err(|_| ClientError::ImageTooLarge)?;
         if actual_len != metadata.byte_len {

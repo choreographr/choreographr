@@ -83,10 +83,16 @@ fn execute_http_request_tool_inner(arguments_json: &str) -> Result<String, ToolE
 fn build_http_request_headers(headers: HashMap<String, String>) -> Result<HeaderMap, ToolError> {
     let mut request_headers = HeaderMap::new();
     for (name, value) in headers {
-        let header_name = HeaderName::try_from(name.as_str())
-            .map_err(|error| ToolError::InvalidHeader { name: name.clone(), error: error.to_string() })?;
-        let header_value = HeaderValue::from_str(&value)
-            .map_err(|error| ToolError::InvalidHeader { name: name.clone(), error: error.to_string() })?;
+        let header_name =
+            HeaderName::try_from(name.as_str()).map_err(|error| ToolError::InvalidHeader {
+                name: name.clone(),
+                error: error.to_string(),
+            })?;
+        let header_value =
+            HeaderValue::from_str(&value).map_err(|error| ToolError::InvalidHeader {
+                name: name.clone(),
+                error: error.to_string(),
+            })?;
         request_headers.insert(header_name, header_value);
     }
     Ok(request_headers)
@@ -139,7 +145,9 @@ fn format_http_response(status: StatusCode, headers: &HeaderMap, body: &str) -> 
     output
 }
 
-define_tool!(HttpRequest, "http_request",
+define_tool!(
+    HttpRequest,
+    "http_request",
     "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests.",
     execute_http_request_tool,
     serde_json::json!({

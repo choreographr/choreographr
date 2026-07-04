@@ -1,4 +1,6 @@
-use crate::markdown_render::{display_width, lines_height, session_message_lines, streaming_text_lines};
+use crate::markdown_render::{
+    display_width, lines_height, session_message_lines, streaming_text_lines,
+};
 use crate::state::{App, HistoryItem, history_text_height, image_block_height};
 use ratatui::{
     Frame,

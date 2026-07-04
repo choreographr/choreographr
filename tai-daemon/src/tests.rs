@@ -121,7 +121,7 @@ fn read_file_range_tool_reads_numbered_line_chunks() {
             "max_lines": 2
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(!result.is_error, "{}", result.content);
@@ -144,7 +144,7 @@ fn read_file_range_tool_clamps_to_eof() {
             "max_lines": 10
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(!result.is_error, "{}", result.content);
@@ -167,7 +167,7 @@ fn read_file_range_tool_rejects_start_line_past_eof() {
             "max_lines": 1
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(result.is_error, "{}", result.content);
@@ -188,7 +188,7 @@ fn read_file_range_tool_rejects_excessive_max_lines() {
             "max_lines": 201
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(result.is_error, "{}", result.content);
@@ -207,7 +207,7 @@ fn write_file_tool_writes_new_file() {
             "content": "hello from write tool\n"
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(!result.is_error, "{}", result.content);
@@ -231,7 +231,7 @@ fn write_file_tool_refuses_overwrite_when_disabled() {
             "overwrite": false
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(result.is_error, "{}", result.content);
@@ -260,7 +260,7 @@ fn write_file_tool_creates_parent_directories() {
             "create_parents": true
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(!result.is_error, "{}", result.content);
@@ -288,7 +288,7 @@ fn edit_file_tool_replaces_single_unique_match() {
             ]
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(!result.is_error, "{}", result.content);
@@ -317,7 +317,7 @@ fn edit_file_tool_fails_when_old_text_is_missing() {
             ]
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(result.is_error, "{}", result.content);
@@ -346,7 +346,7 @@ fn edit_file_tool_fails_on_ambiguous_non_replace_all_edit() {
             ]
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(result.is_error, "{}", result.content);
@@ -377,7 +377,7 @@ fn edit_file_tool_supports_replace_all_and_dry_run() {
             ]
         })
         .to_string(),
-    None,
+        None,
     );
 
     assert!(!result.is_error, "{}", result.content);
@@ -410,7 +410,7 @@ fn edit_file_tool_validates_expected_sha256() {
             ]
         })
         .to_string(),
-    None,
+        None,
     );
     assert!(!success.is_error, "{}", success.content);
     assert_eq!(
@@ -430,7 +430,7 @@ fn edit_file_tool_validates_expected_sha256() {
             ]
         })
         .to_string(),
-    None,
+        None,
     );
     assert!(failure.is_error, "{}", failure.content);
     assert!(failure.content.contains("expected_sha256 mismatch"));

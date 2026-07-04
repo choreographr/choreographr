@@ -42,8 +42,8 @@ pub(crate) fn execute_display_image_tool(arguments_json: &str) -> ToolExecutionO
 }
 
 fn prepare_image_result(arguments_json: &str) -> Result<PreparedImage, String> {
-    let args: DisplayImageArgs = serde_json::from_str(arguments_json)
-        .map_err(|e| format!("invalid arguments: {e}"))?;
+    let args: DisplayImageArgs =
+        serde_json::from_str(arguments_json).map_err(|e| format!("invalid arguments: {e}"))?;
     prepare_image(args).map_err(|e| e.to_string())
 }
 
@@ -214,7 +214,12 @@ impl super::Tool for DisplayImage {
             "additionalProperties": false
         })
     }
-    fn execute(&self, arguments_json: &str, _x_credentials: Option<&tai_keystore::XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
+    fn execute(
+        &self,
+        arguments_json: &str,
+        _x_credentials: Option<&tai_keystore::XCredentials>,
+        _cwd: Option<&std::path::Path>,
+    ) -> ToolExecutionOutput {
         execute_display_image_tool(arguments_json)
     }
 }

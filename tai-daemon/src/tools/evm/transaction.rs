@@ -14,7 +14,8 @@ pub(crate) fn execute_evm_transaction_tool(arguments_json: &str) -> ToolResult {
 
 fn execute_evm_transaction_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmTransactionArgs = serde_json::from_str(arguments_json)?;
-    let output = tokio::runtime::Handle::current().block_on(evm_transaction_impl(&args.rpc_url, &args.tx_hash))?;
+    let output = tokio::runtime::Handle::current()
+        .block_on(evm_transaction_impl(&args.rpc_url, &args.tx_hash))?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -25,7 +26,8 @@ async fn evm_transaction_impl(rpc_url: &str, tx_hash_str: &str) -> Result<String
         .strip_prefix("0x")
         .or_else(|| tx_hash_str.strip_prefix("0X"))
         .unwrap_or(tx_hash_str);
-    let hash = B256::from_str(stripped).map_err(|e| ToolError::Other(format!("invalid tx hash: {e}")))?;
+    let hash =
+        B256::from_str(stripped).map_err(|e| ToolError::Other(format!("invalid tx hash: {e}")))?;
 
     let receipt = provider
         .get_transaction_receipt(hash)
@@ -55,7 +57,9 @@ async fn evm_transaction_impl(rpc_url: &str, tx_hash_str: &str) -> Result<String
     Ok(out)
 }
 
-define_tool!(EvmTransaction, "evm_transaction",
+define_tool!(
+    EvmTransaction,
+    "evm_transaction",
     "Get details about a transaction on an EVM blockchain by its hash. Returns hash, block number, from/to, gas used, effective gas price, and log count.",
     execute_evm_transaction_tool,
     serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"tx_hash":{"type":"string","description":"0x-prefixed transaction hash"}},"required":["rpc_url","tx_hash"],"additionalProperties":false})

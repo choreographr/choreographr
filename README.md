@@ -19,7 +19,8 @@ A local AI terminal interface in Rust. Connects to an OpenAI-compatible API, run
 **Agent loop (harness):** The daemon drives a server-side loop that repeatedly sends
 conversation history and available tools to the LLM, executes any tool calls the model
 requests, appends results back into the conversation, and loops until the model produces a
-final answer or the per-session iteration cap is reached. The client only sees
+final answer or the per-session iteration cap is reached. Each session keeps a responsive
+control thread and runs request work in a separate worker thread. The client only sees
 `ToolCallStarted`/`ToolCallFinished` lifecycle events, keeping it simple.
 
 **Session / subsession:** A *session* is a persisted conversation with its own message
@@ -65,6 +66,9 @@ cargo run -p tai-tui     # terminal UI
 cargo run -p tai-dioxus  # desktop app
 cargo run -p tai-im      # IM bridge
 ```
+
+In `tai-tui`, `Ctrl+C` exits the local client and disconnects from the daemon without
+requesting daemon shutdown.
 
 ## Configuration
 

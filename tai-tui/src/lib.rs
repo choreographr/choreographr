@@ -3,8 +3,8 @@ use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use resvg::{tiny_skia, usvg};
 use std::io;
 pub use tai_client_core::{
-    ClientError, ImageAssembler, MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline,
-    ShellCommand, StreamingText, parse_input_line,
+    ClientError, ImageAssembler, MarkdownAlignment, MarkdownBlock, MarkdownDocument,
+    MarkdownInline, ShellCommand, StreamingText, parse_input_line,
 };
 use tai_proto::ImageMetadata;
 use tokio::sync::mpsc;

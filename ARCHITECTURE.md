@@ -168,7 +168,7 @@ Entry point: `src/main.rs` → initializes tracing, creates `DaemonState`, runs 
 | Module | Purpose |
 |---|---|
 | `server.rs` | Accepts Unix connections, spawns per-client `handle_client` tasks. Dispatches all `ClientMessage` variants. Implements lock/unlock flow. |
-| `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
+| `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Each session has a control thread; request work runs on separate worker threads. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
@@ -216,7 +216,7 @@ main()
 
 | Module | Purpose |
 |---|---|
-| `connection.rs` | Socket setup, event loop, input handling, daemon message dispatch |
+| `connection.rs` | Socket setup, event loop, local shutdown signal handling, input handling, daemon message dispatch |
 | `state.rs` | `App` struct: input buffer, request tracking, `ClientHistory`, scroll state |
 | `render.rs` | Ratatui rendering: history pane (top) + command input (bottom), word wrap, Unicode width |
 | `lib.rs` | SVG rasterization (resvg), PNG/JPEG decoding (image crate), ratatui-image protocol picker |
@@ -368,7 +368,7 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 
 ### Session state (in-memory)
 
-Each active session has a `SessionState` (wrapped in `Arc<Mutex<>>`):
+Each active session has a `SessionState` owned by its control thread:
 
 - `title: Option<String>` — display name
 - `selected_model: Option<String>` — AI model for this session
@@ -377,7 +377,7 @@ Each active session has a `SessionState` (wrapped in `Arc<Mutex<>>`):
 - `max_turns: Option<u32>` — per-session tool loop iteration cap (inherits from parent)
 - `created_at: i64` — Unix timestamp of creation
 - `messages: Vec<SessionMessage>` — conversation history (also persisted to DB)
-- `active_requests: HashMap<u32, ActiveRequest>` — running request handles
+- `active_requests: HashMap<u32, ActiveRequest>` — running request cancel flags
 - `subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>` — attached clients
 
 ### Hierarchy and CWD inheritance
@@ -395,14 +395,13 @@ same directory as their parent with a default iteration cap.
 - **Session creation**: Writes a `SessionRecord` to the DB immediately.
 - **Message append**: Each `SessionMessage` is written to the DB alongside the
   in-memory push via `append_message_and_persist()`.
-- **Shutdown**: No explicit shutdown needed; redb commits are durable on write.
+- **Shutdown**: The daemon sends `SessionCommand::Shutdown` to each active session, waits for request workers to drain, then exits cleanly.
 
 ### Multiple concurrent sessions
 
-Multiple sessions can have active requests running simultaneously. Each `SessionState`
-tracks its own `active_requests: HashMap<u32, ActiveRequest>`. Tokio tasks spawned for
-requests hold independent `Arc` references to their session, so sessions can run
-concurrently and complete independently.
+Multiple sessions can be active at the same time. Each session control thread stays
+responsive while at most one request worker runs for that session. Request workers own a
+snapshot of the session state and use cooperative cancellation via an `AtomicBool`.
 
 ---
 

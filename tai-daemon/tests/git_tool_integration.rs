@@ -5,12 +5,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tai_daemon::{
-    execute_git_add_tool,
-    execute_git_commit_tool,
-    execute_git_diff_tool,
-    execute_git_log_tool,
-    execute_git_push_tool,
-    execute_git_status_tool,
+    execute_git_add_tool, execute_git_commit_tool, execute_git_diff_tool, execute_git_log_tool,
+    execute_git_push_tool, execute_git_status_tool,
 };
 
 static NEXT_UNIQUE_ID: AtomicU64 = AtomicU64::new(1);
@@ -114,17 +110,17 @@ fn git_diff_reports_worktree_and_cached_changes() {
     git(&repo, &["add", "added.txt"]);
 
     let worktree = execute_git_diff_tool(
-        &serde_json::json!({ "repo_path": repo, "cached": false }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "cached": false }).to_string(),
+        None,
+    );
     assert!(!worktree.is_error, "{}", worktree.content);
     assert!(worktree.content.contains("mode: working tree"));
     assert!(worktree.content.contains("M file.txt"));
 
     let cached = execute_git_diff_tool(
-        &serde_json::json!({ "repo_path": repo, "cached": true }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "cached": true }).to_string(),
+        None,
+    );
     assert!(!cached.is_error, "{}", cached.content);
     assert!(cached.content.contains("mode: staged"));
     assert!(cached.content.contains("A added.txt"));
@@ -142,9 +138,10 @@ fn git_log_reports_recent_commits() {
     std::fs::write(repo.join("file.txt"), "two\n").expect("rewrite file");
     git(&repo, &["commit", "-am", "second commit"]);
 
-    let result =
-        execute_git_log_tool(&serde_json::json!({ "repo_path": repo, "limit": 2 }).to_string(), None)
-            ;
+    let result = execute_git_log_tool(
+        &serde_json::json!({ "repo_path": repo, "limit": 2 }).to_string(),
+        None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("head: main"));
@@ -180,9 +177,9 @@ fn git_add_stages_modified_untracked_and_deleted_paths() {
             "repo_path": repo,
             "pathspec": ["tracked.txt", "new.txt", "delete-me.txt"]
         })
-        .to_string(), None,
-    )
-    ;
+        .to_string(),
+        None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     let cached = git_output(&repo, &["diff", "--cached", "--name-status"]);
@@ -202,9 +199,9 @@ fn git_add_accepts_clean_tracked_paths_as_noop() {
     git(&repo, &["commit", "-m", "initial commit"]);
 
     let result = execute_git_add_tool(
-        &serde_json::json!({ "repo_path": repo, "pathspec": ["tracked.txt"] }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "pathspec": ["tracked.txt"] }).to_string(),
+        None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("index_changed: no"));
@@ -222,9 +219,9 @@ fn git_add_works_from_subdirectory_repo_path() {
 
     let subdir = repo.join("src");
     let result = execute_git_add_tool(
-        &serde_json::json!({ "repo_path": subdir, "pathspec": ["lib.rs"] }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": subdir, "pathspec": ["lib.rs"] }).to_string(),
+        None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     let cached = git_output(&repo, &["diff", "--cached", "--name-status"]);
@@ -239,9 +236,9 @@ fn git_add_rejects_empty_and_unmatched_pathspecs() {
     let repo = init_repo();
 
     let empty = execute_git_add_tool(
-        &serde_json::json!({ "repo_path": repo, "pathspec": ["", "  "] }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "pathspec": ["", "  "] }).to_string(),
+        None,
+    );
     assert!(empty.is_error);
     assert!(
         empty
@@ -250,9 +247,9 @@ fn git_add_rejects_empty_and_unmatched_pathspecs() {
     );
 
     let unmatched = execute_git_add_tool(
-        &serde_json::json!({ "repo_path": repo, "pathspec": ["missing.txt"] }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "pathspec": ["missing.txt"] }).to_string(),
+        None,
+    );
     assert!(unmatched.is_error);
     assert!(
         unmatched
@@ -269,14 +266,14 @@ fn git_commit_creates_commit_from_staged_index() {
     let repo = init_repo();
     std::fs::write(repo.join("file.txt"), "one\n").expect("write file");
     execute_git_add_tool(
-        &serde_json::json!({ "repo_path": repo, "pathspec": ["file.txt"] }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "pathspec": ["file.txt"] }).to_string(),
+        None,
+    );
 
     let result = execute_git_commit_tool(
-        &serde_json::json!({ "repo_path": repo, "message": "Add file" }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "message": "Add file" }).to_string(),
+        None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("head: main"));
@@ -302,9 +299,9 @@ fn git_commit_supports_multiline_messages_and_allow_empty() {
             "message": "Initial empty\n\nBody",
             "allow_empty": true
         })
-        .to_string(), None,
-    )
-    ;
+        .to_string(),
+        None,
+    );
     assert!(!empty_commit.is_error, "{}", empty_commit.content);
     assert!(empty_commit.content.contains("Initial empty"));
 
@@ -320,16 +317,16 @@ fn git_commit_rejects_blank_message_and_missing_staged_changes() {
     let repo = init_repo();
 
     let blank = execute_git_commit_tool(
-        &serde_json::json!({ "repo_path": repo, "message": "   " }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "message": "   " }).to_string(),
+        None,
+    );
     assert!(blank.is_error);
     assert!(blank.content.contains("commit message must not be empty"));
 
     let no_changes = execute_git_commit_tool(
-        &serde_json::json!({ "repo_path": repo, "message": "Nothing" }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "message": "Nothing" }).to_string(),
+        None,
+    );
     assert!(no_changes.is_error);
     assert!(no_changes.content.contains("no staged changes to commit"));
 
@@ -360,9 +357,9 @@ fn git_commit_rejects_conflicted_index() {
     assert!(!output.status.success(), "merge unexpectedly succeeded");
 
     let result = execute_git_commit_tool(
-        &serde_json::json!({ "repo_path": repo, "message": "should fail" }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "message": "should fail" }).to_string(),
+        None,
+    );
     assert!(result.is_error);
     assert!(result.content.contains("unresolved index conflicts"));
 
@@ -393,9 +390,9 @@ fn git_push_pushes_branch_to_remote_and_sets_upstream() {
             "remote": "origin",
             "set_upstream": true
         })
-        .to_string(), None,
-    )
-    ;
+        .to_string(),
+        None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("remote: origin"));
@@ -440,9 +437,9 @@ fn git_push_supports_dry_run() {
             "branch": "main",
             "dry_run": true
         })
-        .to_string(), None,
-    )
-    ;
+        .to_string(),
+        None,
+    );
 
     assert!(!result.is_error, "{}", result.content);
     assert!(result.content.contains("dry_run: yes"));
@@ -478,9 +475,9 @@ fn git_push_rejects_detached_head_without_branch() {
     git(&repo, &["checkout", head.trim()]);
 
     let result = execute_git_push_tool(
-        &serde_json::json!({ "repo_path": repo, "remote": "origin" }).to_string(), None,
-    )
-    ;
+        &serde_json::json!({ "repo_path": repo, "remote": "origin" }).to_string(),
+        None,
+    );
 
     assert!(result.is_error);
     assert!(
@@ -507,9 +504,9 @@ fn git_push_reports_push_failure() {
             "remote": "origin",
             "branch": "main"
         })
-        .to_string(), None,
-    )
-    ;
+        .to_string(),
+        None,
+    );
 
     assert!(result.is_error);
     assert!(result.content.contains("result: push failed"));

@@ -29,7 +29,10 @@ fn hmac_sha1(key: &[u8], data: &str) -> String {
     let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     let result = mac.finalize();
-    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, result.into_bytes().as_slice())
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        result.into_bytes().as_slice(),
+    )
 }
 
 fn build_oauth1_header(
@@ -119,7 +122,11 @@ fn build_oauth1_header(
     format!("OAuth {header_value}")
 }
 
-fn x_api_get(path: &str, params: &[(&str, &str)], x_credentials: Option<&XCredentials>) -> Result<String, String> {
+fn x_api_get(
+    path: &str,
+    params: &[(&str, &str)],
+    x_credentials: Option<&XCredentials>,
+) -> Result<String, String> {
     let creds = get_x_credentials(x_credentials).ok_or("X credentials not configured")?;
     let url = format!("{X_API_BASE}{path}");
     let auth_header = build_oauth1_header("GET", &url, &creds, params);
@@ -132,7 +139,9 @@ fn x_api_get(path: &str, params: &[(&str, &str)], x_credentials: Option<&XCreden
         .map_err(|e| format!("X API request failed: {e}"))?;
 
     let status = response.status();
-    let body = response.text().map_err(|e| format!("failed to read response: {e}"))?;
+    let body = response
+        .text()
+        .map_err(|e| format!("failed to read response: {e}"))?;
 
     if !status.is_success() {
         return Err(format!("X API error (status {status}): {body}"));
@@ -141,7 +150,11 @@ fn x_api_get(path: &str, params: &[(&str, &str)], x_credentials: Option<&XCreden
     Ok(body)
 }
 
-fn x_api_post(path: &str, body_json: &str, x_credentials: Option<&XCredentials>) -> Result<String, String> {
+fn x_api_post(
+    path: &str,
+    body_json: &str,
+    x_credentials: Option<&XCredentials>,
+) -> Result<String, String> {
     let creds = get_x_credentials(x_credentials).ok_or("X credentials not configured")?;
     let url = format!("{X_API_BASE}{path}");
     let auth_header = build_oauth1_header("POST", &url, &creds, &[]);
@@ -156,7 +169,9 @@ fn x_api_post(path: &str, body_json: &str, x_credentials: Option<&XCredentials>)
         .map_err(|e| format!("X API request failed: {e}"))?;
 
     let status = response.status();
-    let body = response.text().map_err(|e| format!("failed to read response: {e}"))?;
+    let body = response
+        .text()
+        .map_err(|e| format!("failed to read response: {e}"))?;
 
     if !status.is_success() {
         return Err(format!("X API error (status {status}): {body}"));
@@ -189,7 +204,12 @@ impl super::Tool for XPost {
         })
     }
 
-    fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
+    fn execute(
+        &self,
+        arguments_json: &str,
+        x_credentials: Option<&XCredentials>,
+        _cwd: Option<&std::path::Path>,
+    ) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -259,7 +279,12 @@ impl super::Tool for XSearchRecent {
         })
     }
 
-    fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
+    fn execute(
+        &self,
+        arguments_json: &str,
+        x_credentials: Option<&XCredentials>,
+        _cwd: Option<&std::path::Path>,
+    ) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -278,10 +303,7 @@ impl super::Tool for XSearchRecent {
             };
         }
 
-        let max_results = args["max_results"]
-            .as_u64()
-            .unwrap_or(10)
-            .clamp(10, 100);
+        let max_results = args["max_results"].as_u64().unwrap_or(10).clamp(10, 100);
         let max_results_str = max_results.to_string();
 
         let params = vec![
@@ -335,7 +357,12 @@ impl super::Tool for XUserLookup {
         })
     }
 
-    fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, _cwd: Option<&std::path::Path>) -> ToolExecutionOutput {
+    fn execute(
+        &self,
+        arguments_json: &str,
+        x_credentials: Option<&XCredentials>,
+        _cwd: Option<&std::path::Path>,
+    ) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
             Ok(v) => v,
             Err(e) => {
@@ -356,7 +383,11 @@ impl super::Tool for XUserLookup {
 
         let params = vec![("user.fields", "description,public_metrics,created_at")];
 
-        match x_api_get(&format!("/2/users/by/username/{username}"), &params, x_credentials) {
+        match x_api_get(
+            &format!("/2/users/by/username/{username}"),
+            &params,
+            x_credentials,
+        ) {
             Ok(response) => {
                 let formatted = match serde_json::from_str::<serde_json::Value>(&response) {
                     Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(response),

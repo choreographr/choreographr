@@ -24,14 +24,13 @@ async fn evm_gas_impl(rpc_url: &str) -> Result<String, ToolError> {
         .get_max_priority_fee_per_gas()
         .await
         .map_err(alloy_err)?;
-    let estimation = provider
-        .estimate_eip1559_fees()
-        .await
-        .map_err(alloy_err)?;
+    let estimation = provider.estimate_eip1559_fees().await.map_err(alloy_err)?;
 
     let mut out = String::new();
     out.push_str(&format!("gas_price: {gas_price} wei\n"));
-    out.push_str(&format!("max_priority_fee_per_gas: {max_priority_fee} wei\n"));
+    out.push_str(&format!(
+        "max_priority_fee_per_gas: {max_priority_fee} wei\n"
+    ));
     out.push_str(&format!(
         "estimated_max_fee_per_gas: {} wei\n",
         estimation.max_fee_per_gas
@@ -43,7 +42,9 @@ async fn evm_gas_impl(rpc_url: &str) -> Result<String, ToolError> {
     Ok(out)
 }
 
-define_tool!(EvmGas, "evm_gas",
+define_tool!(
+    EvmGas,
+    "evm_gas",
     "Get current gas fee estimates on an EVM blockchain: gas price, max priority fee, and EIP-1559 fee estimation.",
     execute_evm_gas_tool,
     serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"}},"required":["rpc_url"],"additionalProperties":false})

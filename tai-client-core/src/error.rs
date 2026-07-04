@@ -1,6 +1,6 @@
 use std::io;
-use thiserror::Error;
 use tai_proto::ProtoError;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum ClientError {
@@ -18,7 +18,9 @@ pub enum ClientError {
     DuplicateImage { image_id: u32, request_id: u32 },
     #[error("unknown image {image_id} for request {request_id}")]
     UnknownImage { image_id: u32, request_id: u32 },
-    #[error("image {image_id} for request {request_id} ended with {actual} bytes, expected {expected}")]
+    #[error(
+        "image {image_id} for request {request_id} ended with {actual} bytes, expected {expected}"
+    )]
     ImageSizeMismatch {
         image_id: u32,
         request_id: u32,

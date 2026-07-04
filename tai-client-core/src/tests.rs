@@ -5,7 +5,10 @@ use tai_proto::{ClientMessage, ImageMetadata, OutputStream};
 #[test]
 fn parses_empty_line() {
     let mut next = 1;
-    assert_eq!(parse_input_line("   ", &mut next, None), ShellCommand::Empty);
+    assert_eq!(
+        parse_input_line("   ", &mut next, None),
+        ShellCommand::Empty
+    );
     assert_eq!(next, 1);
 }
 
@@ -282,7 +285,9 @@ fn rejects_add_key_without_enough_args() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/add-key openai", &mut next, None),
-        ShellCommand::UnknownCommand("usage: /add-key <service> <api_key> <passphrase>".to_string())
+        ShellCommand::UnknownCommand(
+            "usage: /add-key <service> <api_key> <passphrase>".to_string()
+        )
     );
     assert_eq!(next, 3);
 }
@@ -309,7 +314,11 @@ fn parses_add_x() {
 fn parses_add_x_with_bearer() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-x twitter ck cs at ats mybearer mypass", &mut next, None),
+        parse_input_line(
+            "/add-x twitter ck cs at ats mybearer mypass",
+            &mut next,
+            None
+        ),
         ShellCommand::Send(ClientMessage::AddXCredential {
             service: "twitter".to_string(),
             passphrase: "mypass".to_string(),

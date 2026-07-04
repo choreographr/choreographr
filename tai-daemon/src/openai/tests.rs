@@ -104,10 +104,7 @@ fn backoff_respects_max_cap() {
 #[test]
 fn parse_retry_after_seconds() {
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::RETRY_AFTER,
-        "42".parse().unwrap(),
-    );
+    headers.insert(reqwest::header::RETRY_AFTER, "42".parse().unwrap());
     assert_eq!(parse_retry_after_secs(&headers), Some(42));
 }
 
@@ -120,9 +117,6 @@ fn parse_retry_after_missing_header() {
 #[test]
 fn parse_retry_after_non_integer() {
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        reqwest::header::RETRY_AFTER,
-        "abc".parse().unwrap(),
-    );
+    headers.insert(reqwest::header::RETRY_AFTER, "abc".parse().unwrap());
     assert_eq!(parse_retry_after_secs(&headers), None);
 }

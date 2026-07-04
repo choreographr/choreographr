@@ -8,7 +8,11 @@ pub enum ShellCommand {
     Empty,
 }
 
-pub fn parse_input_line(line: &str, next_request_id: &mut u32, attached_session_id: Option<u64>) -> ShellCommand {
+pub fn parse_input_line(
+    line: &str,
+    next_request_id: &mut u32,
+    attached_session_id: Option<u64>,
+) -> ShellCommand {
     let line = line.trim();
     if line.is_empty() {
         return ShellCommand::Empty;
@@ -26,7 +30,11 @@ pub fn parse_input_line(line: &str, next_request_id: &mut u32, attached_session_
     })
 }
 
-fn parse_command(rest: &str, next_request_id: &mut u32, attached_session_id: Option<u64>) -> ShellCommand {
+fn parse_command(
+    rest: &str,
+    next_request_id: &mut u32,
+    attached_session_id: Option<u64>,
+) -> ShellCommand {
     if let Some(arg) = rest.strip_prefix("cancel ") {
         return match arg.trim().parse::<u32>() {
             Ok(request_id) => ShellCommand::Send(ClientMessage::Cancel { request_id }),
@@ -45,9 +53,7 @@ fn parse_command(rest: &str, next_request_id: &mut u32, attached_session_id: Opt
     }
 
     if rest == "unlock" {
-        return ShellCommand::UnknownCommand(
-            "usage: /unlock <passphrase>".to_string(),
-        );
+        return ShellCommand::UnknownCommand("usage: /unlock <passphrase>".to_string());
     }
 
     if rest == "lock" {
@@ -64,7 +70,11 @@ fn parse_command(rest: &str, next_request_id: &mut u32, attached_session_id: Opt
         let service = parts[0].to_string();
         let key = parts[1].to_string();
         let passphrase = parts[2..].join(" ");
-        return ShellCommand::Send(ClientMessage::AddApiKey { service, passphrase, key });
+        return ShellCommand::Send(ClientMessage::AddApiKey {
+            service,
+            passphrase,
+            key,
+        });
     }
 
     if let Some(args) = rest.strip_prefix("add-x ") {
@@ -105,7 +115,10 @@ fn parse_command(rest: &str, next_request_id: &mut u32, attached_session_id: Opt
         }
         let service = parts[0].to_string();
         let passphrase = parts[1..].join(" ");
-        return ShellCommand::Send(ClientMessage::RemoveCredential { service, passphrase });
+        return ShellCommand::Send(ClientMessage::RemoveCredential {
+            service,
+            passphrase,
+        });
     }
 
     if rest == "image" {
@@ -119,22 +132,22 @@ fn parse_command(rest: &str, next_request_id: &mut u32, attached_session_id: Opt
         if let Some(session_id) = sub.strip_prefix("switch ") {
             return match session_id.trim().parse::<u64>() {
                 Ok(id) => ShellCommand::Send(ClientMessage::AttachSession { session_id: id }),
-                Err(_) => ShellCommand::UnknownCommand(
-                    "usage: /session switch <id>".to_string(),
-                ),
+                Err(_) => ShellCommand::UnknownCommand("usage: /session switch <id>".to_string()),
             };
         }
         if let Some(session_id) = sub.strip_prefix("info ") {
             return match session_id.trim().parse::<u64>() {
                 Ok(id) => ShellCommand::Send(ClientMessage::GetSessionState { session_id: id }),
-                Err(_) => ShellCommand::UnknownCommand(
-                    "usage: /session info <id>".to_string(),
-                ),
+                Err(_) => ShellCommand::UnknownCommand("usage: /session info <id>".to_string()),
             };
         }
         if let Some(title) = sub.strip_prefix("new ") {
             let title = title.trim();
-            let title = if title.is_empty() { None } else { Some(title.to_string()) };
+            let title = if title.is_empty() {
+                None
+            } else {
+                Some(title.to_string())
+            };
             return ShellCommand::Send(ClientMessage::CreateSession {
                 title,
                 parent_session_id: None,

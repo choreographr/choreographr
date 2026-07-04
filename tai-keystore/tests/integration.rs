@@ -18,7 +18,10 @@ fn test_init_and_load() {
     let passphrase = "initial-passphrase";
 
     let ks = Keystore::init(&path, passphrase).expect("init should succeed");
-    assert!(ks.service_names().count() == 0, "new keystore should be empty");
+    assert!(
+        ks.service_names().count() == 0,
+        "new keystore should be empty"
+    );
 
     let loaded = Keystore::load(&path, passphrase).expect("load should succeed");
     assert!(
@@ -63,9 +66,7 @@ fn test_save_and_load_round_trip() {
         _ => panic!("expected ApiKey variant"),
     }
 
-    let twitter = loaded
-        .get("twitter")
-        .expect("twitter service should exist");
+    let twitter = loaded.get("twitter").expect("twitter service should exist");
     match twitter {
         ServiceCredential::X {
             api_key,
@@ -111,12 +112,7 @@ fn test_corrupted_file() {
     let passphrase = "corrupt-test-pass";
 
     let mut ks = Keystore::new();
-    ks.add(
-        "svc".into(),
-        ServiceCredential::ApiKey {
-            key: "k".into(),
-        },
-    );
+    ks.add("svc".into(), ServiceCredential::ApiKey { key: "k".into() });
     ks.save(&path, passphrase).expect("save should succeed");
 
     let mut data = fs::read(&path).expect("should read file");
@@ -237,7 +233,9 @@ fn test_get_api_key_vs_x() {
     assert_eq!(ks.get_api_key("openai"), Some("sk-key"));
     assert!(ks.get_api_key("twitter").is_none());
 
-    let x_creds = ks.get_x_credentials("twitter").expect("twitter should have X creds");
+    let x_creds = ks
+        .get_x_credentials("twitter")
+        .expect("twitter should have X creds");
     assert_eq!(x_creds.api_key, "x-api");
     assert_eq!(x_creds.api_key_secret, "x-secret");
     assert_eq!(x_creds.access_token, "x-token");
@@ -252,24 +250,9 @@ fn test_get_api_key_vs_x() {
 fn test_service_names() {
     let mut ks = Keystore::new();
 
-    ks.add(
-        "a".into(),
-        ServiceCredential::ApiKey {
-            key: "k1".into(),
-        },
-    );
-    ks.add(
-        "b".into(),
-        ServiceCredential::ApiKey {
-            key: "k2".into(),
-        },
-    );
-    ks.add(
-        "c".into(),
-        ServiceCredential::ApiKey {
-            key: "k3".into(),
-        },
-    );
+    ks.add("a".into(), ServiceCredential::ApiKey { key: "k1".into() });
+    ks.add("b".into(), ServiceCredential::ApiKey { key: "k2".into() });
+    ks.add("c".into(), ServiceCredential::ApiKey { key: "k3".into() });
 
     let mut names: Vec<String> = ks.service_names().cloned().collect();
     names.sort();

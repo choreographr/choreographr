@@ -17,9 +17,11 @@ pub(crate) fn execute_evm_token_balance_tool(arguments_json: &str) -> ToolResult
 
 fn execute_evm_token_balance_inner(arguments_json: &str) -> Result<String, ToolError> {
     let args: EvmTokenBalanceArgs = serde_json::from_str(arguments_json)?;
-    let output = tokio::runtime::Handle::current().block_on(
-        evm_token_balance_impl(&args.rpc_url, &args.token_address, &args.address),
-    )?;
+    let output = tokio::runtime::Handle::current().block_on(evm_token_balance_impl(
+        &args.rpc_url,
+        &args.token_address,
+        &args.address,
+    ))?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -31,8 +33,8 @@ async fn evm_token_balance_impl(
     let provider = connect(rpc_url)?;
     let token_address = Address::from_str(token_address_str)
         .map_err(|e| ToolError::Other(format!("invalid token address: {e}")))?;
-    let owner_address =
-        Address::from_str(address_str).map_err(|e| ToolError::Other(format!("invalid owner address: {e}")))?;
+    let owner_address = Address::from_str(address_str)
+        .map_err(|e| ToolError::Other(format!("invalid owner address: {e}")))?;
 
     let call = balanceOfCall {
         account: owner_address,
@@ -43,8 +45,7 @@ async fn evm_token_balance_impl(
         .with_input(call_data);
 
     let result: Bytes = provider.call(tx).await.map_err(alloy_err)?;
-    let return_data =
-        balanceOfCall::abi_decode_returns(&result).map_err(alloy_err)?;
+    let return_data = balanceOfCall::abi_decode_returns(&result).map_err(alloy_err)?;
     let balance = return_data;
 
     let mut out = String::new();
@@ -66,7 +67,9 @@ async fn evm_token_balance_impl(
     Ok(out)
 }
 
-define_tool!(EvmTokenBalance, "evm_token_balance",
+define_tool!(
+    EvmTokenBalance,
+    "evm_token_balance",
     "Query the ERC-20 token balance for an address. Also attempts to fetch the token symbol.",
     execute_evm_token_balance_tool,
     serde_json::json!({"type":"object","properties":{"rpc_url":{"type":"string","description":"JSON-RPC URL of the EVM node"},"token_address":{"type":"string","description":"0x-prefixed ERC-20 token contract address"},"address":{"type":"string","description":"0x-prefixed wallet address to check balance for"}},"required":["rpc_url","token_address","address"],"additionalProperties":false})
