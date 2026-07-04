@@ -257,7 +257,7 @@ impl DaemonState {
                                 created_at: record.created_at,
                                 message_count: record.message_count,
                                 max_turns: record.max_turns,
-                                status: SessionStatus::Inactive,
+                                status: SessionStatus::Sleeping,
                             });
                         }
                     }
@@ -290,6 +290,9 @@ impl DaemonState {
             }
             DaemonCommand::SessionExited { session_id } => {
                 self.active_sessions.remove(&session_id);
+                if let Some(meta) = self.session_metadata.get_mut(&session_id) {
+                    meta.status = SessionStatus::Sleeping;
+                }
                 let msg = DaemonMessage::SessionStatusChanged {
                     session_id,
                     status: SessionStatus::Sleeping,
