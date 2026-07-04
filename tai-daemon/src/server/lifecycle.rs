@@ -34,6 +34,7 @@ pub async fn run_server(socket_path: &str, mut state: DaemonState) -> io::Result
             accept_result = listener.accept() => {
                 let (stream, _) = accept_result?;
                 let stream = stream.into_std()?;
+                stream.set_nonblocking(false)?;
                 let tx = daemon_tx.clone();
                 task::spawn_blocking(move || {
                     if let Err(e) = crate::server::connection::client_thread(stream, tx) {
