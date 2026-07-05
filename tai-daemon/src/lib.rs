@@ -16,8 +16,10 @@ pub use crate::server::run_server;
 pub use crate::sessions::{
     ActiveSessionEntry, SessionCommand, SessionMetadata, SessionState, session_main,
 };
-pub use crate::tools::bash::execute_bash_tool;
+pub use crate::tools::sh::execute_sh_tool;
 pub use crate::tools::nu::execute_nu_tool;
+pub use crate::tools::fish::execute_fish_tool;
+pub use crate::tools::exec::execute_exec_tool;
 pub use crate::tools::vm::execute_run_riscv_tool;
 pub use crate::tools::git::{
     execute_git_add_tool, execute_git_commit_tool, execute_git_diff_tool, execute_git_log_tool,

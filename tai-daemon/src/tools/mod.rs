@@ -66,8 +66,11 @@ macro_rules! define_tool_with_cwd {
 mod error;
 pub(crate) use error::{ToolError, tool_err, tool_ok};
 
-pub(crate) mod bash;
+pub(crate) mod shell_util;
+pub(crate) mod sh;
 pub(crate) mod nu;
+pub(crate) mod fish;
+pub(crate) mod exec;
 mod fff;
 pub(crate) mod fs;
 pub(crate) mod git;
@@ -145,8 +148,20 @@ impl ToolRegistry {
         reg.register(git::GitAdd);
         reg.register(git::GitCommit);
         reg.register(git::GitPush);
-        reg.register(bash::Bash);
-        reg.register(nu::NuShell);
+        // Only register the shell tool when at least one POSIX variant is found.
+        if shell_util::binary_exists("bash")
+            || shell_util::binary_exists("dash")
+            || shell_util::binary_exists("zsh")
+        {
+            reg.register(sh::Sh);
+        }
+        if shell_util::binary_exists("nu") {
+            reg.register(nu::NuShell);
+        }
+        if shell_util::binary_exists("fish") {
+            reg.register(fish::FishShell);
+        }
+        reg.register(exec::Exec);
         reg.register(fff::Fff);
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);

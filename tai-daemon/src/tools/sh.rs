@@ -1,28 +1,37 @@
 use super::{
     ToolError, ToolResult, tool_ok,
-    shell_util::{format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
+    shell_util::{binary_exists, format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
 };
 use serde::Deserialize;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
-struct NuArgs {
+struct ShArgs {
     command: String,
+    shell: String,
     workdir: Option<String>,
     timeout: Option<u64>,
 }
 
-define_tool_with_cwd!(
-    NuShell,
-    "nushell",
-    "Execute a nushell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang.",
-    execute_nu_tool,
+/// Build the JSON schema dynamically so the `shell` enum only lists
+/// shells that are actually installed on the current system.
+fn sh_schema() -> serde_json::Value {
+    let shells: Vec<&str> = ["bash", "dash", "zsh"]
+        .iter()
+        .filter(|s| binary_exists(s))
+        .copied()
+        .collect();
     serde_json::json!({
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The nushell command to execute (runs via `nu -c`)"
+                "description": "The shell command to execute (runs via `<shell> -c`)"
+            },
+            "shell": {
+                "type": "string",
+                "enum": shells,
+                "description": "Which POSIX-compatible shell to use. Must be one of the available variants on this system."
             },
             "workdir": {
                 "type": "string",
@@ -34,30 +43,39 @@ define_tool_with_cwd!(
                 "default": 30000
             }
         },
-        "required": ["command"],
+        "required": ["command", "shell"],
         "additionalProperties": false
     })
+}
+
+define_tool_with_cwd!(
+    Sh,
+    "sh",
+    "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified.",
+    execute_sh_tool,
+    sh_schema()
 );
 
-pub fn execute_nu_tool(arguments_json: &str, cwd: Option<&Path>) -> ToolResult {
-    match execute_nu_inner(arguments_json, cwd) {
+pub fn execute_sh_tool(arguments_json: &str, cwd: Option<&Path>) -> ToolResult {
+    match execute_sh_inner(arguments_json, cwd) {
         Ok(content) => tool_ok(content),
         Err(error) => error.into(),
     }
 }
 
-fn execute_nu_inner(
+fn execute_sh_inner(
     arguments_json: &str,
     cwd: Option<&Path>,
 ) -> Result<String, ToolError> {
-    let args: NuArgs = serde_json::from_str(arguments_json)?;
+    let args: ShArgs = serde_json::from_str(arguments_json)?;
 
+    let shell = args.shell;
     let command = args.command;
     let timeout_ms = args.timeout.unwrap_or(30000).min(300000);
 
     let resolved = resolve_and_confine(args.workdir.as_deref(), cwd)?;
 
-    let mut cmd = std::process::Command::new("nu");
+    let mut cmd = std::process::Command::new(&shell);
     cmd.args(["-c", &command])
         .current_dir(&resolved)
         .stdout(std::process::Stdio::piped())
