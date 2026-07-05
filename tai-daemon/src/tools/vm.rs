@@ -509,6 +509,10 @@ impl Tool for RunRiscV {
         "run_riscv"
     }
 
+    fn category(&self) -> &'static str {
+        "vm"
+    }
+
     fn description(&self) -> &'static str {
         "Compile and run Rust code in a RISC-V sandboxed virtual machine"
     }

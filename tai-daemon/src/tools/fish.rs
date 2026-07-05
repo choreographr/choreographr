@@ -36,7 +36,8 @@ define_tool_with_cwd!(
         },
         "required": ["command"],
         "additionalProperties": false
-    })
+    }),
+    "shell"
 );
 
 pub fn execute_fish_tool(arguments_json: &str, cwd: Option<&Path>) -> ToolResult {

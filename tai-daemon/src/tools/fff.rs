@@ -138,7 +138,8 @@ define_tool_with_cwd!(
         },
         "required": ["query"],
         "additionalProperties": false
-    })
+    }),
+    "core"
 );
 
 pub(crate) fn execute_fff_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {

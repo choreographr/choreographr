@@ -187,6 +187,10 @@ impl super::Tool for XPost {
         "x_post"
     }
 
+    fn category(&self) -> &'static str {
+        "x"
+    }
+
     fn description(&self) -> &'static str {
         "Post a tweet to X (Twitter). Requires X credentials to be configured via the keystore."
     }
@@ -256,6 +260,10 @@ pub(crate) struct XSearchRecent;
 impl super::Tool for XSearchRecent {
     fn name(&self) -> &'static str {
         "x_search_recent"
+    }
+
+    fn category(&self) -> &'static str {
+        "x"
     }
 
     fn description(&self) -> &'static str {
@@ -338,6 +346,10 @@ pub(crate) struct XUserLookup;
 impl super::Tool for XUserLookup {
     fn name(&self) -> &'static str {
         "x_user_lookup"
+    }
+
+    fn category(&self) -> &'static str {
+        "x"
     }
 
     fn description(&self) -> &'static str {

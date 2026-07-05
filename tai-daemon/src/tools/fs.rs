@@ -472,7 +472,8 @@ define_tool_with_cwd!(
         },
         "required": ["path"],
         "additionalProperties": false
-    })
+    }),
+    "core"
 );
 
 define_tool_with_cwd!(
@@ -501,7 +502,8 @@ define_tool_with_cwd!(
         },
         "required": ["path", "start_line", "max_lines"],
         "additionalProperties": false
-    })
+    }),
+    "core"
 );
 
 define_tool_with_cwd!(
@@ -519,7 +521,8 @@ define_tool_with_cwd!(
             }
         },
         "additionalProperties": false
-    })
+    }),
+    "core"
 );
 
 define_tool_with_cwd!(
@@ -537,7 +540,8 @@ define_tool_with_cwd!(
         },
         "required": ["path"],
         "additionalProperties": false
-    })
+    }),
+    "core"
 );
 
 define_tool_with_cwd!(
@@ -569,7 +573,8 @@ define_tool_with_cwd!(
         },
         "required": ["path", "content"],
         "additionalProperties": false
-    })
+    }),
+    "core"
 );
 
 define_tool_with_cwd!(
@@ -620,7 +625,8 @@ define_tool_with_cwd!(
         },
         "required": ["path", "edits"],
         "additionalProperties": false
-    })
+    }),
+    "core"
 );
 
 #[cfg(test)]

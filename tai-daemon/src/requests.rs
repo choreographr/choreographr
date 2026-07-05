@@ -78,11 +78,11 @@ pub(crate) fn run_agent_loop(
     max_turns_default: u32,
     cmd_tx: &std::sync::mpsc::Sender<SessionCommand>,
 ) -> io::Result<()> {
-    let tools = tool_registry.available_definitions();
     let mut next_image_id = 1u32;
     let max_turns = session.max_turns.unwrap_or(max_turns_default);
 
     for _ in 0..max_turns {
+        let tools = tool_registry.available_definitions(&session.active_categories);
         if cancel.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -238,7 +238,7 @@ fn execute_tool_with_timeout(
     daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
     client: &OpenAiClient,
     db: &redb::Database,
-    session: &SessionState,
+    session: &mut SessionState,
     session_id: u64,
     model: &str,
     max_turns_default: u32,
@@ -267,6 +267,34 @@ fn execute_tool_with_timeout(
     }
     if tool_call.name == "load_skill" {
         return execute_load_skill_sync(session, cwd, &tool_call.arguments_json);
+    }
+    if tool_call.name == "load_tools" {
+        let result = crate::tools::categories::execute_load_tools(
+            &mut session.active_categories,
+            &tool_call.arguments_json,
+        );
+        persist_categories(db, session_id, &session.active_categories);
+        return ToolExecutionOutput {
+            result: ToolResult {
+                content: result,
+                is_error: false,
+            },
+            image: None,
+        };
+    }
+    if tool_call.name == "unload_tools" {
+        let result = crate::tools::categories::execute_unload_tools(
+            &mut session.active_categories,
+            &tool_call.arguments_json,
+        );
+        persist_categories(db, session_id, &session.active_categories);
+        return ToolExecutionOutput {
+            result: ToolResult {
+                content: result,
+                is_error: false,
+            },
+            image: None,
+        };
     }
 
     let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -459,7 +487,7 @@ fn execute_get_session_sync(
 fn execute_spawn_subsession_sync(
     _client: &OpenAiClient,
     daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
-    _parent_session: &SessionState,
+    parent_session: &SessionState,
     parent_session_id: u64,
     _db: &redb::Database,
     _model: &str,
@@ -503,12 +531,20 @@ fn execute_spawn_subsession_sync(
         .map(|v| v as u32);
     let child_cwd = cwd.map(|p| p.to_path_buf());
 
+    // Inherit categories from parent, or use explicit list if provided.
+    let categories = args
+        .get("categories")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_else(|| parent_session.active_categories.iter().cloned().collect());
+
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     let _ = daemon_tx.send(crate::daemon::DaemonCommand::CreateSession {
         title,
         parent_session_id: Some(parent_session_id),
         cwd: child_cwd.clone(),
         max_turns,
+        active_categories: categories,
         reply: reply_tx,
     });
 
@@ -673,7 +709,18 @@ fn persist_assistant_tool_use_sync(
     write_message_retry(db, session_id, idx, &msg).ok();
 }
 
-pub(crate) fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMessage> {
+pub(crate) fn persist_categories(
+    db: &redb::Database,
+    session_id: u64,
+    active_categories: &std::collections::HashSet<String>,
+) {
+    if let Ok(Some(mut record)) = crate::db::read_session(db, session_id) {
+        record.active_categories = active_categories.iter().cloned().collect();
+        crate::db::write_session_retry(db, session_id, &record).ok();
+    }
+}
+
+fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMessage> {
     messages
         .iter()
         .map(|message| match message {

@@ -277,5 +277,6 @@ define_tool_with_cwd!(
     "git_diff",
     "Show the diff for a file or repository. When `full` is true, returns line-by-line unified diff instead of file status summary.",
     execute_git_diff_tool,
-    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"cached":{"type":"boolean","description":"Show staged (cached) changes instead of worktree changes","default":false},"pathspec":{"type":"array","items":{"type":"string"},"description":"Optional pathspecs to filter"},"full":{"type":"boolean","description":"Return full unified diff instead of file status summary","default":false}},"additionalProperties":false})
+    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"cached":{"type":"boolean","description":"Show staged (cached) changes instead of worktree changes","default":false},"pathspec":{"type":"array","items":{"type":"string"},"description":"Optional pathspecs to filter"},"full":{"type":"boolean","description":"Return full unified diff instead of file status summary","default":false}},"additionalProperties":false}),
+    "git"
 );

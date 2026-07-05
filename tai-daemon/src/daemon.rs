@@ -31,6 +31,7 @@ pub enum DaemonCommand {
         parent_session_id: Option<u64>,
         cwd: Option<PathBuf>,
         max_turns: Option<u32>,
+        active_categories: Vec<String>,
         reply: std::sync::mpsc::Sender<io::Result<(u64, std::sync::mpsc::Sender<SessionCommand>)>>,
     },
     AttachSession {
@@ -84,6 +85,7 @@ impl DaemonState {
                 parent_session_id,
                 cwd,
                 max_turns,
+                active_categories,
                 reply,
             } => {
                 if self.openai_client.is_none() {
@@ -97,6 +99,11 @@ impl DaemonState {
                 self.next_session_id += 1;
 
                 let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
+                let active_cats = if active_categories.is_empty() {
+                    vec!["core".into(), "git".into(), "shell".into()]
+                } else {
+                    active_categories.clone()
+                };
                 let record = SessionRecord {
                     title: title.clone(),
                     selected_model: None,
@@ -108,6 +115,7 @@ impl DaemonState {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs() as i64,
+                    active_categories: active_cats.clone(),
                 };
 
                 db::write_session(&self.db, sid, &record).ok();
@@ -153,6 +161,7 @@ impl DaemonState {
                         message_count: 0,
                         max_turns,
                         status: SessionStatus::Inactive,
+                        active_categories: active_cats.clone(),
                     },
                 );
 
@@ -243,6 +252,7 @@ impl DaemonState {
                         message_count: meta.message_count,
                         max_turns: meta.max_turns,
                         status: meta.status.clone(),
+                        active_categories: meta.active_categories.clone(),
                     })
                     .collect();
 
@@ -259,6 +269,7 @@ impl DaemonState {
                                 message_count: record.message_count,
                                 max_turns: record.max_turns,
                                 status: SessionStatus::Sleeping,
+                                active_categories: Vec::new(),
                             });
                         }
                     }
@@ -280,6 +291,7 @@ impl DaemonState {
                         message_count: meta.message_count,
                         max_turns: meta.max_turns,
                         status: meta.status.clone(),
+                        active_categories: meta.active_categories.clone(),
                     });
                 let _ = reply.send(summary);
             }

@@ -364,6 +364,35 @@ working directory. Filesystem and Git tools resolve relative paths against this 
 | **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
 | **Skills** | `load_skill` (loads the full instructions for a skill by name, following the Agent Skills standard) |
 
+### Tool categories
+
+Tools are organized into categories to reduce context overhead. Each tool declares its category
+via `fn category() -> &'static str` on the `Tool` trait. Categories are:
+
+| Category | Default | Description |
+|---|---|---|
+| `core` | always on | File system, HTTP, images, file search |
+| `git` | on | Local Git operations |
+| `shell` | on | Shell and exec |
+| `x` | off | X/Twitter API |
+| `vm` | off | RISC-V sandboxed code execution |
+
+The system prompt lists all categories and their descriptions. The model uses `load_tools` to
+activate additional categories and `unload_tools` to deactivate them. **core** cannot be unloaded.
+
+Categories affect only tool **availability** in the API `tools` array — they are a discovery
+mechanism, not access control. The RISC-V VM (`run_riscv`) always has access to all registered
+tools regardless of category state.
+
+Implementation details:
+- `ToolRegistry::available_definitions(active)` filters by `active: &HashSet<String>`
+- `load_tools`/`unload_tools` are intercepted in `execute_tool_with_timeout()` (same pattern as
+  `spawn_subsession` and `load_skill`)
+- Session state stores `active_categories: HashSet<String>` (default: `{core, git, shell}`)
+- `ToolCategory` struct and `CATEGORIES` constant live in `tai-daemon/src/tools/mod.rs`
+- Handler functions live in `tai-daemon/src/tools/categories.rs`
+- Category metadata is appended to the system prompt in `context::build_base_prompt()`
+
 ### spawn_subsession
 
 `spawn_subsession` is a special tool: it does not implement the `Tool` trait. Instead, it is
@@ -409,6 +438,7 @@ Each active session has a `SessionState` owned by its control thread:
 - `messages: Vec<SessionMessage>` — conversation history (also persisted to DB)
 - `active_requests: HashMap<u32, ActiveRequest>` — running request cancel flags
 - `subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>` — attached clients
+- `active_categories: HashSet<String>` — tool categories active for this session
 
 ### Hierarchy and CWD inheritance
 

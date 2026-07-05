@@ -13,6 +13,13 @@ pub(crate) fn spawn_subsession_schema() -> serde_json::Value {
             "max_turns": {
                 "type": "integer",
                 "description": "Optional maximum tool-calling iterations for this sub-session. Inherits from parent if not set."
+            },
+            "categories": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "description": "Optional tool categories to activate. Inherits from parent session if not set."
             }
         },
         "required": ["prompt"],

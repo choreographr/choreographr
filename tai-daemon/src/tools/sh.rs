@@ -53,7 +53,8 @@ define_tool_with_cwd!(
     "sh",
     "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified.",
     execute_sh_tool,
-    sh_schema()
+    sh_schema(),
+    "shell"
 );
 
 pub fn execute_sh_tool(arguments_json: &str, cwd: Option<&Path>) -> ToolResult {

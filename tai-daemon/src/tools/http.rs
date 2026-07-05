@@ -181,5 +181,6 @@ define_tool!(
         },
         "required": ["method", "url"],
         "additionalProperties": false
-    })
+    }),
+    "core"
 );

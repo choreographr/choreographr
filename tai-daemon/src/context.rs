@@ -1,3 +1,4 @@
+use crate::tools::ToolCategory;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -201,18 +202,23 @@ pub fn assemble_context(bundle: &ContextBundle) -> String {
     out
 }
 
-pub fn build_base_prompt(skills: &[SkillMeta]) -> String {
+pub fn build_base_prompt(skills: &[SkillMeta], categories: &[ToolCategory]) -> String {
     let user_prompt = load_user_system_prompt();
     let mut base = user_prompt.unwrap_or_else(default_system_prompt);
 
-    if skills.is_empty() {
-        return base;
+    // Tool category listing (always shown)
+    base.push_str("\n\n## Tool categories\n");
+    base.push_str("Tools are organized into categories. Only **core**, **git**, and **shell** are active by default. Use the `load_tools` tool to activate additional categories and `unload_tools` to deactivate them.\n\n");
+    for cat in categories {
+        base.push_str(&format!("- **{}**: {}\n", cat.name, cat.description));
     }
 
-    base.push_str("\n\n## Available skills\n");
-    base.push_str("Use the `load_skill` tool to load a skill's full instructions when a task matches its description:\n\n");
-    for skill in skills {
-        base.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
+    if !skills.is_empty() {
+        base.push_str("\n## Available skills\n");
+        base.push_str("Use the `load_skill` tool to load a skill's full instructions when a task matches its description:\n\n");
+        for skill in skills {
+            base.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
+        }
     }
     base
 }
@@ -588,7 +594,7 @@ mod tests {
             path: PathBuf::from("/fake/SKILL.md"),
         }];
 
-        let prompt = build_base_prompt(&skills);
+        let prompt = build_base_prompt(&skills, &[]);
         assert!(prompt.contains("test-skill"));
         assert!(prompt.contains("A test skill"));
         assert!(prompt.contains("load_skill"));

@@ -4,7 +4,7 @@ use crate::db::{self, SessionRecord, write_message_retry, write_session_retry};
 use crate::openai::OpenAiClient;
 use crate::requests::run_agent_loop;
 use crate::tools::ToolRegistry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +65,7 @@ pub struct SessionMetadata {
     pub message_count: u32,
     pub max_turns: Option<u32>,
     pub status: SessionStatus,
+    pub active_categories: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -80,6 +81,7 @@ pub struct SessionSnapshot {
     pub context_file_paths: Vec<PathBuf>,
     pub context_message_index: Option<usize>,
     pub status: SessionStatus,
+    pub active_categories: std::collections::HashSet<String>,
 }
 
 struct ActiveRequest {
@@ -105,6 +107,7 @@ pub struct SessionState {
     pub context_file_paths: Vec<PathBuf>,
     pub context_message_index: Option<usize>,
     pub status: SessionStatus,
+    pub active_categories: std::collections::HashSet<String>,
 }
 
 impl SessionState {
@@ -121,6 +124,7 @@ impl SessionState {
             context_file_paths: self.context_file_paths.clone(),
             context_message_index: self.context_message_index,
             status: self.status.clone(),
+            active_categories: self.active_categories.clone(),
         }
     }
 
@@ -142,6 +146,7 @@ impl SessionState {
             context_file_paths: snapshot.context_file_paths,
             context_message_index: snapshot.context_message_index,
             status: snapshot.status,
+            active_categories: snapshot.active_categories,
         }
     }
 
@@ -157,6 +162,7 @@ impl SessionState {
         self.context_file_paths = snapshot.context_file_paths;
         self.context_message_index = snapshot.context_message_index;
         self.status = snapshot.status;
+        self.active_categories = snapshot.active_categories;
     }
 }
 
@@ -206,6 +212,15 @@ pub fn session_main(
         context_file_paths: Vec::new(),
         context_message_index: None,
         status: SessionStatus::Inactive,
+        active_categories: init_record
+            .as_ref()
+            .map(|r| r.active_categories.iter().cloned().collect())
+            .filter(|cats: &HashSet<String>| !cats.is_empty())
+            .unwrap_or_else(|| HashSet::from([
+                "core".to_string(),
+                "git".to_string(),
+                "shell".to_string(),
+            ])),
     };
 
     match db::read_messages(&db, session_id) {
@@ -216,7 +231,7 @@ pub fn session_main(
     if init_record.is_none() || state.messages.is_empty() {
         let effective_cwd = state.cwd.as_deref().unwrap_or_else(|| Path::new("."));
         let skills = context::discover_skills(effective_cwd);
-        let base_prompt = context::build_base_prompt(&skills);
+        let base_prompt = context::build_base_prompt(&skills, tool_registry.categories());
         state.messages.push(SessionMessage::SystemText {
             content: base_prompt,
         });
@@ -247,6 +262,7 @@ pub fn session_main(
             message_count: state.messages.len() as u32,
             max_turns: state.max_turns,
             status: state.status.clone(),
+            active_categories: state.active_categories.iter().cloned().collect(),
         },
     });
 
@@ -482,6 +498,7 @@ fn process_command(
                     message_count: state.messages.len() as u32,
                     max_turns: state.max_turns,
                     status: state.status.clone(),
+                    active_categories: state.active_categories.iter().cloned().collect(),
                 },
             });
             false
@@ -499,6 +516,7 @@ fn process_command(
                     message_count: state.messages.len() as u32,
                     max_turns: state.max_turns,
                     status: state.status.clone(),
+                    active_categories: state.active_categories.iter().cloned().collect(),
                 },
             });
             broadcast(&state.subscribers, DaemonMessage::SessionStatusChanged {
@@ -521,6 +539,7 @@ fn process_command(
                 cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
                 max_turns: state.max_turns,
                 messages: state.messages.clone(),
+                active_categories: state.active_categories.iter().cloned().collect(),
             };
             if let Some(tx) = state.subscribers.get(&client_id) {
                 let _ = tx.send(snapshot);
@@ -543,6 +562,7 @@ fn process_command(
                 message_count: state.messages.len() as u32,
                 max_turns: state.max_turns,
                 status: state.status.clone(),
+                active_categories: state.active_categories.iter().cloned().collect(),
             });
             false
         }
@@ -570,6 +590,7 @@ fn process_command(
                     message_count: state.messages.len() as u32,
                     max_turns: state.max_turns,
                     status: state.status.clone(),
+                    active_categories: state.active_categories.iter().cloned().collect(),
                 },
             });
             broadcast(
@@ -722,6 +743,7 @@ fn persist_and_exit(
         max_turns: state.max_turns,
         message_count: state.messages.len() as u32,
         created_at: state.created_at,
+        active_categories: state.active_categories.iter().cloned().collect(),
     };
     write_session_retry(db, session_id, &record).ok();
     let _ = daemon_tx.send(DaemonCommand::SessionExited { session_id });
