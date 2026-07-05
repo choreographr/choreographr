@@ -66,6 +66,7 @@ mod error;
 pub(crate) use error::{ToolError, tool_err, tool_ok};
 
 pub(crate) mod bash;
+pub(crate) mod nu;
 mod fff;
 pub(crate) mod fs;
 pub(crate) mod git;
@@ -146,6 +147,7 @@ impl ToolRegistry {
         reg.register(git::GitCommit);
         reg.register(git::GitPush);
         reg.register(bash::Bash);
+        reg.register(nu::NuShell);
         reg.register(fff::Fff);
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);
