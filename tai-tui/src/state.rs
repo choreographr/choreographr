@@ -53,6 +53,7 @@ pub(crate) struct App {
     pub(crate) attached_session_id: Option<u64>,
     pub(crate) page: Page,
     pub(crate) session_mgr: SessionManagerState,
+    pub(crate) scroll_accumulator: isize,
 }
 
 #[derive(Clone, Copy)]
@@ -296,6 +297,7 @@ impl App {
             attached_session_id: None,
             page: Page::Chat,
             session_mgr: SessionManagerState::new(),
+            scroll_accumulator: 0,
         }
     }
 
@@ -415,6 +417,16 @@ impl App {
     pub(crate) fn scroll_down(&mut self, amount: usize) {
         self.history_scroll
             .scroll_down(amount, self.max_scroll_offset());
+    }
+
+    pub(crate) fn apply_scroll_delta(&mut self) {
+        let delta = self.scroll_accumulator;
+        self.scroll_accumulator = 0;
+        if delta > 0 {
+            self.scroll_up(delta as usize);
+        } else if delta < 0 {
+            self.scroll_down((-delta) as usize);
+        }
     }
 
     fn trimmed_height_on_append(&self) -> usize {

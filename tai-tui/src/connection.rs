@@ -1,7 +1,7 @@
 use crate::render::{mouse_in_history_box, render};
 use crate::state::{App, Page, SessionManagerView, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use signal_hook::consts::SIGINT;
 use std::sync::{
     Arc,
@@ -113,10 +113,7 @@ pub(crate) fn run_ui_loop(
             break;
         }
 
-        while let Ok(event) = event::poll(Duration::from_millis(0)) {
-            if !event {
-                break;
-            }
+        while let Ok(true) = event::poll(Duration::from_millis(0)) {
             handle_terminal_event(event::read()?, app, client_tx)?;
         }
 
@@ -133,10 +130,20 @@ pub(crate) fn run_ui_loop(
             }
         }
 
+        app.apply_scroll_delta();
+
+        if let Ok((width, height)) = crossterm::terminal::size() {
+            if width > 0 && height > 3 {
+                app.history_viewport
+                    .update(Rect { x: 0, y: 0, width, height: height - 3 });
+            }
+        }
+        app.clamp_scroll_state();
+
         terminal.draw(|frame| render(frame, app))?;
 
         if event::poll(Duration::from_millis(UI_FRAME_POLL_MS))? {
-            handle_terminal_event(event::read()?, app, client_tx)?;
+            // Collected on next iteration's drain loop
         }
     }
 
@@ -241,8 +248,12 @@ fn handle_chat_event(
         }
         Event::Mouse(mouse) if mouse_in_history_box(mouse.column, mouse.row) => {
             match mouse.kind {
-                MouseEventKind::ScrollUp => app.scroll_up(1),
-                MouseEventKind::ScrollDown => app.scroll_down(1),
+                MouseEventKind::ScrollUp => {
+                    app.scroll_accumulator = app.scroll_accumulator.saturating_add(1);
+                }
+                MouseEventKind::ScrollDown => {
+                    app.scroll_accumulator = app.scroll_accumulator.saturating_sub(1);
+                }
                 _ => {}
             }
         }

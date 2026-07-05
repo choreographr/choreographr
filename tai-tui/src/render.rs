@@ -41,8 +41,6 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(frame.area());
 
-    app.history_viewport.update(chunks[0]);
-    app.clamp_scroll_state();
     render_history(frame, chunks[0], app);
 
     let input = Paragraph::new(app.input.as_str())
@@ -111,7 +109,8 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     continue;
                 }
 
-                let height = image_block_height(rows_remaining) as u16;
+                let visible_height = (full_height.saturating_sub(rows_to_skip)).min(rows_remaining);
+                let height = visible_height as u16;
                 if height == 0 {
                     break;
                 }
@@ -153,7 +152,7 @@ fn render_history_text(
         return;
     }
 
-    let visible_height = wrapped.min(*rows_remaining);
+    let visible_height = (wrapped.saturating_sub(*rows_to_skip)).min(*rows_remaining);
     if visible_height == 0 {
         return;
     }
@@ -192,7 +191,7 @@ fn render_history_lines(
         return;
     }
 
-    let visible_height = wrapped.min(*rows_remaining);
+    let visible_height = (wrapped.saturating_sub(*rows_to_skip)).min(*rows_remaining);
     if visible_height == 0 {
         return;
     }
