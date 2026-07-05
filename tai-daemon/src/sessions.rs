@@ -470,6 +470,20 @@ fn process_command(
         }
         SessionCommand::SetModel { model } => {
             state.selected_model = Some(model.clone());
+            broadcast(&state.subscribers, DaemonMessage::ModelSelected { model: model.clone() });
+            let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
+                session_id,
+                metadata: SessionMetadata {
+                    title: state.title.clone(),
+                    selected_model: state.selected_model.clone(),
+                    parent_session_id: state.parent_session_id,
+                    cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
+                    created_at: state.created_at,
+                    message_count: state.messages.len() as u32,
+                    max_turns: state.max_turns,
+                    status: state.status.clone(),
+                },
+            });
             false
         }
         SessionCommand::StatusChanged(new_status) => {

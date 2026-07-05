@@ -138,6 +138,11 @@ pub(crate) fn client_thread(
                     ClientMessage::SetModel { model } => {
                         if let Some(ref tx) = attached_session_tx {
                             let _ = tx.send(SessionCommand::SetModel { model });
+                        } else {
+                            let _ = writer_tx.send(DaemonMessage::ModelSelectionFailed {
+                                model,
+                                error: "no session attached".to_string(),
+                            });
                         }
                     }
                     ClientMessage::Unlock { passphrase } => {
