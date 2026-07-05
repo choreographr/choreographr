@@ -1,5 +1,5 @@
 use crate::render::{mouse_in_history_box, render};
-use crate::state::{App, Page, SessionManagerView, UiEvent};
+use crate::state::{App, InputBuffer, Page, SessionManagerView, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use signal_hook::consts::SIGINT;
@@ -211,9 +211,8 @@ fn handle_chat_event(
                 KeyCode::Char('q') if app.input.is_empty() => app.should_quit = true,
                 KeyCode::Esc => app.should_quit = true,
                 KeyCode::Enter => {
-                    let line = app.input.trim().to_string();
+                    let line = app.input.text.trim().to_string();
                     app.input.clear();
-                    app.cursor = 0;
                     match parse_input_line(
                         &line,
                         &mut app.next_request_id,
@@ -246,48 +245,12 @@ fn handle_chat_event(
                         }
                     }
                 }
-                KeyCode::Backspace
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    app.delete_word_backward();
+                KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right
+                | KeyCode::Home | KeyCode::End => {
+                    handle_input_key(key, &mut app.input);
                 }
-                KeyCode::Backspace => {
-                    app.backspace_at_cursor();
-                }
-                KeyCode::Delete
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    app.delete_word_forward();
-                }
-                KeyCode::Delete => {
-                    app.delete_at_cursor();
-                }
-                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.word_left();
-                }
-                KeyCode::Left => {
-                    app.cursor_left();
-                }
-                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.word_right();
-                }
-                KeyCode::Right => {
-                    app.cursor_right();
-                }
-                KeyCode::Home => {
-                    app.cursor_home();
-                }
-                KeyCode::End => {
-                    app.cursor_end();
-                }
-                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.delete_word_backward();
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.delete_to_start();
-                }
-                KeyCode::Char(c) => {
-                    app.insert_char_at_cursor(c);
+                KeyCode::Char(_) => {
+                    handle_input_key(key, &mut app.input);
                 }
                 KeyCode::PageUp => {
                     app.scroll_up(3);
@@ -318,6 +281,51 @@ fn handle_chat_event(
         _ => {}
     }
     Ok(())
+}
+
+fn handle_input_key(key: crossterm::event::KeyEvent, input: &mut InputBuffer) {
+    match key.code {
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.delete_word_backward();
+        }
+        KeyCode::Backspace => {
+            input.backspace_at_cursor();
+        }
+        KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.delete_word_forward();
+        }
+        KeyCode::Delete => {
+            input.delete_at_cursor();
+        }
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.word_left();
+        }
+        KeyCode::Left => {
+            input.cursor_left();
+        }
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.word_right();
+        }
+        KeyCode::Right => {
+            input.cursor_right();
+        }
+        KeyCode::Home => {
+            input.cursor_home();
+        }
+        KeyCode::End => {
+            input.cursor_end();
+        }
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.delete_word_backward();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.delete_to_start();
+        }
+        KeyCode::Char(c) => {
+            input.insert_char_at_cursor(c);
+        }
+        _ => {}
+    }
 }
 
 fn handle_session_manager_event(

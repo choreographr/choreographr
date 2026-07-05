@@ -44,8 +44,7 @@ pub(crate) struct SessionManagerState {
 }
 
 pub(crate) struct App {
-    pub(crate) input: String,
-    pub(crate) cursor: usize,
+    pub(crate) input: InputBuffer,
     pub(crate) next_request_id: u32,
     pub(crate) active: HashSet<u32>,
     pub(crate) client: ClientHistory<Box<RenderedImage>>,
@@ -293,11 +292,159 @@ impl SessionManagerState {
     }
 }
 
+pub(crate) struct InputBuffer {
+    pub(crate) text: String,
+    pub(crate) cursor: usize,
+}
+
+impl InputBuffer {
+    pub(crate) fn new() -> Self {
+        Self { text: String::new(), cursor: 0 }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.text.as_str()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    // ── Cursor movement ────────────────────────────────────────
+
+    pub(crate) fn cursor_left(&mut self) {
+        let prefix = &self.text[..self.cursor];
+        if let Some((start, _)) = prefix.grapheme_indices(true).next_back() {
+            self.cursor = start;
+        }
+    }
+
+    pub(crate) fn cursor_right(&mut self) {
+        let suffix = &self.text[self.cursor..];
+        if suffix.is_empty() {
+            return;
+        }
+        if let Some((offset, grapheme)) = suffix.grapheme_indices(true).next() {
+            self.cursor += offset + grapheme.len();
+        }
+    }
+
+    pub(crate) fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub(crate) fn cursor_end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
+    // ── Word movement ──────────────────────────────────────────
+
+    /// Returns the byte position of the word boundary before current cursor.
+    fn word_left_boundary(&self) -> usize {
+        let s = &self.text[..self.cursor];
+        let trimmed = s.trim_end();
+        if trimmed.is_empty() {
+            return 0;
+        }
+        trimmed
+            .rfind(|c: char| c.is_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0)
+    }
+
+    /// Returns the byte position of the word boundary after current cursor.
+    fn word_right_boundary(&self) -> usize {
+        let s = &self.text[self.cursor..];
+        if s.is_empty() {
+            return self.cursor;
+        }
+        let mut chars = s.char_indices().peekable();
+
+        // Skip past the current word if not at whitespace
+        if chars.peek().map_or(false, |&(_, c)| !c.is_whitespace()) {
+            while let Some((_, c)) = chars.next() {
+                if c.is_whitespace() {
+                    break;
+                }
+            }
+        }
+
+        // Skip whitespace to find the start of the next word
+        while chars.peek().map_or(false, |&(_, c)| c.is_whitespace()) {
+            chars.next();
+        }
+
+        self.cursor + chars.next().map(|(pos, _)| pos).unwrap_or(s.len())
+    }
+
+    pub(crate) fn word_left(&mut self) {
+        self.cursor = self.word_left_boundary();
+    }
+
+    pub(crate) fn word_right(&mut self) {
+        self.cursor = self.word_right_boundary();
+    }
+
+    // ── Editing ────────────────────────────────────────────────
+
+    pub(crate) fn insert_char_at_cursor(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    pub(crate) fn backspace_at_cursor(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prefix = &self.text[..self.cursor];
+        if let Some((start, _)) = prefix.grapheme_indices(true).next_back() {
+            self.text.drain(start..self.cursor);
+            self.cursor = start;
+        }
+    }
+
+    pub(crate) fn delete_at_cursor(&mut self) {
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        let suffix = &self.text[self.cursor..];
+        if let Some((offset, grapheme)) = suffix.grapheme_indices(true).next() {
+            self.text.drain(self.cursor + offset..self.cursor + offset + grapheme.len());
+        }
+    }
+
+    pub(crate) fn delete_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let boundary = self.word_left_boundary();
+        self.text.drain(boundary..self.cursor);
+        self.cursor = boundary;
+    }
+
+    pub(crate) fn delete_word_forward(&mut self) {
+        if self.cursor >= self.text.len() {
+            return;
+        }
+        let boundary = self.word_right_boundary();
+        self.text.drain(self.cursor..boundary);
+    }
+
+    pub(crate) fn delete_to_start(&mut self) {
+        self.text.drain(..self.cursor);
+        self.cursor = 0;
+    }
+}
+
 impl App {
     pub(crate) fn new(socket_path: String, picker_protocol: String) -> Self {
         Self {
-            input: String::new(),
-            cursor: 0,
+            input: InputBuffer::new(),
             next_request_id: 1,
             active: HashSet::new(),
             client: ClientHistory::new(vec![
@@ -468,133 +615,7 @@ impl App {
         }
     }
 
-    // ── Cursor movement ────────────────────────────────────────
 
-    pub(crate) fn cursor_left(&mut self) {
-        let prefix = &self.input[..self.cursor];
-        if let Some((start, _)) = prefix.grapheme_indices(true).next_back() {
-            self.cursor = start;
-        }
-    }
-
-    pub(crate) fn cursor_right(&mut self) {
-        let suffix = &self.input[self.cursor..];
-        if suffix.is_empty() {
-            return;
-        }
-        if let Some((offset, grapheme)) = suffix.grapheme_indices(true).next() {
-            self.cursor += offset + grapheme.len();
-        }
-    }
-
-    pub(crate) fn cursor_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    pub(crate) fn cursor_end(&mut self) {
-        self.cursor = self.input.len();
-    }
-
-    // ── Word movement ──────────────────────────────────────────
-
-    pub(crate) fn word_left(&mut self) {
-        let s = &self.input[..self.cursor];
-        let trimmed = s.trim_end();
-        if trimmed.is_empty() {
-            self.cursor = 0;
-            return;
-        }
-        self.cursor = trimmed
-            .rfind(|c: char| c.is_whitespace())
-            .map(|i| i + 1)
-            .unwrap_or(0);
-    }
-
-    pub(crate) fn word_right(&mut self) {
-        let s = &self.input[self.cursor..];
-        if s.is_empty() {
-            return;
-        }
-
-        let char_indices: Vec<(usize, char)> = s.char_indices().collect();
-
-        if char_indices.is_empty() {
-            return;
-        }
-
-        let mut i = 0;
-
-        // If at a non-whitespace character, skip past this word
-        if !char_indices[0].1.is_whitespace() {
-            while i < char_indices.len() && !char_indices[i].1.is_whitespace() {
-                i += 1;
-            }
-        }
-
-        // Skip whitespace to find the start of the next word
-        while i < char_indices.len() && char_indices[i].1.is_whitespace() {
-            i += 1;
-        }
-
-        if i < char_indices.len() {
-            self.cursor += char_indices[i].0;
-        } else {
-            self.cursor = self.input.len();
-        }
-    }
-
-    // ── Editing ────────────────────────────────────────────────
-
-    pub(crate) fn insert_char_at_cursor(&mut self, c: char) {
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-    }
-
-    pub(crate) fn backspace_at_cursor(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prefix = &self.input[..self.cursor];
-        if let Some((start, _)) = prefix.grapheme_indices(true).next_back() {
-            self.input.drain(start..self.cursor);
-            self.cursor = start;
-        }
-    }
-
-    pub(crate) fn delete_at_cursor(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        let suffix = &self.input[self.cursor..];
-        if let Some((offset, grapheme)) = suffix.grapheme_indices(true).next() {
-            self.input.drain(self.cursor + offset..self.cursor + offset + grapheme.len());
-        }
-    }
-
-    pub(crate) fn delete_word_backward(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let old_cursor = self.cursor;
-        self.word_left();
-        self.input.drain(self.cursor..old_cursor);
-    }
-
-    pub(crate) fn delete_word_forward(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        let old_cursor = self.cursor;
-        self.word_right();
-        let after = self.cursor;
-        self.cursor = old_cursor;
-        self.input.drain(self.cursor..after);
-    }
-
-    pub(crate) fn delete_to_start(&mut self) {
-        self.input.drain(..self.cursor);
-        self.cursor = 0;
-    }
 
     fn trimmed_height_on_append(&self) -> usize {
         if self.client.history.len() < MAX_HISTORY_ITEMS || self.history_scroll.follow_output() {
