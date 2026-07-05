@@ -7642,6 +7642,7 @@ dependencies = [
  "fff-search",
  "filetime",
  "gix",
+ "gix-imara-diff",
  "hex",
  "hmac",
  "image",

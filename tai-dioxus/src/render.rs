@@ -2,6 +2,7 @@ use crate::state::{HistoryItem, StreamingEntry};
 use dioxus::prelude::*;
 use tai_client_core::HistoryItem as SharedHistoryItem;
 use tai_client_core::render_markdown_html;
+use tai_client_core::FileDiff;
 use tai_proto::SessionMessage;
 
 pub(crate) fn render_history_item(item: HistoryItem) -> Element {
@@ -35,7 +36,31 @@ pub(crate) fn render_history_item(item: HistoryItem) -> Element {
                 }
             }
         },
+        SharedHistoryItem::Diff(files) => rsx! {
+            div { class: "history-item diff-item",
+                div { class: "diff-header", "Diff ({files.len()} file(s))" }
+                pre { class: "diff-body",
+                    {files.iter().map(|f| format_diff_file(f)).collect::<Vec<_>>().join("\n")}
+                }
+            }
+        },
     }
+}
+
+fn format_diff_file(file: &FileDiff) -> String {
+    let mut out = format!("--- {}\n+++ {}\n", file.old_path, file.new_path);
+    for hunk in &file.hunks {
+        out.push_str(&format!("{}\n", hunk.header));
+        for line in &hunk.lines {
+            let prefix = match line.kind {
+                tai_client_core::DiffLineKind::Addition => "+",
+                tai_client_core::DiffLineKind::Deletion => "-",
+                tai_client_core::DiffLineKind::Context => " ",
+            };
+            out.push_str(&format!("{}{}\n", prefix, line.content));
+        }
+    }
+    out
 }
 
 fn render_session_message(message: SessionMessage) -> Element {

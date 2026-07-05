@@ -373,6 +373,7 @@ fn temporary_sibling_path(path: &Path) -> PathBuf {
 
 struct AppliedEditSummary {
     content: String,
+    original: Option<String>,
     replacement_count: usize,
     char_delta: isize,
 }
@@ -381,7 +382,8 @@ fn apply_text_edits(
     original_content: &str,
     edits: &[TextEditArgs],
 ) -> Result<AppliedEditSummary, String> {
-    let mut content = original_content.to_string();
+    let original = original_content.to_string();
+    let mut content = original.clone();
     let mut replacement_count = 0usize;
     let mut char_delta = 0isize;
 
@@ -425,13 +427,14 @@ fn apply_text_edits(
 
     Ok(AppliedEditSummary {
         content,
+        original: Some(original),
         replacement_count,
         char_delta,
     })
 }
 
 fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) -> String {
-    format!(
+    let mut out = format!(
         "{action} file: {path} ({} replacement{}, {:+} chars)",
         summary.replacement_count,
         if summary.replacement_count == 1 {
@@ -440,7 +443,18 @@ fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) ->
             "s"
         },
         summary.char_delta,
-    )
+    );
+
+    // Append diff if we have original content
+    if let Some(ref original) = summary.original {
+        let diff = crate::diff_util::generate_diff(original, &summary.content, path, path);
+        if !diff.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&diff);
+        }
+    }
+
+    out
 }
 
 define_tool_with_cwd!(

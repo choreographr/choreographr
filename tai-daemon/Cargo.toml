@@ -13,6 +13,7 @@ hex = "0.4"
 libc = "0.2"
 
 gix = { version = "0.85", features = ["tree-editor"] }
+gix-imara-diff = { version = "0.2", features = ["unified_diff"] }
 hmac = "0.13"
 image.workspace = true
 rand.workspace = true

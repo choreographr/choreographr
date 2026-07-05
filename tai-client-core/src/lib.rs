@@ -1,4 +1,5 @@
 mod connection;
+mod diff;
 mod dispatch;
 mod error;
 mod history;
@@ -7,6 +8,7 @@ mod markdown;
 mod shell;
 
 pub use connection::run_daemon_connection;
+pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 pub use dispatch::{DaemonMessageHandler, dispatch_daemon_message};
 pub use error::ClientError;
 pub use history::{ClientHistory, HistoryItem, MAX_HISTORY_ITEMS};

@@ -14,7 +14,7 @@ fn app_push_text_trims_history_to_limit() {
     assert_eq!(app.client.history.len(), 500);
     match &app.client.history[0] {
         HistoryItem::Text(text) => assert!(text.contains("line 100")),
-        HistoryItem::SessionMessage(_) | HistoryItem::Streaming(_) | HistoryItem::Image(_) => {
+        HistoryItem::SessionMessage(_) | HistoryItem::Streaming(_) | HistoryItem::Image(_) | HistoryItem::Diff(_) => {
             panic!("expected text history item")
         }
     }

@@ -8,6 +8,7 @@ use tai_proto::{ImageMetadata, OutputStream, SessionMessage, SessionStatus, Sess
 use tai_tui::{RenderedImage, StreamingText, build_rendered_image};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::diff_render::{diff_display_height, is_diff_text, parse_diff};
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +105,7 @@ impl HistoryViewport {
                 lines_height(&lines, self.width).max(1)
             }
             HistoryItem::Image(_) => image_block_height(self.height as usize),
+            HistoryItem::Diff(diffs) => diff_display_height(diffs),
         }
     }
 }
@@ -338,10 +340,19 @@ impl App {
 
     pub(crate) fn push_tool_text(&mut self, request_id: u32, text: impl Into<String>) {
         let text = text.into();
-        let item = HistoryItem::Text(text.clone());
+        let item: HistoryItem = if is_diff_text(&text) {
+            let diffs = parse_diff(&text);
+            if !diffs.is_empty() {
+                HistoryItem::Diff(diffs)
+            } else {
+                HistoryItem::Text(text)
+            }
+        } else {
+            HistoryItem::Text(text)
+        };
         let added_height = self.history_viewport.item_height(&item);
         let trimmed_height = self.trimmed_height_on_append();
-        self.client.insert_text_before_stream(request_id, text);
+        self.client.insert_before_stream(request_id, item);
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
         self.account_for_trimmed_height(trimmed_height);
@@ -349,6 +360,15 @@ impl App {
     }
 
     pub(crate) fn push_session_message(&mut self, message: SessionMessage) {
+        if let SessionMessage::ToolResult { content, is_error, .. } = &message {
+            if !is_error && is_diff_text(content) {
+                let diffs = parse_diff(content);
+                if !diffs.is_empty() {
+                    self.push_history_item(HistoryItem::Diff(diffs));
+                    return;
+                }
+            }
+        }
         self.push_history_item(HistoryItem::SessionMessage(message));
     }
 

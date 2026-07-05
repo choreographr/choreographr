@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::{ImageAssembler, StreamingText};
+use crate::{FileDiff, ImageAssembler, StreamingText};
 use std::collections::HashMap;
 use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
 
@@ -11,6 +11,7 @@ pub enum HistoryItem<TImage> {
     SessionMessage(SessionMessage),
     Streaming(StreamingText),
     Image(TImage),
+    Diff(Vec<FileDiff>),
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,10 @@ impl<TImage> ClientHistory<TImage> {
         self.push_history_item(HistoryItem::SessionMessage(message));
     }
 
+    pub fn push_diff(&mut self, diffs: Vec<FileDiff>) {
+        self.push_history_item(HistoryItem::Diff(diffs));
+    }
+
     pub fn push_image(&mut self, image: TImage) {
         self.push_history_item(HistoryItem::Image(image));
     }
@@ -46,9 +51,9 @@ impl<TImage> ClientHistory<TImage> {
         self.trim_history();
     }
 
-    pub fn insert_text_before_stream(&mut self, request_id: u32, text: impl Into<String>) {
+    pub fn insert_before_stream(&mut self, request_id: u32, item: HistoryItem<TImage>) {
         if let Some(&index) = self.in_progress.get(&request_id) {
-            self.history.insert(index, HistoryItem::Text(text.into()));
+            self.history.insert(index, item);
             for idx in self.in_progress.values_mut() {
                 if *idx >= index {
                     *idx += 1;
@@ -56,8 +61,13 @@ impl<TImage> ClientHistory<TImage> {
             }
             self.trim_history();
         } else {
-            self.push_text(text);
+            self.history.push(item);
+            self.trim_history();
         }
+    }
+
+    pub fn insert_text_before_stream(&mut self, request_id: u32, text: impl Into<String>) {
+        self.insert_before_stream(request_id, HistoryItem::Text(text.into()));
     }
 
     pub fn begin_stream(&mut self, request_id: u32) {

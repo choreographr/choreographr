@@ -1,3 +1,4 @@
+use crate::diff_render::build_diff_panes;
 use crate::markdown_render::{
     display_width, lines_height, session_message_lines, streaming_text_lines,
 };
@@ -11,6 +12,7 @@ use ratatui::{
     text::Line,
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use tai_client_core::{DiffLineKind, FileDiff};
 use ratatui_image::StatefulImage;
 use tai_proto::SessionStatus;
 
@@ -133,6 +135,16 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 frame.render_stateful_widget(StatefulImage::default(), inner, &mut image.protocol);
                 rows_remaining = rows_remaining.saturating_sub(height as usize);
                 rows_to_skip = 0;
+            }
+            HistoryItem::Diff(diffs) => {
+                render_history_diff(
+                    frame,
+                    area,
+                    diffs,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
             }
         }
     }
@@ -402,4 +414,128 @@ fn format_status(status: &SessionStatus) -> String {
         SessionStatus::Inference => "inferring".to_string(),
         SessionStatus::ToolCall(name) => format!("tool call: {name}"),
     }
+}
+
+// ── Diff rendering ─────────────────────────────────────────
+
+fn render_history_diff(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    diffs: &[FileDiff],
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+) {
+    use crate::diff_render::diff_display_height;
+
+    let full_height = diff_display_height(diffs);
+    if *rows_to_skip >= full_height {
+        *rows_to_skip -= full_height;
+        return;
+    }
+
+    let visible_height = (full_height.saturating_sub(*rows_to_skip)).min(*rows_remaining);
+    if visible_height == 0 {
+        return;
+    }
+
+    let bottom_line = full_height.saturating_sub(*rows_to_skip);
+    let top_line = bottom_line.saturating_sub(visible_height);
+
+    *y = (*y).saturating_sub(visible_height as u16);
+    let rect = Rect {
+        x: area.x,
+        y: *y,
+        width: area.width,
+        height: visible_height as u16,
+    };
+
+    let pane_width = if area.width > 4 {
+        (area.width - 2) / 2
+    } else {
+        1
+    };
+
+    let rows = build_diff_panes(diffs);
+    let visible_rows: Vec<_> = rows
+        .iter()
+        .skip(top_line)
+        .take(visible_height)
+        .collect();
+
+    let mut left_spans: Vec<Vec<ratatui::text::Span>> = Vec::with_capacity(visible_rows.len());
+    let mut right_spans: Vec<Vec<ratatui::text::Span>> = Vec::with_capacity(visible_rows.len());
+
+    for row in &visible_rows {
+        left_spans.push(diff_cell_spans(&row.left_content, row.left_kind, pane_width, true));
+        right_spans.push(diff_cell_spans(&row.right_content, row.right_kind, pane_width, false));
+    }
+
+    let separator_style = Style::default().fg(Color::DarkGray);
+    let separator_str = "│";
+
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_rows.len());
+    for i in 0..visible_rows.len() {
+        let mut spans = Vec::new();
+        spans.extend(left_spans[i].clone());
+        // separator
+        spans.push(ratatui::text::Span::styled(
+            separator_str.to_string(),
+            separator_style,
+        ));
+        spans.extend(right_spans[i].clone());
+        lines.push(Line::from(spans));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, rect);
+
+    *rows_remaining = rows_remaining.saturating_sub(visible_height);
+    *rows_to_skip = 0;
+}
+
+fn diff_cell_spans(
+    content: &str,
+    kind: DiffLineKind,
+    pane_width: u16,
+    is_left: bool,
+) -> Vec<ratatui::text::Span<'_>> {
+    let pane_width = pane_width as usize;
+    let truncated = if content.len() > pane_width {
+        let mut s: String = content.chars().take(pane_width.saturating_sub(1)).collect();
+        s.push('…');
+        s
+    } else {
+        let mut s = content.to_string();
+        // pad to fill the pane width for consistent background coloring
+        let w = display_width(&s);
+        if w < pane_width {
+            s.push_str(&" ".repeat(pane_width.saturating_sub(w)));
+        }
+        s
+    };
+
+    let style = match kind {
+        DiffLineKind::Deletion => {
+            if is_left {
+                Style::default()
+                    .fg(Color::Red)
+                    .bg(Color::Rgb(80, 0, 0))
+            } else {
+                Style::default()
+            }
+        }
+        DiffLineKind::Addition => {
+            if !is_left {
+                Style::default()
+                    .fg(Color::Green)
+                    .bg(Color::Rgb(0, 80, 0))
+            } else {
+                Style::default()
+            }
+        }
+        DiffLineKind::Context => Style::default(),
+    };
+
+    vec![ratatui::text::Span::styled(truncated, style)]
 }
