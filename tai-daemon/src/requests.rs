@@ -148,6 +148,8 @@ pub(crate) fn run_agent_loop(
 
                     let tool_timeout = if tool_call.name == "spawn_subsession" {
                         Duration::from_secs(120)
+                    } else if tool_call.name == "bash" {
+                        Duration::from_secs(300)
                     } else {
                         Duration::from_secs(60)
                     };

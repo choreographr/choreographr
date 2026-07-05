@@ -337,7 +337,7 @@ list available tool definitions and dispatch tool execution.
 Each tool receives an optional `cwd: Option<&Path>` parameter that represents the session's
 working directory. Filesystem and Git tools resolve relative paths against this CWD.
 
-### Available tools (30 total)
+### Available tools (31 total)
 
 | Category | Tools |
 |---|---|
@@ -348,6 +348,7 @@ working directory. Filesystem and Git tools resolve relative paths against this 
 | **EVM** | `evm_chain`, `evm_balance`, `evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`, `evm_logs`, `evm_nonce`, `evm_resolve` |
 | **File search** | `fff` (file finding) |
 | **RISC-V VM** | `run_riscv` (compile & run Rust code in a sandboxed RISC-V VM with access to all registered tools) |
+| **Shell** | `bash` (run shell commands in sandboxed child process with rlimits, path confinement, and timeout) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
 | **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
 | **Skills** | `load_skill` (loads the full instructions for a skill by name, following the Agent Skills standard) |
@@ -699,6 +700,22 @@ pub mod tai {
 through the same `ToolRegistry` as the host agent, respecting the same `x_credentials` and `cwd`.
 The guest cannot access host memory, syscalls, or files outside the VM without going through
 registered tools.
+
+### `bash` — shell command execution with sandboxing
+
+`bash` runs shell commands in a child `sh -c` process with layered sandboxing:
+
+1. **Timeout** — the command is killed after a configurable timeout (default 30s, max 300s). A watchdog thread enforces the inner timeout; the outer tool loop timeout is extended to 300s for this tool.
+
+2. **Resource limits** — set via `setrlimit` in the child (pre-exec): `RLIMIT_AS` (4 GB) prevents runaway memory allocation, `RLIMIT_FSIZE` (100 MB) prevents disk-filling writes.
+
+3. **Environment sanitization** — dangerous env vars (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `LD_DEBUG`, `PYTHONPATH`, `PERL5LIB`, `RUBYLIB`, `DYLD_INSERT_LIBRARIES`) are stripped in the child before exec.
+
+4. **Path confinement** — the resolved working directory is canonicalized and must be at or below the session CWD. Absolute paths or `..` traversals that escape the project directory are rejected.
+
+5. **Output limits** — stdout/stderr are combined and truncated to 16 KB via the existing `truncate_tool_output`, preventing context overflow.
+
+6. **Non-interactive** — stdin is not connected. Commands that attempt to read from stdin will hang until the timeout.
 
 
 | Layer | What's tested | Location |

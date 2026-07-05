@@ -10,6 +10,7 @@ base64.workspace = true
 dirs.workspace = true
 fff-search = "0.9"
 hex = "0.4"
+libc = "0.2"
 
 gix = { version = "0.85", features = ["tree-editor"] }
 hmac = "0.13"
