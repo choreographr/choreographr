@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use tai_daemon::daemon::DaemonState;
 use tai_daemon::openai::load_service_config;
+use tai_daemon::tools::init_vm_tool_registry;
 use tai_proto::socket_path;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -52,7 +53,11 @@ fn main() -> anyhow::Result<()> {
         keystore: None,
         x_credentials: None,
         db,
-        tool_registry: Arc::new(tai_daemon::tools::ToolRegistry::new()),
+        tool_registry: {
+            let reg = Arc::new(tai_daemon::tools::ToolRegistry::new());
+            init_vm_tool_registry(&reg);
+            reg
+        },
         client_streams: Vec::new(),
         summary_subscribers: std::collections::HashMap::new(),
     };

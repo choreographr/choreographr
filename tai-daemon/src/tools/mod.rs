@@ -72,7 +72,10 @@ mod image;
 pub(crate) mod sessions;
 pub(crate) mod skill;
 pub(crate) mod subsession;
+pub(crate) mod vm;
 pub(crate) mod x;
+
+pub use vm::init_vm_tool_registry;
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -134,6 +137,7 @@ impl ToolRegistry {
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);
         reg.register(x::XUserLookup);
+        reg.register(vm::RunRiscV);
         reg
     }
 

@@ -1,0 +1,411 @@
+use crate::openai::ChatToolCall;
+use crate::tools::{Tool, ToolExecutionOutput, ToolRegistry, tool_ok, tool_err};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use ckb_vm::Bytes;
+use ckb_vm::{
+    DefaultCoreMachine, DefaultMachineBuilder, FlatMemory, CoreMachine, SupportMachine, Syscalls,
+    DefaultMachineRunner, TraceMachine, ISA_IMC, ISA_B, ISA_MOP, ISA_A,
+    memory::Memory, registers, Error as VmError,
+};
+use ckb_vm::machine::VERSION2;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::process::Command;
+use tai_keystore::XCredentials;
+use tempfile::tempdir;
+
+const BOILERPLATE: &str = r#"
+#![no_std]
+#![no_main]
+#![feature(asm_experimental_arch)]
+
+use core::panic::PanicInfo;
+
+#[panic_handler]
+fn panic(_: &PanicInfo) -> ! {
+    tai::exit(1)
+}
+
+pub mod tai {
+    pub const TOOL_CALL: u64 = 0;
+    pub const WRITE: u64 = 1;
+    pub const EXIT: u64 = 2;
+
+    pub unsafe fn tool_call(request: &[u8], output: &mut [u8]) -> usize {
+        let result: usize;
+        core::arch::asm!(
+            "ecall",
+            in("a0") request.as_ptr(),
+            in("a1") request.len(),
+            in("a2") output.as_mut_ptr(),
+            in("a3") output.len(),
+            in("a7") TOOL_CALL,
+            lateout("a0") result,
+            options(nostack)
+        );
+        result
+    }
+
+    pub fn write(data: &[u8]) {
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                in("a0") data.as_ptr(),
+                in("a1") data.len(),
+                in("a7") WRITE,
+                options(nostack)
+            );
+        }
+    }
+
+    pub fn exit(code: i32) -> ! {
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                in("a0") code,
+                in("a7") EXIT,
+                options(nostack, noreturn)
+            );
+        }
+        core::hint::unreachable_unchecked();
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn _start() {
+    main();
+    tai::exit(0);
+}
+"#;
+
+static VM_TOOL_REGISTRY: OnceLock<Arc<ToolRegistry>> = OnceLock::new();
+
+pub fn init_vm_tool_registry(registry: &Arc<ToolRegistry>) {
+    let _ = VM_TOOL_REGISTRY.set(Arc::clone(registry));
+}
+
+#[derive(Deserialize)]
+struct RunRiscVInput {
+    source: Option<String>,
+    program: Option<String>,
+    args: Option<Vec<String>>,
+    max_cycles: Option<u64>,
+    memory_size: Option<usize>,
+}
+
+struct TaiSyscall {
+    x_credentials: Option<XCredentials>,
+    cwd: Option<PathBuf>,
+    output: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
+    fn initialize(
+        &mut self,
+        _machine: &mut DefaultCoreMachine<u64, FlatMemory<u64>>,
+    ) -> Result<(), VmError> {
+        Ok(())
+    }
+
+    fn ecall(
+        &mut self,
+        machine: &mut DefaultCoreMachine<u64, FlatMemory<u64>>,
+    ) -> Result<bool, VmError> {
+        let code = machine.registers()[registers::A7];
+        match code {
+            0 => {
+                let req_ptr = machine.registers()[registers::A0];
+                let req_len = machine.registers()[registers::A1];
+                let out_ptr = machine.registers()[registers::A2];
+                let out_size = machine.registers()[registers::A3];
+
+                let request_bytes =
+                    machine.memory_mut().load_bytes(req_ptr, req_len)?;
+
+                let registry = VM_TOOL_REGISTRY
+                    .get()
+                    .expect("VM_TOOL_REGISTRY not initialized");
+
+                let v: serde_json::Value = serde_json::from_slice(&request_bytes)
+                    .map_err(|_| VmError::Unexpected("invalid tool call JSON".into()))?;
+
+                let name = v["name"]
+                    .as_str()
+                    .ok_or(VmError::Unexpected("missing 'name' in tool call".into()))?
+                    .to_string();
+                let arguments_json = v["arguments_json"]
+                    .as_str()
+                    .unwrap_or("{}")
+                    .to_string();
+
+                let tool_call = ChatToolCall {
+                    id: "vm-0".to_string(),
+                    name,
+                    arguments_json,
+                };
+
+                let exec_output = registry.execute(
+                    &tool_call,
+                    self.x_credentials.as_ref(),
+                    self.cwd.as_deref(),
+                );
+
+                let content = exec_output.result.content.as_bytes();
+                let to_write = content.len().min(out_size as usize);
+                if to_write > 0 {
+                    machine
+                        .memory_mut()
+                        .store_bytes(out_ptr, &content[..to_write])?;
+                }
+                let result_len = if exec_output.result.is_error {
+                    0usize
+                } else {
+                    to_write
+                };
+                machine.set_register(registers::A0, result_len as u64);
+
+                Ok(true)
+            }
+            1 => {
+                let ptr = machine.registers()[registers::A0];
+                let len = machine.registers()[registers::A1];
+                if len > 0 {
+                    let data = machine.memory_mut().load_bytes(ptr, len)?;
+                    self.output.lock().unwrap().extend_from_slice(&data);
+                }
+                Ok(true)
+            }
+            2 => {
+                machine.set_running(false);
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+fn compile(source: &str) -> Result<Vec<u8>, String> {
+    let target = "riscv64imac-unknown-none-elf";
+
+    let version = Command::new("rustc")
+        .arg("+nightly")
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("rustc not found: {e}\nInstall from https://rustup.rs"))?;
+    if !version.status.success() {
+        let stderr = String::from_utf8_lossy(&version.stderr);
+        return Err(format!("rustc +nightly check failed: {stderr}"));
+    }
+
+    let target_check = Command::new("rustc")
+        .arg("+nightly")
+        .args(["--target", target, "--print", "target-spec-json"])
+        .output()
+        .map_err(|e| format!("failed to check target: {e}"))?;
+    if !target_check.status.success() {
+        let stderr = String::from_utf8_lossy(&target_check.stderr);
+        return Err(format!(
+            "RISC-V target '{target}' not available.\n{stderr}\n\
+             Install with: rustup target add {target} --toolchain nightly"
+        ));
+    }
+
+    let dir = tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
+    let input_path = dir.path().join("main.rs");
+    let output_path = dir.path().join("output.elf");
+
+    let full_source = format!("{BOILERPLATE}\n// User code\n{source}");
+    std::fs::write(&input_path, &full_source)
+        .map_err(|e| format!("failed to write source: {e}"))?;
+
+    let result = Command::new("rustc")
+        .arg("+nightly")
+        .args([
+            "--target",
+            target,
+            "-C",
+            "link-self-contained=yes",
+            "-C",
+            "link-arg=-nostartfiles",
+            "-C",
+            "opt-level=z",
+            "-o",
+        ])
+        .arg(&output_path)
+        .arg(&input_path)
+        .output()
+        .map_err(|e| format!("compilation failed: {e}"))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!("compilation error:\n{stderr}"));
+    }
+
+    let elf = std::fs::read(&output_path)
+        .map_err(|e| format!("failed to read compiled program: {e}"))?;
+
+    drop(dir);
+    Ok(elf)
+}
+
+pub(crate) struct RunRiscV;
+
+impl Tool for RunRiscV {
+    fn name(&self) -> &'static str {
+        "run_riscv"
+    }
+
+    fn description(&self) -> &'static str {
+        "Compile and run Rust code in a RISC-V sandboxed virtual machine"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Rust source code providing a `fn main()` entry point. The `tai` module is auto-generated for syscall access: use `tai::write(b\"...\")`, `tai::tool_call(request, output_buffer)`, and `tai::exit(code)`."
+                },
+                "program": {
+                    "type": "string",
+                    "description": "Base64-encoded RISC-V ELF binary to execute directly (alternative to source)"
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Command-line arguments passed to the guest program"
+                },
+                "max_cycles": {
+                    "type": "integer",
+                    "description": "Maximum CPU cycles before VM termination (default: 1_000_000)"
+                }
+            }
+        })
+    }
+
+    fn execute(
+        &self,
+        args: &str,
+        x_credentials: Option<&XCredentials>,
+        cwd: Option<&Path>,
+    ) -> ToolExecutionOutput {
+        let input: RunRiscVInput = match serde_json::from_str(args) {
+            Ok(i) => i,
+            Err(e) => {
+                return ToolExecutionOutput {
+                    result: tool_err(format!("invalid arguments: {e}")),
+                    image: None,
+                }
+            }
+        };
+
+        let elf = match (input.source, input.program) {
+            (Some(source), None) => match compile(&source) {
+                Ok(elf) => elf,
+                Err(e) => {
+                    return ToolExecutionOutput {
+                        result: tool_err(e),
+                        image: None,
+                    }
+                }
+            },
+            (None, Some(program_b64)) => match BASE64.decode(&program_b64) {
+                Ok(elf) => elf,
+                Err(e) => {
+                    return ToolExecutionOutput {
+                        result: tool_err(format!("base64 decode error: {e}")),
+                        image: None,
+                    }
+                }
+            },
+            (None, None) => {
+                return ToolExecutionOutput {
+                    result: tool_err("either 'source' or 'program' is required"),
+                    image: None,
+                }
+            }
+            (Some(_), Some(_)) => {
+                return ToolExecutionOutput {
+                    result: tool_err("provide only one of 'source' or 'program'"),
+                    image: None,
+                }
+            }
+        };
+
+        let memory_size = input.memory_size.unwrap_or(4 * 1024 * 1024);
+        if memory_size % 4096 != 0 {
+            return ToolExecutionOutput {
+                result: tool_err("memory_size must be a multiple of 4096"),
+                image: None,
+            };
+        }
+        if memory_size > 4 * 1024 * 1024 {
+            return ToolExecutionOutput {
+                result: tool_err("memory_size cannot exceed 4MB"),
+                image: None,
+            };
+        }
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let syscall = TaiSyscall {
+            x_credentials: x_credentials.cloned(),
+            cwd: cwd.map(|p| p.to_path_buf()),
+            output: Arc::clone(&output),
+        };
+
+        let core = DefaultCoreMachine::<u64, FlatMemory<u64>>::new_with_memory(
+            ISA_IMC | ISA_A | ISA_B | ISA_MOP,
+            VERSION2,
+            input.max_cycles.unwrap_or(1_000_000),
+            memory_size,
+        );
+
+        let machine = DefaultMachineBuilder::new(core)
+            .syscall(Box::new(syscall))
+            .build();
+
+        let mut trace = TraceMachine::new(machine);
+
+        let args_list: Vec<Bytes> = input
+            .args
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| Bytes::from(a))
+            .collect();
+
+        if let Err(e) =
+            trace.load_program(&Bytes::from(elf), args_list.iter().map(|b| Ok(b.clone())))
+        {
+            return ToolExecutionOutput {
+                result: tool_err(format!("failed to load program: {e}")),
+                image: None,
+            };
+        }
+
+        match trace.run() {
+            Ok(_exit_code) => {
+                let out = output.lock().unwrap().clone();
+                let out_str = String::from_utf8_lossy(&out).to_string();
+                ToolExecutionOutput {
+                    result: tool_ok(out_str),
+                    image: None,
+                }
+            }
+            Err(e) => {
+                let out = output.lock().unwrap().clone();
+                let out_str = String::from_utf8_lossy(&out).to_string();
+                let msg = if out_str.is_empty() {
+                    format!("VM error: {e}")
+                } else {
+                    format!("VM error: {e}\noutput so far:\n{out_str}")
+                };
+                ToolExecutionOutput {
+                    result: tool_err(msg),
+                    image: None,
+                }
+            }
+        }
+    }
+}

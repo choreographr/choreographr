@@ -177,7 +177,8 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
-| `tools/` | Tool trait, registry, and 19 registered tools. |
+| `tools/` | Tool trait, registry, and 20 registered tools. |
+| `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
 
 **Per-client architecture (OS threads):**
 
@@ -336,7 +337,7 @@ list available tool definitions and dispatch tool execution.
 Each tool receives an optional `cwd: Option<&Path>` parameter that represents the session's
 working directory. Filesystem and Git tools resolve relative paths against this CWD.
 
-### Available tools (29 total)
+### Available tools (30 total)
 
 | Category | Tools |
 |---|---|
@@ -346,6 +347,7 @@ working directory. Filesystem and Git tools resolve relative paths against this 
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push` |
 | **EVM** | `evm_chain`, `evm_balance`, `evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`, `evm_logs`, `evm_nonce`, `evm_resolve` |
 | **File search** | `fff` (file finding) |
+| **RISC-V VM** | `run_riscv` (compile & run Rust code in a sandboxed RISC-V VM with access to all registered tools) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
 | **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
 | **Skills** | `load_skill` (loads the full instructions for a skill by name, following the Agent Skills standard) |
@@ -660,6 +662,44 @@ Registered alongside other tools in the tool loop. When the model calls
 
 The skill body is available to the model on all subsequent turns.
 
+### `run_riscv` — RISC-V sandboxed code execution
+
+`run_riscv` is a tool that compiles Rust source code into a RISC-V ELF binary and executes it
+inside a sandboxed virtual machine powered by `ckb-vm`. It is registered manually (not via
+`define_tool!`) to pass `x_credentials` and `cwd` through to the guest syscall handler.
+
+**Execution flow:**
+
+1. Accepts either Rust `source` or pre-compiled base64 `program`.
+2. If `source` is provided, prepends a `#![no_std]` boilerplate (panic handler, entry point,
+   `tai` module with `tool_call`, `write`, `exit` syscall wrappers) and compiles via a single
+   `rustc +nightly --target riscv64imac-unknown-none-elf` invocation in a temp directory.
+3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory.
+4. Registers a `TaiSyscall` handler that intercepts three guest syscalls:
+   - **Syscall #0 (TOOL_CALL)** — reads a JSON `ChatToolCall` from guest memory, dispatches it
+     via the global `ToolRegistry` (stored in a `OnceLock`), and writes the result to the guest's
+     output buffer.
+   - **Syscall #1 (WRITE)** — copies guest data into an accumulator buffer that becomes the tool's
+     output upon VM exit.
+   - **Syscall #2 (EXIT)** — stops the VM.
+5. Loads the ELF via `TraceMachine::load_program` and runs via `TraceMachine::run()`.
+6. Returns the accumulated WRITE output as the tool result.
+
+**Guest ABI** (auto-generated in the boilerplate):
+
+```rust
+pub mod tai {
+    pub unsafe fn tool_call(request: &[u8], output: &mut [u8]) -> usize;
+    pub fn write(data: &[u8]);
+    pub fn exit(code: i32) -> !;
+}
+```
+
+**Safety:** The guest runs in an isolated VM with 4 MB of flat memory. All tool access goes
+through the same `ToolRegistry` as the host agent, respecting the same `x_credentials` and `cwd`.
+The guest cannot access host memory, syscalls, or files outside the VM without going through
+registered tools.
+
 
 | Layer | What's tested | Location |
 |---|---|---|
@@ -723,6 +763,7 @@ cargo run -p tai-im -- telegram
 | `dioxus` | tai-dioxus | Desktop UI |
 | `image` + `resvg` | daemon, tai-tui | Image decoding, SVG rasterization |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
+| `ckb-vm` | daemon | RISC-V VM interpreter for sandboxed code execution |
 | `thiserror` | proto, keystore, client-core, daemon | Structured library error types |
 | `anyhow` | daemon, tui, dioxus, im, keystore | Application error context & propagation |
 
