@@ -3,20 +3,23 @@ use crate::tools::{Tool, ToolExecutionOutput, ToolRegistry, tool_ok, tool_err};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ckb_vm::Bytes;
 use ckb_vm::{
-    DefaultCoreMachine, DefaultMachineBuilder, FlatMemory, CoreMachine, SupportMachine, Syscalls,
-    DefaultMachineRunner, TraceMachine, ISA_IMC, ISA_B, ISA_MOP, ISA_A,
+    DefaultCoreMachine, DefaultMachineBuilder, DefaultMachineRunner, FlatMemory,
+    CoreMachine, SupportMachine, Syscalls,
+    TraceMachine, ISA_IMC, ISA_B, ISA_MOP, ISA_A,
     memory::Memory, registers, Error as VmError,
 };
 use ckb_vm::machine::VERSION2;
 use serde::Deserialize;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::process::Command;
+use std::time::{Duration, Instant};
 use tai_keystore::XCredentials;
 use tempfile::tempdir;
 
-const BOILERPLATE: &str = r#"
+const BOILERPLATE_HEAD: &str = r#"
 #![no_std]
 #![no_main]
 #![feature(asm_experimental_arch)]
@@ -28,6 +31,9 @@ fn panic(_: &PanicInfo) -> ! {
     tai::exit(1)
 }
 
+"#;
+
+const BOILERPLATE_ALLOC: &str = r#"
 extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -48,13 +54,16 @@ unsafe impl GlobalAlloc for BumpAlloc {
         let align = layout.align();
         let misalign = *offset % align;
         if misalign != 0 {
-            *offset += align - misalign;
+            match offset.checked_add(align - misalign) {
+                Some(aligned) => *offset = aligned,
+                None => return core::ptr::null_mut(),
+            }
         }
-        if *offset + size > HEAP_SIZE {
-            return core::ptr::null_mut();
+        match offset.checked_add(size) {
+            Some(next) if next <= HEAP_SIZE => *offset = next,
+            _ => return core::ptr::null_mut(),
         }
-        let ptr = HEAP.as_mut_ptr().add(*offset);
-        *offset += size;
+        let ptr = HEAP.as_mut_ptr().add(*offset - size);
         ptr
     }
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
@@ -63,9 +72,10 @@ unsafe impl GlobalAlloc for BumpAlloc {
 #[global_allocator]
 static ALLOC: BumpAlloc = BumpAlloc;
 
-pub mod tai {
-    use alloc::vec::Vec;
+"#;
 
+const BOILERPLATE_TAIL_BASE: &str = r#"
+pub mod tai {
     static mut ARGC: usize = 0;
     static mut ARGV: *const *const u8 = core::ptr::null();
 
@@ -73,24 +83,6 @@ pub mod tai {
         unsafe {
             ARGC = argc;
             ARGV = argv;
-        }
-    }
-
-    pub fn args() -> Vec<Vec<u8>> {
-        unsafe {
-            let argc = ARGC;
-            let argv = ARGV;
-            let mut result = Vec::with_capacity(argc);
-            for i in 0..argc {
-                let ptr = *argv.add(i);
-                let mut len = 0;
-                while *ptr.add(len) != 0 {
-                    len += 1;
-                }
-                let slice = core::slice::from_raw_parts(ptr, len);
-                result.push(slice.to_vec());
-            }
-            result
         }
     }
 
@@ -156,11 +148,41 @@ pub extern "C" fn _start() {
 }
 "#;
 
-static VM_TOOL_REGISTRY: OnceLock<Arc<ToolRegistry>> = OnceLock::new();
+const BOILERPLATE_TAIL_ALLOC: &str = r#"
+use alloc::vec::Vec;
 
-pub fn init_vm_tool_registry(registry: &Arc<ToolRegistry>) {
-    let _ = VM_TOOL_REGISTRY.set(Arc::clone(registry));
+pub fn args() -> Vec<Vec<u8>> {
+    unsafe {
+        let argc = tai::ARGC;
+        let argv = tai::ARGV;
+        let mut result = Vec::with_capacity(argc);
+        for i in 0..argc {
+            let ptr = *argv.add(i);
+            let mut len = 0;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let slice = core::slice::from_raw_parts(ptr, len);
+            result.push(slice.to_vec());
+        }
+        result
+    }
 }
+"#;
+
+fn build_boilerplate(enable_allocator: bool) -> String {
+    let mut s = String::from(BOILERPLATE_HEAD);
+    if enable_allocator {
+        s.push_str(BOILERPLATE_ALLOC);
+    }
+    s.push_str(BOILERPLATE_TAIL_BASE);
+    if enable_allocator {
+        s.push_str(BOILERPLATE_TAIL_ALLOC);
+    }
+    s
+}
+
+static VM_TOOL_REGISTRY: OnceLock<Arc<ToolRegistry>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct RunRiscVInput {
@@ -169,6 +191,7 @@ struct RunRiscVInput {
     args: Option<Vec<String>>,
     max_cycles: Option<u64>,
     memory_size: Option<usize>,
+    allocator: Option<bool>,
 }
 
 struct TaiSyscall {
@@ -203,7 +226,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
 
                 let registry = VM_TOOL_REGISTRY
                     .get()
-                    .expect("VM_TOOL_REGISTRY not initialized");
+                    .expect("VM_TOOL_REGISTRY not initialized — use ToolRegistry::build()");
 
                 let v: serde_json::Value = serde_json::from_slice(&request_bytes)
                     .map_err(|_| VmError::Unexpected("invalid tool call JSON".into()))?;
@@ -266,7 +289,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
     }
 }
 
-fn compile(source: &str) -> Result<Vec<u8>, String> {
+fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
     let target = "riscv64imac-unknown-none-elf";
 
     let version = Command::new("rustc")
@@ -296,11 +319,12 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
     let input_path = dir.path().join("main.rs");
     let output_path = dir.path().join("output.elf");
 
-    let full_source = format!("{BOILERPLATE}\n// User code\n{source}");
+    let boilerplate = build_boilerplate(enable_allocator);
+    let full_source = format!("{boilerplate}\n// User code\n{source}");
     std::fs::write(&input_path, &full_source)
         .map_err(|e| format!("failed to write source: {e}"))?;
 
-    let result = Command::new("rustc")
+    let mut child = Command::new("rustc")
         .arg("+nightly")
         .args([
             "--target",
@@ -315,12 +339,33 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
         ])
         .arg(&output_path)
         .arg(&input_path)
-        .output()
-        .map_err(|e| format!("compilation failed: {e}"))?;
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("compilation failed to start: {e}"))?;
 
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        return Err(format!("compilation error:\n{stderr}"));
+    let timeout = Duration::from_secs(60);
+    let start = Instant::now();
+    let status = loop {
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("compilation timed out after 60s".into());
+        }
+        match child.try_wait().map_err(|e| format!("error waiting for compiler: {e}"))? {
+            Some(status) => break status,
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+
+    let stderr = child.stderr.take()
+        .and_then(|mut pipe| {
+            let mut buf = Vec::new();
+            pipe.read_to_end(&mut buf).ok().map(|_| buf)
+        })
+        .unwrap_or_default();
+
+    if !status.success() {
+        return Err(format!("compilation error:\n{}", String::from_utf8_lossy(&stderr)));
     }
 
     let elf = std::fs::read(&output_path)
@@ -346,8 +391,10 @@ fn run_riscv_impl(
         }
     };
 
+    let enable_allocator = input.allocator.unwrap_or(true);
+
     let elf = match (input.source, input.program) {
-        (Some(source), None) => match compile(&source) {
+        (Some(source), None) => match compile(&source, enable_allocator) {
             Ok(elf) => elf,
             Err(e) => {
                 return ToolExecutionOutput {
@@ -481,7 +528,11 @@ impl Tool for RunRiscV {
                 "args": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Command-line arguments passed to the guest program. Read them with tai::args() -> Vec<Vec<u8>> in the guest code."
+                    "description": "Command-line arguments passed to the guest program. Read them with tai::args() -> Vec<Vec<u8>> in the guest code (requires allocator: true, the default)."
+                },
+                "allocator": {
+                    "type": "boolean",
+                    "description": "Include a 128 KB bump allocator (#[global_allocator]) so guest code can use alloc crate types (Vec, String, format!, Box, etc.). When true, tai::args() is available to parse guest argv. When false, args() is omitted and guest code must access argc/argv directly from _start's a0/a1 registers. Default: true."
                 },
                 "max_cycles": {
                     "type": "integer",
@@ -509,4 +560,8 @@ impl Tool for RunRiscV {
     ) -> ToolExecutionOutput {
         run_riscv_impl(args, x_credentials, cwd, Some(output_tx))
     }
+}
+
+pub(crate) fn init_vm_tool_registry(registry: &Arc<ToolRegistry>) {
+    let _ = VM_TOOL_REGISTRY.set(Arc::clone(registry));
 }

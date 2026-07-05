@@ -12,7 +12,7 @@ fn spawn_session(
     let (daemon_tx, _daemon_rx) = mpsc::channel();
     let (session_tx, session_rx) = mpsc::channel();
 
-    let tool_registry = Arc::new(tai_daemon::tools::ToolRegistry::new());
+    let tool_registry = tai_daemon::tools::ToolRegistry::new().build();
     let db2 = Arc::clone(&db);
     let daemon_tx2 = daemon_tx.clone();
     let cmd_tx = session_tx.clone();

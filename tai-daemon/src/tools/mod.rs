@@ -1,6 +1,7 @@
 use crate::openai::{ChatToolCall, ChatToolDefinition};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::mpsc;
 use tai_keystore::XCredentials;
 
@@ -78,8 +79,6 @@ pub(crate) mod subsession;
 pub(crate) mod vm;
 pub(crate) mod x;
 
-pub use vm::init_vm_tool_registry;
-
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub content: String,
@@ -154,6 +153,16 @@ impl ToolRegistry {
         reg.register(x::XUserLookup);
         reg.register(vm::RunRiscV);
         reg
+    }
+
+    /// Build a shared registry and initialise the VM tool's global reference.
+    ///
+    /// Call this instead of `Arc::new(ToolRegistry::new())` so that the
+    /// RISC‑V sandbox can dispatch tool calls from within the guest.
+    pub fn build(self) -> Arc<Self> {
+        let arc = Arc::new(self);
+        vm::init_vm_tool_registry(&arc);
+        arc
     }
 
     fn register(&mut self, tool: impl Tool + 'static) {

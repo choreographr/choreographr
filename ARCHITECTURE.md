@@ -673,13 +673,14 @@ inside a sandboxed virtual machine powered by `ckb-vm`. It is registered manuall
 
 1. Accepts either Rust `source` or pre-compiled base64 `program`.
 2. If `source` is provided, prepends a `#![no_std]` boilerplate (panic handler, entry point,
-   `tai` module with `tool_call`, `write`, `exit` syscall wrappers) and compiles via a single
+   `tai` module with `tool_call`, `write`, `exit` syscall wrappers, optional
+   128 KB bump allocator enabled via the `allocator` parameter) and compiles via a single
    `rustc +nightly --target riscv64imac-unknown-none-elf` invocation in a temp directory.
 3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory.
 4. Registers a `TaiSyscall` handler that intercepts three guest syscalls:
    - **Syscall #0 (TOOL_CALL)** — reads a JSON `ChatToolCall` from guest memory, dispatches it
-     via the global `ToolRegistry` (stored in a `OnceLock`), and writes the result to the guest's
-     output buffer.
+     via the `ToolRegistry` (initialized into a process-level `OnceLock` by `ToolRegistry::build()`),
+     and writes the result to the guest's output buffer.
    - **Syscall #1 (WRITE)** — copies guest data into an accumulator buffer that becomes the tool's
      output upon VM exit.
    - **Syscall #2 (EXIT)** — stops the VM.
@@ -695,6 +696,17 @@ pub mod tai {
     pub fn exit(code: i32) -> !;
 }
 ```
+
+When `allocator: true` (the default), a `#[global_allocator]` bump allocator is also
+included, enabling `alloc` crate types (`Vec`, `String`, `format!`, `Box`, etc.), and
+`args()` is injected as a free function returning `Vec<Vec<u8>>`:
+
+```rust
+pub fn args() -> Vec<Vec<u8>>;
+```
+
+With `allocator: false`, `args()` is not available and the guest must access `argc`/`argv`
+directly from the RISC-V ABI registers (`a0`/`a1` at `_start`).
 
 **Safety:** The guest runs in an isolated VM with 4 MB of flat memory. All tool access goes
 through the same `ToolRegistry` as the host agent, respecting the same `x_credentials` and `cwd`.

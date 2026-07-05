@@ -307,37 +307,27 @@ fn execute_tool_with_timeout(
         }
 
         // Drain any streaming output
-        loop {
-            match output_rx.try_recv() {
-                Ok(data) => {
-                    broadcast_to_session(session, DaemonMessage::ToolCallOutput {
-                        request_id,
-                        call_id: tool_call.id.clone(),
-                        data,
-                    });
+        let drain_output = || {
+            loop {
+                match output_rx.try_recv() {
+                    Ok(data) => {
+                        broadcast_to_session(session, DaemonMessage::ToolCallOutput {
+                            request_id,
+                            call_id: tool_call.id.clone(),
+                            data,
+                        });
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
                 }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break,
             }
-        }
+        };
+        drain_output();
 
         let poll = std::cmp::min(Duration::from_millis(100), timeout_dur - elapsed);
         match result_rx.recv_timeout(poll) {
             Ok(output) => {
-                // Final drain of any remaining output
-                loop {
-                    match output_rx.try_recv() {
-                        Ok(data) => {
-                            broadcast_to_session(session, DaemonMessage::ToolCallOutput {
-                                request_id,
-                                call_id: tool_call.id.clone(),
-                                data,
-                            });
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => break,
-                    }
-                }
+                drain_output();
                 return output;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
