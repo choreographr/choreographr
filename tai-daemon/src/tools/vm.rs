@@ -28,7 +28,72 @@ fn panic(_: &PanicInfo) -> ! {
     tai::exit(1)
 }
 
+extern crate alloc;
+
+use core::alloc::{GlobalAlloc, Layout};
+
+const HEAP_SIZE: usize = 131072;
+static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+static mut HEAP_OFFSET: usize = 0;
+
+struct BumpAlloc;
+
+unsafe impl GlobalAlloc for BumpAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let size = layout.size();
+        if size == 0 {
+            return core::ptr::null_mut();
+        }
+        let offset = &mut HEAP_OFFSET;
+        let align = layout.align();
+        let misalign = *offset % align;
+        if misalign != 0 {
+            *offset += align - misalign;
+        }
+        if *offset + size > HEAP_SIZE {
+            return core::ptr::null_mut();
+        }
+        let ptr = HEAP.as_mut_ptr().add(*offset);
+        *offset += size;
+        ptr
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[global_allocator]
+static ALLOC: BumpAlloc = BumpAlloc;
+
 pub mod tai {
+    use alloc::vec::Vec;
+
+    static mut ARGC: usize = 0;
+    static mut ARGV: *const *const u8 = core::ptr::null();
+
+    pub(crate) fn init_args(argc: usize, argv: *const *const u8) {
+        unsafe {
+            ARGC = argc;
+            ARGV = argv;
+        }
+    }
+
+    pub fn args() -> Vec<Vec<u8>> {
+        unsafe {
+            let argc = ARGC;
+            let argv = ARGV;
+            let mut result = Vec::with_capacity(argc);
+            for i in 0..argc {
+                let ptr = *argv.add(i);
+                let mut len = 0;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let slice = core::slice::from_raw_parts(ptr, len);
+                result.push(slice.to_vec());
+            }
+            result
+        }
+    }
+
     pub const TOOL_CALL: u64 = 0;
     pub const WRITE: u64 = 1;
     pub const EXIT: u64 = 2;
@@ -75,6 +140,17 @@ pub mod tai {
 
 #[no_mangle]
 pub extern "C" fn _start() {
+    let argc: usize;
+    let argv: *const *const u8;
+    unsafe {
+        core::arch::asm!(
+            "mv {argc}, a0",
+            "mv {argv}, a1",
+            argc = out(reg) argc,
+            argv = out(reg) argv,
+        );
+    }
+    tai::init_args(argc, argv);
     main();
     tai::exit(0);
 }
@@ -176,9 +252,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                     let data = machine.memory_mut().load_bytes(ptr, len)?;
                     self.output.lock().unwrap().extend_from_slice(&data);
                     if let Some(tx) = &self.write_tx {
-                        let _ = tx.send(data.to_vec());
-                    } else {
-                        drop(data);
+                        let _ = tx.send(data.into());
                     }
                 }
                 Ok(true)
@@ -407,7 +481,7 @@ impl Tool for RunRiscV {
                 "args": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Command-line arguments passed to the guest program"
+                    "description": "Command-line arguments passed to the guest program. Read them with tai::args() -> Vec<Vec<u8>> in the guest code."
                 },
                 "max_cycles": {
                     "type": "integer",
