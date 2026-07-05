@@ -201,6 +201,7 @@ fn terminal_event_appends_characters() {
     .expect("handle key");
 
     assert_eq!(app.input, "hi");
+    assert_eq!(app.cursor, 2);
     assert!(rx.try_recv().is_err());
 }
 
@@ -218,6 +219,7 @@ fn terminal_event_submits_run_input() {
     .expect("handle enter");
 
     assert!(app.input.is_empty());
+    assert_eq!(app.cursor, 0);
     let message = rx.recv().expect("sent message");
     assert_eq!(
         message,
@@ -243,6 +245,7 @@ fn terminal_event_quits_only_when_input_empty() {
 
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     app.input = "q".to_string();
+    app.cursor = 1;
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
         &mut app,
@@ -251,6 +254,7 @@ fn terminal_event_quits_only_when_input_empty() {
     .expect("handle q");
     assert!(!app.should_quit);
     assert_eq!(app.input, "qq");
+    assert_eq!(app.cursor, 2);
 }
 
 #[test]
@@ -266,6 +270,481 @@ fn terminal_event_ctrl_c_quits() {
     .expect("handle ctrl+c");
 
     assert!(app.should_quit);
+}
+
+// ── Cursor & editing tests ────────────────────────────────────
+
+#[test]
+fn insert_char_at_cursor_appends_when_at_end() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.insert_char_at_cursor('a');
+    app.insert_char_at_cursor('b');
+    app.insert_char_at_cursor('c');
+    assert_eq!(app.input, "abc");
+    assert_eq!(app.cursor, 3);
+}
+
+#[test]
+fn insert_char_at_cursor_inserts_in_middle() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "abde".to_string();
+    app.cursor = 2;
+    app.insert_char_at_cursor('c');
+    assert_eq!(app.input, "abcde");
+    assert_eq!(app.cursor, 3);
+}
+
+#[test]
+fn insert_char_at_cursor_works_at_start() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "bc".to_string();
+    app.cursor = 0;
+    app.insert_char_at_cursor('a');
+    assert_eq!(app.input, "abc");
+    assert_eq!(app.cursor, 1);
+}
+
+#[test]
+fn cursor_left_moves_back_by_one_grapheme() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "abcd".to_string();
+    app.cursor = 4;
+    app.cursor_left();
+    assert_eq!(app.cursor, 3);
+    app.cursor_left();
+    assert_eq!(app.cursor, 2);
+}
+
+#[test]
+fn cursor_left_stops_at_start() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "a".to_string();
+    app.cursor = 1;
+    app.cursor_left();
+    assert_eq!(app.cursor, 0);
+    app.cursor_left();
+    assert_eq!(app.cursor, 0);
+}
+
+#[test]
+fn cursor_left_is_grapheme_aware() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "a😀b".to_string();
+    app.cursor = 6;
+    app.cursor_left();
+    assert_eq!(app.cursor, 5); // start of 'b' after emoji
+    app.cursor_left();
+    assert_eq!(app.cursor, 1); // start of 😀 (4-byte emoji at byte 1)
+    app.cursor_left();
+    assert_eq!(app.cursor, 0); // start of 'a'
+}
+
+#[test]
+fn cursor_right_moves_forward_by_one_grapheme() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "abcd".to_string();
+    app.cursor = 0;
+    app.cursor_right();
+    assert_eq!(app.cursor, 1);
+    app.cursor_right();
+    assert_eq!(app.cursor, 2);
+}
+
+#[test]
+fn cursor_right_stops_at_end() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "a".to_string();
+    app.cursor = 0;
+    app.cursor_right();
+    assert_eq!(app.cursor, 1);
+    app.cursor_right();
+    assert_eq!(app.cursor, 1);
+}
+
+#[test]
+fn cursor_right_is_grapheme_aware() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "a😀b".to_string();
+    app.cursor = 0;
+    app.cursor_right();
+    assert_eq!(app.cursor, 1); // after 'a'
+    app.cursor_right();
+    assert_eq!(app.cursor, 5); // after 4-byte emoji
+}
+
+#[test]
+fn cursor_home_moves_to_start() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello".to_string();
+    app.cursor = 5;
+    app.cursor_home();
+    assert_eq!(app.cursor, 0);
+}
+
+#[test]
+fn cursor_end_moves_to_end() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello".to_string();
+    app.cursor = 0;
+    app.cursor_end();
+    assert_eq!(app.cursor, 5);
+}
+
+#[test]
+fn backspace_at_cursor_removes_before_cursor() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "abcd".to_string();
+    app.cursor = 3;
+    app.backspace_at_cursor();
+    assert_eq!(app.input, "abd");
+    assert_eq!(app.cursor, 2);
+}
+
+#[test]
+fn backspace_at_cursor_does_nothing_at_start() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "a".to_string();
+    app.cursor = 0;
+    app.backspace_at_cursor();
+    assert_eq!(app.input, "a");
+    assert_eq!(app.cursor, 0);
+}
+
+#[test]
+fn backspace_at_cursor_is_grapheme_aware() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "a😀".to_string();
+    app.cursor = 5;
+    app.backspace_at_cursor();
+    assert_eq!(app.input, "a");
+    assert_eq!(app.cursor, 1);
+}
+
+#[test]
+fn delete_at_cursor_removes_at_cursor() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "abcd".to_string();
+    app.cursor = 1;
+    app.delete_at_cursor();
+    assert_eq!(app.input, "acd");
+    assert_eq!(app.cursor, 1);
+}
+
+#[test]
+fn delete_at_cursor_does_nothing_at_end() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "a".to_string();
+    app.cursor = 1;
+    app.delete_at_cursor();
+    assert_eq!(app.input, "a");
+    assert_eq!(app.cursor, 1);
+}
+
+#[test]
+fn delete_at_cursor_is_grapheme_aware() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "a😀b".to_string();
+    app.cursor = 1;
+    app.delete_at_cursor();
+    assert_eq!(app.input, "ab");
+    assert_eq!(app.cursor, 1);
+}
+
+#[test]
+fn word_left_moves_to_previous_word() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello world foo".to_string();
+    app.cursor = 15;
+    app.word_left();
+    assert_eq!(app.cursor, 12); // start of "foo"
+    app.word_left();
+    assert_eq!(app.cursor, 6); // start of "world"
+    app.word_left();
+    assert_eq!(app.cursor, 0); // start of "hello"
+}
+
+#[test]
+fn word_left_stays_at_zero() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello".to_string();
+    app.cursor = 0;
+    app.word_left();
+    assert_eq!(app.cursor, 0);
+}
+
+#[test]
+fn word_right_moves_to_next_word() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello world foo".to_string();
+    app.cursor = 0;
+    app.word_right();
+    assert_eq!(app.cursor, 6); // start of "world"
+    app.word_right();
+    assert_eq!(app.cursor, 12); // start of "foo"
+    app.word_right();
+    assert_eq!(app.cursor, 15); // end of string
+}
+
+#[test]
+fn word_right_stays_at_end() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello".to_string();
+    app.cursor = 5;
+    app.word_right();
+    assert_eq!(app.cursor, 5);
+}
+
+#[test]
+fn word_right_skips_whitespace() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "  hello  ".to_string();
+    app.cursor = 0;
+    app.word_right();
+    assert_eq!(app.cursor, 2); // start of "hello", skipping leading spaces
+}
+
+#[test]
+fn delete_word_backward_removes_previous_word() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello world".to_string();
+    app.cursor = 11;
+    app.delete_word_backward();
+    assert_eq!(app.input, "hello ");
+    assert_eq!(app.cursor, 6);
+}
+
+#[test]
+fn delete_word_backward_at_start_does_nothing() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello".to_string();
+    app.cursor = 0;
+    app.delete_word_backward();
+    assert_eq!(app.input, "hello");
+    assert_eq!(app.cursor, 0);
+}
+
+#[test]
+fn delete_word_forward_removes_next_word() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello world foo".to_string();
+    app.cursor = 6;
+    app.delete_word_forward();
+    assert_eq!(app.input, "hello foo");
+    assert_eq!(app.cursor, 6);
+}
+
+#[test]
+fn delete_word_forward_at_end_does_nothing() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello".to_string();
+    app.cursor = 5;
+    app.delete_word_forward();
+    assert_eq!(app.input, "hello");
+    assert_eq!(app.cursor, 5);
+}
+
+#[test]
+fn delete_to_start_removes_from_beginning_to_cursor() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello world".to_string();
+    app.cursor = 6;
+    app.delete_to_start();
+    assert_eq!(app.input, "world");
+    assert_eq!(app.cursor, 0);
+}
+
+#[test]
+fn delete_to_start_when_at_end_clears_input() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello".to_string();
+    app.cursor = 5;
+    app.delete_to_start();
+    assert!(app.input.is_empty());
+    assert_eq!(app.cursor, 0);
+}
+
+#[test]
+fn delete_to_start_when_at_zero_does_nothing() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello".to_string();
+    app.cursor = 0;
+    app.delete_to_start();
+    assert_eq!(app.input, "hello");
+    assert_eq!(app.cursor, 0);
+}
+
+#[test]
+fn terminal_event_submit_resets_cursor() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello".to_string();
+    app.cursor = 5;
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert!(app.input.is_empty());
+    assert_eq!(app.cursor, 0);
+}
+
+#[test]
+fn terminal_event_arrow_keys_move_cursor() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "abc".to_string();
+    app.cursor = 3;
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle left");
+    assert_eq!(app.cursor, 2);
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle right");
+    assert_eq!(app.cursor, 3);
+}
+
+#[test]
+fn terminal_event_home_end_move_cursor() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "abc".to_string();
+    app.cursor = 1;
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle home");
+    assert_eq!(app.cursor, 0);
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle end");
+    assert_eq!(app.cursor, 3);
+}
+
+#[test]
+fn terminal_event_delete_removes_at_cursor() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "abcd".to_string();
+    app.cursor = 1;
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle delete");
+
+    assert_eq!(app.input, "acd");
+    assert_eq!(app.cursor, 1);
+}
+
+#[test]
+fn terminal_event_backspace_uses_cursor() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "abcd".to_string();
+    app.cursor = 3;
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle backspace");
+
+    assert_eq!(app.input, "abd");
+    assert_eq!(app.cursor, 2);
+}
+
+#[test]
+fn terminal_event_inserts_char_at_cursor() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "abd".to_string();
+    app.cursor = 2;
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle char");
+
+    assert_eq!(app.input, "abcd");
+    assert_eq!(app.cursor, 3);
+}
+
+#[test]
+fn terminal_event_ctrl_backspace_deletes_word_backward() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello world".to_string();
+    app.cursor = 11;
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+backspace");
+
+    assert_eq!(app.input, "hello ");
+    assert_eq!(app.cursor, 6);
+}
+
+#[test]
+fn terminal_event_ctrl_w_deletes_word_backward() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello world".to_string();
+    app.cursor = 11;
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+w");
+
+    assert_eq!(app.input, "hello ");
+    assert_eq!(app.cursor, 6);
+}
+
+#[test]
+fn terminal_event_ctrl_u_deletes_to_start() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input = "hello world".to_string();
+    app.cursor = 6;
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+u");
+
+    assert_eq!(app.input, "world");
+    assert_eq!(app.cursor, 0);
 }
 
 #[test]

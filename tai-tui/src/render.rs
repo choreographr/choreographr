@@ -50,7 +50,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
     let cursor_x = chunks[1]
         .x
-        .saturating_add(1 + display_width(&app.input) as u16);
+        .saturating_add(1 + display_width(&app.input[..app.cursor]) as u16);
     let cursor_y = chunks[1].y.saturating_add(1);
     frame.set_cursor_position((cursor_x, cursor_y));
 }

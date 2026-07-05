@@ -199,6 +199,7 @@ fn handle_chat_event(
                 KeyCode::Enter => {
                     let line = app.input.trim().to_string();
                     app.input.clear();
+                    app.cursor = 0;
                     match parse_input_line(
                         &line,
                         &mut app.next_request_id,
@@ -231,11 +232,48 @@ fn handle_chat_event(
                         }
                     }
                 }
+                KeyCode::Backspace
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.delete_word_backward();
+                }
                 KeyCode::Backspace => {
-                    app.input.pop();
+                    app.backspace_at_cursor();
+                }
+                KeyCode::Delete
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.delete_word_forward();
+                }
+                KeyCode::Delete => {
+                    app.delete_at_cursor();
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.word_left();
+                }
+                KeyCode::Left => {
+                    app.cursor_left();
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.word_right();
+                }
+                KeyCode::Right => {
+                    app.cursor_right();
+                }
+                KeyCode::Home => {
+                    app.cursor_home();
+                }
+                KeyCode::End => {
+                    app.cursor_end();
+                }
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.delete_word_backward();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.delete_to_start();
                 }
                 KeyCode::Char(c) => {
-                    app.input.push(c);
+                    app.insert_char_at_cursor(c);
                 }
                 KeyCode::PageUp => {
                     app.scroll_up(3);
