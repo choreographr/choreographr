@@ -113,6 +113,12 @@ pub(crate) fn run_ui_loop(
             break;
         }
 
+        // Drain *all* pending crossterm events before processing UI messages
+        // and rendering.  If we only handled one per iteration, a fast
+        // trackpad scroll could fall behind, and scrolling would continue
+        // after the finger lifts because unprocessed events would still be
+        // applied on subsequent frames.  The `while let Ok(true)` pattern
+        // keeps polling with a zero timeout as long as events are ready.
         while let Ok(true) = event::poll(Duration::from_millis(0)) {
             handle_terminal_event(event::read()?, app, client_tx)?;
         }
@@ -130,8 +136,12 @@ pub(crate) fn run_ui_loop(
             }
         }
 
+        // Consume the frame's accumulated scroll delta in one batch
+        // (read-then-reset so no momentum carries forward).
         app.apply_scroll_delta();
 
+        // Update viewport dimensions and clamp scroll *outside* the
+        // terminal.draw closure so that render never mutates app state.
         if let Ok((width, height)) = crossterm::terminal::size() {
             if width > 0 && height > 3 {
                 app.history_viewport
@@ -142,8 +152,12 @@ pub(crate) fn run_ui_loop(
 
         terminal.draw(|frame| render(frame, app))?;
 
+        // Block for up to ~60 Hz to pace the frame rate without
+        // busy-waiting.  Any event that arrives during this interval
+        // will be handled at the top of the next iteration's drain
+        // loop — ensuring all events are processed in a single batch
+        // before the next render.
         if event::poll(Duration::from_millis(UI_FRAME_POLL_MS))? {
-            // Collected on next iteration's drain loop
         }
     }
 
@@ -285,6 +299,11 @@ fn handle_chat_event(
             }
         }
         Event::Mouse(mouse) if mouse_in_history_box(mouse.column, mouse.row) => {
+            // Accumulate scroll events rather than scrolling immediately.
+            // All accumulated deltas are applied in a single batch each
+            // frame by `apply_scroll_delta`, which reads the accumulator
+            // and resets it to zero — this prevents per-event re-renders
+            // and ensures no momentum carries between frames.
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
                     app.scroll_accumulator = app.scroll_accumulator.saturating_add(1);

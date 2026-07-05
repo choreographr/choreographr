@@ -111,6 +111,12 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     continue;
                 }
 
+                // Clip the item's full height by the number of rows
+                // already scrolled past (rows_to_skip) *and* by the
+                // remaining space in the viewport.  The old code used
+                // `image_block_height(rows_remaining)` directly, which
+                // ignored rows_to_skip and caused layout jumps at item
+                // boundaries when partially scrolled past an image.
                 let visible_height = (full_height.saturating_sub(rows_to_skip)).min(rows_remaining);
                 let height = visible_height as u16;
                 if height == 0 {
@@ -164,6 +170,11 @@ fn render_history_text(
         return;
     }
 
+    // The visible portion of this text item is the wrapped height
+    // minus any rows already skipped past (rows_to_skip), further
+    // clamped to the remaining viewport space.  Previously this was
+    // `wrapped.min(*rows_remaining)` — omitting rows_to_skip meant
+    // the view would jump at item boundaries during partial-scroll.
     let visible_height = (wrapped.saturating_sub(*rows_to_skip)).min(*rows_remaining);
     if visible_height == 0 {
         return;
@@ -203,6 +214,11 @@ fn render_history_lines(
         return;
     }
 
+    // Same pattern as render_history_text: the visible height is the
+    // wrapped content height minus rows already skipped, clamped to
+    // remaining viewport space.  Without accounting for rows_to_skip,
+    // a partial scroll past a session-message boundary would cause a
+    // visible jump on the next frame.
     let visible_height = (wrapped.saturating_sub(*rows_to_skip)).min(*rows_remaining);
     if visible_height == 0 {
         return;
@@ -434,6 +450,9 @@ fn render_history_diff(
         return;
     }
 
+    // Same visible-height calculation as the text/lines renderers:
+    // subtract the portion already scrolled past, then clamp to the
+    // viewport rows that are still available.
     let visible_height = (full_height.saturating_sub(*rows_to_skip)).min(*rows_remaining);
     if visible_height == 0 {
         return;

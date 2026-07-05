@@ -56,6 +56,15 @@ pub(crate) struct App {
     pub(crate) attached_session_id: Option<u64>,
     pub(crate) page: Page,
     pub(crate) session_mgr: SessionManagerState,
+    /// Accumulated scroll-wheel delta consumed each frame.
+    ///
+    /// Mouse scroll events increment/decrement this counter instead of
+    /// adjusting the scroll position immediately.  Once per frame
+    /// `apply_scroll_delta` reads it, resets it to zero, and applies
+    /// the total delta in one batch.  This coalesces multiple events
+    /// that arrive between frames into a single operation, making fast
+    /// trackpad scrolling smooth while ensuring scrolling stops
+    /// instantly when the finger lifts (no momentum carry-over).
     pub(crate) scroll_accumulator: isize,
 }
 
@@ -442,6 +451,13 @@ impl App {
             .scroll_down(amount, self.max_scroll_offset());
     }
 
+    /// Consume the frame-accumulated scroll delta and apply it as a
+    /// single scroll operation.
+    ///
+    /// Read-then-reset is atomic within the frame so that no delta
+    /// carries forward to the next frame — this is what makes
+    /// trackpad scrolling stop immediately on finger lift rather than
+    /// coasting.
     pub(crate) fn apply_scroll_delta(&mut self) {
         let delta = self.scroll_accumulator;
         self.scroll_accumulator = 0;

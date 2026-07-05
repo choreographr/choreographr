@@ -1209,3 +1209,205 @@ mod session_manager_key_tests {
         );
     }
 }
+
+// ── Scroll accumulator tests ───────────────────────────────
+
+#[test]
+fn scroll_accumulator_increments_on_scroll_up() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.history_viewport.height = 10;
+
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle scroll up");
+
+    assert_eq!(app.scroll_accumulator, 1);
+}
+
+#[test]
+fn scroll_accumulator_decrements_on_scroll_down() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.history_viewport.height = 10;
+
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle scroll down");
+
+    assert_eq!(app.scroll_accumulator, -1);
+}
+
+#[test]
+fn scroll_accumulator_accumulates_multiple_events() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.history_viewport.height = 10;
+
+    for _ in 0..3 {
+        handle_terminal_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &tx,
+        )
+        .expect("handle scroll up");
+    }
+
+    assert_eq!(app.scroll_accumulator, 3);
+}
+
+#[test]
+fn apply_scroll_delta_consumes_accumulator_scroll_up() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.history_viewport.width = 10;
+    app.history_viewport.height = 1;
+    for _ in 0..5 {
+        app.push_text("line");
+    }
+    app.scroll_accumulator = 2;
+
+    // Sanity: accumulator is consumed and scroll position advances.
+    let before = app.effective_scroll();
+    app.apply_scroll_delta();
+    assert_eq!(app.scroll_accumulator, 0);
+    assert_eq!(app.effective_scroll(), before + 2);
+}
+
+#[test]
+fn apply_scroll_delta_consumes_accumulator_scroll_down() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.history_viewport.width = 10;
+    app.history_viewport.height = 1;
+    for _ in 0..5 {
+        app.push_text("line");
+    }
+    // Scroll up first, then set a negative delta to scroll back.
+    app.scroll_up(3);
+    let before = app.effective_scroll();
+    app.scroll_accumulator = -2;
+
+    app.apply_scroll_delta();
+    assert_eq!(app.scroll_accumulator, 0);
+    assert_eq!(app.effective_scroll(), before - 2);
+}
+
+#[test]
+fn apply_scroll_delta_zero_does_nothing() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.history_viewport.width = 10;
+    app.history_viewport.height = 1;
+    for _ in 0..5 {
+        app.push_text("line");
+    }
+    app.scroll_up(2);
+    let before = app.effective_scroll();
+
+    app.apply_scroll_delta();
+    assert_eq!(app.scroll_accumulator, 0);
+    assert_eq!(app.effective_scroll(), before);
+}
+
+#[test]
+fn scroll_up_mouse_inside_history_box_via_accumulator() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.history_viewport.width = 10;
+    app.history_viewport.height = 1;
+    for _ in 0..5 {
+        app.push_text("line");
+    }
+
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle scroll up");
+
+    assert_eq!(app.scroll_accumulator, 1);
+
+    app.apply_scroll_delta();
+    assert!(!app.history_scroll.follow_output());
+    assert_ne!(app.effective_scroll(), 0);
+}
+
+#[test]
+fn scroll_down_mouse_inside_history_box_via_accumulator() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.history_viewport.width = 10;
+    app.history_viewport.height = 1;
+    for _ in 0..5 {
+        app.push_text("line");
+    }
+    // Pre-scroll up so there is room to scroll down.
+    app.scroll_up(3);
+
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle scroll down");
+
+    assert_eq!(app.scroll_accumulator, -1);
+
+    let before = app.effective_scroll();
+    app.apply_scroll_delta();
+    assert_eq!(app.effective_scroll(), before - 1);
+}
+
+#[test]
+fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.history_viewport.height = 1;
+
+    let (_, height) = crossterm::terminal::size().expect("terminal size");
+    let row = height.saturating_sub(1); // input area, outside history box
+
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle mouse");
+
+    assert_eq!(app.scroll_accumulator, 0, "accumulator must remain unchanged");
+}

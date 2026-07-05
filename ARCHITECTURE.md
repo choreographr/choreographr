@@ -228,15 +228,24 @@ main()
 ├── reader task: read DaemonMessages from socket → push to UI event channel
 ├── writer task: receive ClientMessages from mpsc → write to socket
 └── UI loop: crossterm events (keyboard/mouse) + ratatui rendering
+               │
+               └── per-frame sequence:
+                   1. Drain all pending crossterm events (zero-timeout poll)
+                   2. Drain UI event channel (daemon messages)
+                   3. Consume scroll accumulator → apply batched delta
+                   4. Update history viewport dimensions from terminal size
+                   5. Clamp scroll state to valid range
+                   6. Render via ratatui terminal.draw()
+                   7. Blocking poll (~16 ms) to pace frame rate
 ```
 
 **Module breakdown:**
 
 | Module | Purpose |
 |---|---|
-| `connection.rs` | Socket setup, event loop, local shutdown signal handling, input handling, daemon message dispatch |
-| `state.rs` | `App` struct: input buffer, request tracking, `ClientHistory`, scroll state |
-| `render.rs` | Ratatui rendering: history pane (top) + command input (bottom), word wrap, Unicode width |
+| `connection.rs` | Socket setup, event loop, shutdown signal handling, input/keyboard/mouse dispatch, daemon message routing. Mouse scroll events are accumulated per-frame rather than applied immediately — the delta is consumed in batch before each render (see `apply_scroll_delta`). |
+| `state.rs` | `App` struct: input buffer, request tracking, `ClientHistory`, scroll state (`HistoryScrollState`), and the per-frame scroll accumulator (`scroll_accumulator`) consumed by `apply_scroll_delta()`. |
+| `render.rs` | Ratatui rendering: history pane (top) + command input (bottom), word wrap, Unicode width. Does **not** mutate scroll state or viewport dimensions — those are updated in the event loop before `terminal.draw()`. |
 | `lib.rs` | SVG rasterization (resvg), PNG/JPEG decoding (image crate), ratatui-image protocol picker |
 
 
