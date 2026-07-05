@@ -10,6 +10,7 @@ use ckb_vm::{
 use ckb_vm::machine::VERSION2;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::process::Command;
 use tai_keystore::XCredentials;
@@ -98,6 +99,7 @@ struct TaiSyscall {
     x_credentials: Option<XCredentials>,
     cwd: Option<PathBuf>,
     output: Arc<Mutex<Vec<u8>>>,
+    write_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
@@ -173,6 +175,11 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                 if len > 0 {
                     let data = machine.memory_mut().load_bytes(ptr, len)?;
                     self.output.lock().unwrap().extend_from_slice(&data);
+                    if let Some(tx) = &self.write_tx {
+                        let _ = tx.send(data.to_vec());
+                    } else {
+                        drop(data);
+                    }
                 }
                 Ok(true)
             }
@@ -249,6 +256,131 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
     Ok(elf)
 }
 
+fn run_riscv_impl(
+    args: &str,
+    x_credentials: Option<&XCredentials>,
+    cwd: Option<&Path>,
+    write_tx: Option<mpsc::Sender<Vec<u8>>>,
+) -> ToolExecutionOutput {
+    let input: RunRiscVInput = match serde_json::from_str(args) {
+        Ok(i) => i,
+        Err(e) => {
+            return ToolExecutionOutput {
+                result: tool_err(format!("invalid arguments: {e}")),
+                image: None,
+            }
+        }
+    };
+
+    let elf = match (input.source, input.program) {
+        (Some(source), None) => match compile(&source) {
+            Ok(elf) => elf,
+            Err(e) => {
+                return ToolExecutionOutput {
+                    result: tool_err(e),
+                    image: None,
+                }
+            }
+        },
+        (None, Some(program_b64)) => match BASE64.decode(&program_b64) {
+            Ok(elf) => elf,
+            Err(e) => {
+                return ToolExecutionOutput {
+                    result: tool_err(format!("base64 decode error: {e}")),
+                    image: None,
+                }
+            }
+        },
+        (None, None) => {
+            return ToolExecutionOutput {
+                result: tool_err("either 'source' or 'program' is required"),
+                image: None,
+            }
+        }
+        (Some(_), Some(_)) => {
+            return ToolExecutionOutput {
+                result: tool_err("provide only one of 'source' or 'program'"),
+                image: None,
+            }
+        }
+    };
+
+    let memory_size = input.memory_size.unwrap_or(4 * 1024 * 1024);
+    if memory_size % 4096 != 0 {
+        return ToolExecutionOutput {
+            result: tool_err("memory_size must be a multiple of 4096"),
+            image: None,
+        };
+    }
+    if memory_size > 4 * 1024 * 1024 {
+        return ToolExecutionOutput {
+            result: tool_err("memory_size cannot exceed 4MB"),
+            image: None,
+        };
+    }
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let syscall = TaiSyscall {
+        x_credentials: x_credentials.cloned(),
+        cwd: cwd.map(|p| p.to_path_buf()),
+        output: Arc::clone(&output),
+        write_tx,
+    };
+
+    let core = DefaultCoreMachine::<u64, FlatMemory<u64>>::new_with_memory(
+        ISA_IMC | ISA_A | ISA_B | ISA_MOP,
+        VERSION2,
+        input.max_cycles.unwrap_or(1_000_000),
+        memory_size,
+    );
+
+    let machine = DefaultMachineBuilder::new(core)
+        .syscall(Box::new(syscall))
+        .build();
+
+    let mut trace = TraceMachine::new(machine);
+
+    let args_list: Vec<Bytes> = input
+        .args
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| Bytes::from(a))
+        .collect();
+
+    if let Err(e) =
+        trace.load_program(&Bytes::from(elf), args_list.iter().map(|b| Ok(b.clone())))
+    {
+        return ToolExecutionOutput {
+            result: tool_err(format!("failed to load program: {e}")),
+            image: None,
+        };
+    }
+
+    match trace.run() {
+        Ok(_exit_code) => {
+            let out = output.lock().unwrap().clone();
+            let out_str = String::from_utf8_lossy(&out).to_string();
+            ToolExecutionOutput {
+                result: tool_ok(out_str),
+                image: None,
+            }
+        }
+        Err(e) => {
+            let out = output.lock().unwrap().clone();
+            let out_str = String::from_utf8_lossy(&out).to_string();
+            let msg = if out_str.is_empty() {
+                format!("VM error: {e}")
+            } else {
+                format!("VM error: {e}\noutput so far:\n{out_str}")
+            };
+            ToolExecutionOutput {
+                result: tool_err(msg),
+                image: None,
+            }
+        }
+    }
+}
+
 pub(crate) struct RunRiscV;
 
 impl Tool for RunRiscV {
@@ -291,121 +423,16 @@ impl Tool for RunRiscV {
         x_credentials: Option<&XCredentials>,
         cwd: Option<&Path>,
     ) -> ToolExecutionOutput {
-        let input: RunRiscVInput = match serde_json::from_str(args) {
-            Ok(i) => i,
-            Err(e) => {
-                return ToolExecutionOutput {
-                    result: tool_err(format!("invalid arguments: {e}")),
-                    image: None,
-                }
-            }
-        };
+        run_riscv_impl(args, x_credentials, cwd, None)
+    }
 
-        let elf = match (input.source, input.program) {
-            (Some(source), None) => match compile(&source) {
-                Ok(elf) => elf,
-                Err(e) => {
-                    return ToolExecutionOutput {
-                        result: tool_err(e),
-                        image: None,
-                    }
-                }
-            },
-            (None, Some(program_b64)) => match BASE64.decode(&program_b64) {
-                Ok(elf) => elf,
-                Err(e) => {
-                    return ToolExecutionOutput {
-                        result: tool_err(format!("base64 decode error: {e}")),
-                        image: None,
-                    }
-                }
-            },
-            (None, None) => {
-                return ToolExecutionOutput {
-                    result: tool_err("either 'source' or 'program' is required"),
-                    image: None,
-                }
-            }
-            (Some(_), Some(_)) => {
-                return ToolExecutionOutput {
-                    result: tool_err("provide only one of 'source' or 'program'"),
-                    image: None,
-                }
-            }
-        };
-
-        let memory_size = input.memory_size.unwrap_or(4 * 1024 * 1024);
-        if memory_size % 4096 != 0 {
-            return ToolExecutionOutput {
-                result: tool_err("memory_size must be a multiple of 4096"),
-                image: None,
-            };
-        }
-        if memory_size > 4 * 1024 * 1024 {
-            return ToolExecutionOutput {
-                result: tool_err("memory_size cannot exceed 4MB"),
-                image: None,
-            };
-        }
-
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let syscall = TaiSyscall {
-            x_credentials: x_credentials.cloned(),
-            cwd: cwd.map(|p| p.to_path_buf()),
-            output: Arc::clone(&output),
-        };
-
-        let core = DefaultCoreMachine::<u64, FlatMemory<u64>>::new_with_memory(
-            ISA_IMC | ISA_A | ISA_B | ISA_MOP,
-            VERSION2,
-            input.max_cycles.unwrap_or(1_000_000),
-            memory_size,
-        );
-
-        let machine = DefaultMachineBuilder::new(core)
-            .syscall(Box::new(syscall))
-            .build();
-
-        let mut trace = TraceMachine::new(machine);
-
-        let args_list: Vec<Bytes> = input
-            .args
-            .unwrap_or_default()
-            .into_iter()
-            .map(|a| Bytes::from(a))
-            .collect();
-
-        if let Err(e) =
-            trace.load_program(&Bytes::from(elf), args_list.iter().map(|b| Ok(b.clone())))
-        {
-            return ToolExecutionOutput {
-                result: tool_err(format!("failed to load program: {e}")),
-                image: None,
-            };
-        }
-
-        match trace.run() {
-            Ok(_exit_code) => {
-                let out = output.lock().unwrap().clone();
-                let out_str = String::from_utf8_lossy(&out).to_string();
-                ToolExecutionOutput {
-                    result: tool_ok(out_str),
-                    image: None,
-                }
-            }
-            Err(e) => {
-                let out = output.lock().unwrap().clone();
-                let out_str = String::from_utf8_lossy(&out).to_string();
-                let msg = if out_str.is_empty() {
-                    format!("VM error: {e}")
-                } else {
-                    format!("VM error: {e}\noutput so far:\n{out_str}")
-                };
-                ToolExecutionOutput {
-                    result: tool_err(msg),
-                    image: None,
-                }
-            }
-        }
+    fn execute_streaming(
+        &self,
+        args: &str,
+        x_credentials: Option<&XCredentials>,
+        cwd: Option<&Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+    ) -> ToolExecutionOutput {
+        run_riscv_impl(args, x_credentials, cwd, Some(output_tx))
     }
 }

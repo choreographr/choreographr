@@ -233,6 +233,11 @@ pub enum DaemonMessage {
         tool_name: String,
         error: String,
     },
+    ToolCallOutput {
+        request_id: u32,
+        call_id: String,
+        data: Vec<u8>,
+    },
     OutputChunk {
         request_id: u32,
         stream: OutputStream,

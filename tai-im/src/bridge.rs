@@ -252,6 +252,7 @@ fn daemon_to_bridge_events(
         | DaemonMessage::SessionState { .. }
         | DaemonMessage::SessionMessageAppended { .. }
         | DaemonMessage::SessionStatusChanged { .. }
+        | DaemonMessage::ToolCallOutput { .. }
         | DaemonMessage::CredentialAdded { .. }
         | DaemonMessage::CredentialAddFailed { .. }
         | DaemonMessage::CredentialRemoved { .. }

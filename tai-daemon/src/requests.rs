@@ -162,6 +162,7 @@ pub(crate) fn run_agent_loop(
                         None,
                         cwd,
                         tool_timeout,
+                        request_id,
                         daemon_tx,
                         client,
                         db,
@@ -230,6 +231,7 @@ fn execute_tool_with_timeout(
     x_credentials: Option<&XCredentials>,
     cwd: Option<&Path>,
     timeout_dur: Duration,
+    request_id: u32,
     daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
     client: &OpenAiClient,
     db: &redb::Database,
@@ -264,14 +266,15 @@ fn execute_tool_with_timeout(
         return execute_load_skill_sync(session, cwd, &tool_call.arguments_json);
     }
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let (output_tx, output_rx) = std::sync::mpsc::channel();
     let tc = tool_call.clone();
     let tr = Arc::clone(tool_registry);
     let xc = x_credentials.cloned();
     let c = cwd.map(|p| p.to_path_buf());
     std::thread::spawn(move || {
-        let result = tr.execute(&tc, xc.as_ref(), c.as_deref());
-        let _ = tx.send(result);
+        let result = tr.execute_streaming(&tc, output_tx, xc.as_ref(), c.as_deref());
+        let _ = result_tx.send(result);
     });
 
     let start = std::time::Instant::now();
@@ -301,9 +304,40 @@ fn execute_tool_with_timeout(
             };
         }
 
+        // Drain any streaming output
+        loop {
+            match output_rx.try_recv() {
+                Ok(data) => {
+                    broadcast_to_session(session, DaemonMessage::ToolCallOutput {
+                        request_id,
+                        call_id: tool_call.id.clone(),
+                        data,
+                    });
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
         let poll = std::cmp::min(Duration::from_millis(100), timeout_dur - elapsed);
-        match rx.recv_timeout(poll) {
-            Ok(output) => return output,
+        match result_rx.recv_timeout(poll) {
+            Ok(output) => {
+                // Final drain of any remaining output
+                loop {
+                    match output_rx.try_recv() {
+                        Ok(data) => {
+                            broadcast_to_session(session, DaemonMessage::ToolCallOutput {
+                                request_id,
+                                call_id: tool_call.id.clone(),
+                                data,
+                            });
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+                return output;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return ToolExecutionOutput {

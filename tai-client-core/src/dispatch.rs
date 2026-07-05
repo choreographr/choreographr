@@ -139,6 +139,18 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             );
             Ok(None)
         }
+        DaemonMessage::ToolCallOutput {
+            request_id,
+            call_id,
+            data,
+        } => {
+            let text = String::from_utf8(data)?;
+            handler.push_tool_text(
+                request_id,
+                format!("[{request_id}] tool #{call_id} output: {text}"),
+            );
+            Ok(None)
+        }
         DaemonMessage::OutputChunk {
             request_id,
             stream,

@@ -1,6 +1,7 @@
 use crate::openai::{ChatToolCall, ChatToolDefinition};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::mpsc;
 use tai_keystore::XCredentials;
 
 #[macro_export]
@@ -108,6 +109,16 @@ pub trait Tool: Send + Sync {
         x_credentials: Option<&XCredentials>,
         cwd: Option<&std::path::Path>,
     ) -> ToolExecutionOutput;
+
+    fn execute_streaming(
+        &self,
+        arguments_json: &str,
+        x_credentials: Option<&XCredentials>,
+        cwd: Option<&std::path::Path>,
+        _output_tx: mpsc::Sender<Vec<u8>>,
+    ) -> ToolExecutionOutput {
+        self.execute(arguments_json, x_credentials, cwd)
+    }
 }
 
 pub struct ToolRegistry {
@@ -154,6 +165,30 @@ impl ToolRegistry {
     ) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
             Some(tool) => tool.execute(&tool_call.arguments_json, x_credentials, cwd),
+            None => ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!("unknown tool: {}", tool_call.name),
+                    is_error: true,
+                },
+                image: None,
+            },
+        }
+    }
+
+    pub fn execute_streaming(
+        &self,
+        tool_call: &ChatToolCall,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        x_credentials: Option<&XCredentials>,
+        cwd: Option<&std::path::Path>,
+    ) -> ToolExecutionOutput {
+        match self.tools.get(tool_call.name.as_str()) {
+            Some(tool) => tool.execute_streaming(
+                &tool_call.arguments_json,
+                x_credentials,
+                cwd,
+                output_tx,
+            ),
             None => ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("unknown tool: {}", tool_call.name),
