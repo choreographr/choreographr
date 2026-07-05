@@ -1,7 +1,7 @@
 use crate::render::{mouse_in_history_box, render};
-use crate::state::{App, InputBuffer, Page, SessionManagerView, UiEvent};
+use crate::state::{App, InputBuffer, Page, PAGE_SCROLL_LINES, SessionManagerView, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
-use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use signal_hook::consts::SIGINT;
 use std::sync::{
     Arc,
@@ -142,12 +142,7 @@ pub(crate) fn run_ui_loop(
 
         // Update viewport dimensions and clamp scroll *outside* the
         // terminal.draw closure so that render never mutates app state.
-        if let Ok((width, height)) = crossterm::terminal::size() {
-            if width > 0 && height > 3 {
-                app.history_viewport
-                    .update(Rect { x: 0, y: 0, width, height: height - 3 });
-            }
-        }
+        app.update_viewport_from_terminal_size();
         app.clamp_scroll_state();
 
         terminal.draw(|frame| render(frame, app))?;
@@ -157,8 +152,7 @@ pub(crate) fn run_ui_loop(
         // will be handled at the top of the next iteration's drain
         // loop — ensuring all events are processed in a single batch
         // before the next render.
-        if event::poll(Duration::from_millis(UI_FRAME_POLL_MS))? {
-        }
+        let _ = event::poll(Duration::from_millis(UI_FRAME_POLL_MS))?;
     }
 
     Ok(())
@@ -253,10 +247,10 @@ fn handle_chat_event(
                     handle_input_key(key, &mut app.input);
                 }
                 KeyCode::PageUp => {
-                    app.scroll_up(3);
+                    app.scroll_up(PAGE_SCROLL_LINES);
                 }
                 KeyCode::PageDown => {
-                    app.scroll_down(3);
+                    app.scroll_down(PAGE_SCROLL_LINES);
                 }
                 _ => {}
             }

@@ -3,7 +3,8 @@ use crate::markdown_render::{
     display_width, lines_height, session_message_lines, streaming_text_lines,
 };
 use crate::state::{
-    App, HistoryItem, Page, SessionManagerView, history_text_height, image_block_height,
+    App, HistoryItem, INPUT_BAR_HEIGHT, Page, SessionManagerView, history_text_height,
+    image_block_height,
 };
 use ratatui::{
     Frame,
@@ -40,7 +41,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
 fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([Constraint::Min(1), Constraint::Length(INPUT_BAR_HEIGHT)])
         .split(frame.area());
 
     render_history(frame, chunks[0], app);
@@ -557,4 +558,374 @@ fn diff_cell_spans(
     };
 
     vec![ratatui::text::Span::styled(truncated, style)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tai_client_core::{DiffHunk, DiffLine};
+
+    // ── render_history_text tests ──
+
+    #[test]
+    fn render_history_text_no_skip() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 30;
+        let mut y = 30;
+        let mut rows_to_skip = 0;
+
+        terminal
+            .draw(|frame| {
+                render_history_text(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    "line1\nline2",
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        assert_eq!(rows_remaining, 28, "consumed 2 visible rows");
+        assert_eq!(y, 28, "y moved up by 2");
+        assert_eq!(rows_to_skip, 0, "rows_to_skip consumed completely");
+    }
+
+    #[test]
+    fn render_history_text_partial_skip() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 30;
+        let mut y = 30;
+        let mut rows_to_skip = 2;
+
+        terminal
+            .draw(|frame| {
+                render_history_text(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    "line1\nline2\nline3\nline4\nline5",
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        // wrapped=5, skip=2 → visible = (5-2).min(30) = 3 → remaining = 30-3 = 27
+        assert_eq!(rows_remaining, 27);
+        assert_eq!(y, 27);
+        assert_eq!(rows_to_skip, 0);
+    }
+
+    #[test]
+    fn render_history_text_full_skip() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 30;
+        let mut y = 30;
+        let mut rows_to_skip = 10;
+
+        terminal
+            .draw(|frame| {
+                render_history_text(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    "line1\nline2\nline3\nline4\nline5",
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        // wrapped=5 <= skip=10 → fully skipped, skip reduced by 5
+        assert_eq!(rows_remaining, 30, "no rows consumed");
+        assert_eq!(y, 30, "y unchanged");
+        assert_eq!(rows_to_skip, 5, "rows_to_skip decremented by 5");
+    }
+
+    #[test]
+    fn render_history_text_exhausted_viewport() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 2;
+        let mut y = 30;
+        let mut rows_to_skip = 2;
+
+        terminal
+            .draw(|frame| {
+                render_history_text(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    "line1\nline2\nline3\nline4\nline5",
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        // wrapped=5, skip=2 → visible = (5-2).min(2) = 2 → remaining = 0
+        assert_eq!(rows_remaining, 0, "viewport exhausted");
+        assert_eq!(y, 28);
+        assert_eq!(rows_to_skip, 0);
+    }
+
+    #[test]
+    fn render_history_text_zero_remaining() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 0;
+        let mut y = 0;
+        let mut rows_to_skip = 0;
+
+        terminal
+            .draw(|frame| {
+                render_history_text(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    "content",
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        // visible = (1-0).min(0) = 0 → returns early
+        assert_eq!(rows_remaining, 0);
+        assert_eq!(y, 0);
+        assert_eq!(rows_to_skip, 0);
+    }
+
+    // ── render_history_lines tests ──
+
+    #[test]
+    fn render_history_lines_no_skip() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 30;
+        let mut y = 30;
+        let mut rows_to_skip = 0;
+
+        terminal
+            .draw(|frame| {
+                render_history_lines(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        assert_eq!(rows_remaining, 27, "3 rows consumed");
+        assert_eq!(y, 27);
+        assert_eq!(rows_to_skip, 0);
+    }
+
+    #[test]
+    fn render_history_lines_partial_skip() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 30;
+        let mut y = 30;
+        let mut rows_to_skip = 1;
+
+        terminal
+            .draw(|frame| {
+                render_history_lines(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        // wrapped=3, skip=1 → visible=2 → remaining=28
+        assert_eq!(rows_remaining, 28);
+        assert_eq!(y, 28);
+        assert_eq!(rows_to_skip, 0);
+    }
+
+    #[test]
+    fn render_history_lines_full_skip() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 30;
+        let mut y = 30;
+        let mut rows_to_skip = 10;
+
+        terminal
+            .draw(|frame| {
+                render_history_lines(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    vec!["only".to_string()],
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        assert_eq!(rows_remaining, 30, "no rows consumed");
+        assert_eq!(y, 30);
+        assert_eq!(rows_to_skip, 9, "rows_to_skip decremented by 1");
+    }
+
+    #[test]
+    fn render_history_lines_zero_remaining() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 0;
+        let mut y = 0;
+        let mut rows_to_skip = 0;
+
+        terminal
+            .draw(|frame| {
+                render_history_lines(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    vec!["content".to_string()],
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        assert_eq!(rows_remaining, 0);
+        assert_eq!(y, 0);
+        assert_eq!(rows_to_skip, 0);
+    }
+
+    // ── render_history_diff tests ──
+
+    #[test]
+    fn render_history_diff_no_skip() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 30;
+        let mut y = 30;
+        let mut rows_to_skip = 0;
+
+        let diffs = vec![FileDiff {
+            old_path: String::new(),
+            new_path: String::new(),
+            hunks: vec![DiffHunk {
+                header: "header".to_string(),
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: "unchanged".to_string(),
+                }],
+            }],
+        }];
+
+        terminal
+            .draw(|frame| {
+                render_history_diff(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    &diffs,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        // diff_display_height = 1 (header) + 1 (line) = 2
+        assert_eq!(rows_remaining, 28, "2 diff rows consumed");
+        assert_eq!(y, 28, "y moved up by 2");
+        assert_eq!(rows_to_skip, 0);
+    }
+
+    #[test]
+    fn render_history_diff_partial_skip() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 30;
+        let mut y = 30;
+        let mut rows_to_skip = 1;
+
+        let diffs = vec![FileDiff {
+            old_path: String::new(),
+            new_path: String::new(),
+            hunks: vec![DiffHunk {
+                header: "hdr".to_string(),
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Addition,
+                    content: "added".to_string(),
+                }],
+            }],
+        }];
+
+        terminal
+            .draw(|frame| {
+                render_history_diff(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    &diffs,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        // full_height=2, skip=1 → visible=1 → remaining=29
+        assert_eq!(rows_remaining, 29);
+        assert_eq!(y, 29);
+        assert_eq!(rows_to_skip, 0);
+    }
+
+    #[test]
+    fn render_history_diff_full_skip() {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut rows_remaining = 30;
+        let mut y = 30;
+        let mut rows_to_skip = 10;
+
+        let diffs = vec![FileDiff {
+            old_path: String::new(),
+            new_path: String::new(),
+            hunks: vec![DiffHunk {
+                header: "h".to_string(),
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: "c".to_string(),
+                }],
+            }],
+        }];
+
+        terminal
+            .draw(|frame| {
+                render_history_diff(
+                    frame,
+                    Rect { x: 0, y: 0, width: 80, height: 30 },
+                    &diffs,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                );
+            })
+            .unwrap();
+
+        // full_height=2 <= skip=10 → fully skipped, skip reduced by 2
+        assert_eq!(rows_remaining, 30);
+        assert_eq!(y, 30);
+        assert_eq!(rows_to_skip, 8);
+    }
 }

@@ -11,6 +11,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::diff_render::{diff_display_height, is_diff_text, parse_diff};
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
 
+pub(crate) const INPUT_BAR_HEIGHT: u16 = 3;
+pub(crate) const PAGE_SCROLL_LINES: usize = 3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Page {
     Chat,
@@ -478,6 +481,21 @@ impl App {
 
     pub(crate) fn clamp_scroll_state(&mut self) {
         self.history_scroll.clamp(self.max_scroll_offset());
+    }
+
+    /// Query the terminal size and update the history viewport to match,
+    /// reserving `INPUT_BAR_HEIGHT` rows for the input bar.
+    pub(crate) fn update_viewport_from_terminal_size(&mut self) {
+        if let Ok((width, height)) = crossterm::terminal::size() {
+            if width > 0 && height > INPUT_BAR_HEIGHT {
+                self.history_viewport.update(Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: height - INPUT_BAR_HEIGHT,
+                });
+            }
+        }
     }
 
     pub(crate) fn effective_scroll(&self) -> usize {
