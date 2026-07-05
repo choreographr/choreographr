@@ -622,3 +622,29 @@ define_tool_with_cwd!(
         "additionalProperties": false
     })
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_text_edits_sets_original() {
+        let summary = apply_text_edits("hello world", &[TextEditArgs {
+            old_text: "world".into(),
+            new_text: "there".into(),
+            replace_all: None,
+        }]).unwrap();
+        assert_eq!(summary.original, Some("hello world".into()));
+    }
+
+    #[test]
+    fn apply_text_edits_replaces_single_occurrence() {
+        let summary = apply_text_edits("a b c", &[TextEditArgs {
+            old_text: "b".into(),
+            new_text: "B".into(),
+            replace_all: None,
+        }]).unwrap();
+        assert_eq!(summary.content, "a B c");
+        assert_eq!(summary.replacement_count, 1);
+    }
+}

@@ -1,7 +1,7 @@
 use crate::tools::{ToolError, ToolResult, tool_ok, truncate_tool_output};
 use gix::status::UntrackedFiles;
 use serde::Deserialize;
-use std::{fmt::Write as _, io};
+use std::{fmt::Write as _, io, ops::Deref};
 
 use super::{
     collect_cached_diff_lines, format_index_worktree_change, open_repo, path_from_bytes,
@@ -48,6 +48,10 @@ fn execute_git_diff_inner(
 }
 
 /// Produce full unified diffs for changed files using gix.
+///
+/// When `cached` is true, compares HEAD↔index (staged changes).
+/// When `cached` is false, compares index↔worktree (unstaged changes).
+/// Added files diff against an empty string; deleted files diff against HEAD content.
 fn git_full_diff_impl(
     repo_path: Option<&str>,
     cached: bool,
@@ -70,12 +74,14 @@ fn git_full_diff_impl(
 
     let mut has_changes = false;
 
+    // Staged changes: iterate over the HEAD↔index diff entries produced by
+    // collect_cached_diff_lines, and for each status code produce the
+    // corresponding unified diff.
     if cached {
         let changes = collect_cached_diff_lines(&repo, &pathspec)?;
         let index = repo.index().map_err(io::Error::other)?;
 
         for line in &changes {
-            // Format: "M path" or "A path" or "D path"
             let parts: Vec<&str> = line.splitn(2, ' ').collect();
             if parts.len() < 2 {
                 continue;
@@ -88,6 +94,7 @@ fn git_full_diff_impl(
             }
 
             match status {
+                // Added or copied files have no old content — diff against empty string.
                 "A" | "C" => {
                     has_changes = true;
                     writeln!(out).ok();
@@ -96,6 +103,7 @@ fn git_full_diff_impl(
                         out.push_str(&diff);
                     }
                 }
+                // Deleted files have no new content — diff against HEAD.
                 "D" => {
                     has_changes = true;
                     writeln!(out).ok();
@@ -104,6 +112,7 @@ fn git_full_diff_impl(
                         out.push_str(&diff);
                     }
                 }
+                // Modified or renamed files: diff HEAD content against index content.
                 _ => {
                     has_changes = true;
                     writeln!(out).ok();
@@ -119,6 +128,8 @@ fn git_full_diff_impl(
             }
         }
     } else {
+        // Unstaged changes: iterate over the index↔worktree status and produce
+        // unified diffs for modifications and untracked files.
         let index = repo.index().map_err(io::Error::other)?;
 
         let status_iter = repo
@@ -133,6 +144,7 @@ fn git_full_diff_impl(
             let path = path_from_bytes(item.rela_path().as_ref());
 
             match &item {
+                // Differing file content: diff index entry against file on disk.
                 WtItem::Modification { .. } => {
                     let old_content = entry_content_by_path(&repo, &index, &path).unwrap_or_default();
                     let full_path = repo.workdir().unwrap_or(repo.git_dir()).join(&path);
@@ -147,6 +159,7 @@ fn git_full_diff_impl(
                         out.push_str(&diff);
                     }
                 }
+                // Untracked files have no index counterpart — diff against empty string.
                 WtItem::DirectoryContents { entry, .. }
                     if matches!(entry.status, gix::dir::entry::Status::Untracked) =>
                 {
@@ -171,17 +184,25 @@ fn git_full_diff_impl(
     Ok(out.trim_end().to_string())
 }
 
+/// Walk from HEAD commit → tree → entry by path, then return the file content.
+///
+/// The `??` on the `peel_to_entry_by_path` line unwraps the outer `Result` (I/O error)
+/// and then the inner `Option` (path not found in tree).
 fn head_content_by_path(repo: &gix::Repository, path: &str) -> Option<String> {
     let head_id = repo.head().ok()?.id()?;
     let object = head_id.object().ok()?;
     let mut tree = object.peel_to_tree().ok()?;
-    let entry = tree.peel_to_entry_by_path(path).ok()??;
+    let entry = tree.peel_to_entry_by_path(path).ok()?;
+    let entry = entry?;
     let obj = entry.object().ok()?;
     String::from_utf8(obj.data.to_vec()).ok()
 }
 
+/// Search the index for a matching entry by path, then return its blob content.
+///
+/// Deref is used to access the `State` from `gix::index::File` so we can call
+/// `path_backing()` and `path_in()` — these live on `State`, not on the `File` wrapper.
 fn entry_content_by_path(repo: &gix::Repository, index: &gix::index::File, path: &str) -> Option<String> {
-    use std::ops::Deref;
     let state: &gix::index::State = index.deref();
     let backing = state.path_backing();
     let entry = index

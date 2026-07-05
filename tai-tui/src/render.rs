@@ -435,6 +435,13 @@ fn format_status(status: &SessionStatus) -> String {
 
 // ── Diff rendering ─────────────────────────────────────────
 
+/// Render a side-by-side diff into the terminal frame.
+///
+/// The diff is first converted into aligned left/right pane rows via
+/// `build_diff_panes`, then clipped to the visible viewport through the
+/// `rows_to_skip` / `rows_remaining` scrolling mechanism (shared with text
+/// rendering). Each row is split into two panes separated by a `│` gutter.
+/// Deletions appear highlighted in red on the left; additions in green on the right.
 fn render_history_diff(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -514,6 +521,13 @@ fn render_history_diff(
     *rows_to_skip = 0;
 }
 
+/// Build a single-cell ratatui `Span` for one side of the side-by-side diff.
+///
+/// * Truncates content that exceeds the pane width, appending `…`.
+/// * Pads shorter content with spaces for consistent background coloring.
+/// * Applies red background + foreground for deletions on the left pane,
+///   green background + foreground for additions on the right pane,
+///   and default styling for context lines.
 fn diff_cell_spans(
     content: &str,
     kind: DiffLineKind,
@@ -845,9 +859,9 @@ mod tests {
             })
             .unwrap();
 
-        // diff_display_height = 1 (header) + 1 (line) = 2
-        assert_eq!(rows_remaining, 28, "2 diff rows consumed");
-        assert_eq!(y, 28, "y moved up by 2");
+        // build_diff_panes always emits a file header row, so height = 1 (file) + 1 (hunk) + 1 (line) = 3
+        assert_eq!(rows_remaining, 27, "3 diff rows consumed");
+        assert_eq!(y, 27, "y moved up by 3");
         assert_eq!(rows_to_skip, 0);
     }
 
@@ -884,9 +898,9 @@ mod tests {
             })
             .unwrap();
 
-        // full_height=2, skip=1 → visible=1 → remaining=29
-        assert_eq!(rows_remaining, 29);
-        assert_eq!(y, 29);
+        // full_height=3, skip=1 → visible=2 → remaining=28
+        assert_eq!(rows_remaining, 28);
+        assert_eq!(y, 28);
         assert_eq!(rows_to_skip, 0);
     }
 
@@ -923,9 +937,63 @@ mod tests {
             })
             .unwrap();
 
-        // full_height=2 <= skip=10 → fully skipped, skip reduced by 2
+        // full_height=3 <= skip=10 → fully skipped, skip reduced by 3
         assert_eq!(rows_remaining, 30);
         assert_eq!(y, 30);
-        assert_eq!(rows_to_skip, 8);
+        assert_eq!(rows_to_skip, 7);
+    }
+
+    // ── diff_cell_spans tests ──
+
+    #[test]
+    fn diff_cell_spans_pads_short_content() {
+        let spans = diff_cell_spans("hi", DiffLineKind::Context, 10, true);
+        let text = spans[0].content.trim_end();
+        assert!(text.starts_with("hi"), "content='{text}' should start with 'hi'");
+    }
+
+    #[test]
+    fn diff_cell_spans_truncates_long_content() {
+        let long = "a".repeat(20);
+        let spans = diff_cell_spans(&long, DiffLineKind::Context, 5, true);
+        // truncated to 4 chars + '…' (which is 3 bytes, so byte length = 7)
+        assert_eq!(spans[0].content.chars().count(), 5);
+        assert!(spans[0].content.ends_with('…'));
+    }
+
+    #[test]
+    fn diff_cell_spans_left_deletion_has_red_style() {
+        let spans = diff_cell_spans("del", DiffLineKind::Deletion, 10, true);
+        let style = spans[0].style;
+        assert_eq!(style.fg, Some(Color::Red));
+        assert_eq!(style.bg, Some(Color::Rgb(80, 0, 0)));
+    }
+
+    #[test]
+    fn diff_cell_spans_right_deletion_has_default_style() {
+        let spans = diff_cell_spans("del", DiffLineKind::Deletion, 10, false);
+        assert_eq!(spans[0].style, Style::default());
+    }
+
+    #[test]
+    fn diff_cell_spans_right_addition_has_green_style() {
+        let spans = diff_cell_spans("add", DiffLineKind::Addition, 10, false);
+        let style = spans[0].style;
+        assert_eq!(style.fg, Some(Color::Green));
+        assert_eq!(style.bg, Some(Color::Rgb(0, 80, 0)));
+    }
+
+    #[test]
+    fn diff_cell_spans_left_addition_has_default_style() {
+        let spans = diff_cell_spans("add", DiffLineKind::Addition, 10, true);
+        assert_eq!(spans[0].style, Style::default());
+    }
+
+    #[test]
+    fn diff_cell_spans_context_has_default_style() {
+        let spans = diff_cell_spans("ctx", DiffLineKind::Context, 10, true);
+        assert_eq!(spans[0].style, Style::default());
+        let spans = diff_cell_spans("ctx", DiffLineKind::Context, 10, false);
+        assert_eq!(spans[0].style, Style::default());
     }
 }

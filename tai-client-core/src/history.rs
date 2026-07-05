@@ -139,3 +139,76 @@ impl<TImage> ClientHistory<TImage> {
             .retain(|_, index| *index < self.history.len());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DiffHunk;
+
+    fn sample_diffs() -> Vec<FileDiff> {
+        vec![FileDiff {
+            old_path: "old.txt".into(),
+            new_path: "new.txt".into(),
+            hunks: vec![DiffHunk {
+                header: "@@ -1 +1 @@".into(),
+                lines: vec![],
+            }],
+        }]
+    }
+
+    #[test]
+    fn push_diff_appends_diff_item() {
+        let mut hist: ClientHistory<()> = ClientHistory::new(vec![]);
+        let diffs = sample_diffs();
+        hist.push_diff(diffs.clone());
+        assert_eq!(hist.history.len(), 1);
+        match &hist.history[0] {
+            HistoryItem::Diff(d) => assert_eq!(d.len(), 1),
+            other => panic!("expected Diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_diff_respects_max_history() {
+        let mut hist: ClientHistory<()> = ClientHistory::new(
+            (0..MAX_HISTORY_ITEMS).map(|i| HistoryItem::Text(format!("line {i}"))).collect(),
+        );
+        assert_eq!(hist.history.len(), MAX_HISTORY_ITEMS);
+        hist.push_diff(sample_diffs());
+        assert_eq!(hist.history.len(), MAX_HISTORY_ITEMS);
+        match &hist.history[MAX_HISTORY_ITEMS - 1] {
+            HistoryItem::Diff(_) => {} // newest item is the diff
+            other => panic!("expected Diff at tail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_diff_before_stream_inserts_in_middle() {
+        let mut hist: ClientHistory<()> = ClientHistory::new(vec![
+            HistoryItem::Text("before".into()),
+        ]);
+        hist.begin_stream(7);
+        assert_eq!(hist.history.len(), 2);
+        assert_eq!(hist.in_progress.get(&7), Some(&1));
+
+        hist.insert_before_stream(7, HistoryItem::Diff(sample_diffs()));
+
+        assert_eq!(hist.history.len(), 3);
+        match &hist.history[1] {
+            HistoryItem::Diff(_) => {}
+            other => panic!("expected Diff at index 1, got {other:?}"),
+        }
+        assert_eq!(hist.in_progress.get(&7), Some(&2));
+    }
+
+    #[test]
+    fn insert_diff_before_stream_falls_back_to_push_when_no_stream() {
+        let mut hist: ClientHistory<()> = ClientHistory::new(vec![]);
+        hist.insert_before_stream(99, HistoryItem::Diff(sample_diffs()));
+        assert_eq!(hist.history.len(), 1);
+        match &hist.history[0] {
+            HistoryItem::Diff(_) => {}
+            other => panic!("expected Diff, got {other:?}"),
+        }
+    }
+}

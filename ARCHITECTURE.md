@@ -150,11 +150,12 @@ lock state.
 Used by both `tai-tui` and `tai-dioxus`.
 
 | Module | Purpose |
-|---|---|
+|---|---|---|
 | `shell.rs` | Parses terminal input into `ShellCommand`: `/ping`, `/models`, `/model` (alias), `/cancel`, `/unlock`, `/lock`, `/image`, or `RunInput(prompt)`. All commands use `/` prefix exclusively; `parse_command()` is the single dispatch point. |
 | `markdown.rs` | Parses markdown into structured `MarkdownDocument` (paragraphs, headings, code blocks, lists, tables) via `pulldown-cmark`; `render_markdown_html()` sanitizes via `ammonia` |
 | `image.rs` | `ImageAssembler` reconstructs images from chunked stream protocol (`ImageStart` → `ImageChunk`* → `ImageEnd`), validating byte count |
-| `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text) |
+| `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text, structured diffs) |
+| `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
 
 `DaemonMessageHandler` trait uses `ClientError` (thiserror enum) — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`.
 
@@ -242,10 +243,11 @@ main()
 **Module breakdown:**
 
 | Module | Purpose |
-|---|---|
+|---|---|---|
 | `connection.rs` | Socket setup, event loop, shutdown signal handling, input/keyboard/mouse dispatch, daemon message routing. Mouse scroll events are accumulated per-frame rather than applied immediately — the delta is consumed in batch before each render (see `apply_scroll_delta`). |
 | `state.rs` | `App` struct: input buffer, request tracking, `ClientHistory`, scroll state (`HistoryScrollState`), and the per-frame scroll accumulator (`scroll_accumulator`) consumed by `apply_scroll_delta()`. |
-| `render.rs` | Ratatui rendering: history pane (top) + command input (bottom), word wrap, Unicode width. Does **not** mutate scroll state or viewport dimensions — those are updated in the event loop before `terminal.draw()`. |
+| `render.rs` | Ratatui rendering: history pane (top) + command input (bottom), word wrap, Unicode width. Includes side-by-side diff rendering with red/green coloring. Does **not** mutate scroll state or viewport dimensions — those are updated in the event loop before `terminal.draw()`. |
+| `diff_render.rs` | Diff parser and side-by-side pane builder. Detects unified diff text, parses into `FileDiff` structs, builds aligned left/right display rows. |
 | `lib.rs` | SVG rasterization (resvg), PNG/JPEG decoding (image crate), ratatui-image protocol picker |
 
 
@@ -262,7 +264,7 @@ async reader/writer tasks inside the Dioxus runtime.
 |---|---|
 | `client.rs` | `run_client()` — socket split, reader/writer, daemon message dispatch |
 | `state.rs` | `AppState` with input, request tracking, `ClientHistory` |
-| `render.rs` | RSX rendering of history items: markdown → sanitized HTML, images via `data:` URLs |
+| `render.rs` | RSX rendering of history items: markdown → sanitized HTML, images via `data:` URLs, structured diffs via `format_diff_file` |
 | `main.rs` | Dioxus `App` component, toolbar, history pane, textarea composer, CSS |
 
 

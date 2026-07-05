@@ -10,6 +10,19 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::diff_render::{diff_display_height, is_diff_text, parse_diff};
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
+use tai_client_core::FileDiff;
+
+/// If the text looks like a unified diff and can be parsed successfully,
+/// return the structured diffs. Otherwise return `None`.
+fn try_parse_as_diff(text: &str) -> Option<Vec<FileDiff>> {
+    if is_diff_text(text) {
+        let diffs = parse_diff(text);
+        if !diffs.is_empty() {
+            return Some(diffs);
+        }
+    }
+    None
+}
 
 pub(crate) const INPUT_BAR_HEIGHT: u16 = 3;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
@@ -514,15 +527,9 @@ impl App {
 
     pub(crate) fn push_tool_text(&mut self, request_id: u32, text: impl Into<String>) {
         let text = text.into();
-        let item: HistoryItem = if is_diff_text(&text) {
-            let diffs = parse_diff(&text);
-            if !diffs.is_empty() {
-                HistoryItem::Diff(diffs)
-            } else {
-                HistoryItem::Text(text)
-            }
-        } else {
-            HistoryItem::Text(text)
+        let item: HistoryItem = match try_parse_as_diff(&text) {
+            Some(diffs) => HistoryItem::Diff(diffs),
+            None => HistoryItem::Text(text),
         };
         let added_height = self.history_viewport.item_height(&item);
         let trimmed_height = self.trimmed_height_on_append();
@@ -533,11 +540,15 @@ impl App {
         self.clamp_scroll_state();
     }
 
+    /// Feed a `SessionMessage` into history.
+    ///
+    /// If the message is a non-error `ToolResult` whose content looks like a
+    /// unified diff, it is promoted to a `HistoryItem::Diff` for side-by-side
+    /// rendering instead of being displayed as a raw session message.
     pub(crate) fn push_session_message(&mut self, message: SessionMessage) {
         if let SessionMessage::ToolResult { content, is_error, .. } = &message {
-            if !is_error && is_diff_text(content) {
-                let diffs = parse_diff(content);
-                if !diffs.is_empty() {
+            if !is_error {
+                if let Some(diffs) = try_parse_as_diff(content) {
                     self.push_history_item(HistoryItem::Diff(diffs));
                     return;
                 }
@@ -720,4 +731,114 @@ pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
 
 pub(crate) fn image_block_height(available_height: usize) -> usize {
     available_height.min(12)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── try_parse_as_diff ──
+
+    #[test]
+    fn try_parse_returns_some_for_diff_text() {
+        let text = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(try_parse_as_diff(text).is_some());
+    }
+
+    #[test]
+    fn try_parse_returns_some_for_diff_with_metadata_prefix() {
+        let text = "repository: /repo\nmode: working tree\n\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
+        assert!(try_parse_as_diff(text).is_some());
+    }
+
+    #[test]
+    fn try_parse_returns_none_for_plain_text() {
+        assert!(try_parse_as_diff("hello").is_none());
+    }
+
+    #[test]
+    fn try_parse_returns_none_for_empty_string() {
+        assert!(try_parse_as_diff("").is_none());
+    }
+
+    // ── push_tool_text ──
+
+    #[test]
+    fn push_tool_text_with_diff_creates_diff_item() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        let text = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n";
+        app.push_tool_text(1, text);
+
+        assert!(matches!(app.client.history.last().unwrap(), HistoryItem::Diff(_)));
+    }
+
+    #[test]
+    fn push_tool_text_with_plain_text_creates_text_item() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        app.push_tool_text(1, "just some output");
+
+        match &app.client.history.last().unwrap() {
+            HistoryItem::Text(t) => assert!(t.contains("just some output")),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    // ── push_session_message ──
+
+    #[test]
+    fn push_session_message_tool_result_with_diff_creates_diff_item() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        let msg = SessionMessage::ToolResult {
+            call_id: String::new(),
+            name: "edit_file".into(),
+            content: "edit_file: f (1 replacement, +3 chars)\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            is_error: false,
+        };
+        app.push_session_message(msg);
+
+        assert!(matches!(app.client.history.last().unwrap(), HistoryItem::Diff(_)));
+    }
+
+    #[test]
+    fn push_session_message_tool_result_with_error_stays_session_message() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        let msg = SessionMessage::ToolResult {
+            call_id: String::new(),
+            name: "edit_file".into(),
+            content: "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            is_error: true,
+        };
+        app.push_session_message(msg);
+
+        assert!(matches!(app.client.history.last().unwrap(), HistoryItem::SessionMessage(_)));
+    }
+
+    #[test]
+    fn push_session_message_plain_text_stays_session_message() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        let msg = SessionMessage::ToolResult {
+            call_id: String::new(),
+            name: "read_file".into(),
+            content: "hello world".into(),
+            is_error: false,
+        };
+        app.push_session_message(msg);
+
+        assert!(matches!(app.client.history.last().unwrap(), HistoryItem::SessionMessage(_)));
+    }
 }

@@ -31,6 +31,10 @@ embedded `redb` database. A *subsession* is a child session spawned by the
 agent loop independently, and returns its output as the parent's tool result. Subsessions
 persist permanently and can be inspected like any other session.
 
+**Diff rendering:** Unified diff output from tool results (`edit_file`, `git_diff full`) is
+automatically detected by the TUI client and rendered side-by-side with red/green coloring
+for deletions and additions, rather than as raw monospaced text.
+
 **Tool:** A function the LLM can call to interact with the outside world (read files, make
 HTTP requests, run git commands, query blockchains, post to X, etc.). Tools implement the
 `Tool` trait (name, description, JSON Schema, `fn execute`) and are registered in a

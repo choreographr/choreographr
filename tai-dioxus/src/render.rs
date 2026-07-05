@@ -63,6 +63,71 @@ fn format_diff_file(file: &FileDiff) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use tai_client_core::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
+
+    #[test]
+    fn format_diff_file_includes_headers() {
+        let fd = FileDiff {
+            old_path: "old.rs".into(),
+            new_path: "new.rs".into(),
+            hunks: vec![],
+        };
+        let out = super::format_diff_file(&fd);
+        assert!(out.contains("--- old.rs"));
+        assert!(out.contains("+++ new.rs"));
+    }
+
+    #[test]
+    fn format_diff_file_shows_additions() {
+        let fd = FileDiff {
+            old_path: "f".into(),
+            new_path: "f".into(),
+            hunks: vec![DiffHunk {
+                header: "@@ -1 +1 @@".into(),
+                lines: vec![
+                    DiffLine { kind: DiffLineKind::Addition, content: "new_line".into() },
+                ],
+            }],
+        };
+        let out = super::format_diff_file(&fd);
+        assert!(out.contains("+new_line"));
+    }
+
+    #[test]
+    fn format_diff_file_shows_deletions() {
+        let fd = FileDiff {
+            old_path: "f".into(),
+            new_path: "f".into(),
+            hunks: vec![DiffHunk {
+                header: "@@ -1 +1 @@".into(),
+                lines: vec![
+                    DiffLine { kind: DiffLineKind::Deletion, content: "old_line".into() },
+                ],
+            }],
+        };
+        let out = super::format_diff_file(&fd);
+        assert!(out.contains("-old_line"));
+    }
+
+    #[test]
+    fn format_diff_file_shows_context() {
+        let fd = FileDiff {
+            old_path: "f".into(),
+            new_path: "f".into(),
+            hunks: vec![DiffHunk {
+                header: "@@ -1 +1 @@".into(),
+                lines: vec![
+                    DiffLine { kind: DiffLineKind::Context, content: "ctx".into() },
+                ],
+            }],
+        };
+        let out = super::format_diff_file(&fd);
+        assert!(out.contains(" ctx"));
+    }
+}
+
 fn render_session_message(message: SessionMessage) -> Element {
     match message {
         SessionMessage::SystemText { content } => {
