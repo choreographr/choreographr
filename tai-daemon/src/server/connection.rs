@@ -125,6 +125,11 @@ pub(crate) fn client_thread(
                     ClientMessage::RunInput { request_id, input } => {
                         if let Some(ref tx) = attached_session_tx {
                             let _ = tx.send(SessionCommand::RunInput { request_id, input });
+                        } else {
+                            let _ = writer_tx.send(DaemonMessage::Failed {
+                                request_id,
+                                error: "no session attached".to_string(),
+                            });
                         }
                     }
                     ClientMessage::Cancel { request_id } => {
