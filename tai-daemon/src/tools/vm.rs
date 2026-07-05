@@ -1,5 +1,5 @@
 use crate::openai::ChatToolCall;
-use crate::tools::{Tool, ToolExecutionOutput, ToolRegistry, tool_ok, tool_err};
+use crate::tools::{Tool, ToolExecutionOutput, ToolRegistry, ToolResult, tool_ok, tool_err};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ckb_vm::Bytes;
 use ckb_vm::{
@@ -562,6 +562,116 @@ impl Tool for RunRiscV {
     }
 }
 
+pub fn execute_run_riscv_tool(args: &str, cwd: Option<&Path>) -> ToolResult {
+    run_riscv_impl(args, None, cwd, None).result
+}
+
 pub(crate) fn init_vm_tool_registry(registry: &Arc<ToolRegistry>) {
     let _ = VM_TOOL_REGISTRY.set(Arc::clone(registry));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_boilerplate_with_alloc_includes_allocator() {
+        let result = build_boilerplate(true);
+        assert!(result.contains("struct BumpAlloc"), "should contain bump allocator");
+        assert!(result.contains("fn args()"), "should contain args()");
+        assert!(result.contains("fn _start()"), "should contain _start");
+        assert!(result.contains("tai::exit(1)"), "should contain panic handler");
+    }
+
+    #[test]
+    fn build_boilerplate_without_alloc_excludes_allocator() {
+        let result = build_boilerplate(false);
+        assert!(!result.contains("struct BumpAlloc"), "should NOT contain bump allocator");
+        assert!(!result.contains("fn args()"), "should NOT contain args()");
+        assert!(result.contains("fn _start()"), "should still contain _start");
+        assert!(result.contains("tai::exit(1)"), "should still contain panic handler");
+    }
+
+    #[test]
+    fn build_boilerplate_contains_tai_module() {
+        let result = build_boilerplate(false);
+        assert!(result.contains("pub mod tai"));
+        assert!(result.contains("TOOL_CALL"));
+        assert!(result.contains("WRITE"));
+        assert!(result.contains("EXIT"));
+    }
+
+    #[test]
+    fn run_riscv_rejects_invalid_json() {
+        let result = run_riscv_impl(r#"not json"#, None, None, None);
+        assert!(result.result.is_error, "expected error: {}", result.result.content);
+        assert!(result.result.content.contains("invalid arguments"), "{}", result.result.content);
+    }
+
+    #[test]
+    fn run_riscv_requires_source_or_program() {
+        let result = run_riscv_impl(r#"{}"#, None, None, None);
+        assert!(result.result.is_error, "expected error: {}", result.result.content);
+        assert!(result.result.content.contains("source") || result.result.content.contains("program"),
+            "should mention source/program: {}", result.result.content);
+    }
+
+    #[test]
+    fn run_riscv_rejects_both_source_and_program() {
+        let result = run_riscv_impl(
+            r#"{"source": "fn main() {}", "program": "AAAA"}"#,
+            None, None, None,
+        );
+        assert!(result.result.is_error, "expected error: {}", result.result.content);
+        assert!(result.result.content.contains("only one of"), "{}", result.result.content);
+    }
+
+    #[test]
+    fn run_riscv_rejects_invalid_base64() {
+        let result = run_riscv_impl(
+            r#"{"program": "!!!not-base64!!!"}"#,
+            None, None, None,
+        );
+        assert!(result.result.is_error, "expected error: {}", result.result.content);
+        assert!(result.result.content.contains("base64 decode error"), "{}", result.result.content);
+    }
+
+    #[test]
+    fn run_riscv_rejects_non_aligned_memory() {
+        let result = run_riscv_impl(
+            r#"{"program": "AAAA", "memory_size": 100}"#,
+            None, None, None,
+        );
+        assert!(result.result.is_error, "expected error: {}", result.result.content);
+        assert!(result.result.content.contains("multiple of 4096"), "{}", result.result.content);
+    }
+
+    #[test]
+    fn run_riscv_rejects_memory_over_4mb() {
+        let result = run_riscv_impl(
+            r#"{"program": "AAAA", "memory_size": 4198400}"#,
+            None, None, None,
+        );
+        assert!(result.result.is_error, "expected error: {}", result.result.content);
+        assert!(result.result.content.contains("cannot exceed 4MB"), "{}", result.result.content);
+    }
+
+    #[test]
+    fn run_riscv_accepts_valid_base64_program_with_4k_aligned_memory() {
+        // "AAAA" decodes to 3 zero bytes — not a valid ELF, but that's caught at load time,
+        // not during input validation. This test verifies that valid base64 + aligned memory
+        // passes input validation (the error will be about ELF loading, not input).
+        let result = run_riscv_impl(
+            r#"{"program": "AAAA", "memory_size": 4096}"#,
+            None, None, None,
+        );
+        // Should fail at ELF load, not at input validation
+        assert!(result.result.is_error, "expected error: {}", result.result.content);
+        assert!(!result.result.content.contains("base64 decode error"),
+            "should not be base64 error: {}", result.result.content);
+        assert!(!result.result.content.contains("multiple of 4096"),
+            "should not be alignment error: {}", result.result.content);
+        assert!(!result.result.content.contains("cannot exceed 4MB"),
+            "should not be size error: {}", result.result.content);
+    }
 }
