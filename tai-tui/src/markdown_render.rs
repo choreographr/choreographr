@@ -50,9 +50,11 @@ fn to_ratatui_color(c: syntect::highlighting::Color) -> Color {
 ///   plain text (no highlighting).
 /// * `code` – the raw source code.
 ///
-/// Results are memoized in a global cache keyed by `(language, code)`.  This
-/// ensures that syntect's regex-based highlighting is only performed once per
-/// unique code block, not once per frame during scrolling.
+/// Results are memoized in a bounded global cache so that `total_history_height`
+/// (which re-renders every item after each mutation) does not trigger syntect's
+/// regex engine repeatedly for the same code block.  The cache has a fixed
+/// capacity; when full, new entries are dropped silently — the existing entries
+/// for the most common code blocks stay warm.
 fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
     static HIGHLIGHT_CACHE: OnceLock<Mutex<HashMap<(String, String), Vec<Line<'static>>>>> =
         OnceLock::new();
@@ -60,6 +62,7 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
 
     let key = (language.unwrap_or("").to_string(), code.to_string());
 
+    // Fast path: return a clone of the cached result without running syntect.
     {
         let guard = cache.lock().expect("highlight_code cache lock");
         if let Some(cached) = guard.get(&key) {
@@ -100,9 +103,14 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
         result.push(Line::from(spans));
     }
 
+    // Bounded cache: allows up to 200 entries.  When full, new entries are
+    // not inserted so the most frequently seen code blocks stay cached.
+    const MAX_CACHE_ENTRIES: usize = 200;
     {
         let mut guard = cache.lock().expect("highlight_code cache lock");
-        guard.insert(key, result.clone());
+        if guard.len() < MAX_CACHE_ENTRIES {
+            guard.insert(key, result.clone());
+        }
     }
 
     result
@@ -132,7 +140,7 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
 
     lines
         .iter()
-        .map(|line| wrapped_line_height(&line.to_string(), width))
+        .map(|line| wrapped_line_height(line, width))
         .sum::<usize>()
         .max(1)
 }
@@ -229,7 +237,9 @@ fn append_section(lines: &mut Vec<Line<'static>>, label: &'static str, body: Vec
     let mut body_iter = body.into_iter();
     if let Some(first) = body_iter.next() {
         let label_text = format!("{label}: ");
-        let mut first_spans = first.spans.clone();
+        // Move spans out of `first` instead of cloning — body is consumed
+        // by into_iter() so no other code needs the original.
+        let mut first_spans = first.spans;
         first_spans.insert(0, Span::styled(label_text, Style::default()));
         lines.push(Line::from(first_spans));
     } else {
@@ -776,11 +786,13 @@ fn render_inlines_to_lines(
     }
 }
 
-fn wrapped_line_height(line: &str, width: usize) -> usize {
+fn wrapped_line_height(line: &Line<'_>, width: usize) -> usize {
     if width == 0 {
         return 0;
     }
-    let line_width = display_width(line);
+    // Use Line::width() directly instead of line.to_string() + display_width
+    // to avoid allocating a temporary String from concatenating all spans.
+    let line_width = line.width();
     if line_width == 0 {
         1
     } else {

@@ -604,14 +604,12 @@ impl App {
                     width,
                     height: height - INPUT_BAR_HEIGHT,
                 });
-                // Invalidate cache entries whose width no longer matches.
+                // All cached entries were computed at the old width and are
+                // now stale — invalidate every entry so the next render
+                // recomputes at the current terminal width.
                 if old_width != width {
                     for cached in &mut self.render_cache {
-                        if let Some(entry) = cached {
-                            if entry.width != width {
-                                *cached = None;
-                            }
-                        }
+                        *cached = None;
                     }
                 }
             }
@@ -640,8 +638,28 @@ impl App {
         };
         let added_height = self.history_viewport.item_height(&item);
         let trimmed_height = self.trimmed_height_on_append();
+        let old_hist_len = self.client.history.len();
+        let insert_at = self.client.in_progress.get(&request_id).copied();
         self.client.insert_before_stream(request_id, item);
-        self.ensure_cache_synced();
+        // Update the cache for an item inserted mid-history (before a stream).
+        // Handles both the insertion and any front-trimming by ClientHistory.
+        let new_hist_len = self.client.history.len();
+        let trimmed = (old_hist_len + 1).saturating_sub(new_hist_len);
+        if trimmed > 0 {
+            self.render_cache.drain(0..trimmed);
+        }
+        if let Some(index) = insert_at {
+            let adjusted = index.saturating_sub(trimmed);
+            self.render_cache.insert(adjusted, None);
+        } else {
+            // Fallback — stream was already finalized, item goes to back.
+            self.render_cache.push(None);
+        }
+        // Safety net: if lengths still don't match, rebuild from scratch.
+        if self.render_cache.len() != new_hist_len {
+            self.render_cache.clear();
+            self.render_cache.resize(new_hist_len, None);
+        }
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
         self.account_for_trimmed_height(trimmed_height);
@@ -672,19 +690,24 @@ impl App {
 
     /// Ensure the render cache is aligned with the history vector.
     ///
-    /// Whenever items are pushed, inserted, or trimmed the cache length
-    /// diverges from the history length.  This method detects the mismatch
-    /// and rebuilds the cache from scratch (all `None`s) so that subsequent
-    /// frame rendering can lazily populate entries on cache miss.
-    ///
-    /// Rebuilding is O(n) but only runs on mutation (once per user/AI
-    /// message), never during scrolling.
+    /// Items appended to the back of the history get a `None` appended to
+    /// the cache.  Items trimmed from the front are drained from the cache
+    /// front.  Existing cache entries are preserved so that
+    /// `total_history_height` can use cached heights instead of re-rendering
+    /// all items after every mutation.
     pub(crate) fn ensure_cache_synced(&mut self) {
         let hist_len = self.client.history.len();
-        if self.render_cache.len() != hist_len {
-            self.render_cache.clear();
-            self.render_cache.resize(hist_len, None);
+        let cache_len = self.render_cache.len();
+        if cache_len == hist_len {
+            return;
         }
+        // Items trimmed from front (e.g. when history exceeds MAX_HISTORY_ITEMS).
+        if cache_len > hist_len {
+            self.render_cache.drain(0..(cache_len - hist_len));
+            return;
+        }
+        // Items appended at the back.
+        self.render_cache.resize(hist_len, None);
     }
 
     pub(crate) fn push_history_item(&mut self, item: HistoryItem) {
