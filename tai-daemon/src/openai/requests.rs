@@ -85,22 +85,18 @@ fn status_to_error(
     super::OpenAiError::Io(io::Error::new(io::ErrorKind::Other, detail.to_string()))
 }
 
-fn retry_send(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    api_key: &str,
-    body: &serde_json::Value,
+fn retry_send_impl<F>(
+    send_request: F,
     retry: &RetryConfig,
-) -> Result<reqwest::blocking::Response, super::OpenAiError> {
+) -> Result<reqwest::blocking::Response, super::OpenAiError>
+where
+    F: Fn() -> Result<reqwest::blocking::Response, reqwest::Error>,
+{
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
 
-        let result = client
-            .post(url)
-            .bearer_auth(api_key.trim())
-            .json(body)
-            .send();
+        let result = send_request();
 
         match result {
             Ok(response) => {
@@ -160,74 +156,29 @@ fn retry_send(
     }
 }
 
+fn retry_send(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    retry: &RetryConfig,
+) -> Result<reqwest::blocking::Response, super::OpenAiError> {
+    retry_send_impl(
+        || client.post(url).bearer_auth(api_key.trim()).json(body).send(),
+        retry,
+    )
+}
+
 fn retry_send_get(
     client: &reqwest::blocking::Client,
     url: &str,
     api_key: &str,
     retry: &RetryConfig,
 ) -> Result<reqwest::blocking::Response, super::OpenAiError> {
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-
-        let result = client.get(url).bearer_auth(api_key.trim()).send();
-
-        match result {
-            Ok(response) => {
-                let status = response.status();
-                let headers = response.headers().clone();
-                if status.is_success() {
-                    return Ok(response);
-                }
-
-                if is_retryable_status(status) && attempt < retry.max_attempts {
-                    let retry_after = parse_retry_after_secs(response.headers());
-                    let body_text = response.text().unwrap_or_default();
-                    let delay = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        retry_after
-                            .map(Duration::from_secs)
-                            .unwrap_or_else(|| backoff_duration(attempt, retry))
-                    } else {
-                        backoff_duration(attempt, retry)
-                    };
-                    tracing::warn!(
-                        attempt,
-                        max_attempts = retry.max_attempts,
-                        ?status,
-                        %body_text,
-                        delay_ms = delay.as_millis(),
-                        "retrying request"
-                    );
-                    std::thread::sleep(delay);
-                    continue;
-                }
-
-                let body_text = response.text().unwrap_or_default();
-                let trimmed_body = body_text.trim();
-                let detail = if trimmed_body.is_empty() {
-                    format!("request failed with status {status}")
-                } else {
-                    format!("request failed with status {status}: {trimmed_body}")
-                };
-                return Err(status_to_error(status, &detail, &headers));
-            }
-            Err(error) => {
-                if (error.is_connect() || error.is_timeout()) && attempt < retry.max_attempts {
-                    let delay = backoff_duration(attempt, retry);
-                    tracing::warn!(
-                        attempt,
-                        max_attempts = retry.max_attempts,
-                        ?error,
-                        delay_ms = delay.as_millis(),
-                        "retrying request after connection/timeout error"
-                    );
-                    std::thread::sleep(delay);
-                    continue;
-                }
-                return Err(super::OpenAiError::Io(io::Error::other(error)));
-            }
-        }
-    }
+    retry_send_impl(
+        || client.get(url).bearer_auth(api_key.trim()).send(),
+        retry,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
