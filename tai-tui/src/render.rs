@@ -410,6 +410,7 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                     .map_or("unlimited".to_string(), |mt| mt.to_string())
             )),
             Line::from(format!("Status:        {}", format_status(&detail.status))),
+            Line::from(format!("Tool Groups:   {}", detail.active_tool_groups.join(", "))),
         ];
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, inner);

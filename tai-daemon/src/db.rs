@@ -23,7 +23,7 @@ pub struct SessionRecord {
     pub max_turns: Option<u32>,
     pub message_count: u32,
     pub created_at: i64,
-    pub active_categories: Vec<String>,
+    pub active_tool_groups: Vec<String>,
 }
 
 pub fn db_path() -> io::Result<PathBuf> {
@@ -354,7 +354,7 @@ mod tests {
             max_turns: None,
             message_count: 1,
             created_at: 1234567890,
-            active_categories: vec!["core".into(), "git".into()],
+            active_tool_groups: vec!["core".into(), "git".into()],
         };
         write_session(&db, id, &record).unwrap();
 

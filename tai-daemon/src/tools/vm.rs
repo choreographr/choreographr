@@ -509,7 +509,7 @@ impl Tool for RunRiscV {
         "run_riscv"
     }
 
-    fn category(&self) -> &'static str {
+    fn group(&self) -> &'static str {
         "vm"
     }
 

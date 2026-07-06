@@ -7,14 +7,14 @@ use tai_keystore::XCredentials;
 
 #[macro_export]
 macro_rules! define_tool {
-    ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr, $category:literal) => {
+    ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr, $tool_group:literal) => {
         pub(crate) struct $struct;
         impl $crate::tools::Tool for $struct {
             fn name(&self) -> &'static str {
                 $name
             }
-            fn category(&self) -> &'static str {
-                $category
+            fn group(&self) -> &'static str {
+                $tool_group
             }
             fn description(&self) -> &'static str {
                 $desc
@@ -39,14 +39,14 @@ macro_rules! define_tool {
 
 #[macro_export]
 macro_rules! define_tool_with_cwd {
-    ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr, $category:literal) => {
+    ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr, $tool_group:literal) => {
         pub(crate) struct $struct;
         impl $crate::tools::Tool for $struct {
             fn name(&self) -> &'static str {
                 $name
             }
-            fn category(&self) -> &'static str {
-                $category
+            fn group(&self) -> &'static str {
+                $tool_group
             }
             fn description(&self) -> &'static str {
                 $desc
@@ -87,7 +87,7 @@ pub(crate) mod skill;
 pub(crate) mod subsession;
 pub(crate) mod vm;
 pub(crate) mod x;
-pub(crate) mod categories;
+pub(crate) mod groups;
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -111,14 +111,14 @@ pub(crate) struct PreparedImage {
 }
 
 #[derive(Debug, Clone)]
-pub struct ToolCategory {
+pub struct ToolGroup {
     pub name: &'static str,
     pub description: &'static str,
 }
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
-    fn category(&self) -> &'static str {
+    fn group(&self) -> &'static str {
         "core"
     }
     fn description(&self) -> &'static str;
@@ -141,24 +141,24 @@ pub trait Tool: Send + Sync {
     }
 }
 
-pub const CATEGORIES: &[ToolCategory] = &[
-    ToolCategory {
+pub const GROUPS: &[ToolGroup] = &[
+    ToolGroup {
         name: "core",
         description: "File system operations, HTTP requests, image display, and file search",
     },
-    ToolCategory {
+    ToolGroup {
         name: "git",
         description: "Local Git repository operations (status, diff, log, add, commit, push)",
     },
-    ToolCategory {
+    ToolGroup {
         name: "shell",
         description: "Shell command execution (bash, nushell, fish, exec)",
     },
-    ToolCategory {
+    ToolGroup {
         name: "x",
         description: "X/Twitter API (post, search, user lookup)",
     },
-    ToolCategory {
+    ToolGroup {
         name: "vm",
         description: "RISC-V sandboxed code execution",
     },
@@ -266,32 +266,32 @@ impl ToolRegistry {
         }
     }
 
-    pub fn categories(&self) -> &[ToolCategory] {
-        CATEGORIES
+    pub fn groups(&self) -> &[ToolGroup] {
+        GROUPS
     }
 
-    /// Return category names suitable for a JSON Schema enum (excluding "core", which
+    /// Return group names suitable for a JSON Schema enum (excluding "core", which
     /// is always active and should not appear in load_tools/unload_tools schemas).
-    pub fn category_names(&self) -> Vec<&'static str> {
-        CATEGORIES
+    pub fn group_names(&self) -> Vec<&'static str> {
+        GROUPS
             .iter()
             .filter(|c| c.name != "core")
             .map(|c| c.name)
             .collect()
     }
 
-    /// Return tool definitions for categories in the active set, plus always-available
+    /// Return tool definitions for groups in the active set, plus always-available
     /// meta-tools (load_tools, unload_tools, load_skill, spawn_subsession, etc.).
     pub fn available_definitions(&self, active: &HashSet<String>) -> Vec<ChatToolDefinition> {
         let mut defs: Vec<_> = self
             .tools
             .values()
-            .filter(|t| active.contains(t.category()))
+            .filter(|t| active.contains(t.group()))
             .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
             .collect();
         // Always-available meta-tools
-        defs.push(categories::load_tools_definition(self));
-        defs.push(categories::unload_tools_definition(self));
+        defs.push(groups::load_tools_definition(self));
+        defs.push(groups::unload_tools_definition(self));
         defs.push(subsession::spawn_subsession_definition());
         defs.push(sessions::list_sessions_definition());
         defs.push(sessions::get_session_definition());

@@ -33,7 +33,7 @@ pub enum DaemonCommand {
         parent_session_id: Option<u64>,
         cwd: Option<PathBuf>,
         max_turns: Option<u32>,
-        active_categories: Vec<String>,
+        active_tool_groups: Vec<String>,
         reply: std::sync::mpsc::Sender<io::Result<(u64, std::sync::mpsc::Sender<SessionCommand>)>>,
     },
     AttachSession {
@@ -87,7 +87,7 @@ impl DaemonState {
                 parent_session_id,
                 cwd,
                 max_turns,
-                active_categories,
+                active_tool_groups,
                 reply,
             } => {
                 if self.openai_client.is_none() {
@@ -102,10 +102,10 @@ impl DaemonState {
                 info!("CreateSession: id={}, title={:?}", sid, title);
 
                 let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
-                let active_cats = if active_categories.is_empty() {
+                let active_cats = if active_tool_groups.is_empty() {
                     vec!["core".into(), "git".into(), "shell".into()]
                 } else {
-                    active_categories.clone()
+                    active_tool_groups.clone()
                 };
                 let record = SessionRecord {
                     title: title.clone(),
@@ -118,7 +118,7 @@ impl DaemonState {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64,
-                    active_categories: active_cats.clone(),
+                    active_tool_groups: active_cats.clone(),
                 };
 
                 if let Err(e) = db::write_session(&self.db, sid, &record) {
@@ -166,7 +166,7 @@ impl DaemonState {
                         message_count: 0,
                         max_turns,
                         status: SessionStatus::Inactive,
-                        active_categories: active_cats.clone(),
+                        active_tool_groups: active_cats.clone(),
                     },
                 );
 
@@ -262,7 +262,7 @@ impl DaemonState {
                         message_count: meta.message_count,
                         max_turns: meta.max_turns,
                         status: meta.status.clone(),
-                        active_categories: meta.active_categories.clone(),
+                        active_tool_groups: meta.active_tool_groups.clone(),
                     })
                     .collect();
 
@@ -283,7 +283,7 @@ impl DaemonState {
                         message_count: meta.message_count,
                         max_turns: meta.max_turns,
                         status: meta.status.clone(),
-                        active_categories: meta.active_categories.clone(),
+                        active_tool_groups: meta.active_tool_groups.clone(),
                     });
                 let _ = reply.send(summary);
             }
@@ -455,7 +455,7 @@ mod tests {
                 message_count: 3,
                 max_turns: None,
                 status: SessionStatus::Inactive,
-                active_categories: vec!["core".into()],
+                active_tool_groups: vec!["core".into()],
             },
         );
         let (reply, rx) = mpsc::channel();
@@ -492,7 +492,7 @@ mod tests {
                 message_count: 0,
                 max_turns: None,
                 status: SessionStatus::Inactive,
-                active_categories: vec!["core".into()],
+                active_tool_groups: vec!["core".into()],
             },
         );
         let new_meta = SessionMetadata {
@@ -504,7 +504,7 @@ mod tests {
             message_count: 5,
             max_turns: None,
             status: SessionStatus::Inference,
-            active_categories: vec!["core".into(), "git".into()],
+            active_tool_groups: vec!["core".into(), "git".into()],
         };
         state.handle_command(DaemonCommand::UpdateMetadata {
             session_id: 1,
@@ -577,7 +577,7 @@ mod tests {
             parent_session_id: None,
             cwd: None,
             max_turns: None,
-            active_categories: Vec::new(),
+            active_tool_groups: Vec::new(),
             reply,
         });
         let result = rx.recv().unwrap();

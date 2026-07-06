@@ -1,4 +1,4 @@
-use crate::tools::ToolCategory;
+use crate::tools::ToolGroup;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -202,15 +202,15 @@ pub fn assemble_context(bundle: &ContextBundle) -> String {
     out
 }
 
-pub fn build_base_prompt(skills: &[SkillMeta], categories: &[ToolCategory]) -> String {
+pub fn build_base_prompt(skills: &[SkillMeta], groups: &[ToolGroup]) -> String {
     let user_prompt = load_user_system_prompt();
     let mut base = user_prompt.unwrap_or_else(default_system_prompt);
 
-    // Tool category listing (always shown)
-    base.push_str("\n\n## Tool categories\n");
-    base.push_str("Tools are organized into categories. Only **core**, **git**, and **shell** are active by default. Use the `load_tools` tool to activate additional categories and `unload_tools` to deactivate them.\n\n");
-    for cat in categories {
-        base.push_str(&format!("- **{}**: {}\n", cat.name, cat.description));
+    // Tool group listing (always shown)
+    base.push_str("\n\n## Tool groups\n");
+    base.push_str("Tools are organized into groups. Only **core**, **git**, and **shell** are active by default. Use the `load_tools` tool to activate additional groups and `unload_tools` to deactivate them.\n\n");
+    for g in groups {
+        base.push_str(&format!("- **{}**: {}\n", g.name, g.description));
     }
 
     if !skills.is_empty() {

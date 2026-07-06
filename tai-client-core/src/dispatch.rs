@@ -69,7 +69,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             parent_session_id,
             cwd,
             max_turns,
-            active_categories: _,
+            active_tool_groups: _,
             messages,
         } => {
             let title = title.unwrap_or_else(|| "untitled".to_string());

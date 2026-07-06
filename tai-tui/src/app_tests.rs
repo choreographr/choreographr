@@ -964,7 +964,7 @@ fn make_session(id: u64, title: &str, model: &str, count: u32) -> tai_proto::Ses
         message_count: count,
         max_turns: None,
         status: tai_proto::SessionStatus::Inactive,
-        active_categories: Vec::new(),
+        active_tool_groups: Vec::new(),
     }
 }
 

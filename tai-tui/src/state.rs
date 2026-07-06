@@ -51,6 +51,7 @@ pub(crate) struct SessionDetailData {
     pub(crate) message_count: u32,
     pub(crate) max_turns: Option<u32>,
     pub(crate) status: SessionStatus,
+    pub(crate) active_tool_groups: Vec<String>,
 }
 
 pub(crate) struct SessionManagerState {
@@ -343,6 +344,7 @@ impl SessionManagerState {
                 message_count,
                 max_turns,
                 status: s.status.clone(),
+                active_tool_groups: s.active_tool_groups.clone(),
             }
         });
         if self.detail_data.is_some() {

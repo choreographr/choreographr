@@ -84,7 +84,7 @@ pub(crate) fn run_agent_loop(
 
     for turn in 0..max_turns {
         debug!(session_id, turn, "agent loop turn");
-        let tools = tool_registry.available_definitions(&session.active_categories);
+        let tools = tool_registry.available_definitions(&session.active_tool_groups);
         if cancel.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -297,8 +297,8 @@ fn execute_tool_with_timeout(
         return execute_load_skill_sync(session, cwd, &tool_call.arguments_json);
     }
     if tool_call.name == "load_tools" {
-        let result = crate::tools::categories::execute_load_tools(
-            &mut session.active_categories,
+        let result = crate::tools::groups::execute_load_tools(
+            &mut session.active_tool_groups,
             &tool_call.arguments_json,
         );
         let _ = daemon_tx.send(crate::daemon::DaemonCommand::UpdateMetadata {
@@ -314,8 +314,8 @@ fn execute_tool_with_timeout(
         };
     }
     if tool_call.name == "unload_tools" {
-        let result = crate::tools::categories::execute_unload_tools(
-            &mut session.active_categories,
+        let result = crate::tools::groups::execute_unload_tools(
+            &mut session.active_tool_groups,
             &tool_call.arguments_json,
         );
         let _ = daemon_tx.send(crate::daemon::DaemonCommand::UpdateMetadata {
@@ -570,7 +570,7 @@ fn execute_spawn_subsession_sync(
         .get("categories")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_else(|| parent_session.active_categories.iter().cloned().collect());
+        .unwrap_or_else(|| parent_session.active_tool_groups.iter().cloned().collect());
 
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     let _ = daemon_tx.send(crate::daemon::DaemonCommand::CreateSession {
@@ -578,7 +578,7 @@ fn execute_spawn_subsession_sync(
         parent_session_id: Some(parent_session_id),
         cwd: child_cwd.clone(),
         max_turns,
-        active_categories: categories,
+        active_tool_groups: categories,
         reply: reply_tx,
     });
 
@@ -911,7 +911,7 @@ mod tests {
                     message_count: 3,
                     max_turns: None,
                     status: SessionStatus::Inactive,
-                    active_categories: vec!["core".into()],
+                    active_tool_groups: vec!["core".into()],
                 }];
                 let _ = reply.send(sessions);
             }
@@ -963,7 +963,7 @@ mod tests {
                     message_count: 5,
                     max_turns: None,
                     status: SessionStatus::Inactive,
-                    active_categories: vec!["core".into()],
+                    active_tool_groups: vec!["core".into()],
                 }));
             }
         });

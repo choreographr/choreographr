@@ -37,16 +37,12 @@ for deletions and additions, rather than as raw monospaced text.
 
 **Tool:** A function the LLM can call to interact with the outside world (read files, make
 HTTP requests, run git commands, query blockchains, post to X, etc.). Tools implement the
-`Tool` trait (name, category, description, JSON Schema, `fn execute`) and are registered in a
-`ToolRegistry` at daemon startup. The daemon passes tool definitions for active categories to
+`Tool` trait (name, group, description, JSON Schema, `fn execute`) and are registered in a
+`ToolRegistry` at daemon startup. The daemon passes tool definitions for active groups to
 the model with each request and executes them on the model's behalf, feeding results back
 into the conversation.
 
-**Tool category:** Tools are organized into categories (`core`, `git`, `shell`, `x`, `vm`)
-declared on the `Tool` trait. Only `core`, `git`, and `shell` are active by default. The
-model can activate additional categories with the `load_tools` tool and deactivate them with
-`unload_tools`. Categories are a discovery mechanism, not access control — the RISC-V VM
-always has access to all tools.
+**Tool group:** Tools are organized into groups (`core`, `git`, `shell`, `x`, `vm`) declared on the `Tool` trait. Only `core`, `git`, and `shell` are active by default. The model can activate additional groups with the `load_tools` tool and deactivate them with `unload_tools`. Groups are a discovery mechanism, not access control — the RISC-V VM always has access to all tools.
 
 **Skill:** A filesystem-based extension following the Agent Skills standard — a `SKILL.md`
 file with YAML frontmatter (`name`, `description`) placed under `.agents/skills/<name>/`.

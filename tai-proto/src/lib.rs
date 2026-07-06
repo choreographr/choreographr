@@ -100,7 +100,7 @@ pub struct SessionSummary {
     pub message_count: u32,
     pub max_turns: Option<u32>,
     pub status: SessionStatus,
-    pub active_categories: Vec<String>,
+    pub active_tool_groups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -201,7 +201,7 @@ pub enum DaemonMessage {
         cwd: Option<String>,
         max_turns: Option<u32>,
         messages: Vec<SessionMessage>,
-        active_categories: Vec<String>,
+        active_tool_groups: Vec<String>,
     },
     SessionMessageAppended {
         message: SessionMessage,

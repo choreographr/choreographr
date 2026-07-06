@@ -65,7 +65,7 @@ pub struct SessionMetadata {
     pub message_count: u32,
     pub max_turns: Option<u32>,
     pub status: SessionStatus,
-    pub active_categories: Vec<String>,
+    pub active_tool_groups: Vec<String>,
 }
 
 /// Convert a persisted record into metadata. New sessions loaded from the
@@ -82,7 +82,7 @@ impl From<SessionRecord> for SessionMetadata {
             message_count: record.message_count,
             max_turns: record.max_turns,
             status: SessionStatus::Sleeping,
-            active_categories: record.active_categories,
+            active_tool_groups: record.active_tool_groups,
         }
     }
 }
@@ -98,7 +98,7 @@ impl From<SessionMetadata> for SessionRecord {
             max_turns: meta.max_turns,
             message_count: meta.message_count,
             created_at: meta.created_at,
-            active_categories: meta.active_categories,
+            active_tool_groups: meta.active_tool_groups,
         }
     }
 }
@@ -120,7 +120,7 @@ impl From<&SessionState> for SessionMetadata {
             message_count: state.messages.len() as u32,
             max_turns: state.max_turns,
             status: state.status.clone(),
-            active_categories: state.active_categories.iter().cloned().collect(),
+            active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
         }
     }
 }
@@ -149,7 +149,7 @@ pub struct SessionSnapshot {
     pub context_file_paths: Vec<PathBuf>,
     pub context_message_index: Option<usize>,
     pub status: SessionStatus,
-    pub active_categories: std::collections::HashSet<String>,
+    pub active_tool_groups: std::collections::HashSet<String>,
 }
 
 pub(crate) struct ActiveRequest {
@@ -175,7 +175,7 @@ pub struct SessionState {
     pub context_file_paths: Vec<PathBuf>,
     pub context_message_index: Option<usize>,
     pub status: SessionStatus,
-    pub active_categories: std::collections::HashSet<String>,
+    pub active_tool_groups: std::collections::HashSet<String>,
 }
 
 impl SessionState {
@@ -203,7 +203,7 @@ impl SessionState {
             context_file_paths: self.context_file_paths.clone(),
             context_message_index: self.context_message_index,
             status: self.status.clone(),
-            active_categories: self.active_categories.clone(),
+            active_tool_groups: self.active_tool_groups.clone(),
         }
     }
 
@@ -225,7 +225,7 @@ impl SessionState {
             context_file_paths: snapshot.context_file_paths,
             context_message_index: snapshot.context_message_index,
             status: snapshot.status,
-            active_categories: snapshot.active_categories,
+            active_tool_groups: snapshot.active_tool_groups,
         }
     }
 
@@ -241,7 +241,7 @@ impl SessionState {
         self.context_file_paths = snapshot.context_file_paths;
         self.context_message_index = snapshot.context_message_index;
         self.status = snapshot.status;
-        self.active_categories = snapshot.active_categories;
+        self.active_tool_groups = snapshot.active_tool_groups;
     }
 
     /// Read-only access to messages.
@@ -292,7 +292,7 @@ impl SessionState {
             context_file_paths: Vec::new(),
             context_message_index: None,
             status: SessionStatus::Inactive,
-            active_categories: HashSet::new(),
+            active_tool_groups: HashSet::new(),
         }
     }
 }
@@ -343,9 +343,9 @@ pub fn session_main(
         context_file_paths: Vec::new(),
         context_message_index: None,
         status: SessionStatus::Inactive,
-        active_categories: init_record
+        active_tool_groups: init_record
             .as_ref()
-            .map(|r| r.active_categories.iter().cloned().collect())
+            .map(|r| r.active_tool_groups.iter().cloned().collect())
             .filter(|cats: &HashSet<String>| !cats.is_empty())
             .unwrap_or_else(|| HashSet::from([
                 "core".to_string(),
@@ -362,7 +362,7 @@ pub fn session_main(
     if init_record.is_none() || state.messages.is_empty() {
         let effective_cwd = state.cwd.as_deref().unwrap_or_else(|| Path::new("."));
         let skills = context::discover_skills(effective_cwd);
-        let base_prompt = context::build_base_prompt(&skills, tool_registry.categories());
+        let base_prompt = context::build_base_prompt(&skills, tool_registry.groups());
         state.messages.push(SessionMessage::SystemText {
             content: base_prompt,
         });
@@ -649,7 +649,7 @@ fn process_command(
                 cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
                 max_turns: state.max_turns,
                 messages: state.messages.clone(),
-                active_categories: state.active_categories.iter().cloned().collect(),
+                active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
             };
             if let Some(tx) = state.subscribers.get(&client_id) {
                 let _ = tx.send(snapshot);
@@ -673,7 +673,7 @@ fn process_command(
                 message_count: state.messages.len() as u32,
                 max_turns: state.max_turns,
                 status: state.status.clone(),
-                active_categories: state.active_categories.iter().cloned().collect(),
+                active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
             });
             false
         }
@@ -863,7 +863,7 @@ mod tests {
             max_turns: Some(10),
             message_count: 3,
             created_at: 1000,
-            active_categories: vec!["core".into(), "shell".into()],
+            active_tool_groups: vec!["core".into(), "shell".into()],
         }
     }
 
@@ -886,7 +886,7 @@ mod tests {
             context_file_paths: Vec::new(),
             context_message_index: None,
             status: SessionStatus::Inactive,
-            active_categories: ["core".into(), "shell".into()].into(),
+            active_tool_groups: ["core".into(), "shell".into()].into(),
         }
     }
 
@@ -900,7 +900,7 @@ mod tests {
         assert_eq!(meta.selected_model, record.selected_model);
         assert_eq!(meta.cwd, record.cwd);
         assert_eq!(meta.message_count, record.message_count);
-        assert_eq!(meta.active_categories, record.active_categories);
+        assert_eq!(meta.active_tool_groups, record.active_tool_groups);
     }
 
     #[test]
@@ -914,13 +914,13 @@ mod tests {
             message_count: 7,
             max_turns: Some(20),
             status: SessionStatus::Inactive,
-            active_categories: vec!["git".into()],
+            active_tool_groups: vec!["git".into()],
         };
         let record: SessionRecord = meta.clone().into();
         // Status field does not exist in record
         assert_eq!(record.title, meta.title);
         assert_eq!(record.selected_model, meta.selected_model);
-        assert_eq!(record.active_categories, meta.active_categories);
+        assert_eq!(record.active_tool_groups, meta.active_tool_groups);
     }
 
     #[test]
@@ -935,7 +935,7 @@ mod tests {
         assert_eq!(record.max_turns, record2.max_turns);
         assert_eq!(record.message_count, record2.message_count);
         assert_eq!(record.created_at, record2.created_at);
-        assert_eq!(record.active_categories, record2.active_categories);
+        assert_eq!(record.active_tool_groups, record2.active_tool_groups);
     }
 
     #[test]
@@ -977,11 +977,11 @@ mod tests {
     }
 
     #[test]
-    fn record_round_trip_preserves_active_categories() {
+    fn record_round_trip_preserves_active_tool_groups() {
         let record = test_record();
         let meta: SessionMetadata = record.clone().into();
         let record2: SessionRecord = meta.into();
-        assert_eq!(record.active_categories, record2.active_categories);
-        assert_eq!(record2.active_categories.len(), 2);
+        assert_eq!(record.active_tool_groups, record2.active_tool_groups);
+        assert_eq!(record2.active_tool_groups.len(), 2);
     }
 }

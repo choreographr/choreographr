@@ -187,7 +187,7 @@ impl super::Tool for XPost {
         "x_post"
     }
 
-    fn category(&self) -> &'static str {
+    fn group(&self) -> &'static str {
         "x"
     }
 
@@ -262,7 +262,7 @@ impl super::Tool for XSearchRecent {
         "x_search_recent"
     }
 
-    fn category(&self) -> &'static str {
+    fn group(&self) -> &'static str {
         "x"
     }
 
@@ -348,7 +348,7 @@ impl super::Tool for XUserLookup {
         "x_user_lookup"
     }
 
-    fn category(&self) -> &'static str {
+    fn group(&self) -> &'static str {
         "x"
     }
 

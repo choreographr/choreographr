@@ -47,7 +47,7 @@ pub(crate) fn client_thread(
                             parent_session_id,
                             cwd: cwd.map(std::path::PathBuf::from),
                             max_turns,
-                            active_categories: Vec::new(),
+                            active_tool_groups: Vec::new(),
                             reply,
                         });
                         match rx.recv() {
