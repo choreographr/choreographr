@@ -13,6 +13,7 @@ resolver = "3"
 [workspace.dependencies]
 anyhow = "1"
 thiserror = "2"
+futures-channel = "0.3"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 tai-client-core = { path = "tai-client-core" }
@@ -33,3 +34,4 @@ signal-hook = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 lru = "0.18"
+zeroize = { version = "1", features = ["derive"] }

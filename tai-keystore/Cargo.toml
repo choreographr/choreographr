@@ -13,4 +13,4 @@ rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-zeroize = { version = "1", features = ["derive"] }
+zeroize.workspace = true
