@@ -19,6 +19,7 @@ tai-client-core.workspace = true
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 tai-proto.workspace = true
+lru.workspace = true
 signal-hook.workspace = true
 
 [dev-dependencies]

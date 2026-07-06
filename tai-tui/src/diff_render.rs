@@ -1,12 +1,14 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::num::NonZero;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use lru::LruCache;
 use ratatui::style::Style;
 use ratatui::text::Span;
 use syntect::easy::HighlightLines;
+use syntect::parsing::SyntaxReference;
 use tai_client_core::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 
-use crate::syntax::{default_syntax_set, highlight_theme, language_for_path, to_ratatui_color};
+use crate::syntax::{highlight_theme, syntax_for_path, syntax_set, to_ratatui_color};
 
 /// Check if text looks like a unified diff.
 /// Scans the full text (tool output may have a metadata prefix on the first line).
@@ -135,6 +137,17 @@ pub struct DiffPaneRow {
     pub right_spans: Vec<Span<'static>>,
 }
 
+impl DiffPaneRow {
+    fn new(
+        left_content: String,
+        right_content: String,
+        left_kind: DiffLineKind,
+        right_kind: DiffLineKind,
+    ) -> Self {
+        Self { left_content, right_content, left_kind, right_kind, left_spans: Vec::new(), right_spans: Vec::new() }
+    }
+}
+
 /// Create a single default-styled span from plain text content.
 fn content_spans(content: &str) -> Vec<Span<'static>> {
     vec![Span::styled(content.to_string(), Style::default())]
@@ -146,39 +159,43 @@ fn is_meta_line(content: &str) -> bool {
     content.starts_with("--- ") || content.starts_with("+++ ") || content.starts_with("@@")
 }
 
-/// Highlight a block of code (joined lines) through syntect, returning
-/// per-line vectors of styled spans.  Results are memoized in a bounded
-/// global cache so that re-rendering the same diff on the next frame does
-/// not re-run syntect.
+/// Highlight lines through syntect, returning per-line vectors of styled spans.
+///
+/// Results are memoized in an LRU-cached global map so re-rendering the same
+/// diff on the next frame does not re-run syntect.  The result is wrapped in
+/// `Arc` so that cache hits are an O(1) refcount bump rather than a full
+/// clone of all highlighted spans.
+///
+/// Takes a pre-resolved `SyntaxReference` (callers use `syntax_for_path`)
+/// and a slice of individual lines, avoiding the join-then-split cycle of
+/// passing a single joined string.
 fn highlight_lines_cached(
-    lang_token: &str,
-    code: &str,
-) -> Vec<Vec<Span<'static>>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, String), Vec<Vec<Span<'static>>>>>> =
+    syntax: &SyntaxReference,
+    lines: &[&str],
+) -> Arc<Vec<Vec<Span<'static>>>> {
+    static CACHE: OnceLock<Mutex<LruCache<(String, String), Arc<Vec<Vec<Span<'static>>>>>>> =
         OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = CACHE.get_or_init(|| Mutex::new(LruCache::new(NonZero::new(200).unwrap())));
 
-    let key = (lang_token.to_string(), code.to_string());
+    // Build a cache key from the syntax name and the joined lines.
+    let code = lines.join("\n");
+    let key = (syntax.name.to_string(), code);
 
     // Fast path
     {
-        let guard = cache.lock().expect("highlight cache lock");
+        let mut guard = cache.lock().expect("highlight cache lock");
         if let Some(cached) = guard.get(&key) {
             return cached.clone();
         }
     }
 
-    let ss = default_syntax_set();
+    let ss = syntax_set();
     let theme = highlight_theme();
 
-    let syntax = ss
-        .find_syntax_by_token(lang_token)
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
-
     let mut highlighter = HighlightLines::new(syntax, theme);
-    let mut result: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut result: Vec<Vec<Span<'static>>> = Vec::with_capacity(lines.len());
 
-    for line_str in code.split('\n') {
+    for &line_str in lines {
         if let Ok(ranges) = highlighter.highlight_line(line_str, ss) {
             result.push(
                 ranges
@@ -192,7 +209,6 @@ fn highlight_lines_cached(
                     .collect(),
             );
         } else {
-            // Fallback: emit the whole line as a single default-styled span.
             result.push(vec![Span::styled(
                 line_str.to_string(),
                 Style::default(),
@@ -200,14 +216,11 @@ fn highlight_lines_cached(
         }
     }
 
-    // Bounded cache (200 entries); silently drop new entries when full so the
-    // most frequently seen diffs stay warm.
-    const MAX_ENTRIES: usize = 200;
+    let result = Arc::new(result);
+
     {
         let mut guard = cache.lock().expect("highlight cache lock");
-        if guard.len() < MAX_ENTRIES {
-            guard.insert(key, result.clone());
-        }
+        guard.put(key, result.clone());
     }
 
     result
@@ -216,7 +229,7 @@ fn highlight_lines_cached(
 /// Apply syntax highlighting to all code rows in a diff file's pane rows.
 ///
 /// Implements the "two-bucket" approach used by opencode's @pierre/diffs:
-/// all lines on the left side (deletions + context) are concatenated into one
+/// all lines on the left side (deletions + context) are processed in one
 /// pseudo-file and highlighted as a whole; similarly for lines on the right
 /// side (additions + context). This gives syntect the sequential context it
 /// needs for accurate tokenization across adjacent lines. The highlighted
@@ -225,8 +238,8 @@ fn highlight_lines_cached(
 /// Rows that are diff metadata (file headers, hunk headers) are left as plain
 /// text.
 pub fn highlight_diff_panes(rows: &mut [DiffPaneRow], file: &FileDiff) {
-    let Some(lang_token) = language_for_path(&file.new_path)
-        .or_else(|| language_for_path(&file.old_path))
+    let Some(syntax) = syntax_for_path(&file.new_path)
+        .or_else(|| syntax_for_path(&file.old_path))
     else {
         return;
     };
@@ -241,8 +254,7 @@ pub fn highlight_diff_panes(rows: &mut [DiffPaneRow], file: &FileDiff) {
         }
     }
     if !left_lines.is_empty() {
-        let code = left_lines.join("\n");
-        let highlighted = highlight_lines_cached(lang_token, &code);
+        let highlighted = highlight_lines_cached(syntax, &left_lines);
         for (idx, line_spans) in left_rows.iter().zip(highlighted.iter()) {
             rows[*idx].left_spans = line_spans.clone();
         }
@@ -258,8 +270,7 @@ pub fn highlight_diff_panes(rows: &mut [DiffPaneRow], file: &FileDiff) {
         }
     }
     if !right_lines.is_empty() {
-        let code = right_lines.join("\n");
-        let highlighted = highlight_lines_cached(lang_token, &code);
+        let highlighted = highlight_lines_cached(syntax, &right_lines);
         for (idx, line_spans) in right_rows.iter().zip(highlighted.iter()) {
             rows[*idx].right_spans = line_spans.clone();
         }
@@ -278,55 +289,45 @@ pub fn build_diff_panes(diffs: &[FileDiff]) -> Vec<DiffPaneRow> {
         let file_start = rows.len();
 
         // File header rows (rendered full-width, not in panes, but we include empty rows for spacing)
-        rows.push(DiffPaneRow {
-            left_content: format!("--- a/{}", file.old_path),
-            right_content: format!("+++ b/{}", file.new_path),
-            left_kind: DiffLineKind::Context,
-            right_kind: DiffLineKind::Context,
-            left_spans: Vec::new(),
-            right_spans: Vec::new(),
-        });
+        rows.push(DiffPaneRow::new(
+            format!("--- a/{}", file.old_path),
+            format!("+++ b/{}", file.new_path),
+            DiffLineKind::Context,
+            DiffLineKind::Context,
+        ));
         for hunk in &file.hunks {
             // Hunk header row
-            rows.push(DiffPaneRow {
-                left_content: hunk.header.clone(),
-                right_content: hunk.header.clone(),
-                left_kind: DiffLineKind::Context,
-                right_kind: DiffLineKind::Context,
-                left_spans: Vec::new(),
-                right_spans: Vec::new(),
-            });
+            rows.push(DiffPaneRow::new(
+                hunk.header.clone(),
+                hunk.header.clone(),
+                DiffLineKind::Context,
+                DiffLineKind::Context,
+            ));
             for line in &hunk.lines {
                 match line.kind {
                     DiffLineKind::Context => {
-                        rows.push(DiffPaneRow {
-                            left_content: line.content.clone(),
-                            right_content: line.content.clone(),
-                            left_kind: DiffLineKind::Context,
-                            right_kind: DiffLineKind::Context,
-                            left_spans: Vec::new(),
-                            right_spans: Vec::new(),
-                        });
+                        rows.push(DiffPaneRow::new(
+                            line.content.clone(),
+                            line.content.clone(),
+                            DiffLineKind::Context,
+                            DiffLineKind::Context,
+                        ));
                     }
                     DiffLineKind::Deletion => {
-                        rows.push(DiffPaneRow {
-                            left_content: line.content.clone(),
-                            right_content: String::new(),
-                            left_kind: DiffLineKind::Deletion,
-                            right_kind: DiffLineKind::Context,
-                            left_spans: Vec::new(),
-                            right_spans: Vec::new(),
-                        });
+                        rows.push(DiffPaneRow::new(
+                            line.content.clone(),
+                            String::new(),
+                            DiffLineKind::Deletion,
+                            DiffLineKind::Context,
+                        ));
                     }
                     DiffLineKind::Addition => {
-                        rows.push(DiffPaneRow {
-                            left_content: String::new(),
-                            right_content: line.content.clone(),
-                            left_kind: DiffLineKind::Context,
-                            right_kind: DiffLineKind::Addition,
-                            left_spans: Vec::new(),
-                            right_spans: Vec::new(),
-                        });
+                        rows.push(DiffPaneRow::new(
+                            String::new(),
+                            line.content.clone(),
+                            DiffLineKind::Context,
+                            DiffLineKind::Addition,
+                        ));
                     }
                 }
             }

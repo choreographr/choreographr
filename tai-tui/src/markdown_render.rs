@@ -7,7 +7,7 @@ use syntect::easy::HighlightLines;
 use tai_proto::SessionMessage;
 use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, StreamingText};
 
-use crate::syntax::{default_syntax_set, highlight_theme, to_ratatui_color};
+use crate::syntax::{highlight_theme, syntax_set, to_ratatui_color};
 
 /// Highlight a code snippet into styled ratatui lines.
 ///
@@ -36,7 +36,7 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
         }
     }
 
-    let ss = default_syntax_set();
+    let ss = syntax_set();
 
     // Look up the syntax definition by the language token.  If the token
     // isn't recognised (or was omitted), use the built-in "Plain Text"

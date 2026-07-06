@@ -2,9 +2,10 @@ use std::sync::OnceLock;
 
 use ratatui::style::Color;
 use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 
-fn syntax_set() -> &'static SyntaxSet {
+/// Load the default syntax set (with newline-aware grammars).
+pub(crate) fn syntax_set() -> &'static SyntaxSet {
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
     SS.get_or_init(|| SyntaxSet::load_defaults_newlines())
 }
@@ -27,11 +28,6 @@ pub(crate) fn highlight_theme() -> &'static Theme {
         .unwrap_or_else(|| theme_set().themes.values().next().expect("ThemeSet is empty"))
 }
 
-/// Load the default syntax set (with newline-aware grammars).
-pub(crate) fn default_syntax_set() -> &'static SyntaxSet {
-    syntax_set()
-}
-
 /// Convert a syntect RGBA colour to a ratatui `Color`.
 ///
 /// Syntect colours with alpha < 128 are treated as transparent, mapping to
@@ -44,62 +40,20 @@ pub(crate) fn to_ratatui_color(c: syntect::highlighting::Color) -> Color {
     }
 }
 
-/// Map a file path to a syntect-compatible language token for highlighting.
+/// Look up a syntect syntax definition for the given file path.
 ///
-/// Returns `None` for unknown extensions, which callers should handle by
-/// falling back to plain text.
-pub(crate) fn language_for_path(path: &str) -> Option<&'static str> {
-    let ext = std::path::Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-
-    match ext.as_str() {
-        "rs" => Some("rust"),
-        "py" => Some("python"),
-        "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
-        "ts" | "tsx" | "mts" | "cts" => Some("typescript"),
-        "go" => Some("go"),
-        "rb" => Some("ruby"),
-        "java" => Some("java"),
-        "c" | "h" => Some("c"),
-        "cpp" | "hpp" | "cc" | "cxx" | "c++" | "h++" => Some("cpp"),
-        "cs" => Some("csharp"),
-        "swift" => Some("swift"),
-        "kt" | "kts" => Some("kotlin"),
-        "scala" => Some("scala"),
-        "php" => Some("php"),
-        "pl" | "pm" => Some("perl"),
-        "lua" => Some("lua"),
-        "sh" | "bash" | "zsh" | "bashrc" | "profile" => Some("bash"),
-        "fish" => Some("fish"),
-        "sql" => Some("sql"),
-        "r" => Some("r"),
-        "toml" => Some("toml"),
-        "yaml" | "yml" => Some("yaml"),
-        "json" => Some("json"),
-        "xml" | "html" | "htm" | "xhtml" => Some("xml"),
-        "css" => Some("css"),
-        "scss" => Some("scss"),
-        "less" => Some("less"),
-        "md" | "markdown" => Some("markdown"),
-        "svelte" => Some("svelte"),
-        "vue" => Some("vue"),
-        "dart" => Some("dart"),
-        "ex" | "exs" => Some("elixir"),
-        "erl" => Some("erlang"),
-        "hs" | "lhs" => Some("haskell"),
-        "ml" | "mli" => Some("ocaml"),
-        "zig" => Some("zig"),
-        "nim" => Some("nim"),
-        "tex" | "sty" | "cls" | "ltx" => Some("latex"),
-        "dockerfile" => Some("dockerfile"),
-        "cmake" | "cmake.in" => Some("cmake"),
-        "makefile" | "mk" => Some("makefile"),
-        "proto" => Some("protobuf"),
-        "rspec" | "feature" => Some("gherkin"),
-        "gradle" => Some("gradle"),
-        _ => None,
+/// Uses syntect's built-in extension and file-name matching, which covers
+/// all languages in the default syntax set.  Replaces the previous
+/// hand-maintained extension→token map.
+pub(crate) fn syntax_for_path(path: &str) -> Option<&'static SyntaxReference> {
+    let p = std::path::Path::new(path);
+    // Try full file name first (handles "Dockerfile", "Makefile", etc.)
+    if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
+        if let Ok(Some(s)) = syntax_set().find_syntax_for_file(name) {
+            return Some(s);
+        }
     }
+    // Fall back to extension-only lookup
+    let ext = p.extension().and_then(|e| e.to_str())?;
+    syntax_set().find_syntax_by_extension(ext)
 }

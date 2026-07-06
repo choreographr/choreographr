@@ -634,7 +634,15 @@ fn diff_cell_spans(
                 result.push(span);
                 remaining -= w;
             } else if remaining > 0 {
-                let truncated: String = span.content.chars().take(remaining).collect();
+                // Walk characters by display width, not by scalar count,
+                // so CJK/emoji (width 2) are handled correctly.
+                let truncated: String = span.content
+                    .chars()
+                    .scan(remaining, |budget, c| {
+                        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                        if *budget >= cw { *budget -= cw; Some(c) } else { None }
+                    })
+                    .collect();
                 result.push(ratatui::text::Span::styled(truncated, span.style));
                 break;
             } else {

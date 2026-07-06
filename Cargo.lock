@@ -7907,6 +7907,7 @@ dependencies = [
  "crossterm",
  "dirs 6.0.0",
  "image",
+ "lru",
  "ratatui",
  "ratatui-image",
  "redb",
