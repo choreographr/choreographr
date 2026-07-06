@@ -88,3 +88,17 @@ fn execute_sh_inner(
 
     Ok(format_shell_output(&command, &output, timeout_ms, was_killed))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::tools::Tool;
+
+    #[test]
+    fn sh_tool_has_valid_metadata() {
+        let tool = super::Sh;
+        assert!(!tool.name().is_empty());
+        assert!(!tool.description().is_empty());
+        let schema = tool.schema();
+        assert!(schema.is_object());
+    }
+}

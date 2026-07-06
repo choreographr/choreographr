@@ -70,3 +70,17 @@ fn execute_nu_inner(
 
     Ok(format_shell_output(&command, &output, timeout_ms, was_killed))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::tools::Tool;
+
+    #[test]
+    fn nushell_tool_has_valid_metadata() {
+        let tool = super::NuShell;
+        assert!(!tool.name().is_empty());
+        assert!(!tool.description().is_empty());
+        let schema = tool.schema();
+        assert!(schema.is_object());
+    }
+}

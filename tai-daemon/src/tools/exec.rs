@@ -85,3 +85,17 @@ fn execute_exec_inner(
 
     Ok(format_shell_output(&display_cmd, &output, timeout_ms, was_killed))
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::tools::Tool;
+
+    #[test]
+    fn exec_tool_has_valid_metadata() {
+        let tool = super::Exec;
+        assert!(!tool.name().is_empty());
+        assert!(!tool.description().is_empty());
+        let schema = tool.schema();
+        assert!(schema.is_object());
+    }
+}

@@ -419,3 +419,54 @@ impl super::Tool for XUserLookup {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn urlencode_preserves_unreserved_chars() {
+        assert_eq!(super::urlencode("ABCabc123-_."), "ABCabc123-_.");
+        assert_eq!(super::urlencode("~"), "~");
+    }
+
+    #[test]
+    fn urlencode_encodes_space_as_percent_20() {
+        assert_eq!(super::urlencode("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn urlencode_encodes_special_chars() {
+        assert_eq!(super::urlencode("a&b=c+d/e"), "a%26b%3Dc%2Bd%2Fe");
+    }
+
+    #[test]
+    fn urlencode_handles_empty_string() {
+        assert_eq!(super::urlencode(""), "");
+    }
+
+    #[test]
+    fn hmac_sha1_is_deterministic() {
+        let key = b"sekret";
+        let data = "hello";
+        let a = super::hmac_sha1(key, data);
+        let b = super::hmac_sha1(key, data);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hmac_sha1_different_keys_produce_different_output() {
+        let a = super::hmac_sha1(b"key1", "hello");
+        let b = super::hmac_sha1(b"key2", "hello");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hmac_sha1_returns_base64_encoded_string() {
+        let result = super::hmac_sha1(b"key", "data");
+        assert!(
+            result
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+        );
+        assert!(!result.is_empty());
+    }
+}
