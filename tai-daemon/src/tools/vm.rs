@@ -226,7 +226,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
 
                 let registry = VM_TOOL_REGISTRY
                     .get()
-                    .expect("VM_TOOL_REGISTRY not initialized — use ToolRegistry::build()");
+                    .ok_or_else(|| VmError::Unexpected("VM_TOOL_REGISTRY not initialized".into()))?;
 
                 let v: serde_json::Value = serde_json::from_slice(&request_bytes)
                     .map_err(|_| VmError::Unexpected("invalid tool call JSON".into()))?;
@@ -273,7 +273,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                 let len = machine.registers()[registers::A1];
                 if len > 0 {
                     let data = machine.memory_mut().load_bytes(ptr, len)?;
-                    self.output.lock().unwrap().extend_from_slice(&data);
+                    self.output.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&data);
                     if let Some(tx) = &self.write_tx {
                         let _ = tx.send(data.into());
                     }
@@ -479,7 +479,7 @@ fn run_riscv_impl(
 
     match trace.run() {
         Ok(_exit_code) => {
-            let out = output.lock().unwrap().clone();
+            let out = output.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let out_str = String::from_utf8_lossy(&out).to_string();
             ToolExecutionOutput {
                 result: tool_ok(out_str),
@@ -487,7 +487,7 @@ fn run_riscv_impl(
             }
         }
         Err(e) => {
-            let out = output.lock().unwrap().clone();
+            let out = output.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let out_str = String::from_utf8_lossy(&out).to_string();
             let msg = if out_str.is_empty() {
                 format!("VM error: {e}")

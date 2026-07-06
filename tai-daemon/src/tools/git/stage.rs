@@ -152,7 +152,7 @@ fn stage_path(
                 path,
             );
             let current = current_entry_snapshot(index, path)
-                .expect("entry was just inserted for staged path");
+                .ok_or_else(|| ToolError::Other("staged entry not found after insertion".to_string()))?;
             Ok(previous.as_ref() != Some(&current))
         }
         None => Ok(previous.is_some()),

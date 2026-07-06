@@ -65,8 +65,10 @@ fn App() -> Element {
                 loop {
                     let event = {
                         let mut guard = events_rx.write();
-                        let rx = guard.as_mut().expect("events_rx populated by use_hook");
-                        rx.next().await
+                        match guard.as_mut() {
+                            Some(rx) => rx.next().await,
+                            None => break,
+                        }
                     };
 
                     let Some(event) = event else {

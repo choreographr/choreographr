@@ -25,7 +25,18 @@ pub(crate) fn highlight_theme() -> &'static Theme {
     theme_set()
         .themes
         .get(THEME_NAME)
-        .unwrap_or_else(|| theme_set().themes.values().next().expect("ThemeSet is empty"))
+        .unwrap_or_else(|| {
+            theme_set().themes.values().next()
+                .unwrap_or_else(|| {
+                    // Fallback: create a minimal empty theme. This should never
+                    // happen since syntect ships with bundled themes.
+                    static FALLBACK: OnceLock<Theme> = OnceLock::new();
+                    FALLBACK.get_or_init(|| Theme {
+                        name: Some("fallback".into()),
+                        ..Theme::default()
+                    })
+                })
+        })
 }
 
 /// Convert a syntect RGBA colour to a ratatui `Color`.

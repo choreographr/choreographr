@@ -183,7 +183,7 @@ fn highlight_lines_cached(
 
     // Fast path
     {
-        let mut guard = cache.lock().expect("highlight cache lock");
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.get(&key) {
             return cached.clone();
         }
@@ -219,7 +219,7 @@ fn highlight_lines_cached(
     let result = Arc::new(result);
 
     {
-        let mut guard = cache.lock().expect("highlight cache lock");
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         guard.put(key, result.clone());
     }
 

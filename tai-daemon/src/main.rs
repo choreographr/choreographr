@@ -62,7 +62,8 @@ fn main() -> anyhow::Result<()> {
 
     let env_filter = match log_level {
         Some(level) => EnvFilter::new(level),
-        None => EnvFilter::try_from_default_env().expect("invalid RUST_LOG"),
+        None => EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info")),
     };
 
     fmt()

@@ -125,7 +125,7 @@ impl Keystore {
             rand::rng().fill_bytes(&mut buf);
             buf
         };
-        let key = derive_key(passphrase, &salt);
+        let key = derive_key(passphrase, &salt)?;
         let nonce_bytes: [u8; NONCE_LEN] = {
             let mut buf = [0u8; NONCE_LEN];
             rand::rng().fill_bytes(&mut buf);
@@ -179,7 +179,7 @@ impl Keystore {
             .map_err(|_| KeystoreError::TooShort)?;
         let ciphertext = &data[5 + SALT_LEN + NONCE_LEN..];
 
-        let key = derive_key(passphrase, &salt);
+        let key = derive_key(passphrase, &salt)?;
         let nonce =
             Nonce::try_from(&nonce_bytes[..]).map_err(|_| KeystoreError::DecryptionFailed)?;
         let cipher =
@@ -203,12 +203,12 @@ impl Keystore {
     }
 }
 
-fn derive_key(passphrase: &str, salt: &[u8; SALT_LEN]) -> [u8; KEY_LEN] {
+fn derive_key(passphrase: &str, salt: &[u8; SALT_LEN]) -> Result<[u8; KEY_LEN], KeystoreError> {
     let mut output = [0u8; KEY_LEN];
     Argon2::default()
         .hash_password_into(passphrase.as_bytes(), salt, &mut output)
-        .expect("argon2 key derivation failed");
-    output
+        .map_err(|_| KeystoreError::EncryptionFailed)?;
+    Ok(output)
 }
 
 pub fn keystore_path() -> Result<PathBuf, KeystoreError> {
@@ -336,8 +336,8 @@ mod tests {
     #[test]
     fn derive_key_is_deterministic() {
         let salt = [0xAAu8; SALT_LEN];
-        let k1 = derive_key("passphrase", &salt);
-        let k2 = derive_key("passphrase", &salt);
+        let k1 = derive_key("passphrase", &salt).unwrap();
+        let k2 = derive_key("passphrase", &salt).unwrap();
         assert_eq!(k1, k2);
     }
 
@@ -345,16 +345,16 @@ mod tests {
     fn derive_key_different_salt_produces_different_output() {
         let salt1 = [0x01u8; SALT_LEN];
         let salt2 = [0x02u8; SALT_LEN];
-        let k1 = derive_key("passphrase", &salt1);
-        let k2 = derive_key("passphrase", &salt2);
+        let k1 = derive_key("passphrase", &salt1).unwrap();
+        let k2 = derive_key("passphrase", &salt2).unwrap();
         assert_ne!(k1, k2);
     }
 
     #[test]
     fn derive_key_different_passphrase_produces_different_output() {
         let salt = [0xFFu8; SALT_LEN];
-        let k1 = derive_key("alpha", &salt);
-        let k2 = derive_key("beta", &salt);
+        let k1 = derive_key("alpha", &salt).unwrap();
+        let k2 = derive_key("beta", &salt).unwrap();
         assert_ne!(k1, k2);
     }
 

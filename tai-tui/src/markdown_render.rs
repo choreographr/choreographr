@@ -30,7 +30,7 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
 
     // Fast path: return a clone of the cached result without running syntect.
     {
-        let guard = cache.lock().expect("highlight_code cache lock");
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.get(&key) {
             return cached.clone();
         }
@@ -73,7 +73,7 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
     // not inserted so the most frequently seen code blocks stay cached.
     const MAX_CACHE_ENTRIES: usize = 200;
     {
-        let mut guard = cache.lock().expect("highlight_code cache lock");
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if guard.len() < MAX_CACHE_ENTRIES {
             guard.insert(key, result.clone());
         }

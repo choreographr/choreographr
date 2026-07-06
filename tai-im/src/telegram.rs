@@ -27,7 +27,7 @@ pub fn run(
         std::thread::spawn(move || {
             while let Ok(event) = bridge_rx.recv() {
                 debug!(?event, "bridge event received");
-                let cid = *chat_id.lock().unwrap();
+                let cid = *chat_id.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(cid) = cid {
                     send_daemon_event(&bot, cid, event);
                 } else {
@@ -104,11 +104,11 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: frankenstein::types::Me
     let chat_id_val = msg.chat.id;
     debug!(%user_id, input = %text, "received telegram message");
 
-    *state.chat_id.lock().unwrap() = Some(chat_id_val);
+    *state.chat_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(chat_id_val);
 
-    let mut request_id = *state.request_id.lock().unwrap();
+    let mut request_id = *state.request_id.lock().unwrap_or_else(|e| e.into_inner());
     let command = parse_input_line(&text, &mut request_id, None);
-    *state.request_id.lock().unwrap() = request_id;
+    *state.request_id.lock().unwrap_or_else(|e| e.into_inner()) = request_id;
 
     match command {
         ShellCommand::Send(client_msg) => {

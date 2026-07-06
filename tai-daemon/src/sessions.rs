@@ -281,7 +281,7 @@ pub fn session_main(
             .unwrap_or_else(|| {
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_secs() as i64
             }),
         messages: Vec::new(),
