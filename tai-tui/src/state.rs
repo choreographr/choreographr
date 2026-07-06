@@ -11,6 +11,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::db::{self, CommandEntry};
 use crate::diff_render::{diff_display_height, is_diff_text, parse_diff};
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
+use ratatui::text::Line;
 use tai_client_core::FileDiff;
 
 /// If the text looks like a unified diff and can be parsed successfully,
@@ -60,6 +61,21 @@ pub(crate) struct SessionManagerState {
     pub(crate) detail_data: Option<SessionDetailData>,
 }
 
+/// Cached rendering of a history item whose content does not change between
+/// frames.  Stored alongside the item in `App::render_cache` to avoid
+/// re-running markdown parsing and syntect highlighting on every render.
+#[derive(Clone)]
+pub(crate) struct RenderedCache {
+    /// The rendered styled lines at `width`.
+    pub lines: Vec<Line<'static>>,
+    /// The number of wrapped terminal rows this item occupies at `width`.
+    pub height: usize,
+    /// Terminal width at which `lines` and `height` were computed.
+    /// When the terminal is resized the next render will detect the mismatch
+    /// and recompute.
+    pub width: u16,
+}
+
 pub(crate) struct App {
     pub(crate) input: InputBuffer,
     pub(crate) next_request_id: u32,
@@ -101,6 +117,18 @@ pub(crate) struct App {
     /// could not be opened (history is still usable in-memory during
     /// the session, it just won't persist).
     pub(crate) db: Option<redb::Database>,
+
+    /// Per-item render cache, indexed in lockstep with `client.history`.
+    ///
+    /// Each entry caches the rendered `Vec<Line>` and height for history
+    /// items whose content never changes (`SessionMessage`, `Text`, `Diff`).
+    /// `None` means the item has not been rendered yet, is stale after a
+    /// resize, or is a `Streaming` item that is never cached.
+    ///
+    /// The cache is rebuilt from scratch (all `None`s) whenever the history
+    /// vector grows or shrinks — this is O(n) but only happens on mutation,
+    /// never during scrolling.
+    pub(crate) render_cache: Vec<Option<RenderedCache>>,
 }
 
 #[derive(Clone, Copy)]
@@ -495,14 +523,18 @@ impl App {
             }
         };
 
+        let initial_items = vec![
+            HistoryItem::Text(format!("Connected to tai-daemon at {socket_path}")),
+            HistoryItem::Text(format!("image protocol: {picker_protocol}")),
+        ];
+        let render_cache = vec![None; initial_items.len()];
+
         Self {
             input: InputBuffer::new(),
             next_request_id: 1,
             active: HashSet::new(),
-            client: ClientHistory::new(vec![
-                HistoryItem::Text(format!("Connected to tai-daemon at {socket_path}")),
-                HistoryItem::Text(format!("image protocol: {picker_protocol}")),
-            ]),
+            client: ClientHistory::new(initial_items),
+            render_cache,
             history_scroll: HistoryScrollState::new(),
             history_viewport: HistoryViewport::new(),
             should_quit: false,
@@ -519,10 +551,31 @@ impl App {
     }
 
     pub(crate) fn total_history_height(&self) -> usize {
+        // If the cache is out of sync (mutation happened before next render),
+        // fall back to the uncached path.
+        if self.render_cache.len() != self.client.history.len() {
+            return self
+                .client
+                .history
+                .iter()
+                .map(|item| self.history_viewport.item_height(item))
+                .sum();
+        }
+
         self.client
             .history
             .iter()
-            .map(|item| self.history_viewport.item_height(item))
+            .zip(self.render_cache.iter())
+            .map(|(item, cached)| {
+                // Use the cached height if available and at the current width.
+                if let Some(cached) = cached {
+                    if cached.width == self.history_viewport.width {
+                        return cached.height;
+                    }
+                }
+                // Fall back to uncached height computation.
+                self.history_viewport.item_height(item)
+            })
             .sum()
     }
 
@@ -538,15 +591,29 @@ impl App {
 
     /// Query the terminal size and update the history viewport to match,
     /// reserving `INPUT_BAR_HEIGHT` rows for the input bar.
+    ///
+    /// When the width changes, all cached renderings are stale — entries are
+    /// invalidated so the next frame recomputes at the new width.
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
         if let Ok((width, height)) = crossterm::terminal::size() {
             if width > 0 && height > INPUT_BAR_HEIGHT {
+                let old_width = self.history_viewport.width;
                 self.history_viewport.update(Rect {
                     x: 0,
                     y: 0,
                     width,
                     height: height - INPUT_BAR_HEIGHT,
                 });
+                // Invalidate cache entries whose width no longer matches.
+                if old_width != width {
+                    for cached in &mut self.render_cache {
+                        if let Some(entry) = cached {
+                            if entry.width != width {
+                                *cached = None;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -574,6 +641,7 @@ impl App {
         let added_height = self.history_viewport.item_height(&item);
         let trimmed_height = self.trimmed_height_on_append();
         self.client.insert_before_stream(request_id, item);
+        self.ensure_cache_synced();
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
         self.account_for_trimmed_height(trimmed_height);
@@ -602,10 +670,28 @@ impl App {
         self.push_history_item(item);
     }
 
+    /// Ensure the render cache is aligned with the history vector.
+    ///
+    /// Whenever items are pushed, inserted, or trimmed the cache length
+    /// diverges from the history length.  This method detects the mismatch
+    /// and rebuilds the cache from scratch (all `None`s) so that subsequent
+    /// frame rendering can lazily populate entries on cache miss.
+    ///
+    /// Rebuilding is O(n) but only runs on mutation (once per user/AI
+    /// message), never during scrolling.
+    pub(crate) fn ensure_cache_synced(&mut self) {
+        let hist_len = self.client.history.len();
+        if self.render_cache.len() != hist_len {
+            self.render_cache.clear();
+            self.render_cache.resize(hist_len, None);
+        }
+    }
+
     pub(crate) fn push_history_item(&mut self, item: HistoryItem) {
         let added_height = self.history_viewport.item_height(&item);
         let trimmed_height = self.trimmed_height_on_append();
         self.client.push_history_item(item);
+        self.ensure_cache_synced();
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
         self.account_for_trimmed_height(trimmed_height);
@@ -620,6 +706,7 @@ impl App {
         let added_height = self.history_viewport.item_height(&item);
         let trimmed_height = self.trimmed_height_on_append();
         self.client.begin_stream(request_id);
+        self.ensure_cache_synced();
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
         self.account_for_trimmed_height(trimmed_height);
@@ -643,6 +730,10 @@ impl App {
                 .map(|item| self.history_viewport.item_height(item))
                 .unwrap_or(0);
             self.client.append_stream(request_id, stream, chunk);
+            // Streaming content changed — invalidate any stale cache entry
+            if let Some(cached) = self.render_cache.get_mut(index) {
+                *cached = None;
+            }
             let new_height = self
                 .client
                 .history

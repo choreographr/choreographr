@@ -1,4 +1,5 @@
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -48,7 +49,24 @@ fn to_ratatui_color(c: syntect::highlighting::Color) -> Color {
 ///   (e.g. `Some("rust")`).  `None` or an unrecognised token falls back to
 ///   plain text (no highlighting).
 /// * `code` – the raw source code.
+///
+/// Results are memoized in a global cache keyed by `(language, code)`.  This
+/// ensures that syntect's regex-based highlighting is only performed once per
+/// unique code block, not once per frame during scrolling.
 fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
+    static HIGHLIGHT_CACHE: OnceLock<Mutex<HashMap<(String, String), Vec<Line<'static>>>>> =
+        OnceLock::new();
+    let cache = HIGHLIGHT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let key = (language.unwrap_or("").to_string(), code.to_string());
+
+    {
+        let guard = cache.lock().expect("highlight_code cache lock");
+        if let Some(cached) = guard.get(&key) {
+            return cached.clone();
+        }
+    }
+
     let ss = syntax_set();
 
     // Look up the syntax definition by the language token.  If the token
@@ -80,6 +98,11 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
             .collect();
 
         result.push(Line::from(spans));
+    }
+
+    {
+        let mut guard = cache.lock().expect("highlight_code cache lock");
+        guard.insert(key, result.clone());
     }
 
     result

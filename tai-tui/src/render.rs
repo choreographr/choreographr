@@ -2,9 +2,10 @@ use crate::diff_render::build_diff_panes;
 use crate::markdown_render::{
     display_width, lines_height, session_message_lines, streaming_text_lines,
 };
+use tai_proto::SessionMessage;
 use crate::state::{
-    App, HistoryItem, INPUT_BAR_HEIGHT, Page, SessionManagerView, history_text_height,
-    image_block_height,
+    App, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache, SessionManagerView,
+    history_text_height, image_block_height,
 };
 use ratatui::{
     Frame,
@@ -63,11 +64,22 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
+    // Ensure the render cache is aligned with the history vector before
+    // we start iterating.  If items were pushed/inserted/trimmed since the
+    // last frame, this rebuilds the cache from scratch (all Nones).
+    app.ensure_cache_synced();
+
     let mut rows_remaining = area.height as usize;
     let mut y = area.y + area.height;
     let mut rows_to_skip = app.effective_scroll();
 
-    for item in app.client.history.iter_mut().rev() {
+    // Iterate by index so we can borrow the history and render_cache
+    // independently (they are separate fields of App).
+    let len = app.client.history.len();
+    for raw_i in 0..len {
+        let i = len - 1 - raw_i;
+        let item = &mut app.client.history[i];
+
         if rows_remaining == 0 {
             break;
         }
@@ -84,7 +96,13 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 );
             }
             HistoryItem::SessionMessage(message) => {
-                let lines = session_message_lines(message, area.width);
+                let lines = cached_or_compute_lines(
+                    &mut app.render_cache,
+                    i,
+                    |msg| session_message_lines(msg, area.width),
+                    message,
+                    area.width,
+                );
                 render_history_lines(
                     frame,
                     area,
@@ -155,6 +173,35 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             }
         }
     }
+}
+
+/// Return the cached rendered lines for a history item, or compute, cache,
+/// and return them.  Only caches items with stable content (not Streaming).
+fn cached_or_compute_lines(
+    cache: &mut [Option<RenderedCache>],
+    index: usize,
+    compute: impl FnOnce(&SessionMessage) -> Vec<Line<'static>>,
+    message: &SessionMessage,
+    width: u16,
+) -> Vec<Line<'static>> {
+    // Fast path: cache hit at the current width.
+    if let Some(Some(cached)) = cache.get(index) {
+        if cached.width == width {
+            return cached.lines.clone();
+        }
+    }
+
+    // Cache miss: compute, store, and return.
+    let lines = compute(message);
+    let height = lines_height(&lines, width);
+    if let Some(slot) = cache.get_mut(index) {
+        *slot = Some(RenderedCache {
+            lines: lines.clone(),
+            height,
+            width,
+        });
+    }
+    lines
 }
 
 fn render_history_text(
