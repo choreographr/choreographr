@@ -107,6 +107,7 @@ fn main() -> anyhow::Result<()> {
         tool_registry: tai_daemon::tools::ToolRegistry::new().build(),
         client_streams: Vec::new(),
         summary_subscribers: std::collections::HashMap::new(),
+        model_cache: None,
     };
 
     let socket_path = socket_path();

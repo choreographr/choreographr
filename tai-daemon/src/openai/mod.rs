@@ -110,6 +110,13 @@ struct ChatCompletionsStreamOptions {
     include_usage: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatToolDefinition {
     #[serde(rename = "type")]
@@ -172,6 +179,7 @@ pub struct AssistantToolFunction {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionsResponse {
     choices: Vec<Choice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]

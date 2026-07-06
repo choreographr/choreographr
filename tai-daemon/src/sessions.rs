@@ -380,6 +380,12 @@ fn process_command(
         SessionCommand::RunInput { request_id, input } => {
             debug!("session {}: RunInput id={}", session_id, request_id);
             let text = String::from_utf8_lossy(&input).trim().to_string();
+            info!(
+                session_id,
+                input_len = text.len(),
+                input_preview = %text.chars().take(120).collect::<String>(),
+                "session received input",
+            );
             if text.is_empty() {
                 broadcast(&state.subscribers, DaemonMessage::Started { request_id });
                 broadcast(
@@ -570,10 +576,6 @@ fn process_command(
         }
         SessionCommand::StatusChanged(new_status) => {
             state.status = new_status.clone();
-            let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
-                session_id,
-                metadata: state.to_metadata(),
-            });
             broadcast(&state.subscribers, DaemonMessage::SessionStatusChanged {
                 session_id,
                 status: new_status.clone(),
@@ -720,9 +722,11 @@ fn run_request_worker(
 
     match &outcome {
         RequestOutcome::Done => {
+            info!(session_id, request_id, "request completed");
             broadcast(&session.subscribers, DaemonMessage::Done { request_id });
         }
         RequestOutcome::Failed(error) => {
+            info!(session_id, request_id, error = %error, "request failed");
             broadcast(
                 &session.subscribers,
                 DaemonMessage::Failed {
@@ -731,7 +735,9 @@ fn run_request_worker(
                 },
             );
         }
-        RequestOutcome::Cancelled => {}
+        RequestOutcome::Cancelled => {
+            info!(session_id, request_id, "request cancelled");
+        }
     }
 
     if let Some(reply) = child_reply {

@@ -1,4 +1,4 @@
-use tracing::info;
+use tracing::{debug, info};
 
 use super::ServiceConfig;
 use super::{
@@ -413,6 +413,7 @@ fn chat_completions_request_with_tools(
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
 ) -> Result<ChatTurnResult, super::OpenAiError> {
+    let start = std::time::Instant::now();
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
     let (max_tokens_field, max_completion_tokens_field) =
@@ -435,6 +436,16 @@ fn chat_completions_request_with_tools(
     let payload: ChatCompletionsResponse = response
         .json()
         .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+
+    let elapsed = start.elapsed();
+    debug!(
+        model = %model,
+        elapsed_ms = elapsed.as_millis(),
+        prompt_tokens = payload.usage.as_ref().map(|u| u.prompt_tokens),
+        completion_tokens = payload.usage.as_ref().map(|u| u.completion_tokens),
+        total_tokens = payload.usage.as_ref().map(|u| u.total_tokens),
+        "chat completion turn",
+    );
 
     let Some(choice) = payload.choices.into_iter().next() else {
         return Err(super::OpenAiError::EmptyResponse);

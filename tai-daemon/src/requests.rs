@@ -1,5 +1,6 @@
 use crate::context;
 use crate::db::write_message_retry;
+use tracing::debug;
 use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatAssistantToolUse, ChatRequestMessage,
     ChatTurnResult, OpenAiClient,
@@ -81,7 +82,8 @@ pub(crate) fn run_agent_loop(
     let mut next_image_id = 1u32;
     let max_turns = session.max_turns.unwrap_or(max_turns_default);
 
-    for _ in 0..max_turns {
+    for turn in 0..max_turns {
+        debug!(session_id, turn, "agent loop turn");
         let tools = tool_registry.available_definitions(&session.active_categories);
         if cancel.load(Ordering::SeqCst) {
             return Ok(());
@@ -115,6 +117,12 @@ pub(crate) fn run_agent_loop(
         let messages = build_chat_request_messages(&session.messages);
         match client.chat_completion_turn(model, &messages, &tools)? {
             ChatTurnResult::FinalText(content) => {
+                debug!(
+                    session_id,
+                    turn,
+                    response_len = content.len(),
+                    "model returned final text",
+                );
                 broadcast_to_session(
                     session,
                     DaemonMessage::OutputChunk {
@@ -159,6 +167,16 @@ pub(crate) fn run_agent_loop(
                         return Ok(());
                     }
 
+                    debug!(
+                        session_id,
+                        turn,
+                        tool_name = %tool_call.name,
+                        tool_call_id = %tool_call.id,
+                        args_preview = %(&tool_call.arguments_json[..tool_call.arguments_json.len().min(200)]),
+                        "executing tool",
+                    );
+
+                    let tool_start = std::time::Instant::now();
                     let mut output = execute_tool_with_timeout(
                         tool_registry,
                         &tool_call,
@@ -174,6 +192,18 @@ pub(crate) fn run_agent_loop(
                         model,
                         max_turns_default,
                         cancel,
+                    );
+
+                    let elapsed = tool_start.elapsed();
+                    debug!(
+                        session_id,
+                        turn,
+                        tool_name = %tool_call.name,
+                        tool_call_id = %tool_call.id,
+                        elapsed_ms = elapsed.as_millis(),
+                        result_len = output.result.content.len(),
+                        is_error = output.result.is_error,
+                        "tool finished",
                     );
 
                     if let Some(hint) = context::subdirectory_hints(

@@ -23,6 +23,7 @@ pub struct DaemonState {
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
     pub client_streams: Vec<UnixStream>,
     pub summary_subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>,
+    pub model_cache: Option<(Vec<String>, std::time::Instant)>,
 }
 
 pub enum DaemonCommand {
@@ -290,16 +291,8 @@ impl DaemonState {
                 session_id,
                 metadata,
             } => {
-                debug!("UpdateMetadata: id={}", session_id);
-                info!(
-                    "UpdateMetadata: session {} model={:?}",
-                    session_id, metadata.selected_model
-                );
-                self.session_metadata.insert(session_id, metadata.clone());
-                let record: SessionRecord = metadata.into();
-                if let Err(e) = db::write_session(&self.db, session_id, &record) {
-                    error!("UpdateMetadata: failed to persist session {}: {e}", session_id);
-                }
+                debug!("UpdateMetadata: id={}, model={:?}", session_id, metadata.selected_model);
+                self.session_metadata.insert(session_id, metadata);
             }
             DaemonCommand::SessionExited { session_id } => {
                 info!("SessionExited: id={}", session_id);
@@ -376,16 +369,31 @@ fn handle_unlock_inner(state: &mut DaemonState, passphrase: String) -> Result<()
 }
 
 fn handle_list_models_inner(
-    state: &DaemonState,
+    state: &mut DaemonState,
     session_id: Option<u64>,
 ) -> Result<(Vec<String>, Option<String>), String> {
-    let client = state
-        .openai_client
-        .as_ref()
-        .ok_or("daemon is locked".to_string())?;
-    let models = client
-        .validate_and_list_models()
-        .map_err(|e| format!("failed to list models: {e}"))?;
+    let now = std::time::Instant::now();
+    let five_minutes = std::time::Duration::from_secs(300);
+
+    let models = match &state.model_cache {
+        Some((cached_models, cached_at)) if now.duration_since(*cached_at) < five_minutes => {
+            debug!("model cache hit");
+            cached_models.clone()
+        }
+        _ => {
+            debug!("model cache miss");
+            let client = state
+                .openai_client
+                .as_ref()
+                .ok_or("daemon is locked".to_string())?;
+            let models = client
+                .validate_and_list_models()
+                .map_err(|e| format!("failed to list models: {e}"))?;
+            state.model_cache = Some((models.clone(), now));
+            models
+        }
+    };
+
     let selected_model = session_id
         .and_then(|sid| state.session_metadata.get(&sid))
         .and_then(|m| m.selected_model.clone());
