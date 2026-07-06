@@ -40,6 +40,10 @@ Never use `expect()`, `unwrap()`, or `panic!()` in production code. These create
 4. **Mutex poisoning** — use `.lock().unwrap_or_else(|e| e.into_inner())` to recover from poisoned mutexes instead of panicking.
 5. **`unwrap()`/`expect()`/`panic!()` are permitted only in `#[cfg(test)]` modules and `tests/` integration test files.**
 
+## TUI Logging
+
+In the `tai-tui` crate, do not use `eprintln!` for diagnostics. Use `tracing::info!`, `tracing::warn!`, or `tracing::error!` instead — output goes to `/tmp/tai-tui.log`.
+
 ## Inline Comments
 
 Always write inline comments around new code explaining how it works. Focus on the "why" — the reasoning, intent, and non-obvious details — rather than restating what the code literally does.

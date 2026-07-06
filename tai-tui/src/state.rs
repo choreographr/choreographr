@@ -520,7 +520,7 @@ impl App {
             }
             Err(_) => {
                 #[cfg(not(test))]
-                eprintln!("[tai-tui] failed to open command history db");
+                tracing::error!("[tai-tui] failed to open command history db");
                 (None, Vec::new())
             }
         };
@@ -868,7 +868,7 @@ impl App {
                     .unwrap_or(0),
             };
             if let Err(e) = db::save_command(database, &entry) {
-                eprintln!("[tai-tui] failed to save command history: {e}");
+                tracing::error!("[tai-tui] failed to save command history: {e}");
             }
         }
 

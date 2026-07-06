@@ -15,7 +15,7 @@ use tai_client_core::{
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
 
-const UI_EVENT_CHANNEL_SIZE: usize = 128;
+const UI_EVENT_CHANNEL_SIZE: usize = 4096;
 const UI_FRAME_POLL_MS: u64 = 16;
 
 pub(crate) fn run_app() -> io::Result<()> {
@@ -33,17 +33,13 @@ pub(crate) fn run_app() -> io::Result<()> {
         let result = run_daemon_connection(
             &socket_path,
             |message| {
-                if let Err(e) = connection_ui_tx.try_send(UiEvent::Daemon(message)) {
-                    eprintln!("[tai-tui] failed to send Daemon UI event: {e}");
-                }
+                let _ = connection_ui_tx.send(UiEvent::Daemon(message));
             },
             client_rx,
             Some(shutdown_rx),
         );
         if result.is_ok() {
-            if let Err(e) = connection_ui_tx.try_send(UiEvent::ReaderClosed) {
-                eprintln!("[tai-tui] failed to send ReaderClosed UI event: {e}");
-            }
+            let _ = connection_ui_tx.send(UiEvent::ReaderClosed);
         }
         result
     });

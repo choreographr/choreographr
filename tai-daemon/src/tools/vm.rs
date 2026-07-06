@@ -76,8 +76,8 @@ static ALLOC: BumpAlloc = BumpAlloc;
 
 const BOILERPLATE_TAIL_BASE: &str = r#"
 pub mod tai {
-    static mut ARGC: usize = 0;
-    static mut ARGV: *const *const u8 = core::ptr::null();
+    pub(crate) static mut ARGC: usize = 0;
+    pub(crate) static mut ARGV: *const *const u8 = core::ptr::null();
 
     pub(crate) fn init_args(argc: usize, argv: *const *const u8) {
         unsafe {
@@ -126,7 +126,6 @@ pub mod tai {
                 options(nostack, noreturn)
             );
         }
-        core::hint::unreachable_unchecked();
     }
 }
 
@@ -150,6 +149,11 @@ pub extern "C" fn _start() {
 
 const BOILERPLATE_TAIL_ALLOC: &str = r#"
 use alloc::vec::Vec;
+use alloc::vec;
+use alloc::string::String;
+use alloc::string::ToString;
+use alloc::format;
+use alloc::boxed::Box;
 
 pub fn args() -> Vec<Vec<u8>> {
     unsafe {
@@ -302,19 +306,6 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
         return Err(format!("rustc +nightly check failed: {stderr}"));
     }
 
-    let target_check = Command::new("rustc")
-        .arg("+nightly")
-        .args(["--target", target, "--print", "target-spec-json"])
-        .output()
-        .map_err(|e| format!("failed to check target: {e}"))?;
-    if !target_check.status.success() {
-        let stderr = String::from_utf8_lossy(&target_check.stderr);
-        return Err(format!(
-            "RISC-V target '{target}' not available.\n{stderr}\n\
-             Install with: rustup target add {target} --toolchain nightly"
-        ));
-    }
-
     let dir = tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
     let input_path = dir.path().join("main.rs");
     let output_path = dir.path().join("output.elf");
@@ -329,10 +320,6 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
         .args([
             "--target",
             target,
-            "-C",
-            "link-self-contained=yes",
-            "-C",
-            "link-arg=-nostartfiles",
             "-C",
             "opt-level=z",
             "-o",
@@ -514,7 +501,7 @@ impl Tool for RunRiscV {
     }
 
     fn description(&self) -> &'static str {
-        "Compile and run Rust code in a RISC-V sandboxed virtual machine"
+        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `tai` module with syscall wrappers (tai::write, tai::exit, tai::tool_call). Do NOT use raw ecall with Linux syscall numbers (64, 93) — they are not supported."
     }
 
     fn schema(&self) -> serde_json::Value {
@@ -523,11 +510,11 @@ impl Tool for RunRiscV {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Rust source code providing a `fn main()` entry point. The `tai` module is auto-generated for syscall access: use `tai::write(b\"...\")`, `tai::tool_call(request, output_buffer)`, and `tai::exit(code)`."
+                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `tai` module — these are auto-generated. Do NOT use raw ecall with Linux syscall numbers (64 for write, 93 for exit). Use the provided wrappers: tai::write(b\"...\"), tai::exit(code), tai::tool_call(request, &mut output). Example: `fn main() { tai::write(b\"hello\\n\"); tai::exit(0); }`. When allocator:true (default), alloc types are pre-imported: Vec, String, Box, format!, vec!, .to_string()."
                 },
                 "program": {
                     "type": "string",
-                    "description": "Base64-encoded RISC-V ELF binary to execute directly (alternative to source)"
+                    "description": "Base64-encoded RISC-V ELF binary. Only use if you compiled externally WITH the tai syscall ABI (syscall 0=tool_call, 1=write, 2=exit). Programs using Linux syscall numbers (64=write, 93=exit) will fail. When in doubt, use 'source' instead."
                 },
                 "args": {
                     "type": "array",

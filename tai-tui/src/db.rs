@@ -50,7 +50,7 @@ pub fn open_db() -> io::Result<redb::Database> {
         }
         Err(_) => {
             #[cfg(not(test))]
-            eprintln!("[tai-tui] failed to open existing db, recreating");
+            tracing::info!("[tai-tui] failed to open existing db, recreating");
         }
     }
     redb::Database::create(path).map_err(|e| {
@@ -169,7 +169,7 @@ pub fn load_recent_commands(db: &redb::Database, limit: usize) -> io::Result<Vec
         ) {
             Ok((entry, _)) => entries.push((key.value(), entry)),
             Err(e) => {
-                eprintln!("[tai-tui] skipping corrupt history entry {}: {e}", key.value());
+                tracing::warn!("[tai-tui] skipping corrupt history entry {}: {e}", key.value());
             }
         }
     }

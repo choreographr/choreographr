@@ -7918,6 +7918,8 @@ dependencies = [
  "tai-client-core",
  "tai-proto",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
  "unicode-segmentation",
  "unicode-width",
 ]
