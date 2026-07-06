@@ -91,26 +91,38 @@ requesting daemon shutdown.
 
 ## Configuration
 
-The daemon reads auth config from `~/.config/tai-daemon/auth.toml`:
+The daemon reads config from `~/.config/tai-daemon/config.toml` (all fields optional):
 
 ```toml
-api_key = "sk-..."
 base_url = "https://api.openai.com/v1"
 model_list_path = "/models"
 responses_path = "/responses"
 chat_completions_path = "/chat/completions"
-default_request_format = "chat_completions"
+default_request_format = "chat_completions"   # or "responses"
 chat_completions_max_tokens = 4096
 streaming = true
+max_turns = 25
+retry_max_attempts = 5
+retry_initial_backoff_ms = 1000
+retry_max_backoff_ms = 30000
+connect_timeout_secs = 30
+request_timeout_secs = 120
 
 [model_request_formats]
 gpt-5 = "responses"
 
 [model_max_tokens]
 big-pickle = 4096
+
+[context]
+context_file_names = ["AGENTS.md", "CLAUDE.md"]
+context_file_max_bytes = 32768
+disable_claude_code_prompt = false
 ```
 
-Only `api_key` is required. The socket path defaults to `/tmp/tai.sock` and can be overridden via `TAI_SOCKET_PATH`.
+API keys are stored in the encrypted keystore (`~/.config/tai-daemon/credentials.enc`) and managed via `tai-keystore` CLI or the `/unlock` command at runtime.
+
+The socket path defaults to `/tmp/tai.sock` and can be overridden via `TAI_SOCKET_PATH`. The database path defaults to `~/.local/share/tai-daemon/state.redb` and can be overridden via `TAI_DB_PATH`. The keystore path can be overridden via `TAI_KEYSTORE_PATH`.
 
 ## Shell commands
 
