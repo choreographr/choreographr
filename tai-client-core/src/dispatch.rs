@@ -122,10 +122,13 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             tool_name,
             output,
         } => {
-            handler.push_tool_text(
-                request_id,
-                format!("[{request_id}] tool {tool_name}#{call_id} ok: {output}"),
-            );
+            handler.push_session_message(SessionMessage::ToolResult {
+                call_id,
+                name: tool_name,
+                content: output,
+                is_error: false,
+            });
+            let _ = request_id;
             Ok(None)
         }
         DaemonMessage::ToolCallFailed {

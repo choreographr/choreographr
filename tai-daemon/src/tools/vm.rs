@@ -10,7 +10,7 @@ use ckb_vm::{
 };
 use ckb_vm::machine::VERSION2;
 use serde::Deserialize;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -184,6 +184,46 @@ fn build_boilerplate(enable_allocator: bool) -> String {
         s.push_str(BOILERPLATE_TAIL_ALLOC);
     }
     s
+}
+
+/// Pipe Rust source through `rustfmt` and return the formatted output.
+///
+/// Falls back to the original source when `rustfmt` is not installed, cannot
+/// be spawned, or exits with a non-success status.  This keeps the tool
+/// resilient in environments where `rustfmt` is unavailable.
+fn format_rust_source(source: &str) -> String {
+    let mut child = match Command::new("rustfmt")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return source.to_string(),
+    };
+
+    // Write the source to rustfmt's stdin.  If the write fails we still
+    // need to wait on the child to avoid a zombie, so we let the drop +
+    // wait_with_output handle it below.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(source.as_bytes());
+        // Explicitly close stdin so rustfmt knows to start processing.
+        drop(stdin);
+    }
+
+    match child.wait_with_output() {
+        Ok(output) if output.status.success() => {
+            // Trim trailing newline so the output doesn't get a gratuitous
+            // blank line when embedded in a markdown code block.
+            let formatted = String::from_utf8_lossy(&output.stdout).to_string();
+            if formatted.ends_with('\n') {
+                formatted[..formatted.len() - 1].to_string()
+            } else {
+                formatted
+            }
+        }
+        _ => source.to_string(),
+    }
 }
 
 static VM_TOOL_REGISTRY: OnceLock<Arc<ToolRegistry>> = OnceLock::new();
@@ -380,8 +420,24 @@ fn run_riscv_impl(
 
     let enable_allocator = input.allocator.unwrap_or(true);
 
-    let elf = match (input.source, input.program) {
-        (Some(source), None) => match compile(&source, enable_allocator) {
+    // Format the user's Rust source with rustfmt before compiling.
+    // When rustfmt is unavailable or the file is already well-formatted the
+    // output is identical to the input — the fallback is invisible.
+    let formatted_source: Option<String> = input.source.as_ref().map(|s| format_rust_source(s));
+
+    // Source to hand to rustc — prefer the formatted version, fall back to
+    // the original if formatting failed or was skipped.
+    let compile_source: Option<&str> = formatted_source
+        .as_deref()
+        .or_else(|| input.source.as_deref());
+
+    // Source to include in the result display (also prefer formatted).
+    let display_source: Option<&str> = formatted_source
+        .as_deref()
+        .or_else(|| input.source.as_deref());
+
+    let elf = match (compile_source, input.program.as_deref()) {
+        (Some(source), None) => match compile(source, enable_allocator) {
             Ok(elf) => elf,
             Err(e) => {
                 return ToolExecutionOutput {
@@ -390,7 +446,7 @@ fn run_riscv_impl(
                 }
             }
         },
-        (None, Some(program_b64)) => match BASE64.decode(&program_b64) {
+        (None, Some(program_b64)) => match BASE64.decode(program_b64) {
             Ok(elf) => elf,
             Err(e) => {
                 return ToolExecutionOutput {
@@ -468,8 +524,22 @@ fn run_riscv_impl(
         Ok(_exit_code) => {
             let out = output.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let out_str = String::from_utf8_lossy(&out).to_string();
+
+            // Prepend the formatted source as a syntax-highlighted markdown
+            // code block so the tai-tui can render it with syntect.
+            let mut result_content = String::new();
+            if let Some(source) = display_source {
+                result_content.push_str("```rust\n");
+                result_content.push_str(source);
+                if !source.ends_with('\n') {
+                    result_content.push('\n');
+                }
+                result_content.push_str("```\n\n");
+            }
+            result_content.push_str(&out_str);
+
             ToolExecutionOutput {
-                result: tool_ok(out_str),
+                result: tool_ok(result_content),
                 image: None,
             }
         }
@@ -564,6 +634,57 @@ pub(crate) fn init_vm_tool_registry(registry: &Arc<ToolRegistry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_rust_source_returns_input_when_rustfmt_unavailable() {
+        // When rustfmt is not in PATH, the function should return the source
+        // unchanged rather than panicking or erroring.
+        let src = "fn main() { let x = 1; }";
+        let result = format_rust_source(src);
+        // The function either formats (rustfmt available) or returns the
+        // original; either way it must not panic and must contain the fn.
+        assert!(result.contains("fn main()"), "must contain fn main()");
+        assert!(!result.is_empty(), "result must not be empty");
+    }
+
+    #[test]
+    fn format_rust_source_formats_when_rustfmt_available() {
+        // Only test actual formatting if rustfmt is installed.
+        let has_rustfmt = Command::new("rustfmt")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_rustfmt {
+            return;
+        }
+
+        let src = "fn main(){let x=1;}";
+        let result = format_rust_source(src);
+        assert!(result.contains("fn main()"), "must contain fn main()");
+        // If formatting succeeded, there should be spaces around braces.
+        assert!(
+            !result.contains("fn main(){"),
+            "formatted source should not lack spaces: {result}"
+        );
+    }
+
+    #[test]
+    fn format_rust_source_preserves_valid_code() {
+        let has_rustfmt = Command::new("rustfmt")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_rustfmt {
+            return;
+        }
+
+        // Already well-formatted code should not be mangled.
+        let src = "fn main() {\n    let x = 1;\n}\n";
+        let result = format_rust_source(src);
+        assert_eq!(result, "fn main() {\n    let x = 1;\n}");
+    }
 
     #[test]
     fn build_boilerplate_with_alloc_includes_allocator() {

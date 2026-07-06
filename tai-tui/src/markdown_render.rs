@@ -161,7 +161,24 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             } else {
                 "tool result"
             };
-            prefixed_lines(label, plain_text_lines(&format!("{name}: {content}")))
+            // Header line with the label and tool name.
+            let mut lines = vec![Line::from(Span::styled(
+                format!("{label}: {name}"),
+                Style::default(),
+            ))];
+            if !content.is_empty() {
+                // Non-error results are rendered as markdown so that code
+                // blocks produced by tools such as run_riscv (which wraps
+                // formatted Rust source in ```rust fences) get syntect-based
+                // syntax highlighting.  Errors remain plain text.
+                let body = if *is_error {
+                    plain_text_lines(content)
+                } else {
+                    markdown_lines(content, width)
+                };
+                lines.extend(body);
+            }
+            lines
         }
     }
 }
@@ -977,5 +994,66 @@ mod tests {
     fn to_ratatui_color_semi_transparent() {
         let c = to_ratatui_color(syntect::highlighting::Color { r: 255, g: 0, b: 0, a: 100 });
         assert_eq!(c, Color::Reset, "alpha < 128 → Reset");
+    }
+
+    // ── ToolResult rendering (markdown support) ──────────────────────────
+
+    #[test]
+    fn tool_result_with_code_block_gets_syntax_highlighting() {
+        let msg = SessionMessage::ToolResult {
+            call_id: "0".to_string(),
+            name: "run_riscv".to_string(),
+            content: "```rust\nfn main() {}\n```\n\nhello".to_string(),
+            is_error: false,
+        };
+        let lines = session_message_lines(&msg, 80);
+        // Line 0: header "tool result: run_riscv"
+        assert_eq!(lines[0].to_string(), "tool result: run_riscv");
+        // Line 1: ```rust
+        assert!(lines[1].to_string().contains("```rust"), "{}", lines[1].to_string());
+        // The highlighted line for "fn main() {}" should have colour spans
+        let has_colour = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
+        });
+        assert!(has_colour, "Rust code in tool result should have coloured spans");
+        // The closing fence and the output should be present
+        let all_text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(all_text.contains("```"), "should contain closing fence");
+        assert!(all_text.contains("hello"), "should contain execution output");
+    }
+
+    #[test]
+    fn tool_result_plain_text_still_renders() {
+        let msg = SessionMessage::ToolResult {
+            call_id: "0".to_string(),
+            name: "echo".to_string(),
+            content: "hello world".to_string(),
+            is_error: false,
+        };
+        let lines = session_message_lines(&msg, 80);
+        assert_eq!(lines[0].to_string(), "tool result: echo");
+        assert!(lines.len() >= 2, "should have body line");
+        let body: String = lines[1..].iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(body.contains("hello world"), "body should contain the text");
+    }
+
+    #[test]
+    fn tool_result_error_stays_plain_text() {
+        let msg = SessionMessage::ToolResult {
+            call_id: "0".to_string(),
+            name: "run_riscv".to_string(),
+            content: "```rust\nfn main() {}\n```\ncrash!".to_string(),
+            is_error: true,
+        };
+        let lines = session_message_lines(&msg, 80);
+        assert_eq!(lines[0].to_string(), "tool error: run_riscv");
+        // Error results should NOT have syntax highlighting — they should
+        // render the content verbatim (no colour spans from syntect).
+        let has_syntax_colour = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
+        });
+        assert!(!has_syntax_colour, "error tool result should not have coloured spans");
+        let body: String = lines[1..].iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        assert!(body.contains("```rust"), "error body should be verbatim");
     }
 }

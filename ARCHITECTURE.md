@@ -725,10 +725,13 @@ inside a sandboxed virtual machine powered by `ckb-vm`. It is registered manuall
 **Execution flow:**
 
 1. Accepts either Rust `source` or pre-compiled base64 `program`.
-2. If `source` is provided, prepends a `#![no_std]` boilerplate (panic handler, entry point,
-   `tai` module with `tool_call`, `write`, `exit` syscall wrappers, optional
-   128 KB bump allocator enabled via the `allocator` parameter) and compiles via a single
-   `rustc +nightly --target riscv64imac-unknown-none-elf` invocation in a temp directory.
+2. If `source` is provided, it is first formatted via `rustfmt` (silently skipped
+   if `rustfmt` is unavailable).  The formatted source is then prepended with a
+   `#![no_std]` boilerplate (panic handler, entry point, `tai` module with
+   `tool_call`, `write`, `exit` syscall wrappers, optional 128 KB bump allocator
+   enabled via the `allocator` parameter) and compiled via a single
+   `rustc +nightly --target riscv64imac-unknown-none-elf` invocation in a temp
+   directory.
 3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory.
 4. Registers a `TaiSyscall` handler that intercepts three guest syscalls:
    - **Syscall #0 (TOOL_CALL)** — reads a JSON `ChatToolCall` from guest memory, dispatches it
@@ -738,7 +741,9 @@ inside a sandboxed virtual machine powered by `ckb-vm`. It is registered manuall
      output upon VM exit.
    - **Syscall #2 (EXIT)** — stops the VM.
 5. Loads the ELF via `TraceMachine::load_program` and runs via `TraceMachine::run()`.
-6. Returns the accumulated WRITE output as the tool result.
+6. Returns the formatted source wrapped in a `rust` markdown fenced code block,
+   followed by the accumulated WRITE output, as the tool result.  The TUI renders
+   the code block with syntect syntax highlighting.
 
 **Guest ABI** (auto-generated in the boilerplate):
 
