@@ -115,3 +115,24 @@ fn custom_args_are_passed() {
     assert!(result.content.contains("arg: bar"), "{}", result.content);
     assert!(result.content.contains("arg: baz"), "{}", result.content);
 }
+
+#[test]
+#[ignore]
+fn fast_command_does_not_wait_full_timeout() {
+    // The bug: even a fast command would block for the default 30s timeout
+    // because the watchdog thread's sleep was non-interruptible.
+    // This test verifies a 5ms command with a 10s timeout returns in < 1s.
+    let start = std::time::Instant::now();
+    let result = execute_exec_tool(
+        r#"{"command": "echo", "args": ["fast"], "timeout": 10000}"#,
+        Some(Path::new("/tmp")),
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 1000,
+        "fast command took {}ms (should be << 10000ms timeout)",
+        elapsed.as_millis()
+    );
+    assert!(!result.is_error, "expected success: {}", result.content);
+    assert!(result.content.contains("fast"), "{}", result.content);
+}

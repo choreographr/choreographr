@@ -6,6 +6,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     time::Duration,
 };
@@ -78,6 +79,10 @@ pub(crate) fn setup_child(cmd: &mut Command) {
 /// Spawn the command, run a watchdog thread to enforce the timeout,
 /// and return the process output along with a flag indicating whether
 /// the watchdog killed the process.
+///
+/// The watchdog blocks on a channel receive with the given timeout.
+/// When the child finishes, the main thread sends a signal through the
+/// channel, waking the watchdog early — no polling required.
 pub(crate) fn spawn_with_watchdog(
     cmd: &mut Command,
     timeout_ms: u64,
@@ -86,14 +91,14 @@ pub(crate) fn spawn_with_watchdog(
     let pid = child.id();
 
     let was_killed = Arc::new(AtomicBool::new(false));
-    let cancel = Arc::new(AtomicBool::new(false));
-    let was_killed_clone = was_killed.clone();
-    let cancel_clone = cancel.clone();
+    let wk = was_killed.clone();
+
+    let (done_tx, done_rx) = mpsc::channel::<()>();
 
     let watchdog = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(timeout_ms));
-        if !cancel_clone.load(Ordering::SeqCst) {
-            was_killed_clone.store(true, Ordering::SeqCst);
+        if done_rx.recv_timeout(Duration::from_millis(timeout_ms)).is_err() {
+            // Timeout expired before the main thread signalled completion — kill.
+            wk.store(true, Ordering::SeqCst);
             unsafe {
                 libc::kill(pid as i32, libc::SIGKILL);
             }
@@ -101,7 +106,7 @@ pub(crate) fn spawn_with_watchdog(
     });
 
     let output = child.wait_with_output()?;
-    cancel.store(true, Ordering::SeqCst);
+    let _ = done_tx.send(());
     let _ = watchdog.join();
 
     Ok((output, was_killed.load(Ordering::SeqCst)))
