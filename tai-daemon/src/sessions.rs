@@ -152,8 +152,8 @@ pub struct SessionSnapshot {
     pub active_categories: std::collections::HashSet<String>,
 }
 
-struct ActiveRequest {
-    cancel: Arc<AtomicBool>,
+pub(crate) struct ActiveRequest {
+    pub(crate) cancel: Arc<AtomicBool>,
 }
 
 pub struct ActiveSessionEntry {
@@ -170,7 +170,7 @@ pub struct SessionState {
     pub created_at: i64,
     pub messages: Vec<SessionMessage>,
     pub subscribers: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
-    active_requests: HashMap<u32, ActiveRequest>,
+    pub(crate) active_requests: HashMap<u32, ActiveRequest>,
     pub context_fingerprint: Option<u64>,
     pub context_file_paths: Vec<PathBuf>,
     pub context_message_index: Option<usize>,

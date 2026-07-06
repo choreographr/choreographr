@@ -804,3 +804,245 @@ pub const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
 pub const REQUEST_IMAGE_MIME_TYPE: &str = "image/jpeg";
 pub const REQUEST_IMAGE_WIDTH: u32 = 640;
 pub const REQUEST_IMAGE_HEIGHT: u32 = 640;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::DaemonCommand;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::mpsc;
+    use tai_proto::SessionSummary;
+
+    #[test]
+    fn build_chat_request_messages_empty() {
+        let result = build_chat_request_messages(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn build_chat_request_messages_system_text() {
+        let msgs = [SessionMessage::SystemText { content: "system prompt".into() }];
+        let result = build_chat_request_messages(&msgs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "system");
+        assert_eq!(result[0].content.as_deref(), Some("system prompt"));
+    }
+
+    #[test]
+    fn build_chat_request_messages_user_text() {
+        let msgs = [SessionMessage::UserText { content: "hello".into() }];
+        let result = build_chat_request_messages(&msgs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "user");
+        assert_eq!(result[0].content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn build_chat_request_messages_assistant_text() {
+        let msgs = [SessionMessage::AssistantText { content: "hi".into() }];
+        let result = build_chat_request_messages(&msgs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "assistant");
+        assert_eq!(result[0].content.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn build_chat_request_messages_assistant_tool_use() {
+        let msgs = [SessionMessage::AssistantToolUse {
+            content: Some("thinking".into()),
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: "call_1".into(),
+                name: "read_file".into(),
+                arguments_json: r#"{"path": "/tmp/test"}"#.into(),
+            }],
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_text: None,
+        }];
+        let result = build_chat_request_messages(&msgs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "assistant");
+        assert_eq!(result[0].content.as_deref(), Some("thinking"));
+        let tool_calls = result[0].tool_calls.as_ref().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].kind, "function");
+        assert_eq!(tool_calls[0].function.name, "read_file");
+        assert_eq!(tool_calls[0].function.arguments, r#"{"path": "/tmp/test"}"#);
+    }
+
+    #[test]
+    fn build_chat_request_messages_tool_result() {
+        let msgs = [SessionMessage::ToolResult {
+            call_id: "call_1".into(),
+            name: "read_file".into(),
+            content: "file content".into(),
+            is_error: false,
+        }];
+        let result = build_chat_request_messages(&msgs);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "tool");
+        assert_eq!(result[0].content.as_deref(), Some("file content"));
+        assert_eq!(result[0].tool_call_id.as_deref(), Some("call_1"));
+        assert!(result[0].tool_calls.is_none());
+    }
+
+    #[test]
+    fn execute_list_sessions_sync_empty() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::ListSessions { reply }) = daemon_rx.recv() {
+                let _ = reply.send(Vec::new());
+            }
+        });
+        let output = execute_list_sessions_sync(&daemon_tx);
+        assert!(!output.result.is_error);
+        assert_eq!(output.result.content, "No sessions found.");
+    }
+
+    #[test]
+    fn execute_list_sessions_sync_with_sessions() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::ListSessions { reply }) = daemon_rx.recv() {
+                let sessions = vec![SessionSummary {
+                    session_id: 1,
+                    title: Some("Test".into()),
+                    selected_model: Some("gpt-4".into()),
+                    parent_session_id: None,
+                    cwd: Some("/tmp".into()),
+                    created_at: 1000,
+                    message_count: 3,
+                    max_turns: None,
+                    status: SessionStatus::Inactive,
+                    active_categories: vec!["core".into()],
+                }];
+                let _ = reply.send(sessions);
+            }
+        });
+        let output = execute_list_sessions_sync(&daemon_tx);
+        assert!(!output.result.is_error);
+        assert!(output.result.content.contains("Session 1"));
+        assert!(output.result.content.contains("Test"));
+        assert!(output.result.content.contains("gpt-4"));
+    }
+
+    #[test]
+    fn execute_list_sessions_sync_disconnected() {
+        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        drop(daemon_rx);
+        let output = execute_list_sessions_sync(&daemon_tx);
+        assert!(output.result.is_error);
+        assert_eq!(output.result.content, "failed to list sessions");
+    }
+
+    #[test]
+    fn execute_get_session_sync_invalid_args() {
+        let (daemon_tx, _) = mpsc::channel::<DaemonCommand>();
+        let output = execute_get_session_sync(&daemon_tx, "not json");
+        assert!(output.result.is_error);
+        assert!(output.result.content.contains("invalid arguments"));
+    }
+
+    #[test]
+    fn execute_get_session_sync_missing_id() {
+        let (daemon_tx, _) = mpsc::channel::<DaemonCommand>();
+        let output = execute_get_session_sync(&daemon_tx, r#"{}"#);
+        assert!(output.result.is_error);
+        assert_eq!(output.result.content, "missing required argument: session_id");
+    }
+
+    #[test]
+    fn execute_get_session_sync_found() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::GetSession { session_id: 1, reply }) = daemon_rx.recv() {
+                let _ = reply.send(Some(SessionSummary {
+                    session_id: 1,
+                    title: Some("Test".into()),
+                    selected_model: Some("gpt-4".into()),
+                    parent_session_id: None,
+                    cwd: Some("/tmp".into()),
+                    created_at: 1000,
+                    message_count: 5,
+                    max_turns: None,
+                    status: SessionStatus::Inactive,
+                    active_categories: vec!["core".into()],
+                }));
+            }
+        });
+        let output = execute_get_session_sync(&daemon_tx, r#"{"session_id": 1}"#);
+        assert!(!output.result.is_error);
+        assert!(output.result.content.contains("Session 1"));
+        assert!(output.result.content.contains("Test"));
+        assert!(output.result.content.contains("5 messages"));
+    }
+
+    #[test]
+    fn execute_get_session_sync_not_found() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::GetSession { session_id: 99, reply }) = daemon_rx.recv() {
+                let _ = reply.send(None);
+            }
+        });
+        let output = execute_get_session_sync(&daemon_tx, r#"{"session_id": 99}"#);
+        assert!(output.result.is_error);
+        assert_eq!(output.result.content, "Session 99 not found.");
+    }
+
+    #[test]
+    fn execute_get_session_sync_disconnected() {
+        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        drop(daemon_rx);
+        let output = execute_get_session_sync(&daemon_tx, r#"{"session_id": 1}"#);
+        assert!(output.result.is_error);
+        assert_eq!(output.result.content, "failed to get session");
+    }
+
+    #[test]
+    fn execute_load_skill_sync_invalid_json() {
+        let session = SessionState {
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            cwd: None,
+            max_turns: None,
+            created_at: 0,
+            messages: Vec::new(),
+            subscribers: HashMap::new(),
+            active_requests: HashMap::new(),
+            context_fingerprint: None,
+            context_file_paths: Vec::new(),
+            context_message_index: None,
+            status: SessionStatus::Inactive,
+            active_categories: HashSet::new(),
+        };
+        let output = execute_load_skill_sync(&session, None, "not json");
+        assert!(output.result.is_error);
+        assert!(output.result.content.contains("invalid json"));
+    }
+
+    #[test]
+    fn execute_load_skill_sync_missing_name() {
+        let session = SessionState {
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            cwd: None,
+            max_turns: None,
+            created_at: 0,
+            messages: Vec::new(),
+            subscribers: HashMap::new(),
+            active_requests: HashMap::new(),
+            context_fingerprint: None,
+            context_file_paths: Vec::new(),
+            context_message_index: None,
+            status: SessionStatus::Inactive,
+            active_categories: HashSet::new(),
+        };
+        let output = execute_load_skill_sync(&session, None, r#"{}"#);
+        assert!(output.result.is_error);
+        assert_eq!(output.result.content, "missing required parameter: name");
+    }
+}

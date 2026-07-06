@@ -399,3 +399,189 @@ fn handle_list_models_inner(
         .and_then(|m| m.selected_model.clone());
     Ok((models, selected_model))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sessions::SessionMetadata;
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+    use tai_proto::{DaemonMessage, SessionStatus};
+    use tempfile::tempdir;
+
+    fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let dir = tempdir().unwrap();
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let tool_registry = crate::tools::ToolRegistry::new().build();
+        let state = DaemonState {
+            next_session_id: 1,
+            max_turns: 10,
+            active_sessions: HashMap::new(),
+            session_metadata: HashMap::new(),
+            openai_client: None,
+            keystore: None,
+            x_credentials: None,
+            db,
+            tool_registry,
+            daemon_tx,
+            client_streams: Vec::new(),
+            summary_subscribers: HashMap::new(),
+            model_cache: None,
+        };
+        (state, daemon_rx)
+    }
+
+    #[test]
+    fn handle_list_sessions_empty() {
+        let (mut state, _rx) = make_daemon_state();
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::ListSessions { reply });
+        let sessions = rx.recv().unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn handle_list_sessions_with_metadata() {
+        let (mut state, _rx) = make_daemon_state();
+        state.session_metadata.insert(
+            1,
+            SessionMetadata {
+                title: Some("test".into()),
+                selected_model: None,
+                parent_session_id: None,
+                cwd: None,
+                created_at: 1000,
+                message_count: 3,
+                max_turns: None,
+                status: SessionStatus::Inactive,
+                active_categories: vec!["core".into()],
+            },
+        );
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::ListSessions { reply });
+        let sessions = rx.recv().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, 1);
+        assert_eq!(sessions[0].title.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn handle_get_session_missing() {
+        let (mut state, _rx) = make_daemon_state();
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::GetSession {
+            session_id: 1,
+            reply,
+        });
+        let result = rx.recv().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn handle_update_metadata() {
+        let (mut state, _rx) = make_daemon_state();
+        state.session_metadata.insert(
+            1,
+            SessionMetadata {
+                title: Some("original".into()),
+                selected_model: None,
+                parent_session_id: None,
+                cwd: None,
+                created_at: 1000,
+                message_count: 0,
+                max_turns: None,
+                status: SessionStatus::Inactive,
+                active_categories: vec!["core".into()],
+            },
+        );
+        let new_meta = SessionMetadata {
+            title: Some("updated".into()),
+            selected_model: Some("gpt-4".into()),
+            parent_session_id: None,
+            cwd: None,
+            created_at: 2000,
+            message_count: 5,
+            max_turns: None,
+            status: SessionStatus::Inference,
+            active_categories: vec!["core".into(), "git".into()],
+        };
+        state.handle_command(DaemonCommand::UpdateMetadata {
+            session_id: 1,
+            metadata: new_meta.clone(),
+        });
+        let stored = state.session_metadata.get(&1).unwrap();
+        assert_eq!(stored.title.as_deref(), Some("updated"));
+        assert_eq!(stored.selected_model.as_deref(), Some("gpt-4"));
+        assert_eq!(stored.message_count, 5);
+        assert_eq!(stored.status, SessionStatus::Inference);
+    }
+
+    #[test]
+    fn handle_session_exited_nonexistent() {
+        let (mut state, _rx) = make_daemon_state();
+        state.handle_command(DaemonCommand::SessionExited { session_id: 999 });
+        assert!(state.session_metadata.get(&999).is_none());
+    }
+
+    #[test]
+    fn handle_get_credential_locked() {
+        let (mut state, _rx) = make_daemon_state();
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::GetCredential {
+            service: "openai".into(),
+            reply,
+        });
+        let key = rx.recv().unwrap();
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn handle_register_unregister_subscriber() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx, _rx_sub) = mpsc::channel();
+        assert!(!state.summary_subscribers.contains_key(&42));
+        state.handle_command(DaemonCommand::RegisterSummarySubscriber {
+            client_id: 42,
+            writer: tx,
+        });
+        assert!(state.summary_subscribers.contains_key(&42));
+        state.handle_command(DaemonCommand::UnregisterSummarySubscriber { client_id: 42 });
+        assert!(!state.summary_subscribers.contains_key(&42));
+    }
+
+    #[test]
+    fn handle_broadcast_session_status() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::RegisterSummarySubscriber {
+            client_id: 1,
+            writer: tx,
+        });
+        state.handle_command(DaemonCommand::BroadcastSessionStatus {
+            session_id: 42,
+            status: SessionStatus::Inference,
+        });
+        let msg = rx.recv().unwrap();
+        assert!(
+            matches!(msg, DaemonMessage::SessionStatusChanged { session_id: 42, status: SessionStatus::Inference })
+        );
+    }
+
+    #[test]
+    fn handle_create_session_locked() {
+        let (mut state, _rx) = make_daemon_state();
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::CreateSession {
+            title: None,
+            parent_session_id: None,
+            cwd: None,
+            max_turns: None,
+            active_categories: Vec::new(),
+            reply,
+        });
+        let result = rx.recv().unwrap();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "daemon is locked");
+    }
+}

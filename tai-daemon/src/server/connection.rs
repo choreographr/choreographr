@@ -268,3 +268,118 @@ fn handle_get_credential_sync(
         Err(_) => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_unlock_sync_ok() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::Unlock { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        handle_unlock_sync(&daemon_tx, &writer_tx, "pass".into());
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(msg, DaemonMessage::Unlocked));
+    }
+
+    #[test]
+    fn handle_unlock_sync_err() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::Unlock { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(Err("wrong password".into()));
+            }
+        });
+        handle_unlock_sync(&daemon_tx, &writer_tx, "pass".into());
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(msg, DaemonMessage::LockedError { .. }));
+        if let DaemonMessage::LockedError { error } = &msg {
+            assert_eq!(error, "wrong password");
+        }
+    }
+
+    #[test]
+    fn handle_unlock_sync_disconnected() {
+        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        drop(daemon_rx);
+        handle_unlock_sync(&daemon_tx, &writer_tx, "pass".into());
+        assert!(writer_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn handle_list_models_sync_ok() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::ListModels { reply, .. }) = daemon_rx.recv() {
+                let _ = reply
+                    .send(Ok((vec!["gpt-4".into(), "gpt-3.5".into()], Some("gpt-4".into()))));
+            }
+        });
+        handle_list_models_sync(&daemon_tx, &writer_tx, None);
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(msg, DaemonMessage::Models { .. }));
+    }
+
+    #[test]
+    fn handle_list_models_sync_err() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::ListModels { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(Err("daemon is locked".into()));
+            }
+        });
+        handle_list_models_sync(&daemon_tx, &writer_tx, None);
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(msg, DaemonMessage::ModelsFailed { .. }));
+        if let DaemonMessage::ModelsFailed { error } = &msg {
+            assert_eq!(error, "daemon is locked");
+        }
+    }
+
+    #[test]
+    fn handle_get_credential_sync_some() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::GetCredential { service, reply }) = daemon_rx.recv() {
+                assert_eq!(service, "openai");
+                let _ = reply.send(Some("sk-123".into()));
+            }
+        });
+        handle_get_credential_sync(&daemon_tx, &writer_tx, "openai".into());
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(msg, DaemonMessage::Credential { .. }));
+        if let DaemonMessage::Credential { service, key } = &msg {
+            assert_eq!(service, "openai");
+            assert_eq!(key.as_deref(), Some("sk-123"));
+        }
+    }
+
+    #[test]
+    fn handle_get_credential_sync_none() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::GetCredential { service, reply }) = daemon_rx.recv() {
+                assert_eq!(service, "openai");
+                let _ = reply.send(None);
+            }
+        });
+        handle_get_credential_sync(&daemon_tx, &writer_tx, "openai".into());
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(msg, DaemonMessage::Credential { .. }));
+        if let DaemonMessage::Credential { service, key } = &msg {
+            assert_eq!(service, "openai");
+            assert!(key.is_none());
+        }
+    }
+}
