@@ -6,6 +6,7 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
+use tracing::{debug, error, info, warn};
 use tai_proto::SessionMessage;
 
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
@@ -40,8 +41,22 @@ pub fn db_path() -> io::Result<PathBuf> {
 
 pub fn open_db() -> io::Result<redb::Database> {
     let path = db_path()?;
+    info!(path = %path.display(), "opening database");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+    }
+    // Try open first (fails if file doesn't exist), then fall back to create
+    let result = redb::Database::open(&path);
+    match result {
+        Ok(db) => return Ok(db),
+        Err(redb::DatabaseError::Storage(redb::StorageError::Io(io_err)))
+            if io_err.kind() == std::io::ErrorKind::NotFound =>
+        {
+            info!("database file not found, creating new database");
+        }
+        Err(e) => {
+            warn!("failed to open existing database, trying to recreate: {e}");
+        }
     }
     redb::Database::create(path).map_err(|e| {
         io::Error::new(
@@ -74,10 +89,12 @@ pub fn write_session(
     write_txn
         .commit()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit session: {e}")))?;
+    debug!("write_session: id={} ok", session_id);
     Ok(())
 }
 
 pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<SessionRecord>> {
+    debug!("read_session: id={}", session_id);
     let read_txn = db
         .begin_read()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb read txn: {e}")))?;
@@ -102,32 +119,56 @@ pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<S
 }
 
 pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRecord)>> {
-    let read_txn = db
-        .begin_read()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb read txn: {e}")))?;
-    let table = read_txn
-        .open_table(SESSIONS)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb open sessions: {e}")))?;
+    debug!("read_all_sessions");
+    let read_txn = db.begin_read().map_err(|e| {
+        let msg = format!("redb read txn: {e}");
+        error!("read_all_sessions: {msg}");
+        io::Error::new(io::ErrorKind::Other, msg)
+    })?;
+    let table = match read_txn.open_table(SESSIONS) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("read_all_sessions: table 'sessions' not found (first run?): {e}");
+            return Ok(Vec::new());
+        }
+    };
     let mut sessions: Vec<(u64, SessionRecord)> = Vec::new();
-    for result in table
-        .iter()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb iter sessions: {e}")))?
-    {
-        let (key, value) = result
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb iter item: {e}")))?;
-        let record: SessionRecord =
-            bincode::serde::decode_from_slice(value.value(), bincode::config::standard())
-                .map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("bincode decode session: {e}"))
-                })?
-                .0;
-        sessions.push((key.value(), record));
+    let iter = match table.iter() {
+        Ok(it) => it,
+        Err(e) => {
+            let msg = format!("redb iter sessions: {e}");
+            error!("read_all_sessions: {msg}");
+            return Err(io::Error::new(io::ErrorKind::Other, msg));
+        }
+    };
+    for result in iter {
+        let (key, value) = match result {
+            Ok(kv) => kv,
+            Err(e) => {
+                warn!("read_all_sessions: skipping bad entry: {e}");
+                continue;
+            }
+        };
+        match bincode::serde::decode_from_slice::<SessionRecord, _>(
+            value.value(),
+            bincode::config::standard(),
+        ) {
+            Ok((record, _)) => {
+                sessions.push((key.value(), record));
+            }
+            Err(e) => {
+                warn!("read_all_sessions: skipping session {} (decode failed: {e})", key.value());
+                continue;
+            }
+        }
     }
+    debug!("read_all_sessions: {} records", sessions.len());
     sessions.sort_by_key(|(id, _)| *id);
     Ok(sessions)
 }
 
 pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
+    debug!("delete_session: id={}", session_id);
     let write_txn = db
         .begin_write()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb write txn: {e}")))?;

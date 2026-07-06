@@ -66,7 +66,16 @@ cargo build
 Start the daemon:
 
 ```bash
-cargo run -p tai-daemon
+cargo run -p tai-daemon         # default log level: info
+cargo run -p tai-daemon -- -v   # debug
+cargo run -p tai-daemon -- -vv  # trace
+cargo run -p tai-daemon -- -q   # warnings only
+```
+
+Alternatively, set `RUST_LOG` (takes precedence over CLI flags):
+
+```bash
+RUST_LOG=debug cargo run -p tai-daemon
 ```
 
 Then a client:

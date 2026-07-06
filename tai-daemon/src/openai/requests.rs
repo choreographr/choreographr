@@ -1,3 +1,5 @@
+use tracing::info;
+
 use super::ServiceConfig;
 use super::{
     ChatAssistantToolUse, ChatCompletionsRequest, ChatCompletionsResponse,
@@ -244,13 +246,16 @@ fn chat_completions_max_tokens_field(config: &ServiceConfig, model: &str) -> Max
 
 impl OpenAiClient {
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, super::OpenAiError> {
+        info!("listing models from {}", self.config.base_url);
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
         let retry = RetryConfig::from_service_config(&self.config);
         let response = retry_send_get(&self.http, &url, &self.api_key, &retry)?;
         let payload: ModelListResponse = response
             .json()
             .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
-        Ok(payload.data.into_iter().map(|model| model.id).collect())
+        let models: Vec<String> = payload.data.into_iter().map(|model| model.id).collect();
+        info!("models returned: {}", models.len());
+        Ok(models)
     }
 
     pub fn completion(&self, model: &str, prompt: &str) -> Result<String, super::OpenAiError> {

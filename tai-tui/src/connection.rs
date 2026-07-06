@@ -483,7 +483,10 @@ pub(crate) fn handle_daemon_message(
                     }
                 }
             }
-            if app.attached_session_id.is_none() {
+            // Only auto-attach/auto-create when on the chat page —
+            // the session manager page doesn't need an attached session,
+            // and triggering one here would bounce the user back to chat.
+            if app.page == Page::Chat && app.attached_session_id.is_none() {
                 if let Some(first) = sessions.first() {
                     client_tx
                         .send(ClientMessage::AttachSession {

@@ -4,7 +4,7 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use tai_proto::{ClientMessage, DaemonMessage, ProtoError, read_message_sync, write_message_sync};
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 pub(crate) fn client_thread(
     stream: UnixStream,
@@ -26,6 +26,7 @@ pub(crate) fn client_thread(
     let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
     let mut attached_session_id: Option<u64> = None;
     let client_id = rand::random::<u64>();
+    info!("client connected: id={}", client_id);
 
     let mut reader = reader;
     loop {
@@ -38,6 +39,7 @@ pub(crate) fn client_thread(
                         cwd,
                         max_turns,
                     } => {
+                        info!("client {}: CreateSession", client_id);
                         let cwd_str = cwd.clone();
                         let (reply, rx) = mpsc::channel();
                         let _ = daemon_tx.send(DaemonCommand::CreateSession {
@@ -80,6 +82,7 @@ pub(crate) fn client_thread(
                         }
                     }
                     ClientMessage::AttachSession { session_id } => {
+                        info!("client {}: AttachSession id={}", client_id, session_id);
                         let (reply, rx) = mpsc::channel();
                         let _ = daemon_tx.send(DaemonCommand::AttachSession { session_id, reply });
                         match rx.recv() {
@@ -106,6 +109,7 @@ pub(crate) fn client_thread(
                         }
                     }
                     ClientMessage::ListSessions => {
+                        debug!("client {}: ListSessions", client_id);
                         let (reply, rx) = mpsc::channel();
                         let _ = daemon_tx.send(DaemonCommand::ListSessions { reply });
                         if let Ok(sessions) = rx.recv() {
@@ -124,6 +128,7 @@ pub(crate) fn client_thread(
                         });
                     }
                     ClientMessage::RunInput { request_id, input } => {
+                        debug!("client {}: RunInput id={}", client_id, request_id);
                         if let Some(ref tx) = attached_session_tx {
                             let _ = tx.send(SessionCommand::RunInput { request_id, input });
                         } else {
@@ -134,14 +139,17 @@ pub(crate) fn client_thread(
                         }
                     }
                     ClientMessage::Cancel { request_id } => {
+                        debug!("client {}: Cancel id={}", client_id, request_id);
                         if let Some(ref tx) = attached_session_tx {
                             let _ = tx.send(SessionCommand::Cancel { request_id });
                         }
                     }
                     ClientMessage::Ping => {
+                        debug!("client {}: Ping", client_id);
                         let _ = writer_tx.send(DaemonMessage::Pong);
                     }
                     ClientMessage::SetModel { model } => {
+                        info!("client {}: SetModel model={} attached={}", client_id, model, attached_session_tx.is_some());
                         if let Some(ref tx) = attached_session_tx {
                             let _ = tx.send(SessionCommand::SetModel { model });
                         } else {
@@ -152,9 +160,11 @@ pub(crate) fn client_thread(
                         }
                     }
                     ClientMessage::Unlock { passphrase } => {
+                        info!("client {}: Unlock", client_id);
                         handle_unlock_sync(&daemon_tx, &writer_tx, passphrase);
                     }
                     ClientMessage::ListModels => {
+                        debug!("client {}: ListModels", client_id);
                         handle_list_models_sync(&daemon_tx, &writer_tx, attached_session_id);
                     }
                     ClientMessage::GetCredential { service } => {

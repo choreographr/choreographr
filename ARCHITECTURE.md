@@ -496,6 +496,16 @@ chain: per-session `max_turns` → `TAI_MAX_TURNS` env var → `config.toml` →
 The `spawn_subsession` tool accepts an optional `max_turns` parameter; if not set, the
 child inherits the parent's value.
 
+**Logging:** `tai-daemon` uses `tracing` with `tracing-subscriber`. Default level is `info`.
+CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level.
+`RUST_LOG` env var takes precedence over CLI flags.
+
+**Session persistence:** On daemon start, sessions are loaded from the database into
+`session_metadata` (in-memory). Model selection (`/models <name>`) updates both the
+in-memory metadata and the database via `UpdateMetadata → db::write_session`. The
+`AttachSession` handler also populates `session_metadata` when re-loading a session
+from the database, ensuring `ListModels` and metadata queries see the correct
+`selected_model`.
 
 ---
 

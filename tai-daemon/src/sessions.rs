@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tai_proto::{DaemonMessage, SessionMessage, SessionStatus, SessionSummary};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 pub enum SessionCommand {
     RunInput {
@@ -266,6 +266,8 @@ pub fn session_main(
         },
     });
 
+    info!("session {} started", session_id);
+
     let mut shutdown_requested = false;
     loop {
         match rx.recv() {
@@ -289,6 +291,7 @@ pub fn session_main(
         }
     }
 
+    info!("session {} exiting", session_id);
     persist_and_exit(&state, &db, session_id, &daemon_tx);
 }
 
@@ -306,6 +309,7 @@ fn process_command(
 ) -> bool {
     match cmd {
         SessionCommand::RunInput { request_id, input } => {
+            debug!("session {}: RunInput id={}", session_id, request_id);
             let text = String::from_utf8_lossy(&input).trim().to_string();
             if text.is_empty() {
                 broadcast(&state.subscribers, DaemonMessage::Started { request_id });
@@ -485,7 +489,9 @@ fn process_command(
             false
         }
         SessionCommand::SetModel { model } => {
+            info!("session {}: SetModel model={}", session_id, model);
             state.selected_model = Some(model.clone());
+            debug!("session {}: broadcasting ModelSelected model={}", session_id, model);
             broadcast(&state.subscribers, DaemonMessage::ModelSelected { model: model.clone() });
             let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
                 session_id,
@@ -530,6 +536,7 @@ fn process_command(
             false
         }
         SessionCommand::Attach { client_id, tx } => {
+            info!("session {}: client {} attached", session_id, client_id);
             state.subscribers.insert(client_id, tx);
             let snapshot = DaemonMessage::SessionState {
                 session_id,
@@ -547,6 +554,7 @@ fn process_command(
             false
         }
         SessionCommand::Detach { client_id } => {
+            info!("session {}: client {} detached", session_id, client_id);
             state.subscribers.remove(&client_id);
             state.active_requests.is_empty()
                 && (state.subscribers.is_empty() || *shutdown_requested)
@@ -745,6 +753,8 @@ fn persist_and_exit(
         created_at: state.created_at,
         active_categories: state.active_categories.iter().cloned().collect(),
     };
-    write_session_retry(db, session_id, &record).ok();
+    if let Err(e) = write_session_retry(db, session_id, &record) {
+        tracing::error!("persist_and_exit: failed to persist session {}: {e}", session_id);
+    }
     let _ = daemon_tx.send(DaemonCommand::SessionExited { session_id });
 }

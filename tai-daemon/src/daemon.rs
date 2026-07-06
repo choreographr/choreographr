@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use tai_proto::{DaemonMessage, SessionStatus, SessionSummary};
+use tracing::{debug, error, info};
 
 pub struct DaemonState {
     pub next_session_id: u64,
@@ -97,6 +98,7 @@ impl DaemonState {
                 }
                 let sid = self.next_session_id;
                 self.next_session_id += 1;
+                info!("CreateSession: id={}, title={:?}", sid, title);
 
                 let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
                 let active_cats = if active_categories.is_empty() {
@@ -118,7 +120,9 @@ impl DaemonState {
                     active_categories: active_cats.clone(),
                 };
 
-                db::write_session(&self.db, sid, &record).ok();
+                if let Err(e) = db::write_session(&self.db, sid, &record) {
+                    error!("CreateSession: failed to persist session {}: {e}", sid);
+                }
 
                 let db = Arc::clone(&self.db);
                 let client = self.openai_client.clone();
@@ -182,6 +186,7 @@ impl DaemonState {
                 });
             }
             DaemonCommand::AttachSession { session_id, reply } => {
+                debug!("AttachSession: id={}", session_id);
                 if self.openai_client.is_none() {
                     let _ = reply.send(Err(io::Error::new(
                         io::ErrorKind::Other,
@@ -195,6 +200,17 @@ impl DaemonState {
                     }
                     None => match db::read_session(&self.db, session_id) {
                         Ok(Some(record)) => {
+                            let metadata = SessionMetadata {
+                                title: record.title.clone(),
+                                selected_model: record.selected_model.clone(),
+                                parent_session_id: record.parent_session_id,
+                                cwd: record.cwd.clone(),
+                                created_at: record.created_at,
+                                message_count: record.message_count,
+                                max_turns: record.max_turns,
+                                status: SessionStatus::Inactive,
+                                active_categories: record.active_categories.clone(),
+                            };
                             let db = Arc::clone(&self.db);
                             let client = self.openai_client.clone();
                             let tool_registry = Arc::clone(&self.tool_registry);
@@ -224,6 +240,8 @@ impl DaemonState {
                                     handle,
                                 },
                             );
+                            self.session_metadata.insert(session_id, metadata);
+                            info!("AttachSession: loaded session {} from db", session_id);
                             let _ = reply.send(Ok(session_tx));
                         }
                         Ok(None) => {
@@ -256,24 +274,33 @@ impl DaemonState {
                     })
                     .collect();
 
-                if let Ok(all) = db::read_all_sessions(&self.db) {
-                    for (id, record) in all {
-                        if !self.session_metadata.contains_key(&id) {
-                            summaries.push(SessionSummary {
-                                session_id: id,
-                                title: record.title,
-                                selected_model: record.selected_model,
-                                parent_session_id: record.parent_session_id,
-                                cwd: record.cwd,
-                                created_at: record.created_at,
-                                message_count: record.message_count,
-                                max_turns: record.max_turns,
-                                status: SessionStatus::Sleeping,
-                                active_categories: Vec::new(),
-                            });
+                let db_count = match db::read_all_sessions(&self.db) {
+                    Ok(all) => {
+                        let count = all.len();
+                        for (id, record) in all {
+                            if !self.session_metadata.contains_key(&id) {
+                                summaries.push(SessionSummary {
+                                    session_id: id,
+                                    title: record.title,
+                                    selected_model: record.selected_model,
+                                    parent_session_id: record.parent_session_id,
+                                    cwd: record.cwd,
+                                    created_at: record.created_at,
+                                    message_count: record.message_count,
+                                    max_turns: record.max_turns,
+                                    status: SessionStatus::Sleeping,
+                                    active_categories: Vec::new(),
+                                });
+                            }
                         }
+                        count
                     }
-                }
+                    Err(e) => {
+                        error!("ListSessions: failed to read sessions from database: {e}");
+                        0
+                    }
+                };
+                debug!("ListSessions: {} in-memory + {} from db", self.session_metadata.len(), db_count);
                 summaries.sort_by_key(|s| s.session_id);
                 let _ = reply.send(summaries);
             }
@@ -299,9 +326,28 @@ impl DaemonState {
                 session_id,
                 metadata,
             } => {
-                self.session_metadata.insert(session_id, metadata);
+                debug!("UpdateMetadata: id={}", session_id);
+                info!(
+                    "UpdateMetadata: session {} model={:?}",
+                    session_id, metadata.selected_model
+                );
+                self.session_metadata.insert(session_id, metadata.clone());
+                let record = SessionRecord {
+                    title: metadata.title,
+                    selected_model: metadata.selected_model,
+                    parent_session_id: metadata.parent_session_id,
+                    cwd: metadata.cwd,
+                    max_turns: metadata.max_turns,
+                    message_count: metadata.message_count,
+                    created_at: metadata.created_at,
+                    active_categories: metadata.active_categories,
+                };
+                if let Err(e) = db::write_session(&self.db, session_id, &record) {
+                    error!("UpdateMetadata: failed to persist session {}: {e}", session_id);
+                }
             }
             DaemonCommand::SessionExited { session_id } => {
+                info!("SessionExited: id={}", session_id);
                 self.active_sessions.remove(&session_id);
                 if let Some(meta) = self.session_metadata.get_mut(&session_id) {
                     meta.status = SessionStatus::Sleeping;
@@ -315,10 +361,13 @@ impl DaemonState {
                 });
             }
             DaemonCommand::Unlock { passphrase, reply } => {
+                info!("Unlock attempt");
                 let result = handle_unlock_inner(self, passphrase);
+                info!("Unlock result: success={}", result.is_ok());
                 let _ = reply.send(result);
             }
             DaemonCommand::ListModels { session_id, reply } => {
+                debug!("ListModels: session_id={:?}", session_id);
                 let result = handle_list_models_inner(self, session_id);
                 let _ = reply.send(result);
             }

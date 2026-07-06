@@ -716,7 +716,9 @@ pub(crate) fn persist_categories(
 ) {
     if let Ok(Some(mut record)) = crate::db::read_session(db, session_id) {
         record.active_categories = active_categories.iter().cloned().collect();
-        crate::db::write_session_retry(db, session_id, &record).ok();
+        if let Err(e) = crate::db::write_session_retry(db, session_id, &record) {
+            tracing::error!("failed to persist active_categories for session {}: {e}", session_id);
+        }
     }
 }
 
