@@ -248,6 +248,7 @@ main()
 | `state.rs` | `App` struct: input buffer, request tracking, `ClientHistory`, scroll state (`HistoryScrollState`), and the per-frame scroll accumulator (`scroll_accumulator`) consumed by `apply_scroll_delta()`. |
 | `render.rs` | Ratatui rendering: history pane (top) + command input (bottom), word wrap, Unicode width. Includes side-by-side diff rendering with red/green coloring. Does **not** mutate scroll state or viewport dimensions — those are updated in the event loop before `terminal.draw()`. |
 | `diff_render.rs` | Diff parser and side-by-side pane builder. Detects unified diff text, parses into `FileDiff` structs, builds aligned left/right display rows. |
+| `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `tai-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Code blocks are syntax-highlighted via `syntect`. |
 | `lib.rs` | SVG rasterization (resvg), PNG/JPEG decoding (image crate), ratatui-image protocol picker |
 
 
@@ -860,6 +861,7 @@ cargo run -p tai-im -- telegram
 | `ratatui` + `crossterm` | tai-tui | Terminal UI |
 | `dioxus` | tai-dioxus | Desktop UI |
 | `image` + `resvg` | daemon, tai-tui | Image decoding, SVG rasterization |
+| `syntect` | tai-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `ckb-vm` | daemon | RISC-V VM interpreter for sandboxed code execution |
 | `thiserror` | proto, keystore, client-core, daemon | Structured library error types |

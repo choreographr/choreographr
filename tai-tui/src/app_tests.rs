@@ -2,6 +2,7 @@ use crate::connection::handle_terminal_event;
 use crate::markdown_render::*;
 use crate::state::*;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::text::Line;
 use tai_client_core::DaemonMessageHandler;
 use tai_proto::{ClientMessage, OutputStream};
 
@@ -97,8 +98,8 @@ fn display_width_treats_emoji_as_terminal_cells() {
 
 #[test]
 fn wrapped_line_height_uses_terminal_display_width() {
-    assert_eq!(lines_height(&["😀😀".into()], 2), 2);
-    assert_eq!(lines_height(&["👨‍👩‍👧‍👦".into()], 2), 1);
+    assert_eq!(lines_height(&[Line::from("😀😀")], 2), 2);
+    assert_eq!(lines_height(&[Line::from("👨‍👩‍👧‍👦")], 2), 1);
 }
 
 #[test]
@@ -112,9 +113,9 @@ fn streaming_text_lines_include_reasoning_and_answer() {
         80,
     );
 
-    assert_eq!(lines[0], "[9]");
-    assert_eq!(lines[1], "reasoning: step by step");
-    assert_eq!(lines[2], "answer: final");
+    assert_eq!(lines[0].to_string(), "[9]");
+    assert_eq!(lines[1].to_string(), "reasoning: step by step");
+    assert_eq!(lines[2].to_string(), "answer: final");
 }
 
 #[test]
@@ -128,11 +129,11 @@ fn streaming_text_lines_preserve_newlines() {
         80,
     );
 
-    assert_eq!(lines[0], "[3]");
-    assert_eq!(lines[1], "reasoning: line one");
-    assert_eq!(lines[2], "line two");
-    assert_eq!(lines[3], "answer: final one");
-    assert_eq!(lines[4], "final two");
+    assert_eq!(lines[0].to_string(), "[3]");
+    assert_eq!(lines[1].to_string(), "reasoning: line one");
+    assert_eq!(lines[2].to_string(), "line two");
+    assert_eq!(lines[3].to_string(), "answer: final one");
+    assert_eq!(lines[4].to_string(), "final two");
 }
 
 #[test]
@@ -142,7 +143,7 @@ fn markdown_lines_render_tables() {
         60,
     );
 
-    let rendered = lines.join("\n");
+    let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
 
     assert!(rendered.contains("┌"));
     assert!(rendered.contains("Ada Lovelace"));
@@ -154,7 +155,7 @@ fn markdown_lines_render_tables() {
 fn markdown_lines_render_lists_with_item_text() {
     let lines = markdown_lines("- one\n- [x] done\n1. first\n2. second", 80);
 
-    let rendered = lines.join("\n");
+    let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
 
     assert!(rendered.contains("• one"));
     assert!(rendered.contains("• [x] done"));

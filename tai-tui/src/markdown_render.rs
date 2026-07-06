@@ -1,35 +1,123 @@
+use std::sync::OnceLock;
+
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
 use tai_proto::SessionMessage;
 use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, StreamingText};
 
-pub(crate) fn plain_text_lines(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        vec![String::new()]
+// ── Lazy-loaded syntect state ──────────────────────────────────────────────
+
+fn syntax_set() -> &'static SyntaxSet {
+    static SS: OnceLock<SyntaxSet> = OnceLock::new();
+    SS.get_or_init(|| SyntaxSet::load_defaults_newlines())
+}
+
+fn theme_set() -> &'static ThemeSet {
+    static TS: OnceLock<ThemeSet> = OnceLock::new();
+    TS.get_or_init(ThemeSet::load_defaults)
+}
+
+fn highlight_theme() -> &'static syntect::highlighting::Theme {
+    // base16-ocean.dark is a well-known dark-terminal theme with good contrast.
+    // Fall back to the first available theme if the name is somehow missing.
+    const THEME_NAME: &str = "base16-ocean.dark";
+    theme_set()
+        .themes
+        .get(THEME_NAME)
+        .unwrap_or_else(|| theme_set().themes.values().next().expect("ThemeSet is empty"))
+}
+
+/// Convert a syntect RGBA colour to a ratatui `Color`.
+/// Syntect colours with alpha < 255 are ignored (transparent → default
+/// terminal foreground), preserving the user's terminal colour scheme.
+fn to_ratatui_color(c: syntect::highlighting::Color) -> Color {
+    if c.a < 128 {
+        // Transparent-ish → don't override the terminal default
+        Color::Reset
     } else {
-        text.split('\n').map(|line| line.to_string()).collect()
+        Color::Rgb(c.r, c.g, c.b)
     }
 }
 
-pub(crate) fn lines_height(lines: &[String], width: u16) -> usize {
+/// Highlight a code snippet into styled ratatui lines.
+///
+/// * `language` – the language hint from the markdown fenced-code info string
+///   (e.g. `Some("rust")`).  `None` or an unrecognised token falls back to
+///   plain text (no highlighting).
+/// * `code` – the raw source code.
+fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
+    let ss = syntax_set();
+
+    // Look up the syntax definition by the language token.  If the token
+    // isn't recognised (or was omitted), use the built-in "Plain Text"
+    // syntax which emits a single unstyled span per line.
+    let syntax = language
+        .and_then(|lang| ss.find_syntax_by_token(lang))
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+    let theme = highlight_theme();
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut result = Vec::with_capacity(code.len().max(1));
+
+    for line in code.split('\n') {
+        let Ok(ranges) = highlighter.highlight_line(line, ss) else {
+            // If highlighting fails for a line, emit it as plain text.
+            result.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default(),
+            )));
+            continue;
+        };
+
+        let spans: Vec<Span<'static>> = ranges
+            .into_iter()
+            .map(|(style, text)| {
+                Span::styled(text.to_string(), Style::default().fg(to_ratatui_color(style.foreground)))
+            })
+            .collect();
+
+        result.push(Line::from(spans));
+    }
+
+    result
+}
+
+// ── Public API ────────────────────────────────────────────────────────────
+
+pub(crate) fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        vec![Line::from(Span::styled(String::new(), Style::default()))]
+    } else {
+        text.split('\n')
+            .map(|line| Line::from(Span::styled(line.to_string(), Style::default())))
+            .collect()
+    }
+}
+
+pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
     let width = width as usize;
     if width == 0 {
         return 0;
     }
 
-    if lines.len() <= 1 && lines.iter().all(|line| line.is_empty()) {
+    if lines.len() <= 1 && lines.iter().all(|line| line.width() == 0) {
         return 1;
     }
 
     lines
         .iter()
-        .map(|line| wrapped_line_height(line, width))
+        .map(|line| wrapped_line_height(&line.to_string(), width))
         .sum::<usize>()
         .max(1)
 }
 
-pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec<String> {
+pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec<Line<'static>> {
     match message {
-        SessionMessage::SystemText { content } => labeled_plain_text_lines("system", content),
-        SessionMessage::UserText { content } => labeled_plain_text_lines("user", content),
+        SessionMessage::SystemText { content } => labeled_text_lines("system", content),
+        SessionMessage::UserText { content } => labeled_text_lines("user", content),
         SessionMessage::AssistantText { content } => {
             let body = markdown_lines(content, width);
             prefixed_lines("assistant", body)
@@ -41,14 +129,17 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             reasoning,
             reasoning_text,
         } => {
-            let mut lines = vec![format!(
-                "tool-call: {}",
-                tool_calls
-                    .iter()
-                    .map(|call| format!("{}({})", call.name, call.arguments_json))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )];
+            let mut lines = vec![Line::from(Span::styled(
+                format!(
+                    "tool-call: {}",
+                    tool_calls
+                        .iter()
+                        .map(|call| format!("{}({})", call.name, call.arguments_json))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Style::default(),
+            ))];
             if let Some(reasoning_text) = reasoning_content
                 .as_deref()
                 .or(reasoning.as_deref())
@@ -78,8 +169,11 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
     }
 }
 
-pub(crate) fn streaming_text_lines(text: &StreamingText, width: u16) -> Vec<String> {
-    let mut lines = vec![format!("[{}]", text.request_id)];
+pub(crate) fn streaming_text_lines(text: &StreamingText, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        format!("[{}]", text.request_id),
+        Style::default(),
+    ))];
 
     if !text.reasoning.is_empty() {
         append_section(&mut lines, "reasoning", plain_text_lines(&text.reasoning));
@@ -90,57 +184,66 @@ pub(crate) fn streaming_text_lines(text: &StreamingText, width: u16) -> Vec<Stri
     }
 
     if text.reasoning.is_empty() && text.answer.is_empty() {
-        lines.push(String::new());
+        lines.push(Line::from(Span::styled(String::new(), Style::default())));
     }
 
     lines
 }
 
-fn labeled_plain_text_lines(label: &'static str, text: &str) -> Vec<String> {
+// ── Internal helpers ──────────────────────────────────────────────────────
+
+fn labeled_text_lines(label: &'static str, text: &str) -> Vec<Line<'static>> {
     prefixed_lines(label, plain_text_lines(text))
 }
 
-fn prefixed_lines(label: &'static str, body: Vec<String>) -> Vec<String> {
+fn prefixed_lines(label: &'static str, body: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     append_section(&mut lines, label, body);
     lines
 }
 
-fn append_section(lines: &mut Vec<String>, label: &'static str, body: Vec<String>) {
+fn append_section(lines: &mut Vec<Line<'static>>, label: &'static str, body: Vec<Line<'static>>) {
     let mut body_iter = body.into_iter();
     if let Some(first) = body_iter.next() {
-        lines.push(format!("{label}: {first}"));
+        let label_text = format!("{label}: ");
+        let mut first_spans = first.spans.clone();
+        first_spans.insert(0, Span::styled(label_text, Style::default()));
+        lines.push(Line::from(first_spans));
     } else {
-        lines.push(format!("{label}:"));
+        lines.push(Line::from(Span::styled(
+            format!("{label}:"),
+            Style::default(),
+        )));
     }
     lines.extend(body_iter);
 }
 
-pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<String> {
+pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     let document = MarkdownDocument::parse(markdown);
     let mut lines = Vec::new();
     render_markdown_blocks(&document.blocks, &mut lines, 0, width as usize);
     if lines.is_empty() {
-        lines.push(String::new());
+        lines.push(Line::from(Span::styled(String::new(), Style::default())));
     }
-    while matches!(lines.last(), Some(line) if line.is_empty()) {
+    // Trim trailing empty lines
+    while matches!(lines.last(), Some(line) if line.width() == 0) {
         lines.pop();
     }
     if lines.is_empty() {
-        lines.push(String::new());
+        lines.push(Line::from(Span::styled(String::new(), Style::default())));
     }
     lines
 }
 
 fn render_markdown_blocks(
     blocks: &[MarkdownBlock],
-    lines: &mut Vec<String>,
+    lines: &mut Vec<Line<'static>>,
     indent: usize,
     width: usize,
 ) {
     for (index, block) in blocks.iter().enumerate() {
         if index > 0 {
-            lines.push(String::new());
+            lines.push(Line::from(Span::styled(String::new(), Style::default())));
         }
         render_markdown_block(block, lines, indent, width);
     }
@@ -148,32 +251,49 @@ fn render_markdown_blocks(
 
 fn render_markdown_block(
     block: &MarkdownBlock,
-    lines: &mut Vec<String>,
+    lines: &mut Vec<Line<'static>>,
     indent: usize,
     width: usize,
 ) {
     match block {
-        MarkdownBlock::Paragraph(content) => lines.extend(inlines_to_lines(content, indent, None)),
+        MarkdownBlock::Paragraph(content) => {
+            lines.extend(inlines_to_lines(content, indent, None))
+        }
         MarkdownBlock::Heading { level, content } => {
             let prefix = Some(format!("{} ", "#".repeat(*level as usize)));
             lines.extend(inlines_to_lines(content, indent, prefix));
         }
         MarkdownBlock::CodeBlock { language, code } => {
+            // Opening fence with language hint
             let header = language
                 .as_deref()
                 .map(|value| format!("```{value}"))
                 .unwrap_or_else(|| "```".to_string());
             lines.push(indented_line(indent, header));
-            for line in code.split('\n') {
-                lines.push(indented_line(indent, line.to_string()));
+
+            // Syntax-highlighted code lines
+            let highlighted = highlight_code(language.as_deref(), code);
+            for hl_line in highlighted {
+                if indent > 0 {
+                    let mut spans = vec![Span::styled(" ".repeat(indent), Style::default())];
+                    spans.extend(hl_line.spans.clone());
+                    lines.push(Line::from(spans));
+                } else {
+                    lines.push(hl_line);
+                }
             }
+
+            // Closing fence
             lines.push(indented_line(indent, "```".to_string()));
         }
         MarkdownBlock::BlockQuote(blocks) => {
             let mut quoted = Vec::new();
             render_markdown_blocks(blocks, &mut quoted, 0, width);
             for line in quoted {
-                lines.push(indented_line(indent, format!("> {line}")));
+                let mut spans = line.spans.clone();
+                // Prepend "> " to the first span of the quoted line
+                spans.insert(0, Span::styled("> ".to_string(), Style::default()));
+                lines.push(indented_line_as_spans(indent, spans));
             }
         }
         MarkdownBlock::List {
@@ -192,12 +312,23 @@ fn render_markdown_block(
                 render_markdown_blocks(item, &mut rendered, 0, width);
                 let mut rendered_iter = rendered.into_iter();
                 if let Some(first) = rendered_iter.next() {
-                    lines.push(format!("{}{}{}", " ".repeat(indent), marker, first));
+                    let mut spans = vec![Span::styled(
+                        format!("{}{}", " ".repeat(indent), marker),
+                        Style::default(),
+                    )];
+                    spans.extend(first.spans.clone());
+                    lines.push(Line::from(spans));
                 } else {
-                    lines.push(format!("{}{}", " ".repeat(indent), marker));
+                    lines.push(indented_line(indent, marker));
                 }
                 for line in rendered_iter {
-                    lines.push(format!("{}{}", " ".repeat(continuation_indent), line));
+                    lines.push({
+                        let text = line.to_string();
+                        Line::from(Span::styled(
+                            format!("{}{}", " ".repeat(continuation_indent), text),
+                            Style::default(),
+                        ))
+                    });
                 }
             }
         }
@@ -210,19 +341,21 @@ fn render_markdown_block(
     }
 }
 
+// ── Table rendering ───────────────────────────────────────────────────────
+
 fn render_table_lines(
     alignments: &[MarkdownAlignment],
     header: &[Vec<MarkdownInline>],
     rows: &[Vec<Vec<MarkdownInline>>],
     indent: usize,
     width: usize,
-) -> Vec<String> {
+) -> Vec<Line<'static>> {
     let column_count = alignments
         .len()
         .max(header.len())
         .max(rows.iter().map(Vec::len).max().unwrap_or(0));
     if column_count == 0 {
-        return vec![String::new()];
+        return vec![Line::from(Span::styled(String::new(), Style::default()))];
     }
     let mut table_rows = Vec::with_capacity(rows.len() + 1);
     table_rows.push(normalize_table_row(header, column_count));
@@ -315,7 +448,7 @@ fn table_border_line(
     right: char,
     widths: &[usize],
     indent: usize,
-) -> String {
+) -> Line<'static> {
     let mut text = String::new();
     text.push(left);
     for (index, width) in widths.iter().enumerate() {
@@ -333,7 +466,7 @@ fn table_separator_line(
     widths: &[usize],
     alignments: &[MarkdownAlignment],
     indent: usize,
-) -> String {
+) -> Line<'static> {
     let mut text = String::new();
     text.push('├');
     for (index, width) in widths.iter().enumerate() {
@@ -368,7 +501,7 @@ fn render_table_row_wrapped(
     widths: &[usize],
     alignments: &[MarkdownAlignment],
     indent: usize,
-) -> Vec<String> {
+) -> Vec<Line<'static>> {
     let wrapped_cells: Vec<Vec<String>> = row
         .iter()
         .zip(widths.iter())
@@ -538,41 +671,57 @@ fn append_inline_plain_text(inlines: &[MarkdownInline], text: &mut String) {
     }
 }
 
-fn indented_line(indent: usize, text: String) -> String {
+// ── Line-building helpers ─────────────────────────────────────────────────
+
+/// Create a `Line` with an indentation prefix made of spaces, followed by
+/// the given text as a default-styled span.
+fn indented_line(indent: usize, text: String) -> Line<'static> {
+    let mut spans = Vec::new();
     if indent > 0 {
-        format!("{}{}", " ".repeat(indent), text)
-    } else {
-        text
+        spans.push(Span::styled(" ".repeat(indent), Style::default()));
     }
+    spans.push(Span::styled(text, Style::default()));
+    Line::from(spans)
+}
+
+/// Create a `Line` by prepending an indentation prefix (in spaces) to an
+/// existing set of spans.
+fn indented_line_as_spans(indent: usize, mut spans: Vec<Span<'static>>) -> Line<'static> {
+    if indent > 0 {
+        spans.insert(0, Span::styled(" ".repeat(indent), Style::default()));
+    }
+    Line::from(spans)
 }
 
 fn inlines_to_lines(
     inlines: &[MarkdownInline],
     indent: usize,
     prefix: Option<String>,
-) -> Vec<String> {
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let mut current = String::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
     if indent > 0 {
-        current.push_str(&" ".repeat(indent));
+        current_spans.push(Span::styled(" ".repeat(indent), Style::default()));
     }
     if let Some(prefix) = prefix {
-        current.push_str(&prefix);
+        current_spans.push(Span::styled(prefix, Style::default()));
     }
-    render_inlines_to_lines(inlines, &mut lines, &mut current, indent);
-    lines.push(current);
+    render_inlines_to_lines(inlines, &mut lines, &mut current_spans, indent);
+    lines.push(Line::from(std::mem::take(&mut current_spans)));
     lines
 }
 
 fn render_inlines_to_lines(
     inlines: &[MarkdownInline],
-    lines: &mut Vec<String>,
-    current: &mut String,
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
     indent: usize,
 ) {
     for inline in inlines {
         match inline {
-            MarkdownInline::Text(text) | MarkdownInline::Code(text) => current.push_str(text),
+            MarkdownInline::Text(text) | MarkdownInline::Code(text) => {
+                current.push(Span::styled(text.clone(), Style::default()));
+            }
             MarkdownInline::Emphasis(content) | MarkdownInline::Strong(content) => {
                 render_inlines_to_lines(content, lines, current, indent)
             }
@@ -581,17 +730,23 @@ fn render_inlines_to_lines(
                 destination,
             } => {
                 render_inlines_to_lines(content, lines, current, indent);
-                current.push_str(&format!(" ({destination})"));
+                current.push(Span::styled(
+                    format!(" ({destination})"),
+                    Style::default(),
+                ));
             }
             MarkdownInline::Image { alt, destination } => {
-                current.push_str("[image: ");
+                current.push(Span::styled("[image: ".to_string(), Style::default()));
                 render_inlines_to_lines(alt, lines, current, indent);
-                current.push_str(&format!("] ({destination})"));
+                current.push(Span::styled(
+                    format!("] ({destination})"),
+                    Style::default(),
+                ));
             }
             MarkdownInline::LineBreak => {
-                lines.push(std::mem::take(current));
+                lines.push(Line::from(std::mem::take(current)));
                 if indent > 0 {
-                    current.push_str(&" ".repeat(indent));
+                    current.push(Span::styled(" ".repeat(indent), Style::default()));
                 }
             }
         }
@@ -607,5 +762,219 @@ fn wrapped_line_height(line: &str, width: usize) -> usize {
         1
     } else {
         line_width.div_ceil(width)
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Color;
+
+    // ── highlight_code ───────────────────────────────────────────────────
+
+    #[test]
+    fn highlight_code_known_language_produces_coloured_spans() {
+        let lines = highlight_code(Some("rust"), "fn main() {}");
+        assert!(!lines.is_empty(), "should produce at least one line");
+
+        // At least one span should have a non-default foreground colour.
+        let has_colour = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
+        });
+        assert!(has_colour, "highlighted Rust should have coloured spans");
+    }
+
+    #[test]
+    fn highlight_code_unknown_language_produces_output() {
+        // An unrecognised language token should still produce output lines
+        // without panicking.  syntect may apply a fallback syntax, so we
+        // merely verify that we get at least one line.
+        let lines = highlight_code(Some("this-is-not-a-real-language"), "some text");
+        assert!(!lines.is_empty(), "should still produce output");
+    }
+
+    #[test]
+    fn highlight_code_none_language_uses_plain_text() {
+        let lines = highlight_code(None, "plain text");
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn highlight_code_empty_string() {
+        let lines = highlight_code(Some("rust"), "");
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn highlight_code_multi_line() {
+        let lines = highlight_code(Some("python"), "def foo():\n    pass");
+        assert_eq!(lines.len(), 2, "should have one line per code line");
+    }
+
+    // ── plain_text_lines ─────────────────────────────────────────────────
+
+    #[test]
+    fn plain_text_lines_empty() {
+        let result = plain_text_lines("");
+        assert_eq!(result.len(), 1, "empty input → one empty line");
+        assert_eq!(result[0].width(), 0);
+    }
+
+    #[test]
+    fn plain_text_lines_single() {
+        let result = plain_text_lines("hello");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "hello");
+    }
+
+    #[test]
+    fn plain_text_lines_multi() {
+        let result = plain_text_lines("a\nb\nc");
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].to_string(), "a");
+        assert_eq!(result[1].to_string(), "b");
+        assert_eq!(result[2].to_string(), "c");
+    }
+
+    // ── lines_height ────────────────────────────────────────────────────
+
+    #[test]
+    fn lines_height_simple() {
+        let lines = vec![Line::from("hello")];
+        assert_eq!(lines_height(&lines, 80), 1);
+    }
+
+    #[test]
+    fn lines_height_zero_width() {
+        let lines = vec![Line::from("hello")];
+        assert_eq!(lines_height(&lines, 0), 0);
+    }
+
+    #[test]
+    fn lines_height_wrapping() {
+        let text = "x".repeat(100);
+        let lines = vec![Line::from(text)];
+        // At width 40, 100 chars → 3 wrapped rows (ceil(100/40))
+        assert_eq!(lines_height(&lines, 40), 3);
+    }
+
+    #[test]
+    fn lines_height_multiple_lines() {
+        let lines = vec![
+            Line::from("short"),
+            Line::from("a".repeat(50)),
+        ];
+        // width=30: short=1 row, 50 chars=2 rows → total 3
+        assert_eq!(lines_height(&lines, 30), 3);
+    }
+
+    #[test]
+    fn lines_height_empty() {
+        let lines = vec![Line::from("")];
+        assert_eq!(lines_height(&lines, 80), 1);
+    }
+
+    // ── markdown_lines ───────────────────────────────────────────────────
+
+    #[test]
+    fn markdown_lines_empty() {
+        let result = markdown_lines("", 80);
+        assert!(!result.is_empty(), "should not return empty vec");
+        assert_eq!(result[0].width(), 0);
+    }
+
+    #[test]
+    fn markdown_lines_paragraph() {
+        let result = markdown_lines("hello world", 80);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "hello world");
+    }
+
+    #[test]
+    fn markdown_lines_code_block() {
+        let md = "```rust\nfn main() {}\n```";
+        let result = markdown_lines(md, 80);
+        // Should have: ```rust line, highlighted code line, ``` line
+        assert!(result.len() >= 3, "code block should have at least 3 lines");
+        assert_eq!(result[0].to_string(), "```rust");
+        assert_eq!(result.last().unwrap().to_string(), "```");
+    }
+
+    #[test]
+    fn markdown_lines_code_block_no_language() {
+        let md = "```\nplain code\n```";
+        let result = markdown_lines(md, 80);
+        assert!(result.len() >= 3);
+        assert_eq!(result[0].to_string(), "```");
+    }
+
+    // ── display_width ────────────────────────────────────────────────────
+
+    #[test]
+    fn display_width_ascii() {
+        assert_eq!(display_width("hello"), 5);
+    }
+
+    #[test]
+    fn display_width_unicode() {
+        assert_eq!(display_width("café"), 4);
+    }
+
+    #[test]
+    fn display_width_empty() {
+        assert_eq!(display_width(""), 0);
+    }
+
+    // ── inlines_to_lines ─────────────────────────────────────────────────
+
+    #[test]
+    fn inlines_to_lines_simple_text() {
+        let inlines = vec![MarkdownInline::Text("hello".to_string())];
+        let result = inlines_to_lines(&inlines, 0, None);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "hello");
+    }
+
+    #[test]
+    fn inlines_to_lines_with_indent_and_prefix() {
+        let inlines = vec![MarkdownInline::Text("world".to_string())];
+        let result = inlines_to_lines(&inlines, 2, Some("# ".to_string()));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "  # world");
+    }
+
+    #[test]
+    fn inlines_to_lines_handles_line_break() {
+        let inlines = vec![
+            MarkdownInline::Text("a".to_string()),
+            MarkdownInline::LineBreak,
+            MarkdownInline::Text("b".to_string()),
+        ];
+        let result = inlines_to_lines(&inlines, 0, None);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].to_string(), "a");
+        assert_eq!(result[1].to_string(), "b");
+    }
+
+    // ── to_ratatui_color ─────────────────────────────────────────────────
+
+    #[test]
+    fn to_ratatui_color_opaque() {
+        let c = to_ratatui_color(syntect::highlighting::Color { r: 255, g: 0, b: 0, a: 255 });
+        assert_eq!(c, Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn to_ratatui_color_transparent() {
+        let c = to_ratatui_color(syntect::highlighting::Color { r: 255, g: 0, b: 0, a: 0 });
+        assert_eq!(c, Color::Reset);
+    }
+
+    #[test]
+    fn to_ratatui_color_semi_transparent() {
+        let c = to_ratatui_color(syntect::highlighting::Color { r: 255, g: 0, b: 0, a: 100 });
+        assert_eq!(c, Color::Reset, "alpha < 128 → Reset");
     }
 }

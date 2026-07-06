@@ -204,7 +204,7 @@ fn render_history_text(
 fn render_history_lines(
     frame: &mut Frame<'_>,
     area: Rect,
-    lines: Vec<String>,
+    lines: Vec<Line<'static>>,
     rows_remaining: &mut usize,
     y: &mut u16,
     rows_to_skip: &mut usize,
@@ -236,7 +236,7 @@ fn render_history_lines(
         height: visible_height as u16,
     };
     frame.render_widget(
-        Paragraph::new(lines.join("\n"))
+        Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((top_line as u16, 0)),
         rect,
@@ -732,7 +732,7 @@ mod tests {
                 render_history_lines(
                     frame,
                     Rect { x: 0, y: 0, width: 80, height: 30 },
-                    vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                    vec![Line::from("a"), Line::from("b"), Line::from("c")],
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
@@ -758,7 +758,7 @@ mod tests {
                 render_history_lines(
                     frame,
                     Rect { x: 0, y: 0, width: 80, height: 30 },
-                    vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                    vec![Line::from("a"), Line::from("b"), Line::from("c")],
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
@@ -785,7 +785,7 @@ mod tests {
                 render_history_lines(
                     frame,
                     Rect { x: 0, y: 0, width: 80, height: 30 },
-                    vec!["only".to_string()],
+                    vec![Line::from("only")],
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
@@ -811,7 +811,7 @@ mod tests {
                 render_history_lines(
                     frame,
                     Rect { x: 0, y: 0, width: 80, height: 30 },
-                    vec!["content".to_string()],
+                    vec![Line::from("content")],
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
