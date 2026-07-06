@@ -8,6 +8,7 @@ use tai_proto::{ImageMetadata, OutputStream, SessionMessage, SessionStatus, Sess
 use tai_tui::{RenderedImage, StreamingText, build_rendered_image};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::db::{self, CommandEntry};
 use crate::diff_render::{diff_display_height, is_diff_text, parse_diff};
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
 use tai_client_core::FileDiff;
@@ -81,6 +82,25 @@ pub(crate) struct App {
     /// trackpad scrolling smooth while ensuring scrolling stops
     /// instantly when the finger lifts (no momentum carry-over).
     pub(crate) scroll_accumulator: isize,
+
+    // ── Command history ─────────────────────────────────────────
+
+    /// Command history entries, newest first.  Loaded from redb on startup
+    /// and kept in memory so that Up/Down navigation is instant.
+    pub(crate) command_history: Vec<String>,
+
+    /// Current position when navigating history with Up/Down.
+    /// `None` = not navigating.  `Some(0)` = most recent entry.
+    pub(crate) history_index: Option<usize>,
+
+    /// A copy of the input text taken the moment the user first presses Up.
+    /// Restored when pressing Down past the newest entry.
+    pub(crate) saved_draft: String,
+
+    /// Optional handle to the redb database.  `None` if the database
+    /// could not be opened (history is still usable in-memory during
+    /// the session, it just won't persist).
+    pub(crate) db: Option<redb::Database>,
 }
 
 #[derive(Clone, Copy)]
@@ -459,6 +479,22 @@ impl InputBuffer {
 
 impl App {
     pub(crate) fn new(socket_path: String, picker_protocol: String) -> Self {
+        let (db, command_history) = match db::open_db() {
+            Ok(database) => {
+                let history = db::load_recent_commands(&database, 100)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|e| e.command)
+                    .collect();
+                (Some(database), history)
+            }
+            Err(_) => {
+                #[cfg(not(test))]
+                eprintln!("[tai-tui] failed to open command history db");
+                (None, Vec::new())
+            }
+        };
+
         Self {
             input: InputBuffer::new(),
             next_request_id: 1,
@@ -475,6 +511,10 @@ impl App {
             page: Page::Chat,
             session_mgr: SessionManagerState::new(),
             scroll_accumulator: 0,
+            command_history,
+            history_index: None,
+            saved_draft: String::new(),
+            db,
         }
     }
 
@@ -645,6 +685,81 @@ impl App {
     }
 
 
+
+    // ── Command history navigation ──────────────────────────────
+
+    /// Navigate backward (older) in command history.
+    ///
+    /// On first invocation saves the current input as a draft.
+    pub(crate) fn navigate_history_up(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+        if self.history_index.is_none() {
+            // First Up press: save the current input as draft.
+            self.saved_draft = self.input.text.clone();
+            self.history_index = Some(0);
+            self.input.text = self.command_history[0].clone();
+        } else if let Some(idx) = self.history_index {
+            let next = idx + 1;
+            if next < self.command_history.len() {
+                self.history_index = Some(next);
+                self.input.text = self.command_history[next].clone();
+            }
+        }
+        self.input.cursor = self.input.text.len();
+    }
+
+    /// Navigate forward (newer) in command history.
+    ///
+    /// Restores the saved draft when moving past the newest entry.
+    pub(crate) fn navigate_history_down(&mut self) {
+        if let Some(idx) = self.history_index {
+            if idx > 0 {
+                let prev = idx - 1;
+                self.history_index = Some(prev);
+                self.input.text = self.command_history[prev].clone();
+            } else {
+                // Past the newest entry: restore draft.
+                self.history_index = None;
+                self.input.text = self.saved_draft.clone();
+                self.saved_draft.clear();
+            }
+            self.input.cursor = self.input.text.len();
+        }
+    }
+
+    /// Save a command to the history (DB + in-memory list).
+    pub(crate) fn commit_to_history(&mut self, command: String) {
+        if command.is_empty() {
+            return;
+        }
+        // Avoid saving a duplicate of the most recent entry.
+        if self.command_history.first().map_or(false, |last| last == &command) {
+            return;
+        }
+
+        // Prepend to in-memory list.
+        self.command_history.insert(0, command.clone());
+
+        // Persist to redb (best-effort).
+        if let Some(ref database) = self.db {
+            let entry = CommandEntry {
+                command,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            };
+            if let Err(e) = db::save_command(database, &entry) {
+                eprintln!("[tai-tui] failed to save command history: {e}");
+            }
+        }
+
+        // Reset navigation state.
+        self.history_index = None;
+        self.saved_draft.clear();
+    }
 
     fn trimmed_height_on_append(&self) -> usize {
         if self.client.history.len() < MAX_HISTORY_ITEMS || self.history_scroll.follow_output() {

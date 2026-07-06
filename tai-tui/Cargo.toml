@@ -5,8 +5,12 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
+bincode.workspace = true
 crossterm = "0.29"
+dirs.workspace = true
 image.workspace = true
+redb.workspace = true
+serde.workspace = true
 ratatui = "0.30"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 resvg.workspace = true
@@ -15,3 +19,6 @@ unicode-segmentation = "1.12"
 unicode-width = "0.2"
 tai-proto.workspace = true
 signal-hook.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

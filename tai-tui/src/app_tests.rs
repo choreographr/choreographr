@@ -1438,6 +1438,242 @@ fn scroll_down_mouse_inside_history_box_via_accumulator() {
     assert_eq!(app.effective_scroll(), before - 1);
 }
 
+// ── Command history tests ──────────────────────────────────────
+
+#[test]
+fn commit_to_history_adds_entry() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    assert!(app.command_history.is_empty());
+
+    app.commit_to_history("hello".to_string());
+    assert_eq!(app.command_history.len(), 1);
+    assert_eq!(app.command_history[0], "hello");
+    assert!(app.history_index.is_none());
+    assert!(app.saved_draft.is_empty());
+}
+
+#[test]
+fn commit_to_history_skips_empty() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.commit_to_history("".to_string());
+    assert!(app.command_history.is_empty());
+}
+
+#[test]
+fn commit_to_history_skips_duplicate_of_most_recent() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.commit_to_history("hello".to_string());
+    app.commit_to_history("hello".to_string());
+    assert_eq!(app.command_history.len(), 1);
+}
+
+#[test]
+fn commit_to_history_inserts_newest_first() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.commit_to_history("first".to_string());
+    app.commit_to_history("second".to_string());
+    assert_eq!(app.command_history.len(), 2);
+    assert_eq!(app.command_history[0], "second");
+    assert_eq!(app.command_history[1], "first");
+}
+
+#[test]
+fn navigate_history_up_loads_most_recent() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.command_history = vec!["cmd-2".into(), "cmd-1".into(), "cmd-0".into()];
+    app.input.text = "typing".to_string();
+    app.input.cursor = 6;
+
+    app.navigate_history_up();
+
+    assert_eq!(app.history_index, Some(0));
+    assert_eq!(app.input.text, "cmd-2");
+    assert_eq!(app.input.cursor, 5);
+    assert_eq!(app.saved_draft, "typing");
+}
+
+#[test]
+fn navigate_history_up_moves_to_older() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.command_history = vec!["c".into(), "b".into(), "a".into()];
+    app.history_index = Some(0);
+
+    app.navigate_history_up();
+    assert_eq!(app.history_index, Some(1));
+    assert_eq!(app.input.text, "b");
+
+    app.navigate_history_up();
+    assert_eq!(app.history_index, Some(2));
+    assert_eq!(app.input.text, "a");
+}
+
+#[test]
+fn navigate_history_up_stops_at_oldest() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.command_history = vec!["c".into(), "b".into()];
+    app.history_index = Some(1);
+
+    app.input.text = "b".to_string();
+    app.input.cursor = 1;
+
+    app.navigate_history_up();
+    assert_eq!(app.history_index, Some(1)); // no change
+    assert_eq!(app.input.text, "b");
+}
+
+#[test]
+fn navigate_history_up_empty_history_does_nothing() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input.text = "hello".to_string();
+
+    app.navigate_history_up();
+    assert_eq!(app.input.text, "hello");
+    assert!(app.history_index.is_none());
+}
+
+#[test]
+fn navigate_history_down_restores_draft() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.command_history = vec!["cmd".into()];
+    app.history_index = Some(0);
+    app.saved_draft = "draft".to_string();
+    app.input.text = "cmd".to_string();
+
+    app.navigate_history_down();
+
+    assert!(app.history_index.is_none());
+    assert_eq!(app.input.text, "draft");
+    assert!(app.saved_draft.is_empty());
+}
+
+#[test]
+fn navigate_history_down_moves_to_newer() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.command_history = vec!["c".into(), "b".into(), "a".into()];
+    app.history_index = Some(2);
+    app.input.text = "a".to_string();
+
+    app.navigate_history_down();
+    assert_eq!(app.history_index, Some(1));
+    assert_eq!(app.input.text, "b");
+
+    app.navigate_history_down();
+    assert_eq!(app.history_index, Some(0));
+    assert_eq!(app.input.text, "c");
+
+    app.navigate_history_down();
+    assert!(app.history_index.is_none()); // past newest
+}
+
+#[test]
+fn history_nav_resets_after_commit() {
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.command_history = vec!["old".into()];
+    app.history_index = Some(0);
+    app.saved_draft = "draft".to_string();
+
+    app.commit_to_history("new".to_string());
+
+    assert!(app.history_index.is_none());
+    assert!(app.saved_draft.is_empty());
+    assert_eq!(app.command_history[0], "new");
+}
+
+#[test]
+fn terminal_event_up_down_navigates_history() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.command_history = vec!["recent".into(), "older".into()];
+
+    // Press Up — loads most recent
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle up");
+    assert_eq!(app.input.text, "recent");
+    assert!(app.saved_draft.is_empty()); // nothing typed yet, draft is empty
+
+    // Press Up again — loads older
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle up");
+    assert_eq!(app.input.text, "older");
+
+    // Press Down — goes back to recent
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle down");
+    assert_eq!(app.input.text, "recent");
+
+    // Press Down — past newest, restores draft (empty)
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle down");
+    assert!(app.input.is_empty());
+    assert!(app.history_index.is_none());
+}
+
+#[test]
+fn terminal_event_enter_saves_to_history() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+    app.input.text = "test command".to_string();
+    app.input.cursor = 12;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(app.command_history.len(), 1);
+    assert_eq!(app.command_history[0], "test command");
+    assert!(app.input.is_empty());
+
+    // Verify the message was sent
+    let msg = rx.recv().expect("sent message");
+    assert_eq!(
+        msg,
+        ClientMessage::RunInput {
+            request_id: 1,
+            input: b"test command".to_vec(),
+        }
+    );
+}
+
+#[test]
+fn terminal_event_enter_empty_does_not_save_to_history() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert!(app.command_history.is_empty());
+}
+
 #[test]
 fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
     let (tx, _rx) = std::sync::mpsc::channel();

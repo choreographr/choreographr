@@ -204,9 +204,16 @@ fn handle_chat_event(
                 }
                 KeyCode::Char('q') if app.input.is_empty() => app.should_quit = true,
                 KeyCode::Esc => app.should_quit = true,
+                KeyCode::Up => {
+                    app.navigate_history_up();
+                }
+                KeyCode::Down => {
+                    app.navigate_history_down();
+                }
                 KeyCode::Enter => {
                     let line = app.input.text.trim().to_string();
                     app.input.clear();
+                    app.commit_to_history(line.clone());
                     match parse_input_line(
                         &line,
                         &mut app.next_request_id,

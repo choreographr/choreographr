@@ -7832,14 +7832,19 @@ name = "tai-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode 2.0.1",
  "crossterm",
+ "dirs 6.0.0",
  "image",
  "ratatui",
  "ratatui-image",
+ "redb",
  "resvg",
+ "serde",
  "signal-hook 0.3.18",
  "tai-client-core",
  "tai-proto",
+ "tempfile",
  "unicode-segmentation",
  "unicode-width",
 ]
