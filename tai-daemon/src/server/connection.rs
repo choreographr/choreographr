@@ -4,7 +4,7 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use tai_proto::{ClientMessage, DaemonMessage, ProtoError, read_message_sync, write_message_sync};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub(crate) fn client_thread(
     stream: UnixStream,
@@ -171,7 +171,7 @@ pub(crate) fn client_thread(
                         handle_get_credential_sync(&daemon_tx, &writer_tx, service);
                     }
                     _ => {
-                        debug!(
+                        warn!(
                             "unhandled client message: {:?}",
                             std::mem::discriminant(&msg)
                         );

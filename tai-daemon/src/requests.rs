@@ -273,7 +273,10 @@ fn execute_tool_with_timeout(
             &mut session.active_categories,
             &tool_call.arguments_json,
         );
-        persist_categories(db, session_id, &session.active_categories);
+        let _ = daemon_tx.send(crate::daemon::DaemonCommand::UpdateMetadata {
+            session_id,
+            metadata: session.to_metadata(),
+        });
         return ToolExecutionOutput {
             result: ToolResult {
                 content: result,
@@ -287,7 +290,10 @@ fn execute_tool_with_timeout(
             &mut session.active_categories,
             &tool_call.arguments_json,
         );
-        persist_categories(db, session_id, &session.active_categories);
+        let _ = daemon_tx.send(crate::daemon::DaemonCommand::UpdateMetadata {
+            session_id,
+            metadata: session.to_metadata(),
+        });
         return ToolExecutionOutput {
             result: ToolResult {
                 content: result,
@@ -707,19 +713,6 @@ fn persist_assistant_tool_use_sync(
     let idx = session.messages.len() as u32;
     session.messages.push(msg.clone());
     write_message_retry(db, session_id, idx, &msg).ok();
-}
-
-pub(crate) fn persist_categories(
-    db: &redb::Database,
-    session_id: u64,
-    active_categories: &std::collections::HashSet<String>,
-) {
-    if let Ok(Some(mut record)) = crate::db::read_session(db, session_id) {
-        record.active_categories = active_categories.iter().cloned().collect();
-        if let Err(e) = crate::db::write_session_retry(db, session_id, &record) {
-            tracing::error!("failed to persist active_categories for session {}: {e}", session_id);
-        }
-    }
 }
 
 fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMessage> {

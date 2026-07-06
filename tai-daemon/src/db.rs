@@ -291,6 +291,8 @@ pub fn next_session_id(db: &redb::Database) -> io::Result<u64> {
     Ok(current)
 }
 
+/// Retry a write_message on transient storage errors (e.g. I/O contention)
+/// with up to 3 retries and a 1ms backoff.
 pub fn write_message_retry(
     db: &redb::Database,
     session_id: u64,
@@ -301,19 +303,17 @@ pub fn write_message_retry(
     loop {
         match write_message(db, session_id, index, message) {
             Ok(()) => return Ok(()),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("database is busy") && attempts < 3 {
-                    attempts += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    continue;
-                }
-                return Err(e);
+            Err(_e) if attempts < 3 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
             }
+            Err(e) => return Err(e),
         }
     }
 }
 
+/// Retry a write_session on transient storage errors with up to 3 retries.
 pub fn write_session_retry(
     db: &redb::Database,
     session_id: u64,
@@ -323,15 +323,12 @@ pub fn write_session_retry(
     loop {
         match write_session(db, session_id, record) {
             Ok(()) => return Ok(()),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("database is busy") && attempts < 3 {
-                    attempts += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    continue;
-                }
-                return Err(e);
+            Err(_e) if attempts < 3 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
             }
+            Err(e) => return Err(e),
         }
     }
 }

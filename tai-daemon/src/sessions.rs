@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tai_proto::{DaemonMessage, SessionMessage, SessionStatus, SessionSummary};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub enum SessionCommand {
     RunInput {
@@ -68,6 +68,74 @@ pub struct SessionMetadata {
     pub active_categories: Vec<String>,
 }
 
+/// Convert a persisted record into metadata. New sessions loaded from the
+/// database are given [`SessionStatus::Sleeping`] by default; the caller can
+/// override if needed (e.g. `AttachSession` sets `Inactive`).
+impl From<SessionRecord> for SessionMetadata {
+    fn from(record: SessionRecord) -> Self {
+        SessionMetadata {
+            title: record.title,
+            selected_model: record.selected_model,
+            parent_session_id: record.parent_session_id,
+            cwd: record.cwd,
+            created_at: record.created_at,
+            message_count: record.message_count,
+            max_turns: record.max_turns,
+            status: SessionStatus::Sleeping,
+            active_categories: record.active_categories,
+        }
+    }
+}
+
+/// Convert metadata back to a record for storage (drops runtime-only fields).
+impl From<SessionMetadata> for SessionRecord {
+    fn from(meta: SessionMetadata) -> Self {
+        SessionRecord {
+            title: meta.title,
+            selected_model: meta.selected_model,
+            parent_session_id: meta.parent_session_id,
+            cwd: meta.cwd,
+            max_turns: meta.max_turns,
+            message_count: meta.message_count,
+            created_at: meta.created_at,
+            active_categories: meta.active_categories,
+        }
+    }
+}
+
+/// Capture a snapshot of `SessionState` as metadata for the daemon's
+/// in-memory index or for sending through the command channel.
+///
+/// Fields that don't exist in [`SessionMetadata`] (subscribers, active
+/// requests, message contents, etc.) are dropped. The `PathBuf` CWD is
+/// stringified.
+impl From<&SessionState> for SessionMetadata {
+    fn from(state: &SessionState) -> Self {
+        SessionMetadata {
+            title: state.title.clone(),
+            selected_model: state.selected_model.clone(),
+            parent_session_id: state.parent_session_id,
+            cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
+            created_at: state.created_at,
+            message_count: state.messages.len() as u32,
+            max_turns: state.max_turns,
+            status: state.status.clone(),
+            active_categories: state.active_categories.iter().cloned().collect(),
+        }
+    }
+}
+
+/// Convert session state to a persistable record.
+///
+/// Delegates through [`SessionMetadata`] so that the field-level mapping
+/// lives in one place.
+impl From<&SessionState> for SessionRecord {
+    fn from(state: &SessionState) -> Self {
+        let meta: SessionMetadata = state.into();
+        meta.into()
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionSnapshot {
     pub title: Option<String>,
@@ -111,6 +179,17 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Produce metadata suitable for the daemon's in-memory index or the
+    /// command channel. Calls [`From<&SessionState> for SessionMetadata`].
+    pub fn to_metadata(&self) -> SessionMetadata {
+        self.into()
+    }
+
+    /// Produce a persistable record. Calls [`From<&SessionState> for SessionRecord`].
+    pub fn to_record(&self) -> SessionRecord {
+        self.into()
+    }
+
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             title: self.title.clone(),
@@ -253,17 +332,7 @@ pub fn session_main(
 
     let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
         session_id,
-        metadata: SessionMetadata {
-            title: state.title.clone(),
-            selected_model: state.selected_model.clone(),
-            parent_session_id: state.parent_session_id,
-            cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
-            created_at: state.created_at,
-            message_count: state.messages.len() as u32,
-            max_turns: state.max_turns,
-            status: state.status.clone(),
-            active_categories: state.active_categories.iter().cloned().collect(),
-        },
+        metadata: state.to_metadata(),
     });
 
     info!("session {} started", session_id);
@@ -495,17 +564,7 @@ fn process_command(
             broadcast(&state.subscribers, DaemonMessage::ModelSelected { model: model.clone() });
             let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
                 session_id,
-                metadata: SessionMetadata {
-                    title: state.title.clone(),
-                    selected_model: state.selected_model.clone(),
-                    parent_session_id: state.parent_session_id,
-                    cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
-                    created_at: state.created_at,
-                    message_count: state.messages.len() as u32,
-                    max_turns: state.max_turns,
-                    status: state.status.clone(),
-                    active_categories: state.active_categories.iter().cloned().collect(),
-                },
+                metadata: state.to_metadata(),
             });
             false
         }
@@ -513,17 +572,7 @@ fn process_command(
             state.status = new_status.clone();
             let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
                 session_id,
-                metadata: SessionMetadata {
-                    title: state.title.clone(),
-                    selected_model: state.selected_model.clone(),
-                    parent_session_id: state.parent_session_id,
-                    cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
-                    created_at: state.created_at,
-                    message_count: state.messages.len() as u32,
-                    max_turns: state.max_turns,
-                    status: state.status.clone(),
-                    active_categories: state.active_categories.iter().cloned().collect(),
-                },
+                metadata: state.to_metadata(),
             });
             broadcast(&state.subscribers, DaemonMessage::SessionStatusChanged {
                 session_id,
@@ -589,17 +638,7 @@ fn process_command(
             state.status = SessionStatus::Inactive;
             let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
                 session_id,
-                metadata: SessionMetadata {
-                    title: state.title.clone(),
-                    selected_model: state.selected_model.clone(),
-                    parent_session_id: state.parent_session_id,
-                    cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
-                    created_at: state.created_at,
-                    message_count: state.messages.len() as u32,
-                    max_turns: state.max_turns,
-                    status: state.status.clone(),
-                    active_categories: state.active_categories.iter().cloned().collect(),
-                },
+                metadata: state.to_metadata(),
             });
             broadcast(
                 &state.subscribers,
@@ -743,18 +782,148 @@ fn persist_and_exit(
     session_id: u64,
     daemon_tx: &mpsc::Sender<DaemonCommand>,
 ) {
-    let record = SessionRecord {
-        title: state.title.clone(),
-        selected_model: state.selected_model.clone(),
-        parent_session_id: state.parent_session_id,
-        cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
-        max_turns: state.max_turns,
-        message_count: state.messages.len() as u32,
-        created_at: state.created_at,
-        active_categories: state.active_categories.iter().cloned().collect(),
-    };
+    let record: SessionRecord = state.to_record();
     if let Err(e) = write_session_retry(db, session_id, &record) {
-        tracing::error!("persist_and_exit: failed to persist session {}: {e}", session_id);
+        error!("persist_and_exit: failed to persist session {}: {e}", session_id);
     }
     let _ = daemon_tx.send(DaemonCommand::SessionExited { session_id });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::SessionRecord;
+    use std::collections::HashMap;
+    use tai_proto::{SessionMessage, SessionStatus};
+
+    fn test_record() -> SessionRecord {
+        SessionRecord {
+            title: Some("test session".into()),
+            selected_model: Some("gpt-4".into()),
+            parent_session_id: None,
+            cwd: Some("/tmp".into()),
+            max_turns: Some(10),
+            message_count: 3,
+            created_at: 1000,
+            active_categories: vec!["core".into(), "shell".into()],
+        }
+    }
+
+    fn test_state() -> SessionState {
+        SessionState {
+            title: Some("test session".into()),
+            selected_model: Some("gpt-4".into()),
+            parent_session_id: None,
+            cwd: Some(std::path::PathBuf::from("/tmp")),
+            max_turns: Some(10),
+            created_at: 1000,
+            messages: vec![
+                SessionMessage::SystemText { content: "prompt".into() },
+                SessionMessage::UserText { content: "hello".into() },
+                SessionMessage::AssistantText { content: "hi".into() },
+            ],
+            subscribers: HashMap::new(),
+            active_requests: HashMap::new(),
+            context_fingerprint: None,
+            context_file_paths: Vec::new(),
+            context_message_index: None,
+            status: SessionStatus::Inactive,
+            active_categories: ["core".into(), "shell".into()].into(),
+        }
+    }
+
+    #[test]
+    fn session_record_to_metadata() {
+        let record = test_record();
+        let meta: SessionMetadata = record.clone().into();
+        // Default status should be Sleeping
+        assert_eq!(meta.status, SessionStatus::Sleeping);
+        assert_eq!(meta.title, record.title);
+        assert_eq!(meta.selected_model, record.selected_model);
+        assert_eq!(meta.cwd, record.cwd);
+        assert_eq!(meta.message_count, record.message_count);
+        assert_eq!(meta.active_categories, record.active_categories);
+    }
+
+    #[test]
+    fn session_metadata_to_record() {
+        let meta = SessionMetadata {
+            title: Some("meta title".into()),
+            selected_model: Some("claude-3".into()),
+            parent_session_id: Some(42),
+            cwd: Some("/home".into()),
+            created_at: 2000,
+            message_count: 7,
+            max_turns: Some(20),
+            status: SessionStatus::Inactive,
+            active_categories: vec!["git".into()],
+        };
+        let record: SessionRecord = meta.clone().into();
+        // Status field does not exist in record
+        assert_eq!(record.title, meta.title);
+        assert_eq!(record.selected_model, meta.selected_model);
+        assert_eq!(record.active_categories, meta.active_categories);
+    }
+
+    #[test]
+    fn session_record_round_trip() {
+        let record = test_record();
+        let meta: SessionMetadata = record.clone().into();
+        let record2: SessionRecord = meta.into();
+        assert_eq!(record.title, record2.title);
+        assert_eq!(record.selected_model, record2.selected_model);
+        assert_eq!(record.parent_session_id, record2.parent_session_id);
+        assert_eq!(record.cwd, record2.cwd);
+        assert_eq!(record.max_turns, record2.max_turns);
+        assert_eq!(record.message_count, record2.message_count);
+        assert_eq!(record.created_at, record2.created_at);
+        assert_eq!(record.active_categories, record2.active_categories);
+    }
+
+    #[test]
+    fn session_state_to_metadata() {
+        let state = test_state();
+        let meta: SessionMetadata = (&state).into();
+        assert_eq!(meta.title, state.title);
+        assert_eq!(meta.selected_model, state.selected_model);
+        assert_eq!(meta.message_count, 3);
+        assert_eq!(meta.status, state.status);
+        assert_eq!(meta.cwd, Some("/tmp".into()));
+        assert_eq!(meta.parent_session_id, state.parent_session_id);
+    }
+
+    #[test]
+    fn session_state_to_record() {
+        let state = test_state();
+        let record: SessionRecord = (&state).into();
+        assert_eq!(record.title, state.title);
+        assert_eq!(record.selected_model, state.selected_model);
+        assert_eq!(record.message_count, 3);
+        assert_eq!(record.cwd, Some("/tmp".into()));
+    }
+
+    #[test]
+    fn session_state_to_metadata_method() {
+        let state = test_state();
+        let meta = state.to_metadata();
+        assert_eq!(meta.title, state.title);
+        assert_eq!(meta.message_count, 3);
+    }
+
+    #[test]
+    fn session_state_to_record_method() {
+        let state = test_state();
+        let record = state.to_record();
+        assert_eq!(record.title, state.title);
+        assert_eq!(record.message_count, 3);
+    }
+
+    #[test]
+    fn record_round_trip_preserves_active_categories() {
+        let record = test_record();
+        let meta: SessionMetadata = record.clone().into();
+        let record2: SessionRecord = meta.into();
+        assert_eq!(record.active_categories, record2.active_categories);
+        assert_eq!(record2.active_categories.len(), 2);
+    }
 }

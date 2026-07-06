@@ -5,8 +5,7 @@ use std::sync::mpsc;
 use tai_daemon::daemon::DaemonState;
 use tai_daemon::db::read_all_sessions;
 use tai_daemon::openai::load_service_config;
-use tai_daemon::SessionMetadata;
-use tai_proto::{SessionStatus, socket_path};
+use tai_proto::socket_path;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -47,6 +46,9 @@ fn main() -> anyhow::Result<()> {
 
     // Determine log level: RUST_LOG env var takes precedence, otherwise use CLI flags
     let log_level = if std::env::var("RUST_LOG").is_ok() {
+        if cli.verbose > 0 || cli.quiet > 0 {
+            warn!("RUST_LOG is set; -v/-q CLI flags are ignored");
+        }
         None // Use RUST_LOG as-is
     } else {
         let level = match (cli.verbose, cli.quiet) {
@@ -82,20 +84,7 @@ fn main() -> anyhow::Result<()> {
     match read_all_sessions(&db) {
         Ok(sessions) => {
             for (id, record) in sessions {
-                session_metadata.insert(
-                    id,
-                    SessionMetadata {
-                        title: record.title,
-                        selected_model: record.selected_model,
-                        parent_session_id: record.parent_session_id,
-                        cwd: record.cwd,
-                        created_at: record.created_at,
-                        message_count: record.message_count,
-                        max_turns: record.max_turns,
-                        status: SessionStatus::Sleeping,
-                        active_categories: record.active_categories,
-                    },
-                );
+                session_metadata.insert(id, record.into());
             }
         }
         Err(e) => {
