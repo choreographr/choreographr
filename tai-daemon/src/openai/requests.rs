@@ -325,9 +325,10 @@ fn chat_completions_request(
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let retry = RetryConfig::from_service_config(config);
+    let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages: vec![ChatRequestMessage::simple("user", prompt.to_string())],
+        messages: &messages,
         tools: None,
         stream: false,
         stream_options: None,
@@ -375,8 +376,8 @@ fn chat_completions_request_with_tools(
     let retry = RetryConfig::from_service_config(config);
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages: messages.to_vec(),
-        tools: Some(tools.to_vec()),
+        messages,
+        tools: Some(tools),
         stream: false,
         stream_options: None,
         max_tokens: max_tokens_field,
@@ -453,9 +454,10 @@ where
             MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let retry = RetryConfig::from_service_config(config);
+    let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
-        messages: vec![ChatRequestMessage::simple("user", prompt.to_string())],
+        messages: &messages,
         tools: None,
         stream: true,
         stream_options: Some(ChatCompletionsStreamOptions {

@@ -92,9 +92,10 @@ where
     M: Serialize,
 {
     model: &'a str,
-    messages: Vec<M>,
+    #[serde(bound(serialize = "M: Serialize"))]
+    messages: &'a [M],
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ChatToolDefinition>>,
+    tools: Option<&'a [ChatToolDefinition]>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
