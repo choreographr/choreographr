@@ -1,4 +1,12 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+use ratatui::style::Style;
+use ratatui::text::Span;
+use syntect::easy::HighlightLines;
 use tai_client_core::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
+
+use crate::syntax::{default_syntax_set, highlight_theme, language_for_path, to_ratatui_color};
 
 /// Check if text looks like a unified diff.
 /// Scans the full text (tool output may have a metadata prefix on the first line).
@@ -95,9 +103,24 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
 }
 
 /// Number of display rows a diff takes up in side-by-side mode.
-/// Delegates to `build_diff_panes` to avoid duplicating the layout logic.
+/// Computes the height directly from the diff structure without building
+/// the full pane rows (which would trigger expensive syntax highlighting).
 pub fn diff_display_height(diffs: &[FileDiff]) -> usize {
-    build_diff_panes(diffs).len().max(1)
+    if diffs.is_empty() {
+        return 1;
+    }
+    diffs
+        .iter()
+        .map(|file| {
+            // 1 for the file header row, 1 per hunk header, plus all hunk lines
+            1usize + file
+                .hunks
+                .iter()
+                .map(|h| 1 + h.lines.len())
+                .sum::<usize>()
+        })
+        .sum::<usize>()
+        .max(1)
 }
 
 /// Result of building aligned left/right panes for a single hunk.
@@ -106,20 +129,162 @@ pub struct DiffPaneRow {
     pub right_content: String,
     pub left_kind: DiffLineKind,
     pub right_kind: DiffLineKind,
+    /// Syntax-highlighted spans for the left pane, populated by `highlight_diff_panes`.
+    pub left_spans: Vec<Span<'static>>,
+    /// Syntax-highlighted spans for the right pane, populated by `highlight_diff_panes`.
+    pub right_spans: Vec<Span<'static>>,
+}
+
+/// Create a single default-styled span from plain text content.
+fn content_spans(content: &str) -> Vec<Span<'static>> {
+    vec![Span::styled(content.to_string(), Style::default())]
+}
+
+/// True if the row content looks like diff metadata (file header or hunk header)
+/// rather than actual source code. Syntax highlighting is skipped for these rows.
+fn is_meta_line(content: &str) -> bool {
+    content.starts_with("--- ") || content.starts_with("+++ ") || content.starts_with("@@")
+}
+
+/// Highlight a block of code (joined lines) through syntect, returning
+/// per-line vectors of styled spans.  Results are memoized in a bounded
+/// global cache so that re-rendering the same diff on the next frame does
+/// not re-run syntect.
+fn highlight_lines_cached(
+    lang_token: &str,
+    code: &str,
+) -> Vec<Vec<Span<'static>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), Vec<Vec<Span<'static>>>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let key = (lang_token.to_string(), code.to_string());
+
+    // Fast path
+    {
+        let guard = cache.lock().expect("highlight cache lock");
+        if let Some(cached) = guard.get(&key) {
+            return cached.clone();
+        }
+    }
+
+    let ss = default_syntax_set();
+    let theme = highlight_theme();
+
+    let syntax = ss
+        .find_syntax_by_token(lang_token)
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut result: Vec<Vec<Span<'static>>> = Vec::new();
+
+    for line_str in code.split('\n') {
+        if let Ok(ranges) = highlighter.highlight_line(line_str, ss) {
+            result.push(
+                ranges
+                    .into_iter()
+                    .map(|(style, text)| {
+                        Span::styled(
+                            text.to_string(),
+                            Style::default().fg(to_ratatui_color(style.foreground)),
+                        )
+                    })
+                    .collect(),
+            );
+        } else {
+            // Fallback: emit the whole line as a single default-styled span.
+            result.push(vec![Span::styled(
+                line_str.to_string(),
+                Style::default(),
+            )]);
+        }
+    }
+
+    // Bounded cache (200 entries); silently drop new entries when full so the
+    // most frequently seen diffs stay warm.
+    const MAX_ENTRIES: usize = 200;
+    {
+        let mut guard = cache.lock().expect("highlight cache lock");
+        if guard.len() < MAX_ENTRIES {
+            guard.insert(key, result.clone());
+        }
+    }
+
+    result
+}
+
+/// Apply syntax highlighting to all code rows in a diff file's pane rows.
+///
+/// Implements the "two-bucket" approach used by opencode's @pierre/diffs:
+/// all lines on the left side (deletions + context) are concatenated into one
+/// pseudo-file and highlighted as a whole; similarly for lines on the right
+/// side (additions + context). This gives syntect the sequential context it
+/// needs for accurate tokenization across adjacent lines. The highlighted
+/// per-line spans are then mapped back onto the corresponding `DiffPaneRow`.
+///
+/// Rows that are diff metadata (file headers, hunk headers) are left as plain
+/// text.
+pub fn highlight_diff_panes(rows: &mut [DiffPaneRow], file: &FileDiff) {
+    let Some(lang_token) = language_for_path(&file.new_path)
+        .or_else(|| language_for_path(&file.old_path))
+    else {
+        return;
+    };
+
+    // --- Left bucket: deletions + context (non-meta lines with left content) ---
+    let mut left_rows: Vec<usize> = Vec::new();
+    let mut left_lines: Vec<&str> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if !row.left_content.is_empty() && !is_meta_line(&row.left_content) {
+            left_rows.push(i);
+            left_lines.push(&row.left_content);
+        }
+    }
+    if !left_lines.is_empty() {
+        let code = left_lines.join("\n");
+        let highlighted = highlight_lines_cached(lang_token, &code);
+        for (idx, line_spans) in left_rows.iter().zip(highlighted.iter()) {
+            rows[*idx].left_spans = line_spans.clone();
+        }
+    }
+
+    // --- Right bucket: additions + context (non-meta lines with right content) ---
+    let mut right_rows: Vec<usize> = Vec::new();
+    let mut right_lines: Vec<&str> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        if !row.right_content.is_empty() && !is_meta_line(&row.right_content) {
+            right_rows.push(i);
+            right_lines.push(&row.right_content);
+        }
+    }
+    if !right_lines.is_empty() {
+        let code = right_lines.join("\n");
+        let highlighted = highlight_lines_cached(lang_token, &code);
+        for (idx, line_spans) in right_rows.iter().zip(highlighted.iter()) {
+            rows[*idx].right_spans = line_spans.clone();
+        }
+    }
 }
 
 /// Build aligned left/right pane rows from parsed diffs.
 /// Each entry in the returned vec is one row in the side-by-side display.
-/// Returns (left_rows, right_rows) where both have the same length.
+/// After building, syntax highlighting is applied to code rows via the
+/// two-bucket algorithm (see `highlight_diff_panes`).
 pub fn build_diff_panes(diffs: &[FileDiff]) -> Vec<DiffPaneRow> {
     let mut rows = Vec::new();
     for file in diffs {
+        // Record the starting index within this file's rows so we can pass
+        // just the right slice to highlight_diff_panes.
+        let file_start = rows.len();
+
         // File header rows (rendered full-width, not in panes, but we include empty rows for spacing)
         rows.push(DiffPaneRow {
             left_content: format!("--- a/{}", file.old_path),
             right_content: format!("+++ b/{}", file.new_path),
             left_kind: DiffLineKind::Context,
             right_kind: DiffLineKind::Context,
+            left_spans: Vec::new(),
+            right_spans: Vec::new(),
         });
         for hunk in &file.hunks {
             // Hunk header row
@@ -128,6 +293,8 @@ pub fn build_diff_panes(diffs: &[FileDiff]) -> Vec<DiffPaneRow> {
                 right_content: hunk.header.clone(),
                 left_kind: DiffLineKind::Context,
                 right_kind: DiffLineKind::Context,
+                left_spans: Vec::new(),
+                right_spans: Vec::new(),
             });
             for line in &hunk.lines {
                 match line.kind {
@@ -137,6 +304,8 @@ pub fn build_diff_panes(diffs: &[FileDiff]) -> Vec<DiffPaneRow> {
                             right_content: line.content.clone(),
                             left_kind: DiffLineKind::Context,
                             right_kind: DiffLineKind::Context,
+                            left_spans: Vec::new(),
+                            right_spans: Vec::new(),
                         });
                     }
                     DiffLineKind::Deletion => {
@@ -145,6 +314,8 @@ pub fn build_diff_panes(diffs: &[FileDiff]) -> Vec<DiffPaneRow> {
                             right_content: String::new(),
                             left_kind: DiffLineKind::Deletion,
                             right_kind: DiffLineKind::Context,
+                            left_spans: Vec::new(),
+                            right_spans: Vec::new(),
                         });
                     }
                     DiffLineKind::Addition => {
@@ -153,18 +324,36 @@ pub fn build_diff_panes(diffs: &[FileDiff]) -> Vec<DiffPaneRow> {
                             right_content: line.content.clone(),
                             left_kind: DiffLineKind::Context,
                             right_kind: DiffLineKind::Addition,
+                            left_spans: Vec::new(),
+                            right_spans: Vec::new(),
                         });
                     }
                 }
             }
         }
+
+        // Apply syntax highlighting to the rows that belong to this file.
+        highlight_diff_panes(&mut rows[file_start..], file);
     }
+
+    // Fill any empty left/right spans with default plain-text spans so that
+    // consumers always have at least one span per side.
+    for row in &mut rows {
+        if row.left_spans.is_empty() {
+            row.left_spans = content_spans(&row.left_content);
+        }
+        if row.right_spans.is_empty() {
+            row.right_spans = content_spans(&row.right_content);
+        }
+    }
+
     rows
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     // ── is_diff_text ──
 
@@ -297,5 +486,107 @@ mod tests {
         let ctx = rows.iter().find(|r| r.left_kind == DiffLineKind::Context && r.left_content == "ctx").unwrap();
         assert_eq!(ctx.left_content, "ctx");
         assert_eq!(ctx.right_content, "ctx");
+    }
+
+    // ── content_spans ──
+
+    #[test]
+    fn content_spans_creates_single_default_span() {
+        let spans = content_spans("hello");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "hello");
+        assert_eq!(spans[0].style, Style::default());
+    }
+
+    #[test]
+    fn content_spans_empty_string() {
+        let spans = content_spans("");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "");
+    }
+
+    // ── highlight_diff_panes ──
+
+    #[test]
+    fn highlighting_applies_syntax_colors_to_rust_diffs() {
+        // Diff of a .rs file with a recognizable keyword
+        let text = "diff --git a/main.rs b/main.rs\n--- a/main.rs\n+++ b/main.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}\n";
+        let diffs = parse_diff(text);
+        let rows = build_diff_panes(&diffs);
+
+        // Build expects at least 4 rows: file header, hunk header, deletion, addition
+        assert!(rows.len() >= 4);
+
+        // Deletion line (index 2) should have syntax-colored spans
+        let del = rows.iter().find(|r| r.left_kind == DiffLineKind::Deletion).unwrap();
+        assert!(
+            del.left_spans.len() > 1 || del.left_spans[0].style != Style::default(),
+            "rust deletion should have multiple colored spans"
+        );
+        let has_colour = del.left_spans.iter().any(|s| {
+            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
+        });
+        assert!(has_colour, "rust deletion should have coloured spans");
+
+        // Addition line (index 3) should also have syntax-colored spans
+        let add = rows.iter().find(|r| r.right_kind == DiffLineKind::Addition).unwrap();
+        let has_colour = add.right_spans.iter().any(|s| {
+            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
+        });
+        assert!(has_colour, "rust addition should have coloured spans");
+    }
+
+    #[test]
+    fn highlighting_skips_unknown_extension() {
+        let text = "diff --git a/file.xyz b/file.xyz\n--- a/file.xyz\n+++ b/file.xyz\n@@ -1 +1 @@\n-old\n+new\n";
+        let diffs = parse_diff(text);
+        let rows = build_diff_panes(&diffs);
+        // highlight_diff_panes is called inside build_diff_panes; for unknown
+        // extensions the spans should remain as single default-styled spans.
+        let del = rows.iter().find(|r| r.left_kind == DiffLineKind::Deletion).unwrap();
+        assert_eq!(del.left_spans.len(), 1);
+        assert_eq!(del.left_spans[0].style, Style::default());
+    }
+
+    #[test]
+    fn highlighting_handles_empty_hunks() {
+        let text = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -0,0 +1,1 @@\n+fn main() {}\n";
+        let diffs = parse_diff(text);
+        let rows = build_diff_panes(&diffs);
+        let add = rows.iter().find(|r| r.right_kind == DiffLineKind::Addition).unwrap();
+        let has_colour = add.right_spans.iter().any(|s| {
+            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
+        });
+        assert!(has_colour, "rust addition in new file should have coloured spans");
+    }
+
+    #[test]
+    fn highlighting_context_lines_get_coloured() {
+        let text = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1,3 +1,3 @@\n fn old() {}\n-foo\n+bar\n fn other() {}\n";
+        let diffs = parse_diff(text);
+        let rows = build_diff_panes(&diffs);
+        // Context lines (fn old() {} and fn other() {}) should have syntax colours
+        let ctx_lines: Vec<&DiffPaneRow> = rows.iter().filter(|r| {
+            r.left_kind == DiffLineKind::Context && !r.left_content.is_empty()
+                && !r.left_content.starts_with("---") && !r.left_content.starts_with("@@")
+        }).collect();
+        assert!(ctx_lines.len() >= 2, "should have at least 2 context code lines");
+        for ctx in &ctx_lines {
+            let has_colour = ctx.left_spans.iter().any(|s| {
+                matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
+            });
+            assert!(has_colour, "context line '{}' should have coloured spans", ctx.left_content);
+        }
+    }
+
+    // ── is_meta_line ──
+
+    #[test]
+    fn meta_line_detection() {
+        assert!(is_meta_line("--- a/file.rs"));
+        assert!(is_meta_line("+++ b/file.rs"));
+        assert!(is_meta_line("@@ -1 +1 @@"));
+        assert!(!is_meta_line("fn main() {}"));
+        assert!(!is_meta_line(""));
     }
 }

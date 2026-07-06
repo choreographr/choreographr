@@ -541,8 +541,8 @@ fn render_history_diff(
     let mut right_spans: Vec<Vec<ratatui::text::Span>> = Vec::with_capacity(visible_rows.len());
 
     for row in &visible_rows {
-        left_spans.push(diff_cell_spans(&row.left_content, row.left_kind, pane_width, true));
-        right_spans.push(diff_cell_spans(&row.right_content, row.right_kind, pane_width, false));
+        left_spans.push(diff_cell_spans(&row.left_spans, row.left_kind, pane_width, true));
+        right_spans.push(diff_cell_spans(&row.right_spans, row.right_kind, pane_width, false));
     }
 
     let separator_style = Style::default().fg(Color::DarkGray);
@@ -568,57 +568,103 @@ fn render_history_diff(
     *rows_to_skip = 0;
 }
 
-/// Build a single-cell ratatui `Span` for one side of the side-by-side diff.
+/// Return the diff foreground colour for a given line kind and side.
+/// Used as a fallback when no syntax highlighting is present.
+fn diff_fg(kind: DiffLineKind, is_left: bool) -> Option<Color> {
+    match (kind, is_left) {
+        (DiffLineKind::Deletion, true) => Some(Color::Red),
+        (DiffLineKind::Addition, false) => Some(Color::Green),
+        _ => None,
+    }
+}
+
+/// Apply diff background styling to pre-computed syntax-highlighted spans.
 ///
+/// * Overlays the red (deletion) or green (addition) background on each span
+///   while preserving the syntax foreground colour from syntect.
+/// * Pads with spaces when the content is narrower than the pane so the
+///   background colour fills the entire cell.
 /// * Truncates content that exceeds the pane width, appending `…`.
-/// * Pads shorter content with spaces for consistent background coloring.
-/// * Applies red background + foreground for deletions on the left pane,
-///   green background + foreground for additions on the right pane,
-///   and default styling for context lines.
 fn diff_cell_spans(
-    content: &str,
+    spans: &[ratatui::text::Span<'static>],
     kind: DiffLineKind,
     pane_width: u16,
     is_left: bool,
-) -> Vec<ratatui::text::Span<'_>> {
+) -> Vec<ratatui::text::Span<'static>> {
     let pane_width = pane_width as usize;
-    let truncated = if content.len() > pane_width {
-        let mut s: String = content.chars().take(pane_width.saturating_sub(1)).collect();
-        s.push('…');
-        s
+
+    let diff_bg = match (kind, is_left) {
+        (DiffLineKind::Deletion, true) => Some(Color::Rgb(80, 0, 0)),
+        (DiffLineKind::Addition, false) => Some(Color::Rgb(0, 80, 0)),
+        _ => None,
+    };
+
+    // Apply background to each span while keeping the syntax foreground.
+    // When no syntax foreground is set (plain text), fall back to the diff
+    // foreground colour (red for deletions, green for additions) so that
+    // header / hunk-header rows and plain-text file types still get coloured.
+    let styled: Vec<ratatui::text::Span<'static>> = spans
+        .iter()
+        .map(|s| {
+            let style = match diff_bg {
+                Some(bg) => ratatui::style::Style {
+                    fg: s.style.fg.or_else(|| diff_fg(kind, is_left)),
+                    ..ratatui::style::Style::default()
+                }
+                .bg(bg),
+                None => s.style,
+            };
+            ratatui::text::Span::styled(s.content.clone(), style)
+        })
+        .collect();
+
+    let total: usize = styled
+        .iter()
+        .map(|s| display_width(&s.content))
+        .sum();
+
+    if total > pane_width {
+        // Truncate spans to fit pane_width, preserving syntax colours on
+        // the remaining content and appending `…` at the end.
+        let mut result = Vec::new();
+        let mut remaining = pane_width.saturating_sub(1);
+        for span in styled {
+            let w = display_width(&span.content);
+            if w <= remaining {
+                result.push(span);
+                remaining -= w;
+            } else if remaining > 0 {
+                let truncated: String = span.content.chars().take(remaining).collect();
+                result.push(ratatui::text::Span::styled(truncated, span.style));
+                break;
+            } else {
+                break;
+            }
+        }
+        let ellipsis_style = diff_bg
+            .map_or(Style::default(), |b| Style::default().bg(b));
+        result.push(ratatui::text::Span::styled("…".to_string(), ellipsis_style));
+        result
     } else {
-        let mut s = content.to_string();
-        // pad to fill the pane width for consistent background coloring
-        let w = display_width(&s);
-        if w < pane_width {
-            s.push_str(&" ".repeat(pane_width.saturating_sub(w)));
-        }
-        s
-    };
-
-    let style = match kind {
-        DiffLineKind::Deletion => {
-            if is_left {
-                Style::default()
-                    .fg(Color::Red)
-                    .bg(Color::Rgb(80, 0, 0))
-            } else {
-                Style::default()
-            }
-        }
-        DiffLineKind::Addition => {
-            if !is_left {
-                Style::default()
-                    .fg(Color::Green)
-                    .bg(Color::Rgb(0, 80, 0))
-            } else {
-                Style::default()
-            }
-        }
-        DiffLineKind::Context => Style::default(),
-    };
-
-    vec![ratatui::text::Span::styled(truncated, style)]
+        // Always pad to pane_width so the `│` separator stays at a fixed
+        // column (every row's left and right cells must have the same byte
+        // width).  The padding span uses the diff background when present,
+        // otherwise default style.
+        let mut result = styled;
+        let pad_style = diff_bg
+            .map_or(Style::default(), |b| {
+                ratatui::style::Style {
+                    fg: None,
+                    ..ratatui::style::Style::default()
+                }
+                .bg(b)
+            });
+        result.push(ratatui::text::Span::styled(
+            " ".repeat(pane_width.saturating_sub(total)),
+            pad_style,
+        ));
+        result
+    }
 }
 
 #[cfg(test)]
@@ -992,9 +1038,16 @@ mod tests {
 
     // ── diff_cell_spans tests ──
 
+    fn span_from_text(text: &str) -> Vec<ratatui::text::Span<'static>> {
+        vec![ratatui::text::Span::styled(
+            text.to_string(),
+            Style::default(),
+        )]
+    }
+
     #[test]
     fn diff_cell_spans_pads_short_content() {
-        let spans = diff_cell_spans("hi", DiffLineKind::Context, 10, true);
+        let spans = diff_cell_spans(&span_from_text("hi"), DiffLineKind::Context, 10, true);
         let text = spans[0].content.trim_end();
         assert!(text.starts_with("hi"), "content='{text}' should start with 'hi'");
     }
@@ -1002,15 +1055,15 @@ mod tests {
     #[test]
     fn diff_cell_spans_truncates_long_content() {
         let long = "a".repeat(20);
-        let spans = diff_cell_spans(&long, DiffLineKind::Context, 5, true);
-        // truncated to 4 chars + '…' (which is 3 bytes, so byte length = 7)
-        assert_eq!(spans[0].content.chars().count(), 5);
-        assert!(spans[0].content.ends_with('…'));
+        let spans = diff_cell_spans(&span_from_text(&long), DiffLineKind::Context, 5, true);
+        // truncated to 4 chars in the first span + '…' as a separate span = 2 spans
+        assert_eq!(spans[0].content.chars().count(), 4);
+        assert_eq!(spans[1].content, "…");
     }
 
     #[test]
     fn diff_cell_spans_left_deletion_has_red_style() {
-        let spans = diff_cell_spans("del", DiffLineKind::Deletion, 10, true);
+        let spans = diff_cell_spans(&span_from_text("del"), DiffLineKind::Deletion, 10, true);
         let style = spans[0].style;
         assert_eq!(style.fg, Some(Color::Red));
         assert_eq!(style.bg, Some(Color::Rgb(80, 0, 0)));
@@ -1018,13 +1071,13 @@ mod tests {
 
     #[test]
     fn diff_cell_spans_right_deletion_has_default_style() {
-        let spans = diff_cell_spans("del", DiffLineKind::Deletion, 10, false);
+        let spans = diff_cell_spans(&span_from_text("del"), DiffLineKind::Deletion, 10, false);
         assert_eq!(spans[0].style, Style::default());
     }
 
     #[test]
     fn diff_cell_spans_right_addition_has_green_style() {
-        let spans = diff_cell_spans("add", DiffLineKind::Addition, 10, false);
+        let spans = diff_cell_spans(&span_from_text("add"), DiffLineKind::Addition, 10, false);
         let style = spans[0].style;
         assert_eq!(style.fg, Some(Color::Green));
         assert_eq!(style.bg, Some(Color::Rgb(0, 80, 0)));
@@ -1032,15 +1085,62 @@ mod tests {
 
     #[test]
     fn diff_cell_spans_left_addition_has_default_style() {
-        let spans = diff_cell_spans("add", DiffLineKind::Addition, 10, true);
+        let spans = diff_cell_spans(&span_from_text("add"), DiffLineKind::Addition, 10, true);
         assert_eq!(spans[0].style, Style::default());
     }
 
     #[test]
     fn diff_cell_spans_context_has_default_style() {
-        let spans = diff_cell_spans("ctx", DiffLineKind::Context, 10, true);
+        let spans = diff_cell_spans(&span_from_text("ctx"), DiffLineKind::Context, 10, true);
         assert_eq!(spans[0].style, Style::default());
-        let spans = diff_cell_spans("ctx", DiffLineKind::Context, 10, false);
+        let spans = diff_cell_spans(&span_from_text("ctx"), DiffLineKind::Context, 10, false);
         assert_eq!(spans[0].style, Style::default());
+    }
+
+    #[test]
+    fn diff_cell_spans_preserves_syntax_fg_on_deletion() {
+        // Simulate a syntax-highlighted span with a non-default fg colour
+        let input = vec![ratatui::text::Span::styled(
+            "fn".to_string(),
+            Style::default().fg(Color::Rgb(200, 100, 0)),
+        )];
+        let spans = diff_cell_spans(&input, DiffLineKind::Deletion, 10, true);
+        assert_eq!(
+            spans[0].style.fg,
+            Some(Color::Rgb(200, 100, 0)),
+            "syntax foreground should be preserved on deletion"
+        );
+        assert_eq!(
+            spans[0].style.bg,
+            Some(Color::Rgb(80, 0, 0)),
+            "diff background should be applied"
+        );
+    }
+
+    #[test]
+    fn diff_cell_spans_preserves_syntax_fg_on_addition() {
+        let input = vec![ratatui::text::Span::styled(
+            "let".to_string(),
+            Style::default().fg(Color::Rgb(0, 150, 200)),
+        )];
+        let spans = diff_cell_spans(&input, DiffLineKind::Addition, 10, false);
+        assert_eq!(spans[0].style.fg, Some(Color::Rgb(0, 150, 200)));
+        assert_eq!(spans[0].style.bg, Some(Color::Rgb(0, 80, 0)));
+    }
+
+    #[test]
+    fn diff_cell_spans_pads_with_diff_background() {
+        let spans = diff_cell_spans(&span_from_text("hi"), DiffLineKind::Deletion, 10, true);
+        // There should be a padding span at the end with the diff background
+        assert!(spans.len() > 1, "should have padding span");
+        assert_eq!(
+            spans.last().unwrap().style.bg,
+            Some(Color::Rgb(80, 0, 0)),
+        );
+        // The text span should have the red bg too
+        assert_eq!(
+            spans[0].style.bg,
+            Some(Color::Rgb(80, 0, 0)),
+        );
     }
 }

@@ -1,47 +1,13 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
 use tai_proto::SessionMessage;
 use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, StreamingText};
 
-// ── Lazy-loaded syntect state ──────────────────────────────────────────────
-
-fn syntax_set() -> &'static SyntaxSet {
-    static SS: OnceLock<SyntaxSet> = OnceLock::new();
-    SS.get_or_init(|| SyntaxSet::load_defaults_newlines())
-}
-
-fn theme_set() -> &'static ThemeSet {
-    static TS: OnceLock<ThemeSet> = OnceLock::new();
-    TS.get_or_init(ThemeSet::load_defaults)
-}
-
-fn highlight_theme() -> &'static syntect::highlighting::Theme {
-    // base16-ocean.dark is a well-known dark-terminal theme with good contrast.
-    // Fall back to the first available theme if the name is somehow missing.
-    const THEME_NAME: &str = "base16-ocean.dark";
-    theme_set()
-        .themes
-        .get(THEME_NAME)
-        .unwrap_or_else(|| theme_set().themes.values().next().expect("ThemeSet is empty"))
-}
-
-/// Convert a syntect RGBA colour to a ratatui `Color`.
-/// Syntect colours with alpha < 255 are ignored (transparent → default
-/// terminal foreground), preserving the user's terminal colour scheme.
-fn to_ratatui_color(c: syntect::highlighting::Color) -> Color {
-    if c.a < 128 {
-        // Transparent-ish → don't override the terminal default
-        Color::Reset
-    } else {
-        Color::Rgb(c.r, c.g, c.b)
-    }
-}
+use crate::syntax::{default_syntax_set, highlight_theme, to_ratatui_color};
 
 /// Highlight a code snippet into styled ratatui lines.
 ///
@@ -70,7 +36,7 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
         }
     }
 
-    let ss = syntax_set();
+    let ss = default_syntax_set();
 
     // Look up the syntax definition by the language token.  If the token
     // isn't recognised (or was omitted), use the built-in "Plain Text"
