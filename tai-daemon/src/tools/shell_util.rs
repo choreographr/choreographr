@@ -98,9 +98,13 @@ pub(crate) fn spawn_with_watchdog(
     let watchdog = std::thread::spawn(move || {
         if done_rx.recv_timeout(Duration::from_millis(timeout_ms)).is_err() {
             // Timeout expired before the main thread signalled completion — kill.
-            wk.store(true, Ordering::SeqCst);
+            // Only set was_killed when kill actually succeeds (ESRCH means the
+            // child already exited normally, which can happen in a narrow race
+            // where the timeout fires at the same instant the child finishes).
             unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
+                if libc::kill(pid as i32, libc::SIGKILL) == 0 {
+                    wk.store(true, Ordering::SeqCst);
+                }
             }
         }
     });
