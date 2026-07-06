@@ -168,8 +168,8 @@ pub struct SessionState {
     pub cwd: Option<PathBuf>,
     pub max_turns: Option<u32>,
     pub created_at: i64,
-    pub messages: Vec<SessionMessage>,
-    pub subscribers: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
+    messages: Vec<SessionMessage>,
+    subscribers: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
     pub(crate) active_requests: HashMap<u32, ActiveRequest>,
     pub context_fingerprint: Option<u64>,
     pub context_file_paths: Vec<PathBuf>,
@@ -242,6 +242,58 @@ impl SessionState {
         self.context_message_index = snapshot.context_message_index;
         self.status = snapshot.status;
         self.active_categories = snapshot.active_categories;
+    }
+
+    /// Read-only access to messages.
+    pub fn messages(&self) -> &[SessionMessage] {
+        &self.messages
+    }
+
+    /// Number of messages (convenience).
+    pub fn num_messages(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Append a message and return its index.
+    pub fn push_message(&mut self, msg: SessionMessage) -> u32 {
+        let idx = self.messages.len() as u32;
+        self.messages.push(msg);
+        idx
+    }
+
+    /// Replace a message at a given index (used for context refresh).
+    pub fn set_message(&mut self, idx: usize, msg: SessionMessage) {
+        self.messages[idx] = msg;
+    }
+
+    /// Read-only access to subscribers.
+    pub fn subscribers(&self) -> &HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>> {
+        &self.subscribers
+    }
+
+    /// Bulk-set subscribers (used when spawning worker threads).
+    pub fn set_subscribers(&mut self, subs: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>) {
+        self.subscribers = subs;
+    }
+
+    /// Create an empty session state.
+    pub fn empty() -> Self {
+        Self {
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            cwd: None,
+            max_turns: None,
+            created_at: 0,
+            messages: Vec::new(),
+            subscribers: HashMap::new(),
+            active_requests: HashMap::new(),
+            context_fingerprint: None,
+            context_file_paths: Vec::new(),
+            context_message_index: None,
+            status: SessionStatus::Inactive,
+            active_categories: HashSet::new(),
+        }
     }
 }
 

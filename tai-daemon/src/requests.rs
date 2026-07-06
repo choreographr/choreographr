@@ -20,7 +20,7 @@ use tai_proto::{
 use std::sync::mpsc;
 
 fn broadcast_to_session(session: &SessionState, message: DaemonMessage) {
-    for tx in session.subscribers.values() {
+    for tx in session.subscribers().values() {
         let _ = tx.send(message.clone());
     }
 }
@@ -98,9 +98,9 @@ pub(crate) fn run_agent_loop(
                     {
                         let new_content = context::assemble_context(&new_bundle);
                         if !new_content.is_empty() {
-                            session.messages[idx] = SessionMessage::SystemText {
+                            session.set_message(idx, SessionMessage::SystemText {
                                 content: new_content,
-                            };
+                            });
                         }
                         session.context_fingerprint = Some(new_bundle.fingerprint);
                         session.context_file_paths =
@@ -114,7 +114,7 @@ pub(crate) fn run_agent_loop(
             return Ok(());
         }
 
-        let messages = build_chat_request_messages(&session.messages);
+        let messages = build_chat_request_messages(session.messages());
         match client.chat_completion_turn(model, &messages, &tools)? {
             ChatTurnResult::FinalText(content) => {
                 debug!(
@@ -132,8 +132,7 @@ pub(crate) fn run_agent_loop(
                     },
                 );
                 let msg = SessionMessage::AssistantText { content };
-                let idx = session.messages.len() as u32;
-                session.messages.push(msg.clone());
+                let idx = session.push_message(msg.clone());
                 write_message_retry(db, session_id, idx, &msg).ok();
                 return Ok(());
             }
@@ -227,8 +226,7 @@ pub(crate) fn run_agent_loop(
                         content: output.result.content.clone(),
                         is_error: output.result.is_error,
                     };
-                    let idx = session.messages.len() as u32;
-                    session.messages.push(msg.clone());
+                    let idx = session.push_message(msg.clone());
                     write_message_retry(db, session_id, idx, &msg).ok();
 
                     let event = if output.result.is_error {
@@ -740,8 +738,7 @@ fn persist_assistant_tool_use_sync(
         reasoning: tool_use.reasoning.clone(),
         reasoning_text: tool_use.reasoning_text.clone(),
     };
-    let idx = session.messages.len() as u32;
-    session.messages.push(msg.clone());
+    let idx = session.push_message(msg.clone());
     write_message_retry(db, session_id, idx, &msg).ok();
 }
 
@@ -809,7 +806,6 @@ pub const REQUEST_IMAGE_HEIGHT: u32 = 640;
 mod tests {
     use super::*;
     use crate::daemon::DaemonCommand;
-    use std::collections::{HashMap, HashSet};
     use std::sync::mpsc;
     use tai_proto::SessionSummary;
 
@@ -1002,22 +998,7 @@ mod tests {
 
     #[test]
     fn execute_load_skill_sync_invalid_json() {
-        let session = SessionState {
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            cwd: None,
-            max_turns: None,
-            created_at: 0,
-            messages: Vec::new(),
-            subscribers: HashMap::new(),
-            active_requests: HashMap::new(),
-            context_fingerprint: None,
-            context_file_paths: Vec::new(),
-            context_message_index: None,
-            status: SessionStatus::Inactive,
-            active_categories: HashSet::new(),
-        };
+        let session = SessionState::empty();
         let output = execute_load_skill_sync(&session, None, "not json");
         assert!(output.result.is_error);
         assert!(output.result.content.contains("invalid json"));
@@ -1025,22 +1006,7 @@ mod tests {
 
     #[test]
     fn execute_load_skill_sync_missing_name() {
-        let session = SessionState {
-            title: None,
-            selected_model: None,
-            parent_session_id: None,
-            cwd: None,
-            max_turns: None,
-            created_at: 0,
-            messages: Vec::new(),
-            subscribers: HashMap::new(),
-            active_requests: HashMap::new(),
-            context_fingerprint: None,
-            context_file_paths: Vec::new(),
-            context_message_index: None,
-            status: SessionStatus::Inactive,
-            active_categories: HashSet::new(),
-        };
+        let session = SessionState::empty();
         let output = execute_load_skill_sync(&session, None, r#"{}"#);
         assert!(output.result.is_error);
         assert_eq!(output.result.content, "missing required parameter: name");
