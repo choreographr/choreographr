@@ -157,7 +157,18 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 };
                 let inner = block.inner(rect);
                 frame.render_widget(block, rect);
-                frame.render_stateful_widget(StatefulImage::default(), inner, &mut image.protocol);
+
+                // Only render the image when fully visible — the
+                // image is not clipped by scroll offset or viewport
+                // space, so its rect is stable and ratatui_image
+                // never rescales during scrolling.
+                if visible_height == full_height {
+                    frame.render_stateful_widget(
+                        StatefulImage::default(),
+                        inner,
+                        &mut image.protocol,
+                    );
+                }
                 rows_remaining = rows_remaining.saturating_sub(height as usize);
                 rows_to_skip = 0;
             }
