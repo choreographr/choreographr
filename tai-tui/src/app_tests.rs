@@ -177,10 +177,28 @@ fn oversized_history_item_keeps_visible_tail() {
 }
 
 #[test]
-fn image_history_height_caps_to_twelve_rows() {
-    assert_eq!(image_block_height(0), 0);
-    assert_eq!(image_block_height(4), 4);
-    assert_eq!(image_block_height(20), 12);
+fn image_item_height_uses_protocol_size_for() {
+    let picker = ratatui_image::picker::Picker::halfblocks();
+    let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><rect width='100' height='50' fill='red'/></svg>"#;
+    let image = tai_tui::build_rendered_image(
+        &picker,
+        tai_proto::ImageMetadata {
+            image_id: 1,
+            mime_type: "image/svg+xml".to_string(),
+            width: 100,
+            height: 50,
+            byte_len: svg.len() as u64,
+            alt: None,
+        },
+        svg.to_vec(),
+    )
+    .expect("svg should render");
+    let item = crate::state::HistoryItem::Image(Box::new(image));
+
+    let viewport = crate::state::HistoryViewport { width: 80, height: 24 };
+    let height = viewport.item_height(&item);
+    assert!(height >= 1, "image item height must be at least 1");
+    assert!(height <= 12, "image should not exceed half the viewport height (24/2=12)");
 }
 
 #[test]

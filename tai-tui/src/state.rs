@@ -1,4 +1,4 @@
-use ratatui::layout::Rect;
+use ratatui::layout::{Rect, Size};
 use std::collections::HashSet;
 use tai_client_core::{
     ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
@@ -12,6 +12,7 @@ use crate::db::{self, CommandEntry};
 use crate::diff_render::{diff_display_height, is_diff_text, parse_diff};
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
 use ratatui::text::Line;
+use ratatui_image::Resize;
 use tai_client_core::FileDiff;
 
 /// If the text looks like a unified diff and can be parsed successfully,
@@ -177,7 +178,13 @@ impl HistoryViewport {
                 let lines = streaming_text_lines(text, self.width);
                 lines_height(&lines, self.width).max(1)
             }
-            HistoryItem::Image(_) => image_block_height(self.height as usize),
+            HistoryItem::Image(image) => {
+                let rendered = image.protocol.size_for(
+                    Resize::Scale(None),
+                    Size::new(self.width, (self.height / 2).max(1)),
+                );
+                rendered.height.max(1) as usize
+            }
             HistoryItem::Diff(diffs) => diff_display_height(diffs),
         }
     }
@@ -970,9 +977,7 @@ pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
     lines_height(&crate::markdown_render::plain_text_lines(text), width)
 }
 
-pub(crate) fn image_block_height(available_height: usize) -> usize {
-    available_height.min(12)
-}
+
 
 #[cfg(test)]
 mod tests {

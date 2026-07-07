@@ -5,7 +5,7 @@ use crate::markdown_render::{
 use tai_proto::SessionMessage;
 use crate::state::{
     App, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache, SessionManagerView,
-    history_text_height, image_block_height,
+    history_text_height,
 };
 use ratatui::{
     Frame,
@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use tai_client_core::{DiffLineKind, FileDiff};
-use ratatui_image::StatefulImage;
+use ratatui_image::{Resize, StatefulImage};
 use tai_proto::SessionStatus;
 
 pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
@@ -124,7 +124,11 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 );
             }
             HistoryItem::Image(image) => {
-                let full_height = image_block_height(area.height as usize);
+                let rendered = image.protocol.size_for(
+                    Resize::Scale(None),
+                    ratatui::layout::Size::new(area.width, (area.height / 2).max(1)),
+                );
+                let full_height = rendered.height.max(1) as usize;
                 if rows_to_skip >= full_height {
                     rows_to_skip -= full_height;
                     continue;
@@ -164,7 +168,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 // never rescales during scrolling.
                 if visible_height == full_height {
                     frame.render_stateful_widget(
-                        StatefulImage::default(),
+                        StatefulImage::new().resize(Resize::Scale(None)),
                         inner,
                         &mut image.protocol,
                     );
