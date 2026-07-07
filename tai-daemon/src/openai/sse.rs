@@ -1,4 +1,4 @@
-use std::io::{self, BufReader, Cursor, Read};
+use std::io::{self, BufReader, Read};
 
 pub(crate) struct SseReader {
     reader: BufReader<Box<dyn Read + Send>>,
@@ -8,9 +8,13 @@ pub(crate) struct SseReader {
 }
 
 impl SseReader {
-    pub(crate) fn new(body: Vec<u8>) -> Self {
+    /// Create an SSE reader from any `Read + Send` source (e.g. an HTTP
+    /// response body).  Events are yielded incrementally as bytes arrive,
+    /// enabling true line-level streaming without preloading the entire
+    /// response into memory.
+    pub(crate) fn from_reader(read: impl Read + Send + 'static) -> Self {
         Self {
-            reader: BufReader::new(Box::new(Cursor::new(body))),
+            reader: BufReader::new(Box::new(read)),
             pending: Vec::new(),
             event_lines: Vec::new(),
             finished: false,

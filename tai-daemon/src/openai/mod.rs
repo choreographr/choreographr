@@ -236,9 +236,28 @@ struct StreamChoice {
 #[derive(Debug, Deserialize)]
 struct StreamDelta {
     content: Option<String>,
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
     reasoning_content: Option<String>,
     reasoning: Option<String>,
     reasoning_text: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+struct StreamToolCallDelta {
+    index: u32,
+    id: Option<String>,
+    // Deserialised from the API's "type" field but never read in Rust — kept
+    // so serde doesn't choke on unknown fields and to document the wire format.
+    #[allow(dead_code)]
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    function: Option<StreamToolCallFunctionDelta>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+struct StreamToolCallFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

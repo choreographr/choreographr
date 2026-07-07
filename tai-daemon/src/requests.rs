@@ -3,7 +3,7 @@ use crate::db::write_message_retry;
 use tracing::debug;
 use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatAssistantToolUse, ChatRequestMessage,
-    ChatTurnResult, OpenAiClient,
+    ChatTurnResult, CompletionChunkKind, OpenAiClient,
 };
 use crate::sessions::{SessionCommand, SessionState};
 use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
@@ -143,7 +143,27 @@ pub(crate) fn run_agent_loop(
             }
         }));
 
-        match client.chat_completion_turn(model, &messages, &tools, &mut retry_cb, Some(cancel_rx)) {
+        match client.chat_completion_turn_streaming(
+            model,
+            &messages,
+            &tools,
+            &mut retry_cb,
+            Some(cancel_rx),
+            |kind, text| {
+                let stream = match kind {
+                    CompletionChunkKind::Answer => OutputStream::Answer,
+                    CompletionChunkKind::Reasoning => OutputStream::Reasoning,
+                };
+                let _ = cmd_tx.send(SessionCommand::Broadcast(
+                    DaemonMessage::OutputChunk {
+                        request_id,
+                        stream,
+                        data: text.into_bytes(),
+                    },
+                ));
+                Ok(())
+            },
+        ) {
             Ok(ChatTurnResult::FinalText(content)) => {
                 debug!(
                     session_id,
@@ -151,13 +171,6 @@ pub(crate) fn run_agent_loop(
                     response_len = content.len(),
                     "model returned final text",
                 );
-                let _ = cmd_tx.send(SessionCommand::Broadcast(
-                    DaemonMessage::OutputChunk {
-                        request_id,
-                        stream: OutputStream::Answer,
-                        data: content.clone().into_bytes(),
-                    },
-                ));
                 let msg = SessionMessage::AssistantText { content };
                 let idx = session.push_message(msg.clone());
                 if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
