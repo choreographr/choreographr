@@ -7,6 +7,12 @@ pub trait DaemonMessageHandler {
         self.push_text(text);
     }
     fn push_session_message(&mut self, message: SessionMessage);
+
+    /// Like `push_session_message` but inserts the message *before* the active
+    /// stream for `request_id` so that tool results appear before the model's
+    /// answer text that follows them.
+    fn insert_session_message_before_stream(&mut self, request_id: u32, message: SessionMessage);
+
     fn begin_stream(&mut self, request_id: u32);
     fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str);
     fn finalize_stream(&mut self, request_id: u32);
@@ -122,13 +128,12 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             tool_name,
             output,
         } => {
-            handler.push_session_message(SessionMessage::ToolResult {
+            handler.insert_session_message_before_stream(request_id, SessionMessage::ToolResult {
                 call_id,
                 name: tool_name,
                 content: output,
                 is_error: false,
             });
-            let _ = request_id;
             Ok(None)
         }
         DaemonMessage::ToolCallFailed {

@@ -632,19 +632,14 @@ impl App {
         self.push_history_item(HistoryItem::Text(line.into()));
     }
 
-    pub(crate) fn push_tool_text(&mut self, request_id: u32, text: impl Into<String>) {
-        let text = text.into();
-        let item: HistoryItem = match try_parse_as_diff(&text) {
-            Some(diffs) => HistoryItem::Diff(diffs),
-            None => HistoryItem::Text(text),
-        };
+    /// Insert a `HistoryItem` before the active stream for `request_id`,
+    /// updating the render cache and scroll state.
+    fn insert_item_before_stream(&mut self, request_id: u32, item: HistoryItem) {
         let added_height = self.history_viewport.item_height(&item);
         let trimmed_height = self.trimmed_height_on_append();
         let old_hist_len = self.client.history.len();
         let insert_at = self.client.in_progress.get(&request_id).copied();
         self.client.insert_before_stream(request_id, item);
-        // Update the cache for an item inserted mid-history (before a stream).
-        // Handles both the insertion and any front-trimming by ClientHistory.
         let new_hist_len = self.client.history.len();
         let trimmed = (old_hist_len + 1).saturating_sub(new_hist_len);
         if trimmed > 0 {
@@ -654,10 +649,8 @@ impl App {
             let adjusted = index.saturating_sub(trimmed);
             self.render_cache.insert(adjusted, None);
         } else {
-            // Fallback — stream was already finalized, item goes to back.
             self.render_cache.push(None);
         }
-        // Safety net: if lengths still don't match, rebuild from scratch.
         if self.render_cache.len() != new_hist_len {
             self.render_cache.clear();
             self.render_cache.resize(new_hist_len, None);
@@ -668,21 +661,34 @@ impl App {
         self.clamp_scroll_state();
     }
 
-    /// Feed a `SessionMessage` into history.
-    ///
-    /// If the message is a non-error `ToolResult` whose content looks like a
-    /// unified diff, it is promoted to a `HistoryItem::Diff` for side-by-side
-    /// rendering instead of being displayed as a raw session message.
-    pub(crate) fn push_session_message(&mut self, message: SessionMessage) {
-        if let SessionMessage::ToolResult { content, is_error, .. } = &message {
+    pub(crate) fn push_tool_text(&mut self, request_id: u32, text: impl Into<String>) {
+        let text = text.into();
+        let item: HistoryItem = match try_parse_as_diff(&text) {
+            Some(diffs) => HistoryItem::Diff(diffs),
+            None => HistoryItem::Text(text),
+        };
+        self.insert_item_before_stream(request_id, item);
+    }
+
+    /// Classify a `SessionMessage` into a `HistoryItem`, promoting non-error
+    /// `ToolResult`s that look like unified diffs to `HistoryItem::Diff`.
+    fn classify_session_message(message: SessionMessage) -> HistoryItem {
+        if let SessionMessage::ToolResult {
+            content, is_error, ..
+        } = &message
+        {
             if !is_error {
                 if let Some(diffs) = try_parse_as_diff(content) {
-                    self.push_history_item(HistoryItem::Diff(diffs));
-                    return;
+                    return HistoryItem::Diff(diffs);
                 }
             }
         }
-        self.push_history_item(HistoryItem::SessionMessage(message));
+        HistoryItem::SessionMessage(message)
+    }
+
+    /// Feed a `SessionMessage` into history.
+    pub(crate) fn push_session_message(&mut self, message: SessionMessage) {
+        self.push_history_item(Self::classify_session_message(message));
     }
 
     pub(crate) fn push_image(&mut self, image: RenderedImage) {
@@ -905,6 +911,10 @@ impl DaemonMessageHandler for App {
 
     fn push_session_message(&mut self, message: SessionMessage) {
         self.push_session_message(message);
+    }
+
+    fn insert_session_message_before_stream(&mut self, request_id: u32, message: SessionMessage) {
+        self.insert_item_before_stream(request_id, App::classify_session_message(message));
     }
 
     fn begin_stream(&mut self, request_id: u32) {

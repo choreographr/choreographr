@@ -82,6 +82,13 @@ impl DaemonMessageHandler for AppState {
         self.push_session_message(message);
     }
 
+    fn insert_session_message_before_stream(&mut self, request_id: u32, message: SessionMessage) {
+        // Unlike the TUI client, dioxus doesn't render diffs natively, so we
+        // skip `try_parse_as_diff` and always store as SessionMessage.
+        self.client
+            .insert_before_stream(request_id, HistoryItem::SessionMessage(message));
+    }
+
     fn begin_stream(&mut self, request_id: u32) {
         self.begin_stream(request_id);
     }
