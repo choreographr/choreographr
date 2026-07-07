@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use tai_proto::SessionMessage;
@@ -113,11 +113,11 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
 
 pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec<Line<'static>> {
     match message {
-        SessionMessage::SystemText { content } => labeled_text_lines("system", content),
-        SessionMessage::UserText { content } => labeled_text_lines("user", content),
+        SessionMessage::SystemText { content } => labeled_text_lines("system", content, Color::DarkGray),
+        SessionMessage::UserText { content } => labeled_text_lines("user", content, Color::Green),
         SessionMessage::AssistantText { content } => {
             let body = markdown_lines(content, width);
-            prefixed_lines("assistant", body)
+            prefixed_lines("assistant", body, Color::Cyan)
         }
         SessionMessage::AssistantToolUse {
             content,
@@ -135,7 +135,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
                         .collect::<Vec<_>>()
                         .join(", ")
                 ),
-                Style::default(),
+                Style::default().fg(Color::Yellow),
             ))];
             if let Some(reasoning_text) = reasoning_content
                 .as_deref()
@@ -143,10 +143,10 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
                 .or(reasoning_text.as_deref())
                 .filter(|value| !value.trim().is_empty())
             {
-                append_section(&mut lines, "reasoning", plain_text_lines(reasoning_text));
+                append_section(&mut lines, "reasoning", plain_text_lines(reasoning_text), Color::DarkGray);
             }
             if let Some(content) = content.as_deref().filter(|value| !value.trim().is_empty()) {
-                append_section(&mut lines, "content", markdown_lines(content, width));
+                append_section(&mut lines, "content", markdown_lines(content, width), Color::Cyan);
             }
             lines
         }
@@ -156,17 +156,19 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             is_error,
             ..
         } => {
-            let label = if *is_error {
-                "tool error"
+            let (label, color) = if *is_error {
+                ("tool error", Color::Red)
             } else {
-                "tool result"
+                ("tool result", Color::Reset)
             };
             // Header line with the label and tool name.
             let mut lines = vec![Line::from(Span::styled(
                 format!("{label}: {name}"),
-                Style::default(),
+                Style::default().fg(color),
             ))];
             if !content.is_empty() {
+                // Separate the body from the header with a blank line.
+                lines.push(Line::from(Span::styled(String::new(), Style::default())));
                 // Non-error results are rendered as markdown so that code
                 // blocks produced by tools such as run_riscv (which wraps
                 // formatted Rust source in ```rust fences) get syntect-based
@@ -191,7 +193,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
                     record.metadata.width,
                     record.metadata.height,
                 ),
-                Style::default(),
+                Style::default().fg(Color::DarkGray),
             ))]
         }
     }
@@ -200,15 +202,15 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
 pub(crate) fn streaming_text_lines(text: &StreamingText, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
         format!("[{}]", text.request_id),
-        Style::default(),
+        Style::default().fg(Color::DarkGray),
     ))];
 
     if !text.reasoning.is_empty() {
-        append_section(&mut lines, "reasoning", plain_text_lines(&text.reasoning));
+        append_section(&mut lines, "reasoning", plain_text_lines(&text.reasoning), Color::DarkGray);
     }
 
     if !text.answer.is_empty() {
-        append_section(&mut lines, "answer", markdown_lines(&text.answer, width));
+        append_section(&mut lines, "answer", markdown_lines(&text.answer, width), Color::Cyan);
     }
 
     if text.reasoning.is_empty() && text.answer.is_empty() {
@@ -220,29 +222,33 @@ pub(crate) fn streaming_text_lines(text: &StreamingText, width: u16) -> Vec<Line
 
 // ── Internal helpers ──────────────────────────────────────────────────────
 
-fn labeled_text_lines(label: &'static str, text: &str) -> Vec<Line<'static>> {
-    prefixed_lines(label, plain_text_lines(text))
+fn labeled_text_lines(label: &'static str, text: &str, color: Color) -> Vec<Line<'static>> {
+    prefixed_lines(label, plain_text_lines(text), color)
 }
 
-fn prefixed_lines(label: &'static str, body: Vec<Line<'static>>) -> Vec<Line<'static>> {
+fn prefixed_lines(label: &'static str, body: Vec<Line<'static>>, color: Color) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    append_section(&mut lines, label, body);
+    append_section(&mut lines, label, body, color);
     lines
 }
 
-fn append_section(lines: &mut Vec<Line<'static>>, label: &'static str, body: Vec<Line<'static>>) {
+fn append_section(lines: &mut Vec<Line<'static>>, label: &'static str, body: Vec<Line<'static>>, color: Color) {
+    // Add a blank line to separate this section from the previous content.
+    if !lines.is_empty() {
+        lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    }
     let mut body_iter = body.into_iter();
     if let Some(first) = body_iter.next() {
         let label_text = format!("{label}: ");
         // Move spans out of `first` instead of cloning — body is consumed
         // by into_iter() so no other code needs the original.
         let mut first_spans = first.spans;
-        first_spans.insert(0, Span::styled(label_text, Style::default()));
+        first_spans.insert(0, Span::styled(label_text, Style::default().fg(color)));
         lines.push(Line::from(first_spans));
     } else {
         lines.push(Line::from(Span::styled(
             format!("{label}:"),
-            Style::default(),
+            Style::default().fg(color),
         )));
     }
     lines.extend(body_iter);
@@ -287,11 +293,11 @@ fn render_markdown_block(
 ) {
     match block {
         MarkdownBlock::Paragraph(content) => {
-            lines.extend(inlines_to_lines(content, indent, None))
+            lines.extend(inlines_to_lines(content, indent, None, width))
         }
         MarkdownBlock::Heading { level, content } => {
             let prefix = Some(format!("{} ", "#".repeat(*level as usize)));
-            lines.extend(inlines_to_lines(content, indent, prefix));
+            lines.extend(inlines_to_lines(content, indent, prefix, width));
         }
         MarkdownBlock::CodeBlock { language, code } => {
             // Opening fence with language hint
@@ -727,62 +733,182 @@ fn inlines_to_lines(
     inlines: &[MarkdownInline],
     indent: usize,
     prefix: Option<String>,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width: usize = 0;
     if indent > 0 {
         current_spans.push(Span::styled(" ".repeat(indent), Style::default()));
+        current_width += indent;
     }
-    if let Some(prefix) = prefix {
-        current_spans.push(Span::styled(prefix, Style::default()));
+    if let Some(ref prefix) = prefix {
+        current_spans.push(Span::styled(prefix.clone(), Style::default()));
+        current_width += display_width(prefix);
     }
-    render_inlines_to_lines(inlines, &mut lines, &mut current_spans, indent);
-    lines.push(Line::from(std::mem::take(&mut current_spans)));
+    render_inlines_to_lines(inlines, &mut lines, &mut current_spans, &mut current_width, indent, width);
+    if !current_spans.is_empty() || lines.is_empty() {
+        lines.push(Line::from(std::mem::take(&mut current_spans)));
+    }
     lines
+}
+
+fn flush_line(
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
+    current_width: &mut usize,
+    indent: usize,
+) {
+    lines.push(Line::from(std::mem::take(current)));
+    *current_width = indent;
+    if indent > 0 {
+        current.push(Span::styled(" ".repeat(indent), Style::default()));
+    }
 }
 
 fn render_inlines_to_lines(
     inlines: &[MarkdownInline],
     lines: &mut Vec<Line<'static>>,
     current: &mut Vec<Span<'static>>,
+    current_width: &mut usize,
     indent: usize,
+    width: usize,
 ) {
+    // Tracks whether a space separator should be added before the next word.
+    // Set to true when an inline ends with content that implies a word boundary
+    // (e.g., a Text inline that ends with whitespace, or any non-trailing-whitespace
+    // inline followed by another inline).
+    let mut needs_separator: bool = false;
+
     for inline in inlines {
         match inline {
-            MarkdownInline::Text(text) | MarkdownInline::Code(text) => {
+            MarkdownInline::Text(text) => {
+                let trimmed = text.trim_start();
+                let ends_with_space = text.ends_with(' ') || text.ends_with('\t');
+                let words: Vec<&str> = if trimmed.is_empty() {
+                    needs_separator = true;
+                    continue;
+                } else {
+                    trimmed.split_whitespace().collect()
+                };
+
+                for (i, word) in words.iter().enumerate() {
+                    let word_width = display_width(word);
+                    let separator_width = usize::from(needs_separator || i > 0);
+                    let projected = *current_width + separator_width + word_width;
+
+                    if projected > width && *current_width > indent {
+                        flush_line(lines, current, current_width, indent);
+                        // After a flush, we're on a fresh line so no separator needed
+                        // unless this is not the first word.
+                        needs_separator = i > 0;
+                    }
+
+                    // Re-check: if the word itself doesn't fit on a fresh line,
+                    // split it grapheme-by-grapheme.
+                    if *current_width + word_width > width && *current_width >= indent {
+                        flush_line(lines, current, current_width, indent);
+                        needs_separator = false;
+                        let available = width.saturating_sub(*current_width);
+                        if word_width > available {
+                            let chunked = split_word_to_width(word, available);
+                            for (ci, chunk) in chunked.iter().enumerate() {
+                                if ci > 0 {
+                                    flush_line(lines, current, current_width, indent);
+                                }
+                                current.push(Span::styled(chunk.clone(), Style::default()));
+                                *current_width += display_width(chunk);
+                            }
+                            needs_separator = true;
+                            continue;
+                        }
+                    }
+
+                    if needs_separator || i > 0 {
+                        if !current.is_empty() && *current_width > indent {
+                            current.push(Span::styled(" ".to_string(), Style::default()));
+                            *current_width += 1;
+                        }
+                    }
+                    current.push(Span::styled(word.to_string(), Style::default()));
+                    *current_width += word_width;
+                    needs_separator = true;
+                }
+
+                if ends_with_space && !words.is_empty() {
+                    needs_separator = true;
+                }
+            }
+            MarkdownInline::Code(text) => {
+                let word_width = display_width(text);
+                let projected = *current_width + usize::from(needs_separator) + word_width;
+                if projected > width && *current_width > indent {
+                    flush_line(lines, current, current_width, indent);
+                } else if needs_separator {
+                    if !current.is_empty() && *current_width > indent {
+                        current.push(Span::styled(" ".to_string(), Style::default()));
+                        *current_width += 1;
+                    }
+                }
                 current.push(Span::styled(text.clone(), Style::default()));
+                *current_width += word_width;
+                needs_separator = true;
             }
             MarkdownInline::Emphasis(content) | MarkdownInline::Strong(content) => {
-                render_inlines_to_lines(content, lines, current, indent)
+                render_inlines_to_lines(content, lines, current, current_width, indent, width);
+                needs_separator = true;
             }
             MarkdownInline::Link {
                 content,
                 destination,
             } => {
-                render_inlines_to_lines(content, lines, current, indent);
-                current.push(Span::styled(
-                    format!(" ({destination})"),
-                    Style::default(),
-                ));
+                render_inlines_to_lines(content, lines, current, current_width, indent, width);
+                if !destination.is_empty() {
+                    let dest_text = format!(" ({destination})");
+                    let dest_width = display_width(&dest_text);
+                    let projected = *current_width + dest_width;
+                    if projected > width && *current_width > indent {
+                        flush_line(lines, current, current_width, indent);
+                    }
+                    // Link destination appends without space (the format already has one).
+                    current.push(Span::styled(dest_text, Style::default()));
+                    *current_width += dest_width;
+                }
+                needs_separator = true;
             }
             MarkdownInline::Image { alt, destination } => {
-                current.push(Span::styled("[image: ".to_string(), Style::default()));
-                render_inlines_to_lines(alt, lines, current, indent);
-                current.push(Span::styled(
-                    format!("] ({destination})"),
-                    Style::default(),
-                ));
+                let prefix_text = "[image: ";
+                let prefix_width = display_width(prefix_text);
+                let projected = *current_width + prefix_width;
+                if projected > width && *current_width > indent {
+                    flush_line(lines, current, current_width, indent);
+                }
+                current.push(Span::styled(prefix_text.to_string(), Style::default()));
+                *current_width += prefix_width;
+
+                render_inlines_to_lines(alt, lines, current, current_width, indent, width);
+
+                let suffix = if !destination.is_empty() {
+                    format!("] ({destination})")
+                } else {
+                    "]".to_string()
+                };
+                let suffix_width = display_width(&suffix);
+                let projected = *current_width + suffix_width;
+                if projected > width && *current_width > indent {
+                    flush_line(lines, current, current_width, indent);
+                }
+                current.push(Span::styled(suffix, Style::default()));
+                *current_width += suffix_width;
+                needs_separator = true;
             }
             MarkdownInline::LineBreak => {
-                lines.push(Line::from(std::mem::take(current)));
-                if indent > 0 {
-                    current.push(Span::styled(" ".repeat(indent), Style::default()));
-                }
+                flush_line(lines, current, current_width, indent);
+                needs_separator = false;
             }
         }
     }
 }
-
 fn wrapped_line_height(line: &Line<'_>, width: usize) -> usize {
     if width == 0 {
         return 0;
@@ -964,7 +1090,7 @@ mod tests {
     #[test]
     fn inlines_to_lines_simple_text() {
         let inlines = vec![MarkdownInline::Text("hello".to_string())];
-        let result = inlines_to_lines(&inlines, 0, None);
+        let result = inlines_to_lines(&inlines, 0, None, 80);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].to_string(), "hello");
     }
@@ -972,7 +1098,7 @@ mod tests {
     #[test]
     fn inlines_to_lines_with_indent_and_prefix() {
         let inlines = vec![MarkdownInline::Text("world".to_string())];
-        let result = inlines_to_lines(&inlines, 2, Some("# ".to_string()));
+        let result = inlines_to_lines(&inlines, 2, Some("# ".to_string()), 80);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].to_string(), "  # world");
     }
@@ -984,10 +1110,53 @@ mod tests {
             MarkdownInline::LineBreak,
             MarkdownInline::Text("b".to_string()),
         ];
-        let result = inlines_to_lines(&inlines, 0, None);
+        let result = inlines_to_lines(&inlines, 0, None, 80);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].to_string(), "a");
         assert_eq!(result[1].to_string(), "b");
+    }
+
+    #[test]
+    fn inlines_to_lines_word_wraps_at_width() {
+        let inlines = vec![MarkdownInline::Text(
+            "hello world foo bar baz".to_string(),
+        )];
+        // Width 10: each word fits individually but they wrap.
+        let result = inlines_to_lines(&inlines, 0, None, 10);
+        // "hello " (6) + "world" (5) = 11 > 10 → wrap after "hello"
+        // First line: "hello" (5), second line: "world" (5)
+        // But then "world " + "foo " = 10, fits. Then "bar" would need to check.
+        // Let me just verify there are multiple lines.
+        assert!(result.len() > 1, "should wrap at narrow width, got {} lines: {:?}", result.len(), result);
+    }
+
+    #[test]
+    fn inlines_to_lines_code_block_does_not_wrap() {
+        let inlines = vec![MarkdownInline::Code("long_code_token".to_string())];
+        // Width 5: the single code token should still be emitted (it may overflow as
+        // a single word, but should not split at spaces).
+        let result = inlines_to_lines(&inlines, 0, None, 5);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].to_string().contains("long_code_token"));
+    }
+
+    #[test]
+    fn inlines_to_lines_wraps_with_prefix_on_first_line_only() {
+        let inlines = vec![
+            MarkdownInline::Text("aaa bbb ccc ddd eee fff ggg".to_string()),
+        ];
+        // Width 10, indent 2, prefix "# ". So first line has "  # " (4 chars)
+        // leaving 6 chars for content. Second (wrapped) line has "  " (2 chars)
+        // leaving 8 chars for content.
+        let result = inlines_to_lines(&inlines, 2, Some("# ".to_string()), 10);
+        assert!(result.len() >= 2, "should wrap, got {} lines: {:?}", result.len(), result);
+        // First line starts with "  # " (prefix only on first line)
+        assert!(result[0].to_string().starts_with("  # "), "first line should have prefix: {:?}", result[0].to_string());
+        // Subsequent lines start with indent-only (no prefix)
+        for line in result.iter().skip(1) {
+            let text = line.to_string();
+            assert!(!text.starts_with("  # "), "continuation line should not have prefix: {:?}", text);
+        }
     }
 
     // ── to_ratatui_color ─────────────────────────────────────────────────
@@ -1023,8 +1192,8 @@ mod tests {
         let lines = session_message_lines(&msg, 80);
         // Line 0: header "tool result: run_riscv"
         assert_eq!(lines[0].to_string(), "tool result: run_riscv");
-        // Line 1: ```rust
-        assert!(lines[1].to_string().contains("```rust"), "{}", lines[1].to_string());
+        // Line 1: blank separator; Line 2: ```rust
+        assert!(lines[2].to_string().contains("```rust"), "{}", lines[2].to_string());
         // The highlighted line for "fn main() {}" should have colour spans
         let has_colour = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
             matches!(s.style.fg, Some(Color::Rgb(_, _, _)))

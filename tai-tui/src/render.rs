@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
-    text::Line,
+    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use tai_client_core::{DiffLineKind, FileDiff};
@@ -64,6 +64,9 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
+    let content_width = area.width.saturating_sub(2);
+    let assistant_content_width = area.width.saturating_sub(4);
+
     // Ensure the render cache is aligned with the history vector before
     // we start iterating.  If items were pushed/inserted/trimmed since the
     // last frame, this rebuilds the cache from scratch (all Nones).
@@ -93,27 +96,48 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    content_width,
                 );
             }
             HistoryItem::SessionMessage(message) => {
-                let lines = cached_or_compute_lines(
-                    &mut app.render_cache,
-                    i,
-                    |msg| session_message_lines(msg, area.width),
-                    message,
-                    area.width,
-                );
-                render_history_lines(
-                    frame,
-                    area,
-                    lines,
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                );
+                if matches!(message, SessionMessage::AssistantText { .. }) {
+                    let lines = cached_or_compute_lines(
+                        &mut app.render_cache,
+                        i,
+                        |msg| session_message_lines(msg, assistant_content_width),
+                        message,
+                        assistant_content_width,
+                    );
+                    render_assistant_lines(
+                        frame,
+                        area,
+                        lines,
+                        &mut rows_remaining,
+                        &mut y,
+                        &mut rows_to_skip,
+                        assistant_content_width,
+                    );
+                } else {
+                    let lines = cached_or_compute_lines(
+                        &mut app.render_cache,
+                        i,
+                        |msg| session_message_lines(msg, content_width),
+                        message,
+                        content_width,
+                    );
+                    render_history_lines(
+                        frame,
+                        area,
+                        lines,
+                        &mut rows_remaining,
+                        &mut y,
+                        &mut rows_to_skip,
+                        content_width,
+                    );
+                }
             }
             HistoryItem::Streaming(text) => {
-                let lines = streaming_text_lines(text, area.width);
+                let lines = streaming_text_lines(text, content_width);
                 render_history_lines(
                     frame,
                     area,
@@ -121,6 +145,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    content_width,
                 );
             }
             HistoryItem::Image(image) => {
@@ -226,18 +251,15 @@ fn render_history_text(
     rows_remaining: &mut usize,
     y: &mut u16,
     rows_to_skip: &mut usize,
+    content_width: u16,
 ) {
-    let wrapped = history_text_height(text, area.width).max(1);
+    let base_wrapped = history_text_height(text, content_width).max(1);
+    let wrapped = base_wrapped + 1; // +1 for blank line separator
     if *rows_to_skip >= wrapped {
         *rows_to_skip -= wrapped;
         return;
     }
 
-    // The visible portion of this text item is the wrapped height
-    // minus any rows already skipped past (rows_to_skip), further
-    // clamped to the remaining viewport space.  Previously this was
-    // `wrapped.min(*rows_remaining)` — omitting rows_to_skip meant
-    // the view would jump at item boundaries during partial-scroll.
     let visible_height = (wrapped.saturating_sub(*rows_to_skip)).min(*rows_remaining);
     if visible_height == 0 {
         return;
@@ -248,19 +270,57 @@ fn render_history_text(
 
     *y = (*y).saturating_sub(visible_height as u16);
     let rect = Rect {
-        x: area.x,
+        x: area.x + 1,
         y: *y,
-        width: area.width,
+        width: content_width,
         height: visible_height as u16,
     };
+
+    // Prepend a blank line for 1-cell vertical margin.
+    let display_text = format!("\n{text}");
+
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(display_text)
             .wrap(Wrap { trim: false })
             .scroll((top_line as u16, 0)),
         rect,
     );
     *rows_remaining -= visible_height;
     *rows_to_skip = 0;
+}
+
+/// Wrap each content line with green margin characters on the left and right,
+/// and prepend a blank separator line that also has margin characters.
+/// Returns the display-ready lines and the total row count.
+fn add_margin_lines(lines: Vec<Line<'static>>, content_width: u16) -> (Vec<Line<'static>>, usize) {
+    let margin_green = Style::default().fg(Color::Green);
+    let cw = content_width as usize;
+
+    // Blank separator line: "│" + spaces + "│"
+    let separator = Line::from(vec![
+        Span::styled("│ ".to_string(), margin_green),
+        Span::styled(" ".repeat(cw), Style::default()),
+        Span::styled(" │".to_string(), margin_green),
+    ]);
+
+    let mut result = Vec::with_capacity(lines.len() + 1);
+    result.push(separator);
+
+    for line in lines {
+        let text_width: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
+        let mut spans = Vec::with_capacity(line.spans.len() + 3);
+        spans.push(Span::styled("│ ".to_string(), margin_green));
+        spans.extend(line.spans);
+        let padding = cw.saturating_sub(text_width);
+        if padding > 0 {
+            spans.push(Span::styled(" ".repeat(padding), Style::default()));
+        }
+        spans.push(Span::styled(" │".to_string(), margin_green));
+        result.push(Line::from(spans));
+    }
+
+    let total_rows = result.len();
+    (result, total_rows)
 }
 
 fn render_history_lines(
@@ -270,18 +330,61 @@ fn render_history_lines(
     rows_remaining: &mut usize,
     y: &mut u16,
     rows_to_skip: &mut usize,
+    content_width: u16,
 ) {
-    let wrapped = lines_height(&lines, area.width).max(1);
+    let wrapped = lines_height(&lines, content_width).max(1) + 1; // +1 for blank line separator
     if *rows_to_skip >= wrapped {
         *rows_to_skip -= wrapped;
         return;
     }
 
-    // Same pattern as render_history_text: the visible height is the
-    // wrapped content height minus rows already skipped, clamped to
-    // remaining viewport space.  Without accounting for rows_to_skip,
-    // a partial scroll past a session-message boundary would cause a
-    // visible jump on the next frame.
+    let visible_height = (wrapped.saturating_sub(*rows_to_skip)).min(*rows_remaining);
+    if visible_height == 0 {
+        return;
+    }
+
+    let bottom_line = wrapped.saturating_sub(*rows_to_skip);
+    let top_line = bottom_line.saturating_sub(visible_height);
+
+    *y = (*y).saturating_sub(visible_height as u16);
+    let rect = Rect {
+        x: area.x + 1,
+        y: *y,
+        width: content_width,
+        height: visible_height as u16,
+    };
+
+    // Prepend a blank line for 1-cell vertical margin.
+    let mut display_lines = vec![Line::from(Span::styled(String::new(), Style::default()))];
+    display_lines.extend(lines);
+
+    frame.render_widget(
+        Paragraph::new(display_lines)
+            .wrap(Wrap { trim: false })
+            .scroll((top_line as u16, 0)),
+        rect,
+    );
+    *rows_remaining -= visible_height;
+    *rows_to_skip = 0;
+}
+
+/// Render assistant-text lines with green margin characters on the left and right.
+fn render_assistant_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+    content_width: u16,
+) {
+    let (display_lines, total_rows) = add_margin_lines(lines, content_width);
+    let wrapped = total_rows;
+    if *rows_to_skip >= wrapped {
+        *rows_to_skip -= wrapped;
+        return;
+    }
+
     let visible_height = (wrapped.saturating_sub(*rows_to_skip)).min(*rows_remaining);
     if visible_height == 0 {
         return;
@@ -297,8 +400,9 @@ fn render_history_lines(
         width: area.width,
         height: visible_height as u16,
     };
+
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(display_lines)
             .wrap(Wrap { trim: false })
             .scroll((top_line as u16, 0)),
         rect,
@@ -526,15 +630,13 @@ fn render_history_diff(
 ) {
     use crate::diff_render::diff_display_height;
 
-    let full_height = diff_display_height(diffs);
+    let raw_height = diff_display_height(diffs);
+    let full_height = raw_height + 2; // +1 for leading blank, +1 for trailing blank
     if *rows_to_skip >= full_height {
         *rows_to_skip -= full_height;
         return;
     }
 
-    // Same visible-height calculation as the text/lines renderers:
-    // subtract the portion already scrolled past, then clamp to the
-    // viewport rows that are still available.
     let visible_height = (full_height.saturating_sub(*rows_to_skip)).min(*rows_remaining);
     if visible_height == 0 {
         return;
@@ -558,37 +660,26 @@ fn render_history_diff(
     };
 
     let rows = build_diff_panes(diffs);
-    let visible_rows: Vec<_> = rows
-        .iter()
-        .skip(top_line)
-        .take(visible_height)
-        .collect();
-
-    let mut left_spans: Vec<Vec<ratatui::text::Span>> = Vec::with_capacity(visible_rows.len());
-    let mut right_spans: Vec<Vec<ratatui::text::Span>> = Vec::with_capacity(visible_rows.len());
-
-    for row in &visible_rows {
-        left_spans.push(diff_cell_spans(&row.left_spans, row.left_kind, pane_width, true));
-        right_spans.push(diff_cell_spans(&row.right_spans, row.right_kind, pane_width, false));
-    }
 
     let separator_style = Style::default().fg(Color::DarkGray);
-    let separator_str = "│";
 
-    let mut lines: Vec<Line> = Vec::with_capacity(visible_rows.len());
-    for i in 0..visible_rows.len() {
+    // Build diff lines with leading and trailing blank lines for vertical spacing.
+    let mut diff_lines: Vec<Line> = Vec::with_capacity(rows.len() + 2);
+    // Leading blank line
+    diff_lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    for row in &rows {
         let mut spans = Vec::new();
-        spans.extend(left_spans[i].clone());
-        // separator
-        spans.push(ratatui::text::Span::styled(
-            separator_str.to_string(),
-            separator_style,
-        ));
-        spans.extend(right_spans[i].clone());
-        lines.push(Line::from(spans));
+        spans.extend(diff_cell_spans(&row.left_spans, row.left_kind, pane_width, true));
+        spans.push(ratatui::text::Span::styled("│".to_string(), separator_style));
+        spans.extend(diff_cell_spans(&row.right_spans, row.right_kind, pane_width, false));
+        diff_lines.push(Line::from(spans));
     }
+    // Trailing blank line
+    diff_lines.push(Line::from(Span::styled(String::new(), Style::default())));
 
-    let paragraph = Paragraph::new(lines);
+    let visible_lines: Vec<Line> = diff_lines.into_iter().skip(top_line).take(visible_height).collect();
+
+    let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, rect);
 
     *rows_remaining = rows_remaining.saturating_sub(visible_height);
@@ -728,12 +819,13 @@ mod tests {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    78,
                 );
             })
             .unwrap();
 
-        assert_eq!(rows_remaining, 28, "consumed 2 visible rows");
-        assert_eq!(y, 28, "y moved up by 2");
+        assert_eq!(rows_remaining, 27, "consumed 2 visible rows");
+        assert_eq!(y, 27, "y moved up by 2");
         assert_eq!(rows_to_skip, 0, "rows_to_skip consumed completely");
     }
 
@@ -754,13 +846,14 @@ mod tests {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    78,
                 );
             })
             .unwrap();
 
-        // wrapped=5, skip=2 → visible = (5-2).min(30) = 3 → remaining = 30-3 = 27
-        assert_eq!(rows_remaining, 27);
-        assert_eq!(y, 27);
+        // wrapped=6, skip=2 → visible = (6-2).min(30) = 4 → remaining = 30-4 = 26
+        assert_eq!(rows_remaining, 26);
+        assert_eq!(y, 26);
         assert_eq!(rows_to_skip, 0);
     }
 
@@ -781,14 +874,15 @@ mod tests {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    78,
                 );
             })
             .unwrap();
 
-        // wrapped=5 <= skip=10 → fully skipped, skip reduced by 5
+        // wrapped=6 <= skip=10 → fully skipped, skip reduced by 6
         assert_eq!(rows_remaining, 30, "no rows consumed");
         assert_eq!(y, 30, "y unchanged");
-        assert_eq!(rows_to_skip, 5, "rows_to_skip decremented by 5");
+        assert_eq!(rows_to_skip, 4, "rows_to_skip decremented by 6");
     }
 
     #[test]
@@ -808,11 +902,12 @@ mod tests {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    78,
                 );
             })
             .unwrap();
 
-        // wrapped=5, skip=2 → visible = (5-2).min(2) = 2 → remaining = 0
+        // wrapped=6, skip=2 → visible = (6-2).min(2) = 2 → remaining = 0
         assert_eq!(rows_remaining, 0, "viewport exhausted");
         assert_eq!(y, 28);
         assert_eq!(rows_to_skip, 0);
@@ -835,6 +930,7 @@ mod tests {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    78,
                 );
             })
             .unwrap();
@@ -864,12 +960,13 @@ mod tests {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    78,
                 );
             })
             .unwrap();
 
-        assert_eq!(rows_remaining, 27, "3 rows consumed");
-        assert_eq!(y, 27);
+        assert_eq!(rows_remaining, 26, "3 rows consumed");
+        assert_eq!(y, 26);
         assert_eq!(rows_to_skip, 0);
     }
 
@@ -890,13 +987,14 @@ mod tests {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    78,
                 );
             })
             .unwrap();
 
-        // wrapped=3, skip=1 → visible=2 → remaining=28
-        assert_eq!(rows_remaining, 28);
-        assert_eq!(y, 28);
+        // wrapped=4, skip=1 → visible=3 → remaining=27
+        assert_eq!(rows_remaining, 27);
+        assert_eq!(y, 27);
         assert_eq!(rows_to_skip, 0);
     }
 
@@ -917,13 +1015,14 @@ mod tests {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    78,
                 );
             })
             .unwrap();
 
         assert_eq!(rows_remaining, 30, "no rows consumed");
         assert_eq!(y, 30);
-        assert_eq!(rows_to_skip, 9, "rows_to_skip decremented by 1");
+        assert_eq!(rows_to_skip, 8, "rows_to_skip decremented by 2");
     }
 
     #[test]
@@ -943,6 +1042,7 @@ mod tests {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    78,
                 );
             })
             .unwrap();
@@ -987,9 +1087,9 @@ mod tests {
             })
             .unwrap();
 
-        // build_diff_panes always emits a file header row, so height = 1 (file) + 1 (hunk) + 1 (line) = 3
-        assert_eq!(rows_remaining, 27, "3 diff rows consumed");
-        assert_eq!(y, 27, "y moved up by 3");
+        // build_diff_panes always emits a file header row, so height = 1 (file) + 1 (hunk) + 1 (line) = 3, +2 blanks = 5
+        assert_eq!(rows_remaining, 25, "5 diff rows consumed");
+        assert_eq!(y, 25, "y moved up by 5");
         assert_eq!(rows_to_skip, 0);
     }
 
@@ -1026,9 +1126,9 @@ mod tests {
             })
             .unwrap();
 
-        // full_height=3, skip=1 → visible=2 → remaining=28
-        assert_eq!(rows_remaining, 28);
-        assert_eq!(y, 28);
+        // full_height=5, skip=1 → visible=4 → remaining=26
+        assert_eq!(rows_remaining, 26);
+        assert_eq!(y, 26);
         assert_eq!(rows_to_skip, 0);
     }
 
@@ -1065,10 +1165,10 @@ mod tests {
             })
             .unwrap();
 
-        // full_height=3 <= skip=10 → fully skipped, skip reduced by 3
+        // full_height=5 <= skip=10 → fully skipped, skip reduced by 5
         assert_eq!(rows_remaining, 30);
         assert_eq!(y, 30);
-        assert_eq!(rows_to_skip, 7);
+        assert_eq!(rows_to_skip, 5);
     }
 
     // ── diff_cell_spans tests ──

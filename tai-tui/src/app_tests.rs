@@ -62,9 +62,10 @@ fn append_stream_text_preserves_manual_scroll_position() {
 
     app.append_stream_text(7, OutputStream::Answer, "hello");
 
+    eprintln!("A1 scroll={} comp={} eff={} fol={}", app.history_scroll.scroll(), app.history_scroll.scroll_compensation(), app.effective_scroll(), app.history_scroll.follow_output());
     assert_eq!(app.history_scroll.scroll(), 3);
-    assert_eq!(app.history_scroll.scroll_compensation(), 1);
-    assert_eq!(app.effective_scroll(), 4);
+    assert_eq!(app.history_scroll.scroll_compensation(), 2);
+    assert_eq!(app.effective_scroll(), 5);
     assert!(!app.history_scroll.follow_output());
 }
 
@@ -114,8 +115,8 @@ fn streaming_text_lines_include_reasoning_and_answer() {
     );
 
     assert_eq!(lines[0].to_string(), "[9]");
-    assert_eq!(lines[1].to_string(), "reasoning: step by step");
-    assert_eq!(lines[2].to_string(), "answer: final");
+    assert_eq!(lines[2].to_string(), "reasoning: step by step");
+    assert_eq!(lines[4].to_string(), "answer: final");
 }
 
 #[test]
@@ -130,10 +131,10 @@ fn streaming_text_lines_preserve_newlines() {
     );
 
     assert_eq!(lines[0].to_string(), "[3]");
-    assert_eq!(lines[1].to_string(), "reasoning: line one");
-    assert_eq!(lines[2].to_string(), "line two");
-    assert_eq!(lines[3].to_string(), "answer: final one");
-    assert_eq!(lines[4].to_string(), "final two");
+    assert_eq!(lines[2].to_string(), "reasoning: line one");
+    assert_eq!(lines[3].to_string(), "line two");
+    assert_eq!(lines[5].to_string(), "answer: final one");
+    assert_eq!(lines[6].to_string(), "final two");
 }
 
 #[test]
@@ -853,10 +854,10 @@ fn scrolling_up_disables_follow_and_scrolling_back_to_bottom_enables_it() {
 
     app.history_viewport.height = 1;
     app.scroll_up(3);
-    assert_eq!(app.history_scroll.scroll(), 1);
+    assert_eq!(app.history_scroll.scroll(), 3);
     assert!(!app.history_scroll.follow_output());
 
-    app.scroll_down(1);
+    app.scroll_down(3);
     assert_eq!(app.history_scroll.scroll(), 0);
     assert!(app.history_scroll.follow_output());
 }
@@ -870,18 +871,18 @@ fn push_text_respects_follow_output_mode() {
         app.push_text(format!("line {index}"));
     }
     app.scroll_up(4);
-
     app.push_text("later");
+
     assert_eq!(app.history_scroll.scroll(), 4);
-    assert_eq!(app.history_scroll.scroll_compensation(), 1);
-    assert_eq!(app.effective_scroll(), 5);
+    assert_eq!(app.history_scroll.scroll_compensation(), 2);
+    assert_eq!(app.effective_scroll(), 6);
     assert!(!app.history_scroll.follow_output());
 
     app.scroll_down(1);
     assert_eq!(app.history_scroll.scroll(), 4);
-    assert_eq!(app.history_scroll.scroll_compensation(), 0);
+    assert_eq!(app.history_scroll.scroll_compensation(), 1);
 
-    app.scroll_down(4);
+    app.scroll_down(5);
     app.push_text("latest");
     assert_eq!(app.history_scroll.scroll(), 0);
     assert_eq!(app.history_scroll.scroll_compensation(), 0);
@@ -901,8 +902,8 @@ fn streaming_growth_above_viewport_preserves_visible_content_offset() {
     app.append_stream_text(7, OutputStream::Answer, "123456");
 
     assert_eq!(app.history_scroll.scroll(), 2);
-    assert_eq!(app.history_scroll.scroll_compensation(), 2);
-    assert_eq!(app.effective_scroll(), 4);
+    assert_eq!(app.history_scroll.scroll_compensation(), 5);
+    assert_eq!(app.effective_scroll(), 7);
     assert!(!app.history_scroll.follow_output());
 }
 
@@ -919,15 +920,15 @@ fn trimming_history_reduces_scroll_by_trimmed_height() {
 
     app.push_text("tail");
     assert_eq!(app.history_scroll.scroll(), 20);
-    assert_eq!(app.history_scroll.scroll_compensation(), 1);
-    assert_eq!(app.effective_scroll(), 21);
+    assert_eq!(app.history_scroll.scroll_compensation(), 2);
+    assert_eq!(app.effective_scroll(), 22);
 
     app.push_text("tail");
 
     assert_eq!(app.client.history.len(), 500);
     assert_eq!(app.history_scroll.scroll(), 20);
-    assert_eq!(app.history_scroll.scroll_compensation(), 1);
-    assert_eq!(app.effective_scroll(), 21);
+    assert_eq!(app.history_scroll.scroll_compensation(), 2);
+    assert_eq!(app.effective_scroll(), 22);
     assert!(!app.history_scroll.follow_output());
 }
 
@@ -938,9 +939,9 @@ fn scrolling_to_top_clamps_without_emptying_history_view() {
 
     app.scroll_up(100);
 
-    assert_eq!(app.max_scroll_offset(), 1);
-    assert_eq!(app.effective_scroll(), 1);
-    assert_eq!(app.history_scroll.scroll(), 1);
+    assert_eq!(app.max_scroll_offset(), 3);
+    assert_eq!(app.effective_scroll(), 3);
+    assert_eq!(app.history_scroll.scroll(), 3);
     assert_eq!(app.history_scroll.scroll_compensation(), 0);
     assert!(!app.history_scroll.follow_output());
 }

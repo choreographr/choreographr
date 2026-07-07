@@ -172,14 +172,22 @@ impl HistoryViewport {
 
     pub(crate) fn item_height(&self, item: &HistoryItem) -> usize {
         match item {
-            HistoryItem::Text(text) => history_text_height(text, self.width).max(1),
+            HistoryItem::Text(text) => {
+                history_text_height(text, self.width.saturating_sub(2)).max(1) + 1
+            }
             HistoryItem::SessionMessage(message) => {
-                let lines = session_message_lines(message, self.width);
-                lines_height(&lines, self.width).max(1)
+                let content_width = if matches!(message, SessionMessage::AssistantText { .. }) {
+                    self.width.saturating_sub(4)
+                } else {
+                    self.width.saturating_sub(2)
+                };
+                let lines = session_message_lines(message, content_width);
+                lines_height(&lines, content_width).max(1) + 1
             }
             HistoryItem::Streaming(text) => {
-                let lines = streaming_text_lines(text, self.width);
-                lines_height(&lines, self.width).max(1)
+                let content_width = self.width.saturating_sub(2);
+                let lines = streaming_text_lines(text, content_width);
+                lines_height(&lines, content_width).max(1) + 1
             }
             HistoryItem::Image(image) => {
                 let rendered = image.protocol.size_for(
@@ -188,7 +196,7 @@ impl HistoryViewport {
                 );
                 rendered.height.max(1) as usize
             }
-            HistoryItem::Diff(diffs) => diff_display_height(diffs),
+            HistoryItem::Diff(diffs) => diff_display_height(diffs) + 2,
         }
     }
 }
