@@ -87,8 +87,12 @@ pub(crate) fn client_thread(
                         let _ = daemon_tx.send(DaemonCommand::AttachSession { session_id, reply });
                         match rx.recv() {
                             Ok(Ok(session_tx)) => {
-                                if let Some(ref old_tx) = attached_session_tx {
-                                    let _ = old_tx.send(SessionCommand::Detach { client_id });
+                                // Don't detach when re-attaching to the same session —
+                                // it would kill the session's only subscriber.
+                                if Some(session_id) != attached_session_id {
+                                    if let Some(ref old_tx) = attached_session_tx {
+                                        let _ = old_tx.send(SessionCommand::Detach { client_id });
+                                    }
                                 }
                                 let _ = session_tx.send(SessionCommand::Attach {
                                     client_id,
