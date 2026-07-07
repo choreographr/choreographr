@@ -4,7 +4,7 @@ use frankenstein::{ParseMode, TelegramApi};
 use frankenstein::methods::{GetUpdatesParams, SendMessageParams, SendPhotoParams};
 use frankenstein::types::ChatType;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::cell::Cell;
 use tai_client_core::{ShellCommand, parse_input_line, render_markdown_html};
 use tai_proto::ClientMessage;
 use tracing::{debug, error, info, warn};
@@ -19,16 +19,18 @@ pub fn run(
 ) {
     let bot = Bot::new(&bot_token);
 
-    let chat_id: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
+    let (chat_id_tx, chat_id_rx) = mpsc::channel();
 
     {
         let bot = bot.clone();
-        let chat_id = chat_id.clone();
         std::thread::spawn(move || {
+            let mut chat_id: Option<i64> = None;
             while let Ok(event) = bridge_rx.recv() {
                 debug!(?event, "bridge event received");
-                let cid = *chat_id.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(cid) = cid {
+                while let Ok(cid) = chat_id_rx.try_recv() {
+                    chat_id = Some(cid);
+                }
+                if let Some(cid) = chat_id {
                     send_daemon_event(&bot, cid, event);
                 } else {
                     warn!("no chat id set, dropping bridge event");
@@ -41,8 +43,8 @@ pub fn run(
     let state = TelegramState {
         bridge_tx,
         admin_ids,
-        request_id: Mutex::new(0),
-        chat_id: chat_id.clone(),
+        request_id: Cell::new(0),
+        chat_id_tx,
     };
 
     info!("starting telegram bot polling");
@@ -75,8 +77,8 @@ pub fn run(
 struct TelegramState {
     bridge_tx: mpsc::Sender<DaemonBridgeCommand>,
     admin_ids: Vec<i64>,
-    request_id: Mutex<u32>,
-    chat_id: Arc<Mutex<Option<i64>>>,
+    request_id: Cell<u32>,
+    chat_id_tx: mpsc::Sender<i64>,
 }
 
 fn is_chat_private(msg: &frankenstein::types::Message) -> bool {
@@ -104,11 +106,11 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: frankenstein::types::Me
     let chat_id_val = msg.chat.id;
     debug!(%user_id, input = %text, "received telegram message");
 
-    *state.chat_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(chat_id_val);
+    let _ = state.chat_id_tx.send(chat_id_val);
 
-    let mut request_id = *state.request_id.lock().unwrap_or_else(|e| e.into_inner());
+    let mut request_id = state.request_id.get();
     let command = parse_input_line(&text, &mut request_id, None);
-    *state.request_id.lock().unwrap_or_else(|e| e.into_inner()) = request_id;
+    state.request_id.set(request_id);
 
     match command {
         ShellCommand::Send(client_msg) => {

@@ -3,11 +3,7 @@ use std::{
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::mpsc,
     time::Duration,
 };
 
@@ -90,10 +86,8 @@ pub(crate) fn spawn_with_watchdog(
     let child = cmd.spawn()?;
     let pid = child.id();
 
-    let was_killed = Arc::new(AtomicBool::new(false));
-    let wk = was_killed.clone();
-
     let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (killed_tx, killed_rx) = mpsc::channel::<()>();
 
     let watchdog = std::thread::spawn(move || {
         if done_rx.recv_timeout(Duration::from_millis(timeout_ms)).is_err() {
@@ -103,7 +97,7 @@ pub(crate) fn spawn_with_watchdog(
             // where the timeout fires at the same instant the child finishes).
             unsafe {
                 if libc::kill(pid as i32, libc::SIGKILL) == 0 {
-                    wk.store(true, Ordering::SeqCst);
+                    let _ = killed_tx.send(());
                 }
             }
         }
@@ -113,7 +107,7 @@ pub(crate) fn spawn_with_watchdog(
     let _ = done_tx.send(());
     let _ = watchdog.join();
 
-    Ok((output, was_killed.load(Ordering::SeqCst)))
+    Ok((output, killed_rx.try_recv().is_ok()))
 }
 
 /// Format the tool output string for a shell-style command.
@@ -135,6 +129,53 @@ pub(crate) fn format_shell_output(
     truncate_tool_output(&format!(
         "$ {display_cmd}\n{combined_str}\n\nExit code: {exit_code}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn format_shell_output_was_killed_shows_timeout() {
+        let output = Output {
+            stdout: b"some output".to_vec(),
+            stderr: b"".to_vec(),
+            status: std::process::ExitStatus::from_raw(0),
+        };
+        let result = format_shell_output("sleep 10", &output, 5000, true);
+        assert!(result.contains("timed out after 5000ms"));
+        assert!(result.contains("Exit code: -1"));
+    }
+
+    #[test]
+    fn format_shell_output_not_killed_shows_exit_code() {
+        let output = Output {
+            stdout: b"hello\nworld".to_vec(),
+            stderr: b"".to_vec(),
+            status: std::process::ExitStatus::from_raw(0),
+        };
+        let result = format_shell_output("echo hello", &output, 5000, false);
+        assert!(!result.contains("timed out"));
+        assert!(result.contains("hello"));
+        assert!(result.contains("world"));
+        assert!(result.contains("Exit code: 0"));
+    }
+
+    #[test]
+    fn format_shell_output_includes_stderr() {
+        // On Linux, the raw status encodes the exit code in bits 8-15.
+        // `from_raw(1 << 8)` means exit code 1 (normal exit).
+        let output = Output {
+            stdout: b"stdout".to_vec(),
+            stderr: b"stderr".to_vec(),
+            status: std::process::ExitStatus::from_raw(1 << 8),
+        };
+        let result = format_shell_output("cmd", &output, 1000, false);
+        assert!(result.contains("stdout"));
+        assert!(result.contains("stderr"));
+        assert!(result.contains("Exit code: 1"));
+    }
 }
 
 fn check_path_confinement(

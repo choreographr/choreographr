@@ -10,7 +10,6 @@ use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult}
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tai_keystore::XCredentials;
 use tai_proto::{
@@ -60,6 +59,25 @@ fn emit_prepared_image_sync(
     ));
 }
 
+/// Check whether a cancellation signal has been received from an `mpsc` channel.
+///
+/// In a one-shot check (no caching needed), pass `&mut false`:
+///
+/// ```ignore
+/// if is_cancelled(&cancel_rx, &mut false) { return Ok(true); }
+/// ```
+///
+/// In a polling loop, pass a persistent `was_cancelled: &mut bool` initialized to
+/// `false`. The flag is set once when the signal arrives and never cleared, so
+/// subsequent iterations don't re-check the (now-empty) channel. This models a
+/// single-shot, irreversible cancellation flag.
+pub(crate) fn is_cancelled(rx: &mpsc::Receiver<()>, was_cancelled: &mut bool) -> bool {
+    if !*was_cancelled {
+        *was_cancelled = rx.try_recv().is_ok();
+    }
+    *was_cancelled
+}
+
 pub(crate) fn run_agent_loop(
     client: &OpenAiClient,
     session: &mut SessionState,
@@ -68,20 +86,20 @@ pub(crate) fn run_agent_loop(
     model: &str,
     request_id: u32,
     cwd: Option<&Path>,
-    cancel: &AtomicBool,
+    cancel_rx: &mpsc::Receiver<()>,
     tool_registry: &Arc<ToolRegistry>,
     daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
     max_turns_default: u32,
     cmd_tx: &std::sync::mpsc::Sender<SessionCommand>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let mut next_image_id = 1u32;
     let max_turns = session.max_turns.unwrap_or(max_turns_default);
 
     for turn in 0..max_turns {
         debug!(session_id, turn, "agent loop turn");
         let tools = tool_registry.available_definitions(&session.active_tool_groups);
-        if cancel.load(Ordering::SeqCst) {
-            return Ok(());
+        if is_cancelled(&cancel_rx, &mut false) {
+            return Ok(true);
         }
 
         if let Some(ref session_cwd) = session.cwd {
@@ -106,7 +124,7 @@ pub(crate) fn run_agent_loop(
         }
 
         if cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Inference)).is_err() {
-            return Ok(());
+            return Ok(false);
         }
 
         let messages = build_chat_request_messages(session.messages());
@@ -130,13 +148,13 @@ pub(crate) fn run_agent_loop(
                 if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
                     tracing::warn!(session_id, error = %e, "failed to persist assistant text");
                 }
-                return Ok(());
+                return Ok(false);
             }
             ChatTurnResult::ToolUse(tool_use) => {
                 persist_assistant_tool_use_sync(session, session_id, db, &tool_use);
                 for tool_call in tool_use.tool_calls {
-                    if cancel.load(Ordering::SeqCst) {
-                        return Ok(());
+                    if is_cancelled(&cancel_rx, &mut false) {
+                        return Ok(true);
                     }
 
                     let _ = cmd_tx.send(SessionCommand::Broadcast(
@@ -158,7 +176,7 @@ pub(crate) fn run_agent_loop(
                     };
 
                     if cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::ToolCall(tool_call.name.clone()))).is_err() {
-                        return Ok(());
+                        return Ok(false);
                     }
 
                     debug!(
@@ -185,7 +203,7 @@ pub(crate) fn run_agent_loop(
                         session_id,
                         model,
                         max_turns_default,
-                        cancel,
+                        cancel_rx,
                         cmd_tx,
                     );
 
@@ -311,7 +329,7 @@ fn execute_tool_with_timeout(
     session_id: u64,
     model: &str,
     max_turns_default: u32,
-    cancel: &AtomicBool,
+    cancel_rx: &mpsc::Receiver<()>,
     cmd_tx: &mpsc::Sender<SessionCommand>,
 ) -> ToolExecutionOutput {
     if tool_call.name == "list_sessions" {
@@ -332,7 +350,7 @@ fn execute_tool_with_timeout(
             None,
             cwd,
             max_turns_default,
-            cancel,
+            cancel_rx,
         );
     }
     if tool_call.name == "load_skill" {
@@ -385,8 +403,12 @@ fn execute_tool_with_timeout(
     });
 
     let start = std::time::Instant::now();
+    let mut was_cancelled = false;
     loop {
-        if cancel.load(Ordering::SeqCst) {
+        // Cancellation is one-shot: `is_cancelled` reads the channel once
+        // and then caches the result so subsequent iterations don't need
+        // to re-check the (now-empty) channel.
+        if is_cancelled(&cancel_rx, &mut was_cancelled) {
             return ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("tool '{}' cancelled", tool_call.name),
@@ -571,7 +593,7 @@ fn execute_spawn_subsession_sync(
     _x_credentials: Option<&XCredentials>,
     cwd: Option<&Path>,
     _max_turns_default: u32,
-    cancel: &AtomicBool,
+    cancel_rx: &mpsc::Receiver<()>,
 ) -> ToolExecutionOutput {
     let args: serde_json::Value = match serde_json::from_str(&tool_call.arguments_json) {
         Ok(a) => a,
@@ -636,8 +658,12 @@ fn execute_spawn_subsession_sync(
                 input_tokens: Vec::new(),
                 reply: result_tx,
             });
+            let mut was_cancelled = false;
             loop {
-                if cancel.load(Ordering::SeqCst) {
+                // Cancellation is one-shot: `is_cancelled` reads the channel once
+                // and then caches the result so subsequent iterations don't need
+                // to re-check the (now-empty) channel.
+                if is_cancelled(&cancel_rx, &mut was_cancelled) {
                     let _ =
                         child_tx.send(crate::sessions::SessionCommand::Cancel { request_id: 1 });
                     return ToolExecutionOutput {
@@ -1080,5 +1106,71 @@ mod tests {
         let output = execute_load_skill_sync(&session, None, r#"{}"#);
         assert!(output.result.is_error);
         assert_eq!(output.result.content, "missing required parameter: name");
+    }
+
+    // -- Cancellation helper tests -----------------------------------------
+
+    #[test]
+    fn is_cancelled_returns_false_initially() {
+        let (_tx, rx) = mpsc::channel::<()>();
+        let mut flag = false;
+        assert!(!is_cancelled(&rx, &mut flag));
+        assert!(!flag);
+    }
+
+    #[test]
+    fn is_cancelled_returns_true_after_send() {
+        let (tx, rx) = mpsc::channel::<()>();
+        tx.send(()).unwrap();
+        let mut flag = false;
+        assert!(is_cancelled(&rx, &mut flag));
+        assert!(flag);
+    }
+
+    #[test]
+    fn is_cancelled_caching_persists_after_message_consumed() {
+        let (tx, rx) = mpsc::channel::<()>();
+        tx.send(()).unwrap();
+        let mut flag = false;
+
+        // First call consumes the message and sets the cached flag.
+        assert!(is_cancelled(&rx, &mut flag));
+
+        // Second call should still return true using the cached flag,
+        // even though the channel is now empty.
+        assert!(is_cancelled(&rx, &mut flag));
+        assert!(flag);
+    }
+
+    #[test]
+    fn is_cancelled_one_shot_without_cache_still_detects() {
+        // Passing `&mut false` on every call works as a one-shot check:
+        // each call tries the channel afresh.
+        let (tx, rx) = mpsc::channel::<()>();
+        tx.send(()).unwrap();
+
+        assert!(is_cancelled(&rx, &mut false));
+    }
+
+    #[test]
+    fn is_cancelled_disconnected_no_signal() {
+        let (tx, rx) = mpsc::channel::<()>();
+        drop(tx); // disconnected without sending
+        let mut flag = false;
+        assert!(!is_cancelled(&rx, &mut flag));
+        assert!(!flag);
+    }
+
+    #[test]
+    fn is_cancelled_disconnected_after_signal_still_true_with_cache() {
+        let (tx, rx) = mpsc::channel::<()>();
+        tx.send(()).unwrap();
+        drop(tx); // disconnect after sending
+
+        let mut flag = false;
+        assert!(is_cancelled(&rx, &mut flag)); // consumes the message
+        assert!(flag);
+        // Channel is now empty *and* disconnected, but cache keeps it true.
+        assert!(is_cancelled(&rx, &mut flag));
     }
 }

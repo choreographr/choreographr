@@ -7,7 +7,6 @@ use crate::tools::ToolRegistry;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tai_proto::{DaemonMessage, SessionMessage, SessionStatus, SessionSummary};
@@ -157,7 +156,7 @@ pub struct SessionSnapshot {
 }
 
 pub(crate) struct ActiveRequest {
-    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) cancel_tx: mpsc::Sender<()>,
 }
 
 pub struct ActiveSessionEntry {
@@ -503,12 +502,10 @@ fn process_command(
             );
 
             broadcast(&state.subscribers, DaemonMessage::Started { request_id });
-            let cancel = Arc::new(AtomicBool::new(false));
+            let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
             state.active_requests.insert(
                 request_id,
-                ActiveRequest {
-                    cancel: Arc::clone(&cancel),
-                },
+                ActiveRequest { cancel_tx },
             );
 
             let cwd = state.cwd.clone();
@@ -531,7 +528,7 @@ fn process_command(
                     db,
                     model,
                     cwd,
-                    cancel,
+                    cancel_rx,
                     tool_registry,
                     daemon_tx,
                     max_turns_default,
@@ -567,12 +564,10 @@ fn process_command(
             }
             broadcast(&state.subscribers, DaemonMessage::Started { request_id });
             let cwd = state.cwd.clone();
-            let cancel = Arc::new(AtomicBool::new(false));
+            let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
             state.active_requests.insert(
                 request_id,
-                ActiveRequest {
-                    cancel: Arc::clone(&cancel),
-                },
+                ActiveRequest { cancel_tx },
             );
             let mut worker_session =
                 SessionState::from_snapshot(state.snapshot(), HashMap::new());
@@ -590,7 +585,7 @@ fn process_command(
                     db,
                     model,
                     cwd,
-                    cancel,
+                    cancel_rx,
                     tool_registry,
                     daemon_tx,
                     max_turns_default,
@@ -603,7 +598,7 @@ fn process_command(
         }
         SessionCommand::Cancel { request_id } => {
             if let Some(active) = state.active_requests.get(&request_id) {
-                active.cancel.store(true, Ordering::SeqCst);
+                let _ = active.cancel_tx.send(());
                 broadcast(&state.subscribers, DaemonMessage::Cancelled { request_id });
             }
             false
@@ -710,7 +705,7 @@ fn process_command(
         SessionCommand::Shutdown => {
             *shutdown_requested = true;
             for (&request_id, active) in &state.active_requests {
-                active.cancel.store(true, Ordering::SeqCst);
+                let _ = active.cancel_tx.send(());
                 broadcast(&state.subscribers, DaemonMessage::Cancelled { request_id });
             }
             state.active_requests.is_empty()
@@ -726,7 +721,7 @@ fn run_request_worker(
     db: Arc<redb::Database>,
     model: String,
     cwd: Option<PathBuf>,
-    cancel: Arc<AtomicBool>,
+    cancel_rx: mpsc::Receiver<()>,
     tool_registry: Arc<ToolRegistry>,
     daemon_tx: mpsc::Sender<DaemonCommand>,
     max_turns_default: u32,
@@ -743,7 +738,7 @@ fn run_request_worker(
             &model,
             request_id,
             cwd.as_deref(),
-            &cancel,
+            &cancel_rx,
             &tool_registry,
             &daemon_tx,
             max_turns_default,
@@ -752,13 +747,8 @@ fn run_request_worker(
     }));
 
     let (outcome, snapshot) = match result {
-        Ok(Ok(())) if cancel.load(Ordering::SeqCst) => {
-            (RequestOutcome::Cancelled, session.snapshot())
-        }
-        Ok(Ok(())) => (RequestOutcome::Done, session.snapshot()),
-        Ok(Err(_)) if cancel.load(Ordering::SeqCst) => {
-            (RequestOutcome::Cancelled, session.snapshot())
-        }
+        Ok(Ok(true)) => (RequestOutcome::Cancelled, session.snapshot()),
+        Ok(Ok(false)) => (RequestOutcome::Done, session.snapshot()),
         Ok(Err(e)) => (RequestOutcome::Failed(e), session.snapshot()),
         Err(_) => (
             RequestOutcome::Failed(io::Error::new(
@@ -1095,5 +1085,125 @@ mod tests {
         );
 
         assert!(!shutdown);
+    }
+
+    // -- Cancel / Shutdown tests -------------------------------------------
+
+    #[test]
+    fn cancel_sends_through_channel() {
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        state.active_requests.insert(1, ActiveRequest { cancel_tx });
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Cancel { request_id: 1 },
+            &mut state, 1, &db, None, &tool_registry,
+            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+        );
+
+        // The cancellation signal should be delivered on the channel.
+        assert!(cancel_rx.try_recv().is_ok());
+        assert!(!shutdown);
+    }
+
+    #[test]
+    fn cancel_broadcasts_cancelled_to_subscribers() {
+        let (cancel_tx, _cancel_rx) = mpsc::channel::<()>();
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        state.active_requests.insert(1, ActiveRequest { cancel_tx });
+
+        let (sub_tx, sub_rx) = mpsc::channel();
+        state.subscribers.insert(42, sub_tx);
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Cancel { request_id: 1 },
+            &mut state, 1, &db, None, &tool_registry,
+            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+        );
+
+        assert_eq!(
+            sub_rx.recv().unwrap(),
+            DaemonMessage::Cancelled { request_id: 1 },
+        );
+    }
+
+    #[test]
+    fn cancel_unknown_request_id_is_noop() {
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        // No active requests — cancel on a non-existent ID should not fail.
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Cancel { request_id: 99 },
+            &mut state, 1, &db, None, &tool_registry,
+            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+        );
+
+        assert!(!shutdown);
+    }
+
+    #[test]
+    fn shutdown_cancels_all_active_requests() {
+        let (cancel_tx1, cancel_rx1) = mpsc::channel::<()>();
+        let (cancel_tx2, cancel_rx2) = mpsc::channel::<()>();
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        state.active_requests.insert(1, ActiveRequest { cancel_tx: cancel_tx1 });
+        state.active_requests.insert(2, ActiveRequest { cancel_tx: cancel_tx2 });
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Shutdown,
+            &mut state, 1, &db, None, &tool_registry,
+            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+        );
+
+        assert!(shutdown);
+        // Both requests should have received cancellation signals.
+        assert!(cancel_rx1.try_recv().is_ok());
+        assert!(cancel_rx2.try_recv().is_ok());
+    }
+
+    #[test]
+    fn shutdown_with_empty_active_requests_returns_true() {
+        // When there are no active requests, Shutdown should signal
+        // that the session loop can exit (return true).
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        // active_requests is already empty.
+
+        let mut shutdown = false;
+        let should_exit = process_command(
+            SessionCommand::Shutdown,
+            &mut state, 1, &db, None, &tool_registry,
+            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+        );
+
+        assert!(shutdown);
+        assert!(should_exit);
+    }
+
+    #[test]
+    fn shutdown_broadcasts_cancelled_for_each_active_request() {
+        let (cancel_tx1, _) = mpsc::channel::<()>();
+        let (cancel_tx2, _) = mpsc::channel::<()>();
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        state.active_requests.insert(1, ActiveRequest { cancel_tx: cancel_tx1 });
+        state.active_requests.insert(2, ActiveRequest { cancel_tx: cancel_tx2 });
+
+        let (sub_tx, sub_rx) = mpsc::channel();
+        state.subscribers.insert(10, sub_tx);
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Shutdown,
+            &mut state, 1, &db, None, &tool_registry,
+            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+        );
+
+        // Should receive two Cancelled broadcasts (order not guaranteed).
+        let msgs: Vec<DaemonMessage> = (0..2).map(|_| sub_rx.recv().unwrap()).collect();
+        assert!(msgs.contains(&DaemonMessage::Cancelled { request_id: 1 }));
+        assert!(msgs.contains(&DaemonMessage::Cancelled { request_id: 2 }));
     }
 }

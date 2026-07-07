@@ -13,7 +13,7 @@ use serde::Deserialize;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tai_keystore::XCredentials;
@@ -241,7 +241,7 @@ struct RunRiscVInput {
 struct TaiSyscall {
     x_credentials: Option<XCredentials>,
     cwd: Option<PathBuf>,
-    output: Arc<Mutex<Vec<u8>>>,
+    output_tx: mpsc::Sender<Vec<u8>>,
     write_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
@@ -317,7 +317,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                 let len = machine.registers()[registers::A1];
                 if len > 0 {
                     let data = machine.memory_mut().load_bytes(ptr, len)?;
-                    self.output.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&data);
+                    let _ = self.output_tx.send(data.to_vec());
                     if let Some(tx) = &self.write_tx {
                         let _ = tx.send(data.into());
                     }
@@ -483,11 +483,11 @@ fn run_riscv_impl(
         };
     }
 
-    let output = Arc::new(Mutex::new(Vec::new()));
+    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
     let syscall = TaiSyscall {
         x_credentials: x_credentials.cloned(),
         cwd: cwd.map(|p| p.to_path_buf()),
-        output: Arc::clone(&output),
+        output_tx,
         write_tx,
     };
 
@@ -522,7 +522,11 @@ fn run_riscv_impl(
 
     match trace.run() {
         Ok(_exit_code) => {
-            let out = output.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            // Drain all buffered output written via the TaiSyscall write
+            // handler during VM execution.  `trace.run()` is synchronous,
+            // so every write completes before `try_iter()` runs — no need
+            // for a blocking receive even though the sender is still alive.
+            let out: Vec<u8> = output_rx.try_iter().flatten().collect();
             let out_str = String::from_utf8_lossy(&out).to_string();
 
             // Prepend the formatted source as a syntax-highlighted markdown
@@ -544,7 +548,9 @@ fn run_riscv_impl(
             }
         }
         Err(e) => {
-            let out = output.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            // Same pattern — drain all buffered output collected before
+            // the VM faulted.  No blocking needed (see Ok arm above).
+            let out: Vec<u8> = output_rx.try_iter().flatten().collect();
             let out_str = String::from_utf8_lossy(&out).to_string();
             let msg = if out_str.is_empty() {
                 format!("VM error: {e}")
@@ -617,7 +623,7 @@ impl Tool for RunRiscV {
         args: &str,
         x_credentials: Option<&XCredentials>,
         cwd: Option<&Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
+    output_tx: mpsc::Sender<Vec<u8>>,
     ) -> ToolExecutionOutput {
         run_riscv_impl(args, x_credentials, cwd, Some(output_tx))
     }
@@ -785,5 +791,63 @@ mod tests {
             "should not be alignment error: {}", result.result.content);
         assert!(!result.result.content.contains("cannot exceed 4MB"),
             "should not be size error: {}", result.result.content);
+    }
+
+    // -- Channel output collection tests -----------------------------------
+    //
+    // These verify the `try_iter().flatten().collect()` pattern used to drain
+    // the VM's byte output channel after a synchronous `trace.run()`.
+
+    #[test]
+    fn channel_output_collection_empty_when_nothing_sent() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        drop(tx);
+
+        let out: Vec<u8> = rx.try_iter().flatten().collect();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn channel_output_collection_single_chunk() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        tx.send(b"hello".to_vec()).unwrap();
+        drop(tx);
+
+        let out: Vec<u8> = rx.try_iter().flatten().collect();
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn channel_output_collection_preserves_order() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        tx.send(b"hello ".to_vec()).unwrap();
+        tx.send(b"world".to_vec()).unwrap();
+        drop(tx);
+
+        let out: Vec<u8> = rx.try_iter().flatten().collect();
+        assert_eq!(out, b"hello world");
+    }
+
+    #[test]
+    fn channel_output_collection_works_with_open_channel() {
+        // `try_iter()` returns whatever is buffered even if the sender
+        // is still alive — exactly the pattern used after `trace.run()`.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        tx.send(b"data".to_vec()).unwrap();
+        // Don't drop tx — simulate the open-sender scenario.
+
+        let out: Vec<u8> = rx.try_iter().flatten().collect();
+        assert_eq!(out, b"data");
+    }
+
+    #[test]
+    fn channel_output_collection_multiple_chunks_open_sender() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        tx.send(b"a".to_vec()).unwrap();
+        tx.send(b"b".to_vec()).unwrap();
+        tx.send(b"c".to_vec()).unwrap();
+
+        let out: Vec<u8> = rx.try_iter().flatten().collect();
+        assert_eq!(out, b"abc");
     }
 }

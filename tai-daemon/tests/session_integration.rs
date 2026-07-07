@@ -84,3 +84,27 @@ fn session_shutdown_exits_without_active_requests() {
 
     handle.join().unwrap();
 }
+
+#[ignore]
+#[test]
+fn session_cancel_nonexistent_request_does_not_panic() {
+    let db = Arc::new(common::test_db());
+    let (session_tx, handle) = spawn_session(db, 1);
+
+    // Cancel on a request_id that doesn't exist should not panic or hang.
+    session_tx.send(SessionCommand::Cancel { request_id: 999 }).unwrap();
+
+    // Session should still be functional afterwards.
+    let (writer_tx, _writer_rx) = mpsc::channel();
+    session_tx
+        .send(SessionCommand::Attach {
+            client_id: 10,
+            tx: writer_tx,
+        })
+        .unwrap();
+
+    session_tx.send(SessionCommand::Shutdown).unwrap();
+    drop(session_tx);
+
+    handle.join().unwrap();
+}
