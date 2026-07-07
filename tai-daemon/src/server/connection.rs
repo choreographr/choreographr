@@ -165,6 +165,10 @@ pub(crate) fn client_thread(
                         debug!("client {}: ListModels", client_id);
                         handle_list_models_sync(&daemon_tx, &writer_tx, attached_session_id);
                     }
+                    ClientMessage::DeleteSession { session_id } => {
+                        info!("client {}: DeleteSession id={}", client_id, session_id);
+                        handle_delete_session_sync(&daemon_tx, &writer_tx, session_id);
+                    }
                     ClientMessage::GetCredential { service } => {
                         handle_get_credential_sync(&daemon_tx, &writer_tx, service);
                     }
@@ -287,6 +291,29 @@ fn handle_get_credential_sync(
         }
         Ok(None) => {
             let _ = writer_tx.send(DaemonMessage::Credential { service, key: None });
+        }
+        Err(_) => {}
+    }
+}
+
+fn handle_delete_session_sync(
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    writer_tx: &mpsc::Sender<DaemonMessage>,
+    session_id: u64,
+) {
+    let (reply, rx) = mpsc::channel();
+    let _ = daemon_tx.send(DaemonCommand::DeleteSession { session_id, reply });
+    match rx.recv() {
+        Ok(Ok(())) => {
+            // The daemon broadcasts SessionDeleted to all summary
+            // subscribers (including this client when it's viewing
+            // the session list), so we don't duplicate it here.
+        }
+        Ok(Err(e)) => {
+            let _ = writer_tx.send(DaemonMessage::SessionDeleteFailed {
+                session_id,
+                error: e.to_string(),
+            });
         }
         Err(_) => {}
     }
@@ -463,6 +490,47 @@ mod tests {
         ));
         // State stays at session 1
         assert_eq!(attached_id, Some(1));
+    }
+
+    #[test]
+    fn handle_delete_session_sync_success_no_message_sent() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::DeleteSession { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(Ok(()));
+            }
+        });
+        handle_delete_session_sync(&daemon_tx, &writer_tx, 42);
+        // On success, no message is sent to writer (broadcast handles it)
+        assert!(writer_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn handle_delete_session_sync_error() {
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::DeleteSession { reply, .. }) = daemon_rx.recv() {
+                let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "db error")));
+            }
+        });
+        handle_delete_session_sync(&daemon_tx, &writer_tx, 42);
+        let msg = writer_rx.recv().unwrap();
+        assert!(matches!(msg, DaemonMessage::SessionDeleteFailed { .. }));
+        if let DaemonMessage::SessionDeleteFailed { session_id, error } = &msg {
+            assert_eq!(*session_id, 42);
+            assert_eq!(error, "db error");
+        }
+    }
+
+    #[test]
+    fn handle_delete_session_sync_disconnected() {
+        let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        drop(daemon_rx);
+        handle_delete_session_sync(&daemon_tx, &writer_tx, 42);
+        assert!(writer_rx.try_recv().is_err());
     }
 
     #[test]

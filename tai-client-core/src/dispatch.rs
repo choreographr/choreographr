@@ -274,6 +274,16 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             Ok(None)
         }
         DaemonMessage::Credential { .. } => Ok(None),
+        DaemonMessage::SessionDeleted { .. } => {
+            // Handled upstream by the TUI before dispatch; this crate-level
+            // handler just acknowledges it so the match is exhaustive.
+            Ok(None)
+        }
+        DaemonMessage::SessionDeleteFailed { .. } => {
+            // Handled upstream by the TUI before dispatch; this crate-level
+            // handler just acknowledges it so the match is exhaustive.
+            Ok(None)
+        }
         DaemonMessage::ShuttingDown => {
             handler.push_text("[daemon] shutting down".to_string());
             Ok(None)

@@ -160,6 +160,9 @@ pub enum ClientMessage {
         service: String,
         passphrase: String,
     },
+    DeleteSession {
+        session_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -300,6 +303,13 @@ pub enum DaemonMessage {
     },
     CredentialRemoveFailed {
         service: String,
+        error: String,
+    },
+    SessionDeleted {
+        session_id: u64,
+    },
+    SessionDeleteFailed {
+        session_id: u64,
         error: String,
     },
     Credential {

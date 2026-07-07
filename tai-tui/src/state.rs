@@ -61,6 +61,7 @@ pub(crate) struct SessionManagerState {
     pub(crate) selection: Option<usize>,
     pub(crate) scroll: usize,
     pub(crate) detail_data: Option<SessionDetailData>,
+    pub(crate) confirm_delete: Option<(u64, String)>,
 }
 
 /// Cached rendering of a history item whose content does not change between
@@ -294,6 +295,7 @@ impl SessionManagerState {
             selection: None,
             scroll: 0,
             detail_data: None,
+            confirm_delete: None,
         }
     }
 
@@ -362,6 +364,39 @@ impl SessionManagerState {
     pub(crate) fn leave_detail(&mut self) {
         self.view = SessionManagerView::List;
         self.detail_data = None;
+    }
+
+    /// Remove a session by ID from the list, adjusting selection and scroll
+    /// state.  Safe to call even when the session is not in the list.
+    pub(crate) fn remove_session(&mut self, id: u64) {
+        let old_len = self.sessions.len();
+        self.sessions.retain(|s| s.session_id != id);
+        let removed = old_len - self.sessions.len();
+        if removed == 0 {
+            return;
+        }
+        // Adjust selection
+        if let Some(sel) = self.selection {
+            if sel >= self.sessions.len() {
+                self.selection = if self.sessions.is_empty() {
+                    None
+                } else {
+                    Some(self.sessions.len().saturating_sub(1))
+                };
+            }
+        }
+        // Clamp scroll to valid range after removal
+        let max_scroll = self.sessions.len().saturating_sub(1);
+        self.scroll = self.scroll.min(max_scroll);
+        // If detail view was showing this session, go back to list
+        if self.detail_data.as_ref().map_or(false, |d| d.session_id == id) {
+            self.view = SessionManagerView::List;
+            self.detail_data = None;
+        }
+        // Clear any pending confirmation
+        if self.confirm_delete.as_ref().map(|(sid, _)| *sid) == Some(id) {
+            self.confirm_delete = None;
+        }
     }
 }
 
@@ -982,6 +1017,114 @@ pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_session(id: u64, title: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: id,
+            title: Some(title.into()),
+            selected_model: None,
+            parent_session_id: None,
+            cwd: None,
+            created_at: 1000,
+            message_count: 0,
+            max_turns: None,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec!["core".into()],
+        }
+    }
+
+    fn make_detail_data(session_id: u64) -> SessionDetailData {
+        SessionDetailData {
+            session_id,
+            title: String::new(),
+            selected_model: String::new(),
+            parent_session_id: None,
+            cwd: String::new(),
+            created_at: 0,
+            message_count: 0,
+            max_turns: None,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+        }
+    }
+
+    // ── remove_session ──
+
+    #[test]
+    fn remove_session_removes_from_list() {
+        let mut mgr = SessionManagerState::new();
+        mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
+        mgr.selection = Some(0);
+        mgr.remove_session(1);
+        assert_eq!(mgr.sessions.len(), 1);
+        assert_eq!(mgr.sessions[0].session_id, 2);
+    }
+
+    #[test]
+    fn remove_session_nonexistent_is_noop() {
+        let mut mgr = SessionManagerState::new();
+        mgr.sessions = vec![make_session(1, "a")];
+        mgr.selection = Some(0);
+        mgr.remove_session(999);
+        assert_eq!(mgr.sessions.len(), 1);
+        assert_eq!(mgr.selection, Some(0));
+    }
+
+    #[test]
+    fn remove_session_last_item_clears_selection() {
+        let mut mgr = SessionManagerState::new();
+        mgr.sessions = vec![make_session(1, "a")];
+        mgr.selection = Some(0);
+        mgr.remove_session(1);
+        assert!(mgr.sessions.is_empty());
+        assert_eq!(mgr.selection, None);
+    }
+
+    #[test]
+    fn remove_session_clamps_selection_to_new_len() {
+        let mut mgr = SessionManagerState::new();
+        mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
+        mgr.selection = Some(1); // pointing at session 2
+        mgr.remove_session(2);
+        assert_eq!(mgr.sessions.len(), 1);
+        assert_eq!(mgr.selection, Some(0));
+    }
+
+    #[test]
+    fn remove_session_clears_detail_view_for_deleted_session() {
+        let mut mgr = SessionManagerState::new();
+        mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
+        mgr.view = SessionManagerView::Detail;
+        mgr.detail_data = Some(make_detail_data(1));
+        mgr.remove_session(1);
+        assert_eq!(mgr.view, SessionManagerView::List);
+        assert!(mgr.detail_data.is_none());
+    }
+
+    #[test]
+    fn remove_session_clears_confirmation_for_deleted_session() {
+        let mut mgr = SessionManagerState::new();
+        mgr.sessions = vec![make_session(1, "a")];
+        mgr.confirm_delete = Some((1, "a".into()));
+        mgr.remove_session(1);
+        assert!(mgr.confirm_delete.is_none());
+    }
+
+    #[test]
+    fn remove_session_preserves_scroll_within_bounds() {
+        let mut mgr = SessionManagerState::new();
+        mgr.sessions = vec![
+            make_session(1, "a"),
+            make_session(2, "b"),
+            make_session(3, "c"),
+        ];
+        mgr.selection = Some(2);
+        mgr.scroll = 1;
+        // Remove the first item; scroll of 1 should stay valid
+        mgr.remove_session(1);
+        assert_eq!(mgr.scroll, 1);
+        assert_eq!(mgr.sessions.len(), 2);
+    }
 
     // ── try_parse_as_diff ──
 

@@ -77,6 +77,10 @@ pub enum DaemonCommand {
         session_id: u64,
         status: SessionStatus,
     },
+    DeleteSession {
+        session_id: u64,
+        reply: std::sync::mpsc::Sender<io::Result<()>>,
+    },
 }
 
 impl DaemonState {
@@ -90,11 +94,8 @@ impl DaemonState {
                 active_tool_groups,
                 reply,
             } => {
-                if self.openai_client.is_none() {
-                    let _ = reply.send(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "daemon is locked",
-                    )));
+                if let Err(e) = self.ensure_unlocked() {
+                    let _ = reply.send(Err(e));
                     return;
                 }
                 let sid = self.next_session_id;
@@ -182,17 +183,13 @@ impl DaemonState {
                     session_id: sid,
                     status: SessionStatus::Inactive,
                 };
-                self.summary_subscribers.retain(|_id, tx| {
-                    tx.send(created_msg.clone()).is_ok() && tx.send(status_msg.clone()).is_ok()
-                });
+                self.broadcast(created_msg);
+                self.broadcast(status_msg);
             }
             DaemonCommand::AttachSession { session_id, reply } => {
                 debug!("AttachSession: id={}", session_id);
-                if self.openai_client.is_none() {
-                    let _ = reply.send(Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        "daemon is locked",
-                    )));
+                if let Err(e) = self.ensure_unlocked() {
+                    let _ = reply.send(Err(e));
                     return;
                 }
                 match self.active_sessions.get(&session_id) {
@@ -304,9 +301,7 @@ impl DaemonState {
                     session_id,
                     status: SessionStatus::Sleeping,
                 };
-                self.summary_subscribers.retain(|_id, tx| {
-                    tx.send(msg.clone()).is_ok()
-                });
+                self.broadcast(msg);
             }
             DaemonCommand::Unlock { passphrase, reply } => {
                 info!("Unlock attempt");
@@ -334,12 +329,50 @@ impl DaemonState {
             }
             DaemonCommand::BroadcastSessionStatus { session_id, status } => {
                 let msg = DaemonMessage::SessionStatusChanged { session_id, status };
-                self.summary_subscribers.retain(|_id, tx| {
-                    tx.send(msg.clone()).is_ok()
-                });
+                self.broadcast(msg);
+            }
+            DaemonCommand::DeleteSession { session_id, reply } => {
+                info!("DeleteSession: id={}", session_id);
+                if let Err(e) = self.ensure_unlocked() {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+                // Gracefully shut down the session thread so it can persist its
+                // final state before we delete from the DB — otherwise the
+                // session's persist_and_exit would re-write the session
+                // back to the DB after we delete it.
+                if let Some(entry) = self.active_sessions.remove(&session_id) {
+                    let _ = entry.cmd_tx.send(SessionCommand::Shutdown);
+                    let _ = entry.handle.join();
+                }
+                // Remove from in-memory metadata
+                self.session_metadata.remove(&session_id);
+                // Remove from database
+                if let Err(e) = db::delete_session(&self.db, session_id) {
+                    error!("DeleteSession: failed to delete session {} from db: {e}", session_id);
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+                // Broadcast deletion to subscribers
+                self.broadcast(DaemonMessage::SessionDeleted { session_id });
+                let _ = reply.send(Ok(()));
             }
             DaemonCommand::Shutdown => unreachable!("handled by command loop"),
         }
+    }
+
+    /// Returns an error if the daemon hasn't been unlocked yet.
+    fn ensure_unlocked(&self) -> io::Result<()> {
+        if self.openai_client.is_none() {
+            Err(io::Error::new(io::ErrorKind::Other, "daemon is locked"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Send a message to all summary subscribers, removing dead ones.
+    fn broadcast(&mut self, msg: DaemonMessage) {
+        self.summary_subscribers.retain(|_id, tx| tx.send(msg.clone()).is_ok());
     }
 }
 
@@ -583,5 +616,50 @@ mod tests {
         let result = rx.recv().unwrap();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "daemon is locked");
+    }
+
+    #[test]
+    fn ensure_unlocked_returns_err_when_locked() {
+        let (state, _rx) = make_daemon_state();
+        let result = state.ensure_unlocked();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "daemon is locked");
+    }
+
+    #[test]
+    fn handle_delete_session_locked() {
+        let (mut state, _rx) = make_daemon_state();
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::DeleteSession {
+            session_id: 1,
+            reply,
+        });
+        let result = rx.recv().unwrap();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "daemon is locked");
+    }
+
+    #[test]
+    fn broadcast_sends_to_subscriber() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx, rx) = mpsc::channel();
+        state.summary_subscribers.insert(1, tx);
+        let msg = DaemonMessage::SessionDeleted { session_id: 42 };
+        state.broadcast(msg.clone());
+        let received = rx.recv().unwrap();
+        assert_eq!(received, msg);
+        // Subscriber should still be registered
+        assert!(state.summary_subscribers.contains_key(&1));
+    }
+
+    #[test]
+    fn broadcast_removes_disconnected_subscriber() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx, rx) = mpsc::channel::<DaemonMessage>();
+        state.summary_subscribers.insert(1, tx);
+        drop(rx); // Disconnect the receiver
+        state.broadcast(DaemonMessage::SessionDeleted { session_id: 42 });
+        // Dead subscriber should be removed
+        assert!(!state.summary_subscribers.contains_key(&1));
     }
 }

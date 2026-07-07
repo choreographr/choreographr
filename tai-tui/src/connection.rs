@@ -333,6 +333,24 @@ fn handle_session_list_key(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // If in delete-confirmation mode, handle y/n/Esc first
+    if app.session_mgr.confirm_delete.is_some() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some((session_id, _title)) = app.session_mgr.confirm_delete.take() {
+                    client_tx
+                        .send(ClientMessage::DeleteSession { session_id })
+                        .map_err(broken_pipe)?;
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.session_mgr.confirm_delete = None;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
@@ -363,6 +381,15 @@ fn handle_session_list_key(
                     max_turns: None,
                 })
                 .map_err(broken_pipe)?;
+        }
+        KeyCode::Char('d') => {
+            // Enter delete-confirmation mode for the selected session
+            if let Some(sel) = app.session_mgr.selection {
+                if let Some(session) = app.session_mgr.sessions.get(sel) {
+                    let title = session.title.clone().unwrap_or_else(|| "untitled".into());
+                    app.session_mgr.confirm_delete = Some((session.session_id, title));
+                }
+            }
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.page = Page::Chat;
@@ -489,6 +516,20 @@ pub(crate) fn handle_daemon_message(
                 }
             }
             return Ok(());
+        }
+        DaemonMessage::SessionDeleted { session_id } => {
+            // The session was removed on the daemon side.  Remove from
+            // the local session list and clear the attachment if needed.
+            app.session_mgr.remove_session(*session_id);
+            if app.attached_session_id == Some(*session_id) {
+                app.attached_session_id = None;
+            }
+        }
+        DaemonMessage::SessionDeleteFailed { session_id, error } => {
+            app.push_text(format!(
+                "failed to delete session {}: {}",
+                session_id, error,
+            ));
         }
         _ => {}
     }

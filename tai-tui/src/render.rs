@@ -384,10 +384,16 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_widget(paragraph, inner);
     }
 
-    let status = Paragraph::new(Line::from(format!(
-        " <j/k nav>  <Enter switch>  <i details>  <n new>  <Esc back>  —  {} sessions",
-        app.session_mgr.sessions.len()
-    )));
+    let status = if let Some((_id, title)) = &app.session_mgr.confirm_delete {
+        Paragraph::new(Line::from(format!(
+            " Delete “{title}”? (y/N)  "
+        )))
+    } else {
+        Paragraph::new(Line::from(format!(
+            " <j/k nav>  <Enter switch>  <i details>  <n new>  <d delete>  <Esc back>  —  {} sessions",
+            app.session_mgr.sessions.len()
+        )))
+    };
     frame.render_widget(status, chunks[1]);
 }
 
