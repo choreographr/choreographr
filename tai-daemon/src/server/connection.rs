@@ -52,14 +52,14 @@ pub(crate) fn client_thread(
                         });
                         match rx.recv() {
                             Ok(Ok((sid, session_tx))) => {
-                                // Detach old first
-                                if let Some(ref old_tx) = attached_session_tx {
-                                    let _ = old_tx.send(SessionCommand::Detach { client_id });
-                                }
-                                let _ = session_tx.send(SessionCommand::Attach {
+                                switch_attached_session(
+                                    sid,
+                                    session_tx,
+                                    &writer_tx,
+                                    &mut attached_session_id,
+                                    &mut attached_session_tx,
                                     client_id,
-                                    tx: writer_tx.clone(),
-                                });
+                                );
                                 let _ = writer_tx.send(DaemonMessage::SessionCreated {
                                     session_id: sid,
                                     title,
@@ -69,8 +69,6 @@ pub(crate) fn client_thread(
                                 });
                                 let _ = writer_tx
                                     .send(DaemonMessage::SessionAttached { session_id: sid });
-                                attached_session_tx = Some(session_tx);
-                                attached_session_id = Some(sid);
                             }
                             Ok(Err(e)) => {
                                 let _ = writer_tx.send(DaemonMessage::SessionFailed {
@@ -87,21 +85,16 @@ pub(crate) fn client_thread(
                         let _ = daemon_tx.send(DaemonCommand::AttachSession { session_id, reply });
                         match rx.recv() {
                             Ok(Ok(session_tx)) => {
-                                // Don't detach when re-attaching to the same session —
-                                // it would kill the session's only subscriber.
-                                if Some(session_id) != attached_session_id {
-                                    if let Some(ref old_tx) = attached_session_tx {
-                                        let _ = old_tx.send(SessionCommand::Detach { client_id });
-                                    }
-                                }
-                                let _ = session_tx.send(SessionCommand::Attach {
+                                switch_attached_session(
+                                    session_id,
+                                    session_tx,
+                                    &writer_tx,
+                                    &mut attached_session_id,
+                                    &mut attached_session_tx,
                                     client_id,
-                                    tx: writer_tx.clone(),
-                                });
+                                );
                                 let _ =
                                     writer_tx.send(DaemonMessage::SessionAttached { session_id });
-                                attached_session_tx = Some(session_tx);
-                                attached_session_id = Some(session_id);
                             }
                             Ok(Err(e)) => {
                                 let _ = writer_tx.send(DaemonMessage::SessionFailed {
@@ -205,6 +198,31 @@ pub(crate) fn client_thread(
     drop(writer_tx);
     let _ = writer_handle.join();
     Ok(())
+}
+
+/// Switch the client's attachment from the old session to a new one.
+/// Skips detaching when re-attaching to the same session to avoid
+/// killing the session's only subscriber.
+fn switch_attached_session(
+    new_session_id: u64,
+    session_tx: mpsc::Sender<SessionCommand>,
+    writer_tx: &mpsc::Sender<DaemonMessage>,
+    attached_session_id: &mut Option<u64>,
+    attached_session_tx: &mut Option<mpsc::Sender<SessionCommand>>,
+    client_id: u64,
+) {
+    // Don't detach when re-attaching to the same session.
+    if Some(new_session_id) != *attached_session_id {
+        if let Some(old_tx) = attached_session_tx.as_ref() {
+            let _ = old_tx.send(SessionCommand::Detach { client_id });
+        }
+    }
+    let _ = session_tx.send(SessionCommand::Attach {
+        client_id,
+        tx: writer_tx.clone(),
+    });
+    *attached_session_tx = Some(session_tx);
+    *attached_session_id = Some(new_session_id);
 }
 
 fn handle_unlock_sync(
@@ -385,5 +403,87 @@ mod tests {
             assert_eq!(service, "openai");
             assert!(key.is_none());
         }
+    }
+
+    #[test]
+    fn switch_session_to_different_sends_detach_to_old() {
+        let (old_tx, old_rx) = mpsc::channel();
+        let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
+        let (writer_tx, _writer_rx) = mpsc::channel::<DaemonMessage>();
+        let mut attached_id = Some(1u64);
+        let mut attached_tx = Some(old_tx);
+
+        switch_attached_session(
+            2,
+            new_tx,
+            &writer_tx,
+            &mut attached_id,
+            &mut attached_tx,
+            42,
+        );
+
+        // Detach sent to old session
+        assert!(matches!(
+            old_rx.try_recv().ok(),
+            Some(SessionCommand::Detach { client_id: 42 })
+        ));
+        // Attach sent to new session
+        assert!(matches!(
+            new_rx.try_recv().ok(),
+            Some(SessionCommand::Attach { client_id: 42, .. })
+        ));
+        // State updated to new session
+        assert_eq!(attached_id, Some(2));
+    }
+
+    #[test]
+    fn switch_session_same_skips_detach() {
+        let (old_tx, old_rx) = mpsc::channel();
+        let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
+        let (writer_tx, _writer_rx) = mpsc::channel::<DaemonMessage>();
+        let mut attached_id = Some(1u64);
+        let mut attached_tx = Some(old_tx);
+
+        switch_attached_session(
+            1,
+            new_tx,
+            &writer_tx,
+            &mut attached_id,
+            &mut attached_tx,
+            42,
+        );
+
+        // No Detach sent — same session id
+        assert!(old_rx.try_recv().is_err());
+        // Attach still sent (caller expects the subscription)
+        assert!(matches!(
+            new_rx.try_recv().ok(),
+            Some(SessionCommand::Attach { client_id: 42, .. })
+        ));
+        // State stays at session 1
+        assert_eq!(attached_id, Some(1));
+    }
+
+    #[test]
+    fn switch_session_from_none_no_detach() {
+        let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
+        let (writer_tx, _writer_rx) = mpsc::channel::<DaemonMessage>();
+        let mut attached_id: Option<u64> = None;
+        let mut attached_tx: Option<mpsc::Sender<SessionCommand>> = None;
+
+        switch_attached_session(
+            1,
+            new_tx,
+            &writer_tx,
+            &mut attached_id,
+            &mut attached_tx,
+            42,
+        );
+
+        assert_eq!(attached_id, Some(1));
+        assert!(matches!(
+            new_rx.try_recv().ok(),
+            Some(SessionCommand::Attach { client_id: 42, .. })
+        ));
     }
 }
