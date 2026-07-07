@@ -12,6 +12,7 @@ use tai_proto::SessionMessage;
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
 const SESSION_MESSAGES: TableDefinition<(u64, u32), &[u8]> =
     TableDefinition::new("session_messages");
+#[cfg(test)]
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,30 +268,6 @@ pub fn read_messages(db: &redb::Database, session_id: u64) -> io::Result<Vec<Ses
     Ok(messages.into_iter().map(|(_, msg)| msg).collect())
 }
 
-pub fn next_session_id(db: &redb::Database) -> io::Result<u64> {
-    let write_txn = db
-        .begin_write()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb write txn: {e}")))?;
-    let current = {
-        let mut table = write_txn
-            .open_table(META)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb open meta: {e}")))?;
-        let current = table
-            .get("next_session_id")
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb get meta: {e}")))?
-            .map(|g| g.value())
-            .unwrap_or(1);
-        table
-            .insert("next_session_id", current.wrapping_add(1))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb set meta: {e}")))?;
-        current
-    };
-    write_txn
-        .commit()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit meta: {e}")))?;
-    Ok(current)
-}
-
 /// Retry a write_message on transient storage errors (e.g. I/O contention)
 /// with up to 3 retries and a 1ms backoff.
 pub fn write_message_retry(
@@ -337,6 +314,33 @@ pub fn write_session_retry(
 mod tests {
     use super::*;
     use tai_proto::SessionMessage;
+
+    /// Read the current `next_session_id` from the DB and atomically
+    /// increment it.  Only used by tests — production code derives the
+    /// next ID from max(existing keys) + 1 at startup.
+    fn next_session_id(db: &redb::Database) -> io::Result<u64> {
+        let write_txn = db
+            .begin_write()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb write txn: {e}")))?;
+        let current = {
+            let mut table = write_txn
+                .open_table(META)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb open meta: {e}")))?;
+            let current = table
+                .get("next_session_id")
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb get meta: {e}")))?
+                .map(|g| g.value())
+                .unwrap_or(1);
+            table
+                .insert("next_session_id", current.wrapping_add(1))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb set meta: {e}")))?;
+            current
+        };
+        write_txn
+            .commit()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit meta: {e}")))?;
+        Ok(current)
+    }
 
     #[test]
     fn round_trip() {

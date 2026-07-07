@@ -97,7 +97,12 @@ fn main() -> anyhow::Result<()> {
 
     let state = DaemonState {
         daemon_tx,
-        next_session_id: tai_daemon::db::next_session_id(&db).unwrap_or(1),
+        // Compute the next session ID from actual session records so we
+        // never collide with an existing session.  The DB's stored counter
+        // is only updated at startup and goes stale once the in-memory
+        // counter diverges — if the daemon crashes the counter resets and
+        // IDs get reused, overwriting old sessions.
+        next_session_id: session_metadata.keys().max().copied().map(|m| m + 1).unwrap_or(1),
         max_turns,
         active_sessions: std::collections::HashMap::new(),
         session_metadata,

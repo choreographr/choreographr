@@ -10,7 +10,7 @@ mod shell;
 pub use connection::run_daemon_connection;
 pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 pub use dispatch::{DaemonMessageHandler, dispatch_daemon_message};
-pub use error::ClientError;
+pub use error::{ClientError, broken_pipe};
 pub use history::{ClientHistory, HistoryItem, MAX_HISTORY_ITEMS};
 pub use image::{ImageAssembler, PendingImage};
 pub use markdown::{

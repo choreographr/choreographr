@@ -29,6 +29,14 @@ pub enum ClientError {
     },
 }
 
+/// Convert an mpsc send error (or any displayable error) into a
+/// `ClientError::Io(BrokenPipe)`.  This is the standard pattern when
+/// the daemon connection drops and we need to propagate the error
+/// through `client_tx.send(...).map_err(broken_pipe)?`.
+pub fn broken_pipe(err: impl std::fmt::Display) -> ClientError {
+    ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, err.to_string()))
+}
+
 impl From<ClientError> for io::Error {
     fn from(error: ClientError) -> Self {
         match error {

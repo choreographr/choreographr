@@ -10,7 +10,7 @@ use std::sync::{
 };
 use std::{io, time::Duration};
 use tai_client_core::{
-    ClientError, dispatch_daemon_message, run_daemon_connection, shell_command_echo,
+    broken_pipe, ClientError, dispatch_daemon_message, run_daemon_connection, shell_command_echo,
 };
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
@@ -180,18 +180,8 @@ fn handle_chat_event(
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     app.page = Page::SessionManager;
-                    client_tx.send(ClientMessage::ListSessions).map_err(|e| {
-                        ClientError::Io(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            e.to_string(),
-                        ))
-                    })?;
-                    client_tx.send(ClientMessage::SubscribeSessionsSummary).map_err(|e| {
-                        ClientError::Io(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            e.to_string(),
-                        ))
-                    })?;
+                    client_tx.send(ClientMessage::ListSessions).map_err(broken_pipe)?;
+                    client_tx.send(ClientMessage::SubscribeSessionsSummary).map_err(broken_pipe)?;
                 }
                 KeyCode::Char('c')
                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -233,12 +223,7 @@ fn handle_chat_event(
                                 }
                                 _ => {}
                             }
-                            client_tx.send(message).map_err(|e| {
-                                ClientError::Io(io::Error::new(
-                                    io::ErrorKind::BrokenPipe,
-                                    e.to_string(),
-                                ))
-                            })?;
+                            client_tx.send(message).map_err(broken_pipe)?;
                         }
                     }
                 }
@@ -364,12 +349,7 @@ fn handle_session_list_key(
                         .send(ClientMessage::AttachSession {
                             session_id: session.session_id,
                         })
-                        .map_err(|e| {
-                            ClientError::Io(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                e.to_string(),
-                            ))
-                        })?;
+                        .map_err(broken_pipe)?;
                 }
             }
         }
@@ -382,12 +362,7 @@ fn handle_session_list_key(
                     cwd: None,
                     max_turns: None,
                 })
-                .map_err(|e| {
-                    ClientError::Io(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        e.to_string(),
-                    ))
-                })?;
+                .map_err(broken_pipe)?;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.page = Page::Chat;
@@ -419,12 +394,7 @@ fn handle_session_detail_key(
                     .send(ClientMessage::AttachSession {
                         session_id: detail.session_id,
                     })
-                    .map_err(|e| {
-                        ClientError::Io(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            e.to_string(),
-                        ))
-                    })?;
+                    .map_err(broken_pipe)?;
             }
         }
         _ => {}
@@ -445,10 +415,21 @@ pub(crate) fn handle_daemon_message(
             if app.session_mgr.sessions.iter().any(|s| s.session_id == *session_id) {
                 return Ok(());
             }
-            app.attached_session_id = Some(*session_id);
             if app.page == Page::SessionManager {
-                app.page = Page::Chat;
+                // Stay on the session manager page — the new session will
+                // appear when the list refreshes.  The daemon no longer
+                // auto-attaches on CreateSession, so the old session stays
+                // alive and the user can accumulate multiple sessions.
                 let _ = client_tx.send(ClientMessage::ListSessions);
+            } else {
+                // On the chat page (auto-create flow): attach to the new
+                // session so the user can immediately start sending input.
+                app.attached_session_id = Some(*session_id);
+                client_tx
+                    .send(ClientMessage::AttachSession {
+                        session_id: *session_id,
+                    })
+                    .map_err(broken_pipe)?;
             }
         }
         DaemonMessage::SessionAttached { session_id } => {
@@ -495,12 +476,7 @@ pub(crate) fn handle_daemon_message(
                         .send(ClientMessage::AttachSession {
                             session_id: first.session_id,
                         })
-                        .map_err(|e| {
-                            ClientError::Io(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                e.to_string(),
-                            ))
-                        })?;
+                        .map_err(broken_pipe)?;
                 } else {
                     client_tx
                         .send(ClientMessage::CreateSession {
@@ -509,12 +485,7 @@ pub(crate) fn handle_daemon_message(
                             cwd: None,
                             max_turns: None,
                         })
-                        .map_err(|e| {
-                            ClientError::Io(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                e.to_string(),
-                            ))
-                        })?;
+                        .map_err(broken_pipe)?;
                 }
             }
             return Ok(());
@@ -524,9 +495,7 @@ pub(crate) fn handle_daemon_message(
 
     let response = dispatch_daemon_message(app, message)?;
     if let Some(msg) = response {
-        client_tx.send(msg).map_err(|e| {
-            ClientError::Io(io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))
-        })?;
+        client_tx.send(msg).map_err(broken_pipe)?;
     }
     Ok(())
 }

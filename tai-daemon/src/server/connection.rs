@@ -51,15 +51,18 @@ pub(crate) fn client_thread(
                             reply,
                         });
                         match rx.recv() {
-                            Ok(Ok((sid, session_tx))) => {
-                                switch_attached_session(
-                                    sid,
-                                    session_tx,
-                                    &writer_tx,
-                                    &mut attached_session_id,
-                                    &mut attached_session_tx,
-                                    client_id,
-                                );
+                            Ok(Ok((sid, _session_tx))) => {
+                                // _session_tx is discarded here because the
+                                // daemon keeps its own clone in active_sessions
+                                // (keyed by sid).  When the client later calls
+                                // AttachSession the daemon returns another clone
+                                // — no need to hold one in the connection thread.
+                                //
+                                // Don't auto-attach or detach here — the TUI
+                                // attaches explicitly via AttachSession when
+                                // the user presses Enter on a session.
+                                // This keeps the old session alive when
+                                // creating from the session manager page.
                                 let _ = writer_tx.send(DaemonMessage::SessionCreated {
                                     session_id: sid,
                                     title,
@@ -67,8 +70,6 @@ pub(crate) fn client_thread(
                                     cwd: cwd_str,
                                     max_turns,
                                 });
-                                let _ = writer_tx
-                                    .send(DaemonMessage::SessionAttached { session_id: sid });
                             }
                             Ok(Err(e)) => {
                                 let _ = writer_tx.send(DaemonMessage::SessionFailed {
