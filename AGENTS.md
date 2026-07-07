@@ -44,6 +44,10 @@ Never use `expect()`, `unwrap()`, or `panic!()` in production code. These create
 
 In the `tai-tui` crate, do not use `eprintln!` for diagnostics. Use `tracing::info!`, `tracing::warn!`, or `tracing::error!` instead — output goes to `/tmp/tai-tui.log`.
 
+## Thread Communication
+
+Do not share mutable state between threads. Use message passing (`mpsc` channels) for all cross-thread communication. Shared-state patterns (`Arc<RwLock<…>>`, `Arc<Mutex<…>>`) should be avoided in favor of channel-based designs.
+
 ## Inline Comments
 
 Always write inline comments around new code explaining how it works. Focus on the "why" — the reasoning, intent, and non-obvious details — rather than restating what the code literally does.

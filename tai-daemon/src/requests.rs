@@ -19,14 +19,10 @@ use tai_proto::{
 };
 use std::sync::mpsc;
 
-fn broadcast_to_session(session: &SessionState, message: DaemonMessage) {
-    for tx in session.subscribers().values() {
-        let _ = tx.send(message.clone());
-    }
-}
-
+/// Route an image-sync broadcast through the session command channel so the
+/// main session thread dispatches it to its live subscriber map.
 fn emit_prepared_image_sync(
-    session: &SessionState,
+    cmd_tx: &mpsc::Sender<SessionCommand>,
     request_id: u32,
     image_id: u32,
     image: PreparedImage,
@@ -39,30 +35,27 @@ fn emit_prepared_image_sync(
         byte_len: image.data.len() as u64,
         alt: image.alt,
     };
-    broadcast_to_session(
-        session,
+    let _ = cmd_tx.send(SessionCommand::Broadcast(
         DaemonMessage::ImageStart {
             request_id,
             metadata,
         },
-    );
+    ));
     for chunk in image.data.chunks(MAX_IMAGE_CHUNK_SIZE) {
-        broadcast_to_session(
-            session,
+        let _ = cmd_tx.send(SessionCommand::Broadcast(
             DaemonMessage::ImageChunk {
                 request_id,
                 image_id,
                 data: chunk.to_vec(),
             },
-        );
+        ));
     }
-    broadcast_to_session(
-        session,
+    let _ = cmd_tx.send(SessionCommand::Broadcast(
         DaemonMessage::ImageEnd {
             request_id,
             image_id,
         },
-    );
+    ));
 }
 
 pub(crate) fn run_agent_loop(
@@ -123,14 +116,13 @@ pub(crate) fn run_agent_loop(
                     response_len = content.len(),
                     "model returned final text",
                 );
-                broadcast_to_session(
-                    session,
+                let _ = cmd_tx.send(SessionCommand::Broadcast(
                     DaemonMessage::OutputChunk {
                         request_id,
                         stream: OutputStream::Answer,
                         data: content.clone().into_bytes(),
                     },
-                );
+                ));
                 let msg = SessionMessage::AssistantText { content };
                 let idx = session.push_message(msg.clone());
                 write_message_retry(db, session_id, idx, &msg).ok();
@@ -143,15 +135,14 @@ pub(crate) fn run_agent_loop(
                         return Ok(());
                     }
 
-                    broadcast_to_session(
-                        session,
+                    let _ = cmd_tx.send(SessionCommand::Broadcast(
                         DaemonMessage::ToolCallStarted {
                             request_id,
                             call_id: tool_call.id.clone(),
                             tool_name: tool_call.name.clone(),
                             arguments_json: tool_call.arguments_json.clone(),
                         },
-                    );
+                    ));
 
                     let tool_timeout = if tool_call.name == "spawn_subsession" {
                         Duration::from_secs(120)
@@ -191,6 +182,7 @@ pub(crate) fn run_agent_loop(
                         model,
                         max_turns_default,
                         cancel,
+                        cmd_tx,
                     );
 
                     let elapsed = tool_start.elapsed();
@@ -216,7 +208,7 @@ pub(crate) fn run_agent_loop(
                     }
 
                     if let Some(image) = output.image {
-                        emit_prepared_image_sync(session, request_id, next_image_id, image);
+                        emit_prepared_image_sync(cmd_tx, request_id, next_image_id, image);
                         next_image_id = next_image_id.wrapping_add(1);
                     }
 
@@ -244,7 +236,7 @@ pub(crate) fn run_agent_loop(
                             output: output.result.content.clone(),
                         }
                     };
-                    broadcast_to_session(session, event);
+                    let _ = cmd_tx.send(SessionCommand::Broadcast(event));
                 }
             }
         }
@@ -271,6 +263,7 @@ fn execute_tool_with_timeout(
     model: &str,
     max_turns_default: u32,
     cancel: &AtomicBool,
+    cmd_tx: &mpsc::Sender<SessionCommand>,
 ) -> ToolExecutionOutput {
     if tool_call.name == "list_sessions" {
         return execute_list_sessions_sync(daemon_tx);
@@ -374,11 +367,11 @@ fn execute_tool_with_timeout(
             loop {
                 match output_rx.try_recv() {
                     Ok(data) => {
-                        broadcast_to_session(session, DaemonMessage::ToolCallOutput {
+                        let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::ToolCallOutput {
                             request_id,
                             call_id: tool_call.id.clone(),
                             data,
-                        });
+                        }));
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => break,

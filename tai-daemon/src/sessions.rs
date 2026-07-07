@@ -47,6 +47,10 @@ pub enum SessionCommand {
         request_id: u32,
         snapshot: SessionSnapshot,
     },
+    /// Route a daemon message through the main session thread's subscriber
+    /// map so that workers always broadcast to the live subscriber set
+    /// rather than a stale clone of it.
+    Broadcast(DaemonMessage),
     Shutdown,
 }
 
@@ -264,16 +268,6 @@ impl SessionState {
     /// Replace a message at a given index (used for context refresh).
     pub fn set_message(&mut self, idx: usize, msg: SessionMessage) {
         self.messages[idx] = msg;
-    }
-
-    /// Read-only access to subscribers.
-    pub fn subscribers(&self) -> &HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>> {
-        &self.subscribers
-    }
-
-    /// Bulk-set subscribers (used when spawning worker threads).
-    pub fn set_subscribers(&mut self, subs: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>) {
-        self.subscribers = subs;
     }
 
     /// Create an empty session state.
@@ -518,9 +512,11 @@ fn process_command(
             );
 
             let cwd = state.cwd.clone();
-            let worker_subscribers = state.subscribers.clone();
+            // Workers don't need their own subscriber map — all broadcasts
+            // are routed through SessionCommand::Broadcast to this main
+            // session thread which holds the live subscriber set.
             let mut worker_session =
-                SessionState::from_snapshot(state.snapshot(), worker_subscribers.clone());
+                SessionState::from_snapshot(state.snapshot(), HashMap::new());
             let db = Arc::clone(db);
             let client = Arc::clone(client);
             let tool_registry = Arc::clone(tool_registry);
@@ -538,7 +534,6 @@ fn process_command(
                     cancel,
                     tool_registry,
                     daemon_tx,
-                    worker_subscribers,
                     max_turns_default,
                     cmd_tx,
                     None,
@@ -579,9 +574,8 @@ fn process_command(
                     cancel: Arc::clone(&cancel),
                 },
             );
-            let worker_subscribers = state.subscribers.clone();
             let mut worker_session =
-                SessionState::from_snapshot(state.snapshot(), worker_subscribers.clone());
+                SessionState::from_snapshot(state.snapshot(), HashMap::new());
             let db = Arc::clone(db);
             let client = Arc::clone(client);
             let tool_registry = Arc::clone(tool_registry);
@@ -599,7 +593,6 @@ fn process_command(
                     cancel,
                     tool_registry,
                     daemon_tx,
-                    worker_subscribers,
                     max_turns_default,
                     cmd_tx,
                     Some(reply),
@@ -708,6 +701,12 @@ fn process_command(
             state.active_requests.is_empty()
                 && (state.subscribers.is_empty() || *shutdown_requested)
         }
+        SessionCommand::Broadcast(message) => {
+            // Broadcast through the main session thread's live subscriber
+            // map so that in-flight worker broadcasts respect detach.
+            broadcast(&state.subscribers, message);
+            false
+        }
         SessionCommand::Shutdown => {
             *shutdown_requested = true;
             for (&request_id, active) in &state.active_requests {
@@ -730,12 +729,10 @@ fn run_request_worker(
     cancel: Arc<AtomicBool>,
     tool_registry: Arc<ToolRegistry>,
     daemon_tx: mpsc::Sender<DaemonCommand>,
-    subscribers: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
     max_turns_default: u32,
     cmd_tx: mpsc::Sender<SessionCommand>,
     child_reply: Option<mpsc::Sender<io::Result<ChildResult>>>,
 ) -> io::Result<()> {
-    session.subscribers = subscribers;
     let initial_snapshot = session.snapshot();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_agent_loop(
@@ -775,17 +772,18 @@ fn run_request_worker(
     match &outcome {
         RequestOutcome::Done => {
             info!(session_id, request_id, "request completed");
-            broadcast(&session.subscribers, DaemonMessage::Done { request_id });
+            // Route through the main session thread so detach is respected.
+            let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::Done { request_id }));
         }
         RequestOutcome::Failed(error) => {
             info!(session_id, request_id, error = %error, "request failed");
-            broadcast(
-                &session.subscribers,
+            // Route through the main session thread so detach is respected.
+            let _ = cmd_tx.send(SessionCommand::Broadcast(
                 DaemonMessage::Failed {
                     request_id,
                     error: error.to_string(),
                 },
-            );
+            ));
         }
         RequestOutcome::Cancelled => {
             info!(session_id, request_id, "request cancelled");
@@ -851,8 +849,10 @@ fn persist_and_exit(
 mod tests {
     use super::*;
     use crate::db::SessionRecord;
+    use crate::tools::ToolRegistry;
     use std::collections::HashMap;
-    use tai_proto::{SessionMessage, SessionStatus};
+    use tai_proto::{OutputStream, SessionMessage, SessionStatus};
+    use tempfile::tempdir;
 
     fn test_record() -> SessionRecord {
         SessionRecord {
@@ -983,5 +983,117 @@ mod tests {
         let record2: SessionRecord = meta.into();
         assert_eq!(record.active_tool_groups, record2.active_tool_groups);
         assert_eq!(record2.active_tool_groups.len(), 2);
+    }
+
+    // -- SessionCommand::Broadcast tests -----------------------------------
+
+    /// Build minimal stubs needed to call `process_command` with a Broadcast.
+    fn broadcast_setup() -> (
+        SessionState,
+        Arc<redb::Database>,
+        Arc<ToolRegistry>,
+        mpsc::Sender<DaemonCommand>,
+        mpsc::Sender<SessionCommand>,
+    ) {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let tool_registry = ToolRegistry::new().build();
+        let (daemon_tx, _) = mpsc::channel();
+        let (cmd_tx, _) = mpsc::channel();
+        (test_state(), db, tool_registry, daemon_tx, cmd_tx)
+    }
+
+    #[test]
+    fn broadcast_delivers_message_to_all_subscribers() {
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        state.subscribers.insert(10, tx1);
+        state.subscribers.insert(20, tx2);
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Broadcast(DaemonMessage::Done { request_id: 5 }),
+            &mut state, 1, &db, None, &tool_registry,
+            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+        );
+
+        assert_eq!(rx1.recv().unwrap(), DaemonMessage::Done { request_id: 5 });
+        assert_eq!(rx2.recv().unwrap(), DaemonMessage::Done { request_id: 5 });
+        assert!(!shutdown);
+    }
+
+    #[test]
+    fn broadcast_does_not_deliver_to_detached_client() {
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        state.subscribers.insert(10, tx1);
+        state.subscribers.insert(20, tx2);
+
+        // Detach client 10
+        state.subscribers.remove(&10);
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Broadcast(DaemonMessage::OutputChunk {
+                request_id: 1,
+                stream: OutputStream::Answer,
+                data: b"hello".to_vec(),
+            }),
+            &mut state, 1, &db, None, &tool_registry,
+            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+        );
+
+        // Client 20 (still attached) receives the message.
+        assert_eq!(
+            rx2.recv().unwrap(),
+            DaemonMessage::OutputChunk {
+                request_id: 1,
+                stream: OutputStream::Answer,
+                data: b"hello".to_vec(),
+            },
+        );
+
+        // Client 10 (detached) does not — the sender was removed and dropped,
+        // so the channel is disconnected.
+        match rx1.recv() {
+            Err(_) => {} // expected
+            Ok(msg) => panic!("detached client received: {msg:?}"),
+        }
+    }
+
+    #[test]
+    fn broadcast_with_no_subscribers_does_not_panic() {
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        // subscribers is already empty
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Broadcast(DaemonMessage::Done { request_id: 0 }),
+            &mut state, 1, &db, None, &tool_registry,
+            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+        );
+
+        assert!(!shutdown);
+    }
+
+    #[test]
+    fn broadcast_handles_disconnected_subscriber_gracefully() {
+        // A sender whose receiver has been dropped (simulating a client that
+        // disconnected without properly detaching) should not panic or crash.
+        let (tx, _rx) = mpsc::channel();
+        drop(_rx);
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        state.subscribers.insert(99, tx);
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Broadcast(DaemonMessage::Pong),
+            &mut state, 1, &db, None, &tool_registry,
+            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+        );
+
+        assert!(!shutdown);
     }
 }
