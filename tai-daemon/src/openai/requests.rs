@@ -8,7 +8,12 @@ use super::{
     RequestFormat, ResponsesRequest, ResponsesResponse, SseReader, endpoint_url,
     extract_responses_text_delta,
 };
-use std::{io, time::Duration};
+use std::sync::mpsc;
+use std::time::Duration;
+use std::{io, thread};
+
+/// Called before each retry attempt with (current_attempt, max_attempts, delay).
+pub type RetryCallback = Box<dyn FnMut(u32, u32, Duration) + Send>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct RetryConfig {
@@ -53,6 +58,39 @@ pub(crate) fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> Op
         .and_then(|v| v.parse::<u64>().ok())
 }
 
+/// Block for `delay`, returning `Cancelled` early if a signal arrives on
+/// `cancel_rx`.  When no channel is provided, falls back to `thread::sleep`.
+fn sleep_or_cancel(
+    delay: Duration,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
+) -> Result<(), super::OpenAiError> {
+    if let Some(rx) = cancel_rx {
+        match rx.recv_timeout(delay) {
+            Ok(()) => return Err(super::OpenAiError::Cancelled),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+    } else {
+        thread::sleep(delay);
+    }
+    Ok(())
+}
+
+/// Invoke the retry callback (if any) then wait for the backoff duration.
+/// Returns `Cancelled` if the user cancelled during the wait.
+fn wait_before_retry(
+    attempt: u32,
+    max_attempts: u32,
+    delay: Duration,
+    on_retry: &mut Option<RetryCallback>,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
+) -> Result<(), super::OpenAiError> {
+    if let Some(cb) = on_retry.as_mut() {
+        cb(attempt, max_attempts, delay);
+    }
+    sleep_or_cancel(delay, cancel_rx)
+}
+
 fn status_to_error(
     status: reqwest::StatusCode,
     detail: &str,
@@ -88,6 +126,8 @@ fn status_to_error(
 fn retry_send_impl<F>(
     send_request: F,
     retry: &RetryConfig,
+    on_retry: &mut Option<RetryCallback>,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<reqwest::blocking::Response, super::OpenAiError>
 where
     F: Fn() -> Result<reqwest::blocking::Response, reqwest::Error>,
@@ -124,7 +164,7 @@ where
                         delay_ms = delay.as_millis(),
                         "retrying request"
                     );
-                    std::thread::sleep(delay);
+                    wait_before_retry(attempt, retry.max_attempts, delay, on_retry, cancel_rx)?;
                     continue;
                 }
 
@@ -147,7 +187,7 @@ where
                         delay_ms = delay.as_millis(),
                         "retrying request after connection/timeout error"
                     );
-                    std::thread::sleep(delay);
+                    wait_before_retry(attempt, retry.max_attempts, delay, on_retry, cancel_rx)?;
                     continue;
                 }
                 return Err(super::OpenAiError::Io(io::Error::other(error)));
@@ -162,10 +202,14 @@ fn retry_send(
     api_key: &str,
     body: &serde_json::Value,
     retry: &RetryConfig,
+    on_retry: &mut Option<RetryCallback>,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<reqwest::blocking::Response, super::OpenAiError> {
     retry_send_impl(
         || client.post(url).bearer_auth(api_key.trim()).json(body).send(),
         retry,
+        on_retry,
+        cancel_rx,
     )
 }
 
@@ -174,11 +218,38 @@ fn retry_send_get(
     url: &str,
     api_key: &str,
     retry: &RetryConfig,
+    on_retry: &mut Option<RetryCallback>,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<reqwest::blocking::Response, super::OpenAiError> {
     retry_send_impl(
         || client.get(url).bearer_auth(api_key.trim()).send(),
         retry,
+        on_retry,
+        cancel_rx,
     )
+}
+
+/// Thin wrapper around [`retry_send`] that skips retry callbacks and
+/// cancellation — used by callers that don't need interactive retry.
+fn retry_send_simple(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    retry: &RetryConfig,
+) -> Result<reqwest::blocking::Response, super::OpenAiError> {
+    retry_send(client, url, api_key, body, retry, &mut None, None)
+}
+
+/// Thin wrapper around [`retry_send_get`] that skips retry callbacks and
+/// cancellation.
+fn retry_send_get_simple(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    api_key: &str,
+    retry: &RetryConfig,
+) -> Result<reqwest::blocking::Response, super::OpenAiError> {
+    retry_send_get(client, url, api_key, retry, &mut None, None)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -200,7 +271,7 @@ impl OpenAiClient {
         info!("listing models from {}", self.config.base_url);
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
         let retry = RetryConfig::from_service_config(&self.config);
-        let response = retry_send_get(&self.http, &url, &self.api_key, &retry)?;
+        let response = retry_send_get_simple(&self.http, &url, &self.api_key, &retry)?;
         let payload: ModelListResponse = response
             .json()
             .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
@@ -262,6 +333,8 @@ impl OpenAiClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        on_retry: &mut Option<RetryCallback>,
+        cancel_rx: Option<&mpsc::Receiver<()>>,
     ) -> Result<ChatTurnResult, super::OpenAiError> {
         chat_completions_request_with_tools(
             &self.http,
@@ -270,6 +343,8 @@ impl OpenAiClient {
             model,
             messages,
             tools,
+            on_retry,
+            cancel_rx,
         )
     }
 }
@@ -289,7 +364,7 @@ fn responses_request(
         stream: false,
     })
     .map_err(io::Error::other)?;
-    let response = retry_send(client, &url, api_key, &body, &retry)?;
+    let response = retry_send_simple(client, &url, api_key, &body, &retry)?;
     let payload: ResponsesResponse = response
         .json()
         .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
@@ -336,7 +411,7 @@ fn chat_completions_request(
         max_completion_tokens: max_completion_tokens_field,
     })
     .map_err(io::Error::other)?;
-    let response = retry_send(client, &url, api_key, &body, &retry)?;
+    let response = retry_send_simple(client, &url, api_key, &body, &retry)?;
     let payload: ChatCompletionsResponse = response
         .json()
         .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
@@ -364,6 +439,8 @@ fn chat_completions_request_with_tools(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
+    on_retry: &mut Option<RetryCallback>,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
     let start = std::time::Instant::now();
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
@@ -384,7 +461,7 @@ fn chat_completions_request_with_tools(
         max_completion_tokens: max_completion_tokens_field,
     })
     .map_err(io::Error::other)?;
-    let response = retry_send(client, &url, api_key, &body, &retry)?;
+    let response = retry_send(client, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
     let payload: ChatCompletionsResponse = response
         .json()
         .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
@@ -467,7 +544,7 @@ where
         max_completion_tokens: max_completion_tokens_field,
     })
     .map_err(io::Error::other)?;
-    let response = retry_send(client, &url, api_key, &body, &retry)?;
+    let response = retry_send_simple(client, &url, api_key, &body, &retry)?;
     let body_bytes = response.bytes().map_err(io::Error::other)?.to_vec();
 
     let mut reader = SseReader::new(body_bytes);
@@ -525,7 +602,7 @@ where
         stream: true,
     })
     .map_err(io::Error::other)?;
-    let response = retry_send(client, &url, api_key, &body, &retry)?;
+    let response = retry_send_simple(client, &url, api_key, &body, &retry)?;
     let body_bytes = response.bytes().map_err(io::Error::other)?.to_vec();
 
     let mut reader = SseReader::new(body_bytes);
@@ -544,4 +621,43 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- sleep_or_cancel tests -------------------------------------------
+
+    #[test]
+    fn sleep_or_cancel_no_channel_returns_ok() {
+        let result = sleep_or_cancel(Duration::from_millis(1), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sleep_or_cancel_timeout_returns_ok() {
+        let (_tx, rx) = mpsc::channel::<()>();
+        let result = sleep_or_cancel(Duration::from_millis(1), Some(&rx));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sleep_or_cancel_signal_returns_cancelled() {
+        let (tx, rx) = mpsc::channel::<()>();
+        tx.send(()).unwrap();
+        let result = sleep_or_cancel(Duration::from_secs(10), Some(&rx));
+        assert!(matches!(
+            result,
+            Err(crate::openai::OpenAiError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn sleep_or_cancel_disconnected_returns_ok() {
+        let (tx, rx) = mpsc::channel::<()>();
+        drop(tx);
+        let result = sleep_or_cancel(Duration::from_millis(1), Some(&rx));
+        assert!(result.is_ok());
+    }
 }

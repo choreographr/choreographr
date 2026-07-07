@@ -35,6 +35,14 @@ pub enum SessionStatus {
     Inactive,
     Inference,
     ToolCall(String),
+    /// The daemon received a retryable HTTP error (429/5xx/connection) and is
+    /// waiting before the next attempt.  Displayed in the TUI so the user
+    /// knows the model call hasn't stalled and can choose to cancel.
+    Retrying {
+        attempt: u32,
+        max_attempts: u32,
+        delay_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

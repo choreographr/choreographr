@@ -16,6 +16,7 @@ pub(crate) use sse::{SseReader, extract_responses_text_delta};
 pub(crate) use requests::{
     RetryConfig, backoff_duration, is_retryable_status, parse_retry_after_secs,
 };
+pub use requests::RetryCallback;
 
 use serde::{Deserialize, Serialize};
 use std::{io, time::Duration};
@@ -35,6 +36,8 @@ pub enum OpenAiError {
     ClientError { status: u16, detail: String },
     #[error("provider returned an empty response")]
     EmptyResponse,
+    #[error("request cancelled during retry backoff")]
+    Cancelled,
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

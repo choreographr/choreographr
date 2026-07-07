@@ -354,12 +354,14 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
                 SessionStatus::Inactive => "idle",
                 SessionStatus::Inference => "infer",
                 SessionStatus::ToolCall(name) => &name,
+                SessionStatus::Retrying { .. } => "retry",
             };
             let status_style = match &session.status {
                 SessionStatus::Sleeping => Color::DarkGray,
                 SessionStatus::Inactive => Color::Green,
                 SessionStatus::Inference => Color::Yellow,
                 SessionStatus::ToolCall(_) => Color::Cyan,
+                SessionStatus::Retrying { .. } => Color::Magenta,
             };
             let row = format!(
                 "{sel}{att} {:>4}  \"{title}\"  ({model})  — {} messages  [",
@@ -499,6 +501,9 @@ fn format_status(status: &SessionStatus) -> String {
         SessionStatus::Inactive => "idle".to_string(),
         SessionStatus::Inference => "inferring".to_string(),
         SessionStatus::ToolCall(name) => format!("tool call: {name}"),
+        SessionStatus::Retrying { attempt, max_attempts, delay_ms } => {
+            format!("retrying ({attempt}/{max_attempts}, {delay_ms}ms)")
+        }
     }
 }
 
@@ -1156,6 +1161,28 @@ mod tests {
         let spans = diff_cell_spans(&input, DiffLineKind::Addition, 10, false);
         assert_eq!(spans[0].style.fg, Some(Color::Rgb(0, 150, 200)));
         assert_eq!(spans[0].style.bg, Some(Color::Rgb(0, 80, 0)));
+    }
+
+    // ── format_status tests ──
+
+    #[test]
+    fn format_status_retrying() {
+        let status = SessionStatus::Retrying {
+            attempt: 2,
+            max_attempts: 5,
+            delay_ms: 3000,
+        };
+        assert_eq!(format_status(&status), "retrying (2/5, 3000ms)");
+    }
+
+    #[test]
+    fn format_status_retrying_first_attempt() {
+        let status = SessionStatus::Retrying {
+            attempt: 1,
+            max_attempts: 3,
+            delay_ms: 1500,
+        };
+        assert_eq!(format_status(&status), "retrying (1/3, 1500ms)");
     }
 
     #[test]

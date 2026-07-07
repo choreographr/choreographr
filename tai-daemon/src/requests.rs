@@ -128,8 +128,23 @@ pub(crate) fn run_agent_loop(
         }
 
         let messages = build_chat_request_messages(session.messages());
-        match client.chat_completion_turn(model, &messages, &tools)? {
-            ChatTurnResult::FinalText(content) => {
+
+        // Build a retry-notification callback that forwards status updates
+        // through the session command channel so the TUI can display the
+        // retry progress and the user can cancel during backoff.
+        let mut retry_cb: Option<crate::openai::RetryCallback> = Some(Box::new({
+            let cmd_tx = cmd_tx.clone();
+            move |attempt, max_attempts, delay| {
+                let _ = cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Retrying {
+                    attempt,
+                    max_attempts,
+                    delay_ms: delay.as_millis() as u64,
+                }));
+            }
+        }));
+
+        match client.chat_completion_turn(model, &messages, &tools, &mut retry_cb, Some(cancel_rx)) {
+            Ok(ChatTurnResult::FinalText(content)) => {
                 debug!(
                     session_id,
                     turn,
@@ -150,7 +165,7 @@ pub(crate) fn run_agent_loop(
                 }
                 return Ok(false);
             }
-            ChatTurnResult::ToolUse(tool_use) => {
+            Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 persist_assistant_tool_use_sync(session, session_id, db, &tool_use);
                 for tool_call in tool_use.tool_calls {
                     if is_cancelled(&cancel_rx, &mut false) {
@@ -306,6 +321,12 @@ pub(crate) fn run_agent_loop(
                     let _ = cmd_tx.send(SessionCommand::Broadcast(event));
                 }
             }
+            Err(crate::openai::OpenAiError::Cancelled) => {
+                // The user cancelled during a retry backoff —
+                // treat this as a clean cancellation, not a failure.
+                return Ok(true);
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 

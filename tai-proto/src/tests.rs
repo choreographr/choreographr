@@ -120,3 +120,15 @@ fn render_line_displayed_image_with_alt() {
         "[image: image/svg+xml (100x50, 999 bytes)]"
     );
 }
+
+#[test]
+fn session_status_retrying_serde_round_trip() {
+    let status = SessionStatus::Retrying {
+        attempt: 2,
+        max_attempts: 5,
+        delay_ms: 3000,
+    };
+    let frame = encode_frame(&status).expect("encode");
+    let decoded: SessionStatus = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, status);
+}
