@@ -1,5 +1,7 @@
 use crate::render::{mouse_in_history_box, render};
-use crate::state::{App, InputBuffer, Page, PAGE_SCROLL_LINES, SessionManagerView, UiEvent};
+use crate::state::{
+    App, InputBuffer, Page, PAGE_SCROLL_LINES, SessionManagerView, UiEvent,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use signal_hook::consts::SIGINT;
@@ -360,13 +362,13 @@ fn handle_session_list_key(
         KeyCode::Enter => {
             if let Some(sel) = app.session_mgr.selection {
                 if let Some(session) = app.session_mgr.sessions.get(sel) {
+                    let session_id = session.session_id;
                     app.page = Page::Chat;
                     let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
-                    app.attached_session_id = Some(session.session_id);
+                    app.reset_for_session_switch();
+                    app.attached_session_id = Some(session_id);
                     client_tx
-                        .send(ClientMessage::AttachSession {
-                            session_id: session.session_id,
-                        })
+                        .send(ClientMessage::AttachSession { session_id })
                         .map_err(broken_pipe)?;
                 }
             }
@@ -414,13 +416,13 @@ fn handle_session_detail_key(
         }
         KeyCode::Enter => {
             if let Some(ref detail) = app.session_mgr.detail_data {
+                let session_id = detail.session_id;
                 app.page = Page::Chat;
                 let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
-                app.attached_session_id = Some(detail.session_id);
+                app.reset_for_session_switch();
+                app.attached_session_id = Some(session_id);
                 client_tx
-                    .send(ClientMessage::AttachSession {
-                        session_id: detail.session_id,
-                    })
+                    .send(ClientMessage::AttachSession { session_id })
                     .map_err(broken_pipe)?;
             }
         }

@@ -5,10 +5,22 @@ pub use error::ProtoError;
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u8 = 1;
-pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+/// Max serialised frame size (4 bytes length prefix + payload).
+///
+/// Bumped from 1 MiB to 32 MiB to accommodate `SessionState` responses that
+/// carry full image binary data inside `DisplayedImage` records.  The old
+/// limit was tight enough that a single large tool-generated image could
+/// overflow the frame when the client re-attaches to a session.
+pub const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/tai.sock";
 pub const SOCKET_PATH_ENV: &str = "TAI_SOCKET_PATH";
 pub const MAX_IMAGE_CHUNK_SIZE: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisplayedImageRecord {
+    pub metadata: ImageMetadata,
+    pub data: Vec<u8>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssistantToolCallRecord {
@@ -49,6 +61,7 @@ pub enum SessionMessage {
         content: String,
         is_error: bool,
     },
+    DisplayedImage(DisplayedImageRecord),
 }
 
 impl SessionMessage {
@@ -84,6 +97,15 @@ impl SessionMessage {
             } => {
                 let status = if *is_error { "error" } else { "ok" };
                 format!("[tool-result:{status}] {name}: {content}")
+            }
+            Self::DisplayedImage(record) => {
+                format!(
+                    "[image: {} ({}x{}, {} bytes)]",
+                    record.metadata.mime_type,
+                    record.metadata.width,
+                    record.metadata.height,
+                    record.metadata.byte_len,
+                )
             }
         }
     }
@@ -173,6 +195,8 @@ pub enum OutputStream {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageMetadata {
+    /// Image identifier for the live streaming protocol (`ImageStart`/`Chunk`/`End`).
+    /// Meaningless for persisted `DisplayedImage` records (always set to `0`).
     pub image_id: u32,
     pub mime_type: String,
     pub width: u32,

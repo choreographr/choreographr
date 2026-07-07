@@ -4,8 +4,10 @@ use tai_client_core::{
     ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
     MAX_HISTORY_ITEMS,
 };
-use tai_proto::{ImageMetadata, OutputStream, SessionMessage, SessionStatus, SessionSummary};
-use tai_tui::{RenderedImage, StreamingText, build_rendered_image};
+use tai_proto::{
+    ImageMetadata, OutputStream, SessionMessage, SessionStatus, SessionSummary,
+};
+use tai_tui::{ImageAssembler, RenderedImage, StreamingText, build_rendered_image};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::db::{self, CommandEntry};
@@ -729,13 +731,50 @@ impl App {
     }
 
     /// Feed a `SessionMessage` into history.
+    ///
+    /// `DisplayedImage` messages (persisted images) are decoded into
+    /// `RenderedImage` objects and pushed as `HistoryItem::Image`, preserving
+    /// them across session switches and daemon restarts.  All other message
+    /// types go through the normal diff-classification path.
     pub(crate) fn push_session_message(&mut self, message: SessionMessage) {
-        self.push_history_item(Self::classify_session_message(message));
+        match message {
+            SessionMessage::DisplayedImage(record) => {
+                if let Some(picker) = self.picker.as_ref() {
+                    match build_rendered_image(picker, record.metadata, record.data) {
+                        Ok(img) => self.push_image(img),
+                        Err(e) => self.push_text(format!(
+                            "[tai-tui] failed to decode replayed image: {e}"
+                        )),
+                    }
+                } else {
+                    self.push_text(
+                        "[tai-tui] no image picker available for replayed image".to_string(),
+                    );
+                }
+            }
+            other => {
+                self.push_history_item(Self::classify_session_message(other));
+            }
+        }
     }
 
     pub(crate) fn push_image(&mut self, image: RenderedImage) {
         let item = HistoryItem::Image(Box::new(image));
         self.push_history_item(item);
+    }
+
+    /// Clear all per-session state when switching to a different session.
+    ///
+    /// Called from the Enter-key handlers in `connection.rs` before sending
+    /// `AttachSession`, so that the incoming `SessionState` response populates
+    /// a clean view of the target session.
+    pub(crate) fn reset_for_session_switch(&mut self) {
+        self.client.history.clear();
+        self.render_cache.clear();
+        self.history_scroll = HistoryScrollState::new();
+        self.active.clear();
+        self.client.in_progress.clear();
+        self.client.pending_images = ImageAssembler::new();
     }
 
     /// Ensure the render cache is aligned with the history vector.
@@ -1017,6 +1056,7 @@ pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tai_proto::DisplayedImageRecord;
 
     fn make_session(id: u64, title: &str) -> SessionSummary {
         SessionSummary {
@@ -1229,5 +1269,116 @@ mod tests {
         app.push_session_message(msg);
 
         assert!(matches!(app.client.history.last().unwrap(), HistoryItem::SessionMessage(_)));
+    }
+
+    // ── push_session_message with DisplayedImage ──
+
+    #[test]
+    fn push_session_message_displayed_image_no_picker() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        // App::new() initialises picker to None.
+
+        let msg = SessionMessage::DisplayedImage(DisplayedImageRecord {
+            metadata: ImageMetadata {
+                image_id: 0,
+                mime_type: "image/png".into(),
+                width: 1,
+                height: 1,
+                byte_len: 0,
+                alt: None,
+            },
+            data: vec![],
+        });
+        app.push_session_message(msg);
+
+        let last = app.client.history.last().unwrap();
+        match last {
+            HistoryItem::Text(t) => assert!(t.contains("no image picker"), "{t}"),
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn push_session_message_displayed_image_decode_failure() {
+        use ratatui_image::picker::Picker;
+
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.picker = Some(Picker::halfblocks());
+
+        let msg = SessionMessage::DisplayedImage(DisplayedImageRecord {
+            metadata: ImageMetadata {
+                image_id: 0,
+                mime_type: "image/png".into(),
+                width: 1,
+                height: 1,
+                byte_len: 3,
+                alt: None,
+            },
+            data: vec![1, 2, 3],
+        });
+        app.push_session_message(msg);
+
+        let last = app.client.history.last().unwrap();
+        match last {
+            HistoryItem::Text(t) => assert!(t.contains("failed to decode"), "{t}"),
+            _ => panic!("expected Text with error"),
+        }
+    }
+
+    #[test]
+    fn push_session_message_displayed_image_svg() {
+        use ratatui_image::picker::Picker;
+
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.picker = Some(Picker::halfblocks());
+
+        let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='red'/></svg>"#;
+        let msg = SessionMessage::DisplayedImage(DisplayedImageRecord {
+            metadata: ImageMetadata {
+                image_id: 0,
+                mime_type: "image/svg+xml".into(),
+                width: 4,
+                height: 3,
+                byte_len: svg.len() as u64,
+                alt: Some("red rect".into()),
+            },
+            data: svg.to_vec(),
+        });
+        app.push_session_message(msg);
+
+        let last = app.client.history.last().unwrap();
+        assert!(matches!(last, HistoryItem::Image(_)), "expected Image");
+    }
+
+    // ── reset_for_session_switch ──
+
+    #[test]
+    fn reset_for_session_switch_clears_state() {
+        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        // Populate state as if we were in an active session.
+        app.client.history.push(HistoryItem::Text("old".into()));
+        app.render_cache.push(None);
+        app.active.insert(1);
+        app.client.in_progress.insert(1, 0);
+
+        app.reset_for_session_switch();
+
+        assert!(app.client.history.is_empty(), "history not cleared");
+        assert!(app.render_cache.is_empty(), "render_cache not cleared");
+        assert_eq!(app.history_scroll.scroll, 0);
+        assert_eq!(app.history_scroll.scroll_compensation, 0);
+        assert!(app.history_scroll.follow_output);
+        assert!(app.active.is_empty(), "active not cleared");
+        assert!(app.client.in_progress.is_empty(), "in_progress not cleared");
+        // pending_images is replaced with ImageAssembler::new(), which is always empty.
     }
 }

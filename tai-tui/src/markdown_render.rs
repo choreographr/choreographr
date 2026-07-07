@@ -180,6 +180,20 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             }
             lines
         }
+        // DisplayedImage is intercepted by App::push_session_message and
+        // converted directly to HistoryItem::Image, so this arm should never
+        // be reached at runtime — it exists only for exhaustive matching.
+        SessionMessage::DisplayedImage(record) => {
+            vec![Line::from(Span::styled(
+                format!(
+                    "[displayed image: {} ({}x{})]",
+                    record.metadata.mime_type,
+                    record.metadata.width,
+                    record.metadata.height,
+                ),
+                Style::default(),
+            ))]
+        }
     }
 }
 

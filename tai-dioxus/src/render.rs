@@ -200,6 +200,16 @@ fn render_session_message(message: SessionMessage) -> Element {
                 "session-item tool-result-item",
             )
         }
+        SessionMessage::DisplayedImage(record) => {
+            rsx! {
+                div { class: "history-item session-item image-item",
+                    div { class: "message-label", "image" }
+                    pre { class: "plain-body",
+                        "[displayed image: {record.metadata.mime_type} ({record.metadata.width}x{record.metadata.height})]"
+                    }
+                }
+            }
+        }
     }
 }
 

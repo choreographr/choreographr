@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tai_keystore::XCredentials;
 use tai_proto::{
-    AssistantToolCallRecord, DaemonMessage, ImageMetadata, MAX_IMAGE_CHUNK_SIZE, OutputStream,
-    SessionMessage, SessionStatus,
+    AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata,
+    MAX_IMAGE_CHUNK_SIZE, OutputStream, SessionMessage, SessionStatus,
 };
 use std::sync::mpsc;
 
@@ -27,12 +27,14 @@ fn emit_prepared_image_sync(
     image_id: u32,
     image: PreparedImage,
 ) {
+    // Safety: image.data.len() fits in u64 on all supported platforms.
+    let byte_len = image.data.len() as u64;
     let metadata = ImageMetadata {
         image_id,
         mime_type: image.mime_type,
         width: image.width,
         height: image.height,
-        byte_len: image.data.len() as u64,
+        byte_len,
         alt: image.alt,
     };
     let _ = cmd_tx.send(SessionCommand::Broadcast(
@@ -125,7 +127,9 @@ pub(crate) fn run_agent_loop(
                 ));
                 let msg = SessionMessage::AssistantText { content };
                 let idx = session.push_message(msg.clone());
-                write_message_retry(db, session_id, idx, &msg).ok();
+                if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
+                    tracing::warn!(session_id, error = %e, "failed to persist assistant text");
+                }
                 return Ok(());
             }
             ChatTurnResult::ToolUse(tool_use) => {
@@ -208,8 +212,48 @@ pub(crate) fn run_agent_loop(
                     }
 
                     if let Some(image) = output.image {
-                        emit_prepared_image_sync(cmd_tx, request_id, next_image_id, image);
+                        let PreparedImage { mime_type, data, width, height, alt } = image;
+
+                        // Broadcast to live subscribers first (needs a clone of
+                        // data/mime_type/alt for chunking over the channel).
+                        emit_prepared_image_sync(
+                            cmd_tx,
+                            request_id,
+                            next_image_id,
+                            PreparedImage {
+                                mime_type: mime_type.clone(),
+                                data: data.clone(),
+                                width,
+                                height,
+                                alt: alt.clone(),
+                            },
+                        );
                         next_image_id = next_image_id.wrapping_add(1);
+
+                        // Persist the image data so it can be replayed on session
+                        // re-attach or after a daemon restart.  Written to the DB
+                        // before pushing to the in-memory vec so that a crash between
+                        // the two leaves a complete snapshot.
+                        let persisted = SessionMessage::DisplayedImage(DisplayedImageRecord {
+                            metadata: ImageMetadata {
+                                image_id: 0, // unused for persisted images
+                                mime_type,   // moved
+                                width,
+                                height,
+                                // Safety: data.len() fits in u64 on all supported platforms.
+                                byte_len: data.len() as u64,
+                                alt, // moved
+                            },
+                            data, // moved — only one clone total (done above for broadcast)
+                        });
+                        let img_idx = session.messages().len() as u32;
+                        if let Err(e) = write_message_retry(db, session_id, img_idx, &persisted) {
+                            tracing::warn!(
+                                session_id, error = %e,
+                                "failed to persist displayed image",
+                            );
+                        }
+                        session.push_message(persisted);
                     }
 
                     let msg = SessionMessage::ToolResult {
@@ -219,7 +263,12 @@ pub(crate) fn run_agent_loop(
                         is_error: output.result.is_error,
                     };
                     let idx = session.push_message(msg.clone());
-                    write_message_retry(db, session_id, idx, &msg).ok();
+                    if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
+                        tracing::warn!(
+                            session_id, tool_name = %tool_call.name, error = %e,
+                            "failed to persist tool result",
+                        );
+                    }
 
                     let event = if output.result.is_error {
                         DaemonMessage::ToolCallFailed {
@@ -732,21 +781,26 @@ fn persist_assistant_tool_use_sync(
         reasoning_text: tool_use.reasoning_text.clone(),
     };
     let idx = session.push_message(msg.clone());
-    write_message_retry(db, session_id, idx, &msg).ok();
+    if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
+        tracing::warn!(session_id, error = %e, "failed to persist assistant tool use");
+    }
 }
 
 fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMessage> {
     messages
         .iter()
-        .map(|message| match message {
+        .filter_map(|message| match message {
+            // DisplayedImage records are not part of the LLM conversation —
+            // they are purely a display-side artifact for replayed images.
+            SessionMessage::DisplayedImage(_) => None,
             SessionMessage::SystemText { content } => {
-                ChatRequestMessage::simple("system", content.clone())
+                Some(ChatRequestMessage::simple("system", content.clone()))
             }
             SessionMessage::UserText { content } => {
-                ChatRequestMessage::simple("user", content.clone())
+                Some(ChatRequestMessage::simple("user", content.clone()))
             }
             SessionMessage::AssistantText { content } => {
-                ChatRequestMessage::simple("assistant", content.clone())
+                Some(ChatRequestMessage::simple("assistant", content.clone()))
             }
             SessionMessage::AssistantToolUse {
                 content,
@@ -754,7 +808,7 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
                 reasoning_content,
                 reasoning,
                 reasoning_text,
-            } => ChatRequestMessage {
+            } => Some(ChatRequestMessage {
                 role: "assistant",
                 content: content.clone(),
                 tool_call_id: None,
@@ -774,10 +828,10 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
                 reasoning_content: reasoning_content.clone(),
                 reasoning: reasoning.clone(),
                 reasoning_text: reasoning_text.clone(),
-            },
+            }),
             SessionMessage::ToolResult {
                 call_id, content, ..
-            } => ChatRequestMessage {
+            } => Some(ChatRequestMessage {
                 role: "tool",
                 content: Some(content.clone()),
                 tool_call_id: Some(call_id.clone()),
@@ -785,7 +839,7 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_text: None,
-            },
+            }),
         })
         .collect()
 }
@@ -874,6 +928,29 @@ mod tests {
         assert_eq!(result[0].content.as_deref(), Some("file content"));
         assert_eq!(result[0].tool_call_id.as_deref(), Some("call_1"));
         assert!(result[0].tool_calls.is_none());
+    }
+
+    #[test]
+    fn build_chat_request_messages_skips_displayed_image() {
+        let msgs = [
+            SessionMessage::UserText { content: "hello".into() },
+            SessionMessage::DisplayedImage(DisplayedImageRecord {
+                metadata: ImageMetadata {
+                    image_id: 0,
+                    mime_type: "image/png".into(),
+                    width: 1,
+                    height: 1,
+                    byte_len: 0,
+                    alt: None,
+                },
+                data: vec![],
+            }),
+            SessionMessage::AssistantText { content: "hi".into() },
+        ];
+        let result = build_chat_request_messages(&msgs);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].role, "user");
+        assert_eq!(result[1].role, "assistant");
     }
 
     #[test]

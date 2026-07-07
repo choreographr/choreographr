@@ -85,8 +85,9 @@ Defines all shared message types and framing. No dependencies on other workspace
 |---|---|
 | `ClientMessage` | Enum of all messages a client can send |
 | `DaemonMessage` | Enum of all messages the daemon can send |
-| `SessionMessage` | A single turn in a conversation |
+| `SessionMessage` | A single turn in a conversation. Variants: `SystemText`, `UserText`, `AssistantText`, `AssistantToolUse`, `ToolResult`, `DisplayedImage` (persisted image replay) |
 | `ImageMetadata` | Mime type, dimensions, byte length for streamed images |
+| `DisplayedImageRecord` | Binary image data + `ImageMetadata` for persisted image replay (carried inside `SessionMessage::DisplayedImage`) |
 
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
@@ -455,8 +456,9 @@ same directory as their parent with a default iteration cap.
   reconstructing the in-memory `HashMap`. If the DB is empty, a default session #1
   is created.
 - **Session creation**: Writes a `SessionRecord` to the DB immediately.
-- **Message append**: Each `SessionMessage` is written to the DB alongside the
-  in-memory push via `append_message_and_persist()`.
+- **Message append**: Each `SessionMessage` (including `DisplayedImage` records for
+  persisted images) is written to the DB alongside the in-memory push via
+  `append_message_and_persist()`.
 - **Shutdown**: The daemon sends `SessionCommand::Shutdown` to each active session, waits for request workers to drain, then exits cleanly.
 
 ### Multiple concurrent sessions
@@ -551,11 +553,30 @@ from the database, ensuring `ListModels` and metadata queries see the correct
 Model calls display_image tool
   → daemon executes tool
   → ToolExecutionOutput with PreparedImage
-  → DaemonMessage::ImageStart { request_id, metadata }
-  → DaemonMessage::ImageChunk { request_id, data (≤64 KiB) } × N
-  → DaemonMessage::ImageEnd { request_id }
-  → client ImageAssembler reconstructs full image
-  → client renders image in terminal (ratatui-image) or desktop (data: URL)
+  ├── Persistence path (new):
+  │     → clone image data
+  │     → SessionMessage::DisplayedImage(DisplayedImageRecord)
+  │     → push to session messages + write to DB via write_message_retry
+  │     → replayed on session re-attach via DaemonMessage::SessionState
+  └── Live broadcast path (unchanged):
+        → DaemonMessage::ImageStart { request_id, metadata }
+        → DaemonMessage::ImageChunk { request_id, data (≤64 KiB) } × N
+        → DaemonMessage::ImageEnd { request_id }
+        → client ImageAssembler reconstructs full image
+        → client renders image in terminal (ratatui-image) or desktop (data: URL)
+```
+
+### Session switch flow (updated)
+
+```
+User presses Enter on a session in the session manager
+  → history cleared (client.history, render_cache, scroll, in_progress, pending_images)
+  → AttachSession sent to daemon
+  → daemon responds with SessionState { messages: Vec<SessionMessage>, … }
+    where messages may include SessionMessage::DisplayedImage for persisted images
+  → for each message:
+    DisplayedImage → build_rendered_image(picker, metadata, data) → HistoryItem::Image
+    other         → classify_session_message → HistoryItem::{SessionMessage,Text,Diff}
 ```
 
 
