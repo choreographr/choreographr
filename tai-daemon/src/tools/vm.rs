@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
 use tai_keystore::XCredentials;
 use tempfile::tempdir;
 
@@ -370,29 +371,36 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
         .spawn()
         .map_err(|e| format!("compilation failed to start: {e}"))?;
 
+    let stderr_pipe = child.stderr.take();
+
+    // Wait for the compiler to finish with a poll loop.  The calling thread
+    // is a dedicated tool-execution thread, so blocking here is fine.
     let timeout = Duration::from_secs(60);
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let status = loop {
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
             return Err("compilation timed out after 60s".into());
         }
-        match child.try_wait().map_err(|e| format!("error waiting for compiler: {e}"))? {
-            Some(status) => break status,
-            None => std::thread::sleep(Duration::from_millis(100)),
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                // Brief sleep to avoid busy-looping.
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("error waiting for compiler: {e}")),
         }
     };
 
-    let stderr = child.stderr.take()
-        .and_then(|mut pipe| {
-            let mut buf = Vec::new();
-            pipe.read_to_end(&mut buf).ok().map(|_| buf)
-        })
-        .unwrap_or_default();
+    let mut stderr_buf = Vec::new();
+    if let Some(mut p) = stderr_pipe {
+        p.read_to_end(&mut stderr_buf)
+            .map_err(|e| format!("failed to read compiler stderr: {e}"))?;
+    }
 
     if !status.success() {
-        return Err(format!("compilation error:\n{}", String::from_utf8_lossy(&stderr)));
+        return Err(format!("compilation error:\n{}", String::from_utf8_lossy(&stderr_buf)));
     }
 
     let elf = std::fs::read(&output_path)

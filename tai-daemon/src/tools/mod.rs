@@ -219,7 +219,7 @@ impl ToolRegistry {
         arc
     }
 
-    fn register(&mut self, tool: impl Tool + 'static) {
+    pub(crate) fn register(&mut self, tool: impl Tool + 'static) {
         let name = tool.name();
         self.tools.insert(name, Box::new(tool));
     }

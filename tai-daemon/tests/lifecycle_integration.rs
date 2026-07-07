@@ -1,0 +1,81 @@
+use std::collections::HashMap;
+use std::io::{BufReader, BufWriter, Write};
+use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+use tai_daemon::{DaemonState, run_server};
+use tai_proto::{ClientMessage, DaemonMessage, read_message_sync, write_message_sync};
+
+/// Build a minimal [`DaemonState`] suitable for testing the server lifecycle.
+fn test_daemon_state() -> DaemonState {
+    let (daemon_tx, _daemon_rx) = mpsc::channel();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Arc::new(
+        redb::Database::create(dir.path().join("state.redb"))
+            .expect("test database"),
+    );
+    let tool_registry = tai_daemon::tools::ToolRegistry::new().build();
+
+    DaemonState {
+        next_session_id: 1,
+        max_turns: 10,
+        active_sessions: HashMap::new(),
+        session_metadata: HashMap::new(),
+        openai_client: None,
+        keystore: None,
+        x_credentials: None,
+        db,
+        tool_registry,
+        daemon_tx,
+        client_streams: Vec::new(),
+        summary_subscribers: HashMap::new(),
+        model_cache: None,
+    }
+}
+
+#[test]
+#[ignore]
+fn server_accepts_ping_and_shuts_down_on_signal() {
+    let dir = tempfile::tempdir().expect("tempdir for socket");
+    let socket_path = dir.path().join("test.sock");
+    let socket_str = socket_path.to_str().expect("valid socket path").to_string();
+
+    let state = test_daemon_state();
+
+    // Run the server in a background thread.
+    let handle = thread::spawn(move || {
+        run_server(&socket_str, state).expect("run_server");
+    });
+
+    // Wait for the socket to appear (server is ready).
+    while !socket_path.exists() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Give the accept loop a moment to start blocking.
+    thread::sleep(Duration::from_millis(50));
+
+    // Connect a client and verify the server responds to Ping.
+    let client = UnixStream::connect(&socket_path).expect("connect");
+    let mut reader = BufReader::new(client.try_clone().expect("clone for reader"));
+    let mut writer = BufWriter::new(client);
+
+    write_message_sync(&mut writer, &ClientMessage::Ping).expect("write Ping");
+    writer.flush().expect("flush Ping");
+
+    let response: DaemonMessage =
+        read_message_sync(&mut reader).expect("read response");
+    assert_eq!(response, DaemonMessage::Pong);
+
+    // Trigger graceful shutdown by sending SIGINT.
+    // The signal handler thread sets the shutdown flag and self-connects
+    // to the socket, which unblocks the accept loop.
+    unsafe { libc::raise(libc::SIGINT); }
+
+    // The server thread should exit cleanly within a reasonable timeout.
+    handle
+        .join()
+        .expect("server thread panicked");
+}
