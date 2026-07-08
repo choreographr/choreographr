@@ -16,6 +16,7 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 resvg.workspace = true
 syntect = "5.3"
 tai-client-core.workspace = true
+tai-keystore.workspace = true
 tai-markdown.workspace = true
 unicode-segmentation = "1.12"
 unicode-width = "0.2"

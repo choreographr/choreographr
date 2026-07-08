@@ -1,8 +1,28 @@
 use tai_proto::ClientMessage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnlockMethod {
+    /// Read identity.pk directly (no passphrase).
+    Raw,
+    /// Decrypt identity.pk.enc with the given passphrase.
+    Passphrase(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellCommand {
     Send(ClientMessage),
+    Unlock {
+        method: UnlockMethod,
+    },
+    AddCredential {
+        service: String,
+        credential_type: String,
+        fields: Vec<String>,
+        unlock: bool,
+    },
+    RemoveCredential {
+        service: String,
+    },
     InvalidCancel(String),
     UnknownCommand(String),
     Empty,
@@ -47,37 +67,46 @@ fn parse_command(
     }
 
     if let Some(passphrase) = rest.strip_prefix("unlock ") {
-        return ShellCommand::Send(ClientMessage::Unlock {
-            passphrase: passphrase.trim().to_string(),
-        });
+        let trimmed = passphrase.trim();
+        if trimmed.is_empty() {
+            return ShellCommand::UnknownCommand("usage: /unlock [passphrase]".to_string());
+        }
+        return ShellCommand::Unlock {
+            method: UnlockMethod::Passphrase(trimmed.to_string()),
+        };
     }
 
     if rest == "unlock" {
-        return ShellCommand::UnknownCommand("usage: /unlock <passphrase>".to_string());
+        return ShellCommand::Unlock {
+            method: UnlockMethod::Raw,
+        };
     }
 
     if let Some(args) = rest.strip_prefix("add-key ") {
         let parts: Vec<&str> = args.split_whitespace().collect();
-        if parts.len() < 3 {
-            return ShellCommand::UnknownCommand(
-                "usage: /add-key <service> <api_key> <passphrase>".to_string(),
-            );
+        if parts.len() < 2 {
+            return ShellCommand::UnknownCommand("usage: /add-key <service> <api_key>".to_string());
         }
         let service = parts[0].to_string();
         let key = parts[1].to_string();
-        let passphrase = parts[2..].join(" ");
-        return ShellCommand::Send(ClientMessage::AddApiKey {
+        let unlock = parts
+            .get(2)
+            .copied()
+            .map(|s| s.to_lowercase() == "unlock")
+            .unwrap_or(false);
+        return ShellCommand::AddCredential {
             service,
-            passphrase,
-            key,
-        });
+            credential_type: "api_key".to_string(),
+            fields: vec![key],
+            unlock,
+        };
     }
 
     if let Some(args) = rest.strip_prefix("add-x ") {
         let parts: Vec<&str> = args.split_whitespace().collect();
-        if parts.len() < 7 {
+        if parts.len() < 6 {
             return ShellCommand::UnknownCommand(
-                "usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ <passphrase>".to_string(),
+                "usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ [unlock]".to_string(),
             );
         }
         let service = parts[0].to_string();
@@ -85,36 +114,41 @@ fn parse_command(
         let api_key_secret = parts[2].to_string();
         let access_token = parts[3].to_string();
         let access_token_secret = parts[4].to_string();
-        let bearer_token = if parts[5] == "-" {
-            None
-        } else {
-            Some(parts[5].to_string())
-        };
-        let passphrase = parts[6..].join(" ");
-        return ShellCommand::Send(ClientMessage::AddXCredential {
+        let bearer_token = parts[5].to_string();
+        let unlock = parts
+            .get(6)
+            .copied()
+            .map(|s| s.to_lowercase() == "unlock")
+            .unwrap_or(false);
+        return ShellCommand::AddCredential {
             service,
-            passphrase,
-            api_key,
-            api_key_secret,
-            access_token,
-            access_token_secret,
-            bearer_token,
-        });
+            credential_type: "x".to_string(),
+            fields: vec![
+                api_key,
+                api_key_secret,
+                access_token,
+                access_token_secret,
+                bearer_token,
+            ],
+            unlock,
+        };
     }
 
-    if let Some(args) = rest.strip_prefix("remove-key ") {
-        let parts: Vec<&str> = args.split_whitespace().collect();
-        if parts.len() < 2 {
-            return ShellCommand::UnknownCommand(
-                "usage: /remove-key <service> <passphrase>".to_string(),
-            );
+    if rest == "remove-key" {
+        return ShellCommand::UnknownCommand("usage: /remove-key <service>".to_string());
+    }
+    if let Some(service) = rest.strip_prefix("remove-key ") {
+        let service = service.trim();
+        if service.is_empty() {
+            return ShellCommand::UnknownCommand("usage: /remove-key <service>".to_string());
         }
-        let service = parts[0].to_string();
-        let passphrase = parts[1..].join(" ");
-        return ShellCommand::Send(ClientMessage::RemoveCredential {
-            service,
-            passphrase,
-        });
+        return ShellCommand::RemoveCredential {
+            service: service.to_string(),
+        };
+    }
+
+    if rest == "lock" {
+        return ShellCommand::Send(ClientMessage::Lock);
     }
 
     if rest == "image" {

@@ -17,12 +17,7 @@ custom length-prefixed binary protocol.
 ├──────────────┤                    │              │
 │   tai-im     │◄──────────────────►│              │
 │ (IM bridge)  │    Unix socket     │              │
-└──────────────┘                    └──────┬───────┘
-                                          │
-                                   ┌──────┴───────┐
-                                   │ tai-keystore │
-                                   │ (encrypted)  │
-                                   └──────────────┘
+└──────────────┘                    └──────────────┘
 ```
 
 ---
@@ -34,7 +29,7 @@ Seven crates in a single Cargo workspace (resolver = "3"):
 ```
 tai (workspace)
 ├── tai-proto           Wire protocol (shared types + framing)
-├── tai-keystore        Encrypted credential storage (+ CLI binary)
+├── tai-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── tai-client-core     Shared client logic (parsing, markdown, images, history)
 ├── tai-daemon          Unix socket server — the core engine
 ├── tai-tui              Terminal UI client (ratatui + crossterm)
@@ -92,7 +87,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
 `TestImage`, `Cancel`, `Ping`, `GetCredential`, `ListModels`, `SetModel`, `Unlock`,
-`Lock`, `AddApiKey`, `AddXCredential`, `RemoveCredential`
+`Lock`, `AddCredential`, `RemoveCredential`
 
 `DaemonMessage` variants:
 - Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionMessageAppended`, `SessionFailed`
@@ -119,31 +114,44 @@ Defines all shared message types and framing. No dependencies on other workspace
 - **Error type**: `ProtoError` (thiserror enum) — `Bincode`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io`
 
 
-### `tai-keystore` — Credential storage
+### `tai-keystore` — Identity keypair & credential crypto
 
-Stores API keys and other secrets encrypted on disk.
+Provides the cryptographic primitives for credential management. No longer a standalone
+CLI binary — it is a library used by `tai-client-core` and `tai-daemon`.
 
-**Encryption pipeline:**
+**Identity keypair (X25519):**
+The daemon's identity is an X25519 keypair stored as two files:
+- `~/.config/tai-daemon/identity.pk` — raw 32-byte private key
+- `~/.config/tai-daemon/public.pk` — raw 32-byte public key
+
+The private key can be stored encrypted at rest:
+- `~/.config/tai-daemon/identity.pk.enc` — Argon2 + AES-256-GCM encrypted private key
+
+**Credential encryption pipeline (client-side):**
 ```
-passphrase ──► argon2 KDF ──► 256-bit key ──► AES-256-GCM encrypt(credentials)
+credential ──► bincode serialize ──► ECDH (ephemeral + recipient pubkey)
+  ──► HKDF ──► AES-256-GCM encrypt ──► encrypted payload
 ```
 
-**File format:**
+Output format for each credential:
 ```
-┌──────┬───────┬──────┬───────┬────────────┐
-│ TAIK │  ver  │ salt │ nonce │ ciphertext │
-│  4B  │  1B   │ 16B  │  12B  │   ...      │
-└──────┴───────┴──────┴───────┴────────────┘
+eph_public(32) || nonce(12) || ciphertext(rest)
 ```
+
+Credentials are encrypted per-credential, using ECDH key agreement so only the
+daemon (holder of the private key) can decrypt them. The encrypted blobs are stored
+in the `redb` database alongside sessions.
+
+**Modules:**
+
+| Module | Purpose |
+|---|---|
+| `crypto.rs` | X25519 keypair generation, ECDH + HKDF + AES-256-GCM encrypt/decrypt, passphrase-based private key encryption |
+| `paths.rs` | Resolves filesystem paths for identity key files |
+| `error.rs` | `KeystoreError` enum |
 
 **Credential types:** `ApiKey` (OpenAI), `X` (Twitter OAuth 1.0a credentials)
-**Error type:** `KeystoreError` (thiserror enum) — `Io`, `TooShort`, `InvalidMagic`, `UnsupportedVersion`, `InvalidKeyLength`, `EncryptionFailed`, `DecryptionFailed`, `InvalidData`, `AlreadyExists`, `ConfigDirNotFound`
-
-**CLI binary (`tai-keystore`):** `init`, `add`, `remove`, `list` subcommands.
-Stored at `~/.config/tai-daemon/credentials.enc`. Override path via `TAI_KEYSTORE_PATH` env var.
-Credentials can also be managed at runtime via `/add-key`, `/add-x`, and `/remove-key` shell
-commands, which require the keystore passphrase as a parameter and do not depend on daemon
-lock state.
+**Error type:** `KeystoreError` (thiserror enum) — `Io`, `TooShort`, `InvalidKeyLength`, `EncryptionFailed`, `DecryptionFailed`, `ConfigDirNotFound`
 
 
 ### `tai-client-core` — Shared client logic
@@ -152,7 +160,8 @@ Used by both `tai-tui` and `tai-dioxus`.
 
 | Module | Purpose |
 |---|---|---|
-| `shell.rs` | Parses terminal input into `ShellCommand`: `/ping`, `/models`, `/model` (alias), `/cancel`, `/unlock`, `/lock`, `/image`, or `RunInput(prompt)`. All commands use `/` prefix exclusively; `parse_command()` is the single dispatch point. |
+| `shell.rs` | Parses terminal input into `ShellCommand`: `/ping`, `/models`, `/model` (alias), `/cancel`, `/unlock`, `/lock`, `/image`, `/add-key`, `/add-x`, `/remove-key`, or `RunInput(prompt)`. All commands use `/` prefix exclusively; `parse_command()` is the single dispatch point. |
+| `credentials.rs` | Shared helpers: `resolve_private_key()` (read or decrypt the identity key), `build_add_credential_message()` (encrypt and package a credential for the daemon), `read_public_key_bytes()`. Eliminates duplicated logic across `tai-tui`, `tai-dioxus`, and `tai-im`. |
 | `markdown.rs` | Parses markdown into structured `MarkdownDocument` (paragraphs, headings, code blocks, lists, tables) via `pulldown-cmark`; `render_markdown_html()` sanitizes via `ammonia` |
 | `image.rs` | `ImageAssembler` reconstructs images from chunked stream protocol (`ImageStart` → `ImageChunk`* → `ImageEnd`), validating byte count |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text, structured diffs) |
@@ -281,8 +290,9 @@ Single binary (`tai-im`) that bridges IM platforms to the daemon.
 The binary accepts a platform subcommand: `tai-im telegram`.
 
 **Credentials:** The daemon serves platform credentials via the `GetCredential` wire
-message, so `tai-im` does not depend on `tai-keystore`. The admin first stores the
-bot token in the keystore (`tai-keystore add telegram <token>`) and unlocks the daemon.
+message. The admin stores credentials via `/add-key` or `/add-x` at runtime, which
+encrypts them with the daemon's public key. On unlock (`/unlock`) the daemon decrypts
+all stored credentials into memory using its private key.
 
 **Module breakdown:**
 
@@ -309,23 +319,23 @@ Telegram user → teloxide polling → handle_message()
 
 ### Lock/Unlock flow
 
-The daemon starts in a **locked** state. No OpenAI client is constructed until
-a client sends `/unlock <passphrase>`.
+The daemon starts in a **locked** state. The client resolves the private key (reading
+`identity.pk` directly or decrypting `identity.pk.enc` with a passphrase) and sends
+it to the daemon via `ClientMessage::Unlock { private_key }`.
 
 ```
-startup                    /unlock <passphrase>
+startup                    /unlock [passphrase]
    │                              │
-   │  locked                      │  decrypt keystore
-   │  (no OpenAI client)          │  extract API key
-   │                              │  build OpenAiClient
-   │                              │  validate credentials
+   │  locked                      │  read identity.pk (or decrypt identity.pk.enc)
+   │  (no credentials)            │  decrypt all credential blobs from database
+   │                              │  build OpenAiClient if openai key found
    │                              │  → Unlocked (ready)
    ▼                              ▼
 ```
 
-- Credentials never appear in config files, environment variables, or command-line args
-- The keystore uses argon2 + AES-256-GCM for authenticated encryption
-- `/lock` destroys the in-memory OpenAiClient, returning to locked state
+- Credentials are encrypted per-credential with ECDH (X25519) + HKDF + AES-256-GCM
+- The private key is sent over the Unix socket; zeroized after use by the daemon
+- `/lock` destroys all in-memory credentials, returning to locked state
 - `LockedError` is sent if any client attempts a request while locked
 
 
@@ -491,7 +501,7 @@ gpt-5 = "responses"
 big-model = 4096
 ```
 
-**Credential storage:** `~/.config/tai-daemon/credentials.enc` (encrypted, managed via `tai-keystore` CLI)
+**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Identity keys reside in `~/.config/tai-daemon/identity.pk` (private), `~/.config/tai-daemon/public.pk` (public), and optionally `~/.config/tai-daemon/identity.pk.enc` (passphrase-encrypted private key).
 
 **Database:** `~/.local/share/tai-daemon/state.redb` (override via `TAI_DB_PATH` env var)
 
@@ -645,8 +655,9 @@ User presses Enter on a session in the session manager
 2. **Binary protocol (bincode), not JSON** — compact, typed, versioned. Length-prefixed framing
    avoids parsing ambiguities. Version field allows protocol evolution.
 
-3. **Lock/Unlock security** — the daemon starts without credentials in memory. The passphrase is
-   never stored. This avoids secrets in env vars, config files, or command-line arguments.
+3. **Lock/Unlock security** — the daemon starts without credentials in memory. The private key is
+   sent over the Unix socket and zeroized after use. Credentials are encrypted per-credential so
+   they can be stored in the database without a global passphrase.
 
 4. **Sessions, not per-client state** — sessions are independent from client connections. A
    session has its own model, CWD, and messages. Clients subscribe/unsubscribe from sessions
@@ -920,11 +931,6 @@ cargo run -p tai-tui
 # Run desktop client
 cargo run -p tai-dioxus
 
-# Run credential manager
-cargo run -p tai-keystore -- init
-cargo run -p tai-keystore -- add openai
-cargo run -p tai-keystore -- list
-
 # Run IM bridge (Telegram)
 cargo run -p tai-im -- telegram
 ```
@@ -945,6 +951,7 @@ cargo run -p tai-im -- telegram
 | `image` + `resvg` | daemon, tai-tui | Image decoding, SVG rasterization |
 | `syntect` | tai-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
+| `x25519-dalek` + `hkdf` + `sha2` | keystore | X25519 ECDH key agreement, HKDF key derivation |
 | `ckb-vm` | daemon | RISC-V VM interpreter for sandboxed code execution |
 | `thiserror` | proto, keystore, client-core, daemon | Structured library error types |
 | `anyhow` | daemon, tui, dioxus, im, keystore | Application error context & propagation |
@@ -961,7 +968,7 @@ Each library crate defines a structured error enum:
 | Crate | Error type | Key variants |
 |---|---|---|
 | `tai-proto` | `ProtoError` | `Bincode`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io` |
-| `tai-keystore` | `KeystoreError` | `Io`, `TooShort`, `InvalidMagic`, `DecryptionFailed`, `AlreadyExists`, `ConfigDirNotFound`, … |
+| `tai-keystore` | `KeystoreError` | `Io`, `TooShort`, `DecryptionFailed`, `InvalidKeyLength`, `EncryptionFailed`, `ConfigDirNotFound` |
 | `tai-client-core` | `ClientError` | `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch` |
 
 Every library error type implements `From<ErrorType> for io::Error` for backward compatibility

@@ -36,18 +36,26 @@ fn main() -> anyhow::Result<()> {
     let mut writer = BufWriter::new(stream);
 
     if let Some(ref passphrase) = unlock_passphrase {
-        info!("unlocking daemon keystore");
+        info!("unlocking daemon with private key");
+        // Read the encrypted private key and decrypt it with the passphrase
+        let enc_path = tai_keystore::paths::private_key_enc_path()
+            .context("failed to determine encrypted private key path")?;
+        let enc_data =
+            std::fs::read(&enc_path).context("failed to read encrypted private key file")?;
+        let private_key = tai_keystore::crypto::decrypt_private_key(&enc_data, passphrase)
+            .context("failed to decrypt private key")?;
+        let private_key_vec: Vec<u8> = private_key.to_vec();
         write_message_sync(
             &mut writer,
             &ClientMessage::Unlock {
-                passphrase: passphrase.clone(),
+                private_key: private_key_vec,
             },
         )
         .context("failed to send unlock message")?;
         writer.flush().context("failed to flush unlock message")?;
         match read_message_sync::<_, DaemonMessage>(&mut reader) {
             Ok(DaemonMessage::Unlocked) => {
-                info!("daemon keystore unlocked");
+                info!("daemon unlocked");
             }
             Ok(DaemonMessage::LockedError { error: unlock_err }) => {
                 error!(%unlock_err, "unlock failed");

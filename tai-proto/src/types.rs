@@ -109,26 +109,16 @@ pub enum ClientMessage {
         model: String,
     },
     Unlock {
-        passphrase: String,
+        private_key: Vec<u8>,
     },
     Lock,
-    AddApiKey {
+    AddCredential {
         service: String,
-        passphrase: String,
-        key: String,
-    },
-    AddXCredential {
-        service: String,
-        passphrase: String,
-        api_key: String,
-        api_key_secret: String,
-        access_token: String,
-        access_token_secret: String,
-        bearer_token: Option<String>,
+        encrypted_payload: Vec<u8>,
+        unlock_key: Option<Vec<u8>>,
     },
     RemoveCredential {
         service: String,
-        passphrase: String,
     },
     DeleteSession {
         session_id: u64,
@@ -592,10 +582,8 @@ impl ClientMessage {
         }
     }
 
-    pub fn unlock(passphrase: impl Into<String>) -> Self {
-        Self::Unlock {
-            passphrase: passphrase.into(),
-        }
+    pub fn unlock(private_key: Vec<u8>) -> Self {
+        Self::Unlock { private_key }
     }
 
     pub fn lock() -> Self {
@@ -606,22 +594,21 @@ impl ClientMessage {
         Self::DeleteSession { session_id }
     }
 
-    pub fn add_api_key(
+    pub fn add_credential(
         service: impl Into<String>,
-        passphrase: impl Into<String>,
-        key: impl Into<String>,
+        encrypted_payload: Vec<u8>,
+        unlock_key: Option<Vec<u8>>,
     ) -> Self {
-        Self::AddApiKey {
+        Self::AddCredential {
             service: service.into(),
-            passphrase: passphrase.into(),
-            key: key.into(),
+            encrypted_payload,
+            unlock_key,
         }
     }
 
-    pub fn remove_credential(service: impl Into<String>, passphrase: impl Into<String>) -> Self {
+    pub fn remove_credential(service: impl Into<String>) -> Self {
         Self::RemoveCredential {
             service: service.into(),
-            passphrase: passphrase.into(),
         }
     }
 }

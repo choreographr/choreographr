@@ -10,7 +10,8 @@ use std::sync::{
 };
 use std::{io, time::Duration};
 use tai_client_core::{
-    ClientError, broken_pipe, dispatch_daemon_message, run_daemon_connection, shell_command_echo,
+    ClientError, broken_pipe, build_add_credential_message, dispatch_daemon_message,
+    resolve_private_key, run_daemon_connection, shell_command_echo,
 };
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
@@ -219,6 +220,39 @@ fn handle_chat_event(
                                 _ => {}
                             }
                             client_tx.send(message).map_err(broken_pipe)?;
+                        }
+                        ShellCommand::Unlock { method } => match resolve_private_key(&method) {
+                            Ok(private_key) => {
+                                let _ = client_tx.send(ClientMessage::Unlock { private_key });
+                            }
+                            Err(e) => {
+                                app.push_text(format!("[error] {e}"));
+                                return Ok(());
+                            }
+                        },
+                        ShellCommand::AddCredential {
+                            service,
+                            credential_type,
+                            fields,
+                            unlock,
+                        } => {
+                            match build_add_credential_message(
+                                service,
+                                credential_type,
+                                fields,
+                                unlock,
+                            ) {
+                                Ok(msg) => {
+                                    let _ = client_tx.send(msg);
+                                }
+                                Err(e) => {
+                                    app.push_text(format!("[error] {e}"));
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        ShellCommand::RemoveCredential { service } => {
+                            let _ = client_tx.send(ClientMessage::RemoveCredential { service });
                         }
                     }
                 }

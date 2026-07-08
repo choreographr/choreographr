@@ -114,7 +114,7 @@ fn main() -> anyhow::Result<()> {
         active_sessions: std::collections::HashMap::new(),
         session_metadata,
         openai_client: None,
-        keystore: None,
+        credentials: std::collections::HashMap::new(),
         x_credentials: None,
         db,
         tool_registry: tai_daemon::tools::ToolRegistry::new().build(),

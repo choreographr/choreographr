@@ -42,23 +42,37 @@ fn rejects_invalid_cancel() {
 }
 
 #[test]
-fn parses_unlock() {
+fn parses_unlock_raw() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line("/unlock mypass", &mut next, None),
-        ShellCommand::Send(ClientMessage::Unlock {
-            passphrase: "mypass".to_string(),
-        })
+        parse_input_line("/unlock", &mut next, None),
+        ShellCommand::Unlock {
+            method: UnlockMethod::Raw,
+        }
     );
     assert_eq!(next, 3);
 }
 
 #[test]
-fn rejects_unlock_without_passphrase() {
+fn parses_unlock_with_passphrase() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line("/unlock", &mut next, None),
-        ShellCommand::UnknownCommand("usage: /unlock <passphrase>".to_string())
+        parse_input_line("/unlock mypass", &mut next, None),
+        ShellCommand::Unlock {
+            method: UnlockMethod::Passphrase("mypass".to_string()),
+        }
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn parses_unlock_with_spaced_passphrase() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/unlock my pass phrase", &mut next, None),
+        ShellCommand::Unlock {
+            method: UnlockMethod::Passphrase("my pass phrase".to_string()),
+        }
     );
     assert_eq!(next, 3);
 }
@@ -245,26 +259,28 @@ fn session_unknown_subcommand() {
 fn parses_add_key() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-key openai sk-abc123 mypass", &mut next, None),
-        ShellCommand::Send(ClientMessage::AddApiKey {
+        parse_input_line("/add-key openai sk-abc123", &mut next, None),
+        ShellCommand::AddCredential {
             service: "openai".to_string(),
-            passphrase: "mypass".to_string(),
-            key: "sk-abc123".to_string(),
-        })
+            credential_type: "api_key".to_string(),
+            fields: vec!["sk-abc123".to_string()],
+            unlock: false,
+        }
     );
     assert_eq!(next, 3);
 }
 
 #[test]
-fn parses_add_key_with_spaced_passphrase() {
+fn parses_add_key_with_unlock() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-key openai sk-abc123 my pass phrase", &mut next, None),
-        ShellCommand::Send(ClientMessage::AddApiKey {
+        parse_input_line("/add-key openai sk-abc123 unlock", &mut next, None),
+        ShellCommand::AddCredential {
             service: "openai".to_string(),
-            passphrase: "my pass phrase".to_string(),
-            key: "sk-abc123".to_string(),
-        })
+            credential_type: "api_key".to_string(),
+            fields: vec!["sk-abc123".to_string()],
+            unlock: true,
+        }
     );
     assert_eq!(next, 3);
 }
@@ -274,9 +290,7 @@ fn rejects_add_key_without_enough_args() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/add-key openai", &mut next, None),
-        ShellCommand::UnknownCommand(
-            "usage: /add-key <service> <api_key> <passphrase>".to_string()
-        )
+        ShellCommand::UnknownCommand("usage: /add-key <service> <api_key>".to_string())
     );
     assert_eq!(next, 3);
 }
@@ -285,16 +299,19 @@ fn rejects_add_key_without_enough_args() {
 fn parses_add_x() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line("/add-x twitter ck cs at ats - mypass", &mut next, None),
-        ShellCommand::Send(ClientMessage::AddXCredential {
+        parse_input_line("/add-x twitter ck cs at ats -", &mut next, None),
+        ShellCommand::AddCredential {
             service: "twitter".to_string(),
-            passphrase: "mypass".to_string(),
-            api_key: "ck".to_string(),
-            api_key_secret: "cs".to_string(),
-            access_token: "at".to_string(),
-            access_token_secret: "ats".to_string(),
-            bearer_token: None,
-        })
+            credential_type: "x".to_string(),
+            fields: vec![
+                "ck".to_string(),
+                "cs".to_string(),
+                "at".to_string(),
+                "ats".to_string(),
+                "-".to_string(),
+            ],
+            unlock: false,
+        }
     );
     assert_eq!(next, 3);
 }
@@ -303,20 +320,19 @@ fn parses_add_x() {
 fn parses_add_x_with_bearer() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line(
-            "/add-x twitter ck cs at ats mybearer mypass",
-            &mut next,
-            None
-        ),
-        ShellCommand::Send(ClientMessage::AddXCredential {
+        parse_input_line("/add-x twitter ck cs at ats mybearer", &mut next, None),
+        ShellCommand::AddCredential {
             service: "twitter".to_string(),
-            passphrase: "mypass".to_string(),
-            api_key: "ck".to_string(),
-            api_key_secret: "cs".to_string(),
-            access_token: "at".to_string(),
-            access_token_secret: "ats".to_string(),
-            bearer_token: Some("mybearer".to_string()),
-        })
+            credential_type: "x".to_string(),
+            fields: vec![
+                "ck".to_string(),
+                "cs".to_string(),
+                "at".to_string(),
+                "ats".to_string(),
+                "mybearer".to_string(),
+            ],
+            unlock: false,
+        }
     );
     assert_eq!(next, 3);
 }
@@ -326,7 +342,7 @@ fn rejects_add_x_without_enough_args() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/add-x twitter ck cs", &mut next, None),
-        ShellCommand::UnknownCommand("usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ <passphrase>".to_string())
+        ShellCommand::UnknownCommand("usage: /add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ [unlock]".to_string())
     );
     assert_eq!(next, 3);
 }
@@ -335,36 +351,33 @@ fn rejects_add_x_without_enough_args() {
 fn parses_remove_key() {
     let mut next = 3;
     assert_eq!(
-        parse_input_line("/remove-key openai mypass", &mut next, None),
-        ShellCommand::Send(ClientMessage::RemoveCredential {
-            service: "openai".to_string(),
-            passphrase: "mypass".to_string(),
-        })
-    );
-    assert_eq!(next, 3);
-}
-
-#[test]
-fn parses_remove_key_with_spaced_passphrase() {
-    let mut next = 3;
-    assert_eq!(
-        parse_input_line("/remove-key openai my pass phrase", &mut next, None),
-        ShellCommand::Send(ClientMessage::RemoveCredential {
-            service: "openai".to_string(),
-            passphrase: "my pass phrase".to_string(),
-        })
-    );
-    assert_eq!(next, 3);
-}
-
-#[test]
-fn rejects_remove_key_without_passphrase() {
-    let mut next = 3;
-    assert_eq!(
         parse_input_line("/remove-key openai", &mut next, None),
-        ShellCommand::UnknownCommand("usage: /remove-key <service> <passphrase>".to_string())
+        ShellCommand::RemoveCredential {
+            service: "openai".to_string(),
+        }
     );
     assert_eq!(next, 3);
+}
+
+#[test]
+fn parses_remove_key_with_spaced_service() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/remove-key my service", &mut next, None),
+        ShellCommand::RemoveCredential {
+            service: "my service".to_string(),
+        }
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn rejects_remove_key_without_service() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/remove-key", &mut next, None),
+        ShellCommand::UnknownCommand("usage: /remove-key <service>".to_string())
+    );
 }
 
 #[test]

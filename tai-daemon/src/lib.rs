@@ -25,11 +25,9 @@ pub use crate::tools::git::{
 };
 pub use crate::tools::nu::execute_nu_tool;
 pub use crate::tools::sh::execute_sh_tool;
-pub use crate::tools::vm::execute_run_riscv_tool;
-pub use tai_keystore::Keystore;
-
 #[cfg(test)]
 pub(crate) use crate::tools::sha256_hex;
+pub use crate::tools::vm::execute_run_riscv_tool;
 
 #[cfg(test)]
 pub(crate) use crate::tools::fs::{

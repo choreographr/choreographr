@@ -12,7 +12,7 @@ A local AI terminal interface in Rust. Connects to an OpenAI-compatible API, run
 | `tai-im` | Instant messaging bridge (Telegram) that connects to the daemon |
 | `tai-client-core` | Shared parsing, markdown, and image assembly for UI clients |
 | `tai-proto` | Framed binary protocol used between client and daemon |
-| `tai-keystore` | Encrypted credential keystore used by the daemon |
+| `tai-keystore` | X25519 keypair crypto library for credential encryption |
 
 ## Concepts
 
@@ -116,9 +116,9 @@ context_file_max_bytes = 32768
 disable_claude_code_prompt = false
 ```
 
-API keys are stored in the encrypted keystore (`~/.config/tai-daemon/credentials.enc`) and managed via `tai-keystore` CLI or the `/unlock` command at runtime.
+Credentials are encrypted per-credential with the daemon's X25519 public key and stored in the `redb` database. Identity keys reside in `~/.config/tai-daemon/identity.pk` (private), `~/.config/tai-daemon/public.pk` (public), and optionally `~/.config/tai-daemon/identity.pk.enc` (passphrase-encrypted private key).
 
-The socket path defaults to `/tmp/tai.sock` and can be overridden via `TAI_SOCKET_PATH`. The database path defaults to `~/.local/share/tai-daemon/state.redb` and can be overridden via `TAI_DB_PATH`. The keystore path can be overridden via `TAI_KEYSTORE_PATH`.
+The socket path defaults to `/tmp/tai.sock` and can be overridden via `TAI_SOCKET_PATH`. The database path defaults to `~/.local/share/tai-daemon/state.redb` and can be overridden via `TAI_DB_PATH`.
 
 ## Shell commands
 
@@ -132,10 +132,11 @@ In `tai-tui`:
 - `/session switch <id>` — switch to a different session
 - `/session info <id>` — show info for a specific session
 - `/cancel <request-id>` — cancel a running request
-- `/unlock <passphrase>` — unlock the encrypted keystore
+- `/unlock [passphrase]` — unlock the daemon (reads `identity.pk` or decrypts `identity.pk.enc`)
 - `/lock` — lock the daemon, clearing credentials from memory
-- `/add-key <service> <api_key> <passphrase>` — add an API key to the keystore
-- `/remove-key <service> <passphrase>` — remove a credential from the keystore
+- `/add-key <service> <api_key> [unlock]` — add an API key credential
+- `/add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ [unlock]` — add an X credential
+- `/remove-key <service>` — remove a credential
 - any other input — sent as a prompt
 
 ## Monitoring

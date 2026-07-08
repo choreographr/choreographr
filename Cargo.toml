@@ -38,3 +38,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 lru = "0.18"
 chrono = "0.4"
 zeroize = { version = "1", features = ["derive"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.11"
+hkdf = "0.13"
+x25519-dalek = { version = "2", features = ["static_secrets"] }

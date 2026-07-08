@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -12,6 +13,7 @@ use tracing::{debug, error, info, warn};
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
 const SESSION_MESSAGES: TableDefinition<(u64, u32), &[u8]> =
     TableDefinition::new("session_messages");
+const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credentials");
 #[cfg(test)]
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
@@ -280,6 +282,45 @@ pub fn write_message_retry(
             Err(e) => return Err(e),
         }
     }
+}
+
+// ── Credential table ────────────────────────────────────────────────────────────
+
+pub fn set_credential_blob(
+    db: &redb::Database,
+    service: &str,
+    blob: &[u8],
+) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(CREDENTIALS)?;
+        table.insert(service, blob)?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+pub fn get_all_credential_blobs(
+    db: &redb::Database,
+) -> Result<HashMap<String, Vec<u8>>, redb::Error> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(CREDENTIALS)?;
+    let mut map = HashMap::new();
+    for result in table.iter()? {
+        let (key, value) = result?;
+        map.insert(key.value().to_string(), value.value().to_vec());
+    }
+    Ok(map)
+}
+
+pub fn remove_credential_blob(db: &redb::Database, service: &str) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(CREDENTIALS)?;
+        table.remove(service)?;
+    }
+    write_txn.commit()?;
+    Ok(())
 }
 
 /// Retry a write_session on transient storage errors with up to 3 retries.

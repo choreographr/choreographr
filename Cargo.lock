@@ -1282,6 +1282,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "curve25519-dalek"
+version = "4.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "curve25519-dalek-derive",
+ "fiat-crypto",
+ "rustc_version",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "curve25519-dalek-derive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "darling"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2219,6 +2245,12 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "fiat-crypto"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "field-offset"
@@ -3925,6 +3957,15 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac",
+]
 
 [[package]]
 name = "hmac"
@@ -7954,6 +7995,8 @@ dependencies = [
 name = "tai-client-core"
 version = "0.1.0"
 dependencies = [
+ "bincode 2.0.1",
+ "tai-keystore",
  "tai-proto",
  "thiserror 2.0.18",
 ]
@@ -7973,6 +8016,7 @@ dependencies = [
  "gix",
  "gix-imara-diff",
  "hex",
+ "hkdf",
  "hmac",
  "image",
  "libc",
@@ -7996,7 +8040,9 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "x25519-dalek",
  "yaml_serde",
+ "zeroize",
 ]
 
 [[package]]
@@ -8004,10 +8050,12 @@ name = "tai-dioxus"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bincode 2.0.1",
  "dioxus",
  "futures-channel",
  "futures-util",
  "tai-client-core",
+ "tai-keystore",
  "tai-markdown",
  "tai-proto",
  "tracing",
@@ -8019,8 +8067,10 @@ version = "0.1.0"
 dependencies = [
  "ammonia",
  "anyhow",
+ "bincode 2.0.1",
  "frankenstein",
  "tai-client-core",
+ "tai-keystore",
  "tai-markdown",
  "tai-proto",
  "tempfile",
@@ -8033,13 +8083,17 @@ name = "tai-keystore"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
- "anyhow",
  "argon2",
+ "bincode 2.0.1",
  "dirs 6.0.0",
+ "hkdf",
  "rand 0.10.2",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -8079,6 +8133,7 @@ dependencies = [
  "signal-hook 0.4.4",
  "syntect",
  "tai-client-core",
+ "tai-keystore",
  "tai-markdown",
  "tai-proto",
  "tempfile",
@@ -10065,6 +10120,18 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "xkeysym"

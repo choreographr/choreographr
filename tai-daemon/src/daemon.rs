@@ -1,4 +1,5 @@
 use crate::db::{self, SessionRecord};
+use crate::openai::load_service_config;
 use crate::sessions::{ActiveSessionEntry, SessionCommand, SessionMetadata, session_main};
 use std::collections::HashMap;
 use std::io;
@@ -7,8 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+use tai_keystore::ServiceCredential;
 use tai_proto::{DaemonMessage, SessionStatus, SessionSummary};
 use tracing::{debug, error, info};
+use zeroize::Zeroize;
 
 /// Reply type for the ListModels command.
 pub(super) type ListModelsReply =
@@ -20,8 +23,8 @@ pub struct DaemonState {
     pub active_sessions: HashMap<u64, ActiveSessionEntry>,
     pub session_metadata: HashMap<u64, SessionMetadata>,
     pub openai_client: Option<Arc<crate::openai::OpenAiClient>>,
-    pub keystore: Option<Arc<crate::Keystore>>,
-    pub x_credentials: Option<tai_keystore::ServiceCredential>,
+    pub credentials: HashMap<String, ServiceCredential>,
+    pub x_credentials: Option<ServiceCredential>,
     pub db: Arc<redb::Database>,
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
@@ -59,8 +62,18 @@ pub enum DaemonCommand {
         session_id: u64,
     },
     Unlock {
-        passphrase: String,
+        private_key: Vec<u8>,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    SaveCredential {
+        service: String,
+        encrypted_blob: Vec<u8>,
+        unlock_key: Option<Vec<u8>>,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
+    RemoveCredentialCmd {
+        service: String,
+        reply: mpsc::Sender<Result<(), String>>,
     },
     ListModels {
         session_id: Option<u64>,
@@ -251,11 +264,76 @@ impl DaemonState {
                 };
                 self.broadcast(msg);
             }
-            DaemonCommand::Unlock { passphrase, reply } => {
+            DaemonCommand::Unlock { private_key, reply } => {
                 info!("Unlock attempt");
-                let result = handle_unlock_inner(self, passphrase);
+                let result = handle_unlock_inner(self, private_key);
                 info!("Unlock result: success={}", result.is_ok());
                 let _ = reply.send(result);
+            }
+            DaemonCommand::SaveCredential {
+                service,
+                encrypted_blob,
+                unlock_key,
+                reply,
+            } => {
+                // Write to DB
+                if let Err(e) = db::set_credential_blob(&self.db, &service, &encrypted_blob) {
+                    let _ = reply.send(Err(format!("failed to save credential: {e}")));
+                    return;
+                }
+                // Optionally decrypt into memory
+                if let Some(mut uk) = unlock_key {
+                    let key: [u8; 32] = match uk.as_slice().try_into() {
+                        Ok(k) => k,
+                        Err(_) => {
+                            uk.zeroize();
+                            let _ = reply.send(Ok(()));
+                            return;
+                        }
+                    };
+                    uk.zeroize();
+                    if let Ok(plaintext) =
+                        tai_keystore::crypto::decrypt_with_private_key(&key, &encrypted_blob)
+                        && let Ok((cred, _)) =
+                            bincode::serde::decode_from_slice::<ServiceCredential, _>(
+                                &plaintext,
+                                bincode::config::standard(),
+                            )
+                    {
+                        // Update in-memory state
+                        if let ServiceCredential::ApiKey { key: api_key } = &cred
+                            && service == "openai"
+                        {
+                            let config = load_service_config().unwrap_or_default();
+                            if let Ok(client) =
+                                crate::openai::OpenAiClient::new(config, api_key.clone())
+                            {
+                                self.openai_client = Some(Arc::new(client));
+                            }
+                        }
+                        if matches!(&cred, ServiceCredential::X { .. }) && service == "twitter" {
+                            self.x_credentials = Some(cred.clone());
+                        }
+                        self.credentials.insert(service.clone(), cred);
+                    }
+                }
+                let _ = reply.send(Ok(()));
+            }
+            DaemonCommand::RemoveCredentialCmd { service, reply } => {
+                // Remove from DB
+                if let Err(e) = db::remove_credential_blob(&self.db, &service) {
+                    let _ = reply.send(Err(format!("failed to remove credential: {e}")));
+                    return;
+                }
+                // Remove from in-memory state
+                self.credentials.remove(&service);
+                if service == "openai" {
+                    self.openai_client = None;
+                }
+                if service == "twitter" {
+                    self.x_credentials = None;
+                }
+                let _ = reply.send(Ok(()));
             }
             DaemonCommand::ListModels { session_id, reply } => {
                 debug!("ListModels: session_id={:?}", session_id);
@@ -263,10 +341,10 @@ impl DaemonState {
                 let _ = reply.send(result);
             }
             DaemonCommand::GetCredential { service, reply } => {
-                let key = self
-                    .keystore
-                    .as_ref()
-                    .and_then(|ks| ks.get_api_key(&service).map(|k| k.to_string()));
+                let key = self.credentials.get(&service).and_then(|c| match c {
+                    ServiceCredential::ApiKey { key } => Some(key.clone()),
+                    _ => None,
+                });
                 let _ = reply.send(key);
             }
             DaemonCommand::RegisterSummarySubscriber { client_id, writer } => {
@@ -367,31 +445,46 @@ impl DaemonState {
     }
 }
 
-fn handle_unlock_inner(state: &mut DaemonState, passphrase: String) -> Result<(), String> {
-    let ks_path = tai_keystore::keystore_path()
-        .map_err(|e| format!("failed to determine keystore path: {e}"))?;
-    if !ks_path.exists() {
-        return Err("keystore does not exist. run 'tai-keystore init' to create one.".to_string());
-    }
-    let ks = tai_keystore::Keystore::load(&ks_path, &passphrase)
-        .map_err(|e| format!("failed to unlock keystore: {e}"))?;
-    let keystore = Arc::new(ks);
-    match keystore.get_api_key("openai") {
-        Some(api_key) => {
-            let service_config = crate::openai::load_service_config().unwrap_or_default();
-            let client = crate::openai::OpenAiClient::new(service_config, api_key.to_string())
-                .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
-            state.openai_client = Some(Arc::new(client));
-            if let Some(c) = keystore.get("twitter")
-                && matches!(c, tai_keystore::ServiceCredential::X { .. })
-            {
-                state.x_credentials = Some(c.clone());
-            }
-            state.keystore = Some(keystore);
-            Ok(())
+fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> Result<(), String> {
+    let mut key: [u8; 32] = private_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "invalid private key: expected 32 bytes".to_string())?;
+    drop(private_key);
+
+    let blobs = db::get_all_credential_blobs(&state.db)
+        .map_err(|e| format!("failed to read credentials from database: {e}"))?;
+
+    let mut credentials = HashMap::new();
+    for (service, blob) in &blobs {
+        if let Ok(plaintext) = tai_keystore::crypto::decrypt_with_private_key(&key, blob)
+            && let Ok((cred, _)) = bincode::serde::decode_from_slice::<ServiceCredential, _>(
+                &plaintext,
+                bincode::config::standard(),
+            )
+        {
+            credentials.insert(service.clone(), cred);
         }
-        None => Err("no 'openai' credential found in keystore".to_string()),
     }
+
+    // Set up OpenAI client from credentials
+    if let Some(ServiceCredential::ApiKey { key: api_key }) = credentials.get("openai") {
+        let service_config = load_service_config().unwrap_or_default();
+        let client = crate::openai::OpenAiClient::new(service_config, api_key.to_string())
+            .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
+        state.openai_client = Some(Arc::new(client));
+    }
+
+    // Set up X credentials
+    if let Some(c) = credentials.get("twitter")
+        && matches!(c, ServiceCredential::X { .. })
+    {
+        state.x_credentials = Some(c.clone());
+    }
+
+    state.credentials = credentials;
+    key.zeroize();
+    Ok(())
 }
 
 fn handle_list_models_inner(
@@ -433,11 +526,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::mpsc;
     use tai_proto::{DaemonMessage, SessionStatus};
-    use tempfile::tempdir;
 
     fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let dir = tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let tool_registry = crate::tools::ToolRegistry::new().build();
         let state = DaemonState {
@@ -446,7 +538,7 @@ mod tests {
             active_sessions: HashMap::new(),
             session_metadata: HashMap::new(),
             openai_client: None,
-            keystore: None,
+            credentials: HashMap::new(),
             x_credentials: None,
             db,
             tool_registry,

@@ -5,7 +5,9 @@ use frankenstein::types::ChatType;
 use frankenstein::{ParseMode, TelegramApi};
 use std::cell::Cell;
 use std::sync::mpsc;
-use tai_client_core::{ShellCommand, parse_input_line};
+use tai_client_core::{
+    ShellCommand, build_add_credential_message, parse_input_line, resolve_private_key,
+};
 use tai_markdown::render_markdown_html;
 use tai_proto::ClientMessage;
 use tracing::{debug, error, info, warn};
@@ -138,6 +140,47 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: frankenstein::types::Me
                 .build();
             if let Err(e) = bot.send_message(&params) {
                 warn!("failed to send error message to telegram: {e}");
+            }
+        }
+        ShellCommand::Unlock { method } => match resolve_private_key(&method) {
+            Ok(private_key) => {
+                if let Err(e) = state.bridge_tx.send(ClientMessage::Unlock { private_key }) {
+                    warn!("failed to send unlock to bridge: {e}");
+                }
+            }
+            Err(e) => {
+                let params = SendMessageParams::builder()
+                    .chat_id(chat_id_val)
+                    .text(format!("[error] {e}"))
+                    .build();
+                let _ = bot.send_message(&params);
+            }
+        },
+        ShellCommand::AddCredential {
+            service,
+            credential_type,
+            fields,
+            unlock,
+        } => match build_add_credential_message(service, credential_type, fields, unlock) {
+            Ok(msg) => {
+                if let Err(e) = state.bridge_tx.send(msg) {
+                    warn!("failed to send add credential to bridge: {e}");
+                }
+            }
+            Err(e) => {
+                let params = SendMessageParams::builder()
+                    .chat_id(chat_id_val)
+                    .text(format!("[error] {e}"))
+                    .build();
+                let _ = bot.send_message(&params);
+            }
+        },
+        ShellCommand::RemoveCredential { service } => {
+            if let Err(e) = state
+                .bridge_tx
+                .send(ClientMessage::RemoveCredential { service })
+            {
+                warn!("failed to send remove credential to bridge: {e}");
             }
         }
         ShellCommand::Empty | ShellCommand::InvalidCancel(_) => {}

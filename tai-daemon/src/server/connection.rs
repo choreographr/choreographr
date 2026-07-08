@@ -162,9 +162,27 @@ pub(crate) fn client_thread(
                             });
                         }
                     }
-                    ClientMessage::Unlock { passphrase } => {
+                    ClientMessage::Unlock { private_key } => {
                         info!("client {}: Unlock", client_id);
-                        handle_unlock_sync(&daemon_tx, &writer_tx, passphrase);
+                        handle_unlock_sync(&daemon_tx, &writer_tx, private_key);
+                    }
+                    ClientMessage::AddCredential {
+                        service,
+                        encrypted_payload,
+                        unlock_key,
+                    } => {
+                        info!("client {}: AddCredential service={}", client_id, service);
+                        handle_add_credential_sync(
+                            &daemon_tx,
+                            &writer_tx,
+                            service,
+                            encrypted_payload,
+                            unlock_key,
+                        );
+                    }
+                    ClientMessage::RemoveCredential { service } => {
+                        info!("client {}: RemoveCredential service={}", client_id, service);
+                        handle_remove_credential_sync(&daemon_tx, &writer_tx, service);
                     }
                     ClientMessage::ListModels => {
                         debug!("client {}: ListModels", client_id);
@@ -239,10 +257,10 @@ fn switch_attached_session(
 fn handle_unlock_sync(
     daemon_tx: &mpsc::Sender<DaemonCommand>,
     writer_tx: &mpsc::Sender<DaemonMessage>,
-    passphrase: String,
+    private_key: Vec<u8>,
 ) {
     let (reply, rx) = mpsc::channel();
-    let _ = daemon_tx.send(DaemonCommand::Unlock { passphrase, reply });
+    let _ = daemon_tx.send(DaemonCommand::Unlock { private_key, reply });
     match rx.recv() {
         Ok(Ok(())) => {
             let _ = writer_tx.send(DaemonMessage::Unlocked);
@@ -325,6 +343,52 @@ fn handle_delete_session_sync(
     }
 }
 
+fn handle_add_credential_sync(
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    writer_tx: &mpsc::Sender<DaemonMessage>,
+    service: String,
+    encrypted_payload: Vec<u8>,
+    unlock_key: Option<Vec<u8>>,
+) {
+    let (reply, rx) = mpsc::channel();
+    let _ = daemon_tx.send(DaemonCommand::SaveCredential {
+        service: service.clone(),
+        encrypted_blob: encrypted_payload,
+        unlock_key,
+        reply,
+    });
+    match rx.recv() {
+        Ok(Ok(())) => {
+            let _ = writer_tx.send(DaemonMessage::CredentialAdded { service });
+        }
+        Ok(Err(e)) => {
+            let _ = writer_tx.send(DaemonMessage::CredentialAddFailed { service, error: e });
+        }
+        Err(_) => {}
+    }
+}
+
+fn handle_remove_credential_sync(
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    writer_tx: &mpsc::Sender<DaemonMessage>,
+    service: String,
+) {
+    let (reply, rx) = mpsc::channel();
+    let _ = daemon_tx.send(DaemonCommand::RemoveCredentialCmd {
+        service: service.clone(),
+        reply,
+    });
+    match rx.recv() {
+        Ok(Ok(())) => {
+            let _ = writer_tx.send(DaemonMessage::CredentialRemoved { service });
+        }
+        Ok(Err(e)) => {
+            let _ = writer_tx.send(DaemonMessage::CredentialRemoveFailed { service, error: e });
+        }
+        Err(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,7 +402,7 @@ mod tests {
                 let _ = reply.send(Ok(()));
             }
         });
-        handle_unlock_sync(&daemon_tx, &writer_tx, "pass".into());
+        handle_unlock_sync(&daemon_tx, &writer_tx, vec![0u8; 32]);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg, DaemonMessage::Unlocked));
     }
@@ -352,7 +416,7 @@ mod tests {
                 let _ = reply.send(Err("wrong password".into()));
             }
         });
-        handle_unlock_sync(&daemon_tx, &writer_tx, "pass".into());
+        handle_unlock_sync(&daemon_tx, &writer_tx, vec![0u8; 32]);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg, DaemonMessage::LockedError { .. }));
         if let DaemonMessage::LockedError { error } = &msg {
@@ -365,7 +429,7 @@ mod tests {
         let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
         let (writer_tx, writer_rx) = mpsc::channel();
         drop(daemon_rx);
-        handle_unlock_sync(&daemon_tx, &writer_tx, "pass".into());
+        handle_unlock_sync(&daemon_tx, &writer_tx, vec![0u8; 32]);
         assert!(writer_rx.try_recv().is_err());
     }
 

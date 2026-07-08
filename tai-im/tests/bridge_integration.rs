@@ -39,7 +39,7 @@ fn bridge_unlock_locked() {
     let (tx, rx) = bridge.into_parts();
 
     tx.send(ClientMessage::Unlock {
-        passphrase: "secret".into(),
+        private_key: vec![0u8; 32],
     })
     .unwrap();
 

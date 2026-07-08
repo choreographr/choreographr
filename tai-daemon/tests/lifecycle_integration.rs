@@ -23,7 +23,7 @@ fn test_daemon_state() -> DaemonState {
         active_sessions: HashMap::new(),
         session_metadata: HashMap::new(),
         openai_client: None,
-        keystore: None,
+        credentials: HashMap::new(),
         x_credentials: None,
         db,
         tool_registry,

@@ -3,8 +3,8 @@ use dioxus::prelude::*;
 use futures_channel::mpsc::UnboundedSender;
 use std::io;
 use tai_client_core::{
-    ClientError, ShellCommand, dispatch_daemon_message, parse_input_line, run_daemon_connection,
-    shell_command_echo,
+    ClientError, ShellCommand, build_add_credential_message, dispatch_daemon_message,
+    parse_input_line, resolve_private_key, run_daemon_connection, shell_command_echo,
 };
 use tai_proto::{ClientMessage, DaemonMessage};
 
@@ -57,6 +57,30 @@ pub(crate) fn handle_shell_command(
             .push_text(format!("invalid request id: {value}")),
         ShellCommand::UnknownCommand(error) => state.client.push_text(error),
         ShellCommand::Send(message) => send_client_message(state, daemon_tx, message),
+        ShellCommand::Unlock { method } => match resolve_private_key(&method) {
+            Ok(private_key) => {
+                send_client_message(state, daemon_tx, ClientMessage::Unlock { private_key });
+            }
+            Err(e) => {
+                state.client.push_text(format!("[error] {e}"));
+            }
+        },
+        ShellCommand::AddCredential {
+            service,
+            credential_type,
+            fields,
+            unlock,
+        } => match build_add_credential_message(service, credential_type, fields, unlock) {
+            Ok(msg) => send_client_message(state, daemon_tx, msg),
+            Err(e) => state.client.push_text(format!("[error] {e}")),
+        },
+        ShellCommand::RemoveCredential { service } => {
+            send_client_message(
+                state,
+                daemon_tx,
+                ClientMessage::RemoveCredential { service },
+            );
+        }
     }
 }
 

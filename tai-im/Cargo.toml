@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 tai-proto.workspace = true
+tai-keystore.workspace = true
 tai-client-core.workspace = true
+bincode.workspace = true
 tai-markdown.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

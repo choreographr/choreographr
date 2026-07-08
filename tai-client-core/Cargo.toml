@@ -6,4 +6,6 @@ edition = "2024"
 [dependencies]
 
 tai-proto.workspace = true
+tai-keystore.workspace = true
+bincode.workspace = true
 thiserror.workspace = true
