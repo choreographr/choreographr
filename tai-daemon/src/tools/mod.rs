@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc;
-use tai_keystore::XCredentials;
+use tai_keystore::ServiceCredential;
 
 #[macro_export]
 macro_rules! define_tool {
@@ -25,7 +25,7 @@ macro_rules! define_tool {
             fn execute(
                 &self,
                 args: &str,
-                _x_credentials: Option<&tai_keystore::XCredentials>,
+                _x_credentials: Option<&tai_keystore::ServiceCredential>,
                 _cwd: Option<&std::path::Path>,
             ) -> $crate::tools::ToolExecutionOutput {
                 $crate::tools::ToolExecutionOutput {
@@ -57,7 +57,7 @@ macro_rules! define_tool_with_cwd {
             fn execute(
                 &self,
                 args: &str,
-                _x_credentials: Option<&tai_keystore::XCredentials>,
+                _x_credentials: Option<&tai_keystore::ServiceCredential>,
                 cwd: Option<&std::path::Path>,
             ) -> $crate::tools::ToolExecutionOutput {
                 $crate::tools::ToolExecutionOutput {
@@ -126,14 +126,14 @@ pub trait Tool: Send + Sync {
     fn execute(
         &self,
         arguments_json: &str,
-        x_credentials: Option<&XCredentials>,
+        x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
     ) -> ToolExecutionOutput;
 
     fn execute_streaming(
         &self,
         arguments_json: &str,
-        x_credentials: Option<&XCredentials>,
+        x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
         _output_tx: mpsc::Sender<Vec<u8>>,
     ) -> ToolExecutionOutput {
@@ -227,7 +227,7 @@ impl ToolRegistry {
     pub fn execute(
         &self,
         tool_call: &ChatToolCall,
-        x_credentials: Option<&XCredentials>,
+        x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
     ) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
@@ -246,7 +246,7 @@ impl ToolRegistry {
         &self,
         tool_call: &ChatToolCall,
         output_tx: mpsc::Sender<Vec<u8>>,
-        x_credentials: Option<&XCredentials>,
+        x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
     ) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {

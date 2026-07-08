@@ -25,19 +25,3 @@ pub enum KeystoreError {
     ConfigDirNotFound,
 }
 
-impl From<KeystoreError> for io::Error {
-    fn from(error: KeystoreError) -> Self {
-        match error {
-            KeystoreError::Io(io) => io,
-            KeystoreError::TooShort
-            | KeystoreError::InvalidMagic
-            | KeystoreError::InvalidData(_) => io::Error::new(io::ErrorKind::InvalidData, error),
-            KeystoreError::DecryptionFailed => {
-                io::Error::new(io::ErrorKind::PermissionDenied, error)
-            }
-            KeystoreError::AlreadyExists => io::Error::new(io::ErrorKind::AlreadyExists, error),
-            KeystoreError::ConfigDirNotFound => io::Error::new(io::ErrorKind::NotFound, error),
-            _ => io::Error::other(error),
-        }
-    }
-}

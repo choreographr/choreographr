@@ -217,7 +217,7 @@ impl super::Tool for DisplayImage {
     fn execute(
         &self,
         arguments_json: &str,
-        _x_credentials: Option<&tai_keystore::XCredentials>,
+        _x_credentials: Option<&tai_keystore::ServiceCredential>,
         _cwd: Option<&std::path::Path>,
     ) -> ToolExecutionOutput {
         execute_display_image_tool(arguments_json)

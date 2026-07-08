@@ -11,7 +11,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tai_keystore::XCredentials;
+use tai_keystore::ServiceCredential;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata,
     MAX_IMAGE_CHUNK_SIZE, OutputStream, SessionMessage, SessionStatus,
@@ -352,7 +352,7 @@ pub(crate) fn run_agent_loop(
 fn execute_tool_with_timeout(
     tool_registry: &Arc<ToolRegistry>,
     tool_call: &crate::openai::ChatToolCall,
-    x_credentials: Option<&XCredentials>,
+    x_credentials: Option<&ServiceCredential>,
     cwd: Option<&Path>,
     timeout_dur: Duration,
     request_id: u32,
@@ -628,7 +628,7 @@ fn execute_spawn_subsession_sync(
     _db: &redb::Database,
     _model: &str,
     tool_call: &crate::openai::ChatToolCall,
-    _x_credentials: Option<&XCredentials>,
+    _x_credentials: Option<&ServiceCredential>,
     cwd: Option<&Path>,
     _max_turns_default: u32,
     cancel_rx: &mpsc::Receiver<()>,
@@ -1232,7 +1232,7 @@ mod tests {
         fn execute(
             &self,
             _args: &str,
-            _xc: Option<&XCredentials>,
+            _xc: Option<&ServiceCredential>,
             _cwd: Option<&Path>,
         ) -> ToolExecutionOutput {
             ToolExecutionOutput {
@@ -1267,7 +1267,7 @@ mod tests {
         fn execute(
             &self,
             _args: &str,
-            _xc: Option<&XCredentials>,
+            _xc: Option<&ServiceCredential>,
             _cwd: Option<&Path>,
         ) -> ToolExecutionOutput {
             ToolExecutionOutput {
@@ -1281,7 +1281,7 @@ mod tests {
         fn execute_streaming(
             &self,
             _args: &str,
-            _xc: Option<&XCredentials>,
+            _xc: Option<&ServiceCredential>,
             _cwd: Option<&Path>,
             _output_tx: mpsc::Sender<Vec<u8>>,
         ) -> ToolExecutionOutput {
@@ -1439,7 +1439,7 @@ mod tests {
         fn execute(
             &self,
             _args: &str,
-            _xc: Option<&XCredentials>,
+            _xc: Option<&ServiceCredential>,
             _cwd: Option<&Path>,
         ) -> ToolExecutionOutput {
             ToolExecutionOutput {
@@ -1453,7 +1453,7 @@ mod tests {
         fn execute_streaming(
             &self,
             _args: &str,
-            _xc: Option<&XCredentials>,
+            _xc: Option<&ServiceCredential>,
             _cwd: Option<&Path>,
             output_tx: mpsc::Sender<Vec<u8>>,
         ) -> ToolExecutionOutput {

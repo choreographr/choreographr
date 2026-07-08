@@ -17,7 +17,7 @@ pub struct DaemonState {
     pub session_metadata: HashMap<u64, SessionMetadata>,
     pub openai_client: Option<Arc<crate::openai::OpenAiClient>>,
     pub keystore: Option<Arc<crate::Keystore>>,
-    pub x_credentials: Option<tai_keystore::XCredentials>,
+    pub x_credentials: Option<tai_keystore::ServiceCredential>,
     pub db: Arc<redb::Database>,
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
@@ -391,8 +391,10 @@ fn handle_unlock_inner(state: &mut DaemonState, passphrase: String) -> Result<()
             let client = crate::openai::OpenAiClient::new(service_config, api_key.to_string())
                 .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
             state.openai_client = Some(Arc::new(client));
-            if let Some(x_creds) = keystore.get_x_credentials("twitter") {
-                state.x_credentials = Some(x_creds);
+            if let Some(c) = keystore.get("twitter") {
+                if matches!(c, tai_keystore::ServiceCredential::X { .. }) {
+                    state.x_credentials = Some(c.clone());
+                }
             }
             state.keystore = Some(keystore);
             Ok(())

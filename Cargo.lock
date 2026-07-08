@@ -7929,7 +7929,6 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "argon2",
- "base64",
  "dirs 6.0.0",
  "rand 0.10.2",
  "serde",

@@ -1,10 +1,10 @@
 use crate::tools::{ToolExecutionOutput, tool_err, tool_ok, truncate_tool_output};
 use reqwest::blocking::Client;
 use sha1::Sha1;
-use tai_keystore::XCredentials;
+use tai_keystore::{ServiceCredential, XCredentialView};
 
-fn get_x_credentials(x_credentials: Option<&XCredentials>) -> Option<XCredentials> {
-    x_credentials.cloned()
+fn get_x_credentials(x_credentials: Option<&ServiceCredential>) -> Option<XCredentialView<'_>> {
+    x_credentials.and_then(ServiceCredential::as_x)
 }
 
 const X_API_BASE: &str = "https://api.twitter.com";
@@ -38,7 +38,7 @@ fn hmac_sha1(key: &[u8], data: &str) -> String {
 fn build_oauth1_header(
     method: &str,
     url: &str,
-    creds: &XCredentials,
+    creds: &XCredentialView<'_>,
     params: &[(&str, &str)],
 ) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -57,14 +57,14 @@ fn build_oauth1_header(
         .collect();
 
     let mut oauth_params: Vec<(String, String)> = vec![
-        ("oauth_consumer_key".to_string(), creds.api_key.clone()),
+        ("oauth_consumer_key".to_string(), creds.api_key.to_string()),
         ("oauth_nonce".to_string(), nonce),
         (
             "oauth_signature_method".to_string(),
             "HMAC-SHA1".to_string(),
         ),
         ("oauth_timestamp".to_string(), timestamp),
-        ("oauth_token".to_string(), creds.access_token.clone()),
+        ("oauth_token".to_string(), creds.access_token.to_string()),
         ("oauth_version".to_string(), "1.0".to_string()),
     ];
 
@@ -97,8 +97,8 @@ fn build_oauth1_header(
 
     let signing_key = format!(
         "{}&{}",
-        urlencode(&creds.api_key_secret),
-        urlencode(&creds.access_token_secret)
+        urlencode(creds.api_key_secret),
+        urlencode(creds.access_token_secret)
     );
 
     let signature = hmac_sha1(signing_key.as_bytes(), &signature_base);
@@ -125,7 +125,7 @@ fn build_oauth1_header(
 fn x_api_get(
     path: &str,
     params: &[(&str, &str)],
-    x_credentials: Option<&XCredentials>,
+    x_credentials: Option<&ServiceCredential>,
 ) -> Result<String, String> {
     let creds = get_x_credentials(x_credentials).ok_or("X credentials not configured")?;
     let url = format!("{X_API_BASE}{path}");
@@ -153,7 +153,7 @@ fn x_api_get(
 fn x_api_post(
     path: &str,
     body_json: &str,
-    x_credentials: Option<&XCredentials>,
+    x_credentials: Option<&ServiceCredential>,
 ) -> Result<String, String> {
     let creds = get_x_credentials(x_credentials).ok_or("X credentials not configured")?;
     let url = format!("{X_API_BASE}{path}");
@@ -211,7 +211,7 @@ impl super::Tool for XPost {
     fn execute(
         &self,
         arguments_json: &str,
-        x_credentials: Option<&XCredentials>,
+        x_credentials: Option<&ServiceCredential>,
         _cwd: Option<&std::path::Path>,
     ) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
@@ -290,7 +290,7 @@ impl super::Tool for XSearchRecent {
     fn execute(
         &self,
         arguments_json: &str,
-        x_credentials: Option<&XCredentials>,
+        x_credentials: Option<&ServiceCredential>,
         _cwd: Option<&std::path::Path>,
     ) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {
@@ -372,7 +372,7 @@ impl super::Tool for XUserLookup {
     fn execute(
         &self,
         arguments_json: &str,
-        x_credentials: Option<&XCredentials>,
+        x_credentials: Option<&ServiceCredential>,
         _cwd: Option<&std::path::Path>,
     ) -> ToolExecutionOutput {
         let args: serde_json::Value = match serde_json::from_str(arguments_json) {

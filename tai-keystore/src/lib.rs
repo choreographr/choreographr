@@ -22,7 +22,8 @@ const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
+#[zeroize(drop)]
 #[serde(tag = "type")]
 pub enum ServiceCredential {
     #[serde(rename = "api_key")]
@@ -35,6 +36,38 @@ pub enum ServiceCredential {
         access_token_secret: String,
         bearer_token: Option<String>,
     },
+}
+
+/// Borrowed view of X credential fields. Avoids allocating a separate struct.
+#[derive(Debug, Clone, Copy)]
+pub struct XCredentialView<'a> {
+    pub api_key: &'a str,
+    pub api_key_secret: &'a str,
+    pub access_token: &'a str,
+    pub access_token_secret: &'a str,
+    pub bearer_token: Option<&'a str>,
+}
+
+impl ServiceCredential {
+    /// Returns a view of the X credential fields if this is the X variant.
+    pub fn as_x(&self) -> Option<XCredentialView<'_>> {
+        match self {
+            ServiceCredential::X {
+                api_key,
+                api_key_secret,
+                access_token,
+                access_token_secret,
+                bearer_token,
+            } => Some(XCredentialView {
+                api_key,
+                api_key_secret,
+                access_token,
+                access_token_secret,
+                bearer_token: bearer_token.as_deref(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,25 +109,6 @@ impl Keystore {
     pub fn get_api_key(&self, service: &str) -> Option<&str> {
         match self.services.get(service)? {
             ServiceCredential::ApiKey { key } => Some(key.as_str()),
-            _ => None,
-        }
-    }
-
-    pub fn get_x_credentials(&self, service: &str) -> Option<XCredentials> {
-        match self.services.get(service)? {
-            ServiceCredential::X {
-                api_key,
-                api_key_secret,
-                access_token,
-                access_token_secret,
-                bearer_token,
-            } => Some(XCredentials {
-                api_key: api_key.clone(),
-                api_key_secret: api_key_secret.clone(),
-                access_token: access_token.clone(),
-                access_token_secret: access_token_secret.clone(),
-                bearer_token: bearer_token.clone(),
-            }),
             _ => None,
         }
     }
@@ -219,15 +233,6 @@ pub fn keystore_path() -> Result<PathBuf, KeystoreError> {
     Ok(config_dir.join("tai-daemon").join("credentials.enc"))
 }
 
-#[derive(Debug, Clone, Zeroize)]
-pub struct XCredentials {
-    pub api_key: String,
-    pub api_key_secret: String,
-    pub access_token: String,
-    pub access_token_secret: String,
-    pub bearer_token: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,7 +255,7 @@ mod tests {
         );
         assert_eq!(ks.service_names().count(), 1);
         assert_eq!(ks.get_api_key("openai"), Some("sk-test"));
-        assert!(ks.get_x_credentials("openai").is_none());
+        assert!(!matches!(ks.get("openai"), Some(ServiceCredential::X { .. })));
     }
 
     #[test]
@@ -267,12 +272,12 @@ mod tests {
             },
         );
         assert!(ks.get_api_key("twitter").is_none());
-        let creds = ks.get_x_credentials("twitter").unwrap();
+        let creds = ks.get("twitter").and_then(ServiceCredential::as_x).unwrap();
         assert_eq!(creds.api_key, "ak");
         assert_eq!(creds.api_key_secret, "aks");
         assert_eq!(creds.access_token, "at");
         assert_eq!(creds.access_token_secret, "ats");
-        assert_eq!(creds.bearer_token, Some("bt".to_string()));
+        assert_eq!(creds.bearer_token, Some("bt"));
     }
 
     #[test]
@@ -327,9 +332,9 @@ mod tests {
         let restored = Keystore::from_store(store);
 
         assert_eq!(restored.get_api_key("s1"), Some("api-key"));
-        let x = restored.get_x_credentials("s2").unwrap();
+        let x = restored.get("s2").and_then(ServiceCredential::as_x).unwrap();
         assert_eq!(x.api_key, "a");
-        assert_eq!(x.bearer_token, None);
+        assert!(x.bearer_token.is_none());
         assert_eq!(restored.service_names().count(), 2);
     }
 

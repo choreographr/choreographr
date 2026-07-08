@@ -338,7 +338,7 @@ trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn schema(&self) -> serde_json::Value;       // JSON Schema for the model
-    fn execute(&self, arguments_json: &str, x_credentials: Option<&XCredentials>, cwd: Option<&Path>) -> ToolExecutionOutput;
+    fn execute(&self, arguments_json: &str, x_credentials: Option<&ServiceCredential>, cwd: Option<&Path>) -> ToolExecutionOutput;
 }
 ```
 

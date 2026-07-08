@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
-use tai_keystore::XCredentials;
+use tai_keystore::ServiceCredential;
 use tempfile::tempdir;
 
 const BOILERPLATE_HEAD: &str = r#"
@@ -240,7 +240,7 @@ struct RunRiscVInput {
 }
 
 struct TaiSyscall {
-    x_credentials: Option<XCredentials>,
+    x_credentials: Option<ServiceCredential>,
     cwd: Option<PathBuf>,
     output_tx: mpsc::Sender<Vec<u8>>,
     write_tx: Option<mpsc::Sender<Vec<u8>>>,
@@ -412,7 +412,7 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
 
 fn run_riscv_impl(
     args: &str,
-    x_credentials: Option<&XCredentials>,
+    x_credentials: Option<&ServiceCredential>,
     cwd: Option<&Path>,
     write_tx: Option<mpsc::Sender<Vec<u8>>>,
 ) -> ToolExecutionOutput {
@@ -620,7 +620,7 @@ impl Tool for RunRiscV {
     fn execute(
         &self,
         args: &str,
-        x_credentials: Option<&XCredentials>,
+        x_credentials: Option<&ServiceCredential>,
         cwd: Option<&Path>,
     ) -> ToolExecutionOutput {
         run_riscv_impl(args, x_credentials, cwd, None)
@@ -629,7 +629,7 @@ impl Tool for RunRiscV {
     fn execute_streaming(
         &self,
         args: &str,
-        x_credentials: Option<&XCredentials>,
+        x_credentials: Option<&ServiceCredential>,
         cwd: Option<&Path>,
     output_tx: mpsc::Sender<Vec<u8>>,
     ) -> ToolExecutionOutput {
