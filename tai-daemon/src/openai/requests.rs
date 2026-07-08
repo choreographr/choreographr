@@ -107,44 +107,65 @@ impl OpenAiClient {
     where
         F: FnMut(super::CompletionChunkKind, String) -> io::Result<()>,
     {
-        if !self.config.streaming {
-            // Fall back to non-streaming, deliver the full response as a single
-            // chunk through the callback so the caller's broadcasting path
-            // stays uniform regardless of the streaming setting.
-            let mut on_chunk = on_chunk;
-            let result = self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx)?;
-            match &result {
-                ChatTurnResult::FinalText(content) => {
-                    if !content.is_empty() {
-                        on_chunk(super::CompletionChunkKind::Answer, content.clone())?;
-                    }
-                }
-                ChatTurnResult::ToolUse(tool_use) => {
-                    if let Some(ref content) = tool_use.content {
+        // Instrument API call timing and error classification for monitoring.
+        // We wrap both the streaming and non-streaming paths with a single
+        // timing measurement that includes retry backoff.
+        let api_start = std::time::Instant::now();
+        let result: Result<ChatTurnResult, super::OpenAiError> = (|| {
+            if !self.config.streaming {
+                // Fall back to non-streaming, deliver the full response as a single
+                // chunk through the callback so the caller's broadcasting path
+                // stays uniform regardless of the streaming setting.
+                let mut on_chunk = on_chunk;
+                let result =
+                    self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx)?;
+                match &result {
+                    ChatTurnResult::FinalText(content) => {
                         if !content.is_empty() {
                             on_chunk(super::CompletionChunkKind::Answer, content.clone())?;
                         }
                     }
-                    // Send reasoning through whichever field the model populated.
-                    if let Some(reasoning) = tool_use.reasoning.as_ref().filter(|r| !r.is_empty()) {
-                        on_chunk(super::CompletionChunkKind::Reasoning, reasoning.clone())?;
+                    ChatTurnResult::ToolUse(tool_use) => {
+                        if let Some(ref content) = tool_use.content {
+                            if !content.is_empty() {
+                                on_chunk(super::CompletionChunkKind::Answer, content.clone())?;
+                            }
+                        }
+                        // Send reasoning through whichever field the model populated.
+                        if let Some(reasoning) =
+                            tool_use.reasoning.as_ref().filter(|r| !r.is_empty())
+                        {
+                            on_chunk(super::CompletionChunkKind::Reasoning, reasoning.clone())?;
+                        }
                     }
                 }
+                return Ok(result);
             }
-            return Ok(result);
-        }
 
-        chat_completions_request_streaming_with_tools(
-            &self.http,
-            &self.config,
-            &self.api_key,
-            model,
-            messages,
-            tools,
-            on_retry,
-            cancel_rx,
-            on_chunk,
-        )
+            chat_completions_request_streaming_with_tools(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                model,
+                messages,
+                tools,
+                on_retry,
+                cancel_rx,
+                on_chunk,
+            )
+        })();
+
+        let elapsed = api_start.elapsed().as_secs_f64();
+        match &result {
+            Ok(_) => {
+                crate::metrics::record_api_call(model, "chat/completions", elapsed);
+            }
+            Err(e) => {
+                crate::metrics::record_api_call(model, "chat/completions", elapsed);
+                crate::metrics::record_api_error(model, super::error_type_label(e));
+            }
+        }
+        result
     }
 }
 

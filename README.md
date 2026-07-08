@@ -138,6 +138,21 @@ In `tai-tui`:
 - `/remove-key <service> <passphrase>` — remove a credential from the keystore
 - any other input — sent as a prompt
 
+## Monitoring
+
+The daemon can expose an OpenMetrics (Prometheus) endpoint:
+
+```bash
+cargo run -p tai-daemon -- --metrics-addr 127.0.0.1:9464
+```
+
+When `--metrics-addr` is provided, a dedicated HTTP thread serves `GET /metrics`
+at the given address. Without the flag, no metrics server is started.
+
+Metrics include session counts, connection counts, request latency, API call
+latency, tool execution time, and error breakdowns. Process-level metrics (RSS,
+CPU, file descriptors) are also included.
+
 ## Testing
 
 ```bash

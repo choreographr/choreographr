@@ -2,7 +2,7 @@ use crate::daemon::{DaemonCommand, DaemonState};
 use crate::sessions::SessionCommand;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::io::{self, BufWriter};
-use std::net::Shutdown;
+use std::net::{Shutdown, SocketAddr};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +13,11 @@ use std::time::Duration;
 use tai_proto::DaemonMessage;
 use tracing::{error, info};
 
-pub fn run_server(socket_path: &str, mut state: DaemonState) -> io::Result<()> {
+pub fn run_server(
+    socket_path: &str,
+    mut state: DaemonState,
+    metrics_addr: Option<String>,
+) -> io::Result<()> {
     if Path::new(socket_path).exists() {
         std::fs::remove_file(socket_path)?;
     }
@@ -66,6 +70,24 @@ pub fn run_server(socket_path: &str, mut state: DaemonState) -> io::Result<()> {
         }
     });
 
+    // Initialize the metrics registry so that instrumented code throughout
+    // the daemon can safely call record_* functions (they no-op when
+    // uninitialized).  This must happen before the accept loop starts.
+    crate::metrics::init()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    // Metrics HTTP server thread (if `--metrics-addr` was provided).
+    // Spawned before the accept loop so it's reachable immediately.
+    if let Some(ref addr_str) = metrics_addr {
+        let addr: SocketAddr = addr_str.parse().map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid --metrics-addr: {e}"))
+        })?;
+        let shutdown_flag = Arc::clone(&shutdown);
+        thread::spawn(move || {
+            crate::metrics::serve_metrics(addr, shutdown_flag);
+        });
+    }
+
     // Main thread accept loop — blocking accept() is event-driven
     // (the kernel deschedules us until a connection arrives).
     let mut client_streams: Vec<UnixStream> = Vec::new();
@@ -79,6 +101,7 @@ pub fn run_server(socket_path: &str, mut state: DaemonState) -> io::Result<()> {
                     // Wakeup from the signal handler — shut down.
                     break;
                 }
+                crate::metrics::record_connection_accepted();
                 if let Ok(ctrl) = stream.try_clone() {
                     client_streams.push(ctrl);
                 }

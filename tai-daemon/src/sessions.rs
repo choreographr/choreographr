@@ -699,6 +699,7 @@ fn run_request_worker(
     cmd_tx: mpsc::Sender<SessionCommand>,
     child_reply: Option<mpsc::Sender<io::Result<ChildResult>>>,
 ) -> io::Result<()> {
+    let request_start = std::time::Instant::now();
     let initial_snapshot = session.snapshot();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_agent_loop(
@@ -729,6 +730,14 @@ fn run_request_worker(
             initial_snapshot,
         ),
     };
+
+    let req_status = match &outcome {
+        RequestOutcome::Done => "done",
+        RequestOutcome::Failed(_) => "failed",
+        RequestOutcome::Cancelled => "cancelled",
+    };
+    crate::metrics::record_request_total(req_status);
+    crate::metrics::record_request_duration(req_status, request_start.elapsed().as_secs_f64());
 
     match &outcome {
         RequestOutcome::Done => {

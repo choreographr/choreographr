@@ -265,6 +265,20 @@ pub enum CompletionChunkKind {
     Reasoning,
 }
 
+/// Map an API error to a stable label for metrics.
+/// These labels match the expectations of `tai_api_errors_total`.
+pub(crate) fn error_type_label(e: &OpenAiError) -> &'static str {
+    match e {
+        OpenAiError::Unauthorized { .. } => "unauthorized",
+        OpenAiError::RateLimited { .. } => "rate_limited",
+        OpenAiError::ServerError { .. } => "server_error",
+        OpenAiError::ClientError { .. } => "client_error",
+        OpenAiError::EmptyResponse => "client_error",
+        OpenAiError::Cancelled => "cancelled",
+        OpenAiError::Io(_) => "other",
+    }
+}
+
 impl ChatToolDefinition {
     pub fn function(
         name: &'static str,

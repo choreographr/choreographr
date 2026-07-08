@@ -1,6 +1,7 @@
 pub mod context;
 pub mod daemon;
 pub mod db;
+pub mod metrics;
 pub mod diff_util;
 pub mod openai;
 mod requests;

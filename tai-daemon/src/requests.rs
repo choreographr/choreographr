@@ -121,6 +121,7 @@ pub(crate) fn run_agent_loop(
 
     for turn in 0..max_turns {
         debug!(session_id, turn, "agent loop turn");
+        crate::metrics::record_turn(model);
         let tools = tool_registry.available_definitions(&session.active_tool_groups);
         if is_cancelled(&cancel_rx, &mut false) {
             return Ok(true);
@@ -389,6 +390,11 @@ fn execute_tool_with_timeout(
     cancel_rx: &mpsc::Receiver<()>,
     cmd_tx: &mpsc::Sender<SessionCommand>,
 ) -> ToolExecutionOutput {
+    // Capture start time for tool execution metrics.
+    // Admin tools (list_sessions, get_session, spawn_subsession, load_skill,
+    // load_tools, unload_tools) return early and are not timed — only the
+    // registry-executed path records metrics below.
+    let exec_start = std::time::Instant::now();
     match tool_call.name.as_str() {
         "list_sessions" => {
             return execute_list_sessions_sync(daemon_tx);
@@ -495,6 +501,7 @@ fn execute_tool_with_timeout(
         // sent between tool start and our first recv_timeout is honoured
         // immediately rather than waiting up to check_interval.
         if is_cancelled(cancel_rx, &mut was_cancelled) {
+            crate::metrics::record_tool_execution(&tool_call.name, exec_start.elapsed().as_secs_f64(), true);
             return ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("tool '{}' cancelled", tool_call.name),
@@ -506,6 +513,7 @@ fn execute_tool_with_timeout(
 
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
+            crate::metrics::record_tool_execution(&tool_call.name, exec_start.elapsed().as_secs_f64(), true);
             return ToolExecutionOutput {
                 result: ToolResult {
                     content: format!(
@@ -520,9 +528,13 @@ fn execute_tool_with_timeout(
         }
 
         match result_rx.recv_timeout(remaining.min(check_interval)) {
-            Ok(output) => return output,
+            Ok(output) => {
+                crate::metrics::record_tool_execution(&tool_call.name, exec_start.elapsed().as_secs_f64(), output.result.is_error);
+                return output;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                crate::metrics::record_tool_execution(&tool_call.name, exec_start.elapsed().as_secs_f64(), true);
                 return ToolExecutionOutput {
                     result: ToolResult {
                         content: "tool execution thread panicked".to_string(),

@@ -19,6 +19,11 @@ struct Cli {
     /// Decrease logging verbosity (only errors and warnings)
     #[arg(short = 'q', long = "quiet", action = clap::ArgAction::Count)]
     quiet: u8,
+
+    /// Enable Prometheus metrics HTTP server on this socket address
+    /// (e.g. 127.0.0.1:9464).  When absent no metrics server is started.
+    #[arg(long = "metrics-addr")]
+    metrics_addr: Option<String>,
 }
 
 const DEFAULT_MAX_TURNS: u32 = 25;
@@ -117,6 +122,6 @@ fn main() -> anyhow::Result<()> {
     };
 
     let socket_path = socket_path();
-    tai_daemon::run_server(&socket_path, state)
+    tai_daemon::run_server(&socket_path, state, cli.metrics_addr)
         .context("failed to run server")
 }

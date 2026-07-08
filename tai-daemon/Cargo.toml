@@ -34,9 +34,15 @@ signal-hook.workspace = true
 toml = "1.1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# OpenMetrics / Prometheus monitoring.
+# The `process` feature exposes process-level metrics (RSS, CPU, FD count)
+# alongside our application-level gauges, counters, and histograms.
+prometheus = { version = "0.14", features = ["process"] }
+tiny_http = "0.12"
 ckb-vm = { version = "0.24.14", features = ["asm", "detect-asm"] }
 tempfile = "3"
 
 [dev-dependencies]
 filetime = "0.2"
 libc = "0.2"
+serial_test = "3"

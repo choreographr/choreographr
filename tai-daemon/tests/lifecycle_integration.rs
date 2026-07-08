@@ -47,7 +47,7 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
 
     // Run the server in a background thread.
     let handle = thread::spawn(move || {
-        run_server(&socket_str, state).expect("run_server");
+        run_server(&socket_str, state, None).expect("run_server");
     });
 
     // Wait for the socket to appear (server is ready).

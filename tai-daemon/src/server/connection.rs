@@ -27,6 +27,7 @@ pub(crate) fn client_thread(
     let mut attached_session_id: Option<u64> = None;
     let client_id = rand::random::<u64>();
     info!("client connected: id={}", client_id);
+    crate::metrics::record_client_connected();
 
     let mut reader = reader;
     loop {
@@ -202,6 +203,7 @@ pub(crate) fn client_thread(
     let _ = daemon_tx.send(DaemonCommand::UnregisterSummarySubscriber { client_id });
     drop(writer_tx);
     let _ = writer_handle.join();
+    crate::metrics::record_client_disconnected();
     Ok(())
 }
 

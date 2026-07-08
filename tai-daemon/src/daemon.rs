@@ -140,6 +140,7 @@ impl DaemonState {
                 let session_tx = self.spawn_session(sid, record, metadata);
 
                 let _ = reply.send(Ok((sid, session_tx)));
+                crate::metrics::record_session_created();
                 let created_msg = DaemonMessage::SessionCreated {
                     session_id: sid,
                     title,
@@ -232,6 +233,7 @@ impl DaemonState {
             }
             DaemonCommand::SessionExited { session_id } => {
                 info!("SessionExited: id={}", session_id);
+                crate::metrics::record_session_exited();
                 self.active_sessions.remove(&session_id);
                 if let Some(meta) = self.session_metadata.get_mut(&session_id) {
                     meta.status = SessionStatus::Sleeping;

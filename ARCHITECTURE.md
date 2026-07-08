@@ -178,6 +178,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Each session has a control thread; request work runs on separate worker threads. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
+| `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
 | `tools/` | Tool trait, registry, and 20 registered tools. |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
@@ -197,6 +198,7 @@ client_thread(socket)
 main()
 ├── listener thread — UnixListener accept loop (non-blocking poll)
 │   └── per client: spawns client_thread (std::thread::spawn)
+├── metrics HTTP thread — (optional) serves /metrics at `--metrics-addr`
 ├── command thread — DaemonCommand receiver loop (daemon_tx mpsc)
 │   └── owns DaemonState (exclusive access, no Arc<Mutex>)
 ├── per-session threads — spawned on CreateSession, reaped on Shutdown
@@ -510,6 +512,59 @@ in-memory metadata and the database via `UpdateMetadata → db::write_session`. 
 `AttachSession` handler also populates `session_metadata` when re-loading a session
 from the database, ensuring `ListModels` and metadata queries see the correct
 `selected_model`.
+
+---
+
+## Metrics / OpenMetrics monitoring
+
+The daemon can expose a `/metrics` HTTP endpoint in the OpenMetrics format
+(suitable for Prometheus scraping).
+
+**CLI flag:** `--metrics-addr <ADDR>` (e.g. `127.0.0.1:9464`). When the flag is
+absent no metrics server is started — the daemon runs exactly as before.
+
+**Endpoint:** `GET /metrics` returns `Content-Type: text/plain; version=0.0.4; charset=utf-8`.
+
+### Exposed metrics
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `tai_sessions_active` | Gauge | — | Number of active sessions |
+| `tai_connections_active` | Gauge | — | Number of active client connections |
+| `tai_requests_total` | Counter | `status` (`done`, `failed`, `cancelled`) | Total requests processed |
+| `tai_tool_executions_total` | Counter | `tool`, `status` (`ok`, `error`) | Tool call count |
+| `tai_api_calls_total` | Counter | `model`, `endpoint` | API call count |
+| `tai_api_errors_total` | Counter | `model`, `error_type` | API error breakdown |
+| `tai_connections_total` | Counter | — | Total connections accepted |
+| `tai_turns_total` | Counter | `model` | Agent loop turns |
+| `tai_request_duration_seconds` | Histogram | `status` | Request latency |
+| `tai_tool_execution_duration_seconds` | Histogram | `tool` | Per-tool execution time |
+| `tai_api_call_duration_seconds` | Histogram | `model`, `endpoint` | API round-trip time |
+
+Process-level metrics (RSS, CPU, FD count) are also exposed via the `prometheus`
+crate's `process` feature.
+
+### Implementation
+
+The metrics module (`src/metrics.rs`) uses `std::sync::LazyLock` for a single
+static `Metrics` struct that wraps Prometheus counters/gauges/histograms. All
+operations are atomic (no `Arc<Mutex>` needed). A dedicated thread serves the
+`/metrics` endpoint via `tiny_http`; it polls the shutdown flag every 1 second
+and exits cleanly when the daemon shuts down.
+
+### Instrumentation points
+
+| Location | Function | Metrics recorded |
+|---|---|---|
+| `daemon.rs` — `CreateSession` handler | `record_session_created` | `tai_sessions_active +1` |
+| `daemon.rs` — `SessionExited` handler | `record_session_exited` | `tai_sessions_active -1` |
+| `server/connection.rs` — `client_thread` start | `record_client_connected` | `tai_connections_active +1` |
+| `server/connection.rs` — `client_thread` end | `record_client_disconnected` | `tai_connections_active -1` |
+| `server/lifecycle.rs` — accept loop | `record_connection_accepted` | `tai_connections_total +1` |
+| `sessions.rs` — `run_request_worker` | `record_request_total`, `record_request_duration` | request status + latency |
+| `requests.rs` — `run_agent_loop` turn | `record_turn` | turn count per model |
+| `requests.rs` — `execute_tool_with_timeout` | `record_tool_execution` | tool duration + status |
+| `openai/requests.rs` — `chat_completion_turn_streaming` | `record_api_call`, `record_api_error` | API latency + errors |
 
 ---
 
@@ -930,4 +985,6 @@ errors, network failures, etc. Tools return `Result<String, ToolError>` and conv
 `ToolResult` at the `Tool::execute()` boundary via `From<ToolError> for ToolResult`.
 | `gix` | daemon | Git operations |
 | `teloxide` | tai-im | Telegram Bot API client |
+| `prometheus` | daemon | OpenMetrics instrumentation, process metrics |
+| `tiny_http` | daemon | Metrics HTTP server for `/metrics` endpoint |
 | `tracing` | daemon | Structured logging |
