@@ -14,6 +14,8 @@ fn metrics_server_serves_openmetrics_format() {
     let addr: std::net::SocketAddr = "127.0.0.1:19464".parse().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    metrics::init().unwrap();
+
     let srv_shutdown = Arc::clone(&shutdown);
     let server_handle = thread::spawn(move || {
         metrics::serve_metrics(addr, srv_shutdown);
