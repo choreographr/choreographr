@@ -1,6 +1,7 @@
 use super::{
-    ToolError, ToolResult, tool_ok,
+    ToolError, ToolResult,
     shell_util::{format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
+    tool_ok,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -47,10 +48,7 @@ pub fn execute_nu_tool(arguments_json: &str, cwd: Option<&Path>) -> ToolResult {
     }
 }
 
-fn execute_nu_inner(
-    arguments_json: &str,
-    cwd: Option<&Path>,
-) -> Result<String, ToolError> {
+fn execute_nu_inner(arguments_json: &str, cwd: Option<&Path>) -> Result<String, ToolError> {
     let args: NuArgs = serde_json::from_str(arguments_json)?;
 
     let command = args.command;
@@ -68,7 +66,9 @@ fn execute_nu_inner(
 
     let (output, was_killed) = spawn_with_watchdog(&mut cmd, timeout_ms)?;
 
-    Ok(format_shell_output(&command, &output, timeout_ms, was_killed))
+    Ok(format_shell_output(
+        &command, &output, timeout_ms, was_killed,
+    ))
 }
 
 #[cfg(test)]

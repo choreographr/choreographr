@@ -7,7 +7,7 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 /// Load the default syntax set (with newline-aware grammars).
 pub(crate) fn syntax_set() -> &'static SyntaxSet {
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
-    SS.get_or_init(|| SyntaxSet::load_defaults_newlines())
+    SS.get_or_init(SyntaxSet::load_defaults_newlines)
 }
 
 fn theme_set() -> &'static ThemeSet {
@@ -22,21 +22,17 @@ fn theme_set() -> &'static ThemeSet {
 /// since syntect ships `base16-ocean.dark` in its default set).
 pub(crate) fn highlight_theme() -> &'static Theme {
     const THEME_NAME: &str = "base16-ocean.dark";
-    theme_set()
-        .themes
-        .get(THEME_NAME)
-        .unwrap_or_else(|| {
-            theme_set().themes.values().next()
-                .unwrap_or_else(|| {
-                    // Fallback: create a minimal empty theme. This should never
-                    // happen since syntect ships with bundled themes.
-                    static FALLBACK: OnceLock<Theme> = OnceLock::new();
-                    FALLBACK.get_or_init(|| Theme {
-                        name: Some("fallback".into()),
-                        ..Theme::default()
-                    })
-                })
+    theme_set().themes.get(THEME_NAME).unwrap_or_else(|| {
+        theme_set().themes.values().next().unwrap_or_else(|| {
+            // Fallback: create a minimal empty theme. This should never
+            // happen since syntect ships with bundled themes.
+            static FALLBACK: OnceLock<Theme> = OnceLock::new();
+            FALLBACK.get_or_init(|| Theme {
+                name: Some("fallback".into()),
+                ..Theme::default()
+            })
         })
+    })
 }
 
 /// Convert a syntect RGBA colour to a ratatui `Color`.
@@ -59,10 +55,10 @@ pub(crate) fn to_ratatui_color(c: syntect::highlighting::Color) -> Color {
 pub(crate) fn syntax_for_path(path: &str) -> Option<&'static SyntaxReference> {
     let p = std::path::Path::new(path);
     // Try full file name first (handles "Dockerfile", "Makefile", etc.)
-    if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
-        if let Ok(Some(s)) = syntax_set().find_syntax_for_file(name) {
-            return Some(s);
-        }
+    if let Some(name) = p.file_name().and_then(|f| f.to_str())
+        && let Ok(Some(s)) = syntax_set().find_syntax_for_file(name)
+    {
+        return Some(s);
     }
     // Fall back to extension-only lookup
     let ext = p.extension().and_then(|e| e.to_str())?;

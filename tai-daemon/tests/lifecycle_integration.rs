@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tai_daemon::{DaemonState, run_server};
@@ -13,10 +13,8 @@ fn test_daemon_state() -> DaemonState {
     let (daemon_tx, _daemon_rx) = mpsc::channel();
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = Arc::new(
-        redb::Database::create(dir.path().join("state.redb"))
-            .expect("test database"),
-    );
+    let db =
+        Arc::new(redb::Database::create(dir.path().join("state.redb")).expect("test database"));
     let tool_registry = tai_daemon::tools::ToolRegistry::new().build();
 
     DaemonState {
@@ -65,17 +63,16 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
     write_message_sync(&mut writer, &ClientMessage::Ping).expect("write Ping");
     writer.flush().expect("flush Ping");
 
-    let response: DaemonMessage =
-        read_message_sync(&mut reader).expect("read response");
+    let response: DaemonMessage = read_message_sync(&mut reader).expect("read response");
     assert_eq!(response, DaemonMessage::Pong);
 
     // Trigger graceful shutdown by sending SIGINT.
     // The signal handler thread sets the shutdown flag and self-connects
     // to the socket, which unblocks the accept loop.
-    unsafe { libc::raise(libc::SIGINT); }
+    unsafe {
+        libc::raise(libc::SIGINT);
+    }
 
     // The server thread should exit cleanly within a reasonable timeout.
-    handle
-        .join()
-        .expect("server thread panicked");
+    handle.join().expect("server thread panicked");
 }

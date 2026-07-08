@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::mpsc;
 use tai_client_core::{ImageAssembler, StreamingText};
 use tai_proto::{ClientMessage, DaemonMessage, ImageMetadata, write_message_sync};
-use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 pub struct DaemonBridge {
@@ -58,8 +58,8 @@ impl DaemonBridge {
                 debug!(?msg, "sending message to daemon");
                 if let Err(e) = write_message_sync(&mut writer, &msg) {
                     error!(%e, "write error, bridge writer shutting down");
-                    if let Err(send_err) = writer_event_tx
-                        .send(BridgeEvent::Error(format!("write error: {e}")))
+                    if let Err(send_err) =
+                        writer_event_tx.send(BridgeEvent::Error(format!("write error: {e}")))
                     {
                         warn!("failed to send write error event: {send_err}");
                     }
@@ -98,12 +98,7 @@ impl DaemonBridge {
         }
     }
 
-    pub fn into_parts(
-        self,
-    ) -> (
-        mpsc::Sender<ClientMessage>,
-        mpsc::Receiver<BridgeEvent>,
-    ) {
+    pub fn into_parts(self) -> (mpsc::Sender<ClientMessage>, mpsc::Receiver<BridgeEvent>) {
         (self.client_tx, self.event_rx)
     }
 }
@@ -191,12 +186,10 @@ fn daemon_to_bridge_events(
             request_id,
             image_id,
         } => match assembler.finish(request_id, image_id) {
-            Ok((ImageMetadata { mime_type, .. }, data)) => {
-                Some(BridgeEvent::Image {
-                    _mime: mime_type,
-                    data,
-                })
-            }
+            Ok((ImageMetadata { mime_type, .. }, data)) => Some(BridgeEvent::Image {
+                _mime: mime_type,
+                data,
+            }),
             Err(e) => Some(BridgeEvent::Error(format!("image assembly failed: {e}"))),
         },
         DaemonMessage::Models {
@@ -210,9 +203,7 @@ fn daemon_to_bridge_events(
         DaemonMessage::SessionFailed { error, .. }
         | DaemonMessage::LockedError { error }
         | DaemonMessage::ModelsFailed { error }
-        | DaemonMessage::ModelSelectionFailed { error, .. } => {
-            Some(BridgeEvent::Error(error))
-        }
+        | DaemonMessage::ModelSelectionFailed { error, .. } => Some(BridgeEvent::Error(error)),
         DaemonMessage::Started { .. } => {
             debug!("bridge ignoring Started event");
             None
@@ -294,7 +285,7 @@ mod tests {
         let mut buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Done { request_id: 999             },
+            DaemonMessage::Done { request_id: 999 },
             &mut assembler,
             &mut buffers,
         );

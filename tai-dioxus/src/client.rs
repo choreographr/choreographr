@@ -1,12 +1,12 @@
 use crate::state::{AppState, UiEvent};
 use dioxus::prelude::*;
+use futures_channel::mpsc::UnboundedSender;
 use std::io;
 use tai_client_core::{
     ClientError, ShellCommand, dispatch_daemon_message, parse_input_line, run_daemon_connection,
     shell_command_echo,
 };
 use tai_proto::{ClientMessage, DaemonMessage};
-use futures_channel::mpsc::UnboundedSender;
 
 pub(crate) fn run_client(
     socket_path: String,
@@ -23,10 +23,10 @@ pub(crate) fn run_client(
         client_rx,
         None,
     );
-    if result.is_ok() {
-        if let Err(e) = ui_tx.unbounded_send(UiEvent::ReaderClosed) {
-            tracing::warn!("failed to send ReaderClosed UI event: {e}");
-        }
+    if result.is_ok()
+        && let Err(e) = ui_tx.unbounded_send(UiEvent::ReaderClosed)
+    {
+        tracing::warn!("failed to send ReaderClosed UI event: {e}");
     }
     result.map_err(io::Error::from)
 }
@@ -52,9 +52,9 @@ pub(crate) fn handle_shell_command(
 ) {
     match command {
         ShellCommand::Empty => {}
-        ShellCommand::InvalidCancel(value) => {
-            state.client.push_text(format!("invalid request id: {value}"))
-        }
+        ShellCommand::InvalidCancel(value) => state
+            .client
+            .push_text(format!("invalid request id: {value}")),
         ShellCommand::UnknownCommand(error) => state.client.push_text(error),
         ShellCommand::Send(message) => send_client_message(state, daemon_tx, message),
     }
@@ -75,7 +75,9 @@ pub(crate) fn send_client_message(
     }
 
     if let Err(error) = sender.send(message) {
-        state.client.push_text(format!("[client] failed to send command: {error}"));
+        state
+            .client
+            .push_text(format!("[client] failed to send command: {error}"));
     }
 }
 
@@ -101,7 +103,9 @@ fn handle_session_message(
             if sessions.is_empty() {
                 state.client.push_text("[daemon] no sessions");
             } else {
-                state.client.push_text(format!("[daemon] sessions ({})", sessions.len()));
+                state
+                    .client
+                    .push_text(format!("[daemon] sessions ({})", sessions.len()));
                 for session in sessions {
                     let prefix = if Some(session.session_id) == state.attached_session_id {
                         "*"
@@ -116,23 +120,23 @@ fn handle_session_message(
                     ));
                 }
             }
-            if state.attached_session_id.is_none() {
-                if let Some(sender) = daemon_tx {
-                    if let Some(first) = sessions.first() {
-                        if let Err(e) = sender.send(ClientMessage::AttachSession {
-                            session_id: first.session_id,
-                        }) {
-                            tracing::error!("failed to send AttachSession: {e}");
-                        }
-                    } else {
-                        if let Err(e) = sender.send(ClientMessage::CreateSession {
-                            title: Some("default".to_string()),
-                            parent_session_id: None,
-                            cwd: None,
-                            max_turns: None,
-                        }) {
-                            tracing::error!("failed to send CreateSession: {e}");
-                        }
+            if state.attached_session_id.is_none()
+                && let Some(sender) = daemon_tx
+            {
+                if let Some(first) = sessions.first() {
+                    if let Err(e) = sender.send(ClientMessage::AttachSession {
+                        session_id: first.session_id,
+                    }) {
+                        tracing::error!("failed to send AttachSession: {e}");
+                    }
+                } else {
+                    if let Err(e) = sender.send(ClientMessage::CreateSession {
+                        title: Some("default".to_string()),
+                        parent_session_id: None,
+                        cwd: None,
+                        max_turns: None,
+                    }) {
+                        tracing::error!("failed to send CreateSession: {e}");
                     }
                 }
             }
@@ -154,10 +158,9 @@ pub(crate) fn apply_daemon_message(
     let response = dispatch_daemon_message(state, message)?;
     if let Some(msg) = response
         && let Some(sender) = daemon_tx
+        && let Err(e) = sender.send(msg)
     {
-        if let Err(e) = sender.send(msg) {
-            tracing::error!("failed to send daemon response: {e}");
-        }
+        tracing::error!("failed to send daemon response: {e}");
     }
     Ok(())
 }

@@ -182,8 +182,6 @@ pub struct SessionState {
 }
 
 impl SessionState {
-
-
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             title: self.title.clone(),
@@ -308,6 +306,7 @@ fn fail_request(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn session_main(
     cmd_tx: mpsc::Sender<SessionCommand>,
     rx: std::sync::mpsc::Receiver<SessionCommand>,
@@ -347,11 +346,9 @@ pub fn session_main(
             .as_ref()
             .map(|r| r.active_tool_groups.iter().cloned().collect())
             .filter(|cats: &HashSet<String>| !cats.is_empty())
-            .unwrap_or_else(|| HashSet::from([
-                "core".to_string(),
-                "git".to_string(),
-                "shell".to_string(),
-            ])),
+            .unwrap_or_else(|| {
+                HashSet::from(["core".to_string(), "git".to_string(), "shell".to_string()])
+            }),
     };
 
     match db::read_messages(&db, session_id) {
@@ -390,25 +387,20 @@ pub fn session_main(
     info!("session {} started", session_id);
 
     let mut shutdown_requested = false;
-    loop {
-        match rx.recv() {
-            Ok(cmd) => {
-                if process_command(
-                    cmd,
-                    &mut state,
-                    session_id,
-                    &db,
-                    client.as_ref(),
-                    &tool_registry,
-                    &daemon_tx,
-                    &cmd_tx,
-                    &mut shutdown_requested,
-                    max_turns_default,
-                ) {
-                    break;
-                }
-            }
-            Err(_) => break,
+    while let Ok(cmd) = rx.recv() {
+        if process_command(
+            cmd,
+            &mut state,
+            session_id,
+            &db,
+            client.as_ref(),
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown_requested,
+            max_turns_default,
+        ) {
+            break;
         }
     }
 
@@ -416,6 +408,7 @@ pub fn session_main(
     persist_and_exit(&state, &db, session_id, &daemon_tx);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_command(
     cmd: SessionCommand,
     state: &mut SessionState,
@@ -474,17 +467,15 @@ fn process_command(
 
             broadcast(&state.subscribers, DaemonMessage::Started { request_id });
             let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
-            state.active_requests.insert(
-                request_id,
-                ActiveRequest { cancel_tx },
-            );
+            state
+                .active_requests
+                .insert(request_id, ActiveRequest { cancel_tx });
 
             let cwd = state.cwd.clone();
             // Workers don't need their own subscriber map — all broadcasts
             // are routed through SessionCommand::Broadcast to this main
             // session thread which holds the live subscriber set.
-            let mut worker_session =
-                SessionState::from_snapshot(state.snapshot(), HashMap::new());
+            let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
             let db = Arc::clone(db);
             let client = Arc::clone(client);
             let tool_registry = Arc::clone(tool_registry);
@@ -515,20 +506,16 @@ fn process_command(
             reply,
         } => {
             let Some(client) = client else {
-                let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "daemon locked")));
+                let _ = reply.send(Err(io::Error::other("daemon locked")));
                 return false;
             };
             let model = state.selected_model.clone().unwrap_or_default();
             if *shutdown_requested {
-                let _ = reply.send(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "session is shutting down",
-                )));
+                let _ = reply.send(Err(io::Error::other("session is shutting down")));
                 return false;
             }
             if !state.active_requests.is_empty() {
-                let _ = reply.send(Err(io::Error::new(
-                    io::ErrorKind::Other,
+                let _ = reply.send(Err(io::Error::other(
                     "session already has an active request",
                 )));
                 return false;
@@ -536,12 +523,10 @@ fn process_command(
             broadcast(&state.subscribers, DaemonMessage::Started { request_id });
             let cwd = state.cwd.clone();
             let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
-            state.active_requests.insert(
-                request_id,
-                ActiveRequest { cancel_tx },
-            );
-            let mut worker_session =
-                SessionState::from_snapshot(state.snapshot(), HashMap::new());
+            state
+                .active_requests
+                .insert(request_id, ActiveRequest { cancel_tx });
+            let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
             let db = Arc::clone(db);
             let client = Arc::clone(client);
             let tool_registry = Arc::clone(tool_registry);
@@ -577,8 +562,16 @@ fn process_command(
         SessionCommand::SetModel { model } => {
             info!("session {}: SetModel model={}", session_id, model);
             state.selected_model = Some(model.clone());
-            debug!("session {}: broadcasting ModelSelected model={}", session_id, model);
-            broadcast(&state.subscribers, DaemonMessage::ModelSelected { model: model.clone() });
+            debug!(
+                "session {}: broadcasting ModelSelected model={}",
+                session_id, model
+            );
+            broadcast(
+                &state.subscribers,
+                DaemonMessage::ModelSelected {
+                    model: model.clone(),
+                },
+            );
             let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
                 session_id,
                 metadata: SessionMetadata::from(&*state),
@@ -587,10 +580,13 @@ fn process_command(
         }
         SessionCommand::StatusChanged(new_status) => {
             state.status = new_status.clone();
-            broadcast(&state.subscribers, DaemonMessage::SessionStatusChanged {
-                session_id,
-                status: new_status.clone(),
-            });
+            broadcast(
+                &state.subscribers,
+                DaemonMessage::SessionStatusChanged {
+                    session_id,
+                    status: new_status.clone(),
+                },
+            );
             let _ = daemon_tx.send(DaemonCommand::BroadcastSessionStatus {
                 session_id,
                 status: new_status,
@@ -684,6 +680,7 @@ fn process_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_request_worker(
     session_id: u64,
     request_id: u32,
@@ -723,10 +720,7 @@ fn run_request_worker(
         Ok(Ok(false)) => (RequestOutcome::Done, session.snapshot()),
         Ok(Err(e)) => (RequestOutcome::Failed(e), session.snapshot()),
         Err(_) => (
-            RequestOutcome::Failed(io::Error::new(
-                io::ErrorKind::Other,
-                "request worker panicked",
-            )),
+            RequestOutcome::Failed(io::Error::other("request worker panicked")),
             initial_snapshot,
         ),
     };
@@ -743,17 +737,17 @@ fn run_request_worker(
         RequestOutcome::Done => {
             info!(session_id, request_id, "request completed");
             // Route through the main session thread so detach is respected.
-            let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::Done { request_id }));
+            let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::Done {
+                request_id,
+            }));
         }
         RequestOutcome::Failed(error) => {
             info!(session_id, request_id, error = %error, "request failed");
             // Route through the main session thread so detach is respected.
-            let _ = cmd_tx.send(SessionCommand::Broadcast(
-                DaemonMessage::Failed {
-                    request_id,
-                    error: error.to_string(),
-                },
-            ));
+            let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::Failed {
+                request_id,
+                error: error.to_string(),
+            }));
         }
         RequestOutcome::Cancelled => {
             info!(session_id, request_id, "request cancelled");
@@ -810,7 +804,10 @@ fn persist_and_exit(
 ) {
     let record: SessionRecord = SessionRecord::from(state);
     if let Err(e) = write_session_retry(db, session_id, &record) {
-        error!("persist_and_exit: failed to persist session {}: {e}", session_id);
+        error!(
+            "persist_and_exit: failed to persist session {}: {e}",
+            session_id
+        );
     }
     let _ = daemon_tx.send(DaemonCommand::SessionExited { session_id });
 }
@@ -846,9 +843,15 @@ mod tests {
             max_turns: Some(10),
             created_at: 1000,
             messages: vec![
-                SessionMessage::SystemText { content: "prompt".into() },
-                SessionMessage::UserText { content: "hello".into() },
-                SessionMessage::AssistantText { content: "hi".into() },
+                SessionMessage::SystemText {
+                    content: "prompt".into(),
+                },
+                SessionMessage::UserText {
+                    content: "hello".into(),
+                },
+                SessionMessage::AssistantText {
+                    content: "hi".into(),
+                },
             ],
             subscribers: HashMap::new(),
             active_requests: HashMap::new(),
@@ -968,8 +971,15 @@ mod tests {
         let mut shutdown = false;
         process_command(
             SessionCommand::Broadcast(DaemonMessage::Done { request_id: 5 }),
-            &mut state, 1, &db, None, &tool_registry,
-            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+            &mut state,
+            1,
+            &db,
+            None,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
         );
 
         assert_eq!(rx1.recv().unwrap(), DaemonMessage::Done { request_id: 5 });
@@ -995,8 +1005,15 @@ mod tests {
                 stream: OutputStream::Answer,
                 data: b"hello".to_vec(),
             }),
-            &mut state, 1, &db, None, &tool_registry,
-            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+            &mut state,
+            1,
+            &db,
+            None,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
         );
 
         // Client 20 (still attached) receives the message.
@@ -1025,8 +1042,15 @@ mod tests {
         let mut shutdown = false;
         process_command(
             SessionCommand::Broadcast(DaemonMessage::Done { request_id: 0 }),
-            &mut state, 1, &db, None, &tool_registry,
-            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+            &mut state,
+            1,
+            &db,
+            None,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
         );
 
         assert!(!shutdown);
@@ -1044,8 +1068,15 @@ mod tests {
         let mut shutdown = false;
         process_command(
             SessionCommand::Broadcast(DaemonMessage::Pong),
-            &mut state, 1, &db, None, &tool_registry,
-            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+            &mut state,
+            1,
+            &db,
+            None,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
         );
 
         assert!(!shutdown);
@@ -1062,8 +1093,15 @@ mod tests {
         let mut shutdown = false;
         process_command(
             SessionCommand::Cancel { request_id: 1 },
-            &mut state, 1, &db, None, &tool_registry,
-            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+            &mut state,
+            1,
+            &db,
+            None,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
         );
 
         // The cancellation signal should be delivered on the channel.
@@ -1083,8 +1121,15 @@ mod tests {
         let mut shutdown = false;
         process_command(
             SessionCommand::Cancel { request_id: 1 },
-            &mut state, 1, &db, None, &tool_registry,
-            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+            &mut state,
+            1,
+            &db,
+            None,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
         );
 
         assert_eq!(
@@ -1101,8 +1146,15 @@ mod tests {
         let mut shutdown = false;
         process_command(
             SessionCommand::Cancel { request_id: 99 },
-            &mut state, 1, &db, None, &tool_registry,
-            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+            &mut state,
+            1,
+            &db,
+            None,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
         );
 
         assert!(!shutdown);
@@ -1113,14 +1165,31 @@ mod tests {
         let (cancel_tx1, cancel_rx1) = mpsc::channel::<()>();
         let (cancel_tx2, cancel_rx2) = mpsc::channel::<()>();
         let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
-        state.active_requests.insert(1, ActiveRequest { cancel_tx: cancel_tx1 });
-        state.active_requests.insert(2, ActiveRequest { cancel_tx: cancel_tx2 });
+        state.active_requests.insert(
+            1,
+            ActiveRequest {
+                cancel_tx: cancel_tx1,
+            },
+        );
+        state.active_requests.insert(
+            2,
+            ActiveRequest {
+                cancel_tx: cancel_tx2,
+            },
+        );
 
         let mut shutdown = false;
         process_command(
             SessionCommand::Shutdown,
-            &mut state, 1, &db, None, &tool_registry,
-            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+            &mut state,
+            1,
+            &db,
+            None,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
         );
 
         assert!(shutdown);
@@ -1139,8 +1208,15 @@ mod tests {
         let mut shutdown = false;
         let should_exit = process_command(
             SessionCommand::Shutdown,
-            &mut state, 1, &db, None, &tool_registry,
-            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+            &mut state,
+            1,
+            &db,
+            None,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
         );
 
         assert!(shutdown);
@@ -1152,8 +1228,18 @@ mod tests {
         let (cancel_tx1, _) = mpsc::channel::<()>();
         let (cancel_tx2, _) = mpsc::channel::<()>();
         let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
-        state.active_requests.insert(1, ActiveRequest { cancel_tx: cancel_tx1 });
-        state.active_requests.insert(2, ActiveRequest { cancel_tx: cancel_tx2 });
+        state.active_requests.insert(
+            1,
+            ActiveRequest {
+                cancel_tx: cancel_tx1,
+            },
+        );
+        state.active_requests.insert(
+            2,
+            ActiveRequest {
+                cancel_tx: cancel_tx2,
+            },
+        );
 
         let (sub_tx, sub_rx) = mpsc::channel();
         state.subscribers.insert(10, sub_tx);
@@ -1161,8 +1247,15 @@ mod tests {
         let mut shutdown = false;
         process_command(
             SessionCommand::Shutdown,
-            &mut state, 1, &db, None, &tool_registry,
-            &daemon_tx, &cmd_tx, &mut shutdown, 25,
+            &mut state,
+            1,
+            &db,
+            None,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
         );
 
         // Should receive two Cancelled broadcasts (order not guaranteed).

@@ -1,20 +1,19 @@
 use crate::openai::ChatToolCall;
-use crate::tools::{Tool, ToolExecutionOutput, ToolRegistry, ToolResult, tool_ok, tool_err};
+use crate::tools::{Tool, ToolExecutionOutput, ToolRegistry, ToolResult, tool_err, tool_ok};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ckb_vm::Bytes;
-use ckb_vm::{
-    DefaultCoreMachine, DefaultMachineBuilder, DefaultMachineRunner, FlatMemory,
-    CoreMachine, SupportMachine, Syscalls,
-    TraceMachine, ISA_IMC, ISA_B, ISA_MOP, ISA_A,
-    memory::Memory, registers, Error as VmError,
-};
 use ckb_vm::machine::VERSION2;
+use ckb_vm::{
+    CoreMachine, DefaultCoreMachine, DefaultMachineBuilder, DefaultMachineRunner, Error as VmError,
+    FlatMemory, ISA_A, ISA_B, ISA_IMC, ISA_MOP, SupportMachine, Syscalls, TraceMachine,
+    memory::Memory, registers,
+};
 use serde::Deserialize;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, Weak};
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 use tai_keystore::ServiceCredential;
@@ -270,8 +269,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                 let out_ptr = machine.registers()[registers::A2];
                 let out_size = machine.registers()[registers::A3];
 
-                let request_bytes =
-                    machine.memory_mut().load_bytes(req_ptr, req_len)?;
+                let request_bytes = machine.memory_mut().load_bytes(req_ptr, req_len)?;
 
                 let v: serde_json::Value = serde_json::from_slice(&request_bytes)
                     .map_err(|_| VmError::Unexpected("invalid tool call JSON".into()))?;
@@ -280,10 +278,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                     .as_str()
                     .ok_or(VmError::Unexpected("missing 'name' in tool call".into()))?
                     .to_string();
-                let arguments_json = v["arguments_json"]
-                    .as_str()
-                    .unwrap_or("{}")
-                    .to_string();
+                let arguments_json = v["arguments_json"].as_str().unwrap_or("{}").to_string();
 
                 let tool_call = ChatToolCall {
                     id: "vm-0".to_string(),
@@ -358,13 +353,7 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
 
     let mut child = Command::new("rustc")
         .arg("+nightly")
-        .args([
-            "--target",
-            target,
-            "-C",
-            "opt-level=z",
-            "-o",
-        ])
+        .args(["--target", target, "-C", "opt-level=z", "-o"])
         .arg(&output_path)
         .arg(&input_path)
         .stderr(std::process::Stdio::piped())
@@ -400,11 +389,14 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
     }
 
     if !status.success() {
-        return Err(format!("compilation error:\n{}", String::from_utf8_lossy(&stderr_buf)));
+        return Err(format!(
+            "compilation error:\n{}",
+            String::from_utf8_lossy(&stderr_buf)
+        ));
     }
 
-    let elf = std::fs::read(&output_path)
-        .map_err(|e| format!("failed to read compiled program: {e}"))?;
+    let elf =
+        std::fs::read(&output_path).map_err(|e| format!("failed to read compiled program: {e}"))?;
 
     drop(dir);
     Ok(elf)
@@ -423,7 +415,7 @@ fn run_riscv_impl(
             return ToolExecutionOutput {
                 result: tool_err(format!("invalid arguments: {e}")),
                 image: None,
-            }
+            };
         }
     };
 
@@ -436,14 +428,10 @@ fn run_riscv_impl(
 
     // Source to hand to rustc — prefer the formatted version, fall back to
     // the original if formatting failed or was skipped.
-    let compile_source: Option<&str> = formatted_source
-        .as_deref()
-        .or_else(|| input.source.as_deref());
+    let compile_source: Option<&str> = formatted_source.as_deref().or(input.source.as_deref());
 
     // Source to include in the result display (also prefer formatted).
-    let display_source: Option<&str> = formatted_source
-        .as_deref()
-        .or_else(|| input.source.as_deref());
+    let display_source: Option<&str> = formatted_source.as_deref().or(input.source.as_deref());
 
     let elf = match (compile_source, input.program.as_deref()) {
         (Some(source), None) => match compile(source, enable_allocator) {
@@ -452,7 +440,7 @@ fn run_riscv_impl(
                 return ToolExecutionOutput {
                     result: tool_err(e),
                     image: None,
-                }
+                };
             }
         },
         (None, Some(program_b64)) => match BASE64.decode(program_b64) {
@@ -461,25 +449,25 @@ fn run_riscv_impl(
                 return ToolExecutionOutput {
                     result: tool_err(format!("base64 decode error: {e}")),
                     image: None,
-                }
+                };
             }
         },
         (None, None) => {
             return ToolExecutionOutput {
                 result: tool_err("either 'source' or 'program' is required"),
                 image: None,
-            }
+            };
         }
         (Some(_), Some(_)) => {
             return ToolExecutionOutput {
                 result: tool_err("provide only one of 'source' or 'program'"),
                 image: None,
-            }
+            };
         }
     };
 
     let memory_size = input.memory_size.unwrap_or(4 * 1024 * 1024);
-    if memory_size % 4096 != 0 {
+    if !memory_size.is_multiple_of(4096) {
         return ToolExecutionOutput {
             result: tool_err("memory_size must be a multiple of 4096"),
             image: None,
@@ -519,12 +507,10 @@ fn run_riscv_impl(
         .args
         .unwrap_or_default()
         .into_iter()
-        .map(|a| Bytes::from(a))
+        .map(Bytes::from)
         .collect();
 
-    if let Err(e) =
-        trace.load_program(&Bytes::from(elf), args_list.iter().map(|b| Ok(b.clone())))
-    {
+    if let Err(e) = trace.load_program(&Bytes::from(elf), args_list.iter().map(|b| Ok(b.clone()))) {
         return ToolExecutionOutput {
             result: tool_err(format!("failed to load program: {e}")),
             image: None,
@@ -657,7 +643,7 @@ impl Tool for RunRiscV {
         args: &str,
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&Path>,
-    output_tx: mpsc::Sender<Vec<u8>>,
+        output_tx: mpsc::Sender<Vec<u8>>,
     ) -> ToolExecutionOutput {
         match self.registry.upgrade() {
             Some(registry) => run_riscv_impl(args, x_credentials, cwd, Some(output_tx), registry),
@@ -732,19 +718,34 @@ mod tests {
     #[test]
     fn build_boilerplate_with_alloc_includes_allocator() {
         let result = build_boilerplate(true);
-        assert!(result.contains("struct BumpAlloc"), "should contain bump allocator");
+        assert!(
+            result.contains("struct BumpAlloc"),
+            "should contain bump allocator"
+        );
         assert!(result.contains("fn args()"), "should contain args()");
         assert!(result.contains("fn _start()"), "should contain _start");
-        assert!(result.contains("tai::exit(1)"), "should contain panic handler");
+        assert!(
+            result.contains("tai::exit(1)"),
+            "should contain panic handler"
+        );
     }
 
     #[test]
     fn build_boilerplate_without_alloc_excludes_allocator() {
         let result = build_boilerplate(false);
-        assert!(!result.contains("struct BumpAlloc"), "should NOT contain bump allocator");
+        assert!(
+            !result.contains("struct BumpAlloc"),
+            "should NOT contain bump allocator"
+        );
         assert!(!result.contains("fn args()"), "should NOT contain args()");
-        assert!(result.contains("fn _start()"), "should still contain _start");
-        assert!(result.contains("tai::exit(1)"), "should still contain panic handler");
+        assert!(
+            result.contains("fn _start()"),
+            "should still contain _start"
+        );
+        assert!(
+            result.contains("tai::exit(1)"),
+            "should still contain panic handler"
+        );
     }
 
     #[test]
@@ -763,56 +764,115 @@ mod tests {
     #[test]
     fn run_riscv_rejects_invalid_json() {
         let result = run_riscv_impl(r#"not json"#, None, None, None, dummy_registry());
-        assert!(result.result.is_error, "expected error: {}", result.result.content);
-        assert!(result.result.content.contains("invalid arguments"), "{}", result.result.content);
+        assert!(
+            result.result.is_error,
+            "expected error: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("invalid arguments"),
+            "{}",
+            result.result.content
+        );
     }
 
     #[test]
     fn run_riscv_requires_source_or_program() {
         let result = run_riscv_impl(r#"{}"#, None, None, None, dummy_registry());
-        assert!(result.result.is_error, "expected error: {}", result.result.content);
-        assert!(result.result.content.contains("source") || result.result.content.contains("program"),
-            "should mention source/program: {}", result.result.content);
+        assert!(
+            result.result.is_error,
+            "expected error: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("source") || result.result.content.contains("program"),
+            "should mention source/program: {}",
+            result.result.content
+        );
     }
 
     #[test]
     fn run_riscv_rejects_both_source_and_program() {
         let result = run_riscv_impl(
             r#"{"source": "fn main() {}", "program": "AAAA"}"#,
-            None, None, None, dummy_registry(),
+            None,
+            None,
+            None,
+            dummy_registry(),
         );
-        assert!(result.result.is_error, "expected error: {}", result.result.content);
-        assert!(result.result.content.contains("only one of"), "{}", result.result.content);
+        assert!(
+            result.result.is_error,
+            "expected error: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("only one of"),
+            "{}",
+            result.result.content
+        );
     }
 
     #[test]
     fn run_riscv_rejects_invalid_base64() {
         let result = run_riscv_impl(
             r#"{"program": "!!!not-base64!!!"}"#,
-            None, None, None, dummy_registry(),
+            None,
+            None,
+            None,
+            dummy_registry(),
         );
-        assert!(result.result.is_error, "expected error: {}", result.result.content);
-        assert!(result.result.content.contains("base64 decode error"), "{}", result.result.content);
+        assert!(
+            result.result.is_error,
+            "expected error: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("base64 decode error"),
+            "{}",
+            result.result.content
+        );
     }
 
     #[test]
     fn run_riscv_rejects_non_aligned_memory() {
         let result = run_riscv_impl(
             r#"{"program": "AAAA", "memory_size": 100}"#,
-            None, None, None, dummy_registry(),
+            None,
+            None,
+            None,
+            dummy_registry(),
         );
-        assert!(result.result.is_error, "expected error: {}", result.result.content);
-        assert!(result.result.content.contains("multiple of 4096"), "{}", result.result.content);
+        assert!(
+            result.result.is_error,
+            "expected error: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("multiple of 4096"),
+            "{}",
+            result.result.content
+        );
     }
 
     #[test]
     fn run_riscv_rejects_memory_over_4mb() {
         let result = run_riscv_impl(
             r#"{"program": "AAAA", "memory_size": 4198400}"#,
-            None, None, None, dummy_registry(),
+            None,
+            None,
+            None,
+            dummy_registry(),
         );
-        assert!(result.result.is_error, "expected error: {}", result.result.content);
-        assert!(result.result.content.contains("cannot exceed 4MB"), "{}", result.result.content);
+        assert!(
+            result.result.is_error,
+            "expected error: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("cannot exceed 4MB"),
+            "{}",
+            result.result.content
+        );
     }
 
     #[test]
@@ -822,16 +882,32 @@ mod tests {
         // passes input validation (the error will be about ELF loading, not input).
         let result = run_riscv_impl(
             r#"{"program": "AAAA", "memory_size": 4096}"#,
-            None, None, None, dummy_registry(),
+            None,
+            None,
+            None,
+            dummy_registry(),
         );
         // Should fail at ELF load, not at input validation
-        assert!(result.result.is_error, "expected error: {}", result.result.content);
-        assert!(!result.result.content.contains("base64 decode error"),
-            "should not be base64 error: {}", result.result.content);
-        assert!(!result.result.content.contains("multiple of 4096"),
-            "should not be alignment error: {}", result.result.content);
-        assert!(!result.result.content.contains("cannot exceed 4MB"),
-            "should not be size error: {}", result.result.content);
+        assert!(
+            result.result.is_error,
+            "expected error: {}",
+            result.result.content
+        );
+        assert!(
+            !result.result.content.contains("base64 decode error"),
+            "should not be base64 error: {}",
+            result.result.content
+        );
+        assert!(
+            !result.result.content.contains("multiple of 4096"),
+            "should not be alignment error: {}",
+            result.result.content
+        );
+        assert!(
+            !result.result.content.contains("cannot exceed 4MB"),
+            "should not be size error: {}",
+            result.result.content
+        );
     }
 
     // -- Channel output collection tests -----------------------------------

@@ -13,11 +13,11 @@ pub use config::{
 pub(crate) use sse::build_sse_event;
 pub(crate) use sse::{SseReader, extract_responses_text_delta};
 
+pub use retry::RetryCallback;
 #[cfg(test)]
 pub(crate) use retry::{
     RetryConfig, backoff_duration, is_retryable_status, parse_retry_after_secs,
 };
-pub use retry::RetryCallback;
 
 use serde::{Deserialize, Serialize};
 use std::{io, time::Duration};
@@ -45,7 +45,7 @@ pub enum OpenAiError {
 
 impl From<OpenAiError> for std::io::Error {
     fn from(err: OpenAiError) -> Self {
-        std::io::Error::new(std::io::ErrorKind::Other, err.to_string())
+        std::io::Error::other(err.to_string())
     }
 }
 

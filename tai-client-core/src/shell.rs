@@ -214,9 +214,7 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
                 Some(format!("> {}", String::from_utf8_lossy(input)))
             }
             ClientMessage::TestImage { .. } => Some("> /image".to_string()),
-            ClientMessage::SetModel { model } => {
-                Some(format!("> set model: {model}"))
-            }
+            ClientMessage::SetModel { model } => Some(format!("> set model: {model}")),
             _ => None,
         },
         _ => None,

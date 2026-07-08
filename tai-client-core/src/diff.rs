@@ -46,7 +46,10 @@ mod tests {
 
     #[test]
     fn diff_line_construction() {
-        let line = DiffLine { kind: DiffLineKind::Addition, content: "+added".into() };
+        let line = DiffLine {
+            kind: DiffLineKind::Addition,
+            content: "+added".into(),
+        };
         assert_eq!(line.kind, DiffLineKind::Addition);
         assert_eq!(line.content, "+added");
     }
@@ -56,9 +59,18 @@ mod tests {
         let hunk = DiffHunk {
             header: "@@ -1,3 +1,4 @@".into(),
             lines: vec![
-                DiffLine { kind: DiffLineKind::Context, content: "same".into() },
-                DiffLine { kind: DiffLineKind::Deletion, content: "old".into() },
-                DiffLine { kind: DiffLineKind::Addition, content: "new".into() },
+                DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: "same".into(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Deletion,
+                    content: "old".into(),
+                },
+                DiffLine {
+                    kind: DiffLineKind::Addition,
+                    content: "new".into(),
+                },
             ],
         };
         assert_eq!(hunk.header, "@@ -1,3 +1,4 @@");
@@ -72,7 +84,10 @@ mod tests {
             new_path: "b/src/main.rs".into(),
             hunks: vec![DiffHunk {
                 header: "@@ -1 +1 @@".into(),
-                lines: vec![DiffLine { kind: DiffLineKind::Context, content: "x".into() }],
+                lines: vec![DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: "x".into(),
+                }],
             }],
         };
         assert_eq!(fd.old_path, "a/src/main.rs");

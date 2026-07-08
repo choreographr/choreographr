@@ -1,10 +1,10 @@
 use ammonia::Builder as HtmlSanitizer;
 use frankenstein::client_ureq::Bot;
-use frankenstein::{ParseMode, TelegramApi};
 use frankenstein::methods::{GetUpdatesParams, SendMessageParams, SendPhotoParams};
 use frankenstein::types::ChatType;
-use std::sync::mpsc;
+use frankenstein::{ParseMode, TelegramApi};
 use std::cell::Cell;
+use std::sync::mpsc;
 use tai_client_core::{ShellCommand, parse_input_line};
 use tai_markdown::render_markdown_html;
 use tai_proto::ClientMessage;

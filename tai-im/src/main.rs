@@ -81,8 +81,7 @@ fn main() -> anyhow::Result<()> {
             ..
         }) => {
             info!(%platform, "got credential, starting platform bridge");
-            run_platform(&platform, bot_token, reader, writer)
-                .context("platform bridge failed")?;
+            run_platform(&platform, bot_token, reader, writer).context("platform bridge failed")?;
         }
         Ok(DaemonMessage::Credential { key: None, .. }) => {
             if unlock_passphrase.is_none() {
@@ -121,7 +120,9 @@ fn run_platform(
                 .collect();
 
             if admin_ids.is_empty() {
-                bail!("TAI_TELEGRAM_USER_IDS must be set to a comma-separated list of Telegram user IDs");
+                bail!(
+                    "TAI_TELEGRAM_USER_IDS must be set to a comma-separated list of Telegram user IDs"
+                );
             }
 
             let admin_count = admin_ids.len();

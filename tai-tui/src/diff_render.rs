@@ -70,8 +70,16 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             state.flush_file(&mut files);
             let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-            state.old_path = parts.first().and_then(|p| p.strip_prefix("a/")).unwrap_or("").to_string();
-            state.new_path = parts.get(1).and_then(|p| p.strip_prefix("b/")).unwrap_or("").to_string();
+            state.old_path = parts
+                .first()
+                .and_then(|p| p.strip_prefix("a/"))
+                .unwrap_or("")
+                .to_string();
+            state.new_path = parts
+                .get(1)
+                .and_then(|p| p.strip_prefix("b/"))
+                .unwrap_or("")
+                .to_string();
         } else if let Some(rest) = line.strip_prefix("--- ") {
             if state.old_path.is_empty() {
                 state.old_path = rest.strip_prefix("a/").unwrap_or(rest).to_string();
@@ -86,11 +94,20 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
             state.in_hunk = true;
         } else if state.in_hunk {
             if let Some(content) = line.strip_prefix('+') {
-                state.current_hunk_lines.push(DiffLine { kind: DiffLineKind::Addition, content: content.to_string() });
+                state.current_hunk_lines.push(DiffLine {
+                    kind: DiffLineKind::Addition,
+                    content: content.to_string(),
+                });
             } else if let Some(content) = line.strip_prefix('-') {
-                state.current_hunk_lines.push(DiffLine { kind: DiffLineKind::Deletion, content: content.to_string() });
+                state.current_hunk_lines.push(DiffLine {
+                    kind: DiffLineKind::Deletion,
+                    content: content.to_string(),
+                });
             } else if let Some(content) = line.strip_prefix(' ') {
-                state.current_hunk_lines.push(DiffLine { kind: DiffLineKind::Context, content: content.to_string() });
+                state.current_hunk_lines.push(DiffLine {
+                    kind: DiffLineKind::Context,
+                    content: content.to_string(),
+                });
             } else if line == "\\ No newline at end of file" {
                 // Skip this marker for simplicity
             } else {
@@ -114,11 +131,7 @@ pub fn diff_display_height(diffs: &[FileDiff]) -> usize {
         .iter()
         .map(|file| {
             // 1 for the file header row, 1 per hunk header, plus all hunk lines
-            1usize + file
-                .hunks
-                .iter()
-                .map(|h| 1 + h.lines.len())
-                .sum::<usize>()
+            1usize + file.hunks.iter().map(|h| 1 + h.lines.len()).sum::<usize>()
         })
         .sum::<usize>()
         .max(1)
@@ -143,7 +156,14 @@ impl DiffPaneRow {
         left_kind: DiffLineKind,
         right_kind: DiffLineKind,
     ) -> Self {
-        Self { left_content, right_content, left_kind, right_kind, left_spans: Vec::new(), right_spans: Vec::new() }
+        Self {
+            left_content,
+            right_content,
+            left_kind,
+            right_kind,
+            left_spans: Vec::new(),
+            right_spans: Vec::new(),
+        }
     }
 }
 
@@ -202,10 +222,7 @@ fn highlight_lines_cached(
                         .collect(),
                 );
             } else {
-                result.push(vec![Span::styled(
-                    line_str.to_string(),
-                    Style::default(),
-                )]);
+                result.push(vec![Span::styled(line_str.to_string(), Style::default())]);
             }
         }
 
@@ -225,8 +242,7 @@ fn highlight_lines_cached(
 /// Rows that are diff metadata (file headers, hunk headers) are left as plain
 /// text.
 pub fn highlight_diff_panes(rows: &mut [DiffPaneRow], file: &FileDiff) {
-    let Some(syntax) = syntax_for_path(&file.new_path)
-        .or_else(|| syntax_for_path(&file.old_path))
+    let Some(syntax) = syntax_for_path(&file.new_path).or_else(|| syntax_for_path(&file.old_path))
     else {
         return;
     };
@@ -429,7 +445,10 @@ mod tests {
     #[test]
     fn display_height_matches_pane_count() {
         let diffs = parse_diff(simple_diff_text());
-        assert_eq!(diff_display_height(&diffs), build_diff_panes(&diffs).len().max(1));
+        assert_eq!(
+            diff_display_height(&diffs),
+            build_diff_panes(&diffs).len().max(1)
+        );
     }
 
     #[test]
@@ -451,7 +470,10 @@ mod tests {
     fn pane_deletion_appears_on_left() {
         let diffs = parse_diff(simple_diff_text());
         let rows = build_diff_panes(&diffs);
-        let deletion = rows.iter().find(|r| r.left_kind == DiffLineKind::Deletion).unwrap();
+        let deletion = rows
+            .iter()
+            .find(|r| r.left_kind == DiffLineKind::Deletion)
+            .unwrap();
         assert_eq!(deletion.left_content, "old");
         assert!(deletion.right_content.is_empty());
     }
@@ -460,7 +482,10 @@ mod tests {
     fn pane_addition_appears_on_right() {
         let diffs = parse_diff(simple_diff_text());
         let rows = build_diff_panes(&diffs);
-        let addition = rows.iter().find(|r| r.right_kind == DiffLineKind::Addition).unwrap();
+        let addition = rows
+            .iter()
+            .find(|r| r.right_kind == DiffLineKind::Addition)
+            .unwrap();
         assert_eq!(addition.right_content, "new");
         assert!(addition.left_content.is_empty());
     }
@@ -471,7 +496,10 @@ mod tests {
         let diffs = parse_diff(text);
         let rows = build_diff_panes(&diffs);
         // The leading space is stripped by parse_diff; content is "ctx" without the prefix
-        let ctx = rows.iter().find(|r| r.left_kind == DiffLineKind::Context && r.left_content == "ctx").unwrap();
+        let ctx = rows
+            .iter()
+            .find(|r| r.left_kind == DiffLineKind::Context && r.left_content == "ctx")
+            .unwrap();
         assert_eq!(ctx.left_content, "ctx");
         assert_eq!(ctx.right_content, "ctx");
     }
@@ -506,21 +534,29 @@ mod tests {
         assert!(rows.len() >= 4);
 
         // Deletion line (index 2) should have syntax-colored spans
-        let del = rows.iter().find(|r| r.left_kind == DiffLineKind::Deletion).unwrap();
+        let del = rows
+            .iter()
+            .find(|r| r.left_kind == DiffLineKind::Deletion)
+            .unwrap();
         assert!(
             del.left_spans.len() > 1 || del.left_spans[0].style != Style::default(),
             "rust deletion should have multiple colored spans"
         );
-        let has_colour = del.left_spans.iter().any(|s| {
-            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
-        });
+        let has_colour = del
+            .left_spans
+            .iter()
+            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
         assert!(has_colour, "rust deletion should have coloured spans");
 
         // Addition line (index 3) should also have syntax-colored spans
-        let add = rows.iter().find(|r| r.right_kind == DiffLineKind::Addition).unwrap();
-        let has_colour = add.right_spans.iter().any(|s| {
-            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
-        });
+        let add = rows
+            .iter()
+            .find(|r| r.right_kind == DiffLineKind::Addition)
+            .unwrap();
+        let has_colour = add
+            .right_spans
+            .iter()
+            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
         assert!(has_colour, "rust addition should have coloured spans");
     }
 
@@ -531,21 +567,32 @@ mod tests {
         let rows = build_diff_panes(&diffs);
         // highlight_diff_panes is called inside build_diff_panes; for unknown
         // extensions the spans should remain as single default-styled spans.
-        let del = rows.iter().find(|r| r.left_kind == DiffLineKind::Deletion).unwrap();
+        let del = rows
+            .iter()
+            .find(|r| r.left_kind == DiffLineKind::Deletion)
+            .unwrap();
         assert_eq!(del.left_spans.len(), 1);
         assert_eq!(del.left_spans[0].style, Style::default());
     }
 
     #[test]
     fn highlighting_handles_empty_hunks() {
-        let text = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -0,0 +1,1 @@\n+fn main() {}\n";
+        let text =
+            "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -0,0 +1,1 @@\n+fn main() {}\n";
         let diffs = parse_diff(text);
         let rows = build_diff_panes(&diffs);
-        let add = rows.iter().find(|r| r.right_kind == DiffLineKind::Addition).unwrap();
-        let has_colour = add.right_spans.iter().any(|s| {
-            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
-        });
-        assert!(has_colour, "rust addition in new file should have coloured spans");
+        let add = rows
+            .iter()
+            .find(|r| r.right_kind == DiffLineKind::Addition)
+            .unwrap();
+        let has_colour = add
+            .right_spans
+            .iter()
+            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
+        assert!(
+            has_colour,
+            "rust addition in new file should have coloured spans"
+        );
     }
 
     #[test]
@@ -554,16 +601,29 @@ mod tests {
         let diffs = parse_diff(text);
         let rows = build_diff_panes(&diffs);
         // Context lines (fn old() {} and fn other() {}) should have syntax colours
-        let ctx_lines: Vec<&DiffPaneRow> = rows.iter().filter(|r| {
-            r.left_kind == DiffLineKind::Context && !r.left_content.is_empty()
-                && !r.left_content.starts_with("---") && !r.left_content.starts_with("@@")
-        }).collect();
-        assert!(ctx_lines.len() >= 2, "should have at least 2 context code lines");
+        let ctx_lines: Vec<&DiffPaneRow> = rows
+            .iter()
+            .filter(|r| {
+                r.left_kind == DiffLineKind::Context
+                    && !r.left_content.is_empty()
+                    && !r.left_content.starts_with("---")
+                    && !r.left_content.starts_with("@@")
+            })
+            .collect();
+        assert!(
+            ctx_lines.len() >= 2,
+            "should have at least 2 context code lines"
+        );
         for ctx in &ctx_lines {
-            let has_colour = ctx.left_spans.iter().any(|s| {
-                matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
-            });
-            assert!(has_colour, "context line '{}' should have coloured spans", ctx.left_content);
+            let has_colour = ctx
+                .left_spans
+                .iter()
+                .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
+            assert!(
+                has_colour,
+                "context line '{}' should have coloured spans",
+                ctx.left_content
+            );
         }
     }
 

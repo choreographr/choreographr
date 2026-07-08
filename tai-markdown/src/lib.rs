@@ -746,7 +746,8 @@ mod tests {
 
     #[test]
     fn markdown_html_renders_tables() {
-        let html = render_markdown_html("| Name | Role |\n|---|---|\n| Ada | Math |\n| Grace | CS |");
+        let html =
+            render_markdown_html("| Name | Role |\n|---|---|\n| Ada | Math |\n| Grace | CS |");
 
         assert!(html.contains("<table>"));
         assert!(html.contains("<td>Ada</td>"));

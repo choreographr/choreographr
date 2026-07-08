@@ -10,9 +10,7 @@ use std::{
 /// Check whether a binary with the given name exists somewhere in PATH.
 pub(crate) fn binary_exists(name: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
-        })
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
         .unwrap_or(false)
 }
 
@@ -90,7 +88,10 @@ pub(crate) fn spawn_with_watchdog(
     let (killed_tx, killed_rx) = mpsc::channel::<()>();
 
     let watchdog = std::thread::spawn(move || {
-        if done_rx.recv_timeout(Duration::from_millis(timeout_ms)).is_err() {
+        if done_rx
+            .recv_timeout(Duration::from_millis(timeout_ms))
+            .is_err()
+        {
             // Timeout expired before the main thread signalled completion — kill.
             // Only set was_killed when kill actually succeeds (ESRCH means the
             // child already exited normally, which can happen in a narrow race
@@ -178,10 +179,7 @@ mod tests {
     }
 }
 
-fn check_path_confinement(
-    resolved: &Path,
-    session_cwd: &Path,
-) -> Result<(), ToolError> {
+fn check_path_confinement(resolved: &Path, session_cwd: &Path) -> Result<(), ToolError> {
     let resolved_canonical = std::fs::canonicalize(resolved)
         .map_err(|e| ToolError::Other(format!("cannot resolve workdir path: {e}")))?;
     let cwd_canonical = std::fs::canonicalize(session_cwd)

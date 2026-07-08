@@ -24,4 +24,3 @@ pub enum KeystoreError {
     #[error("could not determine config directory")]
     ConfigDirNotFound,
 }
-

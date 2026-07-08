@@ -40,22 +40,22 @@ macro_rules! define_tool {
 mod error;
 pub(crate) use error::{ToolError, tool_err, tool_ok};
 
-pub(crate) mod shell_util;
-pub(crate) mod sh;
-pub(crate) mod nu;
-pub(crate) mod fish;
 pub(crate) mod exec;
 mod fff;
+pub(crate) mod fish;
 pub(crate) mod fs;
 pub(crate) mod git;
+pub(crate) mod groups;
 pub(crate) mod http;
 mod image;
+pub(crate) mod nu;
 pub(crate) mod sessions;
+pub(crate) mod sh;
+pub(crate) mod shell_util;
 pub(crate) mod skill;
 pub(crate) mod subsession;
 pub(crate) mod vm;
 pub(crate) mod x;
-pub(crate) mod groups;
 
 #[derive(Debug, Clone)]
 pub struct ToolResult {
@@ -134,6 +134,12 @@ pub const GROUPS: &[ToolGroup] = &[
 
 pub struct ToolRegistry {
     tools: HashMap<&'static str, Box<dyn Tool>>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolRegistry {
@@ -219,12 +225,9 @@ impl ToolRegistry {
         cwd: Option<&std::path::Path>,
     ) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
-            Some(tool) => tool.execute_streaming(
-                &tool_call.arguments_json,
-                x_credentials,
-                cwd,
-                output_tx,
-            ),
+            Some(tool) => {
+                tool.execute_streaming(&tool_call.arguments_json, x_credentials, cwd, output_tx)
+            }
             None => ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("unknown tool: {}", tool_call.name),

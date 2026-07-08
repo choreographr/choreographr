@@ -29,19 +29,17 @@ struct Cli {
 const DEFAULT_MAX_TURNS: u32 = 25;
 
 fn resolve_max_turns() -> u32 {
-    if let Ok(val) = std::env::var("TAI_MAX_TURNS") {
-        if let Ok(n) = val.parse::<u32>() {
-            if n > 0 {
-                return n;
-            }
-        }
+    if let Ok(val) = std::env::var("TAI_MAX_TURNS")
+        && let Ok(n) = val.parse::<u32>()
+        && n > 0
+    {
+        return n;
     }
-    if let Ok(config) = load_service_config() {
-        if let Some(n) = config.max_turns {
-            if n > 0 {
-                return n;
-            }
-        }
+    if let Ok(config) = load_service_config()
+        && let Some(n) = config.max_turns
+        && n > 0
+    {
+        return n;
     }
     DEFAULT_MAX_TURNS
 }
@@ -57,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         None // Use RUST_LOG as-is
     } else {
         let level = match (cli.verbose, cli.quiet) {
-            (v, 0) if v == 0 => "info",
+            (0, 0) => "info",
             (_, q) if q > 0 => "warn",
             (1, 0) => "debug",
             _ => "trace",
@@ -67,14 +65,10 @@ fn main() -> anyhow::Result<()> {
 
     let env_filter = match log_level {
         Some(level) => EnvFilter::new(level),
-        None => EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info")),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
     };
 
-    fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .init();
+    fmt().with_env_filter(env_filter).with_target(false).init();
 
     info!(effective_level = ?log_level.unwrap_or("from RUST_LOG"), "logging initialized");
 
@@ -98,7 +92,10 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!(count = session_metadata.len(), "loaded sessions from database");
+    info!(
+        count = session_metadata.len(),
+        "loaded sessions from database"
+    );
 
     let state = DaemonState {
         daemon_tx,
@@ -107,7 +104,12 @@ fn main() -> anyhow::Result<()> {
         // is only updated at startup and goes stale once the in-memory
         // counter diverges — if the daemon crashes the counter resets and
         // IDs get reused, overwriting old sessions.
-        next_session_id: session_metadata.keys().max().copied().map(|m| m + 1).unwrap_or(1),
+        next_session_id: session_metadata
+            .keys()
+            .max()
+            .copied()
+            .map(|m| m + 1)
+            .unwrap_or(1),
         max_turns,
         active_sessions: std::collections::HashMap::new(),
         session_metadata,
@@ -122,6 +124,5 @@ fn main() -> anyhow::Result<()> {
     };
 
     let socket_path = socket_path();
-    tai_daemon::run_server(&socket_path, state, cli.metrics_addr)
-        .context("failed to run server")
+    tai_daemon::run_server(&socket_path, state, cli.metrics_addr).context("failed to run server")
 }

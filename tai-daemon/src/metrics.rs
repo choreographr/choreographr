@@ -1,6 +1,4 @@
-use prometheus::{
-    Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-};
+use prometheus::{Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -74,7 +72,9 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "tai_request_duration_seconds",
             "Request latency in seconds by status",
             &["status"],
-            vec![0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]
+            vec![
+                0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0
+            ]
         )?,
         tool_execution_duration_seconds: prometheus::register_histogram_vec!(
             "tai_tool_execution_duration_seconds",
@@ -96,10 +96,9 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Pre-parse the content-type header so serve_metrics doesn't need to
     // parse it on every request. The string is hardcoded, so this is
     // guaranteed to succeed.
-    let content_type: tiny_http::Header =
-        "Content-Type: text/plain; version=0.0.4; charset=utf-8"
-            .parse()
-            .expect("hardcoded content-type header is valid");
+    let content_type: tiny_http::Header = "Content-Type: text/plain; version=0.0.4; charset=utf-8"
+        .parse()
+        .expect("hardcoded content-type header is valid");
     METRICS_CONTENT_TYPE
         .set(content_type)
         .unwrap_or_else(|_| error!("metrics content-type header already set — this is a bug"));
@@ -228,12 +227,11 @@ pub fn serve_metrics(addr: SocketAddr, shutdown: Arc<AtomicBool>) {
                             .respond(Response::from_string("internal error").with_status_code(500));
                         continue;
                     }
-                    let response =
-                        Response::from_data(buffer).with_header(content_type.clone());
+                    let response = Response::from_data(buffer).with_header(content_type.clone());
                     let _ = request.respond(response);
                 } else {
-                    let _ = request
-                        .respond(Response::from_string("not found").with_status_code(404));
+                    let _ =
+                        request.respond(Response::from_string("not found").with_status_code(404));
                 }
             }
             Ok(None) => {
@@ -353,5 +351,4 @@ mod tests {
         assert!(output.contains("# HELP tai_request_duration_seconds"));
         assert!(output.contains("# TYPE tai_request_duration_seconds histogram"));
     }
-
 }

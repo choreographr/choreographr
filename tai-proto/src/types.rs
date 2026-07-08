@@ -301,7 +301,13 @@ impl DaemonMessage {
         cwd: Option<String>,
         max_turns: Option<u32>,
     ) -> Self {
-        Self::SessionCreated { session_id, title, parent_session_id, cwd, max_turns }
+        Self::SessionCreated {
+            session_id,
+            title,
+            parent_session_id,
+            cwd,
+            max_turns,
+        }
     }
 
     pub fn sessions(sessions: Vec<SessionSummary>) -> Self {
@@ -321,7 +327,10 @@ impl DaemonMessage {
     }
 
     pub fn session_failed(operation: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::SessionFailed { operation: operation.into(), error: error.into() }
+        Self::SessionFailed {
+            operation: operation.into(),
+            error: error.into(),
+        }
     }
 
     pub fn started(request_id: u32) -> Self {
@@ -334,7 +343,12 @@ impl DaemonMessage {
         tool_name: impl Into<String>,
         arguments_json: impl Into<String>,
     ) -> Self {
-        Self::ToolCallStarted { request_id, call_id: call_id.into(), tool_name: tool_name.into(), arguments_json: arguments_json.into() }
+        Self::ToolCallStarted {
+            request_id,
+            call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            arguments_json: arguments_json.into(),
+        }
     }
 
     pub fn tool_call_finished(
@@ -343,7 +357,12 @@ impl DaemonMessage {
         tool_name: impl Into<String>,
         output: impl Into<String>,
     ) -> Self {
-        Self::ToolCallFinished { request_id, call_id: call_id.into(), tool_name: tool_name.into(), output: output.into() }
+        Self::ToolCallFinished {
+            request_id,
+            call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            output: output.into(),
+        }
     }
 
     pub fn tool_call_failed(
@@ -352,27 +371,50 @@ impl DaemonMessage {
         tool_name: impl Into<String>,
         error: impl Into<String>,
     ) -> Self {
-        Self::ToolCallFailed { request_id, call_id: call_id.into(), tool_name: tool_name.into(), error: error.into() }
+        Self::ToolCallFailed {
+            request_id,
+            call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            error: error.into(),
+        }
     }
 
     pub fn tool_call_output(request_id: u32, call_id: impl Into<String>, data: Vec<u8>) -> Self {
-        Self::ToolCallOutput { request_id, call_id: call_id.into(), data }
+        Self::ToolCallOutput {
+            request_id,
+            call_id: call_id.into(),
+            data,
+        }
     }
 
     pub fn output_chunk(request_id: u32, stream: OutputStream, data: Vec<u8>) -> Self {
-        Self::OutputChunk { request_id, stream, data }
+        Self::OutputChunk {
+            request_id,
+            stream,
+            data,
+        }
     }
 
     pub fn image_start(request_id: u32, metadata: ImageMetadata) -> Self {
-        Self::ImageStart { request_id, metadata }
+        Self::ImageStart {
+            request_id,
+            metadata,
+        }
     }
 
     pub fn image_chunk(request_id: u32, image_id: u32, data: Vec<u8>) -> Self {
-        Self::ImageChunk { request_id, image_id, data }
+        Self::ImageChunk {
+            request_id,
+            image_id,
+            data,
+        }
     }
 
     pub fn image_end(request_id: u32, image_id: u32) -> Self {
-        Self::ImageEnd { request_id, image_id }
+        Self::ImageEnd {
+            request_id,
+            image_id,
+        }
     }
 
     pub fn done(request_id: u32) -> Self {
@@ -380,7 +422,10 @@ impl DaemonMessage {
     }
 
     pub fn failed(request_id: u32, error: impl Into<String>) -> Self {
-        Self::Failed { request_id, error: error.into() }
+        Self::Failed {
+            request_id,
+            error: error.into(),
+        }
     }
 
     pub fn cancelled(request_id: u32) -> Self {
@@ -392,19 +437,29 @@ impl DaemonMessage {
     }
 
     pub fn models(models: Vec<String>, selected_model: Option<String>) -> Self {
-        Self::Models { models, selected_model }
+        Self::Models {
+            models,
+            selected_model,
+        }
     }
 
     pub fn models_failed(error: impl Into<String>) -> Self {
-        Self::ModelsFailed { error: error.into() }
+        Self::ModelsFailed {
+            error: error.into(),
+        }
     }
 
     pub fn model_selected(model: impl Into<String>) -> Self {
-        Self::ModelSelected { model: model.into() }
+        Self::ModelSelected {
+            model: model.into(),
+        }
     }
 
     pub fn model_selection_failed(model: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::ModelSelectionFailed { model: model.into(), error: error.into() }
+        Self::ModelSelectionFailed {
+            model: model.into(),
+            error: error.into(),
+        }
     }
 
     pub fn unlocked() -> Self {
@@ -416,23 +471,35 @@ impl DaemonMessage {
     }
 
     pub fn locked_error(error: impl Into<String>) -> Self {
-        Self::LockedError { error: error.into() }
+        Self::LockedError {
+            error: error.into(),
+        }
     }
 
     pub fn credential_added(service: impl Into<String>) -> Self {
-        Self::CredentialAdded { service: service.into() }
+        Self::CredentialAdded {
+            service: service.into(),
+        }
     }
 
     pub fn credential_add_failed(service: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::CredentialAddFailed { service: service.into(), error: error.into() }
+        Self::CredentialAddFailed {
+            service: service.into(),
+            error: error.into(),
+        }
     }
 
     pub fn credential_removed(service: impl Into<String>) -> Self {
-        Self::CredentialRemoved { service: service.into() }
+        Self::CredentialRemoved {
+            service: service.into(),
+        }
     }
 
     pub fn credential_remove_failed(service: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::CredentialRemoveFailed { service: service.into(), error: error.into() }
+        Self::CredentialRemoveFailed {
+            service: service.into(),
+            error: error.into(),
+        }
     }
 
     pub fn session_deleted(session_id: u64) -> Self {
@@ -440,11 +507,17 @@ impl DaemonMessage {
     }
 
     pub fn session_delete_failed(session_id: u64, error: impl Into<String>) -> Self {
-        Self::SessionDeleteFailed { session_id, error: error.into() }
+        Self::SessionDeleteFailed {
+            session_id,
+            error: error.into(),
+        }
     }
 
     pub fn credential(service: impl Into<String>, key: Option<String>) -> Self {
-        Self::Credential { service: service.into(), key }
+        Self::Credential {
+            service: service.into(),
+            key,
+        }
     }
 
     pub fn shutting_down() -> Self {
@@ -459,7 +532,12 @@ impl ClientMessage {
         cwd: Option<String>,
         max_turns: Option<u32>,
     ) -> Self {
-        Self::CreateSession { title, parent_session_id, cwd, max_turns }
+        Self::CreateSession {
+            title,
+            parent_session_id,
+            cwd,
+            max_turns,
+        }
     }
 
     pub fn list_sessions() -> Self {
@@ -499,7 +577,9 @@ impl ClientMessage {
     }
 
     pub fn get_credential(service: impl Into<String>) -> Self {
-        Self::GetCredential { service: service.into() }
+        Self::GetCredential {
+            service: service.into(),
+        }
     }
 
     pub fn list_models() -> Self {
@@ -507,11 +587,15 @@ impl ClientMessage {
     }
 
     pub fn set_model(model: impl Into<String>) -> Self {
-        Self::SetModel { model: model.into() }
+        Self::SetModel {
+            model: model.into(),
+        }
     }
 
     pub fn unlock(passphrase: impl Into<String>) -> Self {
-        Self::Unlock { passphrase: passphrase.into() }
+        Self::Unlock {
+            passphrase: passphrase.into(),
+        }
     }
 
     pub fn lock() -> Self {
@@ -522,11 +606,22 @@ impl ClientMessage {
         Self::DeleteSession { session_id }
     }
 
-    pub fn add_api_key(service: impl Into<String>, passphrase: impl Into<String>, key: impl Into<String>) -> Self {
-        Self::AddApiKey { service: service.into(), passphrase: passphrase.into(), key: key.into() }
+    pub fn add_api_key(
+        service: impl Into<String>,
+        passphrase: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Self {
+        Self::AddApiKey {
+            service: service.into(),
+            passphrase: passphrase.into(),
+            key: key.into(),
+        }
     }
 
     pub fn remove_credential(service: impl Into<String>, passphrase: impl Into<String>) -> Self {
-        Self::RemoveCredential { service: service.into(), passphrase: passphrase.into() }
+        Self::RemoveCredential {
+            service: service.into(),
+            passphrase: passphrase.into(),
+        }
     }
 }

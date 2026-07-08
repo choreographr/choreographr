@@ -255,7 +255,10 @@ mod tests {
         );
         assert_eq!(ks.service_names().count(), 1);
         assert_eq!(ks.get_api_key("openai"), Some("sk-test"));
-        assert!(!matches!(ks.get("openai"), Some(ServiceCredential::X { .. })));
+        assert!(!matches!(
+            ks.get("openai"),
+            Some(ServiceCredential::X { .. })
+        ));
     }
 
     #[test]
@@ -332,7 +335,10 @@ mod tests {
         let restored = Keystore::from_store(store);
 
         assert_eq!(restored.get_api_key("s1"), Some("api-key"));
-        let x = restored.get("s2").and_then(ServiceCredential::as_x).unwrap();
+        let x = restored
+            .get("s2")
+            .and_then(ServiceCredential::as_x)
+            .unwrap();
         assert_eq!(x.api_key, "a");
         assert!(x.bearer_token.is_none());
         assert_eq!(restored.service_names().count(), 2);

@@ -65,9 +65,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             handler.push_text(format!("[daemon] attached session: {session_id}"));
             Ok(None)
         }
-        DaemonMessage::SessionStatusChanged { .. } => {
-            Ok(None)
-        }
+        DaemonMessage::SessionStatusChanged { .. } => Ok(None),
         DaemonMessage::SessionState {
             session_id,
             title,
@@ -128,12 +126,15 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             tool_name,
             output,
         } => {
-            handler.insert_session_message_before_stream(request_id, SessionMessage::ToolResult {
-                call_id,
-                name: tool_name,
-                content: output,
-                is_error: false,
-            });
+            handler.insert_session_message_before_stream(
+                request_id,
+                SessionMessage::ToolResult {
+                    call_id,
+                    name: tool_name,
+                    content: output,
+                    is_error: false,
+                },
+            );
             Ok(None)
         }
         DaemonMessage::ToolCallFailed {

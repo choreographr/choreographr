@@ -1,5 +1,5 @@
-use crate::frame::{decode_frame, encode_frame, MAX_FRAME_SIZE};
 use crate::ProtoError;
+use crate::frame::{MAX_FRAME_SIZE, decode_frame, encode_frame};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 

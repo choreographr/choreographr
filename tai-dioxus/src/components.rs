@@ -10,7 +10,7 @@ pub(crate) fn Toolbar(
     tx: Signal<Option<std::sync::mpsc::Sender<ClientMessage>>>,
 ) -> Element {
     let on_ping = {
-        let t = tx.clone();
+        let t = tx;
         move |_| {
             let daemon_tx = t.read().clone();
             send_client_message(&mut state.write(), daemon_tx, ClientMessage::Ping)
@@ -18,7 +18,7 @@ pub(crate) fn Toolbar(
     };
 
     let on_models = {
-        let t = tx.clone();
+        let t = tx;
         move |_| {
             let daemon_tx = t.read().clone();
             send_client_message(&mut state.write(), daemon_tx, ClientMessage::ListModels)
@@ -26,7 +26,7 @@ pub(crate) fn Toolbar(
     };
 
     let on_cancel = {
-        let t = tx.clone();
+        let t = tx;
         move |_| {
             let request_id_text = state.read().pending_cancel.trim().to_string();
             if request_id_text.is_empty() {
@@ -93,7 +93,7 @@ pub(crate) fn Composer(
     tx: Signal<Option<std::sync::mpsc::Sender<ClientMessage>>>,
 ) -> Element {
     let on_submit = {
-        let t = tx.clone();
+        let t = tx;
         move || submit_input(&mut state, t.read().clone())
     };
 
@@ -107,7 +107,7 @@ pub(crate) fn Composer(
                 value: "{input_value}",
                 oninput: move |event| state.write().input = event.value(),
                 onkeydown: {
-                    let mut os = on_submit.clone();
+                    let mut os = on_submit;
                     move |event| {
                         if event.key() == Key::Enter && !event.modifiers().shift() {
                             event.prevent_default();
@@ -118,7 +118,7 @@ pub(crate) fn Composer(
             }
             div { class: "composer-actions",
                 button { onclick: {
-                    let mut os = on_submit.clone();
+                    let mut os = on_submit;
                     move |_| os()
                 }, "Send" }
             }

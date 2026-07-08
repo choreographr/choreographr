@@ -5,9 +5,9 @@ use std::io::{self, BufWriter};
 use std::net::{Shutdown, SocketAddr};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tai_proto::DaemonMessage;
@@ -34,7 +34,7 @@ pub fn run_server(
     let sig_shutdown = Arc::clone(&shutdown);
     let sig_path = socket_path.to_string();
     thread::spawn(move || {
-        let mut signals = match signal_hook::iterator::Signals::new(&[SIGINT, SIGTERM]) {
+        let mut signals = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) {
             Ok(s) => s,
             Err(e) => {
                 error!("failed to register signal handlers: {e}");
@@ -73,14 +73,16 @@ pub fn run_server(
     // Initialize the metrics registry so that instrumented code throughout
     // the daemon can safely call record_* functions (they no-op when
     // uninitialized).  This must happen before the accept loop starts.
-    crate::metrics::init()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    crate::metrics::init().map_err(io::Error::other)?;
 
     // Metrics HTTP server thread (if `--metrics-addr` was provided).
     // Spawned before the accept loop so it's reachable immediately.
     if let Some(ref addr_str) = metrics_addr {
         let addr: SocketAddr = addr_str.parse().map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid --metrics-addr: {e}"))
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --metrics-addr: {e}"),
+            )
         })?;
         let shutdown_flag = Arc::clone(&shutdown);
         thread::spawn(move || {

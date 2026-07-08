@@ -10,8 +10,8 @@ use super::{
     endpoint_url, extract_responses_text_delta,
 };
 use std::collections::HashMap;
-use std::sync::mpsc;
 use std::io;
+use std::sync::mpsc;
 
 impl OpenAiClient {
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, super::OpenAiError> {
@@ -126,10 +126,10 @@ impl OpenAiClient {
                         }
                     }
                     ChatTurnResult::ToolUse(tool_use) => {
-                        if let Some(ref content) = tool_use.content {
-                            if !content.is_empty() {
-                                on_chunk(super::CompletionChunkKind::Answer, content.clone())?;
-                            }
+                        if let Some(ref content) = tool_use.content
+                            && !content.is_empty()
+                        {
+                            on_chunk(super::CompletionChunkKind::Answer, content.clone())?;
                         }
                         // Send reasoning through whichever field the model populated.
                         if let Some(reasoning) =
@@ -252,6 +252,7 @@ fn chat_completions_request(
     Ok(content)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chat_completions_request_with_tools(
     client: &reqwest::blocking::Client,
     config: &ServiceConfig,
@@ -313,7 +314,9 @@ fn chat_completions_request_with_tools(
                     arguments_json: tool_call.function.arguments,
                 })
                 .collect(),
-            reasoning: choice.message.reasoning_content
+            reasoning: choice
+                .message
+                .reasoning_content
                 .or(choice.message.reasoning)
                 .or(choice.message.reasoning_text),
         }));
@@ -424,11 +427,11 @@ where
     let mut reader = SseReader::from_reader(response);
     let mut saw_text = false;
     while let Some(data) = reader.next_event()? {
-        if let Some(delta) = extract_responses_text_delta(&data)? {
-            if !delta.is_empty() {
-                saw_text = true;
-                on_chunk(CompletionChunkKind::Answer, delta)?;
-            }
+        if let Some(delta) = extract_responses_text_delta(&data)?
+            && !delta.is_empty()
+        {
+            saw_text = true;
+            on_chunk(CompletionChunkKind::Answer, delta)?;
         }
     }
 
@@ -487,6 +490,7 @@ fn accumulate_tool_calls_from_deltas(
 /// `on_chunk` for each content / reasoning delta so the caller can forward
 /// it to subscribers immediately.  Tool call deltas are accumulated across
 /// chunks and returned as `ChatTurnResult::ToolUse` when the stream ends.
+#[allow(clippy::too_many_arguments)]
 fn chat_completions_request_streaming_with_tools<F>(
     client: &reqwest::blocking::Client,
     config: &ServiceConfig,
@@ -546,10 +550,14 @@ where
             }
 
             // Reasoning chunks — use references to avoid partial moves.
-            for reasoning in [&delta.reasoning_content, &delta.reasoning, &delta.reasoning_text]
-                .into_iter()
-                .flatten()
-                .filter(|r| !r.is_empty())
+            for reasoning in [
+                &delta.reasoning_content,
+                &delta.reasoning,
+                &delta.reasoning_text,
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|r| !r.is_empty())
             {
                 saw_text = true;
                 full_reasoning.push_str(reasoning);
@@ -592,8 +600,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::retry;
+    use super::*;
     use crate::openai::StreamToolCallFunctionDelta;
     use std::time::Duration;
 
@@ -604,10 +612,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<()>();
         tx.send(()).unwrap();
         let result = retry::sleep_or_cancel(Duration::from_secs(10), Some(&rx));
-        assert!(matches!(
-            result,
-            Err(crate::openai::OpenAiError::Cancelled)
-        ));
+        assert!(matches!(result, Err(crate::openai::OpenAiError::Cancelled)));
     }
 
     #[test]
@@ -786,18 +791,13 @@ mod tests {
         assert_eq!(tcs[0].kind.as_deref(), Some("function"));
         let func = tcs[0].function.as_ref().unwrap();
         assert_eq!(func.name.as_deref(), Some("get_weather"));
-        assert_eq!(
-            func.arguments.as_deref(),
-            Some(r#"{"city":"London"}"#)
-        );
+        assert_eq!(func.arguments.as_deref(), Some(r#"{"city":"London"}"#));
     }
 
     #[test]
     fn stream_delta_tool_calls_absent_when_not_in_json() {
-        let payload: ChatCompletionsStreamResponse = serde_json::from_str(
-            r#"{"choices":[{"delta":{"content":"Hi"}}]}"#,
-        )
-        .expect("parse");
+        let payload: ChatCompletionsStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"Hi"}}]}"#).expect("parse");
         let delta = payload.choices.into_iter().next().unwrap().delta.unwrap();
         assert_eq!(delta.content.as_deref(), Some("Hi"));
         assert!(delta.tool_calls.is_none());

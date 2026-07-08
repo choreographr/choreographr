@@ -196,7 +196,9 @@ mod tests {
     #[test]
     fn push_diff_respects_max_history() {
         let mut hist: ClientHistory<()> = ClientHistory::new(
-            (0..MAX_HISTORY_ITEMS).map(|i| HistoryItem::Text(format!("line {i}"))).collect(),
+            (0..MAX_HISTORY_ITEMS)
+                .map(|i| HistoryItem::Text(format!("line {i}")))
+                .collect(),
         );
         assert_eq!(hist.history.len(), MAX_HISTORY_ITEMS);
         hist.push_diff(sample_diffs());
@@ -209,9 +211,8 @@ mod tests {
 
     #[test]
     fn insert_diff_before_stream_inserts_in_middle() {
-        let mut hist: ClientHistory<()> = ClientHistory::new(vec![
-            HistoryItem::Text("before".into()),
-        ]);
+        let mut hist: ClientHistory<()> =
+            ClientHistory::new(vec![HistoryItem::Text("before".into())]);
         hist.begin_stream(7);
         assert_eq!(hist.history.len(), 2);
         assert_eq!(hist.in_progress.get(&7), Some(&1));

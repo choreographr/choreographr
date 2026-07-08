@@ -122,9 +122,8 @@ pub(crate) fn client_thread(
                         });
                     }
                     ClientMessage::UnsubscribeSessionsSummary => {
-                        let _ = daemon_tx.send(DaemonCommand::UnregisterSummarySubscriber {
-                            client_id,
-                        });
+                        let _ = daemon_tx
+                            .send(DaemonCommand::UnregisterSummarySubscriber { client_id });
                     }
                     ClientMessage::RunInput { request_id, input } => {
                         debug!("client {}: RunInput id={}", client_id, request_id);
@@ -148,7 +147,12 @@ pub(crate) fn client_thread(
                         let _ = writer_tx.send(DaemonMessage::Pong);
                     }
                     ClientMessage::SetModel { model } => {
-                        info!("client {}: SetModel model={} attached={}", client_id, model, attached_session_tx.is_some());
+                        info!(
+                            "client {}: SetModel model={} attached={}",
+                            client_id,
+                            model,
+                            attached_session_tx.is_some()
+                        );
                         if let Some(ref tx) = attached_session_tx {
                             let _ = tx.send(SessionCommand::SetModel { model });
                         } else {
@@ -219,10 +223,10 @@ fn switch_attached_session(
     client_id: u64,
 ) {
     // Don't detach when re-attaching to the same session.
-    if Some(new_session_id) != *attached_session_id {
-        if let Some(old_tx) = attached_session_tx.as_ref() {
-            let _ = old_tx.send(SessionCommand::Detach { client_id });
-        }
+    if Some(new_session_id) != *attached_session_id
+        && let Some(old_tx) = attached_session_tx.as_ref()
+    {
+        let _ = old_tx.send(SessionCommand::Detach { client_id });
     }
     let _ = session_tx.send(SessionCommand::Attach {
         client_id,
@@ -371,8 +375,10 @@ mod tests {
         let (writer_tx, writer_rx) = mpsc::channel();
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::ListModels { reply, .. }) = daemon_rx.recv() {
-                let _ = reply
-                    .send(Ok((vec!["gpt-4".into(), "gpt-3.5".into()], Some("gpt-4".into()))));
+                let _ = reply.send(Ok((
+                    vec!["gpt-4".into(), "gpt-3.5".into()],
+                    Some("gpt-4".into()),
+                )));
             }
         });
         handle_list_models_sync(&daemon_tx, &writer_tx, None);

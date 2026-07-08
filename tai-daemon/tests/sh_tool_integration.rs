@@ -12,7 +12,11 @@ fn echo_hello() {
     );
     assert!(!result.is_error, "expected success: {}", result.content);
     assert!(result.content.contains("hello world"), "{}", result.content);
-    assert!(result.content.contains("Exit code: 0"), "{}", result.content);
+    assert!(
+        result.content.contains("Exit code: 0"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
@@ -22,7 +26,11 @@ fn exit_nonzero() {
         &format!(r#"{{"command": "exit 42", "shell": "{SHELL}"}}"#),
         Some(Path::new("/tmp")),
     );
-    assert!(result.content.contains("Exit code: 42"), "{}", result.content);
+    assert!(
+        result.content.contains("Exit code: 42"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
@@ -30,11 +38,18 @@ fn exit_nonzero() {
 fn working_directory() {
     let dir = std::env::temp_dir();
     let result = execute_sh_tool(
-        &format!(r#"{{"command": "pwd", "shell": "{SHELL}", "workdir": "{}"}}"#, dir.display()),
+        &format!(
+            r#"{{"command": "pwd", "shell": "{SHELL}", "workdir": "{}"}}"#,
+            dir.display()
+        ),
         None,
     );
     assert!(!result.is_error, "expected success: {}", result.content);
-    assert!(result.content.contains(&dir.display().to_string()), "{}", result.content);
+    assert!(
+        result.content.contains(&dir.display().to_string()),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
@@ -45,7 +60,11 @@ fn timeout_kills_command() {
         Some(Path::new("/tmp")),
     );
     assert!(result.content.contains("timed out"), "{}", result.content);
-    assert!(result.content.contains("Exit code: -1"), "{}", result.content);
+    assert!(
+        result.content.contains("Exit code: -1"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
@@ -57,7 +76,9 @@ fn path_confinement_rejects_escape() {
     );
     assert!(result.is_error, "expected error: {}", result.content);
     assert!(
-        result.content.contains("outside the session working directory"),
+        result
+            .content
+            .contains("outside the session working directory"),
         "{}",
         result.content
     );
@@ -108,19 +129,17 @@ fn stderr_output_included() {
 #[test]
 #[ignore]
 fn invalid_json_returns_error() {
-    let result = execute_sh_tool(
-        r#"not json"#,
-        Some(Path::new("/tmp")),
-    );
+    let result = execute_sh_tool(r#"not json"#, Some(Path::new("/tmp")));
     assert!(result.is_error, "expected error: {}", result.content);
 }
 
 #[test]
 #[ignore]
 fn missing_shell_returns_error() {
-    let result = execute_sh_tool(
-        r#"{"command": "echo test"}"#,
-        Some(Path::new("/tmp")),
+    let result = execute_sh_tool(r#"{"command": "echo test"}"#, Some(Path::new("/tmp")));
+    assert!(
+        result.is_error,
+        "expected error for missing shell: {}",
+        result.content
     );
-    assert!(result.is_error, "expected error for missing shell: {}", result.content);
 }

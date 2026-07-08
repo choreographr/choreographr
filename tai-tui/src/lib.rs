@@ -5,9 +5,7 @@ use std::io;
 pub use tai_client_core::{
     ClientError, ImageAssembler, ShellCommand, StreamingText, parse_input_line,
 };
-pub use tai_markdown::{
-    MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline,
-};
+pub use tai_markdown::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 use tai_proto::ImageMetadata;
 pub struct RenderedImage {
     pub metadata: ImageMetadata,

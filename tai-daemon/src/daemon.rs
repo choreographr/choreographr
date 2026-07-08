@@ -4,11 +4,15 @@ use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use tai_proto::{DaemonMessage, SessionStatus, SessionSummary};
 use tracing::{debug, error, info};
+
+/// Reply type for the ListModels command.
+pub(super) type ListModelsReply =
+    std::sync::mpsc::Sender<Result<(Vec<String>, Option<String>), String>>;
 
 pub struct DaemonState {
     pub next_session_id: u64,
@@ -60,7 +64,7 @@ pub enum DaemonCommand {
     },
     ListModels {
         session_id: Option<u64>,
-        reply: std::sync::mpsc::Sender<Result<(Vec<String>, Option<String>), String>>,
+        reply: ListModelsReply,
     },
     GetCredential {
         service: String,
@@ -228,7 +232,10 @@ impl DaemonState {
                 session_id,
                 metadata,
             } => {
-                debug!("UpdateMetadata: id={}, model={:?}", session_id, metadata.selected_model);
+                debug!(
+                    "UpdateMetadata: id={}, model={:?}",
+                    session_id, metadata.selected_model
+                );
                 self.session_metadata.insert(session_id, metadata);
             }
             DaemonCommand::SessionExited { session_id } => {
@@ -290,7 +297,10 @@ impl DaemonState {
                 self.session_metadata.remove(&session_id);
                 // Remove from database
                 if let Err(e) = db::delete_session(&self.db, session_id) {
-                    error!("DeleteSession: failed to delete session {} from db: {e}", session_id);
+                    error!(
+                        "DeleteSession: failed to delete session {} from db: {e}",
+                        session_id
+                    );
                     let _ = reply.send(Err(e));
                     return;
                 }
@@ -305,7 +315,7 @@ impl DaemonState {
     /// Returns an error if the daemon hasn't been unlocked yet.
     fn ensure_unlocked(&self) -> io::Result<()> {
         if self.openai_client.is_none() {
-            Err(io::Error::new(io::ErrorKind::Other, "daemon is locked"))
+            Err(io::Error::other("daemon is locked"))
         } else {
             Ok(())
         }
@@ -352,7 +362,8 @@ impl DaemonState {
 
     /// Send a message to all summary subscribers, removing dead ones.
     fn broadcast(&mut self, msg: DaemonMessage) {
-        self.summary_subscribers.retain(|_id, tx| tx.send(msg.clone()).is_ok());
+        self.summary_subscribers
+            .retain(|_id, tx| tx.send(msg.clone()).is_ok());
     }
 }
 
@@ -371,10 +382,10 @@ fn handle_unlock_inner(state: &mut DaemonState, passphrase: String) -> Result<()
             let client = crate::openai::OpenAiClient::new(service_config, api_key.to_string())
                 .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
             state.openai_client = Some(Arc::new(client));
-            if let Some(c) = keystore.get("twitter") {
-                if matches!(c, tai_keystore::ServiceCredential::X { .. }) {
-                    state.x_credentials = Some(c.clone());
-                }
+            if let Some(c) = keystore.get("twitter")
+                && matches!(c, tai_keystore::ServiceCredential::X { .. })
+            {
+                state.x_credentials = Some(c.clone());
             }
             state.keystore = Some(keystore);
             Ok(())
@@ -578,9 +589,13 @@ mod tests {
             status: SessionStatus::Inference,
         });
         let msg = rx.recv().unwrap();
-        assert!(
-            matches!(msg, DaemonMessage::SessionStatusChanged { session_id: 42, status: SessionStatus::Inference })
-        );
+        assert!(matches!(
+            msg,
+            DaemonMessage::SessionStatusChanged {
+                session_id: 42,
+                status: SessionStatus::Inference
+            }
+        ));
     }
 
     #[test]

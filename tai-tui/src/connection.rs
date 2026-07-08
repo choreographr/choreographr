@@ -1,7 +1,5 @@
 use crate::render::{mouse_in_history_box, render};
-use crate::state::{
-    App, InputBuffer, Page, PAGE_SCROLL_LINES, SessionManagerView, UiEvent,
-};
+use crate::state::{App, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use signal_hook::consts::SIGINT;
@@ -12,7 +10,7 @@ use std::sync::{
 };
 use std::{io, time::Duration};
 use tai_client_core::{
-    broken_pipe, ClientError, dispatch_daemon_message, run_daemon_connection, shell_command_echo,
+    ClientError, broken_pipe, dispatch_daemon_message, run_daemon_connection, shell_command_echo,
 };
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
@@ -47,8 +45,7 @@ pub(crate) fn run_app() -> io::Result<()> {
     });
 
     let interrupted = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGINT, Arc::clone(&interrupted))
-        .map_err(io::Error::other)?;
+    signal_hook::flag::register(SIGINT, Arc::clone(&interrupted)).map_err(io::Error::other)?;
 
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -93,7 +90,7 @@ pub(crate) fn run_app() -> io::Result<()> {
         }
     }
 
-    result.map_err(io::Error::from)
+    result
 }
 
 pub(crate) fn run_ui_loop(
@@ -130,7 +127,6 @@ pub(crate) fn run_ui_loop(
                     app.push_text("daemon connection closed");
                     app.should_quit = true;
                 }
-
             }
         }
 
@@ -178,16 +174,16 @@ fn handle_chat_event(
                 return Ok(());
             }
             match key.code {
-                KeyCode::Char('s')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.page = Page::SessionManager;
-                    client_tx.send(ClientMessage::ListSessions).map_err(broken_pipe)?;
-                    client_tx.send(ClientMessage::SubscribeSessionsSummary).map_err(broken_pipe)?;
+                    client_tx
+                        .send(ClientMessage::ListSessions)
+                        .map_err(broken_pipe)?;
+                    client_tx
+                        .send(ClientMessage::SubscribeSessionsSummary)
+                        .map_err(broken_pipe)?;
                 }
-                KeyCode::Char('c')
-                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.should_quit = true;
                 }
                 KeyCode::Char('q') if app.input.is_empty() => app.should_quit = true,
@@ -202,11 +198,8 @@ fn handle_chat_event(
                     let line = app.input.text.trim().to_string();
                     app.input.clear();
                     app.commit_to_history(line.clone());
-                    match parse_input_line(
-                        &line,
-                        &mut app.next_request_id,
-                        app.attached_session_id,
-                    ) {
+                    match parse_input_line(&line, &mut app.next_request_id, app.attached_session_id)
+                    {
                         ShellCommand::Empty => {}
                         ShellCommand::InvalidCancel(value) => {
                             app.push_text(format!("invalid request id: {value}"))
@@ -229,8 +222,12 @@ fn handle_chat_event(
                         }
                     }
                 }
-                KeyCode::Backspace | KeyCode::Delete | KeyCode::Left | KeyCode::Right
-                | KeyCode::Home | KeyCode::End => {
+                KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Home
+                | KeyCode::End => {
                     handle_input_key(key, &mut app.input);
                 }
                 KeyCode::Char(_) => {
@@ -320,17 +317,17 @@ fn handle_session_list_key(
         KeyCode::Up | KeyCode::Char('k') => app.session_mgr.select_up(),
         KeyCode::Down | KeyCode::Char('j') => app.session_mgr.select_down(),
         KeyCode::Enter => {
-            if let Some(sel) = app.session_mgr.selection {
-                if let Some(session) = app.session_mgr.sessions.get(sel) {
-                    let session_id = session.session_id;
-                    app.page = Page::Chat;
-                    let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
-                    app.reset_for_session_switch();
-                    app.attached_session_id = Some(session_id);
-                    client_tx
-                        .send(ClientMessage::AttachSession { session_id })
-                        .map_err(broken_pipe)?;
-                }
+            if let Some(sel) = app.session_mgr.selection
+                && let Some(session) = app.session_mgr.sessions.get(sel)
+            {
+                let session_id = session.session_id;
+                app.page = Page::Chat;
+                let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
+                app.reset_for_session_switch();
+                app.attached_session_id = Some(session_id);
+                client_tx
+                    .send(ClientMessage::AttachSession { session_id })
+                    .map_err(broken_pipe)?;
             }
         }
         KeyCode::Char('i') => app.session_mgr.enter_detail(),
@@ -346,11 +343,11 @@ fn handle_session_list_key(
         }
         KeyCode::Char('d') => {
             // Enter delete-confirmation mode for the selected session
-            if let Some(sel) = app.session_mgr.selection {
-                if let Some(session) = app.session_mgr.sessions.get(sel) {
-                    let title = session.title.clone().unwrap_or_else(|| "untitled".into());
-                    app.session_mgr.confirm_delete = Some((session.session_id, title));
-                }
+            if let Some(sel) = app.session_mgr.selection
+                && let Some(session) = app.session_mgr.sessions.get(sel)
+            {
+                let title = session.title.clone().unwrap_or_else(|| "untitled".into());
+                app.session_mgr.confirm_delete = Some((session.session_id, title));
             }
         }
         KeyCode::Esc | KeyCode::Char('q') => {
@@ -405,7 +402,12 @@ pub(crate) fn handle_daemon_message(
     match &message {
         DaemonMessage::SessionCreated { session_id, .. } => {
             // Already known — nothing to do, and skip the generic dispatch too.
-            if app.session_mgr.sessions.iter().any(|s| s.session_id == *session_id) {
+            if app
+                .session_mgr
+                .sessions
+                .iter()
+                .any(|s| s.session_id == *session_id)
+            {
                 return Ok(());
             }
             app.handle_session_created(*session_id, client_tx)?;

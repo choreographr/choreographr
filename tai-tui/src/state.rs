@@ -2,8 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Rect, Size};
 use std::collections::HashSet;
 use tai_client_core::{
-    broken_pipe, ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
-    MAX_HISTORY_ITEMS,
+    ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
+    MAX_HISTORY_ITEMS, broken_pipe,
 };
 use tai_proto::{
     ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionStatus, SessionSummary,
@@ -106,7 +106,6 @@ pub(crate) struct App {
     pub(crate) scroll_accumulator: isize,
 
     // ── Command history ─────────────────────────────────────────
-
     /// Command history entries, newest first.  Loaded from redb on startup
     /// and kept in memory so that Up/Down navigation is instant.
     pub(crate) command_history: Vec<String>,
@@ -311,7 +310,10 @@ impl SessionManagerState {
     }
 
     pub(crate) fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
-        let was_attached = self.selection.and_then(|i| self.sessions.get(i)).map(|s| s.session_id);
+        let was_attached = self
+            .selection
+            .and_then(|i| self.sessions.get(i))
+            .map(|s| s.session_id);
         self.sessions = sessions;
         self.selection = if self.sessions.is_empty() {
             None
@@ -387,20 +389,24 @@ impl SessionManagerState {
             return;
         }
         // Adjust selection
-        if let Some(sel) = self.selection {
-            if sel >= self.sessions.len() {
-                self.selection = if self.sessions.is_empty() {
-                    None
-                } else {
-                    Some(self.sessions.len().saturating_sub(1))
-                };
-            }
+        if let Some(sel) = self.selection
+            && sel >= self.sessions.len()
+        {
+            self.selection = if self.sessions.is_empty() {
+                None
+            } else {
+                Some(self.sessions.len().saturating_sub(1))
+            };
         }
         // Clamp scroll to valid range after removal
         let max_scroll = self.sessions.len().saturating_sub(1);
         self.scroll = self.scroll.min(max_scroll);
         // If detail view was showing this session, go back to list
-        if self.detail_data.as_ref().map_or(false, |d| d.session_id == id) {
+        if self
+            .detail_data
+            .as_ref()
+            .is_some_and(|d| d.session_id == id)
+        {
             self.view = SessionManagerView::List;
             self.detail_data = None;
         }
@@ -418,7 +424,10 @@ pub(crate) struct InputBuffer {
 
 impl InputBuffer {
     pub(crate) fn new() -> Self {
-        Self { text: String::new(), cursor: 0 }
+        Self {
+            text: String::new(),
+            cursor: 0,
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -485,8 +494,8 @@ impl InputBuffer {
         let mut chars = s.char_indices().peekable();
 
         // Skip past the current word if not at whitespace
-        if chars.peek().map_or(false, |&(_, c)| !c.is_whitespace()) {
-            while let Some((_, c)) = chars.next() {
+        if chars.peek().is_some_and(|&(_, c)| !c.is_whitespace()) {
+            for (_, c) in chars.by_ref() {
                 if c.is_whitespace() {
                     break;
                 }
@@ -494,7 +503,7 @@ impl InputBuffer {
         }
 
         // Skip whitespace to find the start of the next word
-        while chars.peek().map_or(false, |&(_, c)| c.is_whitespace()) {
+        while chars.peek().is_some_and(|&(_, c)| c.is_whitespace()) {
             chars.next();
         }
 
@@ -533,7 +542,8 @@ impl InputBuffer {
         }
         let suffix = &self.text[self.cursor..];
         if let Some((offset, grapheme)) = suffix.grapheme_indices(true).next() {
-            self.text.drain(self.cursor + offset..self.cursor + offset + grapheme.len());
+            self.text
+                .drain(self.cursor + offset..self.cursor + offset + grapheme.len());
         }
     }
 
@@ -693,10 +703,10 @@ impl App {
             .zip(self.render_cache.iter())
             .map(|(item, cached)| {
                 // Use the cached height if available and at the current width.
-                if let Some(cached) = cached {
-                    if cached.width == self.history_viewport.width {
-                        return cached.height;
-                    }
+                if let Some(cached) = cached
+                    && cached.width == self.history_viewport.width
+                {
+                    return cached.height;
                 }
                 // Fall back to uncached height computation.
                 self.history_viewport.item_height(item)
@@ -720,22 +730,23 @@ impl App {
     /// When the width changes, all cached renderings are stale — entries are
     /// invalidated so the next frame recomputes at the new width.
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
-        if let Ok((width, height)) = crossterm::terminal::size() {
-            if width > 0 && height > INPUT_BAR_HEIGHT {
-                let old_width = self.history_viewport.width;
-                self.history_viewport.update(Rect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height: height - INPUT_BAR_HEIGHT,
-                });
-                // All cached entries were computed at the old width and are
-                // now stale — invalidate every entry so the next render
-                // recomputes at the current terminal width.
-                if old_width != width {
-                    for cached in &mut self.render_cache {
-                        *cached = None;
-                    }
+        if let Ok((width, height)) = crossterm::terminal::size()
+            && width > 0
+            && height > INPUT_BAR_HEIGHT
+        {
+            let old_width = self.history_viewport.width;
+            self.history_viewport.update(Rect {
+                x: 0,
+                y: 0,
+                width,
+                height: height - INPUT_BAR_HEIGHT,
+            });
+            // All cached entries were computed at the old width and are
+            // now stale — invalidate every entry so the next render
+            // recomputes at the current terminal width.
+            if old_width != width {
+                for cached in &mut self.render_cache {
+                    *cached = None;
                 }
             }
         }
@@ -799,12 +810,10 @@ impl App {
         if let SessionMessage::ToolResult {
             content, is_error, ..
         } = &message
+            && !is_error
+            && let Some(diffs) = try_parse_as_diff(content)
         {
-            if !is_error {
-                if let Some(diffs) = try_parse_as_diff(content) {
-                    return HistoryItem::Diff(diffs);
-                }
-            }
+            return HistoryItem::Diff(diffs);
         }
         HistoryItem::SessionMessage(message)
     }
@@ -821,9 +830,8 @@ impl App {
                 if let Some(picker) = self.picker.as_ref() {
                     match build_rendered_image(picker, record.metadata, record.data) {
                         Ok(img) => self.push_image(img),
-                        Err(e) => self.push_text(format!(
-                            "[tai-tui] failed to decode replayed image: {e}"
-                        )),
+                        Err(e) => self
+                            .push_text(format!("[tai-tui] failed to decode replayed image: {e}")),
                     }
                 } else {
                     self.push_text(
@@ -966,8 +974,6 @@ impl App {
         }
     }
 
-
-
     // ── Command history navigation ──────────────────────────────
 
     /// Navigate backward (older) in command history.
@@ -1017,7 +1023,7 @@ impl App {
             return;
         }
         // Avoid saving a duplicate of the most recent entry.
-        if self.command_history.first().map_or(false, |last| last == &command) {
+        if self.command_history.first() == Some(&command) {
             return;
         }
 
@@ -1106,10 +1112,10 @@ impl App {
         {
             session.status = status.clone();
         }
-        if let Some(ref mut detail) = self.session_mgr.detail_data {
-            if detail.session_id == session_id {
-                detail.status = status.clone();
-            }
+        if let Some(ref mut detail) = self.session_mgr.detail_data
+            && detail.session_id == session_id
+        {
+            detail.status = status.clone();
         }
     }
 
@@ -1239,12 +1245,10 @@ impl DaemonMessageHandler for App {
 
     fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError> {
         let (metadata, data) = self.client.finish_image(request_id, image_id)?;
-        let picker = self.picker.as_ref().ok_or_else(|| {
-            ClientError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "image picker not set",
-            ))
-        })?;
+        let picker = self
+            .picker
+            .as_ref()
+            .ok_or_else(|| ClientError::Io(std::io::Error::other("image picker not set")))?;
         let rendered = build_rendered_image(picker, metadata, data)?;
         self.push_image(rendered);
         Ok(())
@@ -1254,8 +1258,6 @@ impl DaemonMessageHandler for App {
 pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
     lines_height(&crate::markdown_render::plain_text_lines(text), width)
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -1405,7 +1407,10 @@ mod tests {
         let text = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n";
         app.push_tool_text(1, text);
 
-        assert!(matches!(app.client.history.last().unwrap(), HistoryItem::Diff(_)));
+        assert!(matches!(
+            app.client.history.last().unwrap(),
+            HistoryItem::Diff(_)
+        ));
     }
 
     #[test]
@@ -1438,7 +1443,10 @@ mod tests {
         };
         app.push_session_message(msg);
 
-        assert!(matches!(app.client.history.last().unwrap(), HistoryItem::Diff(_)));
+        assert!(matches!(
+            app.client.history.last().unwrap(),
+            HistoryItem::Diff(_)
+        ));
     }
 
     #[test]
@@ -1455,7 +1463,10 @@ mod tests {
         };
         app.push_session_message(msg);
 
-        assert!(matches!(app.client.history.last().unwrap(), HistoryItem::SessionMessage(_)));
+        assert!(matches!(
+            app.client.history.last().unwrap(),
+            HistoryItem::SessionMessage(_)
+        ));
     }
 
     #[test]
@@ -1472,7 +1483,10 @@ mod tests {
         };
         app.push_session_message(msg);
 
-        assert!(matches!(app.client.history.last().unwrap(), HistoryItem::SessionMessage(_)));
+        assert!(matches!(
+            app.client.history.last().unwrap(),
+            HistoryItem::SessionMessage(_)
+        ));
     }
 
     // ── push_session_message with DisplayedImage ──

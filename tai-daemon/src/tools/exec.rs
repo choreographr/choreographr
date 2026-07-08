@@ -1,6 +1,7 @@
 use super::{
-    ToolError, ToolResult, tool_ok,
+    ToolError, ToolResult,
     shell_util::{format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
+    tool_ok,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -54,10 +55,7 @@ pub fn execute_exec_tool(arguments_json: &str, cwd: Option<&Path>) -> ToolResult
     }
 }
 
-fn execute_exec_inner(
-    arguments_json: &str,
-    cwd: Option<&Path>,
-) -> Result<String, ToolError> {
+fn execute_exec_inner(arguments_json: &str, cwd: Option<&Path>) -> Result<String, ToolError> {
     let args: ExecArgs = serde_json::from_str(arguments_json)?;
 
     let program = args.command;
@@ -83,7 +81,12 @@ fn execute_exec_inner(
         format!("{} {}", program, prog_args.join(" "))
     };
 
-    Ok(format_shell_output(&display_cmd, &output, timeout_ms, was_killed))
+    Ok(format_shell_output(
+        &display_cmd,
+        &output,
+        timeout_ms,
+        was_killed,
+    ))
 }
 
 #[cfg(test)]

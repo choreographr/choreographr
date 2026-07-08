@@ -5,20 +5,17 @@ pub fn generate_diff(old: &str, new: &str, old_path: &str, new_path: &str) -> St
         return String::new();
     }
 
-    use gix_imara_diff::{BasicLineDiffPrinter, Diff, InternedInput, Algorithm, UnifiedDiffConfig};
+    use gix_imara_diff::{Algorithm, BasicLineDiffPrinter, Diff, InternedInput, UnifiedDiffConfig};
 
     let input = InternedInput::new(old, new);
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
 
-    let mut out = format!("diff --git a/{old_path} b/{new_path}\n--- a/{old_path}\n+++ b/{new_path}\n");
+    let mut out =
+        format!("diff --git a/{old_path} b/{new_path}\n--- a/{old_path}\n+++ b/{new_path}\n");
 
     let printer = BasicLineDiffPrinter(&input.interner);
-    let rendered = diff.unified_diff(
-        &printer,
-        UnifiedDiffConfig::default(),
-        &input,
-    );
+    let rendered = diff.unified_diff(&printer, UnifiedDiffConfig::default(), &input);
     out.push_str(&rendered.to_string());
 
     // Remove trailing newline if present for cleaner output

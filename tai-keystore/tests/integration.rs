@@ -233,7 +233,8 @@ fn test_get_api_key_vs_x() {
     assert_eq!(ks.get_api_key("openai"), Some("sk-key"));
     assert!(ks.get_api_key("twitter").is_none());
 
-    let x_creds = ks.get("twitter")
+    let x_creds = ks
+        .get("twitter")
         .and_then(ServiceCredential::as_x)
         .expect("twitter should have X creds");
     assert_eq!(x_creds.api_key, "x-api");

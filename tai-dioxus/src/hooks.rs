@@ -4,11 +4,12 @@ use dioxus::prelude::*;
 use futures_channel::mpsc::{self, UnboundedReceiver};
 use tai_proto::{ClientMessage, socket_path};
 
-pub(crate) fn use_daemon_connection(
-) -> (
+type DaemonConnection = (
     Signal<Option<std::sync::mpsc::Sender<ClientMessage>>>,
     Signal<Option<UnboundedReceiver<UiEvent>>>,
-) {
+);
+
+pub(crate) fn use_daemon_connection() -> DaemonConnection {
     let socket = use_signal(socket_path);
     let mut daemon_tx = use_signal(|| None::<std::sync::mpsc::Sender<ClientMessage>>);
     let mut events_rx = use_signal(|| None::<UnboundedReceiver<UiEvent>>);
@@ -32,19 +33,19 @@ pub(crate) fn use_daemon_connection(
             // while the outer scope retains one for the panic path.
             let panic_fallback = error_tx.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                if let Err(error) = run_client(socket, client_rx, tx) {
-                    if let Err(e) = error_tx.unbounded_send(UiEvent::ReaderFailed(error.to_string()))
-                    {
-                        tracing::error!("failed to send ReaderFailed: {e}");
-                    }
+                if let Err(error) = run_client(socket, client_rx, tx)
+                    && let Err(e) =
+                        error_tx.unbounded_send(UiEvent::ReaderFailed(error.to_string()))
+                {
+                    tracing::error!("failed to send ReaderFailed: {e}");
                 }
             }));
-            if result.is_err() {
-                if let Err(e) = panic_fallback.unbounded_send(UiEvent::ReaderFailed(
+            if result.is_err()
+                && let Err(e) = panic_fallback.unbounded_send(UiEvent::ReaderFailed(
                     "client reader task panicked".to_string(),
-                )) {
-                    tracing::error!("failed to send panic notification: {e}");
-                }
+                ))
+            {
+                tracing::error!("failed to send panic notification: {e}");
             }
         });
     });

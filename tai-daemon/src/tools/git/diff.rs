@@ -117,11 +117,11 @@ fn git_full_diff_impl(
                     has_changes = true;
                     writeln!(out).ok();
                     let old_content = head_content_by_path(&repo, path).unwrap_or_default();
-                    let new_content = entry_content_by_path(&repo, &index, path).unwrap_or_default();
+                    let new_content =
+                        entry_content_by_path(&repo, &index, path).unwrap_or_default();
                     if old_content != new_content {
-                        let diff = crate::diff_util::generate_diff(
-                            &old_content, &new_content, path, path,
-                        );
+                        let diff =
+                            crate::diff_util::generate_diff(&old_content, &new_content, path, path);
                         out.push_str(&diff);
                     }
                 }
@@ -146,7 +146,8 @@ fn git_full_diff_impl(
             match &item {
                 // Differing file content: diff index entry against file on disk.
                 WtItem::Modification { .. } => {
-                    let old_content = entry_content_by_path(&repo, &index, &path).unwrap_or_default();
+                    let old_content =
+                        entry_content_by_path(&repo, &index, &path).unwrap_or_default();
                     let full_path = repo.workdir().unwrap_or(repo.git_dir()).join(&path);
                     let new_content = std::fs::read_to_string(&full_path).unwrap_or_default();
 
@@ -154,7 +155,10 @@ fn git_full_diff_impl(
                         has_changes = true;
                         writeln!(out).ok();
                         let diff = crate::diff_util::generate_diff(
-                            &old_content, &new_content, &path, &path,
+                            &old_content,
+                            &new_content,
+                            &path,
+                            &path,
                         );
                         out.push_str(&diff);
                     }
@@ -167,8 +171,7 @@ fn git_full_diff_impl(
                     writeln!(out).ok();
                     let full_path = repo.workdir().unwrap_or(repo.git_dir()).join(&path);
                     if let Ok(new_content) = std::fs::read_to_string(&full_path) {
-                        let diff =
-                            crate::diff_util::generate_diff("", &new_content, &path, &path);
+                        let diff = crate::diff_util::generate_diff("", &new_content, &path, &path);
                         out.push_str(&diff);
                     }
                 }
@@ -202,16 +205,17 @@ fn head_content_by_path(repo: &gix::Repository, path: &str) -> Option<String> {
 ///
 /// Deref is used to access the `State` from `gix::index::File` so we can call
 /// `path_backing()` and `path_in()` — these live on `State`, not on the `File` wrapper.
-fn entry_content_by_path(repo: &gix::Repository, index: &gix::index::File, path: &str) -> Option<String> {
+fn entry_content_by_path(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    path: &str,
+) -> Option<String> {
     let state: &gix::index::State = index.deref();
     let backing = state.path_backing();
-    let entry = index
-        .entries()
-        .iter()
-        .find(|e| {
-            let p = e.path_in(backing);
-            path_from_bytes(p.as_ref()) == path
-        })?;
+    let entry = index.entries().iter().find(|e| {
+        let p = e.path_in(backing);
+        path_from_bytes(p.as_ref()) == path
+    })?;
     let obj = repo.find_object(entry.id).ok()?;
     String::from_utf8(obj.data.to_vec()).ok()
 }

@@ -53,12 +53,8 @@ pub fn open_db() -> io::Result<redb::Database> {
             tracing::info!("[tai-tui] failed to open existing db, recreating");
         }
     }
-    redb::Database::create(path).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("failed to open/create database: {e}"),
-        )
-    })
+    redb::Database::create(path)
+        .map_err(|e| io::Error::other(format!("failed to open/create database: {e}")))
 }
 
 /// Save a command entry and return the assigned ID.
@@ -67,35 +63,34 @@ pub fn open_db() -> io::Result<redb::Database> {
 pub fn save_command(db: &redb::Database, entry: &CommandEntry) -> io::Result<u64> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb write txn: {e}")))?;
+        .map_err(|e| io::Error::other(format!("redb write txn: {e}")))?;
 
     // Allocate the next command ID and bump the counter.
     let cmd_id = {
         let mut table = write_txn
             .open_table(META)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb open meta: {e}")))?;
+            .map_err(|e| io::Error::other(format!("redb open meta: {e}")))?;
         let current = table
             .get("next_cmd_id")
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb get meta: {e}")))?
+            .map_err(|e| io::Error::other(format!("redb get meta: {e}")))?
             .map(|g| g.value())
             .unwrap_or(1);
         table
             .insert("next_cmd_id", current.wrapping_add(1))
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb set meta: {e}")))?;
+            .map_err(|e| io::Error::other(format!("redb set meta: {e}")))?;
         current
     };
 
     // Insert the entry.
     {
-        let payload = bincode::serde::encode_to_vec(entry, bincode::config::standard()).map_err(
-            |e| io::Error::new(io::ErrorKind::Other, format!("bincode encode entry: {e}")),
-        )?;
-        let mut table = write_txn.open_table(COMMAND_HISTORY).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("redb open command_history: {e}"))
-        })?;
-        table.insert(cmd_id, payload.as_slice()).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("redb insert entry: {e}"))
-        })?;
+        let payload = bincode::serde::encode_to_vec(entry, bincode::config::standard())
+            .map_err(|e| io::Error::other(format!("bincode encode entry: {e}")))?;
+        let mut table = write_txn
+            .open_table(COMMAND_HISTORY)
+            .map_err(|e| io::Error::other(format!("redb open command_history: {e}")))?;
+        table
+            .insert(cmd_id, payload.as_slice())
+            .map_err(|e| io::Error::other(format!("redb insert entry: {e}")))?;
     }
 
     // Trim old entries if we've exceeded the cap.
@@ -103,7 +98,7 @@ pub fn save_command(db: &redb::Database, entry: &CommandEntry) -> io::Result<u64
 
     write_txn
         .commit()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit: {e}")))?;
+        .map_err(|e| io::Error::other(format!("redb commit: {e}")))?;
 
     Ok(cmd_id)
 }
@@ -112,20 +107,17 @@ pub fn save_command(db: &redb::Database, entry: &CommandEntry) -> io::Result<u64
 ///
 /// Since IDs are monotonically increasing, any entry with `id <= cmd_id - MAX_HISTORY`
 /// is older than the retention window and can be deleted.
-fn trim_old_entries(
-    write_txn: &redb::WriteTransaction,
-    last_id: u64,
-) -> io::Result<()> {
+fn trim_old_entries(write_txn: &redb::WriteTransaction, last_id: u64) -> io::Result<()> {
     if last_id <= MAX_HISTORY {
         return Ok(());
     }
     let cutoff = last_id.saturating_sub(MAX_HISTORY);
-    let mut table = write_txn.open_table(COMMAND_HISTORY).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("redb open for trim: {e}"))
-    })?;
+    let mut table = write_txn
+        .open_table(COMMAND_HISTORY)
+        .map_err(|e| io::Error::other(format!("redb open for trim: {e}")))?;
     let keys_to_remove: Vec<u64> = table
         .iter()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb iter for trim: {e}")))?
+        .map_err(|e| io::Error::other(format!("redb iter for trim: {e}")))?
         .filter_map(|result| {
             result.ok().and_then(|(key, _)| {
                 if key.value() <= cutoff {
@@ -137,9 +129,9 @@ fn trim_old_entries(
         })
         .collect();
     for key in keys_to_remove {
-        table.remove(key).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("redb remove for trim: {e}"))
-        })?;
+        table
+            .remove(key)
+            .map_err(|e| io::Error::other(format!("redb remove for trim: {e}")))?;
     }
     Ok(())
 }
@@ -148,7 +140,7 @@ fn trim_old_entries(
 pub fn load_recent_commands(db: &redb::Database, limit: usize) -> io::Result<Vec<CommandEntry>> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb read txn: {e}")))?;
+        .map_err(|e| io::Error::other(format!("redb read txn: {e}")))?;
     // Table may not exist on first run — return empty in that case.
     let table = match read_txn.open_table(COMMAND_HISTORY) {
         Ok(t) => t,
@@ -159,23 +151,25 @@ pub fn load_recent_commands(db: &redb::Database, limit: usize) -> io::Result<Vec
     let mut entries: Vec<(u64, CommandEntry)> = Vec::new();
     for result in table
         .iter()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb iter: {e}")))?
+        .map_err(|e| io::Error::other(format!("redb iter: {e}")))?
     {
-        let (key, value) = result
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb iter item: {e}")))?;
+        let (key, value) = result.map_err(|e| io::Error::other(format!("redb iter item: {e}")))?;
         match bincode::serde::decode_from_slice::<CommandEntry, _>(
             value.value(),
             bincode::config::standard(),
         ) {
             Ok((entry, _)) => entries.push((key.value(), entry)),
             Err(e) => {
-                tracing::warn!("[tai-tui] skipping corrupt history entry {}: {e}", key.value());
+                tracing::warn!(
+                    "[tai-tui] skipping corrupt history entry {}: {e}",
+                    key.value()
+                );
             }
         }
     }
 
     // Sort by ID descending (newest first), take limit.
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.sort_by_key(|b| std::cmp::Reverse(b.0));
     Ok(entries.into_iter().take(limit).map(|(_, e)| e).collect())
 }
 

@@ -1,8 +1,8 @@
 use crate::state::{HistoryItem, StreamingEntry};
 use dioxus::prelude::*;
+use tai_client_core::FileDiff;
 use tai_client_core::HistoryItem as SharedHistoryItem;
 use tai_markdown::render_markdown_html;
-use tai_client_core::FileDiff;
 use tai_proto::{ImageMetadata, SessionMessage};
 
 pub(crate) fn render_history_item(item: HistoryItem) -> Element {
@@ -40,7 +40,7 @@ pub(crate) fn render_history_item(item: HistoryItem) -> Element {
             div { class: "history-item diff-item",
                 div { class: "diff-header", "Diff ({files.len()} file(s))" }
                 pre { class: "diff-body",
-                    {files.iter().map(|f| format_diff_file(f)).collect::<Vec<_>>().join("\n")}
+                    {files.iter().map(format_diff_file).collect::<Vec<_>>().join("\n")}
                 }
             }
         },
@@ -133,8 +133,7 @@ fn render_assistant_text(content: &str) -> Element {
 }
 
 fn render_tool_use(name: &str, reasoning: &Option<String>, content: &str) -> Element {
-    let content_html = (!content.trim().is_empty())
-        .then(|| render_markdown_html(content));
+    let content_html = (!content.trim().is_empty()).then(|| render_markdown_html(content));
     rsx! {
         div { class: "history-item session-item tool-use-item",
             div { class: "message-label", "tool call" }
@@ -156,7 +155,11 @@ fn render_tool_use(name: &str, reasoning: &Option<String>, content: &str) -> Ele
 }
 
 fn render_tool_result(is_error: bool, content: &str) -> Element {
-    let label = if is_error { "tool error" } else { "tool result" };
+    let label = if is_error {
+        "tool error"
+    } else {
+        "tool result"
+    };
     render_labeled_plain_message(label, content, "session-item tool-result-item")
 }
 
@@ -186,15 +189,17 @@ fn render_session_message(message: SessionMessage) -> Element {
                 .map(|call| format!("{}({})", call.name, call.arguments_json))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let resolved_reasoning = reasoning
-                .filter(|value| !value.trim().is_empty());
+            let resolved_reasoning = reasoning.filter(|value| !value.trim().is_empty());
             let content = content
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_default();
             render_tool_use(&name, &resolved_reasoning, &content)
         }
         SessionMessage::ToolResult {
-            name, content, is_error, ..
+            name,
+            content,
+            is_error,
+            ..
         } => render_tool_result(is_error, &format!("{name}: {content}")),
         SessionMessage::DisplayedImage(record) => render_displayed_image(&record.metadata),
         _ => rsx! {},

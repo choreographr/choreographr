@@ -14,9 +14,7 @@ fn main() -> anyhow::Result<()> {
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(log_file)
         .with_ansi(false);
-    tracing_subscriber::registry()
-        .with(file_layer)
-        .init();
+    tracing_subscriber::registry().with(file_layer).init();
 
     connection::run_app()?;
     Ok(())

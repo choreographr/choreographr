@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use tai_daemon::metrics;
@@ -24,7 +24,10 @@ fn metrics_server_serves_openmetrics_format() {
 
     // Send a raw HTTP GET request to /metrics.
     let response = fetch_metrics("127.0.0.1:19464");
-    assert!(response.is_some(), "expected a response from metrics server");
+    assert!(
+        response.is_some(),
+        "expected a response from metrics server"
+    );
     let response = response.unwrap();
 
     // Should contain the expected OpenMetrics header and our metrics.
@@ -52,12 +55,8 @@ fn metrics_server_serves_openmetrics_format() {
 /// response body (header + body) as a string.
 fn fetch_metrics(host: &str) -> Option<String> {
     let mut stream = TcpStream::connect(host).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok()?;
-    let request = format!(
-        "GET /metrics HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    );
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let request = format!("GET /metrics HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).ok()?;
     // Signal EOF on the write side so the server knows the request is complete.
     stream.shutdown(Shutdown::Write).ok()?;

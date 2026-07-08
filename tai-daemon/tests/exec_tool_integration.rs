@@ -10,7 +10,11 @@ fn echo_hello() {
     );
     assert!(!result.is_error, "expected success: {}", result.content);
     assert!(result.content.contains("hello world"), "{}", result.content);
-    assert!(result.content.contains("Exit code: 0"), "{}", result.content);
+    assert!(
+        result.content.contains("Exit code: 0"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
@@ -20,7 +24,11 @@ fn exit_nonzero() {
         r#"{"command": "sh", "args": ["-c", "exit 42"]}"#,
         Some(Path::new("/tmp")),
     );
-    assert!(result.content.contains("Exit code: 42"), "{}", result.content);
+    assert!(
+        result.content.contains("Exit code: 42"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
@@ -32,7 +40,11 @@ fn working_directory() {
         None,
     );
     assert!(!result.is_error, "expected success: {}", result.content);
-    assert!(result.content.contains(&dir.display().to_string()), "{}", result.content);
+    assert!(
+        result.content.contains(&dir.display().to_string()),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
@@ -43,7 +55,11 @@ fn timeout_kills_command() {
         Some(Path::new("/tmp")),
     );
     assert!(result.content.contains("timed out"), "{}", result.content);
-    assert!(result.content.contains("Exit code: -1"), "{}", result.content);
+    assert!(
+        result.content.contains("Exit code: -1"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
@@ -55,7 +71,9 @@ fn path_confinement_rejects_escape() {
     );
     assert!(result.is_error, "expected error: {}", result.content);
     assert!(
-        result.content.contains("outside the session working directory"),
+        result
+            .content
+            .contains("outside the session working directory"),
         "{}",
         result.content
     );
@@ -74,10 +92,7 @@ fn path_confinement_allows_subdirectory() {
 #[test]
 #[ignore]
 fn no_cwd_skips_confinement() {
-    let result = execute_exec_tool(
-        r#"{"command": "echo", "args": ["ok"]}"#,
-        None,
-    );
+    let result = execute_exec_tool(r#"{"command": "echo", "args": ["ok"]}"#, None);
     assert!(!result.is_error, "expected success: {}", result.content);
 }
 
@@ -96,10 +111,7 @@ fn stderr_output_included() {
 #[test]
 #[ignore]
 fn invalid_json_returns_error() {
-    let result = execute_exec_tool(
-        r#"not json"#,
-        Some(Path::new("/tmp")),
-    );
+    let result = execute_exec_tool(r#"not json"#, Some(Path::new("/tmp")));
     assert!(result.is_error, "expected error: {}", result.content);
 }
 

@@ -15,7 +15,10 @@ fn app_push_text_trims_history_to_limit() {
     assert_eq!(app.client.history.len(), 500);
     match &app.client.history[0] {
         HistoryItem::Text(text) => assert!(text.contains("line 100")),
-        HistoryItem::SessionMessage(_) | HistoryItem::Streaming(_) | HistoryItem::Image(_) | HistoryItem::Diff(_) => {
+        HistoryItem::SessionMessage(_)
+        | HistoryItem::Streaming(_)
+        | HistoryItem::Image(_)
+        | HistoryItem::Diff(_) => {
             panic!("expected text history item")
         }
     }
@@ -62,7 +65,13 @@ fn append_stream_text_preserves_manual_scroll_position() {
 
     app.append_stream_text(7, OutputStream::Answer, "hello");
 
-    tracing::info!("A1 scroll={} comp={} eff={} fol={}", app.history_scroll.scroll(), app.history_scroll.scroll_compensation(), app.effective_scroll(), app.history_scroll.follow_output());
+    tracing::info!(
+        "A1 scroll={} comp={} eff={} fol={}",
+        app.history_scroll.scroll(),
+        app.history_scroll.scroll_compensation(),
+        app.effective_scroll(),
+        app.history_scroll.follow_output()
+    );
     assert_eq!(app.history_scroll.scroll(), 3);
     assert_eq!(app.history_scroll.scroll_compensation(), 2);
     assert_eq!(app.effective_scroll(), 5);
@@ -144,7 +153,11 @@ fn markdown_lines_render_tables() {
         60,
     );
 
-    let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
+    let rendered = lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(rendered.contains("┌"));
     assert!(rendered.contains("Ada Lovelace"));
@@ -156,7 +169,11 @@ fn markdown_lines_render_tables() {
 fn markdown_lines_render_lists_with_item_text() {
     let lines = markdown_lines("- one\n- [x] done\n1. first\n2. second", 80);
 
-    let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>().join("\n");
+    let rendered = lines
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
 
     assert!(rendered.contains("• one"));
     assert!(rendered.contains("• [x] done"));
@@ -196,10 +213,16 @@ fn image_item_height_uses_protocol_size_for() {
     .expect("svg should render");
     let item = crate::state::HistoryItem::Image(Box::new(image));
 
-    let viewport = crate::state::HistoryViewport { width: 80, height: 24 };
+    let viewport = crate::state::HistoryViewport {
+        width: 80,
+        height: 24,
+    };
     let height = viewport.item_height(&item);
     assert!(height >= 1, "image item height must be at least 1");
-    assert!(height <= 12, "image should not exceed half the viewport height (24/2=12)");
+    assert!(
+        height <= 12,
+        "image should not exceed half the viewport height (24/2=12)"
+    );
 }
 
 #[test]
@@ -990,7 +1013,10 @@ fn make_session(id: u64, title: &str, model: &str, count: u32) -> tai_proto::Ses
 #[test]
 fn session_manager_set_sessions_selects_first() {
     let mut state = SessionManagerState::new();
-    state.set_sessions(vec![make_session(1, "a", "m1", 5), make_session(2, "b", "m2", 3)]);
+    state.set_sessions(vec![
+        make_session(1, "a", "m1", 5),
+        make_session(2, "b", "m2", 3),
+    ]);
     assert_eq!(state.sessions.len(), 2);
     assert_eq!(state.selection, Some(0));
 }
@@ -1715,5 +1741,8 @@ fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
     )
     .expect("handle mouse");
 
-    assert_eq!(app.scroll_accumulator, 0, "accumulator must remain unchanged");
+    assert_eq!(
+        app.scroll_accumulator, 0,
+        "accumulator must remain unchanged"
+    );
 }

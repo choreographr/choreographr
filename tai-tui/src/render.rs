@@ -2,7 +2,6 @@ use crate::diff_render::build_diff_panes;
 use crate::markdown_render::{
     display_width, lines_height, session_message_lines, streaming_text_lines,
 };
-use tai_proto::SessionMessage;
 use crate::state::{
     App, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache, SessionManagerView,
     history_text_height,
@@ -14,10 +13,11 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
-use tai_tui::RenderedImage;
 use ratatui_image::{Resize, StatefulImage};
+use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
+use tai_proto::SessionMessage;
 use tai_proto::SessionStatus;
+use tai_tui::RenderedImage;
 
 pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
     let Ok((width, height)) = crossterm::terminal::size() else {
@@ -53,9 +53,9 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         .wrap(Wrap { trim: false });
     frame.render_widget(input, chunks[1]);
 
-    let cursor_x = chunks[1]
-        .x
-        .saturating_add(1 + display_width(app.input.text.get(..app.input.cursor).unwrap_or("")) as u16);
+    let cursor_x = chunks[1].x.saturating_add(
+        1 + display_width(app.input.text.get(..app.input.cursor).unwrap_or("")) as u16,
+    );
     let cursor_y = chunks[1].y.saturating_add(1);
     frame.set_cursor_position((cursor_x, cursor_y));
 }
@@ -158,10 +158,10 @@ fn cached_or_compute_lines(
     compute: impl FnOnce() -> Vec<Line<'static>>,
 ) -> Vec<Line<'static>> {
     // Fast path: cache hit at the current width.
-    if let Some(Some(cached)) = cache.get(index) {
-        if cached.width == width {
-            return cached.lines.clone();
-        }
+    if let Some(Some(cached)) = cache.get(index)
+        && cached.width == width
+    {
+        return cached.lines.clone();
     }
 
     // Cache miss: compute, store, and return.
@@ -226,7 +226,8 @@ pub(crate) fn render_history_text(
     // +1 for the blank-line separator below each text block
     let wrapped = base_wrapped + 1;
 
-    let Some((top_line, visible_height)) = clipped_area(wrapped, rows_to_skip, rows_remaining, y) else {
+    let Some((top_line, visible_height)) = clipped_area(wrapped, rows_to_skip, rows_remaining, y)
+    else {
         return;
     };
 
@@ -294,7 +295,8 @@ pub(crate) fn render_history_lines(
     // +1 for the blank-line separator below each text block
     let wrapped = lines_height(&lines, content_width).max(1) + 1;
 
-    let Some((top_line, visible_height)) = clipped_area(wrapped, rows_to_skip, rows_remaining, y) else {
+    let Some((top_line, visible_height)) = clipped_area(wrapped, rows_to_skip, rows_remaining, y)
+    else {
         return;
     };
 
@@ -329,7 +331,9 @@ fn render_assistant_lines(
 ) {
     let (display_lines, total_rows) = add_margin_lines(lines, content_width);
 
-    let Some((top_line, visible_height)) = clipped_area(total_rows, rows_to_skip, rows_remaining, y) else {
+    let Some((top_line, visible_height)) =
+        clipped_area(total_rows, rows_to_skip, rows_remaining, y)
+    else {
         return;
     };
 
@@ -351,6 +355,7 @@ fn render_assistant_lines(
 /// Render a `HistoryItem::SessionMessage`: retrieve cached lines (or compute
 /// on cache miss), then render via the appropriate helper (assistant margin
 /// for `AssistantText`, plain lines otherwise).
+#[allow(clippy::too_many_arguments)]
 fn render_item_session_message(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -364,12 +369,9 @@ fn render_item_session_message(
     assistant_content_width: u16,
 ) {
     if matches!(message, SessionMessage::AssistantText { .. }) {
-        let lines = cached_or_compute_lines(
-            cache,
-            idx,
-            assistant_content_width,
-            || session_message_lines(message, assistant_content_width),
-        );
+        let lines = cached_or_compute_lines(cache, idx, assistant_content_width, || {
+            session_message_lines(message, assistant_content_width)
+        });
         render_assistant_lines(
             frame,
             area,
@@ -380,12 +382,9 @@ fn render_item_session_message(
             assistant_content_width,
         );
     } else {
-        let lines = cached_or_compute_lines(
-            cache,
-            idx,
-            content_width,
-            || session_message_lines(message, content_width),
-        );
+        let lines = cached_or_compute_lines(cache, idx, content_width, || {
+            session_message_lines(message, content_width)
+        });
         render_history_lines(
             frame,
             area,
@@ -438,7 +437,9 @@ fn render_item_image(
     let full_height = rendered.height.max(1) as usize;
 
     // Use the shared clipped_area helper just like the text/diff renderers.
-    let Some((_top_line, visible_height)) = clipped_area(full_height, rows_to_skip, rows_remaining, y) else {
+    let Some((_top_line, visible_height)) =
+        clipped_area(full_height, rows_to_skip, rows_remaining, y)
+    else {
         // The item is entirely above the viewport; carry on to the next item.
         // (Unlike text renderers we return from the helper directly here so the
         // caller can distinguish "fully skipped" from "viewport exhausted".)
@@ -521,7 +522,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
                 SessionStatus::Sleeping => "sleep",
                 SessionStatus::Inactive => "idle",
                 SessionStatus::Inference => "infer",
-                SessionStatus::ToolCall(name) => &name,
+                SessionStatus::ToolCall(name) => name,
                 SessionStatus::Retrying { .. } => "retry",
                 _ => "unknown",
             };
@@ -539,9 +540,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             );
 
             let style = if is_selected {
-                Style::default()
-                    .bg(Color::Blue)
-                    .fg(Color::White)
+                Style::default().bg(Color::Blue).fg(Color::White)
             } else {
                 Style::default()
             };
@@ -557,9 +556,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let status = if let Some((_id, title)) = &app.session_mgr.confirm_delete {
-        Paragraph::new(Line::from(format!(
-            " Delete “{title}”? (y/N)  "
-        )))
+        Paragraph::new(Line::from(format!(" Delete “{title}”? (y/N)  ")))
     } else {
         Paragraph::new(Line::from(format!(
             " <j/k nav>  <Enter switch>  <i details>  <n new>  <d delete>  <Esc back>  —  {} sessions",
@@ -594,7 +591,10 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                     .map_or("none".to_string(), |id| id.to_string())
             )),
             Line::from(format!("CWD:           {}", detail.cwd)),
-            Line::from(format!("Created:       {}", format_timestamp(detail.created_at))),
+            Line::from(format!(
+                "Created:       {}",
+                format_timestamp(detail.created_at)
+            )),
             Line::from(format!("Message Count: {}", detail.message_count)),
             Line::from(format!(
                 "Max Turns:     {}",
@@ -603,14 +603,16 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                     .map_or("unlimited".to_string(), |mt| mt.to_string())
             )),
             Line::from(format!("Status:        {}", format_status(&detail.status))),
-            Line::from(format!("Tool Groups:   {}", detail.active_tool_groups.join(", "))),
+            Line::from(format!(
+                "Tool Groups:   {}",
+                detail.active_tool_groups.join(", ")
+            )),
         ];
         let paragraph = Paragraph::new(lines);
         frame.render_widget(paragraph, inner);
     }
 
-    let status =
-        Paragraph::new(Line::from(" <b back>  <Enter switch to this session>"));
+    let status = Paragraph::new(Line::from(" <b back>  <Enter switch to this session>"));
     frame.render_widget(status, chunks[1]);
 }
 
@@ -638,7 +640,11 @@ pub(crate) fn format_status(status: &SessionStatus) -> String {
         SessionStatus::Inactive => "idle".to_string(),
         SessionStatus::Inference => "inferring".to_string(),
         SessionStatus::ToolCall(name) => format!("tool call: {name}"),
-        SessionStatus::Retrying { attempt, max_attempts, delay_ms } => {
+        SessionStatus::Retrying {
+            attempt,
+            max_attempts,
+            delay_ms,
+        } => {
             format!("retrying ({attempt}/{max_attempts}, {delay_ms}ms)")
         }
         _ => "unknown".to_string(),
@@ -667,7 +673,9 @@ pub(crate) fn render_history_diff(
     let raw_height = diff_display_height(diffs);
     let full_height = raw_height + 2; // +1 for leading blank, +1 for trailing blank
 
-    let Some((top_line, visible_height)) = clipped_area(full_height, rows_to_skip, rows_remaining, y) else {
+    let Some((top_line, visible_height)) =
+        clipped_area(full_height, rows_to_skip, rows_remaining, y)
+    else {
         return;
     };
 
@@ -694,15 +702,32 @@ pub(crate) fn render_history_diff(
     diff_lines.push(Line::from(Span::styled(String::new(), Style::default())));
     for row in &rows {
         let mut spans = Vec::new();
-        spans.extend(diff_cell_spans(&row.left_spans, row.left_kind, pane_width, true));
-        spans.push(ratatui::text::Span::styled("│".to_string(), separator_style));
-        spans.extend(diff_cell_spans(&row.right_spans, row.right_kind, pane_width, false));
+        spans.extend(diff_cell_spans(
+            &row.left_spans,
+            row.left_kind,
+            pane_width,
+            true,
+        ));
+        spans.push(ratatui::text::Span::styled(
+            "│".to_string(),
+            separator_style,
+        ));
+        spans.extend(diff_cell_spans(
+            &row.right_spans,
+            row.right_kind,
+            pane_width,
+            false,
+        ));
         diff_lines.push(Line::from(spans));
     }
     // Trailing blank line
     diff_lines.push(Line::from(Span::styled(String::new(), Style::default())));
 
-    let visible_lines: Vec<Line> = diff_lines.into_iter().skip(top_line).take(visible_height).collect();
+    let visible_lines: Vec<Line> = diff_lines
+        .into_iter()
+        .skip(top_line)
+        .take(visible_height)
+        .collect();
 
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, rect);
@@ -758,10 +783,7 @@ pub(crate) fn diff_cell_spans(
         })
         .collect();
 
-    let total: usize = styled
-        .iter()
-        .map(|s| display_width(&s.content))
-        .sum();
+    let total: usize = styled.iter().map(|s| display_width(&s.content)).sum();
 
     if total > pane_width {
         // Truncate spans to fit pane_width, preserving syntax colours on
@@ -776,11 +798,17 @@ pub(crate) fn diff_cell_spans(
             } else if remaining > 0 {
                 // Walk characters by display width, not by scalar count,
                 // so CJK/emoji (width 2) are handled correctly.
-                let truncated: String = span.content
+                let truncated: String = span
+                    .content
                     .chars()
                     .scan(remaining, |budget, c| {
                         let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-                        if *budget >= cw { *budget -= cw; Some(c) } else { None }
+                        if *budget >= cw {
+                            *budget -= cw;
+                            Some(c)
+                        } else {
+                            None
+                        }
                     })
                     .collect();
                 result.push(ratatui::text::Span::styled(truncated, span.style));
@@ -789,8 +817,7 @@ pub(crate) fn diff_cell_spans(
                 break;
             }
         }
-        let ellipsis_style = diff_bg
-            .map_or(Style::default(), |b| Style::default().bg(b));
+        let ellipsis_style = diff_bg.map_or(Style::default(), |b| Style::default().bg(b));
         result.push(ratatui::text::Span::styled("…".to_string(), ellipsis_style));
         result
     } else {
@@ -799,14 +826,13 @@ pub(crate) fn diff_cell_spans(
         // width).  The padding span uses the diff background when present,
         // otherwise default style.
         let mut result = styled;
-        let pad_style = diff_bg
-            .map_or(Style::default(), |b| {
-                ratatui::style::Style {
-                    fg: None,
-                    ..ratatui::style::Style::default()
-                }
-                .bg(b)
-            });
+        let pad_style = diff_bg.map_or(Style::default(), |b| {
+            ratatui::style::Style {
+                fg: None,
+                ..ratatui::style::Style::default()
+            }
+            .bg(b)
+        });
         result.push(ratatui::text::Span::styled(
             " ".repeat(pane_width.saturating_sub(total)),
             pad_style,

@@ -113,7 +113,7 @@ fn status_to_error(
             detail: detail.to_string(),
         };
     }
-    OpenAiError::Io(io::Error::new(io::ErrorKind::Other, detail.to_string()))
+    OpenAiError::Io(io::Error::other(detail.to_string()))
 }
 
 fn retry_send_impl<F>(
@@ -199,7 +199,13 @@ pub(crate) fn retry_send(
     cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<reqwest::blocking::Response, OpenAiError> {
     retry_send_impl(
-        || client.post(url).bearer_auth(api_key.trim()).json(body).send(),
+        || {
+            client
+                .post(url)
+                .bearer_auth(api_key.trim())
+                .json(body)
+                .send()
+        },
         retry,
         on_retry,
         cancel_rx,
@@ -251,7 +257,10 @@ pub(crate) enum MaxTokensField {
     MaxCompletionTokens,
 }
 
-pub(crate) fn chat_completions_max_tokens_field(config: &ServiceConfig, model: &str) -> MaxTokensField {
+pub(crate) fn chat_completions_max_tokens_field(
+    config: &ServiceConfig,
+    model: &str,
+) -> MaxTokensField {
     if config.base_url.contains("opencode.ai") || model == "big-pickle" {
         MaxTokensField::MaxTokens
     } else {

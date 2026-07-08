@@ -9,7 +9,11 @@ fn simple_write_no_alloc() {
         Some(Path::new("/tmp")),
     );
     assert!(!result.is_error, "expected success: {}", result.content);
-    assert!(result.content.contains("Hello from VM!"), "{}", result.content);
+    assert!(
+        result.content.contains("Hello from VM!"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
@@ -20,7 +24,11 @@ fn simple_write_with_alloc() {
         Some(Path::new("/tmp")),
     );
     assert!(!result.is_error, "expected success: {}", result.content);
-    assert!(result.content.contains("Hello from VM!"), "{}", result.content);
+    assert!(
+        result.content.contains("Hello from VM!"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
@@ -32,8 +40,16 @@ fn exit_zero() {
     );
     assert!(!result.is_error, "expected success: {}", result.content);
     // The tool prepends the formatted source as a markdown code block.
-    assert!(result.content.contains("```rust"), "expected source block: {}", result.content);
-    assert!(result.content.contains("fn main()"), "expected source: {}", result.content);
+    assert!(
+        result.content.contains("```rust"),
+        "expected source block: {}",
+        result.content
+    );
+    assert!(
+        result.content.contains("fn main()"),
+        "expected source: {}",
+        result.content
+    );
 }
 
 #[test]
@@ -80,32 +96,31 @@ fn compilation_error_invalid_rust() {
 #[test]
 #[ignore]
 fn invalid_json() {
-    let result = execute_run_riscv_tool(
-        r#"not json"#,
-        None,
-    );
+    let result = execute_run_riscv_tool(r#"not json"#, None);
     assert!(result.is_error, "expected error: {}", result.content);
-    assert!(result.content.contains("invalid arguments"), "{}", result.content);
+    assert!(
+        result.content.contains("invalid arguments"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
 #[ignore]
 fn missing_source_and_program() {
-    let result = execute_run_riscv_tool(
-        r#"{}"#,
-        None,
-    );
+    let result = execute_run_riscv_tool(r#"{}"#, None);
     assert!(result.is_error, "expected error: {}", result.content);
-    assert!(result.content.contains("source") || result.content.contains("program"), "{}", result.content);
+    assert!(
+        result.content.contains("source") || result.content.contains("program"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
 #[ignore]
 fn both_source_and_program() {
-    let result = execute_run_riscv_tool(
-        r#"{"source": "fn main() {}", "program": "AAAA"}"#,
-        None,
-    );
+    let result = execute_run_riscv_tool(r#"{"source": "fn main() {}", "program": "AAAA"}"#, None);
     assert!(result.is_error, "expected error: {}", result.content);
     assert!(result.content.contains("only one of"), "{}", result.content);
 }
@@ -113,34 +128,37 @@ fn both_source_and_program() {
 #[test]
 #[ignore]
 fn memory_size_not_aligned() {
-    let result = execute_run_riscv_tool(
-        r#"{"program": "AAAA", "memory_size": 100}"#,
-        None,
-    );
+    let result = execute_run_riscv_tool(r#"{"program": "AAAA", "memory_size": 100}"#, None);
     assert!(result.is_error, "expected error: {}", result.content);
-    assert!(result.content.contains("multiple of 4096"), "{}", result.content);
+    assert!(
+        result.content.contains("multiple of 4096"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
 #[ignore]
 fn memory_size_exceeds_max() {
-    let result = execute_run_riscv_tool(
-        r#"{"program": "AAAA", "memory_size": 4198400}"#,
-        None,
-    );
+    let result = execute_run_riscv_tool(r#"{"program": "AAAA", "memory_size": 4198400}"#, None);
     assert!(result.is_error, "expected error: {}", result.content);
-    assert!(result.content.contains("cannot exceed 4MB"), "{}", result.content);
+    assert!(
+        result.content.contains("cannot exceed 4MB"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]
 #[ignore]
 fn invalid_base64_program() {
-    let result = execute_run_riscv_tool(
-        r#"{"program": "!!!not-base64!!!"}"#,
-        None,
-    );
+    let result = execute_run_riscv_tool(r#"{"program": "!!!not-base64!!!"}"#, None);
     assert!(result.is_error, "expected error: {}", result.content);
-    assert!(result.content.contains("base64 decode"), "{}", result.content);
+    assert!(
+        result.content.contains("base64 decode"),
+        "{}",
+        result.content
+    );
 }
 
 #[test]

@@ -151,8 +151,9 @@ fn stage_path(
                 kind.into(),
                 path,
             );
-            let current = current_entry_snapshot(index, path)
-                .ok_or_else(|| ToolError::Other("staged entry not found after insertion".to_string()))?;
+            let current = current_entry_snapshot(index, path).ok_or_else(|| {
+                ToolError::Other("staged entry not found after insertion".to_string())
+            })?;
             Ok(previous.as_ref() != Some(&current))
         }
         None => Ok(previous.is_some()),
@@ -227,7 +228,7 @@ fn worktree_metadata(
         .workdir()
         .ok_or_else(|| ToolError::Other("repository has no worktree".to_string()))?;
     gix::index::fs::Metadata::from_path_no_follow(&workdir.join(gix::path::from_bstr(path)))
-        .map_err(|e| ToolError::Io(e.into()))
+        .map_err(ToolError::Io)
 }
 
 fn finalize_index(index: &mut gix::index::File) -> Result<(), ToolError> {

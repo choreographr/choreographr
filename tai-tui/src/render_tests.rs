@@ -1,6 +1,6 @@
 use super::render::*;
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
@@ -21,7 +21,12 @@ fn render_history_text_no_skip() {
         .draw(|frame| {
             render_history_text(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 "line1\nline2",
                 &mut rows_remaining,
                 &mut y,
@@ -48,7 +53,12 @@ fn render_history_text_partial_skip() {
         .draw(|frame| {
             render_history_text(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 "line1\nline2\nline3\nline4\nline5",
                 &mut rows_remaining,
                 &mut y,
@@ -76,7 +86,12 @@ fn render_history_text_full_skip() {
         .draw(|frame| {
             render_history_text(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 "line1\nline2\nline3\nline4\nline5",
                 &mut rows_remaining,
                 &mut y,
@@ -104,7 +119,12 @@ fn render_history_text_exhausted_viewport() {
         .draw(|frame| {
             render_history_text(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 "line1\nline2\nline3\nline4\nline5",
                 &mut rows_remaining,
                 &mut y,
@@ -132,7 +152,12 @@ fn render_history_text_zero_remaining() {
         .draw(|frame| {
             render_history_text(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 "content",
                 &mut rows_remaining,
                 &mut y,
@@ -162,7 +187,12 @@ fn render_history_lines_no_skip() {
         .draw(|frame| {
             render_history_lines(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 vec![Line::from("a"), Line::from("b"), Line::from("c")],
                 &mut rows_remaining,
                 &mut y,
@@ -189,7 +219,12 @@ fn render_history_lines_partial_skip() {
         .draw(|frame| {
             render_history_lines(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 vec![Line::from("a"), Line::from("b"), Line::from("c")],
                 &mut rows_remaining,
                 &mut y,
@@ -217,7 +252,12 @@ fn render_history_lines_full_skip() {
         .draw(|frame| {
             render_history_lines(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 vec![Line::from("only")],
                 &mut rows_remaining,
                 &mut y,
@@ -244,7 +284,12 @@ fn render_history_lines_zero_remaining() {
         .draw(|frame| {
             render_history_lines(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 vec![Line::from("content")],
                 &mut rows_remaining,
                 &mut y,
@@ -285,7 +330,12 @@ fn render_history_diff_no_skip() {
         .draw(|frame| {
             render_history_diff(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 &diffs,
                 &mut rows_remaining,
                 &mut y,
@@ -324,7 +374,12 @@ fn render_history_diff_partial_skip() {
         .draw(|frame| {
             render_history_diff(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 &diffs,
                 &mut rows_remaining,
                 &mut y,
@@ -363,7 +418,12 @@ fn render_history_diff_full_skip() {
         .draw(|frame| {
             render_history_diff(
                 frame,
-                Rect { x: 0, y: 0, width: 80, height: 30 },
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 30,
+                },
                 &diffs,
                 &mut rows_remaining,
                 &mut y,
@@ -391,7 +451,10 @@ fn span_from_text(text: &str) -> Vec<ratatui::text::Span<'static>> {
 fn diff_cell_spans_pads_short_content() {
     let spans = diff_cell_spans(&span_from_text("hi"), DiffLineKind::Context, 10, true);
     let text = spans[0].content.trim_end();
-    assert!(text.starts_with("hi"), "content='{text}' should start with 'hi'");
+    assert!(
+        text.starts_with("hi"),
+        "content='{text}' should start with 'hi'"
+    );
 }
 
 #[test]
@@ -497,13 +560,7 @@ fn diff_cell_spans_pads_with_diff_background() {
     let spans = diff_cell_spans(&span_from_text("hi"), DiffLineKind::Deletion, 10, true);
     // There should be a padding span at the end with the diff background
     assert!(spans.len() > 1, "should have padding span");
-    assert_eq!(
-        spans.last().unwrap().style.bg,
-        Some(Color::Rgb(80, 0, 0)),
-    );
+    assert_eq!(spans.last().unwrap().style.bg, Some(Color::Rgb(80, 0, 0)),);
     // The text span should have the red bg too
-    assert_eq!(
-        spans[0].style.bg,
-        Some(Color::Rgb(80, 0, 0)),
-    );
+    assert_eq!(spans[0].style.bg, Some(Color::Rgb(80, 0, 0)),);
 }

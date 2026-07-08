@@ -1,8 +1,8 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tai_daemon::openai::{
@@ -27,9 +27,7 @@ fn http_response(status_line: &str, body: &str) -> Vec<u8> {
 
 /// A 200 chat-completion response containing `text`.
 fn ok_body(text: &str) -> String {
-    format!(
-        r#"{{"choices":[{{"message":{{"content":"{text}","tool_calls":[]}}}}]}}"#
-    )
+    format!(r#"{{"choices":[{{"message":{{"content":"{text}","tool_calls":[]}}}}]}}"#)
 }
 
 /// Start a local TCP server that responds to each connection in order.
@@ -43,9 +41,7 @@ fn spawn_http_server(responses: Vec<Vec<u8>>) -> (u16, thread::JoinHandle<()>) {
     let handle = thread::spawn(move || {
         for response in &responses {
             let mut buf = [0u8; 4096];
-            let (mut stream, _) = listener
-                .accept()
-                .unwrap_or_else(|e| panic!("accept: {e}"));
+            let (mut stream, _) = listener.accept().unwrap_or_else(|e| panic!("accept: {e}"));
             // Read the HTTP request (we don't care about the content).
             let _ = stream.read(&mut buf);
             stream
@@ -66,7 +62,10 @@ fn spawn_http_server(responses: Vec<Vec<u8>>) -> (u16, thread::JoinHandle<()>) {
 #[ignore]
 fn retry_succeeds_with_callback() {
     let (port, _server) = spawn_http_server(vec![
-        http_response("HTTP/1.1 429 Too Many Requests", r#"{"error":"rate limited"}"#),
+        http_response(
+            "HTTP/1.1 429 Too Many Requests",
+            r#"{"error":"rate limited"}"#,
+        ),
         http_response("HTTP/1.1 200 OK", &ok_body("hello from retry")),
     ]);
 
@@ -81,8 +80,7 @@ fn retry_succeeds_with_callback() {
         streaming: false,
         ..ServiceConfig::default()
     };
-    let client =
-        OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+    let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
 
     let call_count = Arc::new(AtomicU32::new(0));
     let count = call_count.clone();
@@ -137,8 +135,7 @@ fn retry_cancelled_during_backoff() {
         streaming: false,
         ..ServiceConfig::default()
     };
-    let client =
-        OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+    let client = OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
 
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     let messages = [ChatRequestMessage::simple("user", "hello".into())];
@@ -151,13 +148,8 @@ fn retry_cancelled_during_backoff() {
     });
 
     let mut cb: Option<RetryCallback> = None;
-    let result = client.chat_completion_turn(
-        "retry-model",
-        &messages,
-        &[],
-        &mut cb,
-        Some(&cancel_rx),
-    );
+    let result =
+        client.chat_completion_turn("retry-model", &messages, &[], &mut cb, Some(&cancel_rx));
 
     assert!(
         matches!(result, Err(OpenAiError::Cancelled)),

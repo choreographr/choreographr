@@ -23,8 +23,7 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
     // Memoize highlighted results so re-rendering does not re-run syntect.
     // LRU eviction naturally keeps the most frequently seen code blocks
     // cached, replacing the old manual HashMap+cap approach.
-    static CACHE: GlobalLruCache<(String, String), Vec<Line<'static>>, 200> =
-        GlobalLruCache::new();
+    static CACHE: GlobalLruCache<(String, String), Vec<Line<'static>>, 200> = GlobalLruCache::new();
 
     let key = (language.unwrap_or("").to_string(), code.to_string());
 
@@ -45,10 +44,7 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
         for line in code.split('\n') {
             let Ok(ranges) = highlighter.highlight_line(line, ss) else {
                 // If highlighting fails for a line, emit it as plain text.
-                result.push(Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default(),
-                )));
+                result.push(Line::from(Span::styled(line.to_string(), Style::default())));
                 continue;
             };
 
@@ -100,7 +96,9 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
 
 pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec<Line<'static>> {
     match message {
-        SessionMessage::SystemText { content } => labeled_text_lines("system", content, Color::DarkGray),
+        SessionMessage::SystemText { content } => {
+            labeled_text_lines("system", content, Color::DarkGray)
+        }
         SessionMessage::UserText { content } => labeled_text_lines("user", content, Color::Green),
         SessionMessage::AssistantText { content } => {
             let body = markdown_lines(content, width);
@@ -126,10 +124,20 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
             {
-                append_section(&mut lines, "reasoning", plain_text_lines(reasoning_text), Color::DarkGray);
+                append_section(
+                    &mut lines,
+                    "reasoning",
+                    plain_text_lines(reasoning_text),
+                    Color::DarkGray,
+                );
             }
             if let Some(content) = content.as_deref().filter(|value| !value.trim().is_empty()) {
-                append_section(&mut lines, "content", markdown_lines(content, width), Color::Cyan);
+                append_section(
+                    &mut lines,
+                    "content",
+                    markdown_lines(content, width),
+                    Color::Cyan,
+                );
             }
             lines
         }
@@ -180,11 +188,21 @@ pub(crate) fn streaming_text_lines(text: &StreamingText, width: u16) -> Vec<Line
     ))];
 
     if !text.reasoning.is_empty() {
-        append_section(&mut lines, "reasoning", plain_text_lines(&text.reasoning), Color::DarkGray);
+        append_section(
+            &mut lines,
+            "reasoning",
+            plain_text_lines(&text.reasoning),
+            Color::DarkGray,
+        );
     }
 
     if !text.answer.is_empty() {
-        append_section(&mut lines, "answer", markdown_lines(&text.answer, width), Color::Cyan);
+        append_section(
+            &mut lines,
+            "answer",
+            markdown_lines(&text.answer, width),
+            Color::Cyan,
+        );
     }
 
     if text.reasoning.is_empty() && text.answer.is_empty() {
@@ -200,13 +218,22 @@ fn labeled_text_lines(label: &'static str, text: &str, color: Color) -> Vec<Line
     prefixed_lines(label, plain_text_lines(text), color)
 }
 
-fn prefixed_lines(label: &'static str, body: Vec<Line<'static>>, color: Color) -> Vec<Line<'static>> {
+fn prefixed_lines(
+    label: &'static str,
+    body: Vec<Line<'static>>,
+    color: Color,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     append_section(&mut lines, label, body, color);
     lines
 }
 
-fn append_section(lines: &mut Vec<Line<'static>>, label: &'static str, body: Vec<Line<'static>>, color: Color) {
+fn append_section(
+    lines: &mut Vec<Line<'static>>,
+    label: &'static str,
+    body: Vec<Line<'static>>,
+    color: Color,
+) {
     // Add a blank line to separate this section from the previous content.
     if !lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
@@ -721,7 +748,15 @@ fn inlines_to_lines(
         current_width += display_width(prefix);
     }
     let mut needs_separator = false;
-    render_inlines_to_lines(inlines, &mut lines, &mut current_spans, &mut current_width, &mut needs_separator, indent, width);
+    render_inlines_to_lines(
+        inlines,
+        &mut lines,
+        &mut current_spans,
+        &mut current_width,
+        &mut needs_separator,
+        indent,
+        width,
+    );
     if !current_spans.is_empty() || lines.is_empty() {
         lines.push(Line::from(std::mem::take(&mut current_spans)));
     }
@@ -753,19 +788,52 @@ fn render_inlines_to_lines(
     for inline in inlines {
         match inline {
             MarkdownInline::Text(text) => {
-                render_text_inline(text, lines, current, current_width, needs_separator, indent, width);
+                render_text_inline(
+                    text,
+                    lines,
+                    current,
+                    current_width,
+                    needs_separator,
+                    indent,
+                    width,
+                );
             }
             MarkdownInline::Code(text) => {
-                render_code_inline(text, lines, current, current_width, needs_separator, indent, width);
+                render_code_inline(
+                    text,
+                    lines,
+                    current,
+                    current_width,
+                    needs_separator,
+                    indent,
+                    width,
+                );
             }
             MarkdownInline::Emphasis(content) | MarkdownInline::Strong(content) => {
-                render_style_inline(content, lines, current, current_width, needs_separator, indent, width);
+                render_style_inline(
+                    content,
+                    lines,
+                    current,
+                    current_width,
+                    needs_separator,
+                    indent,
+                    width,
+                );
             }
             MarkdownInline::Link {
                 content,
                 destination,
             } => {
-                render_link_inline(content, destination, lines, current, current_width, needs_separator, indent, width);
+                render_link_inline(
+                    content,
+                    destination,
+                    lines,
+                    current,
+                    current_width,
+                    needs_separator,
+                    indent,
+                    width,
+                );
             }
             MarkdownInline::Image { alt, destination } => {
                 let prefix_text = "[image: ";
@@ -777,7 +845,15 @@ fn render_inlines_to_lines(
                 current.push(Span::styled(prefix_text.to_string(), Style::default()));
                 *current_width += prefix_width;
 
-                render_inlines_to_lines(alt, lines, current, current_width, needs_separator, indent, width);
+                render_inlines_to_lines(
+                    alt,
+                    lines,
+                    current,
+                    current_width,
+                    needs_separator,
+                    indent,
+                    width,
+                );
 
                 let suffix = if !destination.is_empty() {
                     format!("] ({destination})")
@@ -851,11 +927,9 @@ fn render_text_inline(
             }
         }
 
-        if *needs_separator || i > 0 {
-            if !current.is_empty() && *current_width > indent {
-                current.push(Span::styled(" ".to_string(), Style::default()));
-                *current_width += 1;
-            }
+        if (*needs_separator || i > 0) && !current.is_empty() && *current_width > indent {
+            current.push(Span::styled(" ".to_string(), Style::default()));
+            *current_width += 1;
         }
         current.push(Span::styled(word.to_string(), Style::default()));
         *current_width += word_width;
@@ -880,11 +954,9 @@ fn render_code_inline(
     let projected = *current_width + usize::from(*needs_separator) + word_width;
     if projected > width && *current_width > indent {
         flush_line(lines, current, current_width, indent);
-    } else if *needs_separator {
-        if !current.is_empty() && *current_width > indent {
-            current.push(Span::styled(" ".to_string(), Style::default()));
-            *current_width += 1;
-        }
+    } else if *needs_separator && !current.is_empty() && *current_width > indent {
+        current.push(Span::styled(" ".to_string(), Style::default()));
+        *current_width += 1;
     }
     current.push(Span::styled(text.to_string(), Style::default()));
     *current_width += word_width;
@@ -900,10 +972,19 @@ fn render_style_inline(
     indent: usize,
     width: usize,
 ) {
-    render_inlines_to_lines(content, lines, current, current_width, needs_separator, indent, width);
+    render_inlines_to_lines(
+        content,
+        lines,
+        current,
+        current_width,
+        needs_separator,
+        indent,
+        width,
+    );
     *needs_separator = true;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_link_inline(
     content: &[MarkdownInline],
     destination: &str,
@@ -914,7 +995,15 @@ fn render_link_inline(
     indent: usize,
     width: usize,
 ) {
-    render_inlines_to_lines(content, lines, current, current_width, needs_separator, indent, width);
+    render_inlines_to_lines(
+        content,
+        lines,
+        current,
+        current_width,
+        needs_separator,
+        indent,
+        width,
+    );
     if !destination.is_empty() {
         let dest_text = format!(" ({destination})");
         let dest_width = display_width(&dest_text);
@@ -957,9 +1046,10 @@ mod tests {
         assert!(!lines.is_empty(), "should produce at least one line");
 
         // At least one span should have a non-default foreground colour.
-        let has_colour = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
-            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
-        });
+        let has_colour = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
         assert!(has_colour, "highlighted Rust should have coloured spans");
     }
 
@@ -1039,10 +1129,7 @@ mod tests {
 
     #[test]
     fn lines_height_multiple_lines() {
-        let lines = vec![
-            Line::from("short"),
-            Line::from("a".repeat(50)),
-        ];
+        let lines = vec![Line::from("short"), Line::from("a".repeat(50))];
         // width=30: short=1 row, 50 chars=2 rows → total 3
         assert_eq!(lines_height(&lines, 30), 3);
     }
@@ -1137,16 +1224,19 @@ mod tests {
 
     #[test]
     fn inlines_to_lines_word_wraps_at_width() {
-        let inlines = vec![MarkdownInline::Text(
-            "hello world foo bar baz".to_string(),
-        )];
+        let inlines = vec![MarkdownInline::Text("hello world foo bar baz".to_string())];
         // Width 10: each word fits individually but they wrap.
         let result = inlines_to_lines(&inlines, 0, None, 10);
         // "hello " (6) + "world" (5) = 11 > 10 → wrap after "hello"
         // First line: "hello" (5), second line: "world" (5)
         // But then "world " + "foo " = 10, fits. Then "bar" would need to check.
         // Let me just verify there are multiple lines.
-        assert!(result.len() > 1, "should wrap at narrow width, got {} lines: {:?}", result.len(), result);
+        assert!(
+            result.len() > 1,
+            "should wrap at narrow width, got {} lines: {:?}",
+            result.len(),
+            result
+        );
     }
 
     #[test]
@@ -1161,20 +1251,33 @@ mod tests {
 
     #[test]
     fn inlines_to_lines_wraps_with_prefix_on_first_line_only() {
-        let inlines = vec![
-            MarkdownInline::Text("aaa bbb ccc ddd eee fff ggg".to_string()),
-        ];
+        let inlines = vec![MarkdownInline::Text(
+            "aaa bbb ccc ddd eee fff ggg".to_string(),
+        )];
         // Width 10, indent 2, prefix "# ". So first line has "  # " (4 chars)
         // leaving 6 chars for content. Second (wrapped) line has "  " (2 chars)
         // leaving 8 chars for content.
         let result = inlines_to_lines(&inlines, 2, Some("# ".to_string()), 10);
-        assert!(result.len() >= 2, "should wrap, got {} lines: {:?}", result.len(), result);
+        assert!(
+            result.len() >= 2,
+            "should wrap, got {} lines: {:?}",
+            result.len(),
+            result
+        );
         // First line starts with "  # " (prefix only on first line)
-        assert!(result[0].to_string().starts_with("  # "), "first line should have prefix: {:?}", result[0].to_string());
+        assert!(
+            result[0].to_string().starts_with("  # "),
+            "first line should have prefix: {:?}",
+            result[0].to_string()
+        );
         // Subsequent lines start with indent-only (no prefix)
         for line in result.iter().skip(1) {
             let text = line.to_string();
-            assert!(!text.starts_with("  # "), "continuation line should not have prefix: {:?}", text);
+            assert!(
+                !text.starts_with("  # "),
+                "continuation line should not have prefix: {:?}",
+                text
+            );
         }
     }
 
@@ -1182,19 +1285,34 @@ mod tests {
 
     #[test]
     fn to_ratatui_color_opaque() {
-        let c = to_ratatui_color(syntect::highlighting::Color { r: 255, g: 0, b: 0, a: 255 });
+        let c = to_ratatui_color(syntect::highlighting::Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        });
         assert_eq!(c, Color::Rgb(255, 0, 0));
     }
 
     #[test]
     fn to_ratatui_color_transparent() {
-        let c = to_ratatui_color(syntect::highlighting::Color { r: 255, g: 0, b: 0, a: 0 });
+        let c = to_ratatui_color(syntect::highlighting::Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 0,
+        });
         assert_eq!(c, Color::Reset);
     }
 
     #[test]
     fn to_ratatui_color_semi_transparent() {
-        let c = to_ratatui_color(syntect::highlighting::Color { r: 255, g: 0, b: 0, a: 100 });
+        let c = to_ratatui_color(syntect::highlighting::Color {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 100,
+        });
         assert_eq!(c, Color::Reset, "alpha < 128 → Reset");
     }
 
@@ -1212,16 +1330,31 @@ mod tests {
         // Line 0: header "tool result: run_riscv"
         assert_eq!(lines[0].to_string(), "tool result: run_riscv");
         // Line 1: blank separator; Line 2: ```rust
-        assert!(lines[2].to_string().contains("```rust"), "{}", lines[2].to_string());
+        assert!(
+            lines[2].to_string().contains("```rust"),
+            "{}",
+            lines[2].to_string()
+        );
         // The highlighted line for "fn main() {}" should have colour spans
-        let has_colour = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
-            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
-        });
-        assert!(has_colour, "Rust code in tool result should have coloured spans");
+        let has_colour = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
+        assert!(
+            has_colour,
+            "Rust code in tool result should have coloured spans"
+        );
         // The closing fence and the output should be present
-        let all_text: String = lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        let all_text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(all_text.contains("```"), "should contain closing fence");
-        assert!(all_text.contains("hello"), "should contain execution output");
+        assert!(
+            all_text.contains("hello"),
+            "should contain execution output"
+        );
     }
 
     #[test]
@@ -1235,7 +1368,11 @@ mod tests {
         let lines = session_message_lines(&msg, 80);
         assert_eq!(lines[0].to_string(), "tool result: echo");
         assert!(lines.len() >= 2, "should have body line");
-        let body: String = lines[1..].iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        let body: String = lines[1..]
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("hello world"), "body should contain the text");
     }
 
@@ -1251,11 +1388,19 @@ mod tests {
         assert_eq!(lines[0].to_string(), "tool error: run_riscv");
         // Error results should NOT have syntax highlighting — they should
         // render the content verbatim (no colour spans from syntect).
-        let has_syntax_colour = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
-            matches!(s.style.fg, Some(Color::Rgb(_, _, _)))
-        });
-        assert!(!has_syntax_colour, "error tool result should not have coloured spans");
-        let body: String = lines[1..].iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n");
+        let has_syntax_colour = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
+        assert!(
+            !has_syntax_colour,
+            "error tool result should not have coloured spans"
+        );
+        let body: String = lines[1..]
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(body.contains("```rust"), "error body should be verbatim");
     }
 }

@@ -61,7 +61,10 @@ pub(crate) fn execute_load_tools(
         Err(e) => return format!("invalid arguments: {e}"),
     };
     let groups: Vec<String> = match args.get("groups").and_then(|v| v.as_array()) {
-        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
         None => return "missing required argument: groups".to_string(),
     };
 
@@ -90,7 +93,10 @@ pub(crate) fn execute_unload_tools(
         Err(e) => return format!("invalid arguments: {e}"),
     };
     let groups: Vec<String> = match args.get("groups").and_then(|v| v.as_array()) {
-        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
         None => return "missing required argument: groups".to_string(),
     };
 
@@ -135,23 +141,23 @@ mod tests {
     #[test]
     fn test_execute_load_tools_skips_already_active() {
         let mut active: std::collections::HashSet<String> =
-            ["core".into(), "git".into(), "shell".into()].into_iter().collect();
+            ["core".into(), "git".into(), "shell".into()]
+                .into_iter()
+                .collect();
         let result = execute_load_tools(&mut active, r#"{"groups": ["shell"]}"#);
         assert_eq!(result, "All specified groups were already active.");
     }
 
     #[test]
     fn test_execute_load_tools_invalid_json() {
-        let mut active: std::collections::HashSet<String> =
-            ["core".into()].into_iter().collect();
+        let mut active: std::collections::HashSet<String> = ["core".into()].into_iter().collect();
         let result = execute_load_tools(&mut active, "not json");
         assert!(result.starts_with("invalid arguments:"));
     }
 
     #[test]
     fn test_execute_load_tools_missing_categories() {
-        let mut active: std::collections::HashSet<String> =
-            ["core".into()].into_iter().collect();
+        let mut active: std::collections::HashSet<String> = ["core".into()].into_iter().collect();
         let result = execute_load_tools(&mut active, r#"{"wrong": []}"#);
         assert_eq!(result, "missing required argument: groups");
     }
@@ -159,7 +165,9 @@ mod tests {
     #[test]
     fn test_execute_unload_tools_removes_groups() {
         let mut active: std::collections::HashSet<String> =
-            ["core".into(), "git".into(), "shell".into(), "x".into()].into_iter().collect();
+            ["core".into(), "git".into(), "shell".into(), "x".into()]
+                .into_iter()
+                .collect();
         let result = execute_unload_tools(&mut active, r#"{"groups": ["x"]}"#);
         assert_eq!(result, "Deactivated tool groups: x");
         assert!(!active.contains("x"));
@@ -178,8 +186,7 @@ mod tests {
 
     #[test]
     fn test_execute_unload_tools_skips_inactive() {
-        let mut active: std::collections::HashSet<String> =
-            ["core".into()].into_iter().collect();
+        let mut active: std::collections::HashSet<String> = ["core".into()].into_iter().collect();
         let result = execute_unload_tools(&mut active, r#"{"groups": ["x", "vm"]}"#);
         assert_eq!(result, "None of the specified groups were active.");
     }

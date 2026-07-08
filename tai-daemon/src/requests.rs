@@ -1,6 +1,5 @@
 use crate::context;
 use crate::db::write_message_retry;
-use tracing::debug;
 use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatAssistantToolUse, ChatRequestMessage,
     ChatToolCall, ChatTurnResult, CompletionChunkKind, OpenAiClient,
@@ -10,13 +9,14 @@ use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult}
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Duration;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata,
     MAX_IMAGE_CHUNK_SIZE, OutputStream, SessionMessage, SessionStatus,
 };
-use std::sync::mpsc;
+use tracing::debug;
 
 /// Route an image-sync broadcast through the session command channel so the
 /// main session thread dispatches it to its live subscriber map.
@@ -36,27 +36,21 @@ fn emit_prepared_image_sync(
         byte_len,
         alt: image.alt,
     };
-    let _ = cmd_tx.send(SessionCommand::Broadcast(
-        DaemonMessage::ImageStart {
-            request_id,
-            metadata,
-        },
-    ));
+    let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::ImageStart {
+        request_id,
+        metadata,
+    }));
     for chunk in image.data.chunks(MAX_IMAGE_CHUNK_SIZE) {
-        let _ = cmd_tx.send(SessionCommand::Broadcast(
-            DaemonMessage::ImageChunk {
-                request_id,
-                image_id,
-                data: chunk.to_vec(),
-            },
-        ));
-    }
-    let _ = cmd_tx.send(SessionCommand::Broadcast(
-        DaemonMessage::ImageEnd {
+        let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::ImageChunk {
             request_id,
             image_id,
-        },
-    ));
+            data: chunk.to_vec(),
+        }));
+    }
+    let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::ImageEnd {
+        request_id,
+        image_id,
+    }));
 }
 
 /// Check whether a cancellation signal has been received from an `mpsc` channel.
@@ -83,25 +77,25 @@ fn refresh_session_context(
     cwd: &Path,
     context_config: &context::ContextConfig,
 ) {
-    if let Some(old_fp) = session.context_fingerprint {
-        if let Some(idx) = session.context_message_index {
-            if let Ok(Some(new_bundle)) =
-                context::recheck_context(cwd, context_config, old_fp)
-            {
-                let new_content = context::assemble_context(&new_bundle);
-                if !new_content.is_empty() {
-                    session.set_message(idx, SessionMessage::SystemText {
-                        content: new_content,
-                    });
-                }
-                session.context_fingerprint = Some(new_bundle.fingerprint);
-                session.context_file_paths =
-                    new_bundle.files.iter().map(|f| f.path.clone()).collect();
-            }
+    if let Some(old_fp) = session.context_fingerprint
+        && let Some(idx) = session.context_message_index
+        && let Ok(Some(new_bundle)) = context::recheck_context(cwd, context_config, old_fp)
+    {
+        let new_content = context::assemble_context(&new_bundle);
+        if !new_content.is_empty() {
+            session.set_message(
+                idx,
+                SessionMessage::SystemText {
+                    content: new_content,
+                },
+            );
         }
+        session.context_fingerprint = Some(new_bundle.fingerprint);
+        session.context_file_paths = new_bundle.files.iter().map(|f| f.path.clone()).collect();
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_agent_loop(
     client: &OpenAiClient,
     session: &mut SessionState,
@@ -123,7 +117,7 @@ pub(crate) fn run_agent_loop(
         debug!(session_id, turn, "agent loop turn");
         crate::metrics::record_turn(model);
         let tools = tool_registry.available_definitions(&session.active_tool_groups);
-        if is_cancelled(&cancel_rx, &mut false) {
+        if is_cancelled(cancel_rx, &mut false) {
             return Ok(true);
         }
 
@@ -132,7 +126,10 @@ pub(crate) fn run_agent_loop(
             refresh_session_context(session, &session_cwd, &context_config);
         }
 
-        if cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Inference)).is_err() {
+        if cmd_tx
+            .send(SessionCommand::StatusChanged(SessionStatus::Inference))
+            .is_err()
+        {
             return Ok(false);
         }
 
@@ -163,13 +160,11 @@ pub(crate) fn run_agent_loop(
                     CompletionChunkKind::Answer => OutputStream::Answer,
                     CompletionChunkKind::Reasoning => OutputStream::Reasoning,
                 };
-                let _ = cmd_tx.send(SessionCommand::Broadcast(
-                    DaemonMessage::OutputChunk {
-                        request_id,
-                        stream,
-                        data: text.into_bytes(),
-                    },
-                ));
+                let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::OutputChunk {
+                    request_id,
+                    stream,
+                    data: text.into_bytes(),
+                }));
                 Ok(())
             },
         ) {
@@ -190,29 +185,36 @@ pub(crate) fn run_agent_loop(
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 persist_assistant_tool_use_sync(session, session_id, db, &tool_use);
                 for tool_call in tool_use.tool_calls {
-                    if is_cancelled(&cancel_rx, &mut false) {
+                    if is_cancelled(cancel_rx, &mut false) {
                         return Ok(true);
                     }
 
-                    let _ = cmd_tx.send(SessionCommand::Broadcast(
-                        DaemonMessage::ToolCallStarted {
+                    let _ =
+                        cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::ToolCallStarted {
                             request_id,
                             call_id: tool_call.id.clone(),
                             tool_name: tool_call.name.clone(),
                             arguments_json: tool_call.arguments_json.clone(),
-                        },
-                    ));
+                        }));
 
                     let tool_timeout = if tool_call.name == "spawn_subsession" {
                         Duration::from_secs(120)
-                    } else if tool_call.name == "sh" || tool_call.name == "nushell"
-                        || tool_call.name == "fish" || tool_call.name == "exec" {
+                    } else if tool_call.name == "sh"
+                        || tool_call.name == "nushell"
+                        || tool_call.name == "fish"
+                        || tool_call.name == "exec"
+                    {
                         Duration::from_secs(300)
                     } else {
                         Duration::from_secs(60)
                     };
 
-                    if cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::ToolCall(tool_call.name.clone()))).is_err() {
+                    if cmd_tx
+                        .send(SessionCommand::StatusChanged(SessionStatus::ToolCall(
+                            tool_call.name.clone(),
+                        )))
+                        .is_err()
+                    {
                         return Ok(false);
                     }
 
@@ -283,6 +285,7 @@ pub(crate) fn run_agent_loop(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_tool_call(
     cmd_tx: &mpsc::Sender<SessionCommand>,
     request_id: u32,
@@ -299,12 +302,17 @@ fn finish_tool_call(
         session.cwd.as_deref(),
         &session.context_file_paths,
     ) {
-        output.result.content =
-            format!("{}\n\n---\n{}", output.result.content, hint);
+        output.result.content = format!("{}\n\n---\n{}", output.result.content, hint);
     }
 
     if let Some(image) = output.image.take() {
-        let PreparedImage { mime_type, data, width, height, alt } = image;
+        let PreparedImage {
+            mime_type,
+            data,
+            width,
+            height,
+            alt,
+        } = image;
 
         emit_prepared_image_sync(
             cmd_tx,
@@ -373,6 +381,7 @@ fn finish_tool_call(
     let _ = cmd_tx.send(SessionCommand::Broadcast(event));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_tool_with_timeout(
     tool_registry: &Arc<ToolRegistry>,
     tool_call: &crate::openai::ChatToolCall,
@@ -501,7 +510,11 @@ fn execute_tool_with_timeout(
         // sent between tool start and our first recv_timeout is honoured
         // immediately rather than waiting up to check_interval.
         if is_cancelled(cancel_rx, &mut was_cancelled) {
-            crate::metrics::record_tool_execution(&tool_call.name, exec_start.elapsed().as_secs_f64(), true);
+            crate::metrics::record_tool_execution(
+                &tool_call.name,
+                exec_start.elapsed().as_secs_f64(),
+                true,
+            );
             return ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("tool '{}' cancelled", tool_call.name),
@@ -513,7 +526,11 @@ fn execute_tool_with_timeout(
 
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            crate::metrics::record_tool_execution(&tool_call.name, exec_start.elapsed().as_secs_f64(), true);
+            crate::metrics::record_tool_execution(
+                &tool_call.name,
+                exec_start.elapsed().as_secs_f64(),
+                true,
+            );
             return ToolExecutionOutput {
                 result: ToolResult {
                     content: format!(
@@ -529,12 +546,20 @@ fn execute_tool_with_timeout(
 
         match result_rx.recv_timeout(remaining.min(check_interval)) {
             Ok(output) => {
-                crate::metrics::record_tool_execution(&tool_call.name, exec_start.elapsed().as_secs_f64(), output.result.is_error);
+                crate::metrics::record_tool_execution(
+                    &tool_call.name,
+                    exec_start.elapsed().as_secs_f64(),
+                    output.result.is_error,
+                );
                 return output;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                crate::metrics::record_tool_execution(&tool_call.name, exec_start.elapsed().as_secs_f64(), true);
+                crate::metrics::record_tool_execution(
+                    &tool_call.name,
+                    exec_start.elapsed().as_secs_f64(),
+                    true,
+                );
                 return ToolExecutionOutput {
                     result: ToolResult {
                         content: "tool execution thread panicked".to_string(),
@@ -658,6 +683,7 @@ fn execute_get_session_sync(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_spawn_subsession_sync(
     _client: &OpenAiClient,
     daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
@@ -709,7 +735,11 @@ fn execute_spawn_subsession_sync(
     let categories = args
         .get("categories")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_else(|| parent_session.active_tool_groups.iter().cloned().collect());
 
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
@@ -739,7 +769,7 @@ fn execute_spawn_subsession_sync(
                 // Cancellation is one-shot: `is_cancelled` reads the channel once
                 // and then caches the result so subsequent iterations don't need
                 // to re-check the (now-empty) channel.
-                if is_cancelled(&cancel_rx, &mut was_cancelled) {
+                if is_cancelled(cancel_rx, &mut was_cancelled) {
                     let _ =
                         child_tx.send(crate::sessions::SessionCommand::Cancel { request_id: 1 });
                     return ToolExecutionOutput {
@@ -964,7 +994,9 @@ mod tests {
 
     #[test]
     fn build_chat_request_messages_system_text() {
-        let msgs = [SessionMessage::SystemText { content: "system prompt".into() }];
+        let msgs = [SessionMessage::SystemText {
+            content: "system prompt".into(),
+        }];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "system");
@@ -973,7 +1005,9 @@ mod tests {
 
     #[test]
     fn build_chat_request_messages_user_text() {
-        let msgs = [SessionMessage::UserText { content: "hello".into() }];
+        let msgs = [SessionMessage::UserText {
+            content: "hello".into(),
+        }];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "user");
@@ -982,7 +1016,9 @@ mod tests {
 
     #[test]
     fn build_chat_request_messages_assistant_text() {
-        let msgs = [SessionMessage::AssistantText { content: "hi".into() }];
+        let msgs = [SessionMessage::AssistantText {
+            content: "hi".into(),
+        }];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "assistant");
@@ -1031,7 +1067,9 @@ mod tests {
     #[test]
     fn build_chat_request_messages_skips_displayed_image() {
         let msgs = [
-            SessionMessage::UserText { content: "hello".into() },
+            SessionMessage::UserText {
+                content: "hello".into(),
+            },
             SessionMessage::DisplayedImage(DisplayedImageRecord {
                 metadata: ImageMetadata {
                     image_id: 0,
@@ -1043,7 +1081,9 @@ mod tests {
                 },
                 data: vec![],
             }),
-            SessionMessage::AssistantText { content: "hi".into() },
+            SessionMessage::AssistantText {
+                content: "hi".into(),
+            },
         ];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 2);
@@ -1113,14 +1153,21 @@ mod tests {
         let (daemon_tx, _) = mpsc::channel::<DaemonCommand>();
         let output = execute_get_session_sync(&daemon_tx, r#"{}"#);
         assert!(output.result.is_error);
-        assert_eq!(output.result.content, "missing required argument: session_id");
+        assert_eq!(
+            output.result.content,
+            "missing required argument: session_id"
+        );
     }
 
     #[test]
     fn execute_get_session_sync_found() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            if let Ok(DaemonCommand::GetSession { session_id: 1, reply }) = daemon_rx.recv() {
+            if let Ok(DaemonCommand::GetSession {
+                session_id: 1,
+                reply,
+            }) = daemon_rx.recv()
+            {
                 let _ = reply.send(Some(SessionSummary {
                     session_id: 1,
                     title: Some("Test".into()),
@@ -1146,7 +1193,11 @@ mod tests {
     fn execute_get_session_sync_not_found() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            if let Ok(DaemonCommand::GetSession { session_id: 99, reply }) = daemon_rx.recv() {
+            if let Ok(DaemonCommand::GetSession {
+                session_id: 99,
+                reply,
+            }) = daemon_rx.recv()
+            {
                 let _ = reply.send(None);
             }
         });
@@ -1374,17 +1425,17 @@ mod tests {
         let result = execute_tool_with_timeout(
             &registry,
             &tool_call,
-            None,                   // x_credentials
-            None,                   // cwd
+            None, // x_credentials
+            None, // cwd
             timeout_dur,
-            1,                      // request_id
+            1, // request_id
             &daemon_tx,
             &client,
             &db,
             &mut session,
-            1,                      // session_id
+            1, // session_id
             "test-model",
-            25,                     // max_turns_default
+            25, // max_turns_default
             &cancel_rx,
             &cmd_tx,
         );
@@ -1394,9 +1445,23 @@ mod tests {
     #[test]
     fn execute_tool_normal_completion() {
         let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let (result, _cmd_rx) = run_exec_tool(FastTestTool, "_test_fast", "{}", Duration::from_secs(60), cancel_rx);
-        assert!(!result.result.is_error, "expected success: {}", result.result.content);
-        assert!(result.result.content.contains("fast result"), "{}", result.result.content);
+        let (result, _cmd_rx) = run_exec_tool(
+            FastTestTool,
+            "_test_fast",
+            "{}",
+            Duration::from_secs(60),
+            cancel_rx,
+        );
+        assert!(
+            !result.result.is_error,
+            "expected success: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("fast result"),
+            "{}",
+            result.result.content
+        );
     }
 
     #[test]
@@ -1405,9 +1470,23 @@ mod tests {
         cancel_tx.send(()).expect("send cancel");
         drop(cancel_tx);
 
-        let (result, _cmd_rx) = run_exec_tool(FastTestTool, "_test_fast", "{}", Duration::from_secs(60), cancel_rx);
-        assert!(result.result.is_error, "expected error: {}", result.result.content);
-        assert!(result.result.content.contains("cancelled"), "{}", result.result.content);
+        let (result, _cmd_rx) = run_exec_tool(
+            FastTestTool,
+            "_test_fast",
+            "{}",
+            Duration::from_secs(60),
+            cancel_rx,
+        );
+        assert!(
+            result.result.is_error,
+            "expected error: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("cancelled"),
+            "{}",
+            result.result.content
+        );
     }
 
     #[test]
@@ -1425,8 +1504,16 @@ mod tests {
             cancel_rx,
         );
 
-        assert!(result.result.is_error, "expected error: {}", result.result.content);
-        assert!(result.result.content.contains("timed out"), "{}", result.result.content);
+        assert!(
+            result.result.is_error,
+            "expected error: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("timed out"),
+            "{}",
+            result.result.content
+        );
 
         // Unblock the tool execution thread so it can exit cleanly.
         drop(proceed_tx);
@@ -1444,13 +1531,20 @@ mod tests {
         // through the Tool trait, this test at least verifies the error
         // message matches what execute_tool_with_timeout produces.
         let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let (result, _cmd_rx) = run_exec_tool(FastTestTool, "_test_fast", "{}", Duration::from_millis(10), cancel_rx);
+        let (result, _cmd_rx) = run_exec_tool(
+            FastTestTool,
+            "_test_fast",
+            "{}",
+            Duration::from_millis(10),
+            cancel_rx,
+        );
         // With a 10ms timeout and an instant tool, we might get either the
         // result (fast tool wins) or a timeout.  Neither is wrong — the
         // disconnected case is exercised elsewhere.
         if result.result.is_error {
             assert!(
-                result.result.content.contains("panicked") || result.result.content.contains("timed out"),
+                result.result.content.contains("panicked")
+                    || result.result.content.contains("timed out"),
                 "unexpected error: {}",
                 result.result.content
             );
@@ -1519,8 +1613,16 @@ mod tests {
             cancel_rx,
         );
 
-        assert!(!result.result.is_error, "expected success: {}", result.result.content);
-        assert!(result.result.content.contains("streaming done"), "{}", result.result.content);
+        assert!(
+            !result.result.is_error,
+            "expected success: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("streaming done"),
+            "{}",
+            result.result.content
+        );
 
         // Verify the streaming payload was forwarded to cmd_tx.
         // The forwarding thread sends the payload before the tool result is

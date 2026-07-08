@@ -78,12 +78,12 @@ fn load_global_files(files: &mut Vec<DiscoveredFile>, config: &ContextConfig) ->
         }
     }
 
-    if !config.disable_claude_code_prompt {
-        if let Some(home) = dirs::home_dir() {
-            let path = home.join(".claude").join("CLAUDE.md");
-            if let Some(df) = try_load_file(&path) {
-                files.push(df);
-            }
+    if !config.disable_claude_code_prompt
+        && let Some(home) = dirs::home_dir()
+    {
+        let path = home.join(".claude").join("CLAUDE.md");
+        if let Some(df) = try_load_file(&path) {
+            files.push(df);
         }
     }
 
@@ -112,11 +112,11 @@ fn load_project_files(
     while let Some(dir) = current {
         for name in &config.context_file_names {
             let path = dir.join(name);
-            if let Some(df) = try_load_file(&path) {
-                if seen.insert(df.path.clone()) {
-                    found.push(df);
-                    break;
-                }
+            if let Some(df) = try_load_file(&path)
+                && seen.insert(df.path.clone())
+            {
+                found.push(df);
+                break;
             }
         }
 
@@ -273,10 +273,10 @@ fn scan_skills_dir(dir: &Path, skills: &mut Vec<SkillMeta>, seen: &mut HashSet<P
             continue;
         }
         let skill_md = path.join("SKILL.md");
-        if let Some(meta) = parse_skill_metadata(&skill_md) {
-            if seen.insert(skill_md.clone()) {
-                skills.push(meta);
-            }
+        if let Some(meta) = parse_skill_metadata(&skill_md)
+            && seen.insert(skill_md.clone())
+        {
+            skills.push(meta);
         }
     }
 }
