@@ -183,6 +183,8 @@ fn parse_command(
                 parent_session_id: None,
                 cwd: None,
                 max_turns: None,
+                context_config: None,
+                account_name: None,
             });
         }
         if sub == "new" {
@@ -191,6 +193,8 @@ fn parse_command(
                 parent_session_id: None,
                 cwd: None,
                 max_turns: None,
+                context_config: None,
+                account_name: None,
             });
         }
         if sub == "list" {
@@ -236,6 +240,50 @@ fn parse_command(
 
     if rest == "model" {
         return ShellCommand::Send(ClientMessage::ListModels);
+    }
+
+    if let Some(args) = rest.strip_prefix("account ") {
+        let args = args.trim();
+        if args.is_empty() {
+            return ShellCommand::UnknownCommand(
+                "usage: /account list | /account remove <name> | /account default <name> | /account <name>".to_string()
+            );
+        }
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        match parts[0] {
+            "list" => {
+                return ShellCommand::Send(ClientMessage::ListAccounts);
+            }
+            "remove" => {
+                if parts.len() < 2 {
+                    return ShellCommand::UnknownCommand(
+                        "usage: /account remove <name>".to_string(),
+                    );
+                }
+                return ShellCommand::Send(ClientMessage::RemoveAccount {
+                    name: parts[1].to_string(),
+                });
+            }
+            "default" => {
+                if parts.len() < 2 {
+                    return ShellCommand::UnknownCommand(
+                        "usage: /account default <name>".to_string(),
+                    );
+                }
+                return ShellCommand::Send(ClientMessage::SetDefaultAccount {
+                    name: parts[1].to_string(),
+                });
+            }
+            // /account <name> — switch the attached session to this account
+            name => {
+                return ShellCommand::Send(ClientMessage::SetSessionAccount {
+                    name: name.to_string(),
+                });
+            }
+        }
+    }
+    if rest == "account" {
+        return ShellCommand::Send(ClientMessage::ListAccounts);
     }
 
     ShellCommand::UnknownCommand(format!("unknown command: /{rest}"))

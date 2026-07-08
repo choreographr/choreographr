@@ -87,17 +87,20 @@ Defines all shared message types and framing. No dependencies on other workspace
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
 `TestImage`, `Cancel`, `Ping`, `GetCredential`, `ListModels`, `SetModel`, `Unlock`,
-`Lock`, `AddCredential`, `RemoveCredential`
+`Lock`, `AddCredential`, `RemoveCredential`, `AddAccount`, `RemoveAccount`,
+`ListAccounts`, `SetDefaultAccount`, `SetSessionAccount`
+- `CreateSession` now carries optional `context_config` and `account_name` fields
 
 `DaemonMessage` variants:
-- Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionMessageAppended`, `SessionFailed`
+- Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionMessageAppended`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`
 - Request lifecycle: `Started`, `OutputChunk`, `Done`, `Failed`, `Cancelled`
-- Tool lifecycle: `ToolCallStarted`, `ToolCallFinished`, `ToolCallFailed`
+- Tool lifecycle: `ToolCallStarted`, `ToolCallFinished`, `ToolCallFailed`, `ToolCallOutput`
 - Image streaming: `ImageStart`, `ImageChunk`, `ImageEnd`
 - Model management: `Models`, `ModelsFailed`, `ModelSelected`, `ModelSelectionFailed`
 - Locking: `Unlocked`, `Locked`, `LockedError`
 - Credential management: `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`
-- Misc: `Pong`
+- Account management: `AccountAdded`, `AccountAddFailed`, `AccountRemoved`, `AccountRemoveFailed`, `Accounts`, `AccountListFailed`, `DefaultAccountSet`, `DefaultAccountSetFailed`, `SessionAccountSet`
+- Misc: `Pong`, `ShuttingDown`
 
 **Wire format:**
 
@@ -180,10 +183,12 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 **Module breakdown:**
 
 | Module | Purpose |
-|---|---|
+|---|---|---|
 | `server/lifecycle.rs` | Accept loop (non-blocking `UnixListener` + 50ms poll), signal handling (`signal_hook::flag`), shutdown orchestration. |
 | `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
-| `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking. `DaemonState` is owned by this thread only (no shared state). |
+| `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
+| `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. |
+| `providers/` | `InferenceProvider` enum wrapping provider-specific clients (OpenAI, future Anthropic). Provides a uniform interface for chat completion, streaming, and model listing. |
 | `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Each session has a control thread; request work runs on separate worker threads. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
@@ -328,7 +333,8 @@ startup                    /unlock [passphrase]
    │                              │
    │  locked                      │  read identity.pk (or decrypt identity.pk.enc)
    │  (no credentials)            │  decrypt all credential blobs from database
-   │                              │  build OpenAiClient if openai key found
+   │                              │  load accounts from accounts.toml
+   │                              │  resolve InferenceProvider per account
    │                              │  → Unlocked (ready)
    ▼                              ▼
 ```
@@ -438,7 +444,7 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 | `meta` | `&str` | `u64` counter |
 
 `SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `cwd`,
-`message_count`, `created_at`.
+`message_count`, `created_at`, `context_config`, `account_name`.
 
 ### Session state (in-memory)
 
@@ -450,6 +456,9 @@ Each active session has a `SessionState` owned by its control thread:
 - `cwd: Option<PathBuf>` — working directory for filesystem tools
 - `max_turns: Option<u32>` — per-session tool loop iteration cap (inherits from parent)
 - `created_at: i64` — Unix timestamp of creation
+- `context_config: ContextConfig` — file discovery settings (context file names, max bytes)
+- `account_name: Option<String>` — inference account assigned to this session
+- `provider: Option<InferenceProvider>` — resolved inference provider for the account
 - `messages: Vec<SessionMessage>` — conversation history (also persisted to DB)
 - `active_requests: HashMap<u32, ActiveRequest>` — running request cancel flags
 - `subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>` — attached clients

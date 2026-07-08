@@ -289,6 +289,52 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             handler.push_text("[daemon] shutting down".to_string());
             Ok(None)
         }
+        DaemonMessage::AccountAdded { name } => {
+            handler.push_text(format!("[daemon] account added: {name}"));
+            Ok(None)
+        }
+        DaemonMessage::AccountAddFailed { name, error } => {
+            handler.push_text(format!("[daemon] failed to add account {name}: {error}"));
+            Ok(None)
+        }
+        DaemonMessage::AccountRemoved { name } => {
+            handler.push_text(format!("[daemon] account removed: {name}"));
+            Ok(None)
+        }
+        DaemonMessage::AccountRemoveFailed { name, error } => {
+            handler.push_text(format!("[daemon] failed to remove account {name}: {error}"));
+            Ok(None)
+        }
+        DaemonMessage::Accounts { accounts } => {
+            if accounts.is_empty() {
+                handler.push_text("[daemon] no accounts configured".to_string());
+            } else {
+                handler.push_text(format!("[daemon] accounts ({})", accounts.len()));
+                for a in &accounts {
+                    let model = a.model.as_deref().unwrap_or("-");
+                    handler.push_text(format!("  {}: {} (model: {})", a.name, a.provider, model));
+                }
+            }
+            Ok(None)
+        }
+        DaemonMessage::AccountListFailed { error } => {
+            handler.push_text(format!("[daemon] failed to list accounts: {error}"));
+            Ok(None)
+        }
+        DaemonMessage::SessionAccountSet { account } => {
+            handler.push_text(format!("[daemon] session account set: {account}"));
+            Ok(None)
+        }
+        DaemonMessage::DefaultAccountSet { name } => {
+            handler.push_text(format!("[daemon] default account set: {name}"));
+            Ok(None)
+        }
+        DaemonMessage::DefaultAccountSetFailed { name, error } => {
+            handler.push_text(format!(
+                "[daemon] failed to set default account {name}: {error}"
+            ));
+            Ok(None)
+        }
         _ => Ok(None),
     }
 }

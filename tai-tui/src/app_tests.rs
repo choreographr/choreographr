@@ -1301,6 +1301,8 @@ mod session_manager_key_tests {
                 parent_session_id: None,
                 cwd: None,
                 max_turns: None,
+                context_config: None,
+                account_name: None,
             }
         );
     }

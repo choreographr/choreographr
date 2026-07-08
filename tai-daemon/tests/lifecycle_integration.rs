@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use tai_daemon::accounts::AccountManager;
 use tai_daemon::{DaemonState, run_server};
 use tai_proto::{ClientMessage, DaemonMessage, read_message_sync, write_message_sync};
 
@@ -16,13 +17,17 @@ fn test_daemon_state() -> DaemonState {
     let db =
         Arc::new(redb::Database::create(dir.path().join("state.redb")).expect("test database"));
     let tool_registry = tai_daemon::tools::ToolRegistry::new().build();
+    let config_dir = tempfile::tempdir().expect("tempdir for config");
+    let accounts_path = config_dir.path().join("accounts.toml");
 
     DaemonState {
         next_session_id: 1,
         max_turns: 10,
         active_sessions: HashMap::new(),
         session_metadata: HashMap::new(),
-        openai_client: None,
+        accounts: AccountManager::load(&accounts_path).unwrap(),
+        providers: HashMap::new(),
+        default_account: None,
         credentials: HashMap::new(),
         x_credentials: None,
         db,
@@ -30,7 +35,7 @@ fn test_daemon_state() -> DaemonState {
         daemon_tx,
         client_streams: Vec::new(),
         summary_subscribers: HashMap::new(),
-        model_cache: None,
+        model_cache: HashMap::new(),
     }
 }
 

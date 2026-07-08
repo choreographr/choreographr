@@ -1163,6 +1163,8 @@ impl App {
                             parent_session_id: None,
                             cwd: None,
                             max_turns: None,
+                            context_config: None,
+                            account_name: None,
                         })
                         .map_err(broken_pipe)?;
                 }

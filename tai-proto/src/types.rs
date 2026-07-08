@@ -2,6 +2,71 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_IMAGE_CHUNK_SIZE: usize = 64 * 1024;
 
+/// ContextConfig — controls file discovery for session context.
+/// Moved here from tai-daemon so proto messages can carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextConfig {
+    #[serde(default = "default_context_file_names")]
+    pub context_file_names: Vec<String>,
+    #[serde(default = "default_context_file_max_bytes")]
+    pub context_file_max_bytes: usize,
+    #[serde(default)]
+    pub disable_claude_code_prompt: bool,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            context_file_names: default_context_file_names(),
+            context_file_max_bytes: default_context_file_max_bytes(),
+            disable_claude_code_prompt: false,
+        }
+    }
+}
+
+fn default_context_file_names() -> Vec<String> {
+    vec!["AGENTS.md".to_string(), "CLAUDE.md".to_string()]
+}
+
+fn default_context_file_max_bytes() -> usize {
+    32 * 1024
+}
+
+/// Unified error type for all inference providers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+pub enum InferenceError {
+    #[error("unauthorized ({status}): {detail}")]
+    Unauthorized { status: u16, detail: String },
+    #[error("rate limited: {detail}")]
+    RateLimited {
+        retry_after_secs: Option<u64>,
+        detail: String,
+    },
+    #[error("server error ({status}): {detail}")]
+    ServerError { status: u16, detail: String },
+    #[error("client error ({status}): {detail}")]
+    ClientError { status: u16, detail: String },
+    #[error("provider returned an empty response")]
+    EmptyResponse,
+    #[error("request cancelled during retry backoff")]
+    Cancelled,
+    #[error("{0}")]
+    Io(String),
+}
+
+impl From<InferenceError> for std::io::Error {
+    fn from(e: InferenceError) -> Self {
+        std::io::Error::other(e.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountInfo {
+    pub name: String,
+    pub provider: String,
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DisplayedImageRecord {
     pub metadata: ImageMetadata,
@@ -80,6 +145,8 @@ pub enum ClientMessage {
         parent_session_id: Option<u64>,
         cwd: Option<String>,
         max_turns: Option<u32>,
+        context_config: Option<ContextConfig>,
+        account_name: Option<String>,
     },
     ListSessions,
     SubscribeSessionsSummary,
@@ -122,6 +189,26 @@ pub enum ClientMessage {
     },
     DeleteSession {
         session_id: u64,
+    },
+    AddAccount {
+        name: String,
+        provider: String,
+        model: Option<String>,
+        base_url: Option<String>,
+        streaming: Option<bool>,
+        retry_max_attempts: Option<u32>,
+        connect_timeout_secs: Option<u64>,
+        request_timeout_secs: Option<u64>,
+    },
+    RemoveAccount {
+        name: String,
+    },
+    ListAccounts,
+    SetDefaultAccount {
+        name: String,
+    },
+    SetSessionAccount {
+        name: String,
     },
 }
 
@@ -279,6 +366,36 @@ pub enum DaemonMessage {
     Credential {
         service: String,
         key: Option<String>,
+    },
+    AccountAdded {
+        name: String,
+    },
+    AccountAddFailed {
+        name: String,
+        error: String,
+    },
+    AccountRemoved {
+        name: String,
+    },
+    AccountRemoveFailed {
+        name: String,
+        error: String,
+    },
+    Accounts {
+        accounts: Vec<AccountInfo>,
+    },
+    AccountListFailed {
+        error: String,
+    },
+    SessionAccountSet {
+        account: String,
+    },
+    DefaultAccountSet {
+        name: String,
+    },
+    DefaultAccountSetFailed {
+        name: String,
+        error: String,
     },
     ShuttingDown,
 }
@@ -513,6 +630,55 @@ impl DaemonMessage {
     pub fn shutting_down() -> Self {
         Self::ShuttingDown
     }
+
+    pub fn account_added(name: impl Into<String>) -> Self {
+        Self::AccountAdded { name: name.into() }
+    }
+
+    pub fn account_add_failed(name: impl Into<String>, error: impl Into<String>) -> Self {
+        Self::AccountAddFailed {
+            name: name.into(),
+            error: error.into(),
+        }
+    }
+
+    pub fn account_removed(name: impl Into<String>) -> Self {
+        Self::AccountRemoved { name: name.into() }
+    }
+
+    pub fn account_remove_failed(name: impl Into<String>, error: impl Into<String>) -> Self {
+        Self::AccountRemoveFailed {
+            name: name.into(),
+            error: error.into(),
+        }
+    }
+
+    pub fn accounts(accounts: Vec<AccountInfo>) -> Self {
+        Self::Accounts { accounts }
+    }
+
+    pub fn account_list_failed(error: impl Into<String>) -> Self {
+        Self::AccountListFailed {
+            error: error.into(),
+        }
+    }
+
+    pub fn session_account_set(account: impl Into<String>) -> Self {
+        Self::SessionAccountSet {
+            account: account.into(),
+        }
+    }
+
+    pub fn default_account_set(name: impl Into<String>) -> Self {
+        Self::DefaultAccountSet { name: name.into() }
+    }
+
+    pub fn default_account_set_failed(name: impl Into<String>, error: impl Into<String>) -> Self {
+        Self::DefaultAccountSetFailed {
+            name: name.into(),
+            error: error.into(),
+        }
+    }
 }
 
 impl ClientMessage {
@@ -521,12 +687,16 @@ impl ClientMessage {
         parent_session_id: Option<u64>,
         cwd: Option<String>,
         max_turns: Option<u32>,
+        context_config: Option<ContextConfig>,
+        account_name: Option<String>,
     ) -> Self {
         Self::CreateSession {
             title,
             parent_session_id,
             cwd,
             max_turns,
+            context_config,
+            account_name,
         }
     }
 
@@ -610,5 +780,44 @@ impl ClientMessage {
         Self::RemoveCredential {
             service: service.into(),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_account(
+        name: impl Into<String>,
+        provider: impl Into<String>,
+        model: Option<String>,
+        base_url: Option<String>,
+        streaming: Option<bool>,
+        retry_max_attempts: Option<u32>,
+        connect_timeout_secs: Option<u64>,
+        request_timeout_secs: Option<u64>,
+    ) -> Self {
+        Self::AddAccount {
+            name: name.into(),
+            provider: provider.into(),
+            model,
+            base_url,
+            streaming,
+            retry_max_attempts,
+            connect_timeout_secs,
+            request_timeout_secs,
+        }
+    }
+
+    pub fn remove_account(name: impl Into<String>) -> Self {
+        Self::RemoveAccount { name: name.into() }
+    }
+
+    pub fn list_accounts() -> Self {
+        Self::ListAccounts
+    }
+
+    pub fn set_default_account(name: impl Into<String>) -> Self {
+        Self::SetDefaultAccount { name: name.into() }
+    }
+
+    pub fn set_session_account(name: impl Into<String>) -> Self {
+        Self::SetSessionAccount { name: name.into() }
     }
 }

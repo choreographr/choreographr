@@ -1,7 +1,7 @@
 use super::{OpenAiClient, RequestFormat};
-use crate::context::ContextConfig;
 use serde::Deserialize;
 use std::{collections::HashMap, fs, io, path::PathBuf};
+use tai_proto::ContextConfig;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL_LIST_PATH: &str = "/models";

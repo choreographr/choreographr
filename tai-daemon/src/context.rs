@@ -6,36 +6,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-
-const DEFAULT_CONTEXT_FILE_MAX_BYTES: usize = 32 * 1024;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ContextConfig {
-    #[serde(default = "default_context_file_names")]
-    pub context_file_names: Vec<String>,
-    #[serde(default = "default_context_file_max_bytes")]
-    pub context_file_max_bytes: usize,
-    #[serde(default)]
-    pub disable_claude_code_prompt: bool,
-}
-
-impl Default for ContextConfig {
-    fn default() -> Self {
-        Self {
-            context_file_names: default_context_file_names(),
-            context_file_max_bytes: default_context_file_max_bytes(),
-            disable_claude_code_prompt: false,
-        }
-    }
-}
-
-fn default_context_file_names() -> Vec<String> {
-    vec!["AGENTS.md".to_string(), "CLAUDE.md".to_string()]
-}
-
-fn default_context_file_max_bytes() -> usize {
-    DEFAULT_CONTEXT_FILE_MAX_BYTES
-}
+use tai_proto::ContextConfig;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredFile {

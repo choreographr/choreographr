@@ -1,7 +1,7 @@
 use crate::context;
 use crate::daemon::DaemonCommand;
 use crate::db::{self, SessionRecord, write_message_retry, write_session_retry};
-use crate::openai::OpenAiClient;
+use crate::providers::InferenceProvider;
 use crate::requests::run_agent_loop;
 use crate::tools::ToolRegistry;
 use std::collections::{HashMap, HashSet};
@@ -9,7 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tai_proto::{DaemonMessage, SessionMessage, SessionStatus, SessionSummary};
+use tai_proto::{ContextConfig, DaemonMessage, SessionMessage, SessionStatus, SessionSummary};
 use tracing::{debug, error, info, warn};
 
 pub enum SessionCommand {
@@ -50,6 +50,9 @@ pub enum SessionCommand {
     /// map so that workers always broadcast to the live subscriber set
     /// rather than a stale clone of it.
     Broadcast(DaemonMessage),
+    SetAccount {
+        name: String,
+    },
     Shutdown,
 }
 
@@ -69,6 +72,7 @@ pub struct SessionMetadata {
     pub max_turns: Option<u32>,
     pub status: SessionStatus,
     pub active_tool_groups: Vec<String>,
+    pub account_name: Option<String>,
 }
 
 /// Convert a persisted record into metadata. New sessions loaded from the
@@ -86,6 +90,7 @@ impl From<SessionRecord> for SessionMetadata {
             max_turns: record.max_turns,
             status: SessionStatus::Sleeping,
             active_tool_groups: record.active_tool_groups,
+            account_name: record.account_name,
         }
     }
 }
@@ -102,6 +107,8 @@ impl From<SessionMetadata> for SessionRecord {
             message_count: meta.message_count,
             created_at: meta.created_at,
             active_tool_groups: meta.active_tool_groups,
+            context_config: ContextConfig::default(),
+            account_name: meta.account_name,
         }
     }
 }
@@ -124,6 +131,7 @@ impl From<&SessionState> for SessionMetadata {
             max_turns: state.max_turns,
             status: state.status.clone(),
             active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
+            account_name: state.account_name.clone(),
         }
     }
 }
@@ -135,7 +143,9 @@ impl From<&SessionState> for SessionMetadata {
 impl From<&SessionState> for SessionRecord {
     fn from(state: &SessionState) -> Self {
         let meta: SessionMetadata = state.into();
-        meta.into()
+        let mut record: SessionRecord = meta.into();
+        record.context_config = state.context_config.clone();
+        record
     }
 }
 
@@ -153,6 +163,8 @@ pub struct SessionSnapshot {
     pub context_message_index: Option<usize>,
     pub status: SessionStatus,
     pub active_tool_groups: std::collections::HashSet<String>,
+    pub context_config: ContextConfig,
+    pub account_name: Option<String>,
 }
 
 pub(crate) struct ActiveRequest {
@@ -179,6 +191,9 @@ pub struct SessionState {
     pub context_message_index: Option<usize>,
     pub status: SessionStatus,
     pub active_tool_groups: std::collections::HashSet<String>,
+    pub context_config: ContextConfig,
+    pub account_name: Option<String>,
+    pub provider: Option<InferenceProvider>,
 }
 
 impl SessionState {
@@ -196,6 +211,8 @@ impl SessionState {
             context_message_index: self.context_message_index,
             status: self.status.clone(),
             active_tool_groups: self.active_tool_groups.clone(),
+            context_config: self.context_config.clone(),
+            account_name: self.account_name.clone(),
         }
     }
 
@@ -218,6 +235,9 @@ impl SessionState {
             context_message_index: snapshot.context_message_index,
             status: snapshot.status,
             active_tool_groups: snapshot.active_tool_groups,
+            context_config: snapshot.context_config,
+            account_name: snapshot.account_name,
+            provider: None,
         }
     }
 
@@ -234,6 +254,8 @@ impl SessionState {
         self.context_message_index = snapshot.context_message_index;
         self.status = snapshot.status;
         self.active_tool_groups = snapshot.active_tool_groups;
+        self.context_config = snapshot.context_config;
+        self.account_name = snapshot.account_name;
     }
 
     /// Read-only access to messages.
@@ -275,6 +297,9 @@ impl SessionState {
             context_message_index: None,
             status: SessionStatus::Inactive,
             active_tool_groups: HashSet::new(),
+            context_config: ContextConfig::default(),
+            account_name: None,
+            provider: None,
         }
     }
 }
@@ -312,7 +337,8 @@ pub fn session_main(
     rx: std::sync::mpsc::Receiver<SessionCommand>,
     session_id: u64,
     db: Arc<redb::Database>,
-    client: Option<Arc<OpenAiClient>>,
+    provider: Option<InferenceProvider>,
+    account_name: Option<String>,
     tool_registry: Arc<ToolRegistry>,
     daemon_tx: mpsc::Sender<DaemonCommand>,
     init_record: Option<SessionRecord>,
@@ -349,6 +375,12 @@ pub fn session_main(
             .unwrap_or_else(|| {
                 HashSet::from(["core".to_string(), "git".to_string(), "shell".to_string()])
             }),
+        context_config: init_record
+            .as_ref()
+            .map(|r| r.context_config.clone())
+            .unwrap_or_default(),
+        account_name,
+        provider,
     };
 
     match db::read_messages(&db, session_id) {
@@ -393,7 +425,6 @@ pub fn session_main(
             &mut state,
             session_id,
             &db,
-            client.as_ref(),
             &tool_registry,
             &daemon_tx,
             &cmd_tx,
@@ -414,7 +445,6 @@ fn process_command(
     state: &mut SessionState,
     session_id: u64,
     db: &Arc<redb::Database>,
-    client: Option<&Arc<OpenAiClient>>,
     tool_registry: &Arc<ToolRegistry>,
     daemon_tx: &mpsc::Sender<DaemonCommand>,
     cmd_tx: &mpsc::Sender<SessionCommand>,
@@ -434,7 +464,7 @@ fn process_command(
             if text.is_empty() {
                 return fail_request(&state.subscribers, request_id, "empty input");
             }
-            let Some(client) = client else {
+            let Some(provider) = state.provider.as_ref() else {
                 return fail_request(&state.subscribers, request_id, "daemon is locked");
             };
             let model = match &state.selected_model {
@@ -477,7 +507,7 @@ fn process_command(
             // session thread which holds the live subscriber set.
             let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
             let db = Arc::clone(db);
-            let client = Arc::clone(client);
+            let provider = provider.clone();
             let tool_registry = Arc::clone(tool_registry);
             let daemon_tx = daemon_tx.clone();
             let cmd_tx = cmd_tx.clone();
@@ -485,7 +515,7 @@ fn process_command(
                 let _ = run_request_worker(
                     session_id,
                     request_id,
-                    client,
+                    provider,
                     &mut worker_session,
                     db,
                     model,
@@ -505,7 +535,7 @@ fn process_command(
             input_tokens: _,
             reply,
         } => {
-            let Some(client) = client else {
+            let Some(provider) = state.provider.as_ref() else {
                 let _ = reply.send(Err(io::Error::other("daemon locked")));
                 return false;
             };
@@ -528,7 +558,7 @@ fn process_command(
                 .insert(request_id, ActiveRequest { cancel_tx });
             let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
             let db = Arc::clone(db);
-            let client = Arc::clone(client);
+            let provider = provider.clone();
             let tool_registry = Arc::clone(tool_registry);
             let daemon_tx = daemon_tx.clone();
             let cmd_tx = cmd_tx.clone();
@@ -536,7 +566,7 @@ fn process_command(
                 let result = run_request_worker(
                     session_id,
                     request_id,
-                    client,
+                    provider,
                     &mut worker_session,
                     db,
                     model,
@@ -669,6 +699,39 @@ fn process_command(
             broadcast(&state.subscribers, message);
             false
         }
+        SessionCommand::SetAccount { name } => {
+            info!("session {}: SetAccount account={}", session_id, name);
+            // Resolve the provider from the daemon by name.
+            let (reply, rx) = mpsc::channel();
+            let _ = daemon_tx.send(DaemonCommand::ResolveProviderCmd {
+                account: name.clone(),
+                reply,
+            });
+            if let Ok(Some(provider)) = rx.recv() {
+                state.provider = Some(provider);
+                state.account_name = Some(name.clone());
+                broadcast(
+                    &state.subscribers,
+                    DaemonMessage::SessionAccountSet { account: name },
+                );
+            } else {
+                // Provider not resolved — account may exist but have no
+                // credential, or the account doesn't exist at all.
+                // Keep the old provider and send a failed message.
+                broadcast(
+                    &state.subscribers,
+                    DaemonMessage::SessionFailed {
+                        operation: "set_account".into(),
+                        error: format!("account '{name}' not found or not configured"),
+                    },
+                );
+            }
+            let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
+                session_id,
+                metadata: SessionMetadata::from(&*state),
+            });
+            false
+        }
         SessionCommand::Shutdown => {
             *shutdown_requested = true;
             for (&request_id, active) in &state.active_requests {
@@ -684,7 +747,7 @@ fn process_command(
 fn run_request_worker(
     session_id: u64,
     request_id: u32,
-    client: Arc<OpenAiClient>,
+    client: InferenceProvider,
     session: &mut SessionState,
     db: Arc<redb::Database>,
     model: String,
@@ -831,6 +894,8 @@ mod tests {
             message_count: 3,
             created_at: 1000,
             active_tool_groups: vec!["core".into(), "shell".into()],
+            context_config: ContextConfig::default(),
+            account_name: None,
         }
     }
 
@@ -860,6 +925,9 @@ mod tests {
             context_message_index: None,
             status: SessionStatus::Inactive,
             active_tool_groups: ["core".into(), "shell".into()].into(),
+            context_config: ContextConfig::default(),
+            account_name: None,
+            provider: None,
         }
     }
 
@@ -888,6 +956,7 @@ mod tests {
             max_turns: Some(20),
             status: SessionStatus::Inactive,
             active_tool_groups: vec!["git".into()],
+            account_name: None,
         };
         let record: SessionRecord = meta.clone().into();
         // Status field does not exist in record
@@ -974,7 +1043,6 @@ mod tests {
             &mut state,
             1,
             &db,
-            None,
             &tool_registry,
             &daemon_tx,
             &cmd_tx,
@@ -1008,7 +1076,6 @@ mod tests {
             &mut state,
             1,
             &db,
-            None,
             &tool_registry,
             &daemon_tx,
             &cmd_tx,
@@ -1045,7 +1112,6 @@ mod tests {
             &mut state,
             1,
             &db,
-            None,
             &tool_registry,
             &daemon_tx,
             &cmd_tx,
@@ -1071,7 +1137,6 @@ mod tests {
             &mut state,
             1,
             &db,
-            None,
             &tool_registry,
             &daemon_tx,
             &cmd_tx,
@@ -1096,7 +1161,6 @@ mod tests {
             &mut state,
             1,
             &db,
-            None,
             &tool_registry,
             &daemon_tx,
             &cmd_tx,
@@ -1124,7 +1188,6 @@ mod tests {
             &mut state,
             1,
             &db,
-            None,
             &tool_registry,
             &daemon_tx,
             &cmd_tx,
@@ -1149,7 +1212,6 @@ mod tests {
             &mut state,
             1,
             &db,
-            None,
             &tool_registry,
             &daemon_tx,
             &cmd_tx,
@@ -1184,7 +1246,6 @@ mod tests {
             &mut state,
             1,
             &db,
-            None,
             &tool_registry,
             &daemon_tx,
             &cmd_tx,
@@ -1211,7 +1272,6 @@ mod tests {
             &mut state,
             1,
             &db,
-            None,
             &tool_registry,
             &daemon_tx,
             &cmd_tx,
@@ -1250,7 +1310,6 @@ mod tests {
             &mut state,
             1,
             &db,
-            None,
             &tool_registry,
             &daemon_tx,
             &cmd_tx,

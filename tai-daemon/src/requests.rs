@@ -2,8 +2,9 @@ use crate::context;
 use crate::db::write_message_retry;
 use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatAssistantToolUse, ChatRequestMessage,
-    ChatToolCall, ChatTurnResult, CompletionChunkKind, OpenAiClient,
+    ChatToolCall, ChatTurnResult, CompletionChunkKind,
 };
+use crate::providers::InferenceProvider;
 use crate::sessions::{SessionCommand, SessionMetadata, SessionState};
 use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
 use std::io;
@@ -75,7 +76,7 @@ pub(crate) fn is_cancelled(rx: &mpsc::Receiver<()>, was_cancelled: &mut bool) ->
 fn refresh_session_context(
     session: &mut SessionState,
     cwd: &Path,
-    context_config: &context::ContextConfig,
+    context_config: &tai_proto::ContextConfig,
 ) {
     if let Some(old_fp) = session.context_fingerprint
         && let Some(idx) = session.context_message_index
@@ -97,7 +98,7 @@ fn refresh_session_context(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_agent_loop(
-    client: &OpenAiClient,
+    client: &InferenceProvider,
     session: &mut SessionState,
     session_id: u64,
     db: &Arc<redb::Database>,
@@ -122,7 +123,7 @@ pub(crate) fn run_agent_loop(
         }
 
         if let Some(session_cwd) = session.cwd.clone() {
-            let context_config = client.config().context.clone();
+            let context_config = session.context_config.clone();
             refresh_session_context(session, &session_cwd, &context_config);
         }
 
@@ -270,7 +271,7 @@ pub(crate) fn run_agent_loop(
                     );
                 }
             }
-            Err(crate::openai::OpenAiError::Cancelled) => {
+            Err(tai_proto::InferenceError::Cancelled) => {
                 // The user cancelled during a retry backoff —
                 // treat this as a clean cancellation, not a failure.
                 return Ok(true);
@@ -390,7 +391,7 @@ fn execute_tool_with_timeout(
     timeout_dur: Duration,
     request_id: u32,
     daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
-    client: &OpenAiClient,
+    client: &InferenceProvider,
     db: &redb::Database,
     session: &mut SessionState,
     session_id: u64,
@@ -685,7 +686,7 @@ fn execute_get_session_sync(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_spawn_subsession_sync(
-    _client: &OpenAiClient,
+    _client: &InferenceProvider,
     daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
     parent_session: &SessionState,
     parent_session_id: u64,
@@ -748,6 +749,8 @@ fn execute_spawn_subsession_sync(
         parent_session_id: Some(parent_session_id),
         cwd: child_cwd.clone(),
         max_turns,
+        context_config: None,
+        account_name: None,
         active_tool_groups: categories,
         reply: reply_tx,
     });
@@ -1404,8 +1407,9 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
 
         let config = crate::openai::ServiceConfig::default();
-        let client =
+        let openai_client =
             crate::openai::OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
+        let client = InferenceProvider::from_openai(openai_client);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let db = redb::Database::create(dir.path().join("test.redb")).expect("Database");

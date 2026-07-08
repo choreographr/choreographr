@@ -24,6 +24,7 @@ fn spawn_session(
             session_id,
             db2,
             None,
+            None,
             tool_registry,
             daemon_tx2,
             None,

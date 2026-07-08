@@ -1,7 +1,9 @@
 use anyhow::Context;
 use clap::Parser;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc;
+use tai_daemon::accounts::{AccountManager, accounts_config_path};
 use tai_daemon::daemon::DaemonState;
 use tai_daemon::db::read_all_sessions;
 use tai_daemon::openai::load_service_config;
@@ -97,6 +99,18 @@ fn main() -> anyhow::Result<()> {
         "loaded sessions from database"
     );
 
+    // Load accounts (may be empty — unlock will reload them)
+    let accounts = match accounts_config_path() {
+        Ok(path) => AccountManager::load(&path).unwrap_or_else(|e| {
+            warn!("failed to load accounts: {e}");
+            AccountManager::load(std::path::Path::new("/dev/null")).unwrap()
+        }),
+        Err(e) => {
+            warn!("no accounts config path: {e}");
+            AccountManager::load(std::path::Path::new("/dev/null")).unwrap()
+        }
+    };
+
     let state = DaemonState {
         daemon_tx,
         // Compute the next session ID from actual session records so we
@@ -113,14 +127,16 @@ fn main() -> anyhow::Result<()> {
         max_turns,
         active_sessions: std::collections::HashMap::new(),
         session_metadata,
-        openai_client: None,
+        accounts,
+        providers: HashMap::new(),
+        default_account: None,
         credentials: std::collections::HashMap::new(),
         x_credentials: None,
         db,
         tool_registry: tai_daemon::tools::ToolRegistry::new().build(),
         client_streams: Vec::new(),
         summary_subscribers: std::collections::HashMap::new(),
-        model_cache: None,
+        model_cache: HashMap::new(),
     };
 
     let socket_path = socket_path();

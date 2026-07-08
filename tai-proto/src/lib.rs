@@ -12,8 +12,9 @@ pub use io::{
     write_message_sync,
 };
 pub use types::{
-    AssistantToolCallRecord, ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata,
-    MAX_IMAGE_CHUNK_SIZE, OutputStream, SessionMessage, SessionStatus, SessionSummary,
+    AccountInfo, AssistantToolCallRecord, ClientMessage, ContextConfig, DaemonMessage,
+    DisplayedImageRecord, ImageMetadata, InferenceError, MAX_IMAGE_CHUNK_SIZE, OutputStream,
+    SessionMessage, SessionStatus, SessionSummary,
 };
 
 #[cfg(test)]

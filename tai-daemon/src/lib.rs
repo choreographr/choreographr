@@ -1,9 +1,11 @@
+pub mod accounts;
 pub mod context;
 pub mod daemon;
 pub mod db;
 pub mod diff_util;
 pub mod metrics;
 pub mod openai;
+pub mod providers;
 mod requests;
 mod server;
 mod sessions;

@@ -1,5 +1,6 @@
+use crate::accounts::{AccountConfig, AccountManager, accounts_config_path};
 use crate::db::{self, SessionRecord};
-use crate::openai::load_service_config;
+use crate::providers::InferenceProvider;
 use crate::sessions::{ActiveSessionEntry, SessionCommand, SessionMetadata, session_main};
 use std::collections::HashMap;
 use std::io;
@@ -8,8 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 use tai_keystore::ServiceCredential;
-use tai_proto::{DaemonMessage, SessionStatus, SessionSummary};
+use tai_proto::{AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary};
 use tracing::{debug, error, info};
 use zeroize::Zeroize;
 
@@ -22,7 +24,9 @@ pub struct DaemonState {
     pub max_turns: u32,
     pub active_sessions: HashMap<u64, ActiveSessionEntry>,
     pub session_metadata: HashMap<u64, SessionMetadata>,
-    pub openai_client: Option<Arc<crate::openai::OpenAiClient>>,
+    pub accounts: AccountManager,
+    pub providers: HashMap<String, InferenceProvider>,
+    pub default_account: Option<String>,
     pub credentials: HashMap<String, ServiceCredential>,
     pub x_credentials: Option<ServiceCredential>,
     pub db: Arc<redb::Database>,
@@ -30,7 +34,7 @@ pub struct DaemonState {
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
     pub client_streams: Vec<UnixStream>,
     pub summary_subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>,
-    pub model_cache: Option<(Vec<String>, std::time::Instant)>,
+    pub model_cache: HashMap<String, (Vec<String>, Instant)>,
 }
 
 pub enum DaemonCommand {
@@ -40,6 +44,8 @@ pub enum DaemonCommand {
         parent_session_id: Option<u64>,
         cwd: Option<PathBuf>,
         max_turns: Option<u32>,
+        context_config: Option<ContextConfig>,
+        account_name: Option<String>,
         active_tool_groups: Vec<String>,
         reply: std::sync::mpsc::Sender<io::Result<(u64, std::sync::mpsc::Sender<SessionCommand>)>>,
     },
@@ -98,6 +104,32 @@ pub enum DaemonCommand {
         session_id: u64,
         reply: std::sync::mpsc::Sender<io::Result<()>>,
     },
+    AddAccountCmd {
+        name: String,
+        provider: String,
+        model: Option<String>,
+        base_url: Option<String>,
+        streaming: Option<bool>,
+        retry_max_attempts: Option<u32>,
+        connect_timeout_secs: Option<u64>,
+        request_timeout_secs: Option<u64>,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    RemoveAccountCmd {
+        name: String,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    ListAccountsCmd {
+        reply: std::sync::mpsc::Sender<Result<Vec<AccountInfo>, String>>,
+    },
+    SetDefaultAccountCmd {
+        name: String,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    ResolveProviderCmd {
+        account: String,
+        reply: std::sync::mpsc::Sender<Option<InferenceProvider>>,
+    },
 }
 
 impl DaemonState {
@@ -108,6 +140,8 @@ impl DaemonState {
                 parent_session_id,
                 cwd,
                 max_turns,
+                context_config,
+                account_name,
                 active_tool_groups,
                 reply,
             } => {
@@ -137,12 +171,17 @@ impl DaemonState {
                         .unwrap_or_default()
                         .as_secs() as i64,
                     active_tool_groups: active_cats.clone(),
+                    context_config: context_config.clone().unwrap_or_default(),
+                    account_name: account_name.clone(),
                 };
 
                 if let Err(e) = db::write_session(&self.db, sid, &record) {
                     error!("CreateSession: failed to persist session {}: {e}", sid);
                 }
 
+                let resolved_account = account_name
+                    .clone()
+                    .or_else(|| self.default_account.clone());
                 let metadata = SessionMetadata {
                     title: title.clone(),
                     selected_model: None,
@@ -153,6 +192,7 @@ impl DaemonState {
                     max_turns,
                     status: SessionStatus::Inactive,
                     active_tool_groups: active_cats.clone(),
+                    account_name: resolved_account,
                 };
                 let session_tx = self.spawn_session(sid, record, metadata);
 
@@ -301,20 +341,20 @@ impl DaemonState {
                             )
                     {
                         // Update in-memory state
-                        if let ServiceCredential::ApiKey { key: api_key } = &cred
-                            && service == "openai"
-                        {
-                            let config = load_service_config().unwrap_or_default();
-                            if let Ok(client) =
-                                crate::openai::OpenAiClient::new(config, api_key.clone())
-                            {
-                                self.openai_client = Some(Arc::new(client));
-                            }
-                        }
                         if matches!(&cred, ServiceCredential::X { .. }) && service == "twitter" {
                             self.x_credentials = Some(cred.clone());
                         }
-                        self.credentials.insert(service.clone(), cred);
+                        self.credentials.insert(service.clone(), cred.clone());
+                        // Resolve provider for any account matching this service name
+                        if let ServiceCredential::ApiKey { key: api_key } = &cred
+                            && let Some(config) = self.accounts.get(&service)
+                            && let Ok(provider) = InferenceProvider::from_account_config(
+                                config,
+                                Some(api_key.clone()),
+                            )
+                        {
+                            self.providers.insert(service.clone(), provider);
+                        }
                     }
                 }
                 let _ = reply.send(Ok(()));
@@ -327,9 +367,7 @@ impl DaemonState {
                 }
                 // Remove from in-memory state
                 self.credentials.remove(&service);
-                if service == "openai" {
-                    self.openai_client = None;
-                }
+                self.providers.remove(&service);
                 if service == "twitter" {
                     self.x_credentials = None;
                 }
@@ -386,13 +424,68 @@ impl DaemonState {
                 self.broadcast(DaemonMessage::SessionDeleted { session_id });
                 let _ = reply.send(Ok(()));
             }
+            DaemonCommand::AddAccountCmd {
+                name,
+                provider,
+                model,
+                base_url,
+                streaming,
+                retry_max_attempts,
+                connect_timeout_secs,
+                request_timeout_secs,
+                reply,
+            } => {
+                let config = AccountConfig {
+                    name: name.clone(),
+                    provider: provider.clone(),
+                    model,
+                    base_url,
+                    streaming,
+                    retry_max_attempts,
+                    connect_timeout_secs,
+                    request_timeout_secs,
+                };
+                let result = self.accounts.add(config);
+                // If account was added and there's a matching credential,
+                // resolve the provider immediately.
+                if result.is_ok()
+                    && let Some(ServiceCredential::ApiKey { key }) = self.credentials.get(&name)
+                {
+                    self.resolve_account_provider(&name, Some(key.clone()));
+                }
+                let _ = reply.send(result);
+            }
+            DaemonCommand::RemoveAccountCmd { name, reply } => {
+                let result = self.accounts.remove(&name);
+                if result.is_ok() {
+                    self.providers.remove(&name);
+                    if self.default_account.as_deref() == Some(&name) {
+                        self.default_account = self.accounts.first().map(|a| a.name.clone());
+                    }
+                }
+                let _ = reply.send(result);
+            }
+            DaemonCommand::ListAccountsCmd { reply } => {
+                let _ = reply.send(Ok(self.accounts.list()));
+            }
+            DaemonCommand::SetDefaultAccountCmd { name, reply } => {
+                if self.accounts.contains(&name) {
+                    self.default_account = Some(name.clone());
+                    let _ = reply.send(Ok(()));
+                } else {
+                    let _ = reply.send(Err(format!("account '{name}' not found")));
+                }
+            }
+            DaemonCommand::ResolveProviderCmd { account, reply } => {
+                let _ = reply.send(self.providers.get(&account).cloned());
+            }
             DaemonCommand::Shutdown => unreachable!("handled by command loop"),
         }
     }
 
     /// Returns an error if the daemon hasn't been unlocked yet.
     fn ensure_unlocked(&self) -> io::Result<()> {
-        if self.openai_client.is_none() {
+        if self.credentials.is_empty() {
             Err(io::Error::other("daemon is locked"))
         } else {
             Ok(())
@@ -406,10 +499,20 @@ impl DaemonState {
         metadata: SessionMetadata,
     ) -> mpsc::Sender<SessionCommand> {
         let db = Arc::clone(&self.db);
-        let client = self.openai_client.clone();
         let tool_registry = Arc::clone(&self.tool_registry);
         let daemon_tx = self.daemon_tx.clone();
         let max_turns_default = self.max_turns;
+
+        // Resolve provider from the session's account name
+        let account_name = metadata
+            .account_name
+            .clone()
+            .or_else(|| self.default_account.clone());
+        let provider = account_name
+            .as_ref()
+            .and_then(|name| self.providers.get(name))
+            .cloned();
+
         let (session_tx, session_rx) = std::sync::mpsc::channel();
         let cmd_tx = session_tx.clone();
 
@@ -419,7 +522,8 @@ impl DaemonState {
                 session_rx,
                 session_id,
                 db,
-                client,
+                provider,
+                account_name,
                 tool_registry,
                 daemon_tx,
                 Some(record),
@@ -436,6 +540,16 @@ impl DaemonState {
         );
         self.session_metadata.insert(session_id, metadata);
         session_tx
+    }
+
+    /// Try to resolve an `InferenceProvider` for the given account name using
+    /// the stored credential.  Silently ignores missing credentials or config.
+    fn resolve_account_provider(&mut self, name: &str, api_key: Option<String>) {
+        if let Some(config) = self.accounts.get(name)
+            && let Ok(provider) = InferenceProvider::from_account_config(config, api_key)
+        {
+            self.providers.insert(name.to_string(), provider);
+        }
     }
 
     /// Send a message to all summary subscribers, removing dead ones.
@@ -467,14 +581,6 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> Result<
         }
     }
 
-    // Set up OpenAI client from credentials
-    if let Some(ServiceCredential::ApiKey { key: api_key }) = credentials.get("openai") {
-        let service_config = load_service_config().unwrap_or_default();
-        let client = crate::openai::OpenAiClient::new(service_config, api_key.to_string())
-            .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
-        state.openai_client = Some(Arc::new(client));
-    }
-
     // Set up X credentials
     if let Some(c) = credentials.get("twitter")
         && matches!(c, ServiceCredential::X { .. })
@@ -483,6 +589,44 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> Result<
     }
 
     state.credentials = credentials;
+
+    // Load accounts from TOML
+    let accounts_path =
+        accounts_config_path().map_err(|e| format!("failed to get accounts config path: {e}"))?;
+    state.accounts = AccountManager::load(&accounts_path)
+        .map_err(|e| format!("failed to load accounts: {e}"))?;
+
+    // If no accounts configured but an "openai" credential exists, create a
+    // default account automatically so the user doesn't have to set one up.
+    if state.accounts.is_empty() && state.credentials.contains_key("openai") {
+        let default_config = AccountConfig {
+            name: "default".to_string(),
+            provider: "openai".to_string(),
+            model: None,
+            base_url: None,
+            streaming: None,
+            retry_max_attempts: None,
+            connect_timeout_secs: None,
+            request_timeout_secs: None,
+        };
+        let _ = state.accounts.add(default_config);
+    }
+
+    // Resolve providers for all accounts
+    state.providers.clear();
+    for config in state.accounts.all_configs() {
+        let api_key = state.credentials.get(&config.name).and_then(|c| match c {
+            ServiceCredential::ApiKey { key } => Some(key.clone()),
+            _ => None,
+        });
+        if let Ok(provider) = InferenceProvider::from_account_config(&config, api_key) {
+            state.providers.insert(config.name.clone(), provider);
+        }
+    }
+
+    // Set default account to the first one
+    state.default_account = state.accounts.first().map(|a| a.name.clone());
+
     key.zeroize();
     Ok(())
 }
@@ -491,24 +635,33 @@ fn handle_list_models_inner(
     state: &mut DaemonState,
     session_id: Option<u64>,
 ) -> Result<(Vec<String>, Option<String>), String> {
-    let now = std::time::Instant::now();
-    let five_minutes = std::time::Duration::from_secs(300);
+    let account_name = session_id
+        .and_then(|sid| state.session_metadata.get(&sid))
+        .and_then(|m| m.account_name.clone())
+        .or_else(|| state.default_account.clone())
+        .unwrap_or_default();
 
-    let models = match &state.model_cache {
+    let provider = state.providers.get(&account_name).ok_or_else(|| {
+        if state.accounts.is_empty() {
+            "no accounts configured".to_string()
+        } else {
+            format!("no provider resolved for account '{account_name}'")
+        }
+    })?;
+
+    let now = Instant::now();
+    let five_minutes = std::time::Duration::from_secs(300);
+    let models = match state.model_cache.get(&account_name) {
         Some((cached_models, cached_at)) if now.duration_since(*cached_at) < five_minutes => {
-            debug!("model cache hit");
             cached_models.clone()
         }
         _ => {
-            debug!("model cache miss");
-            let client = state
-                .openai_client
-                .as_ref()
-                .ok_or("daemon is locked".to_string())?;
-            let models = client
-                .validate_and_list_models()
+            let models = provider
+                .list_models()
                 .map_err(|e| format!("failed to list models: {e}"))?;
-            state.model_cache = Some((models.clone(), now));
+            state
+                .model_cache
+                .insert(account_name, (models.clone(), now));
             models
         }
     };
@@ -532,12 +685,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let tool_registry = crate::tools::ToolRegistry::new().build();
+        let config_dir = tempfile::tempdir().unwrap();
+        let accounts_path = config_dir.path().join("accounts.toml");
         let state = DaemonState {
             next_session_id: 1,
             max_turns: 10,
             active_sessions: HashMap::new(),
             session_metadata: HashMap::new(),
-            openai_client: None,
+            accounts: AccountManager::load(&accounts_path).unwrap(),
+            providers: HashMap::new(),
+            default_account: None,
             credentials: HashMap::new(),
             x_credentials: None,
             db,
@@ -545,7 +702,7 @@ mod tests {
             daemon_tx,
             client_streams: Vec::new(),
             summary_subscribers: HashMap::new(),
-            model_cache: None,
+            model_cache: HashMap::new(),
         };
         (state, daemon_rx)
     }
@@ -574,6 +731,7 @@ mod tests {
                 max_turns: None,
                 status: SessionStatus::Inactive,
                 active_tool_groups: vec!["core".into()],
+                account_name: None,
             },
         );
         let (reply, rx) = mpsc::channel();
@@ -611,6 +769,7 @@ mod tests {
                 max_turns: None,
                 status: SessionStatus::Inactive,
                 active_tool_groups: vec!["core".into()],
+                account_name: None,
             },
         );
         let new_meta = SessionMetadata {
@@ -623,6 +782,7 @@ mod tests {
             max_turns: None,
             status: SessionStatus::Inference,
             active_tool_groups: vec!["core".into(), "git".into()],
+            account_name: None,
         };
         state.handle_command(DaemonCommand::UpdateMetadata {
             session_id: 1,
@@ -699,6 +859,8 @@ mod tests {
             parent_session_id: None,
             cwd: None,
             max_turns: None,
+            context_config: None,
+            account_name: None,
             active_tool_groups: Vec::new(),
             reply,
         });

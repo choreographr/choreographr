@@ -39,6 +39,8 @@ pub(crate) fn client_thread(
                         parent_session_id,
                         cwd,
                         max_turns,
+                        context_config,
+                        account_name,
                     } => {
                         info!("client {}: CreateSession", client_id);
                         let cwd_str = cwd.clone();
@@ -48,6 +50,8 @@ pub(crate) fn client_thread(
                             parent_session_id,
                             cwd: cwd.map(std::path::PathBuf::from),
                             max_turns,
+                            context_config,
+                            account_name,
                             active_tool_groups: Vec::new(),
                             reply,
                         });
@@ -194,6 +198,99 @@ pub(crate) fn client_thread(
                     }
                     ClientMessage::GetCredential { service } => {
                         handle_get_credential_sync(&daemon_tx, &writer_tx, service);
+                    }
+                    ClientMessage::AddAccount {
+                        name,
+                        provider,
+                        model,
+                        base_url,
+                        streaming,
+                        retry_max_attempts,
+                        connect_timeout_secs,
+                        request_timeout_secs,
+                    } => {
+                        let (reply, rx) = mpsc::channel();
+                        let _ = daemon_tx.send(DaemonCommand::AddAccountCmd {
+                            name: name.clone(),
+                            provider,
+                            model,
+                            base_url,
+                            streaming,
+                            retry_max_attempts,
+                            connect_timeout_secs,
+                            request_timeout_secs,
+                            reply,
+                        });
+                        match rx.recv() {
+                            Ok(Ok(())) => {
+                                let _ = writer_tx.send(DaemonMessage::AccountAdded { name });
+                            }
+                            Ok(Err(e)) => {
+                                let _ = writer_tx
+                                    .send(DaemonMessage::AccountAddFailed { name, error: e });
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    ClientMessage::RemoveAccount { name } => {
+                        let (reply, rx) = mpsc::channel();
+                        let _ = daemon_tx.send(DaemonCommand::RemoveAccountCmd {
+                            name: name.clone(),
+                            reply,
+                        });
+                        match rx.recv() {
+                            Ok(Ok(())) => {
+                                let _ = writer_tx.send(DaemonMessage::AccountRemoved { name });
+                            }
+                            Ok(Err(e)) => {
+                                let _ = writer_tx
+                                    .send(DaemonMessage::AccountRemoveFailed { name, error: e });
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    ClientMessage::ListAccounts => {
+                        let (reply, rx) = mpsc::channel();
+                        let _ = daemon_tx.send(DaemonCommand::ListAccountsCmd { reply });
+                        match rx.recv() {
+                            Ok(Ok(accounts)) => {
+                                let _ = writer_tx.send(DaemonMessage::Accounts { accounts });
+                            }
+                            Ok(Err(e)) => {
+                                let _ =
+                                    writer_tx.send(DaemonMessage::AccountListFailed { error: e });
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    ClientMessage::SetDefaultAccount { name } => {
+                        let (reply, rx) = mpsc::channel();
+                        let _ = daemon_tx.send(DaemonCommand::SetDefaultAccountCmd {
+                            name: name.clone(),
+                            reply,
+                        });
+                        match rx.recv() {
+                            Ok(Ok(())) => {
+                                let _ = writer_tx.send(DaemonMessage::DefaultAccountSet { name });
+                            }
+                            Ok(Err(e)) => {
+                                let _ = writer_tx.send(DaemonMessage::DefaultAccountSetFailed {
+                                    name,
+                                    error: e,
+                                });
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    ClientMessage::SetSessionAccount { name } => {
+                        if let Some(ref tx) = attached_session_tx {
+                            let _ = tx.send(SessionCommand::SetAccount { name });
+                        } else {
+                            let _ = writer_tx.send(DaemonMessage::SessionFailed {
+                                operation: "set_account".into(),
+                                error: "no session attached".to_string(),
+                            });
+                        }
                     }
                     _ => {
                         warn!(

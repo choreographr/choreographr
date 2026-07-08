@@ -203,6 +203,8 @@ fn session_new_with_title() {
             parent_session_id: None,
             cwd: None,
             max_turns: None,
+            context_config: None,
+            account_name: None,
         })
     );
     assert_eq!(next, 3);
@@ -218,6 +220,8 @@ fn session_new_without_title() {
             parent_session_id: None,
             cwd: None,
             max_turns: None,
+            context_config: None,
+            account_name: None,
         })
     );
     assert_eq!(next, 3);

@@ -296,7 +296,7 @@ impl ChatToolDefinition {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OpenAiClient {
     config: ServiceConfig,
     api_key: String,

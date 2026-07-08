@@ -7,7 +7,7 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
-use tai_proto::SessionMessage;
+use tai_proto::{ContextConfig, SessionMessage};
 use tracing::{debug, error, info, warn};
 
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
@@ -31,6 +31,10 @@ pub struct SessionRecord {
     pub message_count: u32,
     pub created_at: i64,
     pub active_tool_groups: Vec<String>,
+    #[serde(default)]
+    pub context_config: ContextConfig,
+    #[serde(default)]
+    pub account_name: Option<String>,
 }
 
 pub fn db_path() -> io::Result<PathBuf> {
@@ -392,6 +396,8 @@ mod tests {
             message_count: 1,
             created_at: 1234567890,
             active_tool_groups: vec!["core".into(), "git".into()],
+            context_config: ContextConfig::default(),
+            account_name: None,
         };
         write_session(&db, id, &record).unwrap();
 

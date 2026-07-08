@@ -159,6 +159,8 @@ fn handle_session_message(
                         parent_session_id: None,
                         cwd: None,
                         max_turns: None,
+                        context_config: None,
+                        account_name: None,
                     }) {
                         tracing::error!("failed to send CreateSession: {e}");
                     }
