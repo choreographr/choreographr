@@ -284,7 +284,7 @@ fn scan_skills_dir(dir: &Path, skills: &mut Vec<SkillMeta>, seen: &mut HashSet<P
 fn parse_skill_metadata(path: &Path) -> Option<SkillMeta> {
     let content = fs::read_to_string(path).ok()?;
     let frontmatter = extract_yaml_frontmatter(&content)?;
-    let fm: SkillFrontmatter = serde_yaml::from_str(&frontmatter).ok()?;
+    let fm: SkillFrontmatter = yaml_serde::from_str(&frontmatter).ok()?;
     Some(SkillMeta {
         name: fm.name,
         description: fm.description,
