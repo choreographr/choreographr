@@ -840,9 +840,7 @@ fn persist_assistant_tool_use_sync(
                 arguments_json: tool_call.arguments_json.clone(),
             })
             .collect(),
-        reasoning_content: tool_use.reasoning_content.clone(),
         reasoning: tool_use.reasoning.clone(),
-        reasoning_text: tool_use.reasoning_text.clone(),
     };
     let idx = session.push_message(msg.clone());
     if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
@@ -869,9 +867,7 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
             SessionMessage::AssistantToolUse {
                 content,
                 tool_calls,
-                reasoning_content,
                 reasoning,
-                reasoning_text,
             } => Some(ChatRequestMessage {
                 role: "assistant",
                 content: content.clone(),
@@ -889,9 +885,9 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
                         })
                         .collect(),
                 ),
-                reasoning_content: reasoning_content.clone(),
-                reasoning: reasoning.clone(),
-                reasoning_text: reasoning_text.clone(),
+                reasoning_content: reasoning.clone(),
+                reasoning: None,
+                reasoning_text: None,
             }),
             SessionMessage::ToolResult {
                 call_id, content, ..
@@ -904,6 +900,7 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
                 reasoning: None,
                 reasoning_text: None,
             }),
+            _ => None,
         })
         .collect()
 }
@@ -963,9 +960,7 @@ mod tests {
                 name: "read_file".into(),
                 arguments_json: r#"{"path": "/tmp/test"}"#.into(),
             }],
-            reasoning_content: None,
             reasoning: None,
-            reasoning_text: None,
         }];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);

@@ -380,11 +380,7 @@ impl OpenAiClient {
                         }
                     }
                     // Send reasoning through whichever field the model populated.
-                    for reasoning in [&tool_use.reasoning_content, &tool_use.reasoning, &tool_use.reasoning_text]
-                        .into_iter()
-                        .flatten()
-                        .filter(|r| !r.is_empty())
-                    {
+                    if let Some(reasoning) = tool_use.reasoning.as_ref().filter(|r| !r.is_empty()) {
                         on_chunk(super::CompletionChunkKind::Reasoning, reasoning.clone())?;
                     }
                 }
@@ -550,9 +546,9 @@ fn chat_completions_request_with_tools(
                     arguments_json: tool_call.function.arguments,
                 })
                 .collect(),
-            reasoning_content: choice.message.reasoning_content,
-            reasoning: choice.message.reasoning,
-            reasoning_text: choice.message.reasoning_text,
+            reasoning: choice.message.reasoning_content
+                .or(choice.message.reasoning)
+                .or(choice.message.reasoning_text),
         }));
     }
 
@@ -816,13 +812,7 @@ where
                 Some(full_content)
             },
             tool_calls,
-            reasoning_content: if full_reasoning.is_empty() {
-                None
-            } else {
-                Some(full_reasoning.clone())
-            },
-            reasoning: None,
-            reasoning_text: if full_reasoning.is_empty() {
+            reasoning: if full_reasoning.is_empty() {
                 None
             } else {
                 Some(full_reasoning)
@@ -1092,9 +1082,7 @@ mod tests {
         let result = ChatTurnResult::ToolUse(ChatAssistantToolUse {
             content: Some("I'll search for that.".into()),
             tool_calls,
-            reasoning_content: None,
             reasoning: None,
-            reasoning_text: None,
         });
         match result {
             ChatTurnResult::ToolUse(use_) => {

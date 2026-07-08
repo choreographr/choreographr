@@ -243,6 +243,7 @@ impl StreamingText {
         match stream {
             OutputStream::Answer => self.answer.push_str(chunk),
             OutputStream::Reasoning => self.reasoning.push_str(chunk),
+            _ => {}
         }
     }
 }

@@ -212,9 +212,7 @@ pub struct ChatToolCall {
 pub struct ChatAssistantToolUse {
     pub content: Option<String>,
     pub tool_calls: Vec<ChatToolCall>,
-    pub reasoning_content: Option<String>,
     pub reasoning: Option<String>,
-    pub reasoning_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

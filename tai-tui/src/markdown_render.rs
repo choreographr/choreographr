@@ -109,9 +109,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
         SessionMessage::AssistantToolUse {
             content,
             tool_calls,
-            reasoning_content,
             reasoning,
-            reasoning_text,
         } => {
             let mut lines = vec![Line::from(Span::styled(
                 format!(
@@ -124,10 +122,8 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
                 ),
                 Style::default().fg(Color::Yellow),
             ))];
-            if let Some(reasoning_text) = reasoning_content
+            if let Some(reasoning_text) = reasoning
                 .as_deref()
-                .or(reasoning.as_deref())
-                .or(reasoning_text.as_deref())
                 .filter(|value| !value.trim().is_empty())
             {
                 append_section(&mut lines, "reasoning", plain_text_lines(reasoning_text), Color::DarkGray);
@@ -173,6 +169,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
         // converted directly to HistoryItem::Image, so this arm should never
         // be reached at runtime — it exists only for exhaustive matching.
         SessionMessage::DisplayedImage(_) => vec![],
+        _ => vec![],
     }
 }
 

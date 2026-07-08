@@ -179,18 +179,14 @@ fn render_session_message(message: SessionMessage) -> Element {
         SessionMessage::AssistantToolUse {
             content,
             tool_calls,
-            reasoning_content,
             reasoning,
-            reasoning_text,
         } => {
             let name = tool_calls
                 .iter()
                 .map(|call| format!("{}({})", call.name, call.arguments_json))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let resolved_reasoning = reasoning_content
-                .or(reasoning)
-                .or(reasoning_text)
+            let resolved_reasoning = reasoning
                 .filter(|value| !value.trim().is_empty());
             let content = content
                 .filter(|value| !value.trim().is_empty())
@@ -201,6 +197,7 @@ fn render_session_message(message: SessionMessage) -> Element {
             name, content, is_error, ..
         } => render_tool_result(is_error, &format!("{name}: {content}")),
         SessionMessage::DisplayedImage(record) => render_displayed_image(&record.metadata),
+        _ => rsx! {},
     }
 }
 

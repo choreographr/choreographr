@@ -523,6 +523,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
                 SessionStatus::Inference => "infer",
                 SessionStatus::ToolCall(name) => &name,
                 SessionStatus::Retrying { .. } => "retry",
+                _ => "unknown",
             };
             let status_style = match &session.status {
                 SessionStatus::Sleeping => Color::DarkGray,
@@ -530,6 +531,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
                 SessionStatus::Inference => Color::Yellow,
                 SessionStatus::ToolCall(_) => Color::Cyan,
                 SessionStatus::Retrying { .. } => Color::Magenta,
+                _ => Color::White,
             };
             let row = format!(
                 "{sel}{att} {:>4}  \"{title}\"  ({model})  — {} messages  [",
@@ -639,6 +641,7 @@ pub(crate) fn format_status(status: &SessionStatus) -> String {
         SessionStatus::Retrying { attempt, max_attempts, delay_ms } => {
             format!("retrying ({attempt}/{max_attempts}, {delay_ms}ms)")
         }
+        _ => "unknown".to_string(),
     }
 }
 

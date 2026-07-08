@@ -267,6 +267,7 @@ fn daemon_to_bridge_events(
             warn!(?msg, "unhandled daemon message variant in bridge");
             None
         }
+        _ => None,
     }
 }
 

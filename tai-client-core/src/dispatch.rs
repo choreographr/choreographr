@@ -288,5 +288,6 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             handler.push_text("[daemon] shutting down".to_string());
             Ok(None)
         }
+        _ => Ok(None),
     }
 }

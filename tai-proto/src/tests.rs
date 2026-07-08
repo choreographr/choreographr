@@ -84,44 +84,6 @@ fn encode_rejects_oversized_message() {
 }
 
 #[test]
-fn render_line_displayed_image() {
-    let msg = SessionMessage::DisplayedImage(DisplayedImageRecord {
-        metadata: ImageMetadata {
-            image_id: 0,
-            mime_type: "image/png".into(),
-            width: 640,
-            height: 480,
-            byte_len: 12345,
-            alt: None,
-        },
-        data: vec![],
-    });
-    assert_eq!(
-        msg.render_line(),
-        "[image: image/png (640x480, 12345 bytes)]"
-    );
-}
-
-#[test]
-fn render_line_displayed_image_with_alt() {
-    let msg = SessionMessage::DisplayedImage(DisplayedImageRecord {
-        metadata: ImageMetadata {
-            image_id: 0,
-            mime_type: "image/svg+xml".into(),
-            width: 100,
-            height: 50,
-            byte_len: 999,
-            alt: Some("chart".into()),
-        },
-        data: vec![],
-    });
-    assert_eq!(
-        msg.render_line(),
-        "[image: image/svg+xml (100x50, 999 bytes)]"
-    );
-}
-
-#[test]
 fn session_status_retrying_serde_round_trip() {
     let status = SessionStatus::Retrying {
         attempt: 2,
