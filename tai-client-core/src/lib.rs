@@ -7,7 +7,7 @@ mod image;
 mod markdown;
 mod shell;
 
-pub use connection::run_daemon_connection;
+pub use connection::{run_daemon_connection, run_daemon_reader};
 pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 pub use dispatch::{DaemonMessageHandler, dispatch_daemon_message};
 pub use error::{ClientError, broken_pipe};

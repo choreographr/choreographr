@@ -7918,6 +7918,7 @@ dependencies = [
  "frankenstein",
  "tai-client-core",
  "tai-proto",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

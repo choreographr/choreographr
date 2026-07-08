@@ -9,12 +9,12 @@ use tai_client_core::{ShellCommand, parse_input_line, render_markdown_html};
 use tai_proto::ClientMessage;
 use tracing::{debug, error, info, warn};
 
-use crate::bridge::{BridgeEvent, DaemonBridgeCommand};
+use crate::bridge::BridgeEvent;
 
 pub fn run(
     bot_token: String,
     admin_ids: Vec<i64>,
-    bridge_tx: mpsc::Sender<DaemonBridgeCommand>,
+    bridge_tx: mpsc::Sender<ClientMessage>,
     bridge_rx: mpsc::Receiver<BridgeEvent>,
 ) {
     let bot = Bot::new(&bot_token);
@@ -75,7 +75,7 @@ pub fn run(
 }
 
 struct TelegramState {
-    bridge_tx: mpsc::Sender<DaemonBridgeCommand>,
+    bridge_tx: mpsc::Sender<ClientMessage>,
     admin_ids: Vec<i64>,
     request_id: Cell<u32>,
     chat_id_tx: mpsc::Sender<i64>,
@@ -125,10 +125,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: frankenstein::types::Me
                 }
             }
             debug!("sending command to bridge");
-            if let Err(e) = state
-                .bridge_tx
-                .send(DaemonBridgeCommand::SendMessage(client_msg))
-            {
+            if let Err(e) = state.bridge_tx.send(client_msg) {
                 warn!("failed to send command to bridge: {e}");
             }
         }
@@ -273,19 +270,18 @@ fn send_daemon_event(bot: &Bot, chat_id: i64, event: BridgeEvent) {
 }
 
 fn send_photo_from_memory(bot: &Bot, chat_id: i64, data: &[u8]) -> Result<(), frankenstein::Error> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temp_path = std::env::temp_dir().join(format!("tai_photo_{ts}.png"));
-    std::fs::write(&temp_path, data).map_err(frankenstein::Error::ReadFile)?;
+    use std::io::Write;
+    // Write image data to a temp file that is automatically cleaned up on drop.
+    let mut tmp = tempfile::NamedTempFile::new().map_err(frankenstein::Error::ReadFile)?;
+    tmp.write_all(data).map_err(frankenstein::Error::ReadFile)?;
+    tmp.flush().map_err(frankenstein::Error::ReadFile)?;
+    let path = tmp.path().to_path_buf();
     let params = SendPhotoParams::builder()
         .chat_id(chat_id)
-        .photo(temp_path.clone())
+        .photo(path)
         .build();
-    let result = bot.send_photo(&params).map(|_| ());
-    let _ = std::fs::remove_file(&temp_path);
-    result
+    bot.send_photo(&params).map(|_| ())
+    // NamedTempFile is dropped here, removing the temp file automatically.
 }
 
 fn to_telegram_html(html: &str) -> String {

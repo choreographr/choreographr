@@ -81,7 +81,8 @@ fn main() -> anyhow::Result<()> {
             ..
         }) => {
             info!(%platform, "got credential, starting platform bridge");
-            run_platform(&platform, bot_token, reader, writer);
+            run_platform(&platform, bot_token, reader, writer)
+                .context("platform bridge failed")?;
         }
         Ok(DaemonMessage::Credential { key: None, .. }) => {
             if unlock_passphrase.is_none() {
@@ -110,7 +111,7 @@ fn run_platform(
     bot_token: String,
     reader: BufReader<UnixStream>,
     writer: BufWriter<UnixStream>,
-) {
+) -> anyhow::Result<()> {
     match platform {
         "telegram" => {
             let admin_ids_str = env::var("TAI_TELEGRAM_USER_IDS").unwrap_or_default();
@@ -120,10 +121,7 @@ fn run_platform(
                 .collect();
 
             if admin_ids.is_empty() {
-                error!(
-                    "TAI_TELEGRAM_USER_IDS must be set to a comma-separated list of Telegram user IDs"
-                );
-                return;
+                bail!("TAI_TELEGRAM_USER_IDS must be set to a comma-separated list of Telegram user IDs");
             }
 
             let admin_count = admin_ids.len();
@@ -133,10 +131,10 @@ fn run_platform(
             let (tx, rx) = bridge.into_parts();
 
             telegram::run(bot_token, admin_ids, tx, rx);
+            Ok(())
         }
         other => {
-            error!(platform = %other, "unknown platform");
-            std::process::exit(1);
+            bail!("unknown platform: {other}");
         }
     }
 }

@@ -1,6 +1,6 @@
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
-use tai_im::bridge::{BridgeEvent, DaemonBridge, DaemonBridgeCommand};
+use tai_im::bridge::{BridgeEvent, DaemonBridge};
 use tai_proto::{
     ClientMessage, DaemonMessage, ImageMetadata, OutputStream, read_message_sync,
     write_message_sync,
@@ -19,8 +19,7 @@ fn bridge_ping_pong() {
     let (bridge, mut daemon_reader, mut daemon_writer) = connected_bridge();
     let (tx, rx) = bridge.into_parts();
 
-    tx.send(DaemonBridgeCommand::SendMessage(ClientMessage::Ping))
-        .unwrap();
+    tx.send(ClientMessage::Ping).unwrap();
 
     let msg = read_message_sync::<_, ClientMessage>(&mut daemon_reader).unwrap();
     assert!(matches!(msg, ClientMessage::Ping));
@@ -39,9 +38,9 @@ fn bridge_unlock_locked() {
     let (bridge, mut daemon_reader, mut daemon_writer) = connected_bridge();
     let (tx, rx) = bridge.into_parts();
 
-    tx.send(DaemonBridgeCommand::SendMessage(ClientMessage::Unlock {
+    tx.send(ClientMessage::Unlock {
         passphrase: "secret".into(),
-    }))
+    })
     .unwrap();
 
     let msg = read_message_sync::<_, ClientMessage>(&mut daemon_reader).unwrap();

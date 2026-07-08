@@ -2,19 +2,13 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use tai_client_core::{ImageAssembler, StreamingText};
-use tai_proto::{
-    ClientMessage, DaemonMessage, ImageMetadata, ProtoError, read_message_sync, write_message_sync,
-};
+use tai_proto::{ClientMessage, DaemonMessage, ImageMetadata, write_message_sync};
 use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 pub struct DaemonBridge {
-    client_tx: mpsc::Sender<DaemonBridgeCommand>,
+    client_tx: mpsc::Sender<ClientMessage>,
     event_rx: mpsc::Receiver<BridgeEvent>,
-}
-
-pub enum DaemonBridgeCommand {
-    SendMessage(ClientMessage),
 }
 
 #[derive(Debug, Clone)]
@@ -49,75 +43,52 @@ pub enum BridgeEvent {
 
 impl DaemonBridge {
     pub fn spawn(reader: BufReader<UnixStream>, writer: BufWriter<UnixStream>) -> Self {
-        let (client_tx, client_rx) = mpsc::channel::<DaemonBridgeCommand>();
+        let (client_tx, client_rx) = mpsc::channel::<ClientMessage>();
         let (event_tx, event_rx) = mpsc::channel::<BridgeEvent>();
         let writer_event_tx = event_tx.clone();
 
         info!("spawning daemon bridge tasks");
 
+        // Writer thread: reads ClientMessages from the channel and writes them
+        // to the daemon socket. On write failure, sends an error event and shuts down.
         std::thread::spawn(move || {
             let mut writer = writer;
             let client_rx = client_rx;
-            while let Ok(cmd) = client_rx.recv() {
-                match cmd {
-                    DaemonBridgeCommand::SendMessage(msg) => {
-                        debug!(?msg, "sending message to daemon");
-                        if let Err(e) = write_message_sync(&mut writer, &msg) {
-                            error!(%e, "write error, bridge writer shutting down");
-                            if let Err(send_err) = writer_event_tx
-                                .send(BridgeEvent::Error(format!("write error: {e}")))
-                            {
-                                warn!("failed to send write error event: {send_err}");
-                            }
-                            break;
-                        }
-                        let _ = writer.flush();
+            while let Ok(msg) = client_rx.recv() {
+                debug!(?msg, "sending message to daemon");
+                if let Err(e) = write_message_sync(&mut writer, &msg) {
+                    error!(%e, "write error, bridge writer shutting down");
+                    if let Err(send_err) = writer_event_tx
+                        .send(BridgeEvent::Error(format!("write error: {e}")))
+                    {
+                        warn!("failed to send write error event: {send_err}");
                     }
+                    break;
                 }
+                let _ = writer.flush();
             }
             info!("bridge writer task finished");
         });
 
+        // Reader thread: uses the shared run_daemon_reader loop from tai-client-core.
+        // It handles EOF, connection reset, and protocol errors uniformly.
         std::thread::spawn(move || {
             let mut reader = reader;
             let mut assembler = ImageAssembler::new();
             let mut buffers: HashMap<u32, StreamingText> = HashMap::new();
 
-            loop {
-                match read_message_sync::<_, DaemonMessage>(&mut reader) {
-                    Ok(msg) => {
-                        debug!(?msg, "received daemon message");
-                        if let Some(event) = daemon_to_bridge_events(msg, &mut assembler, &mut buffers) {
-                            if event_tx.send(event).is_err() {
-                                warn!("bridge event receiver dropped, reader task exiting");
-                                return;
-                            }
-                        }
-                    }
-                    Err(ProtoError::Io(e))
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                        ) =>
-                    {
-                        error!(%e, "daemon disconnected");
-                        if let Err(send_err) =
-                            event_tx.send(BridgeEvent::Error("daemon disconnected".into()))
-                        {
-                            warn!("failed to send disconnect error event: {send_err}");
-                        }
-                        return;
-                    }
-                    Err(e) => {
-                        error!(%e, "daemon read error, reader task exiting");
-                        if let Err(send_err) =
-                            event_tx.send(BridgeEvent::Error(format!("daemon error: {e}")))
-                        {
-                            warn!("failed to send daemon error event: {send_err}");
-                        }
-                        return;
-                    }
+            let result = tai_client_core::run_daemon_reader(&mut reader, |msg| {
+                debug!(?msg, "received daemon message");
+                if let Some(event) = daemon_to_bridge_events(msg, &mut assembler, &mut buffers) {
+                    let _ = event_tx.send(event);
                 }
+            });
+
+            if let Err(e) = result {
+                error!(%e, "daemon read loop ended with error");
+                let _ = event_tx.send(BridgeEvent::Error(format!("daemon error: {e}")));
+            } else {
+                info!("daemon disconnected cleanly");
             }
         });
 
@@ -130,7 +101,7 @@ impl DaemonBridge {
     pub fn into_parts(
         self,
     ) -> (
-        mpsc::Sender<DaemonBridgeCommand>,
+        mpsc::Sender<ClientMessage>,
         mpsc::Receiver<BridgeEvent>,
     ) {
         (self.client_tx, self.event_rx)
