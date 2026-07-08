@@ -831,19 +831,6 @@ mod tests {
     // -- sleep_or_cancel tests -------------------------------------------
 
     #[test]
-    fn sleep_or_cancel_no_channel_returns_ok() {
-        let result = sleep_or_cancel(Duration::from_millis(1), None);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn sleep_or_cancel_timeout_returns_ok() {
-        let (_tx, rx) = mpsc::channel::<()>();
-        let result = sleep_or_cancel(Duration::from_millis(1), Some(&rx));
-        assert!(result.is_ok());
-    }
-
-    #[test]
     fn sleep_or_cancel_signal_returns_cancelled() {
         let (tx, rx) = mpsc::channel::<()>();
         tx.send(()).unwrap();

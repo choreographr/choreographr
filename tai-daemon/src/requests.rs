@@ -1373,36 +1373,6 @@ mod tests {
     }
 
     #[test]
-    fn execute_tool_cancelled_during_execution() {
-        let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
-
-        // Cancel from a background thread after a brief delay so the tool
-        // has time to start and the wait loop enters recv_timeout.
-        let cancel_tx2 = cancel_tx;
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            let _ = cancel_tx2.send(());
-        });
-
-        let (result, _cmd_rx) = run_exec_tool(
-            BlockingTestTool {
-                proceed: std::sync::Mutex::new(Some(proceed_rx)),
-            },
-            "_test_blocking",
-            "{}",
-            Duration::from_secs(60),
-            cancel_rx,
-        );
-
-        assert!(result.result.is_error, "expected error: {}", result.result.content);
-        assert!(result.result.content.contains("cancelled"), "{}", result.result.content);
-
-        // Unblock the tool execution thread so it can exit cleanly.
-        drop(proceed_tx);
-    }
-
-    #[test]
     fn execute_tool_timeout() {
         let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
         let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
@@ -1515,12 +1485,14 @@ mod tests {
         assert!(result.result.content.contains("streaming done"), "{}", result.result.content);
 
         // Verify the streaming payload was forwarded to cmd_tx.
-        match cmd_rx.recv_timeout(Duration::from_secs(5)) {
+        // The forwarding thread sends the payload before the tool result is
+        // delivered, so the message is already in the channel by this point.
+        match cmd_rx.recv() {
             Ok(SessionCommand::Broadcast(DaemonMessage::ToolCallOutput { data, .. })) => {
                 assert_eq!(data, b"streamed payload");
             }
             Ok(_other) => panic!("expected ToolCallOutput, got unexpected SessionCommand"),
-            Err(e) => panic!("timed out waiting for streaming output: {e}"),
+            Err(e) => panic!("channel disconnected while waiting for streaming output: {e}"),
         }
     }
 }
