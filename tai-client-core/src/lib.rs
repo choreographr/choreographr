@@ -1,11 +1,10 @@
-mod connection;
-mod diff;
-mod dispatch;
-mod error;
-mod history;
-mod image;
-mod markdown;
-mod shell;
+pub mod connection;
+pub mod diff;
+pub mod dispatch;
+pub mod error;
+pub mod history;
+pub mod image;
+pub mod shell;
 
 pub use connection::{run_daemon_connection, run_daemon_reader};
 pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
@@ -13,9 +12,6 @@ pub use dispatch::{DaemonMessageHandler, dispatch_daemon_message};
 pub use error::{ClientError, broken_pipe};
 pub use history::{ClientHistory, HistoryItem, MAX_HISTORY_ITEMS};
 pub use image::{ImageAssembler, PendingImage};
-pub use markdown::{
-    MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, render_markdown_html,
-};
 pub use shell::{ShellCommand, StreamingText, parse_input_line, shell_command_echo};
 
 #[cfg(test)]

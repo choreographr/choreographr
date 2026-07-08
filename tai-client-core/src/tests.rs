@@ -1,5 +1,4 @@
 use super::*;
-use crate::markdown::inline_text;
 use tai_proto::{ClientMessage, ImageMetadata, OutputStream};
 
 #[test]
@@ -391,108 +390,6 @@ fn streaming_text_appends_to_matching_stream() {
     assert_eq!(entry.request_id, 7);
     assert_eq!(entry.reasoning, "thinking");
     assert_eq!(entry.answer, "hello world");
-}
-
-#[test]
-fn markdown_parser_supports_common_llm_output() {
-    let document = MarkdownDocument::parse(
-        "# Heading\n\nA **bold** [link](https://example.com).\n\n- one\n- two\n\n```rs\nfn main() {}\n```",
-    );
-
-    assert!(matches!(document.blocks[0], MarkdownBlock::Heading { .. }));
-    assert!(matches!(document.blocks[1], MarkdownBlock::Paragraph(_)));
-    assert!(matches!(document.blocks[2], MarkdownBlock::List { .. }));
-    assert!(matches!(
-        document.blocks[3],
-        MarkdownBlock::CodeBlock { .. }
-    ));
-
-    let MarkdownBlock::List { items, .. } = &document.blocks[2] else {
-        panic!("expected list block");
-    };
-    assert_eq!(items.len(), 2);
-    assert_eq!(item_plain_text(&items[0]), "one");
-    assert_eq!(item_plain_text(&items[1]), "two");
-}
-
-#[test]
-fn markdown_parser_preserves_task_list_item_text() {
-    let document = MarkdownDocument::parse("- [x] done\n- [ ] todo");
-
-    let MarkdownBlock::List { items, .. } = &document.blocks[0] else {
-        panic!("expected list block");
-    };
-
-    assert_eq!(item_plain_text(&items[0]), "[x] done");
-    assert_eq!(item_plain_text(&items[1]), "[ ] todo");
-}
-
-#[test]
-fn markdown_parser_preserves_nested_tight_list_text() {
-    let document = MarkdownDocument::parse("- parent\n  - child\n  - child 2");
-
-    let MarkdownBlock::List { items, .. } = &document.blocks[0] else {
-        panic!("expected top-level list block");
-    };
-
-    assert_eq!(item_plain_text(&items[0]), "parentchildchild 2");
-
-    let nested_list = items[0]
-        .iter()
-        .find_map(|block| match block {
-            MarkdownBlock::List { items, .. } => Some(items),
-            _ => None,
-        })
-        .expect("expected nested list");
-    assert_eq!(item_plain_text(&nested_list[0]), "child");
-    assert_eq!(item_plain_text(&nested_list[1]), "child 2");
-}
-
-#[test]
-fn markdown_parser_supports_tables() {
-    let document =
-        MarkdownDocument::parse("| Name | Role |\n|:--|--:|\n| Ada | Math |\n| Grace | CS |");
-
-    assert!(matches!(document.blocks[0], MarkdownBlock::Table { .. }));
-}
-
-#[test]
-fn markdown_html_escapes_unsafe_html_and_links() {
-    let safe_html = render_markdown_html("[ok](https://example.com)");
-    let unsafe_html = render_markdown_html("[x](javascript:alert(1))");
-
-    assert!(safe_html.contains("https://example.com"));
-    assert!(!unsafe_html.contains("javascript:alert(1)"));
-    assert!(!unsafe_html.contains("href="));
-}
-
-#[test]
-fn markdown_html_renders_tables() {
-    let html = render_markdown_html("| Name | Role |\n|---|---|\n| Ada | Math |\n| Grace | CS |");
-
-    assert!(html.contains("<table>"));
-    assert!(html.contains("<td>Ada</td>"));
-    assert!(html.contains("<td>Grace</td>"));
-}
-
-fn item_plain_text(blocks: &[MarkdownBlock]) -> String {
-    let mut text = String::new();
-    for block in blocks {
-        match block {
-            MarkdownBlock::Paragraph(content) | MarkdownBlock::Heading { content, .. } => {
-                text.push_str(&inline_text(content));
-            }
-            MarkdownBlock::CodeBlock { code, .. } => text.push_str(code),
-            MarkdownBlock::BlockQuote(content) => text.push_str(&item_plain_text(content)),
-            MarkdownBlock::List { items, .. } => {
-                for item in items {
-                    text.push_str(&item_plain_text(item));
-                }
-            }
-            MarkdownBlock::Table { .. } | MarkdownBlock::Rule => {}
-        }
-    }
-    text
 }
 
 #[test]

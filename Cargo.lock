@@ -7852,8 +7852,6 @@ dependencies = [
 name = "tai-client-core"
 version = "0.1.0"
 dependencies = [
- "ammonia",
- "pulldown-cmark",
  "tai-proto",
  "thiserror 2.0.18",
 ]
@@ -7905,6 +7903,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "tai-client-core",
+ "tai-markdown",
  "tai-proto",
  "tracing",
 ]
@@ -7917,6 +7916,7 @@ dependencies = [
  "anyhow",
  "frankenstein",
  "tai-client-core",
+ "tai-markdown",
  "tai-proto",
  "tempfile",
  "tracing",
@@ -7936,6 +7936,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "zeroize",
+]
+
+[[package]]
+name = "tai-markdown"
+version = "0.1.0"
+dependencies = [
+ "ammonia",
+ "pulldown-cmark",
 ]
 
 [[package]]
@@ -7966,6 +7974,7 @@ dependencies = [
  "signal-hook 0.4.4",
  "syntect",
  "tai-client-core",
+ "tai-markdown",
  "tai-proto",
  "tempfile",
  "tracing",

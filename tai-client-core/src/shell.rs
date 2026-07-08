@@ -1,4 +1,4 @@
-use tai_proto::{ClientMessage, OutputStream};
+use tai_proto::ClientMessage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellCommand {
@@ -223,27 +223,4 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamingText {
-    pub request_id: u32,
-    pub reasoning: String,
-    pub answer: String,
-}
-
-impl StreamingText {
-    pub fn new(request_id: u32) -> Self {
-        Self {
-            request_id,
-            reasoning: String::new(),
-            answer: String::new(),
-        }
-    }
-
-    pub fn append(&mut self, stream: OutputStream, chunk: &str) {
-        match stream {
-            OutputStream::Answer => self.answer.push_str(chunk),
-            OutputStream::Reasoning => self.reasoning.push_str(chunk),
-            _ => {}
-        }
-    }
-}
+pub use crate::history::StreamingText;

@@ -5,7 +5,8 @@ use frankenstein::methods::{GetUpdatesParams, SendMessageParams, SendPhotoParams
 use frankenstein::types::ChatType;
 use std::sync::mpsc;
 use std::cell::Cell;
-use tai_client_core::{ShellCommand, parse_input_line, render_markdown_html};
+use tai_client_core::{ShellCommand, parse_input_line};
+use tai_markdown::render_markdown_html;
 use tai_proto::ClientMessage;
 use tracing::{debug, error, info, warn};
 
