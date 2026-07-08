@@ -510,6 +510,7 @@ fn run_riscv_impl(
 
     let machine = DefaultMachineBuilder::new(core)
         .syscall(Box::new(syscall))
+        .instruction_cycle_func(Box::new(ckb_vm::cost_model::estimate_cycles))
         .build();
 
     let mut trace = TraceMachine::new(machine);
@@ -529,6 +530,15 @@ fn run_riscv_impl(
             image: None,
         };
     }
+
+    // The CKB-VM does not set A0/A1 registers before jumping to _start.
+    // Set them explicitly so the guest's _start can read argc from a0 and
+    // argv from a1 (the stack has already been laid out by initialize_stack
+    // with [argc, argv[0], ..., NULL] starting at SP).
+    let arg_count = args_list.len() as u64;
+    let sp = trace.registers()[registers::SP];
+    trace.set_register(registers::A0, arg_count);
+    trace.set_register(registers::A1, sp + 8);
 
     match trace.run() {
         Ok(_exit_code) => {

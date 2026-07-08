@@ -31,14 +31,16 @@ fn exit_zero() {
         Some(Path::new("/tmp")),
     );
     assert!(!result.is_error, "expected success: {}", result.content);
-    assert!(result.content.is_empty(), "expected empty output: {}", result.content);
+    // The tool prepends the formatted source as a markdown code block.
+    assert!(result.content.contains("```rust"), "expected source block: {}", result.content);
+    assert!(result.content.contains("fn main()"), "expected source: {}", result.content);
 }
 
 #[test]
 #[ignore]
 fn with_args() {
     let result = execute_run_riscv_tool(
-        r#"{"source": "fn main() { let args = tai::args(); if args.len() > 1 { tai::write(&args[1]); } }", "args": ["hello"]}"#,
+        r#"{"source": "fn main() { let args = tai::args(); if args.len() > 0 { tai::write(&args[0]); } }", "args": ["hello"]}"#,
         Some(Path::new("/tmp")),
     );
     assert!(!result.is_error, "expected success: {}", result.content);
