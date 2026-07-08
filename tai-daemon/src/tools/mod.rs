@@ -173,18 +173,19 @@ impl ToolRegistry {
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);
         reg.register(x::XUserLookup);
-        reg.register(vm::RunRiscV);
         reg
     }
 
-    /// Build a shared registry and initialise the VM tool's global reference.
+    /// Build a shared registry with the RunRiscV tool registered.
     ///
-    /// Call this instead of `Arc::new(ToolRegistry::new())` so that the
-    /// RISC‑V sandbox can dispatch tool calls from within the guest.
+    /// Uses `Arc::new_cyclic` to give the RISC-V sandbox a weak reference to
+    /// the registry so guest tool calls can be dispatched without a global.
     pub fn build(self) -> Arc<Self> {
-        let arc = Arc::new(self);
-        vm::init_vm_tool_registry(&arc);
-        arc
+        Arc::new_cyclic(|weak| {
+            let mut reg = self;
+            reg.register(vm::RunRiscV::new(weak.clone()));
+            reg
+        })
     }
 
     pub(crate) fn register(&mut self, tool: impl Tool + 'static) {

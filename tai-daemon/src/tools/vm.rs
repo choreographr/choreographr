@@ -13,7 +13,7 @@ use serde::Deserialize;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Weak};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -38,6 +38,12 @@ const BOILERPLATE_ALLOC: &str = r#"
 extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
+
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::string::ToString;
+use alloc::format;
+use alloc::boxed::Box;
 
 const HEAP_SIZE: usize = 131072;
 static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
@@ -128,6 +134,31 @@ pub mod tai {
             );
         }
     }
+"#;
+
+const BOILERPLATE_TAIL_ALLOC: &str = r#"
+    use alloc::vec::Vec;
+
+    pub fn args() -> Vec<Vec<u8>> {
+        unsafe {
+            let argc = ARGC;
+            let argv = ARGV;
+            let mut result = Vec::with_capacity(argc);
+            for i in 0..argc {
+                let ptr = *argv.add(i);
+                let mut len = 0;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let slice = core::slice::from_raw_parts(ptr, len);
+                result.push(slice.to_vec());
+            }
+            result
+        }
+    }
+"#;
+
+const BOILERPLATE_TAIL_CLOSE: &str = r#"
 }
 
 #[no_mangle]
@@ -148,33 +179,6 @@ pub extern "C" fn _start() {
 }
 "#;
 
-const BOILERPLATE_TAIL_ALLOC: &str = r#"
-use alloc::vec::Vec;
-use alloc::vec;
-use alloc::string::String;
-use alloc::string::ToString;
-use alloc::format;
-use alloc::boxed::Box;
-
-pub fn args() -> Vec<Vec<u8>> {
-    unsafe {
-        let argc = tai::ARGC;
-        let argv = tai::ARGV;
-        let mut result = Vec::with_capacity(argc);
-        for i in 0..argc {
-            let ptr = *argv.add(i);
-            let mut len = 0;
-            while *ptr.add(len) != 0 {
-                len += 1;
-            }
-            let slice = core::slice::from_raw_parts(ptr, len);
-            result.push(slice.to_vec());
-        }
-        result
-    }
-}
-"#;
-
 fn build_boilerplate(enable_allocator: bool) -> String {
     let mut s = String::from(BOILERPLATE_HEAD);
     if enable_allocator {
@@ -184,6 +188,7 @@ fn build_boilerplate(enable_allocator: bool) -> String {
     if enable_allocator {
         s.push_str(BOILERPLATE_TAIL_ALLOC);
     }
+    s.push_str(BOILERPLATE_TAIL_CLOSE);
     s
 }
 
@@ -227,8 +232,6 @@ fn format_rust_source(source: &str) -> String {
     }
 }
 
-static VM_TOOL_REGISTRY: OnceLock<Arc<ToolRegistry>> = OnceLock::new();
-
 #[derive(Deserialize)]
 struct RunRiscVInput {
     source: Option<String>,
@@ -240,6 +243,7 @@ struct RunRiscVInput {
 }
 
 struct TaiSyscall {
+    registry: Arc<ToolRegistry>,
     x_credentials: Option<ServiceCredential>,
     cwd: Option<PathBuf>,
     output_tx: mpsc::Sender<Vec<u8>>,
@@ -269,10 +273,6 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                 let request_bytes =
                     machine.memory_mut().load_bytes(req_ptr, req_len)?;
 
-                let registry = VM_TOOL_REGISTRY
-                    .get()
-                    .ok_or_else(|| VmError::Unexpected("VM_TOOL_REGISTRY not initialized".into()))?;
-
                 let v: serde_json::Value = serde_json::from_slice(&request_bytes)
                     .map_err(|_| VmError::Unexpected("invalid tool call JSON".into()))?;
 
@@ -291,7 +291,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                     arguments_json,
                 };
 
-                let exec_output = registry.execute(
+                let exec_output = self.registry.execute(
                     &tool_call,
                     self.x_credentials.as_ref(),
                     self.cwd.as_deref(),
@@ -415,6 +415,7 @@ fn run_riscv_impl(
     x_credentials: Option<&ServiceCredential>,
     cwd: Option<&Path>,
     write_tx: Option<mpsc::Sender<Vec<u8>>>,
+    registry: Arc<ToolRegistry>,
 ) -> ToolExecutionOutput {
     let input: RunRiscVInput = match serde_json::from_str(args) {
         Ok(i) => i,
@@ -493,6 +494,7 @@ fn run_riscv_impl(
 
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
     let syscall = TaiSyscall {
+        registry,
         x_credentials: x_credentials.cloned(),
         cwd: cwd.map(|p| p.to_path_buf()),
         output_tx,
@@ -573,7 +575,15 @@ fn run_riscv_impl(
     }
 }
 
-pub(crate) struct RunRiscV;
+pub(crate) struct RunRiscV {
+    registry: Weak<ToolRegistry>,
+}
+
+impl RunRiscV {
+    pub fn new(registry: Weak<ToolRegistry>) -> Self {
+        RunRiscV { registry }
+    }
+}
 
 impl Tool for RunRiscV {
     fn name(&self) -> &'static str {
@@ -623,7 +633,13 @@ impl Tool for RunRiscV {
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&Path>,
     ) -> ToolExecutionOutput {
-        run_riscv_impl(args, x_credentials, cwd, None)
+        match self.registry.upgrade() {
+            Some(registry) => run_riscv_impl(args, x_credentials, cwd, None, registry),
+            None => ToolExecutionOutput {
+                result: tool_err("ToolRegistry no longer available"),
+                image: None,
+            },
+        }
     }
 
     fn execute_streaming(
@@ -633,16 +649,19 @@ impl Tool for RunRiscV {
         cwd: Option<&Path>,
     output_tx: mpsc::Sender<Vec<u8>>,
     ) -> ToolExecutionOutput {
-        run_riscv_impl(args, x_credentials, cwd, Some(output_tx))
+        match self.registry.upgrade() {
+            Some(registry) => run_riscv_impl(args, x_credentials, cwd, Some(output_tx), registry),
+            None => ToolExecutionOutput {
+                result: tool_err("ToolRegistry no longer available"),
+                image: None,
+            },
+        }
     }
 }
 
 pub fn execute_run_riscv_tool(args: &str, cwd: Option<&Path>) -> ToolResult {
-    run_riscv_impl(args, None, cwd, None).result
-}
-
-pub(crate) fn init_vm_tool_registry(registry: &Arc<ToolRegistry>) {
-    let _ = VM_TOOL_REGISTRY.set(Arc::clone(registry));
+    let registry = Arc::new(ToolRegistry::new());
+    run_riscv_impl(args, None, cwd, None, registry).result
 }
 
 #[cfg(test)]
@@ -727,16 +746,20 @@ mod tests {
         assert!(result.contains("EXIT"));
     }
 
+    fn dummy_registry() -> Arc<ToolRegistry> {
+        Arc::new(ToolRegistry::new())
+    }
+
     #[test]
     fn run_riscv_rejects_invalid_json() {
-        let result = run_riscv_impl(r#"not json"#, None, None, None);
+        let result = run_riscv_impl(r#"not json"#, None, None, None, dummy_registry());
         assert!(result.result.is_error, "expected error: {}", result.result.content);
         assert!(result.result.content.contains("invalid arguments"), "{}", result.result.content);
     }
 
     #[test]
     fn run_riscv_requires_source_or_program() {
-        let result = run_riscv_impl(r#"{}"#, None, None, None);
+        let result = run_riscv_impl(r#"{}"#, None, None, None, dummy_registry());
         assert!(result.result.is_error, "expected error: {}", result.result.content);
         assert!(result.result.content.contains("source") || result.result.content.contains("program"),
             "should mention source/program: {}", result.result.content);
@@ -746,7 +769,7 @@ mod tests {
     fn run_riscv_rejects_both_source_and_program() {
         let result = run_riscv_impl(
             r#"{"source": "fn main() {}", "program": "AAAA"}"#,
-            None, None, None,
+            None, None, None, dummy_registry(),
         );
         assert!(result.result.is_error, "expected error: {}", result.result.content);
         assert!(result.result.content.contains("only one of"), "{}", result.result.content);
@@ -756,7 +779,7 @@ mod tests {
     fn run_riscv_rejects_invalid_base64() {
         let result = run_riscv_impl(
             r#"{"program": "!!!not-base64!!!"}"#,
-            None, None, None,
+            None, None, None, dummy_registry(),
         );
         assert!(result.result.is_error, "expected error: {}", result.result.content);
         assert!(result.result.content.contains("base64 decode error"), "{}", result.result.content);
@@ -766,7 +789,7 @@ mod tests {
     fn run_riscv_rejects_non_aligned_memory() {
         let result = run_riscv_impl(
             r#"{"program": "AAAA", "memory_size": 100}"#,
-            None, None, None,
+            None, None, None, dummy_registry(),
         );
         assert!(result.result.is_error, "expected error: {}", result.result.content);
         assert!(result.result.content.contains("multiple of 4096"), "{}", result.result.content);
@@ -776,7 +799,7 @@ mod tests {
     fn run_riscv_rejects_memory_over_4mb() {
         let result = run_riscv_impl(
             r#"{"program": "AAAA", "memory_size": 4198400}"#,
-            None, None, None,
+            None, None, None, dummy_registry(),
         );
         assert!(result.result.is_error, "expected error: {}", result.result.content);
         assert!(result.result.content.contains("cannot exceed 4MB"), "{}", result.result.content);
@@ -789,7 +812,7 @@ mod tests {
         // passes input validation (the error will be about ELF loading, not input).
         let result = run_riscv_impl(
             r#"{"program": "AAAA", "memory_size": 4096}"#,
-            None, None, None,
+            None, None, None, dummy_registry(),
         );
         // Should fail at ELF load, not at input validation
         assert!(result.result.is_error, "expected error: {}", result.result.content);
