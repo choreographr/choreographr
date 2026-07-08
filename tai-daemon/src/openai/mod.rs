@@ -1,5 +1,6 @@
 mod config;
 mod requests;
+mod retry;
 mod sse;
 #[cfg(test)]
 mod tests;
@@ -13,10 +14,10 @@ pub(crate) use sse::build_sse_event;
 pub(crate) use sse::{SseReader, extract_responses_text_delta};
 
 #[cfg(test)]
-pub(crate) use requests::{
+pub(crate) use retry::{
     RetryConfig, backoff_duration, is_retryable_status, parse_retry_after_secs,
 };
-pub use requests::RetryCallback;
+pub use retry::RetryCallback;
 
 use serde::{Deserialize, Serialize};
 use std::{io, time::Duration};

@@ -12,7 +12,7 @@ struct NuArgs {
     timeout: Option<u64>,
 }
 
-define_tool_with_cwd!(
+define_tool!(
     NuShell,
     "nushell",
     "Execute a nushell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang.",

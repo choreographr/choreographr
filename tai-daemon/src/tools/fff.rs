@@ -101,7 +101,7 @@ fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, ToolError
     Ok(state)
 }
 
-define_tool_with_cwd!(
+define_tool!(
     Fff,
     "fff",
     "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes.",

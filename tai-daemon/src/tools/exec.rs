@@ -14,7 +14,7 @@ struct ExecArgs {
     timeout: Option<u64>,
 }
 
-define_tool_with_cwd!(
+define_tool!(
     Exec,
     "exec",
     "Execute a program directly without a shell. The command is not parsed by a shell — no pipes, redirects, glob expansion, or environment variable interpolation. Prefer this over `sh` when you only need to run a single program with arguments (lower risk of shell-injection issues).",

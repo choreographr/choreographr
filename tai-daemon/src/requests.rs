@@ -3,9 +3,9 @@ use crate::db::write_message_retry;
 use tracing::debug;
 use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatAssistantToolUse, ChatRequestMessage,
-    ChatTurnResult, CompletionChunkKind, OpenAiClient,
+    ChatToolCall, ChatTurnResult, CompletionChunkKind, OpenAiClient,
 };
-use crate::sessions::{SessionCommand, SessionState};
+use crate::sessions::{SessionCommand, SessionMetadata, SessionState};
 use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
 use std::io;
 use std::path::Path;
@@ -78,6 +78,30 @@ pub(crate) fn is_cancelled(rx: &mpsc::Receiver<()>, was_cancelled: &mut bool) ->
     *was_cancelled
 }
 
+fn refresh_session_context(
+    session: &mut SessionState,
+    cwd: &Path,
+    context_config: &context::ContextConfig,
+) {
+    if let Some(old_fp) = session.context_fingerprint {
+        if let Some(idx) = session.context_message_index {
+            if let Ok(Some(new_bundle)) =
+                context::recheck_context(cwd, context_config, old_fp)
+            {
+                let new_content = context::assemble_context(&new_bundle);
+                if !new_content.is_empty() {
+                    session.set_message(idx, SessionMessage::SystemText {
+                        content: new_content,
+                    });
+                }
+                session.context_fingerprint = Some(new_bundle.fingerprint);
+                session.context_file_paths =
+                    new_bundle.files.iter().map(|f| f.path.clone()).collect();
+            }
+        }
+    }
+}
+
 pub(crate) fn run_agent_loop(
     client: &OpenAiClient,
     session: &mut SessionState,
@@ -102,25 +126,9 @@ pub(crate) fn run_agent_loop(
             return Ok(true);
         }
 
-        if let Some(ref session_cwd) = session.cwd {
+        if let Some(session_cwd) = session.cwd.clone() {
             let context_config = client.config().context.clone();
-            if let Some(old_fp) = session.context_fingerprint {
-                if let Some(idx) = session.context_message_index {
-                    if let Ok(Some(new_bundle)) =
-                        context::recheck_context(session_cwd, &context_config, old_fp)
-                    {
-                        let new_content = context::assemble_context(&new_bundle);
-                        if !new_content.is_empty() {
-                            session.set_message(idx, SessionMessage::SystemText {
-                                content: new_content,
-                            });
-                        }
-                        session.context_fingerprint = Some(new_bundle.fingerprint);
-                        session.context_file_paths =
-                            new_bundle.files.iter().map(|f| f.path.clone()).collect();
-                    }
-                }
-            }
+            refresh_session_context(session, &session_cwd, &context_config);
         }
 
         if cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Inference)).is_err() {
@@ -247,91 +255,16 @@ pub(crate) fn run_agent_loop(
                         "tool finished",
                     );
 
-                    if let Some(hint) = context::subdirectory_hints(
-                        &tool_call.name,
-                        &tool_call.arguments_json,
-                        session.cwd.as_deref(),
-                        &session.context_file_paths,
-                    ) {
-                        output.result.content =
-                            format!("{}\n\n---\n{}", output.result.content, hint);
-                    }
-
-                    if let Some(image) = output.image {
-                        let PreparedImage { mime_type, data, width, height, alt } = image;
-
-                        // Broadcast to live subscribers first (needs a clone of
-                        // data/mime_type/alt for chunking over the channel).
-                        emit_prepared_image_sync(
-                            cmd_tx,
-                            request_id,
-                            next_image_id,
-                            PreparedImage {
-                                mime_type: mime_type.clone(),
-                                data: data.clone(),
-                                width,
-                                height,
-                                alt: alt.clone(),
-                            },
-                        );
-                        next_image_id = next_image_id.wrapping_add(1);
-
-                        // Persist the image data so it can be replayed on session
-                        // re-attach or after a daemon restart.  Written to the DB
-                        // before pushing to the in-memory vec so that a crash between
-                        // the two leaves a complete snapshot.
-                        let persisted = SessionMessage::DisplayedImage(DisplayedImageRecord {
-                            metadata: ImageMetadata {
-                                image_id: 0, // unused for persisted images
-                                mime_type,   // moved
-                                width,
-                                height,
-                                // Safety: data.len() fits in u64 on all supported platforms.
-                                byte_len: data.len() as u64,
-                                alt, // moved
-                            },
-                            data, // moved — only one clone total (done above for broadcast)
-                        });
-                        let img_idx = session.messages().len() as u32;
-                        if let Err(e) = write_message_retry(db, session_id, img_idx, &persisted) {
-                            tracing::warn!(
-                                session_id, error = %e,
-                                "failed to persist displayed image",
-                            );
-                        }
-                        session.push_message(persisted);
-                    }
-
-                    let msg = SessionMessage::ToolResult {
-                        call_id: tool_call.id.clone(),
-                        name: tool_call.name.clone(),
-                        content: output.result.content.clone(),
-                        is_error: output.result.is_error,
-                    };
-                    let idx = session.push_message(msg.clone());
-                    if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
-                        tracing::warn!(
-                            session_id, tool_name = %tool_call.name, error = %e,
-                            "failed to persist tool result",
-                        );
-                    }
-
-                    let event = if output.result.is_error {
-                        DaemonMessage::ToolCallFailed {
-                            request_id,
-                            call_id: tool_call.id.clone(),
-                            tool_name: tool_call.name.clone(),
-                            error: output.result.content.clone(),
-                        }
-                    } else {
-                        DaemonMessage::ToolCallFinished {
-                            request_id,
-                            call_id: tool_call.id.clone(),
-                            tool_name: tool_call.name.clone(),
-                            output: output.result.content.clone(),
-                        }
-                    };
-                    let _ = cmd_tx.send(SessionCommand::Broadcast(event));
+                    finish_tool_call(
+                        cmd_tx,
+                        request_id,
+                        session,
+                        session_id,
+                        db,
+                        &tool_call,
+                        &mut output,
+                        &mut next_image_id,
+                    );
                 }
             }
             Err(crate::openai::OpenAiError::Cancelled) => {
@@ -347,6 +280,96 @@ pub(crate) fn run_agent_loop(
         io::ErrorKind::InvalidData,
         format!("tool loop exceeded {max_turns} iterations"),
     ))
+}
+
+fn finish_tool_call(
+    cmd_tx: &mpsc::Sender<SessionCommand>,
+    request_id: u32,
+    session: &mut SessionState,
+    session_id: u64,
+    db: &redb::Database,
+    tool_call: &ChatToolCall,
+    output: &mut ToolExecutionOutput,
+    next_image_id: &mut u32,
+) {
+    if let Some(hint) = context::subdirectory_hints(
+        &tool_call.name,
+        &tool_call.arguments_json,
+        session.cwd.as_deref(),
+        &session.context_file_paths,
+    ) {
+        output.result.content =
+            format!("{}\n\n---\n{}", output.result.content, hint);
+    }
+
+    if let Some(image) = output.image.take() {
+        let PreparedImage { mime_type, data, width, height, alt } = image;
+
+        emit_prepared_image_sync(
+            cmd_tx,
+            request_id,
+            *next_image_id,
+            PreparedImage {
+                mime_type: mime_type.clone(),
+                data: data.clone(),
+                width,
+                height,
+                alt: alt.clone(),
+            },
+        );
+        *next_image_id = next_image_id.wrapping_add(1);
+
+        let persisted = SessionMessage::DisplayedImage(DisplayedImageRecord {
+            metadata: ImageMetadata {
+                image_id: 0,
+                mime_type,
+                width,
+                height,
+                byte_len: data.len() as u64,
+                alt,
+            },
+            data,
+        });
+        let img_idx = session.messages().len() as u32;
+        if let Err(e) = write_message_retry(db, session_id, img_idx, &persisted) {
+            tracing::warn!(
+                session_id, error = %e,
+                "failed to persist displayed image",
+            );
+        }
+        session.push_message(persisted);
+    }
+
+    let msg = SessionMessage::ToolResult {
+        call_id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        content: output.result.content.clone(),
+        is_error: output.result.is_error,
+    };
+    let idx = session.push_message(msg.clone());
+    if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
+        tracing::warn!(
+            session_id, tool_name = %tool_call.name, error = %e,
+            "failed to persist tool result",
+        );
+    }
+
+    let event = if output.result.is_error {
+        DaemonMessage::ToolCallFailed {
+            request_id,
+            call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            error: output.result.content.clone(),
+        }
+    } else {
+        DaemonMessage::ToolCallFinished {
+            request_id,
+            call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            output: output.result.content.clone(),
+        }
+    };
+    let _ = cmd_tx.send(SessionCommand::Broadcast(event));
 }
 
 fn execute_tool_with_timeout(
@@ -366,63 +389,66 @@ fn execute_tool_with_timeout(
     cancel_rx: &mpsc::Receiver<()>,
     cmd_tx: &mpsc::Sender<SessionCommand>,
 ) -> ToolExecutionOutput {
-    if tool_call.name == "list_sessions" {
-        return execute_list_sessions_sync(daemon_tx);
-    }
-    if tool_call.name == "get_session" {
-        return execute_get_session_sync(daemon_tx, &tool_call.arguments_json);
-    }
-    if tool_call.name == "spawn_subsession" {
-        return execute_spawn_subsession_sync(
-            client,
-            daemon_tx,
-            session,
-            session_id,
-            db,
-            model,
-            tool_call,
-            None,
-            cwd,
-            max_turns_default,
-            cancel_rx,
-        );
-    }
-    if tool_call.name == "load_skill" {
-        return execute_load_skill_sync(session, cwd, &tool_call.arguments_json);
-    }
-    if tool_call.name == "load_tools" {
-        let result = crate::tools::groups::execute_load_tools(
-            &mut session.active_tool_groups,
-            &tool_call.arguments_json,
-        );
-        let _ = daemon_tx.send(crate::daemon::DaemonCommand::UpdateMetadata {
-            session_id,
-            metadata: session.to_metadata(),
-        });
-        return ToolExecutionOutput {
-            result: ToolResult {
-                content: result,
-                is_error: false,
-            },
-            image: None,
-        };
-    }
-    if tool_call.name == "unload_tools" {
-        let result = crate::tools::groups::execute_unload_tools(
-            &mut session.active_tool_groups,
-            &tool_call.arguments_json,
-        );
-        let _ = daemon_tx.send(crate::daemon::DaemonCommand::UpdateMetadata {
-            session_id,
-            metadata: session.to_metadata(),
-        });
-        return ToolExecutionOutput {
-            result: ToolResult {
-                content: result,
-                is_error: false,
-            },
-            image: None,
-        };
+    match tool_call.name.as_str() {
+        "list_sessions" => {
+            return execute_list_sessions_sync(daemon_tx);
+        }
+        "get_session" => {
+            return execute_get_session_sync(daemon_tx, &tool_call.arguments_json);
+        }
+        "spawn_subsession" => {
+            return execute_spawn_subsession_sync(
+                client,
+                daemon_tx,
+                session,
+                session_id,
+                db,
+                model,
+                tool_call,
+                None,
+                cwd,
+                max_turns_default,
+                cancel_rx,
+            );
+        }
+        "load_skill" => {
+            return execute_load_skill_sync(session, cwd, &tool_call.arguments_json);
+        }
+        "load_tools" => {
+            let result = crate::tools::groups::execute_load_tools(
+                &mut session.active_tool_groups,
+                &tool_call.arguments_json,
+            );
+            let _ = daemon_tx.send(crate::daemon::DaemonCommand::UpdateMetadata {
+                session_id,
+                metadata: SessionMetadata::from(&*session),
+            });
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: result,
+                    is_error: false,
+                },
+                image: None,
+            };
+        }
+        "unload_tools" => {
+            let result = crate::tools::groups::execute_unload_tools(
+                &mut session.active_tool_groups,
+                &tool_call.arguments_json,
+            );
+            let _ = daemon_tx.send(crate::daemon::DaemonCommand::UpdateMetadata {
+                session_id,
+                metadata: SessionMetadata::from(&*session),
+            });
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: result,
+                    is_error: false,
+                },
+                image: None,
+            };
+        }
+        _ => {}
     }
 
     let (result_tx, result_rx) = std::sync::mpsc::channel();

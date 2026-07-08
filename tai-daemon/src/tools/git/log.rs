@@ -80,7 +80,7 @@ pub(crate) fn git_log_impl(
     Ok(out.trim_end().to_string())
 }
 
-define_tool_with_cwd!(
+define_tool!(
     GitLog,
     "git_log",
     "Show recent Git commits for the repository containing the given path.",

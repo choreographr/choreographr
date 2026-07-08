@@ -79,7 +79,7 @@ fn git_status_impl(
     Ok(out.trim_end().to_string())
 }
 
-define_tool_with_cwd!(
+define_tool!(
     GitStatus,
     "git_status",
     "Show the status of the Git repository containing the given path.",

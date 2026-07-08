@@ -112,7 +112,7 @@ fn git_push_impl(
     Ok(out.trim_end().to_string())
 }
 
-define_tool_with_cwd!(
+define_tool!(
     GitPush,
     "git_push",
     "Push to a Git remote branch.",

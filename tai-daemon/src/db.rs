@@ -15,6 +15,10 @@ const SESSION_MESSAGES: TableDefinition<(u64, u32), &[u8]> =
 #[cfg(test)]
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
+fn db_err(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, msg)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub title: Option<String>,
@@ -74,22 +78,22 @@ pub fn write_session(
 ) -> io::Result<()> {
     let payload =
         bincode::serde::encode_to_vec(record, bincode::config::standard()).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("bincode encode session: {e}"))
+            db_err(format!("bincode encode session: {e}"))
         })?;
     let write_txn = db
         .begin_write()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb write txn: {e}")))?;
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn.open_table(SESSIONS).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("redb open sessions: {e}"))
+            db_err(format!("redb open sessions: {e}"))
         })?;
         table.insert(session_id, payload.as_slice()).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("redb insert session: {e}"))
+            db_err(format!("redb insert session: {e}"))
         })?;
     }
     write_txn
         .commit()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit session: {e}")))?;
+        .map_err(|e| db_err(format!("redb commit session: {e}")))?;
     debug!("write_session: id={} ok", session_id);
     Ok(())
 }
@@ -98,19 +102,19 @@ pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<S
     debug!("read_session: id={}", session_id);
     let read_txn = db
         .begin_read()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb read txn: {e}")))?;
+        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
     let table = read_txn
         .open_table(SESSIONS)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb open sessions: {e}")))?;
+        .map_err(|e| db_err(format!("redb open sessions: {e}")))?;
     match table
         .get(session_id)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb get session: {e}")))?
+        .map_err(|e| db_err(format!("redb get session: {e}")))?
     {
         Some(guard) => {
             let record: SessionRecord =
                 bincode::serde::decode_from_slice(guard.value(), bincode::config::standard())
                     .map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("bincode decode session: {e}"))
+                        db_err(format!("bincode decode session: {e}"))
                     })?
                     .0;
             Ok(Some(record))
@@ -124,7 +128,7 @@ pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRec
     let read_txn = db.begin_read().map_err(|e| {
         let msg = format!("redb read txn: {e}");
         error!("read_all_sessions: {msg}");
-        io::Error::new(io::ErrorKind::Other, msg)
+        db_err(msg)
     })?;
     let table = match read_txn.open_table(SESSIONS) {
         Ok(t) => t,
@@ -139,7 +143,7 @@ pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRec
         Err(e) => {
             let msg = format!("redb iter sessions: {e}");
             error!("read_all_sessions: {msg}");
-            return Err(io::Error::new(io::ErrorKind::Other, msg));
+            return Err(db_err(msg));
         }
     };
     for result in iter {
@@ -172,22 +176,22 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
     debug!("delete_session: id={}", session_id);
     let write_txn = db
         .begin_write()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb write txn: {e}")))?;
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
     {
         let mut sessions = write_txn.open_table(SESSIONS).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("redb open sessions: {e}"))
+            db_err(format!("redb open sessions: {e}"))
         })?;
         sessions.remove(session_id).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("redb remove session: {e}"))
+            db_err(format!("redb remove session: {e}"))
         })?;
     }
     {
         let mut messages = write_txn.open_table(SESSION_MESSAGES).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("redb open messages: {e}"))
+            db_err(format!("redb open messages: {e}"))
         })?;
         let keys_to_remove: Vec<(u64, u32)> = messages
             .iter()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb iter messages: {e}")))?
+            .map_err(|e| db_err(format!("redb iter messages: {e}")))?
             .filter_map(|result| {
                 result.ok().and_then(|(key, _)| {
                     if key.value().0 == session_id {
@@ -200,13 +204,13 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
             .collect();
         for key in keys_to_remove {
             messages.remove(key).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("redb remove message: {e}"))
+                db_err(format!("redb remove message: {e}"))
             })?;
         }
     }
     write_txn
         .commit()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit delete: {e}")))?;
+        .map_err(|e| db_err(format!("redb commit delete: {e}")))?;
     Ok(())
 }
 
@@ -218,47 +222,47 @@ pub fn write_message(
 ) -> io::Result<()> {
     let payload =
         bincode::serde::encode_to_vec(message, bincode::config::standard()).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("bincode encode message: {e}"))
+            db_err(format!("bincode encode message: {e}"))
         })?;
     let write_txn = db
         .begin_write()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb write txn: {e}")))?;
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn.open_table(SESSION_MESSAGES).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("redb open messages: {e}"))
+            db_err(format!("redb open messages: {e}"))
         })?;
         table
             .insert((session_id, index), payload.as_slice())
             .map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("redb insert message: {e}"))
+                db_err(format!("redb insert message: {e}"))
             })?;
     }
     write_txn
         .commit()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit message: {e}")))?;
+        .map_err(|e| db_err(format!("redb commit message: {e}")))?;
     Ok(())
 }
 
 pub fn read_messages(db: &redb::Database, session_id: u64) -> io::Result<Vec<SessionMessage>> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb read txn: {e}")))?;
+        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
     let table = read_txn
         .open_table(SESSION_MESSAGES)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb open messages: {e}")))?;
+        .map_err(|e| db_err(format!("redb open messages: {e}")))?;
     let mut messages: Vec<(u32, SessionMessage)> = Vec::new();
     for result in table
         .iter()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb iter messages: {e}")))?
+        .map_err(|e| db_err(format!("redb iter messages: {e}")))?
     {
         let (key, value) = result
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb iter item: {e}")))?;
+            .map_err(|e| db_err(format!("redb iter item: {e}")))?;
         let (sid, idx) = key.value();
         if sid == session_id {
             let message: SessionMessage =
                 bincode::serde::decode_from_slice(value.value(), bincode::config::standard())
                     .map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("bincode decode message: {e}"))
+                        db_err(format!("bincode decode message: {e}"))
                     })?
                     .0;
             messages.push((idx, message));
@@ -321,24 +325,24 @@ mod tests {
     fn next_session_id(db: &redb::Database) -> io::Result<u64> {
         let write_txn = db
             .begin_write()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb write txn: {e}")))?;
+            .map_err(|e| db_err(format!("redb write txn: {e}")))?;
         let current = {
             let mut table = write_txn
                 .open_table(META)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb open meta: {e}")))?;
+                .map_err(|e| db_err(format!("redb open meta: {e}")))?;
             let current = table
                 .get("next_session_id")
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb get meta: {e}")))?
+                .map_err(|e| db_err(format!("redb get meta: {e}")))?
                 .map(|g| g.value())
                 .unwrap_or(1);
             table
                 .insert("next_session_id", current.wrapping_add(1))
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb set meta: {e}")))?;
+                .map_err(|e| db_err(format!("redb set meta: {e}")))?;
             current
         };
         write_txn
             .commit()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("redb commit meta: {e}")))?;
+            .map_err(|e| db_err(format!("redb commit meta: {e}")))?;
         Ok(current)
     }
 

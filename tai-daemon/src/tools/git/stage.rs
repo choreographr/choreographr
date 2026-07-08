@@ -258,7 +258,7 @@ impl IndexEntrySnapshot {
     }
 }
 
-define_tool_with_cwd!(
+define_tool!(
     GitAdd,
     "git_add",
     "Stage a file or pathspec in Git.",

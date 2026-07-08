@@ -48,7 +48,7 @@ fn sh_schema() -> serde_json::Value {
     })
 }
 
-define_tool_with_cwd!(
+define_tool!(
     Sh,
     "sh",
     "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified.",

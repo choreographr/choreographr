@@ -114,7 +114,7 @@ fn current_head_parents(repo: &gix::Repository) -> Result<Vec<ObjectId>, ToolErr
     }
 }
 
-define_tool_with_cwd!(
+define_tool!(
     GitCommit,
     "git_commit",
     "Create a Git commit from the current index.",

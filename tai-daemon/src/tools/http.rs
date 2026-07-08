@@ -1,4 +1,4 @@
-use super::{ToolError, ToolResult, tool_ok, truncate_tool_output};
+use super::{ToolError, ToolExecutionOutput, ToolResult, tool_ok, truncate_tool_output};
 use reqwest::{
     Method, StatusCode, Url,
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -145,42 +145,65 @@ fn format_http_response(status: StatusCode, headers: &HeaderMap, body: &str) -> 
     output
 }
 
-define_tool!(
-    HttpRequest,
-    "http_request",
-    "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests.",
-    execute_http_request_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "method": {
-                "type": "string",
-                "enum": ["GET", "POST", "HEAD"]
-            },
-            "url": {
-                "type": "string",
-                "description": "Absolute http or https URL"
-            },
-            "headers": {
-                "type": "object",
-                "description": "Optional request headers, including Range",
-                "additionalProperties": {
-                    "type": "string"
+pub(crate) struct HttpRequest;
+
+impl super::Tool for HttpRequest {
+    fn name(&self) -> &'static str {
+        "http_request"
+    }
+
+    fn group(&self) -> &'static str {
+        "core"
+    }
+
+    fn description(&self) -> &'static str {
+        "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests."
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST", "HEAD"]
+                },
+                "url": {
+                    "type": "string",
+                    "description": "Absolute http or https URL"
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional request headers, including Range",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Optional UTF-8 request body"
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 30,
+                    "default": 10
                 }
             },
-            "body": {
-                "type": "string",
-                "description": "Optional UTF-8 request body"
-            },
-            "timeout_secs": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 30,
-                "default": 10
-            }
-        },
-        "required": ["method", "url"],
-        "additionalProperties": false
-    }),
-    "core"
-);
+            "required": ["method", "url"],
+            "additionalProperties": false
+        })
+    }
+
+    fn execute(
+        &self,
+        args: &str,
+        _x_credentials: Option<&tai_keystore::ServiceCredential>,
+        _cwd: Option<&std::path::Path>,
+    ) -> ToolExecutionOutput {
+        ToolExecutionOutput {
+            result: execute_http_request_tool(args),
+            image: None,
+        }
+    }
+}

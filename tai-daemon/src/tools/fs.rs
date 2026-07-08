@@ -457,7 +457,7 @@ fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) ->
     out
 }
 
-define_tool_with_cwd!(
+define_tool!(
     ReadFile,
     "read_file",
     "Read a UTF-8 text file from the local workspace.",
@@ -476,7 +476,7 @@ define_tool_with_cwd!(
     "core"
 );
 
-define_tool_with_cwd!(
+define_tool!(
     ReadFileRange,
     "read_file_range",
     "Read a line range from a UTF-8 text file in the local workspace.",
@@ -506,7 +506,7 @@ define_tool_with_cwd!(
     "core"
 );
 
-define_tool_with_cwd!(
+define_tool!(
     ListFiles,
     "list_files",
     "List files in a local directory.",
@@ -525,7 +525,7 @@ define_tool_with_cwd!(
     "core"
 );
 
-define_tool_with_cwd!(
+define_tool!(
     LineCount,
     "line_count",
     "Count the number of lines in a UTF-8 text file.",
@@ -544,7 +544,7 @@ define_tool_with_cwd!(
     "core"
 );
 
-define_tool_with_cwd!(
+define_tool!(
     WriteFile,
     "write_file",
     "Write a UTF-8 text file to the local workspace.",
@@ -577,7 +577,7 @@ define_tool_with_cwd!(
     "core"
 );
 
-define_tool_with_cwd!(
+define_tool!(
     EditFile,
     "edit_file",
     "Edit a UTF-8 text file by applying one or more exact text replacements. Each edit must match at least once; non-replace_all edits must match exactly once.",

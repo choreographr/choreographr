@@ -126,50 +126,18 @@ impl DaemonState {
                     error!("CreateSession: failed to persist session {}: {e}", sid);
                 }
 
-                let db = Arc::clone(&self.db);
-                let client = self.openai_client.clone();
-                let tool_registry = Arc::clone(&self.tool_registry);
-                let daemon_tx = self.daemon_tx.clone();
-                let max_turns_default = self.max_turns;
-                let (session_tx, session_rx) = std::sync::mpsc::channel();
-                let cmd_tx = session_tx.clone();
-                let init_record = record.clone();
-
-                let handle = thread::spawn(move || {
-                    session_main(
-                        cmd_tx,
-                        session_rx,
-                        sid,
-                        db,
-                        client,
-                        tool_registry,
-                        daemon_tx,
-                        Some(init_record),
-                        max_turns_default,
-                    );
-                });
-
-                self.active_sessions.insert(
-                    sid,
-                    ActiveSessionEntry {
-                        cmd_tx: session_tx.clone(),
-                        handle,
-                    },
-                );
-                self.session_metadata.insert(
-                    sid,
-                    SessionMetadata {
-                        title: title.clone(),
-                        selected_model: None,
-                        parent_session_id,
-                        cwd: cwd_str.clone(),
-                        created_at: record.created_at,
-                        message_count: 0,
-                        max_turns,
-                        status: SessionStatus::Inactive,
-                        active_tool_groups: active_cats.clone(),
-                    },
-                );
+                let metadata = SessionMetadata {
+                    title: title.clone(),
+                    selected_model: None,
+                    parent_session_id,
+                    cwd: cwd_str.clone(),
+                    created_at: record.created_at,
+                    message_count: 0,
+                    max_turns,
+                    status: SessionStatus::Inactive,
+                    active_tool_groups: active_cats.clone(),
+                };
+                let session_tx = self.spawn_session(sid, record, metadata);
 
                 let _ = reply.send(Ok((sid, session_tx)));
                 let created_msg = DaemonMessage::SessionCreated {
@@ -200,36 +168,7 @@ impl DaemonState {
                         Ok(Some(record)) => {
                             let mut metadata: SessionMetadata = record.clone().into();
                             metadata.status = SessionStatus::Inactive;
-                            let db = Arc::clone(&self.db);
-                            let client = self.openai_client.clone();
-                            let tool_registry = Arc::clone(&self.tool_registry);
-                            let daemon_tx = self.daemon_tx.clone();
-                            let max_turns_default = self.max_turns;
-                            let (session_tx, session_rx) = std::sync::mpsc::channel();
-                            let cmd_tx = session_tx.clone();
-
-                            let handle = thread::spawn(move || {
-                                session_main(
-                                    cmd_tx,
-                                    session_rx,
-                                    session_id,
-                                    db,
-                                    client,
-                                    tool_registry,
-                                    daemon_tx,
-                                    Some(record),
-                                    max_turns_default,
-                                );
-                            });
-
-                            self.active_sessions.insert(
-                                session_id,
-                                ActiveSessionEntry {
-                                    cmd_tx: session_tx.clone(),
-                                    handle,
-                                },
-                            );
-                            self.session_metadata.insert(session_id, metadata);
+                            let session_tx = self.spawn_session(session_id, record, metadata);
                             info!("AttachSession: loaded session {} from db", session_id);
                             let _ = reply.send(Ok(session_tx));
                         }
@@ -368,6 +307,45 @@ impl DaemonState {
         } else {
             Ok(())
         }
+    }
+
+    fn spawn_session(
+        &mut self,
+        session_id: u64,
+        record: SessionRecord,
+        metadata: SessionMetadata,
+    ) -> mpsc::Sender<SessionCommand> {
+        let db = Arc::clone(&self.db);
+        let client = self.openai_client.clone();
+        let tool_registry = Arc::clone(&self.tool_registry);
+        let daemon_tx = self.daemon_tx.clone();
+        let max_turns_default = self.max_turns;
+        let (session_tx, session_rx) = std::sync::mpsc::channel();
+        let cmd_tx = session_tx.clone();
+
+        let handle = thread::spawn(move || {
+            session_main(
+                cmd_tx,
+                session_rx,
+                session_id,
+                db,
+                client,
+                tool_registry,
+                daemon_tx,
+                Some(record),
+                max_turns_default,
+            );
+        });
+
+        self.active_sessions.insert(
+            session_id,
+            ActiveSessionEntry {
+                cmd_tx: session_tx.clone(),
+                handle,
+            },
+        );
+        self.session_metadata.insert(session_id, metadata);
+        session_tx
     }
 
     /// Send a message to all summary subscribers, removing dead ones.

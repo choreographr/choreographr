@@ -26,38 +26,6 @@ macro_rules! define_tool {
                 &self,
                 args: &str,
                 _x_credentials: Option<&tai_keystore::ServiceCredential>,
-                _cwd: Option<&std::path::Path>,
-            ) -> $crate::tools::ToolExecutionOutput {
-                $crate::tools::ToolExecutionOutput {
-                    result: $exec_fn(args),
-                    image: None,
-                }
-            }
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! define_tool_with_cwd {
-    ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr, $tool_group:literal) => {
-        pub(crate) struct $struct;
-        impl $crate::tools::Tool for $struct {
-            fn name(&self) -> &'static str {
-                $name
-            }
-            fn group(&self) -> &'static str {
-                $tool_group
-            }
-            fn description(&self) -> &'static str {
-                $desc
-            }
-            fn schema(&self) -> serde_json::Value {
-                $schema
-            }
-            fn execute(
-                &self,
-                args: &str,
-                _x_credentials: Option<&tai_keystore::ServiceCredential>,
                 cwd: Option<&std::path::Path>,
             ) -> $crate::tools::ToolExecutionOutput {
                 $crate::tools::ToolExecutionOutput {

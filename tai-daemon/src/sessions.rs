@@ -182,16 +182,7 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    /// Produce metadata suitable for the daemon's in-memory index or the
-    /// command channel. Calls [`From<&SessionState> for SessionMetadata`].
-    pub fn to_metadata(&self) -> SessionMetadata {
-        self.into()
-    }
 
-    /// Produce a persistable record. Calls [`From<&SessionState> for SessionRecord`].
-    pub fn to_record(&self) -> SessionRecord {
-        self.into()
-    }
 
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
@@ -301,6 +292,22 @@ fn broadcast(
     }
 }
 
+fn fail_request(
+    subscribers: &HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
+    request_id: u32,
+    error: impl Into<String>,
+) -> bool {
+    broadcast(subscribers, DaemonMessage::Started { request_id });
+    broadcast(
+        subscribers,
+        DaemonMessage::Failed {
+            request_id,
+            error: error.into(),
+        },
+    );
+    false
+}
+
 pub fn session_main(
     cmd_tx: mpsc::Sender<SessionCommand>,
     rx: std::sync::mpsc::Receiver<SessionCommand>,
@@ -377,7 +384,7 @@ pub fn session_main(
 
     let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
         session_id,
-        metadata: state.to_metadata(),
+        metadata: SessionMetadata::from(&state),
     });
 
     info!("session {} started", session_id);
@@ -432,62 +439,26 @@ fn process_command(
                 "session received input",
             );
             if text.is_empty() {
-                broadcast(&state.subscribers, DaemonMessage::Started { request_id });
-                broadcast(
-                    &state.subscribers,
-                    DaemonMessage::Failed {
-                        request_id,
-                        error: "empty input".to_string(),
-                    },
-                );
-                return false;
+                return fail_request(&state.subscribers, request_id, "empty input");
             }
             let Some(client) = client else {
-                broadcast(&state.subscribers, DaemonMessage::Started { request_id });
-                broadcast(
-                    &state.subscribers,
-                    DaemonMessage::Failed {
-                        request_id,
-                        error: "daemon is locked".to_string(),
-                    },
-                );
-                return false;
+                return fail_request(&state.subscribers, request_id, "daemon is locked");
             };
             let model = match &state.selected_model {
                 Some(m) => m.clone(),
                 None => {
-                    broadcast(&state.subscribers, DaemonMessage::Started { request_id });
-                    broadcast(
-                        &state.subscribers,
-                        DaemonMessage::Failed {
-                            request_id,
-                            error: "no model selected".to_string(),
-                        },
-                    );
-                    return false;
+                    return fail_request(&state.subscribers, request_id, "no model selected");
                 }
             };
             if *shutdown_requested {
-                broadcast(&state.subscribers, DaemonMessage::Started { request_id });
-                broadcast(
-                    &state.subscribers,
-                    DaemonMessage::Failed {
-                        request_id,
-                        error: "session is shutting down".to_string(),
-                    },
-                );
-                return false;
+                return fail_request(&state.subscribers, request_id, "session is shutting down");
             }
             if !state.active_requests.is_empty() {
-                broadcast(&state.subscribers, DaemonMessage::Started { request_id });
-                broadcast(
+                return fail_request(
                     &state.subscribers,
-                    DaemonMessage::Failed {
-                        request_id,
-                        error: "session already has an active request".to_string(),
-                    },
+                    request_id,
+                    "session already has an active request",
                 );
-                return false;
             }
 
             let user_msg = SessionMessage::UserText {
@@ -610,7 +581,7 @@ fn process_command(
             broadcast(&state.subscribers, DaemonMessage::ModelSelected { model: model.clone() });
             let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
                 session_id,
-                metadata: state.to_metadata(),
+                metadata: SessionMetadata::from(&*state),
             });
             false
         }
@@ -680,7 +651,7 @@ fn process_command(
             state.status = SessionStatus::Inactive;
             let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
                 session_id,
-                metadata: state.to_metadata(),
+                metadata: SessionMetadata::from(&*state),
             });
             broadcast(
                 &state.subscribers,
@@ -828,7 +799,7 @@ fn persist_and_exit(
     session_id: u64,
     daemon_tx: &mpsc::Sender<DaemonCommand>,
 ) {
-    let record: SessionRecord = state.to_record();
+    let record: SessionRecord = SessionRecord::from(state);
     if let Err(e) = write_session_retry(db, session_id, &record) {
         error!("persist_and_exit: failed to persist session {}: {e}", session_id);
     }
@@ -948,22 +919,6 @@ mod tests {
         assert_eq!(record.selected_model, state.selected_model);
         assert_eq!(record.message_count, 3);
         assert_eq!(record.cwd, Some("/tmp".into()));
-    }
-
-    #[test]
-    fn session_state_to_metadata_method() {
-        let state = test_state();
-        let meta = state.to_metadata();
-        assert_eq!(meta.title, state.title);
-        assert_eq!(meta.message_count, 3);
-    }
-
-    #[test]
-    fn session_state_to_record_method() {
-        let state = test_state();
-        let record = state.to_record();
-        assert_eq!(record.title, state.title);
-        assert_eq!(record.message_count, 3);
     }
 
     #[test]

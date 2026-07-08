@@ -272,7 +272,7 @@ fn collect_worktree_diff_lines(
     Ok(lines)
 }
 
-define_tool_with_cwd!(
+define_tool!(
     GitDiff,
     "git_diff",
     "Show the diff for a file or repository. When `full` is true, returns line-by-line unified diff instead of file status summary.",
