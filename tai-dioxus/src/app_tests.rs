@@ -5,10 +5,10 @@ use tai_proto::{DaemonMessage, ImageMetadata, OutputStream};
 #[test]
 fn app_state_stream_updates_history() {
     let mut state = AppState::new("/tmp/tai.sock".to_string());
-    state.begin_stream(7);
-    state.append_stream(7, OutputStream::Reasoning, "thinking");
-    state.append_stream(7, OutputStream::Answer, "hello");
-    state.append_stream(7, OutputStream::Answer, " world");
+    state.client.begin_stream(7);
+    state.client.append_stream(7, OutputStream::Reasoning, "thinking");
+    state.client.append_stream(7, OutputStream::Answer, "hello");
+    state.client.append_stream(7, OutputStream::Answer, " world");
 
     let index = state.client.in_progress[&7];
     match &state.client.history[index] {

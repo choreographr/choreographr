@@ -43,35 +43,11 @@ impl AppState {
             attached_session_id: None,
         }
     }
-
-    pub(crate) fn push_text(&mut self, text: impl Into<String>) {
-        self.client.push_text(text);
-    }
-
-    pub(crate) fn push_session_message(&mut self, message: SessionMessage) {
-        self.client.push_session_message(message);
-    }
-
-    pub(crate) fn begin_stream(&mut self, request_id: u32) {
-        self.client.begin_stream(request_id);
-    }
-
-    pub(crate) fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
-        self.client.append_stream(request_id, stream, chunk);
-    }
-
-    pub(crate) fn finalize_stream(&mut self, request_id: u32) {
-        self.client.finalize_stream(request_id);
-    }
-
-    pub(crate) fn push_image(&mut self, image: DisplayImage) {
-        self.client.push_image(image);
-    }
 }
 
 impl DaemonMessageHandler for AppState {
     fn push_text(&mut self, text: String) {
-        self.push_text(text);
+        self.client.push_text(text);
     }
 
     fn push_tool_text(&mut self, request_id: u32, text: String) {
@@ -79,7 +55,7 @@ impl DaemonMessageHandler for AppState {
     }
 
     fn push_session_message(&mut self, message: SessionMessage) {
-        self.push_session_message(message);
+        self.client.push_session_message(message);
     }
 
     fn insert_session_message_before_stream(&mut self, request_id: u32, message: SessionMessage) {
@@ -90,15 +66,15 @@ impl DaemonMessageHandler for AppState {
     }
 
     fn begin_stream(&mut self, request_id: u32) {
-        self.begin_stream(request_id);
+        self.client.begin_stream(request_id);
     }
 
     fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
-        self.append_stream(request_id, stream, chunk);
+        self.client.append_stream(request_id, stream, chunk);
     }
 
     fn finalize_stream(&mut self, request_id: u32) {
-        self.finalize_stream(request_id);
+        self.client.finalize_stream(request_id);
     }
 
     fn drop_request(&mut self, request_id: u32) {
@@ -125,7 +101,7 @@ impl DaemonMessageHandler for AppState {
 
     fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError> {
         let (metadata, data) = self.client.finish_image(request_id, image_id)?;
-        self.push_image(DisplayImage {
+        self.client.push_image(DisplayImage {
             data_url: format!("data:{};base64,{}", metadata.mime_type, BASE64.encode(data)),
             metadata,
         });

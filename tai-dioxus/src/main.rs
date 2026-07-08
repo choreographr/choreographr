@@ -1,15 +1,17 @@
 mod client;
+mod components;
+mod hooks;
 mod render;
 mod state;
 
-use crate::client::{apply_daemon_message, run_client, send_client_message, submit_input};
-use crate::render::render_history_item;
+use crate::client::apply_daemon_message;
+use crate::components::{Composer, HistoryList, Toolbar};
+use crate::hooks::use_daemon_connection;
 use crate::state::{AppState, UiEvent};
 use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
-use tai_proto::{ClientMessage, socket_path};
-use futures_channel::mpsc::{self, UnboundedReceiver};
 use futures_util::StreamExt as _;
+use tai_proto::socket_path;
 
 fn main() {
     dioxus::LaunchBuilder::desktop()
@@ -19,41 +21,8 @@ fn main() {
 
 #[component]
 fn App() -> Element {
-    let socket = use_signal(socket_path);
-    let mut state = use_signal(|| AppState::new(socket.read().clone()));
-    let mut daemon_tx = use_signal(|| None::<std::sync::mpsc::Sender<ClientMessage>>);
-    let mut events_rx = use_signal(|| None::<UnboundedReceiver<UiEvent>>);
-
-    use_hook(move || {
-        let socket = socket.read().clone();
-        let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
-        let (ui_tx, ui_rx) = mpsc::unbounded::<UiEvent>();
-        if let Err(e) = client_tx.send(ClientMessage::ListSessions) {
-            eprintln!("[tai-dioxus] failed to send ListSessions: {e}");
-        }
-        daemon_tx.set(Some(client_tx));
-        events_rx.set(Some(ui_rx));
-        let tx = ui_tx.clone();
-        std::thread::spawn(move || {
-            let error_tx = tx.clone();
-            let panic_tx = tx.clone();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                if let Err(error) = run_client(socket, client_rx, tx) {
-                    if let Err(e) = error_tx.unbounded_send(UiEvent::ReaderFailed(error.to_string()))
-                    {
-                        eprintln!("[tai-dioxus] failed to send ReaderFailed: {e}");
-                    }
-                }
-            }));
-            if result.is_err() {
-                if let Err(e) = panic_tx.unbounded_send(UiEvent::ReaderFailed(
-                    "client reader task panicked".to_string(),
-                )) {
-                    eprintln!("[tai-dioxus] failed to send panic notification: {e}");
-                }
-            }
-        });
-    });
+    let (daemon_tx, mut events_rx) = use_daemon_connection();
+    let mut state = use_signal(|| AppState::new(socket_path()));
 
     let tx = daemon_tx.read().clone();
 
@@ -82,17 +51,18 @@ fn App() -> Element {
                                 apply_daemon_message(&mut app_state, message, tx.clone())
                             };
                             if let Err(error) = result {
-                                state.write().push_text(format!(
+                                state.write().client.push_text(format!(
                                     "[client] failed to process daemon message: {error}"
                                 ));
                             }
                         }
                         UiEvent::ReaderClosed => {
-                            state.write().push_text("daemon connection closed");
+                            state.write().client.push_text("daemon connection closed");
                         }
                         UiEvent::ReaderFailed(error) => {
                             state
                                 .write()
+                                .client
                                 .push_text(format!("[client] connection error: {error}"));
                         }
                     }
@@ -101,95 +71,12 @@ fn App() -> Element {
         }
     });
 
-    let mut on_submit_keydown = {
-        let t = tx.clone();
-        move || submit_input(&mut state, t.clone())
-    };
-
-    let mut on_submit_click = {
-        let t = tx.clone();
-        move || submit_input(&mut state, t.clone())
-    };
-
-    let on_ping = {
-        let t = tx.clone();
-        move |_| send_client_message(&mut state.write(), t.clone(), ClientMessage::Ping)
-    };
-
-    let on_models = {
-        let t = tx.clone();
-        move |_| send_client_message(&mut state.write(), t.clone(), ClientMessage::ListModels)
-    };
-
-    let on_cancel = {
-        let t = tx.clone();
-        move |_| {
-            let request_id_text = state.read().pending_cancel.trim().to_string();
-            if request_id_text.is_empty() {
-                state
-                    .write()
-                    .push_text("[client] enter a request id to cancel");
-                return;
-            }
-            match request_id_text.parse::<u32>() {
-                Ok(request_id) => {
-                    send_client_message(
-                        &mut state.write(),
-                        t.clone(),
-                        ClientMessage::Cancel { request_id },
-                    );
-                    state.write().pending_cancel.clear();
-                }
-                Err(_) => state
-                    .write()
-                    .push_text(format!("invalid request id: {request_id_text}")),
-            }
-        }
-    };
-
-    let history = state.read().client.history.clone();
-    let input_value = state.read().input.clone();
-    let cancel_value = state.read().pending_cancel.clone();
-
     rsx! {
         document::Style { {APP_CSS} }
         div { class: "app-shell",
-            div { class: "toolbar",
-                button { onclick: on_ping, "Ping" }
-                button { onclick: on_models, "Models" }
-                div { class: "cancel-row",
-                    input {
-                        placeholder: "Request id",
-                        value: "{cancel_value}",
-                        oninput: move |event| state.write().pending_cancel = event.value(),
-                    }
-                    button { onclick: on_cancel, "Cancel" }
-                }
-            }
-
-            div { class: "history",
-                for item in history {
-                    {render_history_item(item)}
-                }
-            }
-
-            div { class: "composer",
-                textarea {
-                    rows: "4",
-                    placeholder: "Enter a prompt, /image, /ping, /models, /models <model>, or /cancel <id>",
-                    value: "{input_value}",
-                    oninput: move |event| state.write().input = event.value(),
-                    onkeydown: move |event| {
-                        if event.key() == Key::Enter && !event.modifiers().shift() {
-                            event.prevent_default();
-                            on_submit_keydown();
-                        }
-                    },
-                }
-                div { class: "composer-actions",
-                    button { onclick: move |_| on_submit_click(), "Send" }
-                }
-            }
+            Toolbar { state, tx: daemon_tx }
+            HistoryList { state }
+            Composer { state, tx: daemon_tx }
         }
     }
 }

@@ -7900,13 +7900,13 @@ dependencies = [
 name = "tai-dioxus"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "base64",
  "dioxus",
  "futures-channel",
  "futures-util",
  "tai-client-core",
  "tai-proto",
+ "tracing",
 ]
 
 [[package]]

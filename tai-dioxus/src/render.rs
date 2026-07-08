@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use tai_client_core::HistoryItem as SharedHistoryItem;
 use tai_client_core::render_markdown_html;
 use tai_client_core::FileDiff;
-use tai_proto::SessionMessage;
+use tai_proto::{ImageMetadata, SessionMessage};
 
 pub(crate) fn render_history_item(item: HistoryItem) -> Element {
     match item {
@@ -67,84 +67,115 @@ fn format_diff_file(file: &FileDiff) -> String {
 mod tests {
     use tai_client_core::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 
+    fn make_diff(diff_lines: Vec<(DiffLineKind, &str)>) -> FileDiff {
+        FileDiff {
+            old_path: "test.rs".into(),
+            new_path: "test.rs".into(),
+            hunks: vec![DiffHunk {
+                header: "@@ -1 +1 @@".into(),
+                lines: diff_lines
+                    .into_iter()
+                    .map(|(kind, content)| DiffLine {
+                        kind,
+                        content: content.into(),
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
     #[test]
     fn format_diff_file_includes_headers() {
-        let fd = FileDiff {
-            old_path: "old.rs".into(),
-            new_path: "new.rs".into(),
-            hunks: vec![],
-        };
+        let fd = make_diff(vec![]);
         let out = super::format_diff_file(&fd);
-        assert!(out.contains("--- old.rs"));
-        assert!(out.contains("+++ new.rs"));
+        assert!(out.contains("--- test.rs"));
+        assert!(out.contains("+++ test.rs"));
     }
 
     #[test]
     fn format_diff_file_shows_additions() {
-        let fd = FileDiff {
-            old_path: "f".into(),
-            new_path: "f".into(),
-            hunks: vec![DiffHunk {
-                header: "@@ -1 +1 @@".into(),
-                lines: vec![
-                    DiffLine { kind: DiffLineKind::Addition, content: "new_line".into() },
-                ],
-            }],
-        };
+        let fd = make_diff(vec![(DiffLineKind::Addition, "new_line")]);
         let out = super::format_diff_file(&fd);
         assert!(out.contains("+new_line"));
     }
 
     #[test]
     fn format_diff_file_shows_deletions() {
-        let fd = FileDiff {
-            old_path: "f".into(),
-            new_path: "f".into(),
-            hunks: vec![DiffHunk {
-                header: "@@ -1 +1 @@".into(),
-                lines: vec![
-                    DiffLine { kind: DiffLineKind::Deletion, content: "old_line".into() },
-                ],
-            }],
-        };
+        let fd = make_diff(vec![(DiffLineKind::Deletion, "old_line")]);
         let out = super::format_diff_file(&fd);
         assert!(out.contains("-old_line"));
     }
 
     #[test]
     fn format_diff_file_shows_context() {
-        let fd = FileDiff {
-            old_path: "f".into(),
-            new_path: "f".into(),
-            hunks: vec![DiffHunk {
-                header: "@@ -1 +1 @@".into(),
-                lines: vec![
-                    DiffLine { kind: DiffLineKind::Context, content: "ctx".into() },
-                ],
-            }],
-        };
+        let fd = make_diff(vec![(DiffLineKind::Context, "ctx")]);
         let out = super::format_diff_file(&fd);
         assert!(out.contains(" ctx"));
     }
 }
 
-fn render_session_message(message: SessionMessage) -> Element {
-    match message {
-        SessionMessage::SystemText { content } => {
-            render_labeled_plain_message("system", content, "session-item system-item")
+fn render_system_text(content: &str) -> Element {
+    render_labeled_plain_message("system", content, "session-item system-item")
+}
+
+fn render_user_text(content: &str) -> Element {
+    render_labeled_plain_message("user", content, "session-item user-item")
+}
+
+fn render_assistant_text(content: &str) -> Element {
+    let html = render_markdown_html(content);
+    rsx! {
+        div { class: "history-item session-item assistant-item",
+            div { class: "message-label", "assistant" }
+            div { class: "markdown-body", dangerous_inner_html: "{html}" }
         }
-        SessionMessage::UserText { content } => {
-            render_labeled_plain_message("user", content, "session-item user-item")
-        }
-        SessionMessage::AssistantText { content } => {
-            let html = render_markdown_html(&content);
-            rsx! {
-                div { class: "history-item session-item assistant-item",
-                    div { class: "message-label", "assistant" }
-                    div { class: "markdown-body", dangerous_inner_html: "{html}" }
+    }
+}
+
+fn render_tool_use(name: &str, reasoning: &Option<String>, content: &str) -> Element {
+    let content_html = (!content.trim().is_empty())
+        .then(|| render_markdown_html(content));
+    rsx! {
+        div { class: "history-item session-item tool-use-item",
+            div { class: "message-label", "tool call" }
+            pre { class: "plain-body", "{name}" }
+            if let Some(reasoning) = reasoning {
+                div { class: "stream-section reasoning",
+                    div { class: "label", "reasoning" }
+                    pre { class: "plain-body", "{reasoning}" }
+                }
+            }
+            if let Some(content_html) = content_html {
+                div { class: "stream-section answer markdown-section",
+                    div { class: "label", "content" }
+                    div { class: "markdown-body", dangerous_inner_html: "{content_html}" }
                 }
             }
         }
+    }
+}
+
+fn render_tool_result(is_error: bool, content: &str) -> Element {
+    let label = if is_error { "tool error" } else { "tool result" };
+    render_labeled_plain_message(label, content, "session-item tool-result-item")
+}
+
+fn render_displayed_image(metadata: &ImageMetadata) -> Element {
+    rsx! {
+        div { class: "history-item session-item image-item",
+            div { class: "message-label", "image" }
+            pre { class: "plain-body",
+                "[displayed image: {metadata.mime_type} ({metadata.width}x{metadata.height})]"
+            }
+        }
+    }
+}
+
+fn render_session_message(message: SessionMessage) -> Element {
+    match message {
+        SessionMessage::SystemText { content } => render_system_text(&content),
+        SessionMessage::UserText { content } => render_user_text(&content),
+        SessionMessage::AssistantText { content } => render_assistant_text(&content),
         SessionMessage::AssistantToolUse {
             content,
             tool_calls,
@@ -152,64 +183,24 @@ fn render_session_message(message: SessionMessage) -> Element {
             reasoning,
             reasoning_text,
         } => {
-            let tool_call_text = tool_calls
+            let name = tool_calls
                 .iter()
                 .map(|call| format!("{}({})", call.name, call.arguments_json))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let reasoning = reasoning_content
+            let resolved_reasoning = reasoning_content
                 .or(reasoning)
                 .or(reasoning_text)
                 .filter(|value| !value.trim().is_empty());
-            let content_html = content
+            let content = content
                 .filter(|value| !value.trim().is_empty())
-                .map(|value| render_markdown_html(&value));
-            rsx! {
-                div { class: "history-item session-item tool-use-item",
-                    div { class: "message-label", "tool call" }
-                    pre { class: "plain-body", "{tool_call_text}" }
-                    if let Some(reasoning) = reasoning {
-                        div { class: "stream-section reasoning",
-                            div { class: "label", "reasoning" }
-                            pre { class: "plain-body", "{reasoning}" }
-                        }
-                    }
-                    if let Some(content_html) = content_html {
-                        div { class: "stream-section answer markdown-section",
-                            div { class: "label", "content" }
-                            div { class: "markdown-body", dangerous_inner_html: "{content_html}" }
-                        }
-                    }
-                }
-            }
+                .unwrap_or_default();
+            render_tool_use(&name, &resolved_reasoning, &content)
         }
         SessionMessage::ToolResult {
-            name,
-            content,
-            is_error,
-            ..
-        } => {
-            let label = if is_error {
-                "tool error"
-            } else {
-                "tool result"
-            };
-            render_labeled_plain_message(
-                label,
-                format!("{name}: {content}"),
-                "session-item tool-result-item",
-            )
-        }
-        SessionMessage::DisplayedImage(record) => {
-            rsx! {
-                div { class: "history-item session-item image-item",
-                    div { class: "message-label", "image" }
-                    pre { class: "plain-body",
-                        "[displayed image: {record.metadata.mime_type} ({record.metadata.width}x{record.metadata.height})]"
-                    }
-                }
-            }
-        }
+            name, content, is_error, ..
+        } => render_tool_result(is_error, &format!("{name}: {content}")),
+        SessionMessage::DisplayedImage(record) => render_displayed_image(&record.metadata),
     }
 }
 
