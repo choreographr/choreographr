@@ -62,7 +62,7 @@ fn append_stream_text_preserves_manual_scroll_position() {
 
     app.append_stream_text(7, OutputStream::Answer, "hello");
 
-    eprintln!("A1 scroll={} comp={} eff={} fol={}", app.history_scroll.scroll(), app.history_scroll.scroll_compensation(), app.effective_scroll(), app.history_scroll.follow_output());
+    tracing::info!("A1 scroll={} comp={} eff={} fol={}", app.history_scroll.scroll(), app.history_scroll.scroll_compensation(), app.effective_scroll(), app.history_scroll.follow_output());
     assert_eq!(app.history_scroll.scroll(), 3);
     assert_eq!(app.history_scroll.scroll_compensation(), 2);
     assert_eq!(app.effective_scroll(), 5);

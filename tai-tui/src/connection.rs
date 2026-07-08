@@ -268,48 +268,8 @@ fn handle_chat_event(
 }
 
 fn handle_input_key(key: crossterm::event::KeyEvent, input: &mut InputBuffer) {
-    match key.code {
-        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            input.delete_word_backward();
-        }
-        KeyCode::Backspace => {
-            input.backspace_at_cursor();
-        }
-        KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            input.delete_word_forward();
-        }
-        KeyCode::Delete => {
-            input.delete_at_cursor();
-        }
-        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            input.word_left();
-        }
-        KeyCode::Left => {
-            input.cursor_left();
-        }
-        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            input.word_right();
-        }
-        KeyCode::Right => {
-            input.cursor_right();
-        }
-        KeyCode::Home => {
-            input.cursor_home();
-        }
-        KeyCode::End => {
-            input.cursor_end();
-        }
-        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            input.delete_word_backward();
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            input.delete_to_start();
-        }
-        KeyCode::Char(c) => {
-            input.insert_char_at_cursor(c);
-        }
-        _ => {}
-    }
+    // All editing logic moved into InputBuffer::handle_key.
+    input.handle_key(key);
 }
 
 fn handle_session_manager_event(
@@ -439,99 +399,34 @@ pub(crate) fn handle_daemon_message(
 ) -> Result<(), ClientError> {
     app.picker = Some(picker.clone());
 
+    // Dispatch per-variant handlers first, then let the generic
+    // dispatch in tai_client_core handle the rest (text notifications,
+    // stream appends, image assembly, etc.).
     match &message {
         DaemonMessage::SessionCreated { session_id, .. } => {
+            // Already known — nothing to do, and skip the generic dispatch too.
             if app.session_mgr.sessions.iter().any(|s| s.session_id == *session_id) {
                 return Ok(());
             }
-            if app.page == Page::SessionManager {
-                // Stay on the session manager page — the new session will
-                // appear when the list refreshes.  The daemon no longer
-                // auto-attaches on CreateSession, so the old session stays
-                // alive and the user can accumulate multiple sessions.
-                let _ = client_tx.send(ClientMessage::ListSessions);
-            } else {
-                // On the chat page (auto-create flow): attach to the new
-                // session so the user can immediately start sending input.
-                app.attached_session_id = Some(*session_id);
-                client_tx
-                    .send(ClientMessage::AttachSession {
-                        session_id: *session_id,
-                    })
-                    .map_err(broken_pipe)?;
-            }
+            app.handle_session_created(*session_id, client_tx)?;
         }
         DaemonMessage::SessionAttached { session_id } => {
-            app.attached_session_id = Some(*session_id);
+            app.handle_session_attached(*session_id);
         }
         DaemonMessage::SessionStatusChanged { session_id, status } => {
-            if let Some(session) = app.session_mgr.sessions.iter_mut().find(|s| s.session_id == *session_id) {
-                session.status = status.clone();
-            }
-            if let Some(ref mut detail) = app.session_mgr.detail_data {
-                if detail.session_id == *session_id {
-                    detail.status = status.clone();
-                }
-            }
+            app.handle_session_status_changed(*session_id, status);
         }
         DaemonMessage::Sessions { sessions } => {
-            app.session_mgr.set_sessions(sessions.clone());
-            if app.page == Page::Chat {
-                if sessions.is_empty() {
-                    app.push_text("[daemon] no sessions");
-                } else {
-                    app.push_text(format!("[daemon] sessions ({})", sessions.len()));
-                    for session in sessions {
-                        let prefix = if Some(session.session_id) == app.attached_session_id {
-                            "*"
-                        } else {
-                            " "
-                        };
-                        let title = session.title.as_deref().unwrap_or("untitled");
-                        let model = session.selected_model.as_deref().unwrap_or("-");
-                        app.push_text(format!(
-                            "{} {}: \"{title}\" ({model}) — {} messages",
-                            prefix, session.session_id, session.message_count,
-                        ));
-                    }
-                }
-            }
-            // Only auto-attach/auto-create when on the chat page —
-            // the session manager page doesn't need an attached session,
-            // and triggering one here would bounce the user back to chat.
-            if app.page == Page::Chat && app.attached_session_id.is_none() {
-                if let Some(first) = sessions.first() {
-                    client_tx
-                        .send(ClientMessage::AttachSession {
-                            session_id: first.session_id,
-                        })
-                        .map_err(broken_pipe)?;
-                } else {
-                    client_tx
-                        .send(ClientMessage::CreateSession {
-                            title: Some("default".to_string()),
-                            parent_session_id: None,
-                            cwd: None,
-                            max_turns: None,
-                        })
-                        .map_err(broken_pipe)?;
-                }
-            }
-            return Ok(());
+            // The Sessions handler manages the full lifecycle and should not
+            // fall through to the generic dispatch (which would duplicate
+            // the summary output).
+            return app.handle_sessions(sessions, client_tx);
         }
         DaemonMessage::SessionDeleted { session_id } => {
-            // The session was removed on the daemon side.  Remove from
-            // the local session list and clear the attachment if needed.
-            app.session_mgr.remove_session(*session_id);
-            if app.attached_session_id == Some(*session_id) {
-                app.attached_session_id = None;
-            }
+            app.handle_session_deleted(*session_id);
         }
         DaemonMessage::SessionDeleteFailed { session_id, error } => {
-            app.push_text(format!(
-                "failed to delete session {}: {}",
-                session_id, error,
-            ));
+            app.handle_session_delete_failed(*session_id, error);
         }
         _ => {}
     }

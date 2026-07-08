@@ -1,3 +1,4 @@
+mod cache;
 mod connection;
 mod db;
 mod diff_render;
@@ -23,3 +24,5 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod app_tests;
+#[cfg(test)]
+mod render_tests;

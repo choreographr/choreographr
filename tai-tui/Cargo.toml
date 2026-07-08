@@ -23,6 +23,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 lru.workspace = true
 signal-hook.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

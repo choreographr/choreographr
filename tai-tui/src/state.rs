@@ -1,11 +1,12 @@
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Rect, Size};
 use std::collections::HashSet;
 use tai_client_core::{
-    ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
+    broken_pipe, ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
     MAX_HISTORY_ITEMS,
 };
 use tai_proto::{
-    ImageMetadata, OutputStream, SessionMessage, SessionStatus, SessionSummary,
+    ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionStatus, SessionSummary,
 };
 use tai_tui::{ImageAssembler, RenderedImage, StreamingText, build_rendered_image};
 use unicode_segmentation::UnicodeSegmentation;
@@ -557,6 +558,76 @@ impl InputBuffer {
         self.text.drain(..self.cursor);
         self.cursor = 0;
     }
+
+    /// Map a `KeyEvent` to an edit operation on the buffer.
+    ///
+    /// Returns `true` if the key was consumed by the buffer (character input,
+    /// cursor movement, text editing).  Returns `false` for keys the caller
+    /// should handle itself (Enter, Tab, Esc, and any unrecognised key).
+    ///
+    /// The key-event-kind check (`Press` only) is left to the caller so that
+    /// repeat and release events can be filtered in one place.
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_word_backward();
+                true
+            }
+            KeyCode::Backspace => {
+                self.backspace_at_cursor();
+                true
+            }
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_word_forward();
+                true
+            }
+            KeyCode::Delete => {
+                self.delete_at_cursor();
+                true
+            }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.word_left();
+                true
+            }
+            KeyCode::Left => {
+                self.cursor_left();
+                true
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.word_right();
+                true
+            }
+            KeyCode::Right => {
+                self.cursor_right();
+                true
+            }
+            KeyCode::Home => {
+                self.cursor_home();
+                true
+            }
+            KeyCode::End => {
+                self.cursor_end();
+                true
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_word_backward();
+                true
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.delete_to_start();
+                true
+            }
+            KeyCode::Char(c) => {
+                self.insert_char_at_cursor(c);
+                true
+            }
+            // Enter, Tab, and Esc are not editing operations — the caller
+            // must handle them (submit, focus-change, quit, etc.).
+            KeyCode::Enter | KeyCode::Tab | KeyCode::Esc => false,
+            // Everything else is unrecognised.
+            _ => false,
+        }
+    }
 }
 
 impl App {
@@ -986,6 +1057,131 @@ impl App {
     fn account_for_trimmed_height(&mut self, trimmed_height: usize) {
         self.history_scroll
             .account_for_trimmed_height(trimmed_height, self.max_scroll_offset());
+    }
+
+    // ── Daemon message handlers ──────────────────────────────────
+
+    /// Handle `SessionCreated`: if on the session-manager page, request a
+    /// list refresh so the new session appears; otherwise attach to the new
+    /// session on the chat page so the user can send input immediately.
+    pub(crate) fn handle_session_created(
+        &mut self,
+        session_id: u64,
+        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    ) -> Result<(), ClientError> {
+        if self.page == Page::SessionManager {
+            // Stay on the session manager — the new session will appear
+            // when the list refreshes.  The daemon no longer auto-attaches
+            // on CreateSession, so the old session stays alive and the
+            // user can accumulate multiple sessions.
+            let _ = client_tx.send(ClientMessage::ListSessions);
+        } else {
+            // Chat page (auto-create flow): attach so the user can type
+            // immediately.
+            self.attached_session_id = Some(session_id);
+            client_tx
+                .send(ClientMessage::AttachSession { session_id })
+                .map_err(broken_pipe)?;
+        }
+        Ok(())
+    }
+
+    /// Handle `SessionAttached`: record the attached session ID.
+    pub(crate) fn handle_session_attached(&mut self, session_id: u64) {
+        self.attached_session_id = Some(session_id);
+    }
+
+    /// Handle `SessionStatusChanged`: propagate the new status into the
+    /// session list and into the detail view if it's open for this session.
+    pub(crate) fn handle_session_status_changed(
+        &mut self,
+        session_id: u64,
+        status: &SessionStatus,
+    ) {
+        if let Some(session) = self
+            .session_mgr
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == session_id)
+        {
+            session.status = status.clone();
+        }
+        if let Some(ref mut detail) = self.session_mgr.detail_data {
+            if detail.session_id == session_id {
+                detail.status = status.clone();
+            }
+        }
+    }
+
+    /// Handle `Sessions`: update the session list, show summaries on the
+    /// chat page, and auto-attach or auto-create when no session is attached.
+    pub(crate) fn handle_sessions(
+        &mut self,
+        sessions: &[SessionSummary],
+        client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+    ) -> Result<(), ClientError> {
+        self.session_mgr.set_sessions(sessions.to_vec());
+        if self.page == Page::Chat {
+            if sessions.is_empty() {
+                self.push_text("[daemon] no sessions");
+            } else {
+                self.push_text(format!("[daemon] sessions ({})", sessions.len()));
+                for session in sessions {
+                    let prefix = if Some(session.session_id) == self.attached_session_id {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    let title = session.title.as_deref().unwrap_or("untitled");
+                    let model = session.selected_model.as_deref().unwrap_or("-");
+                    self.push_text(format!(
+                        "{} {}: \"{title}\" ({model}) — {} messages",
+                        prefix, session.session_id, session.message_count,
+                    ));
+                }
+            }
+            // Auto-attach/auto-create only on the chat page — the
+            // session-manager page doesn't need an attached session,
+            // and triggering one would bounce the user back to chat.
+            if self.attached_session_id.is_none() {
+                if let Some(first) = sessions.first() {
+                    client_tx
+                        .send(ClientMessage::AttachSession {
+                            session_id: first.session_id,
+                        })
+                        .map_err(broken_pipe)?;
+                } else {
+                    client_tx
+                        .send(ClientMessage::CreateSession {
+                            title: Some("default".to_string()),
+                            parent_session_id: None,
+                            cwd: None,
+                            max_turns: None,
+                        })
+                        .map_err(broken_pipe)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle `SessionDeleted`: remove the session from the local list and
+    /// clear the attachment if it was the attached session.
+    pub(crate) fn handle_session_deleted(&mut self, session_id: u64) {
+        // The session was removed on the daemon side.  Remove from the
+        // local session list and clear the attachment if needed.
+        self.session_mgr.remove_session(session_id);
+        if self.attached_session_id == Some(session_id) {
+            self.attached_session_id = None;
+        }
+    }
+
+    /// Handle `SessionDeleteFailed`: report the failure in the history.
+    pub(crate) fn handle_session_delete_failed(&mut self, session_id: u64, error: &str) {
+        self.push_text(format!(
+            "failed to delete session {}: {}",
+            session_id, error,
+        ));
     }
 }
 

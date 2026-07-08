@@ -1,13 +1,12 @@
-use std::num::NonZero;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
-use lru::LruCache;
 use ratatui::style::Style;
 use ratatui::text::Span;
 use syntect::easy::HighlightLines;
 use syntect::parsing::SyntaxReference;
 use tai_client_core::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 
+use crate::cache::GlobalLruCache;
 use crate::syntax::{highlight_theme, syntax_for_path, syntax_set, to_ratatui_color};
 
 /// Check if text looks like a unified diff.
@@ -173,57 +172,45 @@ fn highlight_lines_cached(
     syntax: &SyntaxReference,
     lines: &[&str],
 ) -> Arc<Vec<Vec<Span<'static>>>> {
-    static CACHE: OnceLock<Mutex<LruCache<(String, String), Arc<Vec<Vec<Span<'static>>>>>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(LruCache::new(NonZero::new(200).unwrap())));
+    // Memoize highlighted results so re-rendering the same diff on the
+    // next frame does not re-run syntect.
+    static CACHE: GlobalLruCache<(String, String), Arc<Vec<Vec<Span<'static>>>>, 200> =
+        GlobalLruCache::new();
 
     // Build a cache key from the syntax name and the joined lines.
     let code = lines.join("\n");
     let key = (syntax.name.to_string(), code);
 
-    // Fast path
-    {
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = guard.get(&key) {
-            return cached.clone();
+    CACHE.get_or_insert_with(&key, || {
+        let ss = syntax_set();
+        let theme = highlight_theme();
+
+        let mut highlighter = HighlightLines::new(syntax, theme);
+        let mut result: Vec<Vec<Span<'static>>> = Vec::with_capacity(lines.len());
+
+        for &line_str in lines {
+            if let Ok(ranges) = highlighter.highlight_line(line_str, ss) {
+                result.push(
+                    ranges
+                        .into_iter()
+                        .map(|(style, text)| {
+                            Span::styled(
+                                text.to_string(),
+                                Style::default().fg(to_ratatui_color(style.foreground)),
+                            )
+                        })
+                        .collect(),
+                );
+            } else {
+                result.push(vec![Span::styled(
+                    line_str.to_string(),
+                    Style::default(),
+                )]);
+            }
         }
-    }
 
-    let ss = syntax_set();
-    let theme = highlight_theme();
-
-    let mut highlighter = HighlightLines::new(syntax, theme);
-    let mut result: Vec<Vec<Span<'static>>> = Vec::with_capacity(lines.len());
-
-    for &line_str in lines {
-        if let Ok(ranges) = highlighter.highlight_line(line_str, ss) {
-            result.push(
-                ranges
-                    .into_iter()
-                    .map(|(style, text)| {
-                        Span::styled(
-                            text.to_string(),
-                            Style::default().fg(to_ratatui_color(style.foreground)),
-                        )
-                    })
-                    .collect(),
-            );
-        } else {
-            result.push(vec![Span::styled(
-                line_str.to_string(),
-                Style::default(),
-            )]);
-        }
-    }
-
-    let result = Arc::new(result);
-
-    {
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        guard.put(key, result.clone());
-    }
-
-    result
+        Arc::new(result)
+    })
 }
 
 /// Apply syntax highlighting to all code rows in a diff file's pane rows.

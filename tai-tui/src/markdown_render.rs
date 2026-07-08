@@ -1,12 +1,10 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use tai_proto::SessionMessage;
 use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, StreamingText};
 
+use crate::cache::GlobalLruCache;
 use crate::syntax::{highlight_theme, syntax_set, to_ratatui_color};
 
 /// Highlight a code snippet into styled ratatui lines.
@@ -22,64 +20,53 @@ use crate::syntax::{highlight_theme, syntax_set, to_ratatui_color};
 /// capacity; when full, new entries are dropped silently — the existing entries
 /// for the most common code blocks stay warm.
 fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
-    static HIGHLIGHT_CACHE: OnceLock<Mutex<HashMap<(String, String), Vec<Line<'static>>>>> =
-        OnceLock::new();
-    let cache = HIGHLIGHT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Memoize highlighted results so re-rendering does not re-run syntect.
+    // LRU eviction naturally keeps the most frequently seen code blocks
+    // cached, replacing the old manual HashMap+cap approach.
+    static CACHE: GlobalLruCache<(String, String), Vec<Line<'static>>, 200> =
+        GlobalLruCache::new();
 
     let key = (language.unwrap_or("").to_string(), code.to_string());
 
-    // Fast path: return a clone of the cached result without running syntect.
-    {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(cached) = guard.get(&key) {
-            return cached.clone();
+    CACHE.get_or_insert_with(&key, || {
+        let ss = syntax_set();
+
+        // Look up the syntax definition by the language token.  If the
+        // token isn't recognised (or was omitted), use the built-in
+        // "Plain Text" syntax which emits a single unstyled span per line.
+        let syntax = language
+            .and_then(|lang| ss.find_syntax_by_token(lang))
+            .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+        let theme = highlight_theme();
+        let mut highlighter = HighlightLines::new(syntax, theme);
+        let mut result = Vec::with_capacity(code.len().max(1));
+
+        for line in code.split('\n') {
+            let Ok(ranges) = highlighter.highlight_line(line, ss) else {
+                // If highlighting fails for a line, emit it as plain text.
+                result.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default(),
+                )));
+                continue;
+            };
+
+            let spans: Vec<Span<'static>> = ranges
+                .into_iter()
+                .map(|(style, text)| {
+                    Span::styled(
+                        text.to_string(),
+                        Style::default().fg(to_ratatui_color(style.foreground)),
+                    )
+                })
+                .collect();
+
+            result.push(Line::from(spans));
         }
-    }
 
-    let ss = syntax_set();
-
-    // Look up the syntax definition by the language token.  If the token
-    // isn't recognised (or was omitted), use the built-in "Plain Text"
-    // syntax which emits a single unstyled span per line.
-    let syntax = language
-        .and_then(|lang| ss.find_syntax_by_token(lang))
-        .unwrap_or_else(|| ss.find_syntax_plain_text());
-
-    let theme = highlight_theme();
-    let mut highlighter = HighlightLines::new(syntax, theme);
-    let mut result = Vec::with_capacity(code.len().max(1));
-
-    for line in code.split('\n') {
-        let Ok(ranges) = highlighter.highlight_line(line, ss) else {
-            // If highlighting fails for a line, emit it as plain text.
-            result.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default(),
-            )));
-            continue;
-        };
-
-        let spans: Vec<Span<'static>> = ranges
-            .into_iter()
-            .map(|(style, text)| {
-                Span::styled(text.to_string(), Style::default().fg(to_ratatui_color(style.foreground)))
-            })
-            .collect();
-
-        result.push(Line::from(spans));
-    }
-
-    // Bounded cache: allows up to 200 entries.  When full, new entries are
-    // not inserted so the most frequently seen code blocks stay cached.
-    const MAX_CACHE_ENTRIES: usize = 200;
-    {
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.len() < MAX_CACHE_ENTRIES {
-            guard.insert(key, result.clone());
-        }
-    }
-
-    result
+        result
+    })
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -185,17 +172,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
         // DisplayedImage is intercepted by App::push_session_message and
         // converted directly to HistoryItem::Image, so this arm should never
         // be reached at runtime — it exists only for exhaustive matching.
-        SessionMessage::DisplayedImage(record) => {
-            vec![Line::from(Span::styled(
-                format!(
-                    "[displayed image: {} ({}x{})]",
-                    record.metadata.mime_type,
-                    record.metadata.width,
-                    record.metadata.height,
-                ),
-                Style::default().fg(Color::DarkGray),
-            ))]
-        }
+        SessionMessage::DisplayedImage(_) => vec![],
     }
 }
 
@@ -746,7 +723,8 @@ fn inlines_to_lines(
         current_spans.push(Span::styled(prefix.clone(), Style::default()));
         current_width += display_width(prefix);
     }
-    render_inlines_to_lines(inlines, &mut lines, &mut current_spans, &mut current_width, indent, width);
+    let mut needs_separator = false;
+    render_inlines_to_lines(inlines, &mut lines, &mut current_spans, &mut current_width, &mut needs_separator, indent, width);
     if !current_spans.is_empty() || lines.is_empty() {
         lines.push(Line::from(std::mem::take(&mut current_spans)));
     }
@@ -771,110 +749,26 @@ fn render_inlines_to_lines(
     lines: &mut Vec<Line<'static>>,
     current: &mut Vec<Span<'static>>,
     current_width: &mut usize,
+    needs_separator: &mut bool,
     indent: usize,
     width: usize,
 ) {
-    // Tracks whether a space separator should be added before the next word.
-    // Set to true when an inline ends with content that implies a word boundary
-    // (e.g., a Text inline that ends with whitespace, or any non-trailing-whitespace
-    // inline followed by another inline).
-    let mut needs_separator: bool = false;
-
     for inline in inlines {
         match inline {
             MarkdownInline::Text(text) => {
-                let trimmed = text.trim_start();
-                let ends_with_space = text.ends_with(' ') || text.ends_with('\t');
-                let words: Vec<&str> = if trimmed.is_empty() {
-                    needs_separator = true;
-                    continue;
-                } else {
-                    trimmed.split_whitespace().collect()
-                };
-
-                for (i, word) in words.iter().enumerate() {
-                    let word_width = display_width(word);
-                    let separator_width = usize::from(needs_separator || i > 0);
-                    let projected = *current_width + separator_width + word_width;
-
-                    if projected > width && *current_width > indent {
-                        flush_line(lines, current, current_width, indent);
-                        // After a flush, we're on a fresh line so no separator needed
-                        // unless this is not the first word.
-                        needs_separator = i > 0;
-                    }
-
-                    // Re-check: if the word itself doesn't fit on a fresh line,
-                    // split it grapheme-by-grapheme.
-                    if *current_width + word_width > width && *current_width >= indent {
-                        flush_line(lines, current, current_width, indent);
-                        needs_separator = false;
-                        let available = width.saturating_sub(*current_width);
-                        if word_width > available {
-                            let chunked = split_word_to_width(word, available);
-                            for (ci, chunk) in chunked.iter().enumerate() {
-                                if ci > 0 {
-                                    flush_line(lines, current, current_width, indent);
-                                }
-                                current.push(Span::styled(chunk.clone(), Style::default()));
-                                *current_width += display_width(chunk);
-                            }
-                            needs_separator = true;
-                            continue;
-                        }
-                    }
-
-                    if needs_separator || i > 0 {
-                        if !current.is_empty() && *current_width > indent {
-                            current.push(Span::styled(" ".to_string(), Style::default()));
-                            *current_width += 1;
-                        }
-                    }
-                    current.push(Span::styled(word.to_string(), Style::default()));
-                    *current_width += word_width;
-                    needs_separator = true;
-                }
-
-                if ends_with_space && !words.is_empty() {
-                    needs_separator = true;
-                }
+                render_text_inline(text, lines, current, current_width, needs_separator, indent, width);
             }
             MarkdownInline::Code(text) => {
-                let word_width = display_width(text);
-                let projected = *current_width + usize::from(needs_separator) + word_width;
-                if projected > width && *current_width > indent {
-                    flush_line(lines, current, current_width, indent);
-                } else if needs_separator {
-                    if !current.is_empty() && *current_width > indent {
-                        current.push(Span::styled(" ".to_string(), Style::default()));
-                        *current_width += 1;
-                    }
-                }
-                current.push(Span::styled(text.clone(), Style::default()));
-                *current_width += word_width;
-                needs_separator = true;
+                render_code_inline(text, lines, current, current_width, needs_separator, indent, width);
             }
             MarkdownInline::Emphasis(content) | MarkdownInline::Strong(content) => {
-                render_inlines_to_lines(content, lines, current, current_width, indent, width);
-                needs_separator = true;
+                render_style_inline(content, lines, current, current_width, needs_separator, indent, width);
             }
             MarkdownInline::Link {
                 content,
                 destination,
             } => {
-                render_inlines_to_lines(content, lines, current, current_width, indent, width);
-                if !destination.is_empty() {
-                    let dest_text = format!(" ({destination})");
-                    let dest_width = display_width(&dest_text);
-                    let projected = *current_width + dest_width;
-                    if projected > width && *current_width > indent {
-                        flush_line(lines, current, current_width, indent);
-                    }
-                    // Link destination appends without space (the format already has one).
-                    current.push(Span::styled(dest_text, Style::default()));
-                    *current_width += dest_width;
-                }
-                needs_separator = true;
+                render_link_inline(content, destination, lines, current, current_width, needs_separator, indent, width);
             }
             MarkdownInline::Image { alt, destination } => {
                 let prefix_text = "[image: ";
@@ -886,7 +780,7 @@ fn render_inlines_to_lines(
                 current.push(Span::styled(prefix_text.to_string(), Style::default()));
                 *current_width += prefix_width;
 
-                render_inlines_to_lines(alt, lines, current, current_width, indent, width);
+                render_inlines_to_lines(alt, lines, current, current_width, needs_separator, indent, width);
 
                 let suffix = if !destination.is_empty() {
                     format!("] ({destination})")
@@ -900,14 +794,142 @@ fn render_inlines_to_lines(
                 }
                 current.push(Span::styled(suffix, Style::default()));
                 *current_width += suffix_width;
-                needs_separator = true;
+                *needs_separator = true;
             }
             MarkdownInline::LineBreak => {
                 flush_line(lines, current, current_width, indent);
-                needs_separator = false;
+                *needs_separator = false;
             }
         }
     }
+}
+
+fn render_text_inline(
+    text: &str,
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
+    current_width: &mut usize,
+    needs_separator: &mut bool,
+    indent: usize,
+    width: usize,
+) {
+    let trimmed = text.trim_start();
+    let ends_with_space = text.ends_with(' ') || text.ends_with('\t');
+    let words: Vec<&str> = if trimmed.is_empty() {
+        *needs_separator = true;
+        return;
+    } else {
+        trimmed.split_whitespace().collect()
+    };
+
+    for (i, word) in words.iter().enumerate() {
+        let word_width = display_width(word);
+        let separator_width = usize::from(*needs_separator || i > 0);
+        let projected = *current_width + separator_width + word_width;
+
+        if projected > width && *current_width > indent {
+            flush_line(lines, current, current_width, indent);
+            // After a flush, we're on a fresh line so no separator needed
+            // unless this is not the first word.
+            *needs_separator = i > 0;
+        }
+
+        // Re-check: if the word itself doesn't fit on a fresh line,
+        // split it grapheme-by-grapheme.
+        if *current_width + word_width > width && *current_width >= indent {
+            flush_line(lines, current, current_width, indent);
+            *needs_separator = false;
+            let available = width.saturating_sub(*current_width);
+            if word_width > available {
+                let chunked = split_word_to_width(word, available);
+                for (ci, chunk) in chunked.iter().enumerate() {
+                    if ci > 0 {
+                        flush_line(lines, current, current_width, indent);
+                    }
+                    current.push(Span::styled(chunk.clone(), Style::default()));
+                    *current_width += display_width(chunk);
+                }
+                *needs_separator = true;
+                continue;
+            }
+        }
+
+        if *needs_separator || i > 0 {
+            if !current.is_empty() && *current_width > indent {
+                current.push(Span::styled(" ".to_string(), Style::default()));
+                *current_width += 1;
+            }
+        }
+        current.push(Span::styled(word.to_string(), Style::default()));
+        *current_width += word_width;
+        *needs_separator = true;
+    }
+
+    if ends_with_space && !words.is_empty() {
+        *needs_separator = true;
+    }
+}
+
+fn render_code_inline(
+    text: &str,
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
+    current_width: &mut usize,
+    needs_separator: &mut bool,
+    indent: usize,
+    width: usize,
+) {
+    let word_width = display_width(text);
+    let projected = *current_width + usize::from(*needs_separator) + word_width;
+    if projected > width && *current_width > indent {
+        flush_line(lines, current, current_width, indent);
+    } else if *needs_separator {
+        if !current.is_empty() && *current_width > indent {
+            current.push(Span::styled(" ".to_string(), Style::default()));
+            *current_width += 1;
+        }
+    }
+    current.push(Span::styled(text.to_string(), Style::default()));
+    *current_width += word_width;
+    *needs_separator = true;
+}
+
+fn render_style_inline(
+    content: &[MarkdownInline],
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
+    current_width: &mut usize,
+    needs_separator: &mut bool,
+    indent: usize,
+    width: usize,
+) {
+    render_inlines_to_lines(content, lines, current, current_width, needs_separator, indent, width);
+    *needs_separator = true;
+}
+
+fn render_link_inline(
+    content: &[MarkdownInline],
+    destination: &str,
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Vec<Span<'static>>,
+    current_width: &mut usize,
+    needs_separator: &mut bool,
+    indent: usize,
+    width: usize,
+) {
+    render_inlines_to_lines(content, lines, current, current_width, needs_separator, indent, width);
+    if !destination.is_empty() {
+        let dest_text = format!(" ({destination})");
+        let dest_width = display_width(&dest_text);
+        let projected = *current_width + dest_width;
+        if projected > width && *current_width > indent {
+            flush_line(lines, current, current_width, indent);
+        }
+        // Link destination appends without space (the format already has one).
+        current.push(Span::styled(dest_text, Style::default()));
+        *current_width += dest_width;
+    }
+    *needs_separator = true;
 }
 fn wrapped_line_height(line: &Line<'_>, width: usize) -> usize {
     if width == 0 {

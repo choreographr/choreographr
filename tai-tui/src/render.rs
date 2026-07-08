@@ -14,7 +14,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use tai_client_core::{DiffLineKind, FileDiff};
+use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
+use tai_tui::RenderedImage;
 use ratatui_image::{Resize, StatefulImage};
 use tai_proto::SessionStatus;
 
@@ -100,48 +101,24 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 );
             }
             HistoryItem::SessionMessage(message) => {
-                if matches!(message, SessionMessage::AssistantText { .. }) {
-                    let lines = cached_or_compute_lines(
-                        &mut app.render_cache,
-                        i,
-                        |msg| session_message_lines(msg, assistant_content_width),
-                        message,
-                        assistant_content_width,
-                    );
-                    render_assistant_lines(
-                        frame,
-                        area,
-                        lines,
-                        &mut rows_remaining,
-                        &mut y,
-                        &mut rows_to_skip,
-                        assistant_content_width,
-                    );
-                } else {
-                    let lines = cached_or_compute_lines(
-                        &mut app.render_cache,
-                        i,
-                        |msg| session_message_lines(msg, content_width),
-                        message,
-                        content_width,
-                    );
-                    render_history_lines(
-                        frame,
-                        area,
-                        lines,
-                        &mut rows_remaining,
-                        &mut y,
-                        &mut rows_to_skip,
-                        content_width,
-                    );
-                }
-            }
-            HistoryItem::Streaming(text) => {
-                let lines = streaming_text_lines(text, content_width);
-                render_history_lines(
+                render_item_session_message(
                     frame,
                     area,
-                    lines,
+                    message,
+                    &mut app.render_cache,
+                    i,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                    content_width,
+                    assistant_content_width,
+                );
+            }
+            HistoryItem::Streaming(text) => {
+                render_item_streaming(
+                    frame,
+                    area,
+                    text,
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
@@ -149,57 +126,14 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 );
             }
             HistoryItem::Image(image) => {
-                let rendered = image.protocol.size_for(
-                    Resize::Scale(None),
-                    ratatui::layout::Size::new(area.width, (area.height / 2).max(1)),
+                render_item_image(
+                    frame,
+                    area,
+                    image,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
                 );
-                let full_height = rendered.height.max(1) as usize;
-                if rows_to_skip >= full_height {
-                    rows_to_skip -= full_height;
-                    continue;
-                }
-
-                // Clip the item's full height by the number of rows
-                // already scrolled past (rows_to_skip) *and* by the
-                // remaining space in the viewport.  The old code used
-                // `image_block_height(rows_remaining)` directly, which
-                // ignored rows_to_skip and caused layout jumps at item
-                // boundaries when partially scrolled past an image.
-                let visible_height = (full_height.saturating_sub(rows_to_skip)).min(rows_remaining);
-                let height = visible_height as u16;
-                if height == 0 {
-                    break;
-                }
-                y = y.saturating_sub(height);
-                let block = Block::default().title(format!(
-                    "image {} ({} {}x{})",
-                    image.metadata.image_id,
-                    image.metadata.mime_type,
-                    image.metadata.width,
-                    image.metadata.height
-                ));
-                let rect = Rect {
-                    x: area.x,
-                    y,
-                    width: area.width,
-                    height,
-                };
-                let inner = block.inner(rect);
-                frame.render_widget(block, rect);
-
-                // Only render the image when fully visible — the
-                // image is not clipped by scroll offset or viewport
-                // space, so its rect is stable and ratatui_image
-                // never rescales during scrolling.
-                if visible_height == full_height {
-                    frame.render_stateful_widget(
-                        StatefulImage::new().resize(Resize::Scale(None)),
-                        inner,
-                        &mut image.protocol,
-                    );
-                }
-                rows_remaining = rows_remaining.saturating_sub(height as usize);
-                rows_to_skip = 0;
             }
             HistoryItem::Diff(diffs) => {
                 render_history_diff(
@@ -220,9 +154,8 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 fn cached_or_compute_lines(
     cache: &mut [Option<RenderedCache>],
     index: usize,
-    compute: impl FnOnce(&SessionMessage) -> Vec<Line<'static>>,
-    message: &SessionMessage,
     width: u16,
+    compute: impl FnOnce() -> Vec<Line<'static>>,
 ) -> Vec<Line<'static>> {
     // Fast path: cache hit at the current width.
     if let Some(Some(cached)) = cache.get(index) {
@@ -232,7 +165,7 @@ fn cached_or_compute_lines(
     }
 
     // Cache miss: compute, store, and return.
-    let lines = compute(message);
+    let lines = compute();
     let height = lines_height(&lines, width);
     if let Some(slot) = cache.get_mut(index) {
         *slot = Some(RenderedCache {
@@ -244,7 +177,43 @@ fn cached_or_compute_lines(
     lines
 }
 
-fn render_history_text(
+/// Compute the visible window for a scrollable content item.
+///
+/// Given the total height of an item and the current scroll/viewport state,
+/// returns `(top_line, visible_height)` if any portion of the item is visible,
+/// or `None` if the item is entirely outside the viewport.  Also updates
+/// `rows_to_skip`, `rows_remaining`, and `y` to reflect the consumed rows.
+fn clipped_area(
+    full_height: usize,
+    rows_to_skip: &mut usize,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+) -> Option<(usize, usize)> {
+    // Entire item is above the visible area — reduce skip counter and move on
+    if *rows_to_skip >= full_height {
+        *rows_to_skip -= full_height;
+        return None;
+    }
+
+    // How many rows of this item actually fit in the remaining viewport
+    let visible_height = (full_height.saturating_sub(*rows_to_skip)).min(*rows_remaining);
+    if visible_height == 0 {
+        return None;
+    }
+
+    // The index (within the item's content) of the first visible row
+    let bottom_line = full_height.saturating_sub(*rows_to_skip);
+    let top_line = bottom_line.saturating_sub(visible_height);
+
+    // Advance the vertical cursor by the visible portion
+    *y = (*y).saturating_sub(visible_height as u16);
+    *rows_remaining -= visible_height;
+    *rows_to_skip = 0;
+
+    Some((top_line, visible_height))
+}
+
+pub(crate) fn render_history_text(
     frame: &mut Frame<'_>,
     area: Rect,
     text: &str,
@@ -254,21 +223,13 @@ fn render_history_text(
     content_width: u16,
 ) {
     let base_wrapped = history_text_height(text, content_width).max(1);
-    let wrapped = base_wrapped + 1; // +1 for blank line separator
-    if *rows_to_skip >= wrapped {
-        *rows_to_skip -= wrapped;
+    // +1 for the blank-line separator below each text block
+    let wrapped = base_wrapped + 1;
+
+    let Some((top_line, visible_height)) = clipped_area(wrapped, rows_to_skip, rows_remaining, y) else {
         return;
-    }
+    };
 
-    let visible_height = (wrapped.saturating_sub(*rows_to_skip)).min(*rows_remaining);
-    if visible_height == 0 {
-        return;
-    }
-
-    let bottom_line = wrapped.saturating_sub(*rows_to_skip);
-    let top_line = bottom_line.saturating_sub(visible_height);
-
-    *y = (*y).saturating_sub(visible_height as u16);
     let rect = Rect {
         x: area.x + 1,
         y: *y,
@@ -285,8 +246,6 @@ fn render_history_text(
             .scroll((top_line as u16, 0)),
         rect,
     );
-    *rows_remaining -= visible_height;
-    *rows_to_skip = 0;
 }
 
 /// Wrap each content line with green margin characters on the left and right,
@@ -323,7 +282,7 @@ fn add_margin_lines(lines: Vec<Line<'static>>, content_width: u16) -> (Vec<Line<
     (result, total_rows)
 }
 
-fn render_history_lines(
+pub(crate) fn render_history_lines(
     frame: &mut Frame<'_>,
     area: Rect,
     lines: Vec<Line<'static>>,
@@ -332,21 +291,13 @@ fn render_history_lines(
     rows_to_skip: &mut usize,
     content_width: u16,
 ) {
-    let wrapped = lines_height(&lines, content_width).max(1) + 1; // +1 for blank line separator
-    if *rows_to_skip >= wrapped {
-        *rows_to_skip -= wrapped;
+    // +1 for the blank-line separator below each text block
+    let wrapped = lines_height(&lines, content_width).max(1) + 1;
+
+    let Some((top_line, visible_height)) = clipped_area(wrapped, rows_to_skip, rows_remaining, y) else {
         return;
-    }
+    };
 
-    let visible_height = (wrapped.saturating_sub(*rows_to_skip)).min(*rows_remaining);
-    if visible_height == 0 {
-        return;
-    }
-
-    let bottom_line = wrapped.saturating_sub(*rows_to_skip);
-    let top_line = bottom_line.saturating_sub(visible_height);
-
-    *y = (*y).saturating_sub(visible_height as u16);
     let rect = Rect {
         x: area.x + 1,
         y: *y,
@@ -364,8 +315,6 @@ fn render_history_lines(
             .scroll((top_line as u16, 0)),
         rect,
     );
-    *rows_remaining -= visible_height;
-    *rows_to_skip = 0;
 }
 
 /// Render assistant-text lines with green margin characters on the left and right.
@@ -379,21 +328,11 @@ fn render_assistant_lines(
     content_width: u16,
 ) {
     let (display_lines, total_rows) = add_margin_lines(lines, content_width);
-    let wrapped = total_rows;
-    if *rows_to_skip >= wrapped {
-        *rows_to_skip -= wrapped;
+
+    let Some((top_line, visible_height)) = clipped_area(total_rows, rows_to_skip, rows_remaining, y) else {
         return;
-    }
+    };
 
-    let visible_height = (wrapped.saturating_sub(*rows_to_skip)).min(*rows_remaining);
-    if visible_height == 0 {
-        return;
-    }
-
-    let bottom_line = wrapped.saturating_sub(*rows_to_skip);
-    let top_line = bottom_line.saturating_sub(visible_height);
-
-    *y = (*y).saturating_sub(visible_height as u16);
     let rect = Rect {
         x: area.x,
         y: *y,
@@ -407,8 +346,133 @@ fn render_assistant_lines(
             .scroll((top_line as u16, 0)),
         rect,
     );
-    *rows_remaining -= visible_height;
-    *rows_to_skip = 0;
+}
+
+/// Render a `HistoryItem::SessionMessage`: retrieve cached lines (or compute
+/// on cache miss), then render via the appropriate helper (assistant margin
+/// for `AssistantText`, plain lines otherwise).
+fn render_item_session_message(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    message: &SessionMessage,
+    cache: &mut [Option<RenderedCache>],
+    idx: usize,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+    content_width: u16,
+    assistant_content_width: u16,
+) {
+    if matches!(message, SessionMessage::AssistantText { .. }) {
+        let lines = cached_or_compute_lines(
+            cache,
+            idx,
+            assistant_content_width,
+            || session_message_lines(message, assistant_content_width),
+        );
+        render_assistant_lines(
+            frame,
+            area,
+            lines,
+            rows_remaining,
+            y,
+            rows_to_skip,
+            assistant_content_width,
+        );
+    } else {
+        let lines = cached_or_compute_lines(
+            cache,
+            idx,
+            content_width,
+            || session_message_lines(message, content_width),
+        );
+        render_history_lines(
+            frame,
+            area,
+            lines,
+            rows_remaining,
+            y,
+            rows_to_skip,
+            content_width,
+        );
+    }
+}
+
+/// Render a `HistoryItem::Streaming` — text that changes every frame (never cached).
+fn render_item_streaming(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    text: &StreamingText,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+    content_width: u16,
+) {
+    let lines = streaming_text_lines(text, content_width);
+    render_history_lines(
+        frame,
+        area,
+        lines,
+        rows_remaining,
+        y,
+        rows_to_skip,
+        content_width,
+    );
+}
+
+/// Render a `HistoryItem::Image`, clipped to the visible scroll area.
+/// The underlying image protocol is only rendered when the item is fully
+/// visible to avoid rescaling during scrolling.
+fn render_item_image(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    image: &mut Box<RenderedImage>,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+) {
+    let rendered = image.protocol.size_for(
+        Resize::Scale(None),
+        ratatui::layout::Size::new(area.width, (area.height / 2).max(1)),
+    );
+    let full_height = rendered.height.max(1) as usize;
+
+    // Use the shared clipped_area helper just like the text/diff renderers.
+    let Some((_top_line, visible_height)) = clipped_area(full_height, rows_to_skip, rows_remaining, y) else {
+        // The item is entirely above the viewport; carry on to the next item.
+        // (Unlike text renderers we return from the helper directly here so the
+        // caller can distinguish "fully skipped" from "viewport exhausted".)
+        return;
+    };
+
+    let height = visible_height as u16;
+
+    let block = Block::default().title(format!(
+        "image {} ({} {}x{})",
+        image.metadata.image_id,
+        image.metadata.mime_type,
+        image.metadata.width,
+        image.metadata.height
+    ));
+    let rect = Rect {
+        x: area.x,
+        y: *y,
+        width: area.width,
+        height,
+    };
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    // Only render the image when fully visible — the image is not clipped
+    // by scroll offset or viewport space, so its rect is stable and
+    // ratatui_image never rescales during scrolling.
+    if visible_height == full_height {
+        frame.render_stateful_widget(
+            StatefulImage::new().resize(Resize::Scale(None)),
+            inner,
+            &mut image.protocol,
+        );
+    }
 }
 
 // ── Session Manager ──────────────────────────────────────────
@@ -553,53 +617,20 @@ fn format_timestamp(ts: i64) -> String {
         return "-".to_string();
     }
 
-    let mut t = ts as u64;
-    let secs = t % 60;
-    t /= 60;
-    let mins = t % 60;
-    t /= 60;
-    let hours = t % 24;
-    t /= 24;
-    let days = t;
+    use chrono::{Local, TimeZone};
 
-    let mut y = 1970i64;
-    let mut d = days as i64;
-    loop {
-        let days_in_year = if is_leap(y) { 366 } else { 365 };
-        if d < days_in_year {
-            break;
-        }
-        d -= days_in_year;
-        y += 1;
-    }
+    // timestamp_opt handles DST ambiguity and out-of-range inputs.
+    // If the result is ambiguous or invalid we fall back to a safe epoch
+    // display rather than panicking.
+    let dt = match Local.timestamp_opt(ts, 0) {
+        chrono::LocalResult::Single(dt) => dt,
+        _ => return "-".to_string(),
+    };
 
-    const MONTH_DAYS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut m = 0;
-    for &md in &MONTH_DAYS {
-        let adj = if m == 1 && is_leap(y) { 29 } else { md };
-        if d < adj {
-            break;
-        }
-        d -= adj;
-        m += 1;
-    }
-
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        y,
-        m + 1,
-        d + 1,
-        hours,
-        mins,
-        secs
-    )
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-fn format_status(status: &SessionStatus) -> String {
+pub(crate) fn format_status(status: &SessionStatus) -> String {
     match status {
         SessionStatus::Sleeping => "sleeping".to_string(),
         SessionStatus::Inactive => "idle".to_string(),
@@ -620,7 +651,7 @@ fn format_status(status: &SessionStatus) -> String {
 /// `rows_to_skip` / `rows_remaining` scrolling mechanism (shared with text
 /// rendering). Each row is split into two panes separated by a `│` gutter.
 /// Deletions appear highlighted in red on the left; additions in green on the right.
-fn render_history_diff(
+pub(crate) fn render_history_diff(
     frame: &mut Frame<'_>,
     area: Rect,
     diffs: &[FileDiff],
@@ -632,20 +663,11 @@ fn render_history_diff(
 
     let raw_height = diff_display_height(diffs);
     let full_height = raw_height + 2; // +1 for leading blank, +1 for trailing blank
-    if *rows_to_skip >= full_height {
-        *rows_to_skip -= full_height;
+
+    let Some((top_line, visible_height)) = clipped_area(full_height, rows_to_skip, rows_remaining, y) else {
         return;
-    }
+    };
 
-    let visible_height = (full_height.saturating_sub(*rows_to_skip)).min(*rows_remaining);
-    if visible_height == 0 {
-        return;
-    }
-
-    let bottom_line = full_height.saturating_sub(*rows_to_skip);
-    let top_line = bottom_line.saturating_sub(visible_height);
-
-    *y = (*y).saturating_sub(visible_height as u16);
     let rect = Rect {
         x: area.x,
         y: *y,
@@ -681,9 +703,6 @@ fn render_history_diff(
 
     let paragraph = Paragraph::new(visible_lines);
     frame.render_widget(paragraph, rect);
-
-    *rows_remaining = rows_remaining.saturating_sub(visible_height);
-    *rows_to_skip = 0;
 }
 
 /// Return the diff foreground colour for a given line kind and side.
@@ -703,7 +722,7 @@ fn diff_fg(kind: DiffLineKind, is_left: bool) -> Option<Color> {
 /// * Pads with spaces when the content is narrower than the pane so the
 ///   background colour fills the entire cell.
 /// * Truncates content that exceeds the pane width, appending `…`.
-fn diff_cell_spans(
+pub(crate) fn diff_cell_spans(
     spans: &[ratatui::text::Span<'static>],
     kind: DiffLineKind,
     pane_width: u16,
@@ -790,514 +809,5 @@ fn diff_cell_spans(
             pad_style,
         ));
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
-    use tai_client_core::{DiffHunk, DiffLine};
-
-    // ── render_history_text tests ──
-
-    #[test]
-    fn render_history_text_no_skip() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 30;
-        let mut y = 30;
-        let mut rows_to_skip = 0;
-
-        terminal
-            .draw(|frame| {
-                render_history_text(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    "line1\nline2",
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    78,
-                );
-            })
-            .unwrap();
-
-        assert_eq!(rows_remaining, 27, "consumed 2 visible rows");
-        assert_eq!(y, 27, "y moved up by 2");
-        assert_eq!(rows_to_skip, 0, "rows_to_skip consumed completely");
-    }
-
-    #[test]
-    fn render_history_text_partial_skip() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 30;
-        let mut y = 30;
-        let mut rows_to_skip = 2;
-
-        terminal
-            .draw(|frame| {
-                render_history_text(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    "line1\nline2\nline3\nline4\nline5",
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    78,
-                );
-            })
-            .unwrap();
-
-        // wrapped=6, skip=2 → visible = (6-2).min(30) = 4 → remaining = 30-4 = 26
-        assert_eq!(rows_remaining, 26);
-        assert_eq!(y, 26);
-        assert_eq!(rows_to_skip, 0);
-    }
-
-    #[test]
-    fn render_history_text_full_skip() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 30;
-        let mut y = 30;
-        let mut rows_to_skip = 10;
-
-        terminal
-            .draw(|frame| {
-                render_history_text(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    "line1\nline2\nline3\nline4\nline5",
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    78,
-                );
-            })
-            .unwrap();
-
-        // wrapped=6 <= skip=10 → fully skipped, skip reduced by 6
-        assert_eq!(rows_remaining, 30, "no rows consumed");
-        assert_eq!(y, 30, "y unchanged");
-        assert_eq!(rows_to_skip, 4, "rows_to_skip decremented by 6");
-    }
-
-    #[test]
-    fn render_history_text_exhausted_viewport() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 2;
-        let mut y = 30;
-        let mut rows_to_skip = 2;
-
-        terminal
-            .draw(|frame| {
-                render_history_text(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    "line1\nline2\nline3\nline4\nline5",
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    78,
-                );
-            })
-            .unwrap();
-
-        // wrapped=6, skip=2 → visible = (6-2).min(2) = 2 → remaining = 0
-        assert_eq!(rows_remaining, 0, "viewport exhausted");
-        assert_eq!(y, 28);
-        assert_eq!(rows_to_skip, 0);
-    }
-
-    #[test]
-    fn render_history_text_zero_remaining() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 0;
-        let mut y = 0;
-        let mut rows_to_skip = 0;
-
-        terminal
-            .draw(|frame| {
-                render_history_text(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    "content",
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    78,
-                );
-            })
-            .unwrap();
-
-        // visible = (1-0).min(0) = 0 → returns early
-        assert_eq!(rows_remaining, 0);
-        assert_eq!(y, 0);
-        assert_eq!(rows_to_skip, 0);
-    }
-
-    // ── render_history_lines tests ──
-
-    #[test]
-    fn render_history_lines_no_skip() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 30;
-        let mut y = 30;
-        let mut rows_to_skip = 0;
-
-        terminal
-            .draw(|frame| {
-                render_history_lines(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    vec![Line::from("a"), Line::from("b"), Line::from("c")],
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    78,
-                );
-            })
-            .unwrap();
-
-        assert_eq!(rows_remaining, 26, "3 rows consumed");
-        assert_eq!(y, 26);
-        assert_eq!(rows_to_skip, 0);
-    }
-
-    #[test]
-    fn render_history_lines_partial_skip() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 30;
-        let mut y = 30;
-        let mut rows_to_skip = 1;
-
-        terminal
-            .draw(|frame| {
-                render_history_lines(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    vec![Line::from("a"), Line::from("b"), Line::from("c")],
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    78,
-                );
-            })
-            .unwrap();
-
-        // wrapped=4, skip=1 → visible=3 → remaining=27
-        assert_eq!(rows_remaining, 27);
-        assert_eq!(y, 27);
-        assert_eq!(rows_to_skip, 0);
-    }
-
-    #[test]
-    fn render_history_lines_full_skip() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 30;
-        let mut y = 30;
-        let mut rows_to_skip = 10;
-
-        terminal
-            .draw(|frame| {
-                render_history_lines(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    vec![Line::from("only")],
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    78,
-                );
-            })
-            .unwrap();
-
-        assert_eq!(rows_remaining, 30, "no rows consumed");
-        assert_eq!(y, 30);
-        assert_eq!(rows_to_skip, 8, "rows_to_skip decremented by 2");
-    }
-
-    #[test]
-    fn render_history_lines_zero_remaining() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 0;
-        let mut y = 0;
-        let mut rows_to_skip = 0;
-
-        terminal
-            .draw(|frame| {
-                render_history_lines(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    vec![Line::from("content")],
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    78,
-                );
-            })
-            .unwrap();
-
-        assert_eq!(rows_remaining, 0);
-        assert_eq!(y, 0);
-        assert_eq!(rows_to_skip, 0);
-    }
-
-    // ── render_history_diff tests ──
-
-    #[test]
-    fn render_history_diff_no_skip() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 30;
-        let mut y = 30;
-        let mut rows_to_skip = 0;
-
-        let diffs = vec![FileDiff {
-            old_path: String::new(),
-            new_path: String::new(),
-            hunks: vec![DiffHunk {
-                header: "header".to_string(),
-                lines: vec![DiffLine {
-                    kind: DiffLineKind::Context,
-                    content: "unchanged".to_string(),
-                }],
-            }],
-        }];
-
-        terminal
-            .draw(|frame| {
-                render_history_diff(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    &diffs,
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                );
-            })
-            .unwrap();
-
-        // build_diff_panes always emits a file header row, so height = 1 (file) + 1 (hunk) + 1 (line) = 3, +2 blanks = 5
-        assert_eq!(rows_remaining, 25, "5 diff rows consumed");
-        assert_eq!(y, 25, "y moved up by 5");
-        assert_eq!(rows_to_skip, 0);
-    }
-
-    #[test]
-    fn render_history_diff_partial_skip() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 30;
-        let mut y = 30;
-        let mut rows_to_skip = 1;
-
-        let diffs = vec![FileDiff {
-            old_path: String::new(),
-            new_path: String::new(),
-            hunks: vec![DiffHunk {
-                header: "hdr".to_string(),
-                lines: vec![DiffLine {
-                    kind: DiffLineKind::Addition,
-                    content: "added".to_string(),
-                }],
-            }],
-        }];
-
-        terminal
-            .draw(|frame| {
-                render_history_diff(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    &diffs,
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                );
-            })
-            .unwrap();
-
-        // full_height=5, skip=1 → visible=4 → remaining=26
-        assert_eq!(rows_remaining, 26);
-        assert_eq!(y, 26);
-        assert_eq!(rows_to_skip, 0);
-    }
-
-    #[test]
-    fn render_history_diff_full_skip() {
-        let backend = TestBackend::new(80, 30);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let mut rows_remaining = 30;
-        let mut y = 30;
-        let mut rows_to_skip = 10;
-
-        let diffs = vec![FileDiff {
-            old_path: String::new(),
-            new_path: String::new(),
-            hunks: vec![DiffHunk {
-                header: "h".to_string(),
-                lines: vec![DiffLine {
-                    kind: DiffLineKind::Context,
-                    content: "c".to_string(),
-                }],
-            }],
-        }];
-
-        terminal
-            .draw(|frame| {
-                render_history_diff(
-                    frame,
-                    Rect { x: 0, y: 0, width: 80, height: 30 },
-                    &diffs,
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                );
-            })
-            .unwrap();
-
-        // full_height=5 <= skip=10 → fully skipped, skip reduced by 5
-        assert_eq!(rows_remaining, 30);
-        assert_eq!(y, 30);
-        assert_eq!(rows_to_skip, 5);
-    }
-
-    // ── diff_cell_spans tests ──
-
-    fn span_from_text(text: &str) -> Vec<ratatui::text::Span<'static>> {
-        vec![ratatui::text::Span::styled(
-            text.to_string(),
-            Style::default(),
-        )]
-    }
-
-    #[test]
-    fn diff_cell_spans_pads_short_content() {
-        let spans = diff_cell_spans(&span_from_text("hi"), DiffLineKind::Context, 10, true);
-        let text = spans[0].content.trim_end();
-        assert!(text.starts_with("hi"), "content='{text}' should start with 'hi'");
-    }
-
-    #[test]
-    fn diff_cell_spans_truncates_long_content() {
-        let long = "a".repeat(20);
-        let spans = diff_cell_spans(&span_from_text(&long), DiffLineKind::Context, 5, true);
-        // truncated to 4 chars in the first span + '…' as a separate span = 2 spans
-        assert_eq!(spans[0].content.chars().count(), 4);
-        assert_eq!(spans[1].content, "…");
-    }
-
-    #[test]
-    fn diff_cell_spans_left_deletion_has_red_style() {
-        let spans = diff_cell_spans(&span_from_text("del"), DiffLineKind::Deletion, 10, true);
-        let style = spans[0].style;
-        assert_eq!(style.fg, Some(Color::Red));
-        assert_eq!(style.bg, Some(Color::Rgb(80, 0, 0)));
-    }
-
-    #[test]
-    fn diff_cell_spans_right_deletion_has_default_style() {
-        let spans = diff_cell_spans(&span_from_text("del"), DiffLineKind::Deletion, 10, false);
-        assert_eq!(spans[0].style, Style::default());
-    }
-
-    #[test]
-    fn diff_cell_spans_right_addition_has_green_style() {
-        let spans = diff_cell_spans(&span_from_text("add"), DiffLineKind::Addition, 10, false);
-        let style = spans[0].style;
-        assert_eq!(style.fg, Some(Color::Green));
-        assert_eq!(style.bg, Some(Color::Rgb(0, 80, 0)));
-    }
-
-    #[test]
-    fn diff_cell_spans_left_addition_has_default_style() {
-        let spans = diff_cell_spans(&span_from_text("add"), DiffLineKind::Addition, 10, true);
-        assert_eq!(spans[0].style, Style::default());
-    }
-
-    #[test]
-    fn diff_cell_spans_context_has_default_style() {
-        let spans = diff_cell_spans(&span_from_text("ctx"), DiffLineKind::Context, 10, true);
-        assert_eq!(spans[0].style, Style::default());
-        let spans = diff_cell_spans(&span_from_text("ctx"), DiffLineKind::Context, 10, false);
-        assert_eq!(spans[0].style, Style::default());
-    }
-
-    #[test]
-    fn diff_cell_spans_preserves_syntax_fg_on_deletion() {
-        // Simulate a syntax-highlighted span with a non-default fg colour
-        let input = vec![ratatui::text::Span::styled(
-            "fn".to_string(),
-            Style::default().fg(Color::Rgb(200, 100, 0)),
-        )];
-        let spans = diff_cell_spans(&input, DiffLineKind::Deletion, 10, true);
-        assert_eq!(
-            spans[0].style.fg,
-            Some(Color::Rgb(200, 100, 0)),
-            "syntax foreground should be preserved on deletion"
-        );
-        assert_eq!(
-            spans[0].style.bg,
-            Some(Color::Rgb(80, 0, 0)),
-            "diff background should be applied"
-        );
-    }
-
-    #[test]
-    fn diff_cell_spans_preserves_syntax_fg_on_addition() {
-        let input = vec![ratatui::text::Span::styled(
-            "let".to_string(),
-            Style::default().fg(Color::Rgb(0, 150, 200)),
-        )];
-        let spans = diff_cell_spans(&input, DiffLineKind::Addition, 10, false);
-        assert_eq!(spans[0].style.fg, Some(Color::Rgb(0, 150, 200)));
-        assert_eq!(spans[0].style.bg, Some(Color::Rgb(0, 80, 0)));
-    }
-
-    // ── format_status tests ──
-
-    #[test]
-    fn format_status_retrying() {
-        let status = SessionStatus::Retrying {
-            attempt: 2,
-            max_attempts: 5,
-            delay_ms: 3000,
-        };
-        assert_eq!(format_status(&status), "retrying (2/5, 3000ms)");
-    }
-
-    #[test]
-    fn format_status_retrying_first_attempt() {
-        let status = SessionStatus::Retrying {
-            attempt: 1,
-            max_attempts: 3,
-            delay_ms: 1500,
-        };
-        assert_eq!(format_status(&status), "retrying (1/3, 1500ms)");
-    }
-
-    #[test]
-    fn diff_cell_spans_pads_with_diff_background() {
-        let spans = diff_cell_spans(&span_from_text("hi"), DiffLineKind::Deletion, 10, true);
-        // There should be a padding span at the end with the diff background
-        assert!(spans.len() > 1, "should have padding span");
-        assert_eq!(
-            spans.last().unwrap().style.bg,
-            Some(Color::Rgb(80, 0, 0)),
-        );
-        // The text span should have the red bg too
-        assert_eq!(
-            spans[0].style.bg,
-            Some(Color::Rgb(80, 0, 0)),
-        );
     }
 }
