@@ -480,7 +480,17 @@ impl DaemonState {
                 let _ = reply.send(result);
             }
             DaemonCommand::ListAccountsCmd { reply } => {
-                let _ = reply.send(Ok(self.accounts.list()));
+                // Collect the set of account names that have credentials
+                // (either decrypted in memory or stored as encrypted blobs
+                // in the DB) so the TUI can show whether each account has
+                // had a credential supplied, regardless of unlock state.
+                let mut credentialed: std::collections::HashSet<String> =
+                    self.credentials.keys().cloned().collect();
+                // Also check the DB for stored-but-not-yet-decrypted blobs.
+                if let Ok(blobs) = db::get_all_credential_blobs(&self.db) {
+                    credentialed.extend(blobs.into_keys());
+                }
+                let _ = reply.send(Ok(self.accounts.list(&credentialed)));
             }
             DaemonCommand::ResolveProviderCmd { account, reply } => {
                 let _ = reply.send(self.providers.get(&account).cloned());

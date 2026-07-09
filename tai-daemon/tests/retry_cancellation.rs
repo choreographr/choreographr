@@ -100,8 +100,12 @@ fn retry_succeeds_with_callback() {
     );
 
     match result {
-        Ok(ChatTurnResult::FinalText(content)) => {
-            assert!(content.contains("hello from retry"), "content: {content:?}");
+        Ok(ChatTurnResult::FinalText(final_text)) => {
+            assert!(
+                final_text.content.contains("hello from retry"),
+                "content: {:?}",
+                final_text.content
+            );
         }
         Ok(other) => panic!("unexpected Ok variant: {other:?}"),
         Err(e) => panic!("expected Ok, got {e:?}"),

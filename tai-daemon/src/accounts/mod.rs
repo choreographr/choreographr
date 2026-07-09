@@ -43,11 +43,12 @@ impl AccountConfig {
         }
     }
 
-    pub fn to_info(&self) -> AccountInfo {
+    pub fn to_info(&self, has_credential: bool) -> AccountInfo {
         AccountInfo {
             name: self.name.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
+            has_credential,
         }
     }
 }
@@ -143,9 +144,12 @@ impl AccountManager {
         self.accounts.get(name)
     }
 
-    pub fn list(&self) -> Vec<AccountInfo> {
-        let mut configs: Vec<AccountInfo> =
-            self.accounts.values().map(|cfg| cfg.to_info()).collect();
+    pub fn list(&self, credentialed: &std::collections::HashSet<String>) -> Vec<AccountInfo> {
+        let mut configs: Vec<AccountInfo> = self
+            .accounts
+            .values()
+            .map(|cfg| cfg.to_info(credentialed.contains(&cfg.name)))
+            .collect();
         configs.sort_by(|a, b| a.name.cmp(&b.name));
         configs
     }
@@ -302,9 +306,32 @@ model = "claude-4"
 
         mgr.add(config("z")).unwrap();
         mgr.add(config("a")).unwrap();
-        let list = mgr.list();
+        let list = mgr.list(&std::collections::HashSet::new());
         assert_eq!(list[0].name, "a");
         assert_eq!(list[1].name, "z");
+    }
+
+    #[test]
+    fn list_reports_credential_status() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("accounts.toml");
+        let mut mgr = manager(&path);
+
+        mgr.add(config("has_it")).unwrap();
+        mgr.add(config("missing")).unwrap();
+
+        let mut credentialed = std::collections::HashSet::new();
+        credentialed.insert("has_it".to_string());
+
+        let list = mgr.list(&credentialed);
+        assert_eq!(list.len(), 2);
+        for info in &list {
+            match info.name.as_str() {
+                "has_it" => assert!(info.has_credential, "has_it should show credential"),
+                "missing" => assert!(!info.has_credential, "missing should not show credential"),
+                other => panic!("unexpected account: {other}"),
+            }
+        }
     }
 
     #[test]
@@ -344,10 +371,11 @@ model = "claude-4"
             connect_timeout_secs: None,
             request_timeout_secs: None,
         };
-        let info = cfg.to_info();
+        let info = cfg.to_info(true);
         assert_eq!(info.name, "test");
         assert_eq!(info.provider, "openai");
         assert_eq!(info.model, Some("gpt-4".to_string()));
+        assert!(info.has_credential);
     }
 
     #[test]

@@ -100,9 +100,22 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             labeled_text_lines("system", content, Color::DarkGray)
         }
         SessionMessage::UserText { content } => labeled_text_lines("user", content, Color::Green),
-        SessionMessage::AssistantText { content } => {
+        SessionMessage::AssistantText { content, reasoning } => {
+            let mut lines = Vec::new();
+            if let Some(reasoning_text) = reasoning
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                append_section(
+                    &mut lines,
+                    "reasoning",
+                    plain_text_lines(reasoning_text),
+                    Color::DarkGray,
+                );
+            }
             let body = markdown_lines(content, width);
-            prefixed_lines("assistant", body, Color::Cyan)
+            append_section(&mut lines, "assistant", body, Color::Cyan);
+            lines
         }
         SessionMessage::AssistantToolUse {
             content,
@@ -1402,5 +1415,63 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(body.contains("```rust"), "error body should be verbatim");
+    }
+
+    #[test]
+    fn assistant_text_with_reasoning_renders_reasoning_section() {
+        let msg = SessionMessage::AssistantText {
+            content: "The answer is 42.".into(),
+            reasoning: Some("Let me think step by step.".into()),
+        };
+        let lines = session_message_lines(&msg, 80);
+        // First line should be the "reasoning" label
+        assert!(
+            lines[0].to_string().contains("reasoning"),
+            "first line should show reasoning label: {:?}",
+            lines[0].to_string()
+        );
+        // The reasoning body should be present
+        let all_text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_text.contains("Let me think step by step."),
+            "reasoning text should appear"
+        );
+        // The answer text should appear after the reasoning section
+        assert!(
+            all_text.contains("The answer is 42."),
+            "answer text should appear"
+        );
+    }
+
+    #[test]
+    fn assistant_text_without_reasoning_skips_reasoning_section() {
+        let msg = SessionMessage::AssistantText {
+            content: "Just an answer.".into(),
+            reasoning: None,
+        };
+        let lines = session_message_lines(&msg, 80);
+        // Should start directly with the assistant label
+        assert!(
+            lines[0].to_string().contains("assistant"),
+            "first line should show assistant label: {:?}",
+            lines[0].to_string()
+        );
+        let all_text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_text.contains("Just an answer."),
+            "answer text should appear"
+        );
+        assert!(
+            !all_text.contains("reasoning"),
+            "no reasoning section when reasoning is None"
+        );
     }
 }

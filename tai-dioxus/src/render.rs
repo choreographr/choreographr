@@ -122,11 +122,20 @@ fn render_user_text(content: &str) -> Element {
     render_labeled_plain_message("user", content, "session-item user-item")
 }
 
-fn render_assistant_text(content: &str) -> Element {
+fn render_assistant_text(content: &str, reasoning: &Option<String>) -> Element {
     let html = render_markdown_html(content);
+    let reasoning_text = reasoning
+        .as_ref()
+        .and_then(|r| (!r.trim().is_empty()).then(|| r.clone()));
     rsx! {
         div { class: "history-item session-item assistant-item",
             div { class: "message-label", "assistant" }
+            if let Some(text) = reasoning_text {
+                div { class: "stream-section reasoning",
+                    div { class: "label", "reasoning" }
+                    pre { class: "plain-body", "{text}" }
+                }
+            }
             div { class: "markdown-body", dangerous_inner_html: "{html}" }
         }
     }
@@ -178,7 +187,9 @@ fn render_session_message(message: SessionMessage) -> Element {
     match message {
         SessionMessage::SystemText { content } => render_system_text(&content),
         SessionMessage::UserText { content } => render_user_text(&content),
-        SessionMessage::AssistantText { content } => render_assistant_text(&content),
+        SessionMessage::AssistantText { content, reasoning } => {
+            render_assistant_text(&content, &reasoning)
+        }
         SessionMessage::AssistantToolUse {
             content,
             tool_calls,

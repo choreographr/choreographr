@@ -169,14 +169,18 @@ pub(crate) fn run_agent_loop(
                 Ok(())
             },
         ) {
-            Ok(ChatTurnResult::FinalText(content)) => {
+            Ok(ChatTurnResult::FinalText(final_text)) => {
                 debug!(
                     session_id,
                     turn,
-                    response_len = content.len(),
+                    response_len = final_text.content.len(),
+                    reasoning = final_text.reasoning.as_deref().unwrap_or_default(),
                     "model returned final text",
                 );
-                let msg = SessionMessage::AssistantText { content };
+                let msg = SessionMessage::AssistantText {
+                    content: final_text.content,
+                    reasoning: final_text.reasoning,
+                };
                 let idx = session.push_message(msg.clone());
                 if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
                     tracing::warn!(session_id, error = %e, "failed to persist assistant text");
@@ -932,9 +936,15 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
             SessionMessage::UserText { content } => {
                 Some(ChatRequestMessage::simple("user", content.clone()))
             }
-            SessionMessage::AssistantText { content } => {
-                Some(ChatRequestMessage::simple("assistant", content.clone()))
-            }
+            SessionMessage::AssistantText { content, reasoning } => Some(ChatRequestMessage {
+                role: "assistant",
+                content: Some(content.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning_content: reasoning.clone(),
+                reasoning: None,
+                reasoning_text: None,
+            }),
             SessionMessage::AssistantToolUse {
                 content,
                 tool_calls,
@@ -1021,11 +1031,13 @@ mod tests {
     fn build_chat_request_messages_assistant_text() {
         let msgs = [SessionMessage::AssistantText {
             content: "hi".into(),
+            reasoning: Some("thinking".into()),
         }];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "assistant");
         assert_eq!(result[0].content.as_deref(), Some("hi"));
+        assert_eq!(result[0].reasoning_content.as_deref(), Some("thinking"));
     }
 
     #[test]
@@ -1086,6 +1098,7 @@ mod tests {
             }),
             SessionMessage::AssistantText {
                 content: "hi".into(),
+                reasoning: None,
             },
         ];
         let result = build_chat_request_messages(&msgs);

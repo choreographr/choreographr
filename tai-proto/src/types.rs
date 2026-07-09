@@ -65,6 +65,7 @@ pub struct AccountInfo {
     pub name: String,
     pub provider: String,
     pub model: Option<String>,
+    pub has_credential: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,6 +109,7 @@ pub enum SessionMessage {
     },
     AssistantText {
         content: String,
+        reasoning: Option<String>,
     },
     AssistantToolUse {
         content: Option<String>,

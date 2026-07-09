@@ -749,9 +749,9 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         let mut lines: Vec<Line> = Vec::new();
 
         for i in scroll..app.ai_providers.accounts.len() {
-            // Each account takes 2 lines (name line + provider line).
+            // Each account takes 3 lines (name + provider + credential).
             // If we would exceed the available rows, stop.
-            if lines.len() + 2 > max_rows && i != scroll {
+            if lines.len() + 3 > max_rows && i != scroll {
                 break;
             }
             let account = &app.ai_providers.accounts[i];
@@ -780,6 +780,23 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
             lines.push(Line::from(vec![ratatui::text::Span::styled(
                 provider_label,
                 provider_style,
+            )]));
+
+            // Line 3: credential status (indented, dimmer style)
+            let cred_label = if account.has_credential {
+                "   Credential: yes".to_string()
+            } else {
+                "   Credential: no".to_string()
+            };
+            let cred_style = if is_selected {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else if account.has_credential {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(vec![ratatui::text::Span::styled(
+                cred_label, cred_style,
             )]));
 
             // Blank line separator between cards (but not after the last one)

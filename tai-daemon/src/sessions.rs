@@ -847,7 +847,7 @@ fn run_request_worker(
                     .messages
                     .iter()
                     .filter_map(|m| match m {
-                        SessionMessage::AssistantText { content } => Some(content.clone()),
+                        SessionMessage::AssistantText { content, .. } => Some(content.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -939,6 +939,7 @@ mod tests {
                 },
                 SessionMessage::AssistantText {
                     content: "hi".into(),
+                    reasoning: None,
                 },
             ],
             subscribers: HashMap::new(),

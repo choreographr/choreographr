@@ -202,6 +202,17 @@ struct AssistantMessage {
     reasoning_text: Option<String>,
 }
 
+impl AssistantMessage {
+    /// Extract reasoning content from whichever field the model populated
+    /// (reasoning_content, reasoning, or reasoning_text).
+    fn take_reasoning(&mut self) -> Option<String> {
+        self.reasoning_content
+            .take()
+            .or_else(|| self.reasoning.take())
+            .or_else(|| self.reasoning_text.take())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatToolCall {
     pub id: String,
@@ -217,8 +228,14 @@ pub struct ChatAssistantToolUse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalTextResult {
+    pub content: String,
+    pub reasoning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatTurnResult {
-    FinalText(String),
+    FinalText(FinalTextResult),
     ToolUse(ChatAssistantToolUse),
 }
 

@@ -120,3 +120,56 @@ fn parse_retry_after_non_integer() {
     headers.insert(reqwest::header::RETRY_AFTER, "abc".parse().unwrap());
     assert_eq!(parse_retry_after_secs(&headers), None);
 }
+
+#[test]
+fn assistant_message_take_reasoning_returns_none_when_all_fields_empty() {
+    let mut msg = AssistantMessage {
+        content: Some("hello".to_string()),
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: None,
+    };
+    assert_eq!(msg.take_reasoning(), None);
+}
+
+#[test]
+fn assistant_message_take_reasoning_uses_reasoning_content_first() {
+    let mut msg = AssistantMessage {
+        content: None,
+        tool_calls: Vec::new(),
+        reasoning_content: Some("think 1".to_string()),
+        reasoning: Some("think 2".to_string()),
+        reasoning_text: Some("think 3".to_string()),
+    };
+    // take_reasoning should return reasoning_content (first in priority)
+    assert_eq!(msg.take_reasoning(), Some("think 1".to_string()));
+    // After taking, all fields should be consumed
+    assert_eq!(msg.reasoning_content, None);
+    assert_eq!(msg.reasoning, Some("think 2".to_string()));
+    assert_eq!(msg.reasoning_text, Some("think 3".to_string()));
+}
+
+#[test]
+fn assistant_message_take_reasoning_falls_back_to_reasoning() {
+    let mut msg = AssistantMessage {
+        content: None,
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+        reasoning: Some("think 2".to_string()),
+        reasoning_text: None,
+    };
+    assert_eq!(msg.take_reasoning(), Some("think 2".to_string()));
+}
+
+#[test]
+fn assistant_message_take_reasoning_falls_back_to_reasoning_text() {
+    let mut msg = AssistantMessage {
+        content: None,
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+        reasoning: None,
+        reasoning_text: Some("think 3".to_string()),
+    };
+    assert_eq!(msg.take_reasoning(), Some("think 3".to_string()));
+}

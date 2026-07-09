@@ -255,11 +255,24 @@ pub fn read_messages(db: &redb::Database, session_id: u64) -> io::Result<Vec<Ses
         let (key, value) = result.map_err(|e| db_err(format!("redb iter item: {e}")))?;
         let (sid, idx) = key.value();
         if sid == session_id {
-            let message: SessionMessage =
-                bincode::serde::decode_from_slice(value.value(), bincode::config::standard())
-                    .map_err(|e| db_err(format!("bincode decode message: {e}")))?
-                    .0;
-            messages.push((idx, message));
+            match bincode::serde::decode_from_slice::<SessionMessage, _>(
+                value.value(),
+                bincode::config::standard(),
+            ) {
+                Ok((message, _)) => {
+                    messages.push((idx, message));
+                }
+                Err(e) => {
+                    // Schema may have evolved — skip messages that fail to
+                    // decode (e.g. old format missing a newly-added field)
+                    warn!(
+                        session_id,
+                        message_idx = idx,
+                        error = %e,
+                        "skipping undecodable message",
+                    );
+                }
+            }
         }
     }
     messages.sort_by_key(|(idx, _)| *idx);
@@ -433,5 +446,42 @@ mod tests {
         assert!(read_messages(&db, id).unwrap().is_empty());
 
         drop(db);
+    }
+
+    #[test]
+    fn read_messages_skips_corrupt_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let id = 1u64;
+
+        // Write a valid message at index 0
+        let valid_msg = SessionMessage::UserText {
+            content: "valid".into(),
+        };
+        write_message(&db, id, 0, &valid_msg).unwrap();
+
+        // Manually insert a corrupt blob at index 1 (not valid bincode)
+        {
+            let write_txn = db.begin_write().unwrap();
+            {
+                let mut table = write_txn.open_table(SESSION_MESSAGES).unwrap();
+                table
+                    .insert((id, 1u32), b"not valid bincode data".as_slice())
+                    .unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+
+        // Write another valid message at index 2
+        let valid_msg2 = SessionMessage::UserText {
+            content: "also valid".into(),
+        };
+        write_message(&db, id, 2, &valid_msg2).unwrap();
+
+        // read_messages should skip the corrupt entry and return the valid ones
+        let messages = read_messages(&db, id).unwrap();
+        assert_eq!(messages.len(), 2, "corrupt message should be skipped");
+        assert_eq!(messages[0], valid_msg);
+        assert_eq!(messages[1], valid_msg2);
     }
 }

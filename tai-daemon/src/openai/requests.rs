@@ -5,9 +5,9 @@ use super::retry;
 use super::{
     ChatAssistantToolUse, ChatCompletionsRequest, ChatCompletionsResponse,
     ChatCompletionsStreamOptions, ChatCompletionsStreamResponse, ChatRequestMessage, ChatToolCall,
-    ChatToolDefinition, ChatTurnResult, CompletionChunkKind, ModelListResponse, OpenAiClient,
-    RequestFormat, ResponsesRequest, ResponsesResponse, SseReader, StreamToolCallDelta,
-    endpoint_url, extract_responses_text_delta,
+    ChatToolDefinition, ChatTurnResult, CompletionChunkKind, FinalTextResult, ModelListResponse,
+    OpenAiClient, RequestFormat, ResponsesRequest, ResponsesResponse, SseReader,
+    StreamToolCallDelta, endpoint_url, extract_responses_text_delta,
 };
 use std::collections::HashMap;
 use std::io;
@@ -120,9 +120,17 @@ impl OpenAiClient {
                 let result =
                     self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx)?;
                 match &result {
-                    ChatTurnResult::FinalText(content) => {
-                        if !content.is_empty() {
-                            on_chunk(super::CompletionChunkKind::Answer, content.clone())?;
+                    ChatTurnResult::FinalText(final_text) => {
+                        if !final_text.content.is_empty() {
+                            on_chunk(
+                                super::CompletionChunkKind::Answer,
+                                final_text.content.clone(),
+                            )?;
+                        }
+                        if let Some(reasoning) =
+                            final_text.reasoning.as_ref().filter(|r| !r.is_empty())
+                        {
+                            on_chunk(super::CompletionChunkKind::Reasoning, reasoning.clone())?;
                         }
                     }
                     ChatTurnResult::ToolUse(tool_use) => {
@@ -297,9 +305,12 @@ fn chat_completions_request_with_tools(
         "chat completion turn",
     );
 
-    let Some(choice) = payload.choices.into_iter().next() else {
+    let Some(mut choice) = payload.choices.into_iter().next() else {
         return Err(super::OpenAiError::EmptyResponse);
     };
+
+    // Extract reasoning early (before partial moves into tool_calls / content)
+    let reasoning = choice.message.take_reasoning();
 
     if !choice.message.tool_calls.is_empty() {
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
@@ -314,11 +325,7 @@ fn chat_completions_request_with_tools(
                     arguments_json: tool_call.function.arguments,
                 })
                 .collect(),
-            reasoning: choice
-                .message
-                .reasoning_content
-                .or(choice.message.reasoning)
-                .or(choice.message.reasoning_text),
+            reasoning,
         }));
     }
 
@@ -332,7 +339,10 @@ fn chat_completions_request_with_tools(
         return Err(super::OpenAiError::EmptyResponse);
     }
 
-    Ok(ChatTurnResult::FinalText(content))
+    Ok(ChatTurnResult::FinalText(FinalTextResult {
+        content,
+        reasoning,
+    }))
 }
 
 fn chat_completions_request_streaming<F>(
@@ -595,7 +605,14 @@ where
         }));
     }
 
-    Ok(ChatTurnResult::FinalText(full_content))
+    Ok(ChatTurnResult::FinalText(FinalTextResult {
+        content: full_content,
+        reasoning: if full_reasoning.is_empty() {
+            None
+        } else {
+            Some(full_reasoning)
+        },
+    }))
 }
 
 #[cfg(test)]
