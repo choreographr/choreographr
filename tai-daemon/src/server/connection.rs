@@ -263,28 +263,25 @@ pub(crate) fn client_thread(
                             Err(_) => {}
                         }
                     }
-                    ClientMessage::SetDefaultAccount { name } => {
-                        let (reply, rx) = mpsc::channel();
-                        let _ = daemon_tx.send(DaemonCommand::SetDefaultAccountCmd {
-                            name: name.clone(),
-                            reply,
-                        });
-                        match rx.recv() {
-                            Ok(Ok(())) => {
-                                let _ = writer_tx.send(DaemonMessage::DefaultAccountSet { name });
-                            }
-                            Ok(Err(e)) => {
-                                let _ = writer_tx.send(DaemonMessage::DefaultAccountSetFailed {
-                                    name,
-                                    error: e,
-                                });
-                            }
-                            Err(_) => {}
-                        }
-                    }
                     ClientMessage::SetSessionAccount { name } => {
                         if let Some(ref tx) = attached_session_tx {
-                            let _ = tx.send(SessionCommand::SetAccount { name });
+                            // Verify the account exists before setting it.
+                            let (reply, rx) = mpsc::channel();
+                            let _ = daemon_tx.send(DaemonCommand::AccountExists {
+                                name: name.clone(),
+                                reply,
+                            });
+                            match rx.recv() {
+                                Ok(true) => {
+                                    let _ = tx.send(SessionCommand::SetAccount { name });
+                                }
+                                _ => {
+                                    let _ = writer_tx.send(DaemonMessage::SessionFailed {
+                                        operation: "set_account".into(),
+                                        error: format!("account '{name}' not found"),
+                                    });
+                                }
+                            }
                         } else {
                             let _ = writer_tx.send(DaemonMessage::SessionFailed {
                                 operation: "set_account".into(),

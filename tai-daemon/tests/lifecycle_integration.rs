@@ -27,7 +27,6 @@ fn test_daemon_state() -> DaemonState {
         session_metadata: HashMap::new(),
         accounts: AccountManager::load(&accounts_path).unwrap(),
         providers: HashMap::new(),
-        default_account: None,
         credentials: HashMap::new(),
         x_credentials: None,
         db,

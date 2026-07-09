@@ -561,6 +561,20 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     let scroll = app.session_mgr.scroll;
     let max_rows = inner.height as usize;
 
+    // Show error message if one is set (e.g. daemon locked when creating).
+    if let Some(ref err) = app.session_mgr.error {
+        let err_style = Style::default().fg(Color::Red);
+        let err_text = format!("Error: {err}");
+        let err_para = Paragraph::new(Line::from(Span::styled(err_text, err_style)));
+        let err_area = Rect {
+            x: inner.x + 1,
+            y: inner.y + 1,
+            width: inner.width.saturating_sub(2),
+            height: 1,
+        };
+        frame.render_widget(err_para, err_area);
+    }
+
     if app.session_mgr.sessions.is_empty() {
         let msg = Paragraph::new("No sessions. Press 'n' to create one.");
         frame.render_widget(msg, inner);
@@ -662,6 +676,10 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                     .max_turns
                     .map_or("unlimited".to_string(), |mt| mt.to_string())
             )),
+            Line::from(format!(
+                "Account:       {}",
+                detail.account_name.as_deref().unwrap_or("-")
+            )),
             Line::from(format!("Status:        {}", format_status(&detail.status))),
             Line::from(format!(
                 "Tool Groups:   {}",
@@ -729,7 +747,6 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_widget(msg, inner);
     } else {
         let mut lines: Vec<Line> = Vec::new();
-        let default_name = app.ai_providers.default_account.as_deref();
 
         for i in scroll..app.ai_providers.accounts.len() {
             // Each account takes 2 lines (name line + provider line).
@@ -739,10 +756,8 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
             }
             let account = &app.ai_providers.accounts[i];
             let is_selected = Some(i) == app.ai_providers.selection;
-            let is_default = default_name == Some(account.name.as_str());
 
             let sel = if is_selected { ">" } else { " " };
-            let default_label = if is_default { "*default" } else { "" };
 
             let style = if is_selected {
                 Style::default().bg(Color::Blue).fg(Color::White)
@@ -750,12 +765,8 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
                 Style::default()
             };
 
-            // Line 1: name + default badge
-            let name_line = if default_label.is_empty() {
-                format!("{sel} {} ", account.name)
-            } else {
-                format!("{sel} {}   {default_label}", account.name)
-            };
+            // Line 1: name
+            let name_line = format!("{sel} {} ", account.name);
             let name_spans = vec![ratatui::text::Span::styled(name_line, style)];
             lines.push(Line::from(name_spans));
 
@@ -785,7 +796,7 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         Paragraph::new(Line::from(format!(" Remove \"{name}\"? (y/N)  ")))
     } else {
         Paragraph::new(Line::from(format!(
-            " <j/k nav>  <d default>  <r remove>  <c credential>  <n new>  <Esc back>  —  {} accounts",
+            " <j/k nav>  <r remove>  <c credential>  <n new>  <Esc back>  —  {} accounts",
             app.ai_providers.accounts.len()
         )))
     };

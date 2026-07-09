@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Instant;
 use tai_keystore::ServiceCredential;
 use tai_proto::{AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 /// Reply type for the ListModels command.
@@ -26,7 +26,6 @@ pub struct DaemonState {
     pub session_metadata: HashMap<u64, SessionMetadata>,
     pub accounts: AccountManager,
     pub providers: HashMap<String, InferenceProvider>,
-    pub default_account: Option<String>,
     pub credentials: HashMap<String, ServiceCredential>,
     pub x_credentials: Option<ServiceCredential>,
     pub db: Arc<redb::Database>,
@@ -122,13 +121,13 @@ pub enum DaemonCommand {
     ListAccountsCmd {
         reply: std::sync::mpsc::Sender<Result<Vec<AccountInfo>, String>>,
     },
-    SetDefaultAccountCmd {
-        name: String,
-        reply: std::sync::mpsc::Sender<Result<(), String>>,
-    },
     ResolveProviderCmd {
         account: String,
         reply: std::sync::mpsc::Sender<Option<InferenceProvider>>,
+    },
+    AccountExists {
+        name: String,
+        reply: std::sync::mpsc::Sender<bool>,
     },
 }
 
@@ -145,10 +144,11 @@ impl DaemonState {
                 active_tool_groups,
                 reply,
             } => {
-                if let Err(e) = self.ensure_unlocked() {
-                    let _ = reply.send(Err(e));
-                    return;
-                }
+                // A session is just a conversation container — it can be
+                // created regardless of whether the daemon is locked.
+                // Credentials are only needed when running models (RunInput).
+                // The daemon may be locked, but the user can still browse,
+                // create, and delete sessions freely.
                 let sid = self.next_session_id;
                 self.next_session_id += 1;
                 info!("CreateSession: id={}, title={:?}", sid, title);
@@ -179,9 +179,6 @@ impl DaemonState {
                     error!("CreateSession: failed to persist session {}: {e}", sid);
                 }
 
-                let resolved_account = account_name
-                    .clone()
-                    .or_else(|| self.default_account.clone());
                 let metadata = SessionMetadata {
                     title: title.clone(),
                     selected_model: None,
@@ -192,7 +189,7 @@ impl DaemonState {
                     max_turns,
                     status: SessionStatus::Inactive,
                     active_tool_groups: active_cats.clone(),
-                    account_name: resolved_account,
+                    account_name: account_name.clone(),
                 };
                 let session_tx = self.spawn_session(sid, record, metadata);
 
@@ -214,10 +211,9 @@ impl DaemonState {
             }
             DaemonCommand::AttachSession { session_id, reply } => {
                 debug!("AttachSession: id={}", session_id);
-                if let Err(e) = self.ensure_unlocked() {
-                    let _ = reply.send(Err(e));
-                    return;
-                }
+                // Attaching to a session is allowed regardless of lock state.
+                // Credentials are only needed to run models (RunInput), not
+                // to browse or attach to existing sessions.
                 match self.active_sessions.get(&session_id) {
                     Some(entry) => {
                         let _ = reply.send(Ok(entry.cmd_tx.clone()));
@@ -257,6 +253,7 @@ impl DaemonState {
                         max_turns: meta.max_turns,
                         status: meta.status.clone(),
                         active_tool_groups: meta.active_tool_groups.clone(),
+                        account_name: meta.account_name.clone(),
                     })
                     .collect();
 
@@ -278,6 +275,7 @@ impl DaemonState {
                         max_turns: meta.max_turns,
                         status: meta.status.clone(),
                         active_tool_groups: meta.active_tool_groups.clone(),
+                        account_name: meta.account_name.clone(),
                     });
                 let _ = reply.send(summary);
             }
@@ -478,32 +476,17 @@ impl DaemonState {
                 }
                 if result.is_ok() {
                     self.providers.remove(&name);
-                    if self.default_account.as_deref() == Some(&name) {
-                        self.default_account = self.accounts.first().map(|a| a.name.clone());
-                    }
                 }
                 let _ = reply.send(result);
             }
             DaemonCommand::ListAccountsCmd { reply } => {
                 let _ = reply.send(Ok(self.accounts.list()));
             }
-            DaemonCommand::SetDefaultAccountCmd { name, reply } => {
-                if self.accounts.contains(&name) {
-                    let prev = self.default_account.clone();
-                    self.default_account = Some(name.clone());
-                    info!(
-                        account = %name,
-                        previous = prev.as_deref().unwrap_or("(none)"),
-                        "set default inference account"
-                    );
-                    let _ = reply.send(Ok(()));
-                } else {
-                    error!(account = %name, "cannot set default: account not found");
-                    let _ = reply.send(Err(format!("account '{name}' not found")));
-                }
-            }
             DaemonCommand::ResolveProviderCmd { account, reply } => {
                 let _ = reply.send(self.providers.get(&account).cloned());
+            }
+            DaemonCommand::AccountExists { name, reply } => {
+                let _ = reply.send(self.accounts.contains(&name));
             }
             DaemonCommand::Shutdown => unreachable!("handled by command loop"),
         }
@@ -530,10 +513,7 @@ impl DaemonState {
         let max_turns_default = self.max_turns;
 
         // Resolve provider from the session's account name
-        let account_name = metadata
-            .account_name
-            .clone()
-            .or_else(|| self.default_account.clone());
+        let account_name = metadata.account_name.clone();
         let provider = account_name
             .as_ref()
             .and_then(|name| self.providers.get(name))
@@ -595,17 +575,38 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> Result<
     let blobs = db::get_all_credential_blobs(&state.db)
         .map_err(|e| format!("failed to read credentials from database: {e}"))?;
 
+    info!("Unlock: {} credential blobs in DB", blobs.len());
+
     let mut credentials = HashMap::new();
+    let mut decrypt_failures = 0usize;
     for (service, blob) in &blobs {
-        if let Ok(plaintext) = tai_keystore::crypto::decrypt_with_private_key(&key, blob)
-            && let Ok((cred, _)) = bincode::serde::decode_from_slice::<ServiceCredential, _>(
-                &plaintext,
-                bincode::config::standard(),
-            )
-        {
-            credentials.insert(service.clone(), cred);
+        match tai_keystore::crypto::decrypt_with_private_key(&key, blob) {
+            Ok(plaintext) => {
+                match bincode::serde::decode_from_slice::<ServiceCredential, _>(
+                    &plaintext,
+                    bincode::config::standard(),
+                ) {
+                    Ok((cred, _)) => {
+                        credentials.insert(service.clone(), cred);
+                    }
+                    Err(e) => {
+                        warn!("Unlock: failed to decode credential '{}': {e}", service);
+                        decrypt_failures += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Unlock: failed to decrypt credential '{}': {e}", service);
+                decrypt_failures += 1;
+            }
         }
     }
+    info!(
+        "Unlock: decrypted {}/{} credentials; {} failures",
+        credentials.len(),
+        blobs.len(),
+        decrypt_failures
+    );
 
     // Set up X credentials
     if let Some(c) = credentials.get("twitter")
@@ -613,6 +614,12 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> Result<
     {
         state.x_credentials = Some(c.clone());
     }
+
+    info!(
+        "Unlock: decrypted {} credentials from DB: {:?}",
+        state.credentials.len(),
+        state.credentials.keys().collect::<Vec<_>>()
+    );
 
     state.credentials = credentials;
 
@@ -638,6 +645,14 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> Result<
         let _ = state.accounts.add(default_config);
     }
 
+    let account_names: Vec<String> = state
+        .accounts
+        .all_configs()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    info!("Unlock: accounts loaded: {:?}", account_names);
+
     // Resolve providers for all accounts
     state.providers.clear();
     for config in state.accounts.all_configs() {
@@ -645,13 +660,26 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> Result<
             ServiceCredential::ApiKey { key } => Some(key.clone()),
             _ => None,
         });
+        info!(
+            "Unlock: account '{}': api_key_found={}, has_credential={}",
+            config.name,
+            api_key.is_some(),
+            state.credentials.contains_key(&config.name)
+        );
         if let Ok(provider) = InferenceProvider::from_account_config(&config, api_key) {
             state.providers.insert(config.name.clone(), provider);
+            info!("Unlock: provider resolved for account '{}'", config.name);
+        } else {
+            info!(
+                "Unlock: failed to resolve provider for account '{}'",
+                config.name
+            );
         }
     }
-
-    // Set default account to the first one
-    state.default_account = state.accounts.first().map(|a| a.name.clone());
+    info!(
+        "Unlock: providers resolved: {:?}",
+        state.providers.keys().collect::<Vec<_>>()
+    );
 
     key.zeroize();
     Ok(())
@@ -664,14 +692,20 @@ fn handle_list_models_inner(
     let account_name = session_id
         .and_then(|sid| state.session_metadata.get(&sid))
         .and_then(|m| m.account_name.clone())
-        .or_else(|| state.default_account.clone())
         .unwrap_or_default();
+
+    debug!(
+        "ListModels: session_id={:?}, account_name='{}', providers_keys={:?}",
+        session_id,
+        account_name,
+        state.providers.keys().collect::<Vec<_>>()
+    );
 
     let provider = state.providers.get(&account_name).ok_or_else(|| {
         if state.accounts.is_empty() {
             "no accounts configured".to_string()
         } else {
-            format!("no provider resolved for account '{account_name}'")
+            format!("no credential stored for account '{account_name}'")
         }
     })?;
 
@@ -720,7 +754,6 @@ mod tests {
             session_metadata: HashMap::new(),
             accounts: AccountManager::load(&accounts_path).unwrap(),
             providers: HashMap::new(),
-            default_account: None,
             credentials: HashMap::new(),
             x_credentials: None,
             db,
@@ -877,7 +910,10 @@ mod tests {
     }
 
     #[test]
-    fn handle_create_session_locked() {
+    fn handle_create_session_succeeds_when_locked() {
+        // CreateSession should succeed even when the daemon is locked,
+        // because a session is just a container — credentials are only
+        // needed to run models, not to create or browse sessions.
         let (mut state, _rx) = make_daemon_state();
         let (reply, rx) = mpsc::channel();
         state.handle_command(DaemonCommand::CreateSession {
@@ -891,8 +927,11 @@ mod tests {
             reply,
         });
         let result = rx.recv().unwrap();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), "daemon is locked");
+        assert!(
+            result.is_ok(),
+            "CreateSession should succeed even when locked: {:?}",
+            result.err()
+        );
     }
 
     #[test]

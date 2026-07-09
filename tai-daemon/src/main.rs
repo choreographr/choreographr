@@ -129,7 +129,6 @@ fn main() -> anyhow::Result<()> {
         session_metadata,
         accounts,
         providers: HashMap::new(),
-        default_account: None,
         credentials: std::collections::HashMap::new(),
         x_credentials: None,
         db,

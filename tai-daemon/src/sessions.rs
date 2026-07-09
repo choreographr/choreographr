@@ -464,8 +464,36 @@ fn process_command(
             if text.is_empty() {
                 return fail_request(&state.subscribers, request_id, "empty input");
             }
-            let Some(provider) = state.provider.as_ref() else {
-                return fail_request(&state.subscribers, request_id, "daemon is locked");
+            let provider = if let Some(p) = state.provider.as_ref() {
+                p
+            } else if let Some(ref name) = state.account_name {
+                // No cached provider yet — try lazy resolution via the daemon.
+                let (reply, rx) = mpsc::channel();
+                let _ = daemon_tx.send(DaemonCommand::ResolveProviderCmd {
+                    account: name.clone(),
+                    reply,
+                });
+                match rx.recv() {
+                    Ok(Some(provider)) => {
+                        state.provider = Some(provider);
+                        state.provider.as_ref().unwrap()
+                    }
+                    _ => {
+                        return fail_request(
+                            &state.subscribers,
+                            request_id,
+                            format!(
+                                "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
+                            ),
+                        );
+                    }
+                }
+            } else {
+                return fail_request(
+                    &state.subscribers,
+                    request_id,
+                    "no account configured on this session — use /account <name> to set one",
+                );
             };
             let model = match &state.selected_model {
                 Some(m) => m.clone(),
@@ -659,6 +687,7 @@ fn process_command(
                 max_turns: state.max_turns,
                 status: state.status.clone(),
                 active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
+                account_name: state.account_name.clone(),
             });
             false
         }
@@ -701,7 +730,7 @@ fn process_command(
         }
         SessionCommand::SetAccount { name } => {
             info!("session {}: SetAccount account={}", session_id, name);
-            // Resolve the provider from the daemon by name.
+            // Try to resolve the provider from the daemon by name.
             let (reply, rx) = mpsc::channel();
             let _ = daemon_tx.send(DaemonCommand::ResolveProviderCmd {
                 account: name.clone(),
@@ -709,23 +738,17 @@ fn process_command(
             });
             if let Ok(Some(provider)) = rx.recv() {
                 state.provider = Some(provider);
-                state.account_name = Some(name.clone());
-                broadcast(
-                    &state.subscribers,
-                    DaemonMessage::SessionAccountSet { account: name },
-                );
-            } else {
-                // Provider not resolved — account may exist but have no
-                // credential, or the account doesn't exist at all.
-                // Keep the old provider and send a failed message.
-                broadcast(
-                    &state.subscribers,
-                    DaemonMessage::SessionFailed {
-                        operation: "set_account".into(),
-                        error: format!("account '{name}' not found or not configured"),
-                    },
-                );
             }
+            // Always store the account name on the session, even if the
+            // provider wasn't resolvable yet (e.g. no credential stored,
+            // or daemon hasn't unlocked).  The provider can be resolved
+            // lazily when RunInput is called.  This way the user can set
+            // an account on a session before unlocking.
+            state.account_name = Some(name.clone());
+            broadcast(
+                &state.subscribers,
+                DaemonMessage::SessionAccountSet { account: name },
+            );
             let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
                 session_id,
                 metadata: SessionMetadata::from(&*state),

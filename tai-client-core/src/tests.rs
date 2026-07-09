@@ -364,15 +364,36 @@ fn parses_remove_key() {
 }
 
 #[test]
-fn parses_remove_key_with_spaced_service() {
+fn rejects_remove_key_with_invalid_service_name() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/remove-key my service", &mut next, None),
-        ShellCommand::RemoveCredential {
-            service: "my service".to_string(),
-        }
+        ShellCommand::UnknownCommand(
+            "account name must be lowercase alphanumeric, hyphens, or underscores".to_string()
+        )
     );
-    assert_eq!(next, 3);
+}
+
+#[test]
+fn rejects_add_key_with_invalid_service_name() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/add-key Jonathan sk-test", &mut next, None),
+        ShellCommand::UnknownCommand(
+            "account name must be lowercase alphanumeric, hyphens, or underscores".to_string()
+        )
+    );
+}
+
+#[test]
+fn rejects_account_set_with_invalid_name() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/account Jonathan's Opencode", &mut next, None),
+        ShellCommand::UnknownCommand(
+            "account name must be lowercase alphanumeric, hyphens, or underscores".to_string()
+        )
+    );
 }
 
 #[test]
@@ -382,6 +403,27 @@ fn rejects_remove_key_without_service() {
         parse_input_line("/remove-key", &mut next, None),
         ShellCommand::UnknownCommand("usage: /remove-key <service>".to_string())
     );
+}
+
+#[test]
+fn is_valid_account_name_valid() {
+    assert!(is_valid_account_name("my-account"));
+    assert!(is_valid_account_name("a"));
+    assert!(is_valid_account_name("0"));
+    assert!(is_valid_account_name("jonathan-opencode-zen"));
+    assert!(is_valid_account_name("chau_opencode_go"));
+    assert!(is_valid_account_name("a1-b2_c3"));
+}
+
+#[test]
+fn is_valid_account_name_rejects_invalid() {
+    assert!(!is_valid_account_name(""));
+    assert!(!is_valid_account_name("Jonathan"));
+    assert!(!is_valid_account_name("my account"));
+    assert!(!is_valid_account_name("Chau's Opencode go"));
+    assert!(!is_valid_account_name("has space"));
+    assert!(!is_valid_account_name("has.period"));
+    assert!(!is_valid_account_name("UPPERCASE"));
 }
 
 #[test]

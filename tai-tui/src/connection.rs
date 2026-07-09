@@ -15,7 +15,7 @@ use std::sync::{
 use std::{io, time::Duration};
 use tai_client_core::{
     ClientError, broken_pipe, build_add_credential_message, dispatch_daemon_message,
-    resolve_private_key, run_daemon_connection, shell_command_echo,
+    is_valid_account_name, resolve_private_key, run_daemon_connection, shell_command_echo,
 };
 use tai_keystore::ensure_keypair;
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
@@ -25,6 +25,7 @@ const UI_EVENT_CHANNEL_SIZE: usize = 4096;
 const UI_FRAME_POLL_MS: u64 = 16;
 
 pub(crate) fn run_app() -> io::Result<()> {
+    tracing::info!("[tai-tui] run_app starting");
     // Ensure the keystore keypair exists before we try to connect to the
     // daemon.  If no keypair has been generated yet, this creates one on the
     // fly so the client can unlock the daemon without requiring a manual
@@ -328,25 +329,40 @@ fn handle_chat_event(
                             }
                             client_tx.send(message).map_err(broken_pipe)?;
                         }
-                        ShellCommand::Unlock { method } => match resolve_private_key(&method) {
-                            Ok(private_key) => {
-                                let _ = client_tx.send(ClientMessage::Unlock { private_key });
+                        ShellCommand::Unlock { method } => {
+                            if let Some(echo) = shell_command_echo(&ShellCommand::Unlock {
+                                method: method.clone(),
+                            }) {
+                                app.push_text(echo);
                             }
-                            Err(e) => {
-                                app.push_text(format!("[error] {e}"));
-                                return Ok(());
+                            match resolve_private_key(&method) {
+                                Ok(private_key) => {
+                                    let _ = client_tx.send(ClientMessage::Unlock { private_key });
+                                }
+                                Err(e) => {
+                                    app.push_text(format!("[error] {e}"));
+                                    return Ok(());
+                                }
                             }
-                        },
+                        }
                         ShellCommand::AddCredential {
-                            service,
-                            credential_type,
-                            fields,
+                            ref service,
+                            ref credential_type,
+                            ref fields,
                             unlock,
                         } => {
+                            if let Some(echo) = shell_command_echo(&ShellCommand::AddCredential {
+                                service: service.clone(),
+                                credential_type: credential_type.clone(),
+                                fields: fields.clone(),
+                                unlock,
+                            }) {
+                                app.push_text(echo);
+                            }
                             match build_add_credential_message(
-                                service,
-                                credential_type,
-                                fields,
+                                service.clone(),
+                                credential_type.clone(),
+                                fields.clone(),
                                 unlock,
                             ) {
                                 Ok(msg) => {
@@ -358,8 +374,17 @@ fn handle_chat_event(
                                 }
                             }
                         }
-                        ShellCommand::RemoveCredential { service } => {
-                            let _ = client_tx.send(ClientMessage::RemoveCredential { service });
+                        ShellCommand::RemoveCredential { ref service } => {
+                            if let Some(echo) =
+                                shell_command_echo(&ShellCommand::RemoveCredential {
+                                    service: service.clone(),
+                                })
+                            {
+                                app.push_text(echo);
+                            }
+                            let _ = client_tx.send(ClientMessage::RemoveCredential {
+                                service: service.clone(),
+                            });
                         }
                     }
                 }
@@ -473,6 +498,7 @@ fn handle_session_list_key(
         }
         KeyCode::Char('i') => app.session_mgr.enter_detail(),
         KeyCode::Char('n') => {
+            tracing::info!("[tai-tui] pressing n on session list -> CreateSession");
             client_tx
                 .send(ClientMessage::CreateSession {
                     title: None,
@@ -584,18 +610,7 @@ fn handle_ai_providers_list_key(
         }
         KeyCode::Up | KeyCode::Char('k') => app.ai_providers.select_up(),
         KeyCode::Down | KeyCode::Char('j') => app.ai_providers.select_down(),
-        // Set as default account
-        KeyCode::Char('d') => {
-            if let Some(sel) = app.ai_providers.selection
-                && let Some(account) = app.ai_providers.accounts.get(sel)
-            {
-                client_tx
-                    .send(ClientMessage::SetDefaultAccount {
-                        name: account.name.clone(),
-                    })
-                    .map_err(broken_pipe)?;
-            }
-        }
+
         // Remove account (with confirmation)
         KeyCode::Char('r') => {
             if let Some(sel) = app.ai_providers.selection
@@ -731,6 +746,15 @@ fn handle_ai_providers_new_form_key(
                         return Ok(());
                     }
 
+                    if !is_valid_account_name(&name) {
+                        app.ai_providers.add_error = Some(
+                            "account name must be lowercase alphanumeric, hyphens, or underscores"
+                                .to_string(),
+                        );
+                        app.ai_providers.new_field = NewAccountField::Name;
+                        return Ok(());
+                    }
+
                     // Get the selected provider string
                     let provider_idx = app.ai_providers.new_provider_idx;
                     let provider_str = PROVIDER_OPTIONS[provider_idx].provider_str();
@@ -838,6 +862,10 @@ pub(crate) fn handle_daemon_message(
                 return Ok(());
             }
             app.handle_session_created(*session_id, client_tx)?;
+            // Early return so we don't fall through to dispatch_daemon_message,
+            // which would push text to the chat history (duplicate / invisible
+            // on the Session Manager page).
+            return Ok(());
         }
         DaemonMessage::SessionAttached { session_id } => {
             app.handle_session_attached(*session_id);
@@ -857,10 +885,21 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::SessionDeleteFailed { session_id, error } => {
             app.handle_session_delete_failed(*session_id, error);
         }
+        DaemonMessage::SessionFailed { operation, error } => {
+            // Push to chat history for the Chat page.
+            app.push_text(format!("[daemon] {operation} failed: {error}"));
+            // If we're on the Session Manager page, also show the error
+            // right on that page so the user has immediate feedback.
+            if app.page == Page::SessionManager && operation == "create_session" {
+                app.session_mgr.set_error(error.clone());
+            }
+        }
         // ── AI Provider Accounts ──────────────────────────
         DaemonMessage::Accounts { accounts } => {
             app.handle_accounts(accounts);
-            return Ok(());
+            // Don't return early here — fall through to dispatch_daemon_message
+            // which will push the account list to the chat history so the
+            // user sees the response to their `/account` command.
         }
         DaemonMessage::AccountListFailed { error } => {
             app.push_text(format!("[daemon] failed to list accounts: {error}"));
@@ -884,16 +923,7 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::AccountRemoveFailed { name, error } => {
             app.push_text(format!("[daemon] failed to remove account {name}: {error}"));
         }
-        DaemonMessage::DefaultAccountSet { name } => {
-            app.ai_providers.default_account = Some(name.clone());
-            app.push_text(format!("[daemon] default account set to: {name}"));
-            let _ = client_tx.send(ClientMessage::ListAccounts);
-        }
-        DaemonMessage::DefaultAccountSetFailed { name, error } => {
-            app.push_text(format!(
-                "[daemon] failed to set default account {name}: {error}"
-            ));
-        }
+
         _ => {}
     }
 

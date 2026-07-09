@@ -134,10 +134,18 @@ In `tai-tui`:
 - `/cancel <request-id>` — cancel a running request
 - `/unlock [passphrase]` — unlock the daemon (reads `identity.pk` or decrypts `identity.pk.enc`)
 - `/lock` — lock the daemon, clearing credentials from memory
-- `/add-key <service> <api_key> [unlock]` — add an API key credential
-- `/add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ [unlock]` — add an X credential
+- `/add-key <service> <api_key> [unlock]` — add an API key credential (service name must be `[a-z0-9_-]`)
+- `/add-x <service> <api_key> <api_key_secret> <access_token> <access_token_secret> <bearer_or_->_ [unlock]` — add an X credential (service name must be `[a-z0-9_-]`)
 - `/remove-key <service>` — remove a credential
+- `/account list` — list configured AI provider accounts
+- `/account remove <name>` — remove an AI provider account
+- `/account <name>` — set the session's AI provider account
 - any other input — sent as a prompt
+
+Account names must be lowercase alphanumeric with hyphens or underscores (`[a-z0-9_-]`).
+Each session may have its own account, set via `/account <name>`. There is no global default
+account. Sessions can be created and browsed while the daemon is locked — credentials are
+only required when running prompts.
 
 ## Monitoring
 

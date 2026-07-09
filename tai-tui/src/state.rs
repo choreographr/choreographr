@@ -133,7 +133,6 @@ pub(crate) struct AIProvidersState {
     pub(crate) selection: Option<usize>,
     pub(crate) scroll: usize,
     pub(crate) confirm_remove: Option<String>,
-    pub(crate) default_account: Option<String>,
     /// The name being typed in the new-account form.
     pub(crate) new_name: InputBuffer,
     /// Index into PROVIDER_OPTIONS for the selected provider.
@@ -159,7 +158,6 @@ impl AIProvidersState {
             selection: None,
             scroll: 0,
             confirm_remove: None,
-            default_account: None,
             new_name: InputBuffer::new(),
             new_provider_idx: 0,
             new_api_key: InputBuffer::new(),
@@ -276,6 +274,8 @@ pub(crate) struct SessionDetailData {
     pub(crate) max_turns: Option<u32>,
     pub(crate) status: SessionStatus,
     pub(crate) active_tool_groups: Vec<String>,
+    /// The AI provider account associated with this session, if any.
+    pub(crate) account_name: Option<String>,
 }
 
 pub(crate) struct SessionManagerState {
@@ -285,6 +285,10 @@ pub(crate) struct SessionManagerState {
     pub(crate) scroll: usize,
     pub(crate) detail_data: Option<SessionDetailData>,
     pub(crate) confirm_delete: Option<(u64, String)>,
+    /// Error message to display on the session manager page (e.g.
+    /// daemon-locked, create failure). Cleared on next successful
+    /// session list refresh.
+    pub(crate) error: Option<String>,
 }
 
 /// Cached rendering of a history item whose content does not change between
@@ -531,10 +535,12 @@ impl SessionManagerState {
             scroll: 0,
             detail_data: None,
             confirm_delete: None,
+            error: None,
         }
     }
 
     pub(crate) fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        self.error = None;
         let was_attached = self
             .selection
             .and_then(|i| self.sessions.get(i))
@@ -592,6 +598,7 @@ impl SessionManagerState {
                 max_turns,
                 status: s.status.clone(),
                 active_tool_groups: s.active_tool_groups.clone(),
+                account_name: s.account_name.clone(),
             }
         });
         if self.detail_data.is_some() {
@@ -639,6 +646,12 @@ impl SessionManagerState {
         if self.confirm_delete.as_ref().map(|(sid, _)| *sid) == Some(id) {
             self.confirm_delete = None;
         }
+    }
+
+    /// Set an error message to display on the session manager page.
+    /// Cleared automatically on the next successful `set_sessions` call.
+    pub(crate) fn set_error(&mut self, msg: impl Into<String>) {
+        self.error = Some(msg.into());
     }
 }
 
@@ -1352,10 +1365,6 @@ impl App {
     /// chat page, and auto-attach or auto-create when no session is attached.
     pub(crate) fn handle_accounts(&mut self, accounts: &[AccountInfo]) {
         self.ai_providers.set_accounts(accounts.to_vec());
-        // Update default_account from the accounts list if not set
-        if self.ai_providers.default_account.is_none() && !accounts.is_empty() {
-            // Default is the first one (daemon sorts alphabetically)
-        }
     }
 
     pub(crate) fn handle_sessions(
@@ -1515,6 +1524,7 @@ mod tests {
             max_turns: None,
             status: SessionStatus::Inactive,
             active_tool_groups: vec!["core".into()],
+            account_name: None,
         }
     }
 
@@ -1530,6 +1540,7 @@ mod tests {
             max_turns: None,
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
+            account_name: None,
         }
     }
 

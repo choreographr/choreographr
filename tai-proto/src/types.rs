@@ -135,6 +135,8 @@ pub struct SessionSummary {
     pub max_turns: Option<u32>,
     pub status: SessionStatus,
     pub active_tool_groups: Vec<String>,
+    /// The AI provider account name associated with this session, if any.
+    pub account_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,9 +206,6 @@ pub enum ClientMessage {
         name: String,
     },
     ListAccounts,
-    SetDefaultAccount {
-        name: String,
-    },
     SetSessionAccount {
         name: String,
     },
@@ -389,13 +388,6 @@ pub enum DaemonMessage {
     },
     SessionAccountSet {
         account: String,
-    },
-    DefaultAccountSet {
-        name: String,
-    },
-    DefaultAccountSetFailed {
-        name: String,
-        error: String,
     },
     ShuttingDown,
 }
@@ -668,17 +660,6 @@ impl DaemonMessage {
             account: account.into(),
         }
     }
-
-    pub fn default_account_set(name: impl Into<String>) -> Self {
-        Self::DefaultAccountSet { name: name.into() }
-    }
-
-    pub fn default_account_set_failed(name: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::DefaultAccountSetFailed {
-            name: name.into(),
-            error: error.into(),
-        }
-    }
 }
 
 impl ClientMessage {
@@ -811,10 +792,6 @@ impl ClientMessage {
 
     pub fn list_accounts() -> Self {
         Self::ListAccounts
-    }
-
-    pub fn set_default_account(name: impl Into<String>) -> Self {
-        Self::SetDefaultAccount { name: name.into() }
     }
 
     pub fn set_session_account(name: impl Into<String>) -> Self {

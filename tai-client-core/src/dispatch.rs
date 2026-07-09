@@ -311,8 +311,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             } else {
                 handler.push_text(format!("[daemon] accounts ({})", accounts.len()));
                 for a in &accounts {
-                    let model = a.model.as_deref().unwrap_or("-");
-                    handler.push_text(format!("  {}: {} (model: {})", a.name, a.provider, model));
+                    handler.push_text(format!("  {}: {}", a.name, a.provider));
                 }
             }
             Ok(None)
@@ -325,16 +324,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             handler.push_text(format!("[daemon] session account set: {account}"));
             Ok(None)
         }
-        DaemonMessage::DefaultAccountSet { name } => {
-            handler.push_text(format!("[daemon] default account set: {name}"));
-            Ok(None)
-        }
-        DaemonMessage::DefaultAccountSetFailed { name, error } => {
-            handler.push_text(format!(
-                "[daemon] failed to set default account {name}: {error}"
-            ));
-            Ok(None)
-        }
+
         _ => Ok(None),
     }
 }

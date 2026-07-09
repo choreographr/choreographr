@@ -88,7 +88,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
 `TestImage`, `Cancel`, `Ping`, `GetCredential`, `ListModels`, `SetModel`, `Unlock`,
 `Lock`, `AddCredential`, `RemoveCredential`, `AddAccount`, `RemoveAccount`,
-`ListAccounts`, `SetDefaultAccount`, `SetSessionAccount`
+`ListAccounts`, `SetSessionAccount`
 - `CreateSession` now carries optional `context_config` and `account_name` fields
 
 `DaemonMessage` variants:
@@ -99,7 +99,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 - Model management: `Models`, `ModelsFailed`, `ModelSelected`, `ModelSelectionFailed`
 - Locking: `Unlocked`, `Locked`, `LockedError`
 - Credential management: `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`
-- Account management: `AccountAdded`, `AccountAddFailed`, `AccountRemoved`, `AccountRemoveFailed`, `Accounts`, `AccountListFailed`, `DefaultAccountSet`, `DefaultAccountSetFailed`, `SessionAccountSet`
+- Account management: `AccountAdded`, `AccountAddFailed`, `AccountRemoved`, `AccountRemoveFailed`, `Accounts`, `AccountListFailed`, `SessionAccountSet`
 - Misc: `Pong`, `ShuttingDown`
 
 **Wire format:**
@@ -342,7 +342,15 @@ startup                    /unlock [passphrase]
 - Credentials are encrypted per-credential with ECDH (X25519) + HKDF + AES-256-GCM
 - The private key is sent over the Unix socket; zeroized after use by the daemon
 - `/lock` destroys all in-memory credentials, returning to locked state
-- `LockedError` is sent if any client attempts a request while locked
+- `LockedError` is sent if any client attempts a request that requires credentials while locked
+- Session lifecycle operations (CreateSession, AttachSession, ListSessions, etc.) succeed even
+  when locked — credentials are only needed at RunInput time. Provider resolution is lazy:
+  when RunInput is called, the session thread resolves the InferenceProvider from the daemon's
+  provider registry. If no credential is available for the session's account, a clear error is
+  returned telling the user to add a key.
+- There is no global "default account". Each session carries its own `account_name: Option<String>`
+  field. When RunInput is issued, the daemon resolves the provider from the session's own account name.
+  This avoids a global mutable fallback and lets different sessions use different accounts.
 
 
 ---
@@ -671,6 +679,11 @@ User presses Enter on a session in the session manager
 4. **Sessions, not per-client state** — sessions are independent from client connections. A
    session has its own model, CWD, and messages. Clients subscribe/unsubscribe from sessions
    via the broadcast system. Sessions persist in a redb database and survive daemon restarts.
+   Session lifecycle operations (create, attach, list, delete) succeed even when the daemon
+   is locked — credentials are only needed to run models. Sessions carry an optional
+   `account_name` field that determines which provider credential to use at request time;
+   there is no global "default account" fallback. The provider is resolved lazily from the
+   daemon's provider registry when the first RunInput is issued.
 
 5. **Session hierarchy** — sessions can have parent sessions (`parent_session_id`), forming a
    tree. Child sessions inherit their parent's CWD unless explicitly overridden. The

@@ -28,6 +28,16 @@ pub enum ShellCommand {
     Empty,
 }
 
+/// Returns `true` if `name` is a valid account name: non-empty and matching
+/// `[a-z0-9_-]` (lowercase alphanumeric, hyphens, underscores).
+pub fn is_valid_account_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
 pub fn parse_input_line(
     line: &str,
     next_request_id: &mut u32,
@@ -88,6 +98,11 @@ fn parse_command(
             return ShellCommand::UnknownCommand("usage: /add-key <service> <api_key>".to_string());
         }
         let service = parts[0].to_string();
+        if !is_valid_account_name(&service) {
+            return ShellCommand::UnknownCommand(
+                "account name must be lowercase alphanumeric, hyphens, or underscores".to_string(),
+            );
+        }
         let key = parts[1].to_string();
         let unlock = parts
             .get(2)
@@ -110,6 +125,11 @@ fn parse_command(
             );
         }
         let service = parts[0].to_string();
+        if !is_valid_account_name(&service) {
+            return ShellCommand::UnknownCommand(
+                "account name must be lowercase alphanumeric, hyphens, or underscores".to_string(),
+            );
+        }
         let api_key = parts[1].to_string();
         let api_key_secret = parts[2].to_string();
         let access_token = parts[3].to_string();
@@ -137,13 +157,18 @@ fn parse_command(
     if rest == "remove-key" {
         return ShellCommand::UnknownCommand("usage: /remove-key <service>".to_string());
     }
-    if let Some(service) = rest.strip_prefix("remove-key ") {
-        let service = service.trim();
-        if service.is_empty() {
+    if let Some(name) = rest.strip_prefix("remove-key ") {
+        let name = name.trim();
+        if name.is_empty() {
             return ShellCommand::UnknownCommand("usage: /remove-key <service>".to_string());
         }
+        if !is_valid_account_name(name) {
+            return ShellCommand::UnknownCommand(
+                "account name must be lowercase alphanumeric, hyphens, or underscores".to_string(),
+            );
+        }
         return ShellCommand::RemoveCredential {
-            service: service.to_string(),
+            service: name.to_string(),
         };
     }
 
@@ -246,7 +271,7 @@ fn parse_command(
         let args = args.trim();
         if args.is_empty() {
             return ShellCommand::UnknownCommand(
-                "usage: /account list | /account remove <name> | /account default <name> | /account <name>".to_string()
+                "usage: /account list | /account remove <name> | /account <name>".to_string(),
             );
         }
         let parts: Vec<&str> = args.split_whitespace().collect();
@@ -255,30 +280,38 @@ fn parse_command(
                 return ShellCommand::Send(ClientMessage::ListAccounts);
             }
             "remove" => {
-                if parts.len() < 2 {
+                // Everything after "/account remove " is the account name.
+                let name = args
+                    .trim_start()
+                    .strip_prefix("remove")
+                    .unwrap_or("")
+                    .trim();
+                if name.is_empty() {
                     return ShellCommand::UnknownCommand(
                         "usage: /account remove <name>".to_string(),
                     );
                 }
-                return ShellCommand::Send(ClientMessage::RemoveAccount {
-                    name: parts[1].to_string(),
-                });
-            }
-            "default" => {
-                if parts.len() < 2 {
+                if !is_valid_account_name(name) {
                     return ShellCommand::UnknownCommand(
-                        "usage: /account default <name>".to_string(),
+                        "account name must be lowercase alphanumeric, hyphens, or underscores"
+                            .to_string(),
                     );
                 }
-                return ShellCommand::Send(ClientMessage::SetDefaultAccount {
-                    name: parts[1].to_string(),
-                });
-            }
-            // /account <name> — switch the attached session to this account
-            name => {
-                return ShellCommand::Send(ClientMessage::SetSessionAccount {
+                return ShellCommand::Send(ClientMessage::RemoveAccount {
                     name: name.to_string(),
                 });
+            }
+
+            // /account <name> — switch the attached session to this account.
+            _ => {
+                let name = args.to_string();
+                if !is_valid_account_name(&name) {
+                    return ShellCommand::UnknownCommand(
+                        "account name must be lowercase alphanumeric, hyphens, or underscores"
+                            .to_string(),
+                    );
+                }
+                return ShellCommand::Send(ClientMessage::SetSessionAccount { name });
             }
         }
     }
@@ -299,6 +332,16 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
             ClientMessage::SetModel { model } => Some(format!("> set model: {model}")),
             _ => None,
         },
+        // Non-Send shell commands: echo the raw line so the user can see
+        // what they typed even though no ClientMessage is sent.
+        ShellCommand::Unlock { .. } => Some("> /unlock".to_string()),
+        ShellCommand::AddCredential {
+            service, unlock, ..
+        } => {
+            let suffix = if *unlock { " (with unlock)" } else { "" };
+            Some(format!("> /add-key {service}{suffix}"))
+        }
+        ShellCommand::RemoveCredential { service } => Some(format!("> /remove-key {service}")),
         _ => None,
     }
 }

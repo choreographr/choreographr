@@ -1123,6 +1123,7 @@ mod tests {
                     max_turns: None,
                     status: SessionStatus::Inactive,
                     active_tool_groups: vec!["core".into()],
+                    account_name: None,
                 }];
                 let _ = reply.send(sessions);
             }
@@ -1182,6 +1183,7 @@ mod tests {
                     max_turns: None,
                     status: SessionStatus::Inactive,
                     active_tool_groups: vec!["core".into()],
+                    account_name: None,
                 }));
             }
         });

@@ -38,7 +38,6 @@ use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
-#[serde(tag = "type")]
 pub enum ServiceCredential {
     #[serde(rename = "api_key")]
     ApiKey { key: String },
