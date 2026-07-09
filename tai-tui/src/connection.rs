@@ -1,7 +1,8 @@
 use crate::render::{mouse_in_history_box, render};
+use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    App, HOME_MENU_ITEMS, HomeMenuItem, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView,
-    UiEvent,
+    AIProvidersView, App, HOME_MENU_ITEMS, HomeMenuItem, InputBuffer, NewAccountField,
+    PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
@@ -172,6 +173,7 @@ pub(crate) fn handle_terminal_event(
 ) -> Result<(), ClientError> {
     match app.page {
         Page::SessionManager => handle_session_manager_event(event, app, client_tx),
+        Page::AIProviders => handle_ai_providers_event(event, app, client_tx),
         Page::Chat => handle_chat_event(event, app, client_tx),
         Page::Settings => handle_settings_event(event, app, client_tx),
         Page::Home => handle_home_event(event, app, client_tx),
@@ -211,6 +213,10 @@ fn handle_home_event(
                 app.page = Page::SessionManager;
                 let _ = client_tx.send(ClientMessage::ListSessions);
                 let _ = client_tx.send(ClientMessage::SubscribeSessionsSummary);
+            }
+            HomeMenuItem::AIProviders => {
+                app.page = Page::AIProviders;
+                let _ = client_tx.send(ClientMessage::ListAccounts);
             }
             HomeMenuItem::Settings => {
                 app.page = Page::Settings;
@@ -527,6 +533,288 @@ fn handle_session_detail_key(
     Ok(())
 }
 
+fn handle_ai_providers_event(
+    event: Event,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    // If credential input is active, handle that first.
+    if app.ai_providers.credential_target.is_some() {
+        return handle_ai_providers_credential_key(event, app, client_tx);
+    }
+    match app.ai_providers.view {
+        AIProvidersView::List => handle_ai_providers_list_key(event, app, client_tx),
+        AIProvidersView::NewForm => handle_ai_providers_new_form_key(event, app, client_tx),
+    }
+}
+
+fn handle_ai_providers_list_key(
+    event: Event,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Event::Key(key) = event else {
+        return Ok(());
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+
+    // If in delete-confirmation mode, handle y/n/Esc first
+    if app.ai_providers.confirm_remove.is_some() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(name) = app.ai_providers.confirm_remove.take() {
+                    client_tx
+                        .send(ClientMessage::RemoveAccount { name: name.clone() })
+                        .map_err(broken_pipe)?;
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                app.ai_providers.confirm_remove = None;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.ai_providers.select_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.ai_providers.select_down(),
+        // Set as default account
+        KeyCode::Char('d') => {
+            if let Some(sel) = app.ai_providers.selection
+                && let Some(account) = app.ai_providers.accounts.get(sel)
+            {
+                client_tx
+                    .send(ClientMessage::SetDefaultAccount {
+                        name: account.name.clone(),
+                    })
+                    .map_err(broken_pipe)?;
+            }
+        }
+        // Remove account (with confirmation)
+        KeyCode::Char('r') => {
+            if let Some(sel) = app.ai_providers.selection
+                && let Some(account) = app.ai_providers.accounts.get(sel)
+            {
+                app.ai_providers.confirm_remove = Some(account.name.clone());
+            }
+        }
+        // New account
+        KeyCode::Char('n') => {
+            app.ai_providers.enter_new_form();
+        }
+        // Set credential (API key) for the selected account
+        KeyCode::Char('c') => {
+            if let Some(sel) = app.ai_providers.selection
+                && let Some(account) = app.ai_providers.accounts.get(sel)
+            {
+                app.ai_providers.enter_credential(account.name.clone());
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.previous_page = Page::AIProviders;
+            app.home_selection = 0;
+            app.page = Page::Home;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Handle key events for the credential-input view (setting an API key
+/// for an existing account).
+fn handle_ai_providers_credential_key(
+    event: Event,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Event::Key(key) = event else {
+        return Ok(());
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        // Enter saves the credential
+        KeyCode::Enter => {
+            let account_name = match app.ai_providers.credential_target.take() {
+                Some(name) => name,
+                None => return Ok(()),
+            };
+            let api_key = app.ai_providers.credential_input.text.trim().to_string();
+            app.ai_providers.credential_input = InputBuffer::new();
+
+            if api_key.is_empty() {
+                app.ai_providers.add_error = Some("API key cannot be empty".to_string());
+                app.ai_providers.credential_target = Some(account_name);
+                return Ok(());
+            }
+
+            app.ai_providers.add_error = None;
+
+            // Build and send the encrypted credential
+            match tai_client_core::build_add_credential_message(
+                account_name.clone(),
+                "api_key".to_string(),
+                vec![api_key],
+                false,
+            ) {
+                Ok(msg) => {
+                    let _ = client_tx.send(msg);
+                    app.push_text(format!(
+                        "[daemon] credential stored for account: {account_name}"
+                    ));
+                }
+                Err(e) => {
+                    app.push_text(format!(
+                        "[warning] failed to encrypt API key for {account_name}: {e}"
+                    ));
+                }
+            }
+        }
+        // Esc cancels
+        KeyCode::Esc => {
+            app.ai_providers.leave_credential();
+        }
+        // All other keys go to the credential input buffer
+        _ => {
+            app.ai_providers.credential_input.handle_key(key);
+        }
+    }
+    Ok(())
+}
+
+fn handle_ai_providers_new_form_key(
+    event: Event,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Event::Key(key) = event else {
+        return Ok(());
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        // Enter advances to next field, and on Done submits
+        KeyCode::Enter => {
+            match app.ai_providers.new_field {
+                NewAccountField::Name => {
+                    app.ai_providers.new_field = NewAccountField::Provider;
+                }
+                NewAccountField::Provider => {
+                    app.ai_providers.new_field = NewAccountField::ApiKey;
+                }
+                NewAccountField::ApiKey => {
+                    app.ai_providers.new_field = NewAccountField::Done;
+                }
+                NewAccountField::Done => {
+                    // Submit the new account
+                    let name = app.ai_providers.new_name.text.trim().to_string();
+
+                    if name.is_empty() {
+                        app.ai_providers.add_error = Some("Account name is required".to_string());
+                        app.ai_providers.new_field = NewAccountField::Name;
+                        return Ok(());
+                    }
+
+                    // Get the selected provider string
+                    let provider_idx = app.ai_providers.new_provider_idx;
+                    let provider_str = PROVIDER_OPTIONS[provider_idx].provider_str();
+
+                    // Collect the API key
+                    let api_key = app.ai_providers.new_api_key.text.trim().to_string();
+
+                    app.ai_providers.add_error = None;
+
+                    // Send AddAccount
+                    client_tx
+                        .send(ClientMessage::add_account(
+                            &name,
+                            provider_str,
+                            None, // no model
+                            None, // no base_url
+                            None, // streaming
+                            None, // retry_max_attempts
+                            None, // connect_timeout_secs
+                            None, // request_timeout_secs
+                        ))
+                        .map_err(broken_pipe)?;
+
+                    // If an API key was provided, send AddCredential too.
+                    // The credential is encrypted client-side and sent to
+                    // the daemon, keyed by the account name.
+                    if !api_key.is_empty() {
+                        // Use the shared helper from tai-client-core to
+                        // build and encrypt the credential message.
+                        match tai_client_core::build_add_credential_message(
+                            name.clone(),
+                            "api_key".to_string(),
+                            vec![api_key],
+                            false, // don't also unlock — just store
+                        ) {
+                            Ok(msg) => {
+                                let _ = client_tx.send(msg);
+                            }
+                            Err(e) => {
+                                app.push_text(format!("[warning] failed to encrypt API key: {e}"));
+                            }
+                        }
+                    }
+
+                    // Go back to list — the AccountAdded message will
+                    // refresh the list.
+                    app.ai_providers.leave_new_form();
+                }
+            }
+        }
+        // j/k navigate when on provider field; otherwise pass through
+        KeyCode::Char('j') | KeyCode::Down => {
+            if app.ai_providers.new_field == NewAccountField::Provider {
+                let max = PROVIDER_OPTIONS.len().saturating_sub(1);
+                if app.ai_providers.new_provider_idx < max {
+                    app.ai_providers.new_provider_idx += 1;
+                }
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            if app.ai_providers.new_field == NewAccountField::Provider
+                && app.ai_providers.new_provider_idx > 0
+            {
+                app.ai_providers.new_provider_idx -= 1;
+            }
+        }
+        // Esc cancels back to list
+        KeyCode::Esc => {
+            app.ai_providers.leave_new_form();
+        }
+        // All other keys go to the active text field
+        _ => match app.ai_providers.new_field {
+            NewAccountField::Name => {
+                app.ai_providers.new_name.handle_key(key);
+            }
+            NewAccountField::ApiKey => {
+                app.ai_providers.new_api_key.handle_key(key);
+            }
+            _ => {}
+        },
+    }
+    Ok(())
+}
+
 pub(crate) fn handle_daemon_message(
     message: DaemonMessage,
     app: &mut App,
@@ -568,6 +856,43 @@ pub(crate) fn handle_daemon_message(
         }
         DaemonMessage::SessionDeleteFailed { session_id, error } => {
             app.handle_session_delete_failed(*session_id, error);
+        }
+        // ── AI Provider Accounts ──────────────────────────
+        DaemonMessage::Accounts { accounts } => {
+            app.handle_accounts(accounts);
+            return Ok(());
+        }
+        DaemonMessage::AccountListFailed { error } => {
+            app.push_text(format!("[daemon] failed to list accounts: {error}"));
+            return Ok(());
+        }
+        DaemonMessage::AccountAdded { name } => {
+            app.push_text(format!("[daemon] account added: {name}"));
+            let _ = client_tx.send(ClientMessage::ListAccounts);
+        }
+        DaemonMessage::AccountAddFailed { name, error } => {
+            app.ai_providers.add_error = Some(format!("{name}: {error}"));
+            app.push_text(format!("[daemon] failed to add account {name}: {error}"));
+            // Stay on the new-form page so the user can see the error
+            // and fix it.
+        }
+        DaemonMessage::AccountRemoved { name } => {
+            app.push_text(format!("[daemon] account removed: {name}"));
+            app.ai_providers.remove_account(name);
+            let _ = client_tx.send(ClientMessage::ListAccounts);
+        }
+        DaemonMessage::AccountRemoveFailed { name, error } => {
+            app.push_text(format!("[daemon] failed to remove account {name}: {error}"));
+        }
+        DaemonMessage::DefaultAccountSet { name } => {
+            app.ai_providers.default_account = Some(name.clone());
+            app.push_text(format!("[daemon] default account set to: {name}"));
+            let _ = client_tx.send(ClientMessage::ListAccounts);
+        }
+        DaemonMessage::DefaultAccountSetFailed { name, error } => {
+            app.push_text(format!(
+                "[daemon] failed to set default account {name}: {error}"
+            ));
         }
         _ => {}
     }

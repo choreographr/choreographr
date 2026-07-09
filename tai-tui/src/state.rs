@@ -6,7 +6,8 @@ use tai_client_core::{
     MAX_HISTORY_ITEMS, broken_pipe,
 };
 use tai_proto::{
-    ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionStatus, SessionSummary,
+    AccountInfo, ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionStatus,
+    SessionSummary,
 };
 use tai_tui::{ImageAssembler, RenderedImage, StreamingText, build_rendered_image};
 use unicode_segmentation::UnicodeSegmentation;
@@ -37,6 +38,7 @@ pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HomeMenuItem {
     Sessions,
+    AIProviders,
     Settings,
     Exit,
 }
@@ -45,6 +47,7 @@ impl HomeMenuItem {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             HomeMenuItem::Sessions => "Sessions",
+            HomeMenuItem::AIProviders => "AI Provider Accounts",
             HomeMenuItem::Settings => "Settings",
             HomeMenuItem::Exit => "Exit",
         }
@@ -53,6 +56,7 @@ impl HomeMenuItem {
     pub(crate) fn key_hint(&self) -> &'static str {
         match self {
             HomeMenuItem::Sessions => "(s)",
+            HomeMenuItem::AIProviders => "(p)",
             HomeMenuItem::Settings => "(t)",
             HomeMenuItem::Exit => "(q)",
         }
@@ -61,6 +65,7 @@ impl HomeMenuItem {
 
 pub(crate) const HOME_MENU_ITEMS: &[HomeMenuItem] = &[
     HomeMenuItem::Sessions,
+    HomeMenuItem::AIProviders,
     HomeMenuItem::Settings,
     HomeMenuItem::Exit,
 ];
@@ -69,6 +74,7 @@ pub(crate) const HOME_MENU_ITEMS: &[HomeMenuItem] = &[
 pub(crate) enum Page {
     Chat,
     SessionManager,
+    AIProviders,
     Settings,
     Home,
 }
@@ -77,6 +83,186 @@ pub(crate) enum Page {
 pub(crate) enum SessionManagerView {
     List,
     Detail,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AIProvidersView {
+    List,
+    NewForm,
+}
+
+/// Available provider options in the new-account form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderOption {
+    OpenCodeZen,
+    OpenCodeGo,
+}
+
+impl ProviderOption {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            ProviderOption::OpenCodeZen => "opencode zen",
+            ProviderOption::OpenCodeGo => "opencode go",
+        }
+    }
+
+    /// The internal provider string sent to the daemon.
+    pub(crate) fn provider_str(&self) -> &'static str {
+        match self {
+            ProviderOption::OpenCodeZen => "opencode",
+            ProviderOption::OpenCodeGo => "opencode-go",
+        }
+    }
+}
+
+pub(crate) const PROVIDER_OPTIONS: &[ProviderOption] =
+    &[ProviderOption::OpenCodeZen, ProviderOption::OpenCodeGo];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NewAccountField {
+    Name,
+    Provider,
+    ApiKey,
+    Done,
+}
+
+/// State for the AI Provider Accounts page.
+pub(crate) struct AIProvidersState {
+    pub(crate) accounts: Vec<AccountInfo>,
+    pub(crate) view: AIProvidersView,
+    pub(crate) selection: Option<usize>,
+    pub(crate) scroll: usize,
+    pub(crate) confirm_remove: Option<String>,
+    pub(crate) default_account: Option<String>,
+    /// The name being typed in the new-account form.
+    pub(crate) new_name: InputBuffer,
+    /// Index into PROVIDER_OPTIONS for the selected provider.
+    pub(crate) new_provider_idx: usize,
+    /// The API key being typed in the new-account form.
+    pub(crate) new_api_key: InputBuffer,
+    /// Which field the cursor is on.
+    pub(crate) new_field: NewAccountField,
+    /// When set, the user is typing a credential (API key) for this account name.
+    pub(crate) credential_target: Option<String>,
+    /// Input buffer for typing a credential value.
+    pub(crate) credential_input: InputBuffer,
+    /// Whether the last add operation failed — stored here so the renderer
+    /// can show it without interfering with the history.
+    pub(crate) add_error: Option<String>,
+}
+
+impl AIProvidersState {
+    pub(crate) fn new() -> Self {
+        Self {
+            accounts: Vec::new(),
+            view: AIProvidersView::List,
+            selection: None,
+            scroll: 0,
+            confirm_remove: None,
+            default_account: None,
+            new_name: InputBuffer::new(),
+            new_provider_idx: 0,
+            new_api_key: InputBuffer::new(),
+            credential_target: None,
+            credential_input: InputBuffer::new(),
+            new_field: NewAccountField::Name,
+            add_error: None,
+        }
+    }
+
+    pub(crate) fn set_accounts(&mut self, accounts: Vec<AccountInfo>) {
+        let was_selected = self
+            .selection
+            .and_then(|i| self.accounts.get(i))
+            .map(|a| a.name.clone());
+        self.accounts = accounts;
+        self.selection = if self.accounts.is_empty() {
+            None
+        } else {
+            let idx = was_selected
+                .and_then(|name| self.accounts.iter().position(|a| a.name == name))
+                .unwrap_or(0);
+            Some(idx)
+        };
+        self.scroll = 0;
+    }
+
+    pub(crate) fn select_up(&mut self) {
+        let sel = self.selection.unwrap_or(0);
+        if sel > 0 {
+            self.selection = Some(sel - 1);
+            if sel - 1 < self.scroll {
+                self.scroll = self.scroll.saturating_sub(1);
+            }
+        }
+    }
+
+    pub(crate) fn select_down(&mut self) {
+        let max = self.accounts.len().saturating_sub(1);
+        let sel = self.selection.unwrap_or(0);
+        if sel < max {
+            self.selection = Some(sel + 1);
+        }
+    }
+
+    pub(crate) fn remove_account(&mut self, name: &str) {
+        let old_len = self.accounts.len();
+        self.accounts.retain(|a| a.name != name);
+        if self.accounts.len() == old_len {
+            return;
+        }
+        // Adjust selection
+        if let Some(sel) = self.selection
+            && sel >= self.accounts.len()
+        {
+            self.selection = if self.accounts.is_empty() {
+                None
+            } else {
+                Some(self.accounts.len().saturating_sub(1))
+            };
+        }
+        // Clamp scroll
+        let max_scroll = self.accounts.len().saturating_sub(1);
+        self.scroll = self.scroll.min(max_scroll);
+        // Clear confirmation
+        if self.confirm_remove.as_deref() == Some(name) {
+            self.confirm_remove = None;
+        }
+    }
+
+    /// Enter the new-account form and reset all form fields.
+    pub(crate) fn enter_new_form(&mut self) {
+        self.view = AIProvidersView::NewForm;
+        self.new_name = InputBuffer::new();
+        self.new_provider_idx = 0;
+        self.new_api_key = InputBuffer::new();
+        self.new_field = NewAccountField::Name;
+        self.add_error = None;
+    }
+
+    /// Enter credential-input mode for a specific account.
+    pub(crate) fn enter_credential(&mut self, account_name: String) {
+        self.credential_target = Some(account_name);
+        self.credential_input = InputBuffer::new();
+        self.add_error = None;
+    }
+
+    /// Leave credential-input mode.
+    pub(crate) fn leave_credential(&mut self) {
+        self.credential_target = None;
+        self.credential_input = InputBuffer::new();
+        self.add_error = None;
+    }
+
+    /// Leave the new-account form back to the list view.
+    pub(crate) fn leave_new_form(&mut self) {
+        self.view = AIProvidersView::List;
+        self.new_name = InputBuffer::new();
+        self.new_provider_idx = 0;
+        self.new_api_key = InputBuffer::new();
+        self.new_field = NewAccountField::Name;
+        self.add_error = None;
+    }
 }
 
 pub(crate) struct SessionDetailData {
@@ -132,6 +318,7 @@ pub(crate) struct App {
     pub(crate) previous_page: Page,
     pub(crate) home_selection: usize, // index into HOME_MENU_ITEMS
     pub(crate) session_mgr: SessionManagerState,
+    pub(crate) ai_providers: AIProvidersState,
     /// Accumulated scroll-wheel delta consumed each frame.
     ///
     /// Mouse scroll events increment/decrement this counter instead of
@@ -468,6 +655,7 @@ impl InputBuffer {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
@@ -717,6 +905,7 @@ impl App {
             previous_page: Page::Chat,
             home_selection: 0,
             session_mgr: SessionManagerState::new(),
+            ai_providers: AIProvidersState::new(),
             scroll_accumulator: 0,
             command_history,
             history_index: None,
@@ -1161,6 +1350,14 @@ impl App {
 
     /// Handle `Sessions`: update the session list, show summaries on the
     /// chat page, and auto-attach or auto-create when no session is attached.
+    pub(crate) fn handle_accounts(&mut self, accounts: &[AccountInfo]) {
+        self.ai_providers.set_accounts(accounts.to_vec());
+        // Update default_account from the accounts list if not set
+        if self.ai_providers.default_account.is_none() && !accounts.is_empty() {
+            // Default is the first one (daemon sorts alphabetically)
+        }
+    }
+
     pub(crate) fn handle_sessions(
         &mut self,
         sessions: &[SessionSummary],

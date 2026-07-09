@@ -27,7 +27,7 @@ impl InferenceProvider {
         api_key: Option<String>,
     ) -> Result<Self, String> {
         match config.provider.as_str() {
-            "openai" | "openai_compatible" => {
+            "openai" | "openai_compatible" | "opencode" | "opencode-go" => {
                 let mut svc_config = crate::openai::load_service_config().unwrap_or_default();
                 config.apply_overrides(&mut svc_config);
                 let key = api_key.ok_or_else(|| "no API key for OpenAI provider".to_string())?;

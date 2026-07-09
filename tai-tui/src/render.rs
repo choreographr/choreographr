@@ -2,9 +2,10 @@ use crate::diff_render::build_diff_panes;
 use crate::markdown_render::{
     display_width, lines_height, session_message_lines, streaming_text_lines,
 };
+use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache, SessionManagerView,
-    history_text_height,
+    AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT, NewAccountField, Page,
+    RenderedCache, SessionManagerView, history_text_height,
 };
 use ratatui::{
     Frame,
@@ -37,6 +38,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     match app.page {
         Page::Chat => render_chat(frame, app),
         Page::SessionManager => render_session_manager(frame, app),
+        Page::AIProviders => render_ai_providers(frame, app),
         Page::Settings => render_settings(frame, app),
         Page::Home => render_home(frame, app),
     }
@@ -93,7 +95,7 @@ fn render_home(frame: &mut Frame<'_>, app: &mut App) {
 
     // ── Footer help bar ─────────────────────────────────────────
     let status = Paragraph::new(Line::from(
-        " <j/k nav>  <Enter select>  <s sessions>  <t settings>  <q quit>  <Esc back>",
+        " <j/k nav>  <Enter select>  <s sessions>  <p ai providers>  <t settings>  <q quit>  <Esc back>",
     ));
     frame.render_widget(status, chunks[1]);
 }
@@ -690,6 +692,297 @@ fn format_timestamp(ts: i64) -> String {
     };
 
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+// ── AI Provider Accounts ──────────────────────────────────
+
+fn render_ai_providers(frame: &mut Frame<'_>, app: &mut App) {
+    // If credential input is active, render that instead of the normal view.
+    if app.ai_providers.credential_target.is_some() {
+        render_ai_providers_credential(frame, app);
+        return;
+    }
+    match app.ai_providers.view {
+        AIProvidersView::List => render_ai_providers_list(frame, app),
+        AIProvidersView::NewForm => render_ai_providers_new_form(frame, app),
+    }
+}
+
+fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let block = Block::default()
+        .title(" AI Provider Accounts ")
+        .borders(Borders::ALL);
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
+
+    let scroll = app.ai_providers.scroll;
+    let max_rows = inner.height as usize;
+
+    if app.ai_providers.accounts.is_empty() {
+        let msg = Paragraph::new("No AI provider accounts configured. Press 'n' to add one.");
+        frame.render_widget(msg, inner);
+    } else {
+        let mut lines: Vec<Line> = Vec::new();
+        let default_name = app.ai_providers.default_account.as_deref();
+
+        for i in scroll..app.ai_providers.accounts.len() {
+            // Each account takes 2 lines (name line + provider line).
+            // If we would exceed the available rows, stop.
+            if lines.len() + 2 > max_rows && i != scroll {
+                break;
+            }
+            let account = &app.ai_providers.accounts[i];
+            let is_selected = Some(i) == app.ai_providers.selection;
+            let is_default = default_name == Some(account.name.as_str());
+
+            let sel = if is_selected { ">" } else { " " };
+            let default_label = if is_default { "*default" } else { "" };
+
+            let style = if is_selected {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default()
+            };
+
+            // Line 1: name + default badge
+            let name_line = if default_label.is_empty() {
+                format!("{sel} {} ", account.name)
+            } else {
+                format!("{sel} {}   {default_label}", account.name)
+            };
+            let name_spans = vec![ratatui::text::Span::styled(name_line, style)];
+            lines.push(Line::from(name_spans));
+
+            // Line 2: provider (indented, dimmer style)
+            let provider_label = format!("   Provider: {}", account.provider);
+            let provider_style = if is_selected {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(Line::from(vec![ratatui::text::Span::styled(
+                provider_label,
+                provider_style,
+            )]));
+
+            // Blank line separator between cards (but not after the last one)
+            if lines.len() < max_rows && i + 1 < app.ai_providers.accounts.len() {
+                lines.push(Line::from(Span::styled(String::new(), Style::default())));
+            }
+        }
+
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
+    }
+
+    let status = if let Some(ref name) = app.ai_providers.confirm_remove {
+        Paragraph::new(Line::from(format!(" Remove \"{name}\"? (y/N)  ")))
+    } else {
+        Paragraph::new(Line::from(format!(
+            " <j/k nav>  <d default>  <r remove>  <c credential>  <n new>  <Esc back>  —  {} accounts",
+            app.ai_providers.accounts.len()
+        )))
+    };
+    frame.render_widget(status, chunks[1]);
+}
+
+/// Render the credential-input overlay for setting an API key on an account.
+fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let account_name = app
+        .ai_providers
+        .credential_target
+        .as_deref()
+        .unwrap_or("(unknown)");
+
+    let block = Block::default()
+        .title(format!(" API Key for \"{account_name}\" "))
+        .borders(Borders::ALL);
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let input_style = Style::default().fg(Color::Cyan);
+
+    lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    lines.push(Line::from(Span::styled(
+        "  Paste the API key for this account:",
+        dim,
+    )));
+    lines.push(Line::from(Span::styled(String::new(), Style::default())));
+
+    let text = app.ai_providers.credential_input.text.clone();
+    // Mask the key: show first 4 + last 4 if long enough
+    let masked = if text.len() > 12 {
+        format!("{}...{}", &text[..4], &text[text.len().saturating_sub(4)..])
+    } else if text.is_empty() {
+        String::new()
+    } else {
+        "••••••••".to_string()
+    };
+    let caret = if text.is_empty() { "█" } else { "" };
+    let display = if text.is_empty() {
+        format!("> {caret}")
+    } else {
+        format!("> {masked}")
+    };
+    lines.push(Line::from(Span::styled(display, input_style)));
+    lines.push(Line::from(Span::styled(String::new(), Style::default())));
+
+    if let Some(ref err) = app.ai_providers.add_error {
+        lines.push(Line::from(Span::styled(
+            format!("  Error: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+
+    let status = Paragraph::new(Line::from(" <Enter save>  <Esc cancel>"));
+    frame.render_widget(status, chunks[1]);
+}
+
+fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let block = Block::default()
+        .title(" New AI Provider Account ")
+        .borders(Borders::ALL);
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
+
+    // Calculate vertical centering for the form fields
+    let form_field_count = 3; // Name, Provider (with dropdown), instruction
+    let form_height = form_field_count * 2 + PROVIDER_OPTIONS.len() + 3;
+    let top_pad = (inner.height as usize).saturating_sub(form_height) / 2;
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Top padding
+    for _ in 0..top_pad {
+        lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    }
+
+    let bright = Style::default().fg(Color::White).bold();
+    let dim = Style::default().fg(Color::DarkGray);
+    let input_style = Style::default().fg(Color::Cyan);
+    let selected_bg = Style::default().bg(Color::Blue).fg(Color::White);
+
+    // ── Name field ────────────────────────────────────────────
+    let is_name_active = app.ai_providers.new_field == NewAccountField::Name;
+    let label_style = if is_name_active { bright } else { dim };
+    lines.push(Line::from(Span::styled("  Name:", label_style)));
+    let prefix = if is_name_active { "> " } else { "  " };
+    let text = app.ai_providers.new_name.text.clone();
+    let caret = if is_name_active && text.is_empty() {
+        "█"
+    } else {
+        ""
+    };
+    let display = if text.is_empty() {
+        format!("{prefix}{caret}")
+    } else {
+        format!("{prefix}{text}")
+    };
+    lines.push(Line::from(Span::styled(
+        display,
+        if is_name_active { input_style } else { dim },
+    )));
+    lines.push(Line::from(Span::styled(String::new(), Style::default())));
+
+    // ── Provider dropdown ─────────────────────────────────────
+    let is_provider_active = app.ai_providers.new_field == NewAccountField::Provider;
+    let label_style = if is_provider_active { bright } else { dim };
+    lines.push(Line::from(Span::styled("  Provider:", label_style)));
+    for (i, option) in PROVIDER_OPTIONS.iter().enumerate() {
+        let is_selected = i == app.ai_providers.new_provider_idx;
+        let bullet = if is_selected { "◉" } else { "○" };
+        let row_style = if is_provider_active && is_selected {
+            selected_bg
+        } else if is_provider_active {
+            dim
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("    {bullet} {}", option.label()),
+            row_style,
+        )));
+    }
+    lines.push(Line::from(Span::styled(String::new(), Style::default())));
+
+    // ── API Key field ─────────────────────────────────────────
+    let is_key_active = app.ai_providers.new_field == NewAccountField::ApiKey;
+    let label_style = if is_key_active { bright } else { dim };
+    lines.push(Line::from(Span::styled("  API Key:", label_style)));
+    let prefix = if is_key_active { "> " } else { "  " };
+    let key_text = app.ai_providers.new_api_key.text.clone();
+    // Mask the key when displayed; show first 4 + last 4 if long enough
+    let masked = if key_text.len() > 12 {
+        format!(
+            "{}...{}",
+            &key_text[..4],
+            &key_text[key_text.len().saturating_sub(4)..]
+        )
+    } else if key_text.is_empty() {
+        String::new()
+    } else {
+        "••••••••".to_string()
+    };
+    let caret = if is_key_active && key_text.is_empty() {
+        "█"
+    } else {
+        ""
+    };
+    let display = if key_text.is_empty() {
+        format!("{prefix}{caret}")
+    } else {
+        format!("{prefix}{masked}")
+    };
+    lines.push(Line::from(Span::styled(
+        display,
+        if is_key_active { input_style } else { dim },
+    )));
+    lines.push(Line::from(Span::styled(String::new(), Style::default())));
+
+    // ── Done / Cancel instruction ─────────────────────────────
+    lines.push(Line::from(Span::styled(
+        "  Press Enter to advance, j/k to change provider, Esc to cancel",
+        dim,
+    )));
+
+    // ── Error message ─────────────────────────────────────────
+    if let Some(ref err) = app.ai_providers.add_error {
+        lines.push(Line::from(Span::styled(
+            format!("  Error: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
+
+    // Footer
+    let status = Paragraph::new(Line::from(" <Enter next>  <j/k provider>  <Esc cancel>"));
+    frame.render_widget(status, chunks[1]);
 }
 
 pub(crate) fn format_status(status: &SessionStatus) -> String {

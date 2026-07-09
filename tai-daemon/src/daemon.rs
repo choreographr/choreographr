@@ -446,6 +446,19 @@ impl DaemonState {
                     request_timeout_secs,
                 };
                 let result = self.accounts.add(config);
+                match &result {
+                    Ok(()) => info!(
+                        account = %name,
+                        provider = %provider,
+                        "added inference account"
+                    ),
+                    Err(e) => error!(
+                        account = %name,
+                        provider = %provider,
+                        error = %e,
+                        "failed to add inference account"
+                    ),
+                }
                 // If account was added and there's a matching credential,
                 // resolve the provider immediately.
                 if result.is_ok()
@@ -457,6 +470,12 @@ impl DaemonState {
             }
             DaemonCommand::RemoveAccountCmd { name, reply } => {
                 let result = self.accounts.remove(&name);
+                match &result {
+                    Ok(()) => info!(account = %name, "removed inference account"),
+                    Err(e) => {
+                        error!(account = %name, error = %e, "failed to remove inference account")
+                    }
+                }
                 if result.is_ok() {
                     self.providers.remove(&name);
                     if self.default_account.as_deref() == Some(&name) {
@@ -470,9 +489,16 @@ impl DaemonState {
             }
             DaemonCommand::SetDefaultAccountCmd { name, reply } => {
                 if self.accounts.contains(&name) {
+                    let prev = self.default_account.clone();
                     self.default_account = Some(name.clone());
+                    info!(
+                        account = %name,
+                        previous = prev.as_deref().unwrap_or("(none)"),
+                        "set default inference account"
+                    );
                     let _ = reply.send(Ok(()));
                 } else {
+                    error!(account = %name, "cannot set default: account not found");
                     let _ = reply.send(Err(format!("account '{name}' not found")));
                 }
             }
