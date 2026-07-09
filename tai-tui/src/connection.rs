@@ -1,5 +1,8 @@
 use crate::render::{mouse_in_history_box, render};
-use crate::state::{App, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent};
+use crate::state::{
+    App, HOME_MENU_ITEMS, HomeMenuItem, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView,
+    UiEvent,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use signal_hook::consts::SIGINT;
@@ -13,6 +16,7 @@ use tai_client_core::{
     ClientError, broken_pipe, build_add_credential_message, dispatch_daemon_message,
     resolve_private_key, run_daemon_connection, shell_command_echo,
 };
+use tai_keystore::ensure_keypair;
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
 
@@ -20,6 +24,14 @@ const UI_EVENT_CHANNEL_SIZE: usize = 4096;
 const UI_FRAME_POLL_MS: u64 = 16;
 
 pub(crate) fn run_app() -> io::Result<()> {
+    // Ensure the keystore keypair exists before we try to connect to the
+    // daemon.  If no keypair has been generated yet, this creates one on the
+    // fly so the client can unlock the daemon without requiring a manual
+    // setup step.
+    if let Err(e) = ensure_keypair() {
+        tracing::error!("[tai-tui] failed to ensure keystore keypair: {e}");
+    }
+
     let socket_path = socket_path();
     let app_socket_path = socket_path.clone();
     let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
@@ -161,7 +173,92 @@ pub(crate) fn handle_terminal_event(
     match app.page {
         Page::SessionManager => handle_session_manager_event(event, app, client_tx),
         Page::Chat => handle_chat_event(event, app, client_tx),
+        Page::Settings => handle_settings_event(event, app, client_tx),
+        Page::Home => handle_home_event(event, app, client_tx),
     }
+}
+
+fn handle_home_event(
+    event: Event,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Event::Key(key) = event else {
+        return Ok(());
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+    match key.code {
+        // Esc returns to the previous page the user was on.
+        KeyCode::Esc => {
+            app.page = app.previous_page;
+        }
+        // Navigate menu with j/k or Up/Down
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.home_selection > 0 {
+                app.home_selection -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.home_selection < HOME_MENU_ITEMS.len() - 1 {
+                app.home_selection += 1;
+            }
+        }
+        // Select a menu item
+        KeyCode::Enter => match HOME_MENU_ITEMS[app.home_selection] {
+            HomeMenuItem::Sessions => {
+                app.page = Page::SessionManager;
+                let _ = client_tx.send(ClientMessage::ListSessions);
+                let _ = client_tx.send(ClientMessage::SubscribeSessionsSummary);
+            }
+            HomeMenuItem::Settings => {
+                app.page = Page::Settings;
+            }
+            HomeMenuItem::Exit => {
+                app.should_quit = true;
+            }
+        },
+        // Letter shortcuts for each menu item
+        KeyCode::Char('s') => {
+            app.page = Page::SessionManager;
+            let _ = client_tx.send(ClientMessage::ListSessions);
+            let _ = client_tx.send(ClientMessage::SubscribeSessionsSummary);
+        }
+        KeyCode::Char('t') => {
+            app.page = Page::Settings;
+        }
+        KeyCode::Char('q') => {
+            app.should_quit = true;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_settings_event(
+    event: Event,
+    app: &mut App,
+    _client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Event::Key(key) = event else {
+        return Ok(());
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+    match key.code {
+        // Ctrl+C quits from the settings page
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        // Esc returns to the home page
+        KeyCode::Esc => {
+            app.page = Page::Home;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn handle_chat_event(
@@ -185,10 +282,14 @@ fn handle_chat_event(
                         .map_err(broken_pipe)?;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.should_quit = true;
+                    app.page = Page::Settings;
                 }
-                KeyCode::Char('q') if app.input.is_empty() => app.should_quit = true,
-                KeyCode::Esc => app.should_quit = true,
+                KeyCode::Esc => {
+                    // Save where we came from so Home can return to Chat.
+                    app.previous_page = Page::Chat;
+                    app.home_selection = 0;
+                    app.page = Page::Home;
+                }
                 KeyCode::Up => {
                     app.navigate_history_up();
                 }
@@ -387,7 +488,9 @@ fn handle_session_list_key(
             }
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.page = Page::Chat;
+            app.previous_page = Page::SessionManager;
+            app.home_selection = 0;
+            app.page = Page::Home;
             let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
         }
         _ => {}

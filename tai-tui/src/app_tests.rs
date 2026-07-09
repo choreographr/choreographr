@@ -274,34 +274,23 @@ fn terminal_event_submits_run_input() {
 }
 
 #[test]
-fn terminal_event_quits_only_when_input_empty() {
+fn terminal_event_esc_opens_home() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .expect("handle q");
-    assert!(app.should_quit);
+    .expect("handle esc");
 
-    let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
-    app.input.text = "q".to_string();
-    app.input.cursor = 1;
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("handle q");
-    assert!(!app.should_quit);
-    assert_eq!(app.input.text, "qq");
-    assert_eq!(app.input.cursor, 2);
+    assert_eq!(app.page, Page::Home);
+    assert_eq!(app.previous_page, Page::Chat);
 }
 
 #[test]
-fn terminal_event_ctrl_c_quits() {
+fn terminal_event_ctrl_c_opens_settings() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = App::new("/tmp/tai.sock".to_string(), "Kitty".to_string());
 
@@ -312,7 +301,7 @@ fn terminal_event_ctrl_c_quits() {
     )
     .expect("handle ctrl+c");
 
-    assert!(app.should_quit);
+    assert_eq!(app.page, Page::Settings);
 }
 
 // ── Cursor & editing tests ────────────────────────────────────
@@ -1126,7 +1115,7 @@ mod session_manager_key_tests {
     }
 
     #[test]
-    fn session_manager_esc_returns_to_chat() {
+    fn session_manager_esc_returns_to_home() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
 
@@ -1137,11 +1126,12 @@ mod session_manager_key_tests {
         )
         .expect("handle esc");
 
-        assert_eq!(app.page, Page::Chat);
+        assert_eq!(app.page, Page::Home);
+        assert_eq!(app.previous_page, Page::SessionManager);
     }
 
     #[test]
-    fn session_manager_q_returns_to_chat() {
+    fn session_manager_q_returns_to_home() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
 
@@ -1152,7 +1142,8 @@ mod session_manager_key_tests {
         )
         .expect("handle q");
 
-        assert_eq!(app.page, Page::Chat);
+        assert_eq!(app.page, Page::Home);
+        assert_eq!(app.previous_page, Page::SessionManager);
     }
 
     #[test]

@@ -308,7 +308,14 @@ pub fn get_all_credential_blobs(
     db: &redb::Database,
 ) -> Result<HashMap<String, Vec<u8>>, redb::Error> {
     let read_txn = db.begin_read()?;
-    let table = read_txn.open_table(CREDENTIALS)?;
+    // The credentials table may not exist yet (no credentials have ever been
+    // saved).  Return an empty map instead of propagating the error so that
+    // unlock can proceed without credentials.
+    let table = match read_txn.open_table(CREDENTIALS) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+        Err(e) => return Err(e.into()),
+    };
     let mut map = HashMap::new();
     for result in table.iter()? {
         let (key, value) = result?;

@@ -3,12 +3,12 @@ use crate::markdown_render::{
     display_width, lines_height, session_message_lines, streaming_text_lines,
 };
 use crate::state::{
-    App, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache, SessionManagerView,
+    App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache, SessionManagerView,
     history_text_height,
 };
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -37,7 +37,65 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     match app.page {
         Page::Chat => render_chat(frame, app),
         Page::SessionManager => render_session_manager(frame, app),
+        Page::Settings => render_settings(frame, app),
+        Page::Home => render_home(frame, app),
     }
+}
+
+fn render_settings(frame: &mut Frame<'_>, _app: &mut App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let block = Block::default().title(" Settings ").borders(Borders::ALL);
+    frame.render_widget(block, chunks[0]);
+
+    let status = Paragraph::new(Line::from(" <Esc home>  <Ctrl+C quit>"));
+    frame.render_widget(status, chunks[1]);
+}
+
+/// Render the Home page with the Tai logo and a menu.
+fn render_home(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(12),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(area);
+
+    // ── Menu ────────────────────────────────────────────────────
+    let menu_area = chunks[0];
+    let menu_items: Vec<Line> = HOME_MENU_ITEMS
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let is_selected = i == app.home_selection;
+            let prefix = if is_selected { " > " } else { "   " };
+            let label = item.label();
+            let hint = item.key_hint();
+            let text = format!("{prefix}{label} {hint}");
+            let style = if is_selected {
+                Style::default().fg(Color::Yellow).bold()
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(Span::styled(text, style))
+        })
+        .collect();
+
+    let menu = Paragraph::new(menu_items).alignment(Alignment::Center);
+    frame.render_widget(menu, menu_area);
+
+    // ── Footer help bar ─────────────────────────────────────────
+    let status = Paragraph::new(Line::from(
+        " <j/k nav>  <Enter select>  <s sessions>  <t settings>  <q quit>  <Esc back>",
+    ));
+    frame.render_widget(status, chunks[1]);
 }
 
 fn render_chat(frame: &mut Frame<'_>, app: &mut App) {

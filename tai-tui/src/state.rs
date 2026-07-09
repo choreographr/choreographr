@@ -33,10 +33,44 @@ fn try_parse_as_diff(text: &str) -> Option<Vec<FileDiff>> {
 pub(crate) const INPUT_BAR_HEIGHT: u16 = 3;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
+/// A menu item on the Home page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HomeMenuItem {
+    Sessions,
+    Settings,
+    Exit,
+}
+
+impl HomeMenuItem {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            HomeMenuItem::Sessions => "Sessions",
+            HomeMenuItem::Settings => "Settings",
+            HomeMenuItem::Exit => "Exit",
+        }
+    }
+
+    pub(crate) fn key_hint(&self) -> &'static str {
+        match self {
+            HomeMenuItem::Sessions => "(s)",
+            HomeMenuItem::Settings => "(t)",
+            HomeMenuItem::Exit => "(q)",
+        }
+    }
+}
+
+pub(crate) const HOME_MENU_ITEMS: &[HomeMenuItem] = &[
+    HomeMenuItem::Sessions,
+    HomeMenuItem::Settings,
+    HomeMenuItem::Exit,
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Page {
     Chat,
     SessionManager,
+    Settings,
+    Home,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +127,10 @@ pub(crate) struct App {
     pub(crate) picker: Option<ratatui_image::picker::Picker>,
     pub(crate) attached_session_id: Option<u64>,
     pub(crate) page: Page,
+    /// The page the user was on before opening the Home menu.  `Esc` on the
+    /// Home page returns to this page.
+    pub(crate) previous_page: Page,
+    pub(crate) home_selection: usize, // index into HOME_MENU_ITEMS
     pub(crate) session_mgr: SessionManagerState,
     /// Accumulated scroll-wheel delta consumed each frame.
     ///
@@ -676,6 +714,8 @@ impl App {
             picker: None,
             attached_session_id: None,
             page: Page::Chat,
+            previous_page: Page::Chat,
+            home_selection: 0,
             session_mgr: SessionManagerState::new(),
             scroll_accumulator: 0,
             command_history,

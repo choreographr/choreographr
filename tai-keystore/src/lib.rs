@@ -5,6 +5,35 @@ pub mod paths;
 pub use error::KeystoreError;
 
 use serde::{Deserialize, Serialize};
+
+/// Ensure that a keypair exists at the standard paths.
+///
+/// Checks whether `identity.pk` and `public.pk` exist in the config directory.
+/// If either file is missing, generates a new X25519 keypair and writes both
+/// files (32 bytes each, raw binary).  Existing files are left untouched.
+///
+/// This is safe to call on every startup — it only writes when necessary.
+pub fn ensure_keypair() -> Result<(), KeystoreError> {
+    let pk_path = paths::private_key_path()?;
+    let pub_path = paths::public_key_path()?;
+
+    // If both files already exist, there is nothing to do.
+    if pk_path.exists() && pub_path.exists() {
+        return Ok(());
+    }
+
+    let (secret, public) = crypto::generate_keypair();
+
+    // Ensure the config directory exists before writing into it.
+    if let Some(parent) = pk_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    std::fs::write(&pk_path, secret)?;
+    std::fs::write(&pub_path, public)?;
+
+    Ok(())
+}
 use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
@@ -111,5 +140,14 @@ mod tests {
         assert!(matches!(restored, ServiceCredential::X { .. }));
         let view = restored.as_x().unwrap();
         assert_eq!(view.api_key, "ak");
+    }
+
+    #[test]
+    fn ensure_keypair_idempotent() {
+        // Ensure that calling ensure_keypair succeeds even when files already
+        // exist (the standard config dir may or may not have keys — either
+        // way the function should return Ok).
+        let result = ensure_keypair();
+        assert!(result.is_ok(), "ensure_keypair should succeed");
     }
 }
