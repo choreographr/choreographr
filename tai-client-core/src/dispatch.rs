@@ -92,7 +92,11 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             }
             handler.push_text(format!("[daemon]   {} messages", messages.len()));
             for message in messages {
-                handler.push_session_message(message);
+                // SystemText messages carry the system prompt and agent
+                // instructions intended for the LLM, not for display.
+                if !matches!(message, SessionMessage::SystemText { .. }) {
+                    handler.push_session_message(message);
+                }
             }
             Ok(None)
         }
@@ -326,5 +330,1106 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
         }
 
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use tai_proto::{
+        AccountInfo, ImageMetadata, OutputStream, SessionMessage, SessionStatus, SessionSummary,
+    };
+
+    /// A test handler that records every method call in a VecDeque of events.
+    struct TestHandler {
+        events: VecDeque<TestEvent>,
+        /// Returned by `handle_image_start`, controlled for error-testing.
+        image_start_result: Result<(), ClientError>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum TestEvent {
+        PushText(String),
+        PushSessionMessage(SessionMessage),
+        InsertSessionMessageBeforeStream(u32, SessionMessage),
+        BeginStream(u32),
+        AppendStream(u32, OutputStream, String),
+        FinalizeStream(u32),
+        HandleImageStart(u32, ImageMetadata),
+        HandleImageChunk(u32, u32, Vec<u8>),
+        HandleImageEnd(u32, u32),
+    }
+
+    impl TestHandler {
+        fn new() -> Self {
+            Self {
+                events: VecDeque::new(),
+                image_start_result: Ok(()),
+            }
+        }
+
+        fn collect_events(&mut self) -> Vec<TestEvent> {
+            self.events.drain(..).collect()
+        }
+    }
+
+    impl DaemonMessageHandler for TestHandler {
+        fn push_text(&mut self, text: String) {
+            self.events.push_back(TestEvent::PushText(text));
+        }
+        fn push_session_message(&mut self, message: SessionMessage) {
+            self.events
+                .push_back(TestEvent::PushSessionMessage(message));
+        }
+        fn insert_session_message_before_stream(
+            &mut self,
+            request_id: u32,
+            message: SessionMessage,
+        ) {
+            self.events
+                .push_back(TestEvent::InsertSessionMessageBeforeStream(
+                    request_id, message,
+                ));
+        }
+        fn begin_stream(&mut self, request_id: u32) {
+            self.events.push_back(TestEvent::BeginStream(request_id));
+        }
+        fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
+            self.events.push_back(TestEvent::AppendStream(
+                request_id,
+                stream,
+                chunk.to_string(),
+            ));
+        }
+        fn finalize_stream(&mut self, request_id: u32) {
+            self.events.push_back(TestEvent::FinalizeStream(request_id));
+        }
+        fn handle_image_start(
+            &mut self,
+            request_id: u32,
+            metadata: ImageMetadata,
+        ) -> Result<(), ClientError> {
+            self.events
+                .push_back(TestEvent::HandleImageStart(request_id, metadata));
+            // Take the stored result and reset to Ok for subsequent calls,
+            // so the error is only returned once.
+            std::mem::replace(&mut self.image_start_result, Ok(()))
+        }
+        fn handle_image_chunk(
+            &mut self,
+            request_id: u32,
+            image_id: u32,
+            data: &[u8],
+        ) -> Result<(), ClientError> {
+            self.events.push_back(TestEvent::HandleImageChunk(
+                request_id,
+                image_id,
+                data.to_vec(),
+            ));
+            Ok(())
+        }
+        fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError> {
+            self.events
+                .push_back(TestEvent::HandleImageEnd(request_id, image_id));
+            Ok(())
+        }
+    }
+
+    // ── Helper factories ────────────────────────────────────────────────
+
+    fn sample_image_metadata() -> ImageMetadata {
+        ImageMetadata {
+            image_id: 1,
+            mime_type: "image/png".into(),
+            width: 100,
+            height: 50,
+            byte_len: 4096,
+            alt: Some("sample".into()),
+        }
+    }
+
+    // ── SessionState: SystemText filtering ───────────────────────────────
+
+    #[test]
+    fn session_state_filters_system_text() {
+        let mut h = TestHandler::new();
+        let messages = vec![
+            SessionMessage::SystemText {
+                content: "system prompt".into(),
+            },
+            SessionMessage::UserText {
+                content: "hello".into(),
+            },
+        ];
+        let msg = DaemonMessage::SessionState {
+            session_id: 1,
+            title: Some("test".into()),
+            selected_model: None,
+            parent_session_id: None,
+            cwd: None,
+            max_turns: None,
+            messages,
+            active_tool_groups: vec![],
+        };
+        dispatch_daemon_message(&mut h, msg).unwrap();
+
+        let events = h.collect_events();
+        // Should contain intro text lines plus exactly one push_session_message (UserText).
+        let pushed: Vec<&TestEvent> = events
+            .iter()
+            .filter(|e| matches!(e, TestEvent::PushSessionMessage(_)))
+            .collect();
+        assert_eq!(pushed.len(), 1, "SystemText must be filtered out");
+        if let TestEvent::PushSessionMessage(SessionMessage::UserText { content }) = &pushed[0] {
+            assert_eq!(content, "hello");
+        } else {
+            panic!("expected UserText, got {:#?}", pushed[0]);
+        }
+    }
+
+    #[test]
+    fn session_state_passes_non_system_messages() {
+        let mut h = TestHandler::new();
+        let messages = vec![
+            SessionMessage::UserText {
+                content: "user msg".into(),
+            },
+            SessionMessage::AssistantText {
+                content: "assistant msg".into(),
+                reasoning: None,
+            },
+            SessionMessage::ToolResult {
+                call_id: "c1".into(),
+                name: "ls".into(),
+                content: "file.txt".into(),
+                is_error: false,
+            },
+        ];
+        let msg = DaemonMessage::SessionState {
+            session_id: 1,
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            cwd: None,
+            max_turns: None,
+            messages,
+            active_tool_groups: vec![],
+        };
+        dispatch_daemon_message(&mut h, msg).unwrap();
+
+        let events = h.collect_events();
+        let pushed: Vec<&TestEvent> = events
+            .iter()
+            .filter(|e| matches!(e, TestEvent::PushSessionMessage(_)))
+            .collect();
+        assert_eq!(
+            pushed.len(),
+            3,
+            "all non-SystemText messages must pass through"
+        );
+    }
+
+    #[test]
+    fn session_state_empty_messages_is_ok() {
+        let mut h = TestHandler::new();
+        let msg = DaemonMessage::SessionState {
+            session_id: 1,
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            cwd: None,
+            max_turns: None,
+            messages: vec![],
+            active_tool_groups: vec![],
+        };
+        dispatch_daemon_message(&mut h, msg).unwrap();
+        let events = h.collect_events();
+        let pushed: Vec<&TestEvent> = events
+            .iter()
+            .filter(|e| matches!(e, TestEvent::PushSessionMessage(_)))
+            .collect();
+        assert!(pushed.is_empty(), "no messages → no pushes");
+    }
+
+    #[test]
+    fn session_state_show_info_lines() {
+        let mut h = TestHandler::new();
+        let msg = DaemonMessage::SessionState {
+            session_id: 42,
+            title: Some("work".into()),
+            selected_model: Some("gpt-4".into()),
+            parent_session_id: Some(7),
+            cwd: Some("/home".into()),
+            max_turns: Some(10),
+            messages: vec![],
+            active_tool_groups: vec![],
+        };
+        dispatch_daemon_message(&mut h, msg).unwrap();
+        let events = h.collect_events();
+        // Expect: session title, model, parent, cwd, max-turns, count
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("session 42")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("gpt-4")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("7")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("/home")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("10")))
+        );
+    }
+
+    // ── SessionCreated ───────────────────────────────────────────────────
+
+    #[test]
+    fn session_created_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::SessionCreated {
+                session_id: 5,
+                title: Some("new-session".into()),
+                parent_session_id: None,
+                cwd: None,
+                max_turns: None,
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("created session 5")))
+        );
+    }
+
+    // ── Sessions ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn sessions_empty_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::Sessions { sessions: vec![] }).unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("no sessions")))
+        );
+    }
+
+    #[test]
+    fn sessions_non_empty_lists_them() {
+        let mut h = TestHandler::new();
+        let sessions = vec![SessionSummary {
+            session_id: 1,
+            title: Some("first".into()),
+            selected_model: Some("gpt-4".into()),
+            parent_session_id: None,
+            cwd: None,
+            created_at: 0,
+            message_count: 5,
+            max_turns: None,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: None,
+        }];
+        dispatch_daemon_message(&mut h, DaemonMessage::Sessions { sessions }).unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("sessions (1)")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("first")))
+        );
+    }
+
+    // ── SessionAttached ──────────────────────────────────────────────────
+
+    #[test]
+    fn session_attached_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::SessionAttached { session_id: 3 }).unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("attached session: 3")))
+        );
+    }
+
+    // ── SessionStatusChanged ─────────────────────────────────────────────
+
+    #[test]
+    fn session_status_changed_is_noop() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::SessionStatusChanged {
+                session_id: 1,
+                status: SessionStatus::Inference,
+            },
+        )
+        .unwrap();
+        assert!(h.collect_events().is_empty());
+    }
+
+    // ── SessionFailed ────────────────────────────────────────────────────
+
+    #[test]
+    fn session_failed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::SessionFailed {
+                operation: "create".into(),
+                error: "timeout".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, TestEvent::PushText(t) if t.contains("create failed: timeout"))
+            )
+        );
+    }
+
+    // ── SessionMessageAppended ───────────────────────────────────────────
+
+    #[test]
+    fn session_message_appended_pushes_message() {
+        let mut h = TestHandler::new();
+        let msg = SessionMessage::UserText {
+            content: "hi".into(),
+        };
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::SessionMessageAppended {
+                message: msg.clone(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushSessionMessage(m) if *m == msg))
+        );
+    }
+
+    // ── Started / Done / Failed / Cancelled ──────────────────────────────
+
+    #[test]
+    fn started_begins_stream() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::Started { request_id: 7 }).unwrap();
+        let events = h.collect_events();
+        assert!(events.contains(&TestEvent::BeginStream(7)));
+    }
+
+    #[test]
+    fn done_pushes_text_and_drops_request() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::Done { request_id: 7 }).unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("done")))
+        );
+        assert!(events.contains(&TestEvent::FinalizeStream(7)));
+    }
+
+    #[test]
+    fn failed_pushes_text_and_drops_request() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::Failed {
+                request_id: 7,
+                error: "oops".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("[7] failed: oops")))
+        );
+        assert!(events.contains(&TestEvent::FinalizeStream(7)));
+    }
+
+    #[test]
+    fn cancelled_pushes_text_and_drops_request() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::Cancelled { request_id: 7 }).unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("[7] cancelled")))
+        );
+        assert!(events.contains(&TestEvent::FinalizeStream(7)));
+    }
+
+    // ── OutputChunk ──────────────────────────────────────────────────────
+
+    #[test]
+    fn output_chunk_appends_stream() {
+        let mut h = TestHandler::new();
+        let data = "hello world".to_string().into_bytes();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::OutputChunk {
+                request_id: 7,
+                stream: OutputStream::Answer,
+                data,
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.contains(&TestEvent::AppendStream(
+            7,
+            OutputStream::Answer,
+            "hello world".into()
+        )));
+    }
+
+    // ── Tool calls ───────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_call_started_pushes_tool_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ToolCallStarted {
+                request_id: 7,
+                call_id: "call_1".into(),
+                tool_name: "read_file".into(),
+                arguments_json: r#"{"path": "/tmp/x"}"#.into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(
+            |e| matches!(e, TestEvent::PushText(t) if t.contains("tool read_file#call_1 start"))
+        ));
+    }
+
+    #[test]
+    fn tool_call_finished_inserts_tool_result() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ToolCallFinished {
+                request_id: 7,
+                call_id: "c1".into(),
+                tool_name: "ls".into(),
+                output: "file.txt".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        let expected = TestEvent::InsertSessionMessageBeforeStream(
+            7,
+            SessionMessage::ToolResult {
+                call_id: "c1".into(),
+                name: "ls".into(),
+                content: "file.txt".into(),
+                is_error: false,
+            },
+        );
+        assert!(events.contains(&expected));
+    }
+
+    #[test]
+    fn tool_call_failed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ToolCallFailed {
+                request_id: 7,
+                call_id: "c1".into(),
+                tool_name: "ls".into(),
+                error: "permission denied".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("tool ls#c1 failed")))
+        );
+    }
+
+    #[test]
+    fn tool_call_output_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ToolCallOutput {
+                request_id: 7,
+                call_id: "c1".into(),
+                data: b"intermediate output".to_vec(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains("tool #c1 output: intermediate output"))));
+    }
+
+    #[test]
+    fn tool_call_output_invalid_utf8_returns_error() {
+        let mut h = TestHandler::new();
+        let result = dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ToolCallOutput {
+                request_id: 7,
+                call_id: "c1".into(),
+                data: vec![0xFF, 0xFE], // invalid UTF-8
+            },
+        );
+        assert!(result.is_err(), "invalid UTF-8 must produce an error");
+    }
+
+    // ── Image handling ───────────────────────────────────────────────────
+
+    #[test]
+    fn image_start_forwards_to_handler() {
+        let mut h = TestHandler::new();
+        let metadata = sample_image_metadata();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ImageStart {
+                request_id: 7,
+                metadata: metadata.clone(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.contains(&TestEvent::HandleImageStart(7, metadata)));
+    }
+
+    #[test]
+    fn image_start_error_propagates() {
+        let mut h = TestHandler::new();
+        h.image_start_result = Err(ClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "no space",
+        )));
+        let result = dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ImageStart {
+                request_id: 7,
+                metadata: sample_image_metadata(),
+            },
+        );
+        assert!(result.is_err(), "handler error must propagate");
+    }
+
+    #[test]
+    fn image_chunk_forwards_to_handler() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ImageChunk {
+                request_id: 7,
+                image_id: 1,
+                data: b"chunk data".to_vec(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.contains(&TestEvent::HandleImageChunk(7, 1, b"chunk data".to_vec())));
+    }
+
+    #[test]
+    fn image_end_forwards_to_handler() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ImageEnd {
+                request_id: 7,
+                image_id: 1,
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.contains(&TestEvent::HandleImageEnd(7, 1)));
+    }
+
+    // ── Pong ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pong_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::Pong).unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("pong")))
+        );
+    }
+
+    // ── Models ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn models_empty_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::Models {
+                models: vec![],
+                selected_model: None,
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("no models available")))
+        );
+    }
+
+    #[test]
+    fn models_non_empty_lists_them() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::Models {
+                models: vec!["gpt-4".into(), "gpt-3.5".into()],
+                selected_model: Some("gpt-4".into()),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("supported models (2)")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("* gpt-4")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("- gpt-3.5")))
+        );
+    }
+
+    // ── ModelsFailed / ModelSelected / ModelSelectionFailed ──────────────
+
+    #[test]
+    fn models_failed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ModelsFailed {
+                error: "rate limited".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(
+            |e| matches!(e, TestEvent::PushText(t) if t.contains("models failed: rate limited"))
+        ));
+    }
+
+    #[test]
+    fn model_selected_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ModelSelected {
+                model: "gpt-4".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, TestEvent::PushText(t) if t.contains("selected model: gpt-4"))
+            )
+        );
+    }
+
+    #[test]
+    fn model_selection_failed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::ModelSelectionFailed {
+                model: "gpt-4".into(),
+                error: "not found".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains("failed to select model gpt-4: not found")))
+        );
+    }
+
+    // ── Keystore (Unlocked / Locked / LockedError) ───────────────────────
+
+    #[test]
+    fn unlocked_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::Unlocked).unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("keystore unlocked")))
+        );
+    }
+
+    #[test]
+    fn locked_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::Locked).unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains("keystore locked, credentials cleared"))));
+    }
+
+    #[test]
+    fn locked_error_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::LockedError {
+                error: "wrong passphrase".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(
+            |e| matches!(e, TestEvent::PushText(t) if t.contains("locked: wrong passphrase"))
+        ));
+    }
+
+    // ── Credentials ──────────────────────────────────────────────────────
+
+    #[test]
+    fn credential_added_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::CredentialAdded {
+                service: "my-account".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(
+            |e| matches!(e, TestEvent::PushText(t) if t.contains("credential added: my-account"))
+        ));
+    }
+
+    #[test]
+    fn credential_add_failed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::CredentialAddFailed {
+                service: "my-account".into(),
+                error: "bad key".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains("credential add failed (my-account): bad key")))
+        );
+    }
+
+    #[test]
+    fn credential_removed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::CredentialRemoved {
+                service: "my-account".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(
+            |e| matches!(e, TestEvent::PushText(t) if t.contains("credential removed: my-account"))
+        ));
+    }
+
+    #[test]
+    fn credential_remove_failed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::CredentialRemoveFailed {
+                service: "my-account".into(),
+                error: "not found".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains("credential remove failed (my-account): not found")))
+        );
+    }
+
+    #[test]
+    fn credential_variant_is_noop() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::Credential {
+                service: "x".into(),
+                key: None,
+            },
+        )
+        .unwrap();
+        assert!(h.collect_events().is_empty());
+    }
+
+    // ── SessionDeleted / SessionDeleteFailed ────────────────────────────
+
+    #[test]
+    fn session_deleted_is_noop() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::SessionDeleted { session_id: 1 }).unwrap();
+        assert!(h.collect_events().is_empty());
+    }
+
+    #[test]
+    fn session_delete_failed_is_noop() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::SessionDeleteFailed {
+                session_id: 1,
+                error: "locked".into(),
+            },
+        )
+        .unwrap();
+        assert!(h.collect_events().is_empty());
+    }
+
+    // ── ShuttingDown ─────────────────────────────────────────────────────
+
+    #[test]
+    fn shutting_down_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::ShuttingDown).unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("shutting down")))
+        );
+    }
+
+    // ── AI Provider Accounts ─────────────────────────────────────────────
+
+    #[test]
+    fn account_added_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::AccountAdded {
+                name: "my-provider".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(
+            |e| matches!(e, TestEvent::PushText(t) if t.contains("account added: my-provider"))
+        ));
+    }
+
+    #[test]
+    fn account_add_failed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::AccountAddFailed {
+                name: "my-provider".into(),
+                error: "exists".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains("failed to add account my-provider: exists")))
+        );
+    }
+
+    #[test]
+    fn account_removed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::AccountRemoved {
+                name: "my-provider".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(
+            |e| matches!(e, TestEvent::PushText(t) if t.contains("account removed: my-provider"))
+        ));
+    }
+
+    #[test]
+    fn account_remove_failed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::AccountRemoveFailed {
+                name: "my-provider".into(),
+                error: "not found".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(
+            events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains("failed to remove account my-provider: not found")))
+        );
+    }
+
+    #[test]
+    fn accounts_empty_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(&mut h, DaemonMessage::Accounts { accounts: vec![] }).unwrap();
+        let events = h.collect_events();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, TestEvent::PushText(t) if t.contains("no accounts configured"))
+            )
+        );
+    }
+
+    #[test]
+    fn accounts_non_empty_lists_them() {
+        let mut h = TestHandler::new();
+        let accounts = vec![AccountInfo {
+            name: "my-acc".into(),
+            provider: "opencode".into(),
+            model: None,
+            has_credential: true,
+        }];
+        dispatch_daemon_message(&mut h, DaemonMessage::Accounts { accounts }).unwrap();
+        let events = h.collect_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("accounts (1)")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("my-acc: opencode")))
+        );
+    }
+
+    #[test]
+    fn account_list_failed_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::AccountListFailed {
+                error: "daemon locked".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains("failed to list accounts: daemon locked"))));
+    }
+
+    #[test]
+    fn session_account_set_pushes_text() {
+        let mut h = TestHandler::new();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::SessionAccountSet {
+                account: "my-acc".into(),
+            },
+        )
+        .unwrap();
+        let events = h.collect_events();
+        assert!(events.iter().any(
+            |e| matches!(e, TestEvent::PushText(t) if t.contains("session account set: my-acc"))
+        ));
+    }
+
+    // ── Return value tests ───────────────────────────────────────────────
+
+    #[test]
+    fn all_variants_return_none() {
+        // Spot-check a few variants — they should all return Ok(None).
+        let variants: Vec<DaemonMessage> = vec![
+            DaemonMessage::Pong,
+            DaemonMessage::Unlocked,
+            DaemonMessage::Locked,
+            DaemonMessage::ShuttingDown,
+            DaemonMessage::SessionStatusChanged {
+                session_id: 1,
+                status: SessionStatus::Inactive,
+            },
+            DaemonMessage::Credential {
+                service: "x".into(),
+                key: None,
+            },
+            DaemonMessage::SessionDeleted { session_id: 1 },
+            DaemonMessage::SessionDeleteFailed {
+                session_id: 1,
+                error: "x".into(),
+            },
+        ];
+        let mut h = TestHandler::new();
+        for variant in variants {
+            let result = dispatch_daemon_message(&mut h, variant);
+            assert!(result.is_ok(), "expected Ok(None), got {result:?}");
+            assert!(result.unwrap().is_none(), "expected None reply");
+        }
+    }
+
+    #[test]
+    fn output_chunk_invalid_utf8_returns_error() {
+        let mut h = TestHandler::new();
+        let result = dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::OutputChunk {
+                request_id: 7,
+                stream: OutputStream::Answer,
+                data: vec![0xFF, 0xFE],
+            },
+        );
+        assert!(result.is_err(), "invalid UTF-8 must produce an error");
     }
 }
