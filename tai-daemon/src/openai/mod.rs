@@ -4,6 +4,7 @@ mod retry;
 mod sse;
 #[cfg(test)]
 mod tests;
+pub use crate::providers::shared::MaxTokensField;
 
 pub(crate) use config::endpoint_url;
 pub use config::{
@@ -26,7 +27,7 @@ use std::io;
 /// use `super::OpenAiError` without structural changes.
 pub use crate::providers::shared::ProviderError as OpenAiError;
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestFormat {
     Responses,

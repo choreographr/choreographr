@@ -205,9 +205,9 @@ fn chat_completions_request(
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
     let (max_tokens_field, max_completion_tokens_field) =
-        match retry::chat_completions_max_tokens_field(config, model) {
-            retry::MaxTokensField::MaxTokens => (max_tokens, None),
-            retry::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
+        match config.max_tokens_field_for_model(model) {
+            super::MaxTokensField::MaxTokens => (max_tokens, None),
+            super::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let retry = retry::retry_config_from_config(config);
     let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
@@ -259,9 +259,9 @@ fn chat_completions_request_with_tools(
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
     let (max_tokens_field, max_completion_tokens_field) =
-        match retry::chat_completions_max_tokens_field(config, model) {
-            retry::MaxTokensField::MaxTokens => (max_tokens, None),
-            retry::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
+        match config.max_tokens_field_for_model(model) {
+            super::MaxTokensField::MaxTokens => (max_tokens, None),
+            super::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let retry = retry::retry_config_from_config(config);
     let body = serde_json::to_value(&ChatCompletionsRequest {
@@ -345,9 +345,9 @@ where
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
     let (max_tokens_field, max_completion_tokens_field) =
-        match retry::chat_completions_max_tokens_field(config, model) {
-            retry::MaxTokensField::MaxTokens => (max_tokens, None),
-            retry::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
+        match config.max_tokens_field_for_model(model) {
+            super::MaxTokensField::MaxTokens => (max_tokens, None),
+            super::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let retry = retry::retry_config_from_config(config);
     let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
@@ -506,9 +506,9 @@ where
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
     let (max_tokens_field, max_completion_tokens_field) =
-        match retry::chat_completions_max_tokens_field(config, model) {
-            retry::MaxTokensField::MaxTokens => (max_tokens, None),
-            retry::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
+        match config.max_tokens_field_for_model(model) {
+            super::MaxTokensField::MaxTokens => (max_tokens, None),
+            super::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
     let retry = retry::retry_config_from_config(config);
     let body = serde_json::to_value(&ChatCompletionsRequest {

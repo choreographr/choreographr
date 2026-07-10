@@ -1,4 +1,4 @@
-use super::{OpenAiClient, RequestFormat};
+use super::{MaxTokensField, OpenAiClient, RequestFormat};
 use serde::Deserialize;
 use std::{collections::HashMap, fs, io, path::PathBuf};
 use tai_proto::ContextConfig;
@@ -26,6 +26,10 @@ pub struct ServiceConfig {
     pub chat_completions_max_tokens: Option<u32>,
     #[serde(default)]
     pub model_max_tokens: HashMap<String, u32>,
+    #[serde(default = "default_max_tokens_field")]
+    pub chat_completions_max_tokens_field: MaxTokensField,
+    #[serde(default)]
+    pub model_max_tokens_fields: HashMap<String, MaxTokensField>,
     #[serde(default = "default_streaming")]
     pub streaming: bool,
     #[serde(default)]
@@ -55,6 +59,8 @@ impl Default for ServiceConfig {
             model_request_formats: HashMap::new(),
             chat_completions_max_tokens: None,
             model_max_tokens: HashMap::new(),
+            chat_completions_max_tokens_field: default_max_tokens_field(),
+            model_max_tokens_fields: HashMap::new(),
             streaming: default_streaming(),
             max_turns: None,
             retry_max_attempts: default_retry_max_attempts(),
@@ -85,6 +91,10 @@ fn default_chat_completions_path() -> String {
 
 fn default_request_format() -> RequestFormat {
     RequestFormat::ChatCompletions
+}
+
+fn default_max_tokens_field() -> MaxTokensField {
+    MaxTokensField::MaxCompletionTokens
 }
 
 fn default_streaming() -> bool {
@@ -164,6 +174,22 @@ impl ServiceConfig {
             .get(model)
             .copied()
             .or(self.chat_completions_max_tokens)
+    }
+
+    /// Resolve which JSON field to use for the token limit for a given model.
+    /// Per-model overrides take precedence over the default.
+    pub fn max_tokens_field_for_model(&self, model: &str) -> MaxTokensField {
+        let field = self
+            .model_max_tokens_fields
+            .get(model)
+            .copied()
+            .unwrap_or(self.chat_completions_max_tokens_field);
+        tracing::debug!(
+            model = %model,
+            ?field,
+            "max_tokens_field_for_model"
+        );
+        field
     }
 }
 

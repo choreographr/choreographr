@@ -1,6 +1,8 @@
 use std::fmt;
 use tracing::debug;
 
+use crate::providers::shared::MaxTokensField;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {
     OpenAiCompatible,
@@ -32,6 +34,7 @@ pub struct ProviderEntry {
     pub default_base_url: &'static str,
     pub default_model: &'static str,
     pub reasoning: ReasoningSupport,
+    pub max_tokens_field: MaxTokensField,
 }
 
 /// Static catalog of all known providers.
@@ -43,6 +46,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.openai.com/v1",
         default_model: "gpt-4.1",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "openai_compatible",
@@ -51,6 +55,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.openai.com/v1",
         default_model: "custom-model",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "opencode",
@@ -59,6 +64,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://opencode.ai/zen/v1",
         default_model: "deepseek-v4-flash",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxTokens,
     },
     ProviderEntry {
         slug: "opencode-go",
@@ -67,6 +73,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://opencode.ai/zen/go/v1",
         default_model: "deepseek-v4-pro",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxTokens,
     },
     ProviderEntry {
         slug: "deepseek",
@@ -75,6 +82,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.deepseek.com",
         default_model: "deepseek-chat",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "xai",
@@ -83,6 +91,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.x.ai/v1",
         default_model: "grok-4",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "groq",
@@ -91,6 +100,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.groq.com/openai/v1",
         default_model: "llama-3.3-70b-versatile",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "together",
@@ -99,6 +109,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.together.xyz/v1",
         default_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "mistral",
@@ -107,6 +118,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.mistral.ai/v1",
         default_model: "mistral-large-latest",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxTokens,
     },
     ProviderEntry {
         slug: "ollama",
@@ -115,6 +127,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "http://localhost:11434/v1",
         default_model: "llama3.1",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "ollama-cloud",
@@ -123,6 +136,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://ollama.com/v1",
         default_model: "qwen3-coder:480b",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "openrouter",
@@ -131,6 +145,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://openrouter.ai/api/v1",
         default_model: "openai/gpt-4.1",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "huggingface",
@@ -139,6 +154,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://router.huggingface.co/v1",
         default_model: "meta-llama/Llama-3.3-70B-Instruct",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "github",
@@ -147,6 +163,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://models.inference.ai.azure.com",
         default_model: "openai/gpt-4.1",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "nvidia",
@@ -155,6 +172,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://integrate.api.nvidia.com/v1",
         default_model: "nvidia/llama-3.1-nemotron-70b-instruct",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "cerebras",
@@ -163,6 +181,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.cerebras.ai/v1",
         default_model: "cerebras",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "fireworks",
@@ -171,6 +190,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.fireworks.ai/inference/v1",
         default_model: "accounts/fireworks/models/llama-v3p3-70b-instruct",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "xiaomi-mimo",
@@ -179,6 +199,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.mimo.xiaomi.com/openai/v1",
         default_model: "mimo-vl",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "dashscope",
@@ -187,6 +208,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         default_model: "qwen-plus",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "moonshot",
@@ -195,6 +217,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.moonshot.ai/v1",
         default_model: "kimi-k2",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "perplexity",
@@ -203,6 +226,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.perplexity.ai",
         default_model: "sonar-pro",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "zai",
@@ -211,6 +235,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.z.ai/api/paas/v4",
         default_model: "glm-4.5",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "venice",
@@ -219,6 +244,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.venice.ai/api/v1",
         default_model: "qwen-2.5-qwq-32b",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "novita",
@@ -227,6 +253,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.novita.ai/v3/openai",
         default_model: "deepseek-v3",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "lmstudio",
@@ -235,6 +262,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "http://localhost:1234/v1",
         default_model: "local-model",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "custom-openai",
@@ -243,6 +271,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.openai.com/v1",
         default_model: "custom-model",
         reasoning: ReasoningSupport::ReasoningEffort,
+        max_tokens_field: MaxTokensField::MaxCompletionTokens,
     },
     ProviderEntry {
         slug: "anthropic",
@@ -251,6 +280,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.anthropic.com",
         default_model: "claude-sonnet-4-20250514",
         reasoning: ReasoningSupport::AnthropicThinking,
+        max_tokens_field: MaxTokensField::MaxTokens,
     },
     ProviderEntry {
         slug: "minimax",
@@ -259,6 +289,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.minimax.io/anthropic",
         default_model: "MiniMax-M3",
         reasoning: ReasoningSupport::AnthropicThinking,
+        max_tokens_field: MaxTokensField::MaxTokens,
     },
     ProviderEntry {
         slug: "custom-anthropic",
@@ -267,6 +298,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://api.anthropic.com",
         default_model: "custom-model",
         reasoning: ReasoningSupport::AnthropicThinking,
+        max_tokens_field: MaxTokensField::MaxTokens,
     },
     ProviderEntry {
         slug: "google",
@@ -275,6 +307,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_base_url: "https://generativelanguage.googleapis.com/v1beta",
         default_model: "gemini-2.5-pro",
         reasoning: ReasoningSupport::GoogleThinkingConfig,
+        max_tokens_field: MaxTokensField::MaxTokens,
     },
 ];
 

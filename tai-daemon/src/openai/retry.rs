@@ -76,20 +76,3 @@ pub(crate) fn retry_send_get_simple(
 ) -> Result<reqwest::blocking::Response, OpenAiError> {
     retry_send_get(client, url, api_key, retry_cfg, &mut None, None)
 }
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum MaxTokensField {
-    MaxTokens,
-    MaxCompletionTokens,
-}
-
-pub(crate) fn chat_completions_max_tokens_field(
-    config: &ServiceConfig,
-    model: &str,
-) -> MaxTokensField {
-    if config.base_url.contains("opencode.ai") || model == "big-pickle" {
-        MaxTokensField::MaxTokens
-    } else {
-        MaxTokensField::MaxCompletionTokens
-    }
-}

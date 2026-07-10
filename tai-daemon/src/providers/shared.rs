@@ -1,7 +1,19 @@
 use std::io;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tai_proto::InferenceError;
+
+/// Determines which JSON field carries the token limit in a chat
+/// completions request body.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    /// Use the `max_tokens` field.
+    MaxTokens,
+    /// Use the `max_completion_tokens` field.
+    MaxCompletionTokens,
+}
 
 /// Unified error type for all API providers.
 /// Each provider module re-exports this as its own error type.

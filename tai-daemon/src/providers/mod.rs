@@ -59,6 +59,7 @@ impl InferenceProvider {
                 if config.base_url.is_none() {
                     svc_config.base_url = entry.default_base_url.to_string();
                 }
+                svc_config.chat_completions_max_tokens_field = entry.max_tokens_field;
                 config.apply_overrides(&mut svc_config);
                 let key = api_key
                     .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
