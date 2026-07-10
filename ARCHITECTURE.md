@@ -1111,9 +1111,11 @@ inside a sandboxed virtual machine powered by `ckb-vm`. It is registered manuall
      output upon VM exit.
    - **Syscall #2 (EXIT)** — stops the VM.
 5. Loads the ELF via `TraceMachine::load_program` and runs via `TraceMachine::run()`.
-6. Returns the formatted source wrapped in a `rust` markdown fenced code block,
-   followed by the accumulated WRITE output, as the tool result.  The TUI renders
-   the code block with syntect syntax highlighting.
+6. After execution, the machine is dropped and the output channel is drained with
+   a blocking `recv()` loop (deterministic — no buffered-item race).
+7. Returns the formatted source wrapped in a `rust` markdown fenced code block,
+   followed by the accumulated WRITE output, then a `[VM: exited with code N in M cycles]`
+   summary line.  The TUI renders the code block with syntect syntax highlighting.
 
 **Guest ABI** (auto-generated in the boilerplate):
 

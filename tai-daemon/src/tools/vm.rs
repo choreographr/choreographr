@@ -771,12 +771,17 @@ fn run_riscv_impl(
     trace.set_register(registers::A1, sp + 8);
 
     match trace.run() {
-        Ok(_exit_code) => {
-            // Drain all buffered output written via the TaiSyscall write
-            // handler during VM execution.  `trace.run()` is synchronous,
-            // so every write completes before `try_iter()` runs — no need
-            // for a blocking receive even though the sender is still alive.
-            let out: Vec<u8> = output_rx.try_iter().flatten().collect();
+        Ok(exit_code) => {
+            let cycles = trace.machine.cycles();
+            // Drop the trace machine first so the TaiSyscall sender is
+            // closed before we drain the receiver.  This lets us use a
+            // blocking recv() loop that terminates deterministically.
+            drop(trace);
+
+            let mut out = Vec::new();
+            while let Ok(chunk) = output_rx.recv() {
+                out.extend_from_slice(&chunk);
+            }
             let out_str = String::from_utf8_lossy(&out).to_string();
 
             // Prepend the formatted source as a syntax-highlighted markdown
@@ -791,6 +796,9 @@ fn run_riscv_impl(
                 result_content.push_str("```\n\n");
             }
             result_content.push_str(&out_str);
+            result_content.push_str(&format!(
+                "\n[VM: exited with code {exit_code} in {cycles} cycles]"
+            ));
 
             ToolExecutionOutput {
                 result: tool_ok(result_content),
@@ -798,14 +806,19 @@ fn run_riscv_impl(
             }
         }
         Err(e) => {
-            // Same pattern — drain all buffered output collected before
-            // the VM faulted.  No blocking needed (see Ok arm above).
-            let out: Vec<u8> = output_rx.try_iter().flatten().collect();
+            let cycles = trace.machine.cycles();
+            // Same reason as above — close the sender before draining.
+            drop(trace);
+
+            let mut out = Vec::new();
+            while let Ok(chunk) = output_rx.recv() {
+                out.extend_from_slice(&chunk);
+            }
             let out_str = String::from_utf8_lossy(&out).to_string();
             let msg = if out_str.is_empty() {
-                format!("VM error: {e}")
+                format!("VM error after {cycles} cycles: {e}")
             } else {
-                format!("VM error: {e}\noutput so far:\n{out_str}")
+                format!("VM error after {cycles} cycles: {e}\noutput so far:\n{out_str}")
             };
             ToolExecutionOutput {
                 result: tool_err(msg),
@@ -1196,61 +1209,63 @@ mod tests {
         );
     }
 
-    // -- Channel output collection tests -----------------------------------
+    // -- Channel drain tests ----------------------------------------------
     //
-    // These verify the `try_iter().flatten().collect()` pattern used to drain
-    // the VM's byte output channel after a synchronous `trace.run()`.
+    // These verify the blocking `recv()` drain pattern used in the
+    // production path: drop the sender first (simulating `drop(trace)`
+    // from run_riscv_impl), then recv() until Disconnected.
 
     #[test]
-    fn channel_output_collection_empty_when_nothing_sent() {
+    fn channel_drain_empty_when_nothing_sent() {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         drop(tx);
 
-        let out: Vec<u8> = rx.try_iter().flatten().collect();
+        let mut out = Vec::new();
+        while let Ok(chunk) = rx.recv() {
+            out.extend_from_slice(&chunk);
+        }
         assert!(out.is_empty());
     }
 
     #[test]
-    fn channel_output_collection_single_chunk() {
+    fn channel_drain_single_chunk() {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         tx.send(b"hello".to_vec()).unwrap();
         drop(tx);
 
-        let out: Vec<u8> = rx.try_iter().flatten().collect();
+        let mut out = Vec::new();
+        while let Ok(chunk) = rx.recv() {
+            out.extend_from_slice(&chunk);
+        }
         assert_eq!(out, b"hello");
     }
 
     #[test]
-    fn channel_output_collection_preserves_order() {
+    fn channel_drain_preserves_order() {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         tx.send(b"hello ".to_vec()).unwrap();
         tx.send(b"world".to_vec()).unwrap();
         drop(tx);
 
-        let out: Vec<u8> = rx.try_iter().flatten().collect();
+        let mut out = Vec::new();
+        while let Ok(chunk) = rx.recv() {
+            out.extend_from_slice(&chunk);
+        }
         assert_eq!(out, b"hello world");
     }
 
     #[test]
-    fn channel_output_collection_works_with_open_channel() {
-        // `try_iter()` returns whatever is buffered even if the sender
-        // is still alive — exactly the pattern used after `trace.run()`.
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        tx.send(b"data".to_vec()).unwrap();
-        // Don't drop tx — simulate the open-sender scenario.
-
-        let out: Vec<u8> = rx.try_iter().flatten().collect();
-        assert_eq!(out, b"data");
-    }
-
-    #[test]
-    fn channel_output_collection_multiple_chunks_open_sender() {
+    fn channel_drain_multiple_chunks_closed_sender() {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         tx.send(b"a".to_vec()).unwrap();
         tx.send(b"b".to_vec()).unwrap();
         tx.send(b"c".to_vec()).unwrap();
+        drop(tx);
 
-        let out: Vec<u8> = rx.try_iter().flatten().collect();
+        let mut out = Vec::new();
+        while let Ok(chunk) = rx.recv() {
+            out.extend_from_slice(&chunk);
+        }
         assert_eq!(out, b"abc");
     }
 }
