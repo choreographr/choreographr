@@ -38,6 +38,7 @@ const BOILERPLATE_ALLOC: &str = r#"
 extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
+use core::ptr;
 
 use alloc::vec::Vec;
 use alloc::string::String;
@@ -57,21 +58,22 @@ unsafe impl GlobalAlloc for BumpAlloc {
         if size == 0 {
             return core::ptr::null_mut();
         }
-        let offset = &mut HEAP_OFFSET;
+        // Use addr_of_mut! to avoid edition 2024 static_mut_refs error.
+        let offset = ptr::addr_of_mut!(HEAP_OFFSET);
         let align = layout.align();
         let misalign = *offset % align;
         if misalign != 0 {
-            match offset.checked_add(align - misalign) {
+            match (*offset).checked_add(align - misalign) {
                 Some(aligned) => *offset = aligned,
                 None => return core::ptr::null_mut(),
             }
         }
-        match offset.checked_add(size) {
+        match (*offset).checked_add(size) {
             Some(next) if next <= HEAP_SIZE => *offset = next,
             _ => return core::ptr::null_mut(),
         }
-        let ptr = HEAP.as_mut_ptr().add(*offset - size);
-        ptr
+        let heap_ptr = ptr::addr_of_mut!(HEAP) as *mut u8;
+        heap_ptr.add(*offset - size)
     }
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
 }
@@ -138,6 +140,8 @@ pub mod tai {
 
 const BOILERPLATE_TAIL_ALLOC: &str = r#"
     use alloc::vec::Vec;
+    use alloc::string::String;
+    use alloc::string::ToString;
 
     pub fn args() -> Vec<Vec<u8>> {
         unsafe {
@@ -161,7 +165,7 @@ const BOILERPLATE_TAIL_ALLOC: &str = r#"
 const BOILERPLATE_TAIL_CLOSE: &str = r#"
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() {
     let argc: usize;
     let argv: *const *const u8;
@@ -206,9 +210,31 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         buf.extend_from_slice(b);
     }
 
-    /// Encode a u64 as 8-byte BE (for non-varint integer fields).
+    /// Encode a u64 as a postcard varint.
     pub fn enc_u64(v: u64, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&v.to_le_bytes());
+        enc_varint(v, buf);
+    }
+
+    /// Encode an Option<&str>: 0x00 for None, 0x01 + enc_str for Some.
+    pub fn enc_option_str(v: Option<&str>, buf: &mut Vec<u8>) {
+        match v {
+            Some(s) => {
+                buf.push(0x01);
+                enc_str(s, buf);
+            }
+            None => buf.push(0x00),
+        }
+    }
+
+    /// Encode an Option<u64>: 0x00 for None, 0x01 + enc_varint for Some.
+    pub fn enc_option_u64(v: Option<u64>, buf: &mut Vec<u8>) {
+        match v {
+            Some(n) => {
+                buf.push(0x01);
+                enc_varint(n, buf);
+            }
+            None => buf.push(0x00),
+        }
     }
 
     /// Encode a bool as 1 byte.
@@ -277,7 +303,8 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         let mut buf = Vec::new();
         enc_str(name, &mut buf);
         buf.extend_from_slice(args);
-        let mut output = vec![0u8; 65536];
+        let mut output = Vec::new();
+        output.resize(65536, 0u8);
         let n = unsafe { tool_call(&buf, &mut output) };
         output[..n].to_vec()
     }
@@ -331,6 +358,74 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
     /// git_status() -> status string.
     pub fn git_status() -> String {
         let resp = call("git_status", &[]);
+        match dec_result(&resp) {
+            Ok(b) => String::from_utf8_lossy(b).to_string(),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// fff(query: &str) -> file search results as string.
+    pub fn fff(query: &str) -> String {
+        let mut args = Vec::new();
+        enc_str(query, &mut args);
+        enc_option_str(None, &mut args); // path
+        enc_option_str(None, &mut args); // mode
+        enc_option_str(None, &mut args); // pattern_type
+        enc_option_u64(None, &mut args); // max_results
+        let resp = call("fff", &args);
+        match dec_result(&resp) {
+            Ok(b) => String::from_utf8_lossy(b).to_string(),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// http_request(method: &str, url: &str, body: Option<&str>, timeout_secs: Option<u64>) -> response string.
+    /// Headers can be passed as a slice of (key, value) pairs.
+    pub fn http_request(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&str>, timeout_secs: Option<u64>) -> String {
+        let mut args = Vec::new();
+        enc_str(method, &mut args);
+        enc_str(url, &mut args);
+        // headers: Vec<(String, String)> — postcard encodes as varint(len) + each pair
+        enc_varint(headers.len() as u64, &mut args);
+        for &(k, v) in headers {
+            enc_str(k, &mut args);
+            enc_str(v, &mut args);
+        }
+        enc_option_str(body, &mut args);
+        enc_option_u64(timeout_secs, &mut args);
+        let resp = call("http_request", &args);
+        match dec_result(&resp) {
+            Ok(b) => String::from_utf8_lossy(b).to_string(),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// sh(command: &str, shell: &str, workdir: Option<&str>, timeout_ms: Option<u64>) -> command output string.
+    pub fn sh(command: &str, shell: &str, workdir: Option<&str>, timeout_ms: Option<u64>) -> String {
+        let mut args = Vec::new();
+        enc_str(command, &mut args);
+        enc_str(shell, &mut args);
+        enc_option_str(workdir, &mut args);
+        enc_option_u64(timeout_ms, &mut args);
+        let resp = call("sh", &args);
+        match dec_result(&resp) {
+            Ok(b) => String::from_utf8_lossy(b).to_string(),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// exec(command: &str, cmd_args: &[&str], workdir: Option<&str>, timeout_ms: Option<u64>) -> command output string.
+    pub fn exec(command: &str, cmd_args: &[&str], workdir: Option<&str>, timeout_ms: Option<u64>) -> String {
+        let mut args = Vec::new();
+        enc_str(command, &mut args);
+        // args_list: Vec<String> — postcard encodes as varint(len) + each string
+        enc_varint(cmd_args.len() as u64, &mut args);
+        for a in cmd_args {
+            enc_str(a, &mut args);
+        }
+        enc_option_str(workdir, &mut args);
+        enc_option_u64(timeout_ms, &mut args);
+        let resp = call("exec", &args);
         match dec_result(&resp) {
             Ok(b) => String::from_utf8_lossy(b).to_string(),
             Err(_) => String::new(),
@@ -501,7 +596,15 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
 
     let mut child = Command::new("rustc")
         .arg("+nightly")
-        .args(["--target", target, "-C", "opt-level=z", "-o"])
+        .args([
+            "--target",
+            target,
+            "-C",
+            "opt-level=z",
+            "--edition",
+            "2024",
+            "-o",
+        ])
         .arg(&output_path)
         .arg(&input_path)
         .stderr(std::process::Stdio::piped())
@@ -735,7 +838,7 @@ impl Tool for RunRiscV {
     }
 
     fn description(&self) -> &'static str {
-        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `tai` module with syscall wrappers (tai::write, tai::exit, tai::tool_call). Do NOT use raw ecall with Linux syscall numbers (64, 93) — they are not supported."
+        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `tai` module. Use per-tool convenience wrappers (tai::read_file, tai::write_file, tai::db_get, tai::db_set, tai::sh, tai::exec, tai::fff, tai::http_request) for tool calls — they handle the postcard encoding automatically. Use tai::write(b\"...\") for VM output and tai::exit(code) to finish. Do NOT use raw ecall with Linux syscall numbers (64, 93) — they are not supported."
     }
 
     fn schema(&self) -> serde_json::Value {
@@ -744,11 +847,11 @@ impl Tool for RunRiscV {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `tai` module — these are auto-generated. Do NOT use raw ecall with Linux syscall numbers (64 for write, 93 for exit). Use the provided wrappers: tai::write(b\"...\"), tai::exit(code), tai::tool_call(request, &mut output). Example: `fn main() { tai::write(b\"hello\\n\"); tai::exit(0); }`. When allocator:true (default), alloc types are pre-imported: Vec, String, Box, format!, vec!, .to_string()."
+                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `tai` module — these are auto-generated. Do NOT use raw ecall with Linux syscall numbers (64 for write, 93 for exit). Use the provided wrappers: tai::write(b\"...\"), tai::exit(code), and per-tool wrappers like tai::read_file(path), tai::write_file(path, content, overwrite), tai::db_get(key), tai::db_set(key, value), tai::sh(command, shell, ...), tai::exec(command, args, ...), tai::fff(query), tai::http_request(method, url, headers, body, timeout). The wrappers handle postcard encoding automatically — no need to call tai::tool_call or tai::call directly. Example: `fn main() { let content = tai::read_file(\"Cargo.toml\"); tai::write(content.as_bytes()); }`. When allocator:true (default), alloc types are pre-imported: Vec, String, Box, format!, .to_string()."
                 },
                 "program": {
                     "type": "string",
-                    "description": "Base64-encoded RISC-V ELF binary. Only use if you compiled externally WITH the tai syscall ABI (syscall 0=tool_call, 1=write, 2=exit). Programs using Linux syscall numbers (64=write, 93=exit) will fail. When in doubt, use 'source' instead."
+                    "description": "Base64-encoded RISC-V ELF binary. Only use if you compiled externally WITH the tai syscall ABI (syscall 0=postcard-encoded tool dispatch, 1=write, 2=exit). Programs using Linux syscall numbers (64=write, 93=exit) will fail. When in doubt, use 'source' instead."
                 },
                 "args": {
                     "type": "array",
