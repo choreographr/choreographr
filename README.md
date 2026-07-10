@@ -170,6 +170,10 @@ provider = "google"
 name = "local"
 provider = "ollama"
 base_url = "http://localhost:11434/v1"
+
+[[account]]
+name = "mistral"
+provider = "mistral"
 ```
 
 Each provider from the catalog is pre-configured with sensible defaults (base_url, default model). Override any field per-account.

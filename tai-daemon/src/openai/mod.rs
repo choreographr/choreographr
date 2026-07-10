@@ -20,35 +20,12 @@ pub(crate) use crate::retry::{
 pub use retry::RetryCallback;
 
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::sync::mpsc;
-use std::{io, time::Duration};
 
-#[derive(Debug, thiserror::Error)]
-pub enum OpenAiError {
-    #[error("unauthorized ({status}): {detail}")]
-    Unauthorized { status: u16, detail: String },
-    #[error("rate limited: {detail}")]
-    RateLimited {
-        retry_after_secs: Option<u64>,
-        detail: String,
-    },
-    #[error("server error ({status}): {detail}")]
-    ServerError { status: u16, detail: String },
-    #[error("client error ({status}): {detail}")]
-    ClientError { status: u16, detail: String },
-    #[error("provider returned an empty response")]
-    EmptyResponse,
-    #[error("request cancelled during retry backoff")]
-    Cancelled,
-    #[error("{0}")]
-    Io(#[from] std::io::Error),
-}
-
-impl From<OpenAiError> for std::io::Error {
-    fn from(err: OpenAiError) -> Self {
-        std::io::Error::other(err.to_string())
-    }
-}
+/// Re-export the shared provider error type so all OpenAI code continues to
+/// use `super::OpenAiError` without structural changes.
+pub use crate::providers::shared::ProviderError as OpenAiError;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -285,20 +262,6 @@ pub enum CompletionChunkKind {
     Reasoning,
 }
 
-/// Map an API error to a stable label for metrics.
-/// These labels match the expectations of `tai_api_errors_total`.
-pub(crate) fn error_type_label(e: &OpenAiError) -> &'static str {
-    match e {
-        OpenAiError::Unauthorized { .. } => "unauthorized",
-        OpenAiError::RateLimited { .. } => "rate_limited",
-        OpenAiError::ServerError { .. } => "server_error",
-        OpenAiError::ClientError { .. } => "client_error",
-        OpenAiError::EmptyResponse => "client_error",
-        OpenAiError::Cancelled => "cancelled",
-        OpenAiError::Io(_) => "other",
-    }
-}
-
 impl ChatToolDefinition {
     pub fn function(
         name: &'static str,
@@ -325,11 +288,10 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn new(config: ServiceConfig, api_key: String) -> io::Result<Self> {
-        let http = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-            .timeout(Duration::from_secs(config.request_timeout_secs))
-            .build()
-            .map_err(io::Error::other)?;
+        let http = crate::providers::shared::build_http_client(
+            config.connect_timeout_secs,
+            config.request_timeout_secs,
+        )?;
         Ok(Self {
             config,
             api_key,
@@ -379,14 +341,7 @@ impl ProviderClient for OpenAiClient {
         let api_start = std::time::Instant::now();
         let result =
             self.chat_completion_turn(model, messages, tools, thinking_effort, on_retry, cancel_rx);
-        crate::providers::timed_result(
-            api_start,
-            model,
-            "openai",
-            result,
-            error_type_label,
-            openai_error_to_inference,
-        )
+        crate::providers::shared::timed_result(api_start, model, "openai", result)
     }
 
     fn chat_completion_turn_streaming(
@@ -409,42 +364,11 @@ impl ProviderClient for OpenAiClient {
             cancel_rx,
             on_chunk,
         );
-        crate::providers::timed_result(
-            api_start,
-            model,
-            "openai",
-            result,
-            error_type_label,
-            openai_error_to_inference,
-        )
+        crate::providers::shared::timed_result(api_start, model, "openai", result)
     }
 
     fn list_models(&self) -> Result<Vec<String>, InferenceError> {
         let result = self.validate_and_list_models();
-        result.map_err(openai_error_to_inference)
-    }
-}
-
-fn openai_error_to_inference(e: OpenAiError) -> InferenceError {
-    match e {
-        OpenAiError::Unauthorized { status, detail } => {
-            InferenceError::Unauthorized { status, detail }
-        }
-        OpenAiError::RateLimited {
-            retry_after_secs,
-            detail,
-        } => InferenceError::RateLimited {
-            retry_after_secs,
-            detail,
-        },
-        OpenAiError::ServerError { status, detail } => {
-            InferenceError::ServerError { status, detail }
-        }
-        OpenAiError::ClientError { status, detail } => {
-            InferenceError::ClientError { status, detail }
-        }
-        OpenAiError::EmptyResponse => InferenceError::EmptyResponse,
-        OpenAiError::Cancelled => InferenceError::Cancelled,
-        OpenAiError::Io(e) => InferenceError::Io(e.to_string()),
+        result.map_err(crate::providers::shared::provider_error_to_inference)
     }
 }

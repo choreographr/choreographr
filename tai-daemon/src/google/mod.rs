@@ -4,7 +4,6 @@ mod tests;
 
 use std::io;
 use std::sync::mpsc;
-use std::time::Duration;
 use tracing::debug;
 
 use serde::{Deserialize, Serialize};
@@ -65,65 +64,7 @@ impl GoogleConfig {
 }
 
 /// Errors from the Google Gemini API.
-#[derive(Debug, thiserror::Error)]
-pub enum GoogleError {
-    #[error("unauthorized ({status}): {detail}")]
-    Unauthorized { status: u16, detail: String },
-    #[error("rate limited: {detail}")]
-    RateLimited {
-        retry_after_secs: Option<u64>,
-        detail: String,
-    },
-    #[error("server error ({status}): {detail}")]
-    ServerError { status: u16, detail: String },
-    #[error("client error ({status}): {detail}")]
-    ClientError { status: u16, detail: String },
-    #[error("provider returned an empty response")]
-    EmptyResponse,
-    #[error("request cancelled during retry backoff")]
-    Cancelled,
-    #[error("{0}")]
-    Io(#[from] std::io::Error),
-}
-
-impl From<crate::retry::ProviderHttpError> for GoogleError {
-    fn from(err: crate::retry::ProviderHttpError) -> Self {
-        match err {
-            crate::retry::ProviderHttpError::Unauthorized { status, detail } => {
-                GoogleError::Unauthorized { status, detail }
-            }
-            crate::retry::ProviderHttpError::RateLimited {
-                retry_after_secs,
-                detail,
-            } => GoogleError::RateLimited {
-                retry_after_secs,
-                detail,
-            },
-            crate::retry::ProviderHttpError::ServerError { status, detail } => {
-                GoogleError::ServerError { status, detail }
-            }
-            crate::retry::ProviderHttpError::ClientError { status, detail } => {
-                GoogleError::ClientError { status, detail }
-            }
-            crate::retry::ProviderHttpError::EmptyResponse => GoogleError::EmptyResponse,
-            crate::retry::ProviderHttpError::Cancelled => GoogleError::Cancelled,
-            crate::retry::ProviderHttpError::Io(e) => GoogleError::Io(e),
-        }
-    }
-}
-
-/// Map a Google error to a stable label for metrics.
-pub(crate) fn error_type_label(e: &GoogleError) -> &'static str {
-    match e {
-        GoogleError::Unauthorized { .. } => "unauthorized",
-        GoogleError::RateLimited { .. } => "rate_limited",
-        GoogleError::ServerError { .. } => "server_error",
-        GoogleError::ClientError { .. } => "client_error",
-        GoogleError::EmptyResponse => "empty_response",
-        GoogleError::Cancelled => "cancelled",
-        GoogleError::Io(_) => "other",
-    }
-}
+pub use crate::providers::shared::ProviderError as GoogleError;
 
 /// The Google Gemini API client.
 #[derive(Clone, Debug)]
@@ -135,11 +76,10 @@ pub struct GoogleClient {
 
 impl GoogleClient {
     pub fn new(config: GoogleConfig, api_key: String) -> io::Result<Self> {
-        let http = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-            .timeout(Duration::from_secs(config.request_timeout_secs))
-            .build()
-            .map_err(io::Error::other)?;
+        let http = crate::providers::shared::build_http_client(
+            config.connect_timeout_secs,
+            config.request_timeout_secs,
+        )?;
         Ok(Self {
             config,
             api_key,
@@ -277,14 +217,7 @@ impl ProviderClient for GoogleClient {
         let api_start = std::time::Instant::now();
         let result =
             self.chat_completion_turn(model, messages, tools, thinking_effort, on_retry, cancel_rx);
-        crate::providers::timed_result(
-            api_start,
-            model,
-            "google",
-            result,
-            error_type_label,
-            google_error_to_inference,
-        )
+        crate::providers::shared::timed_result(api_start, model, "google", result)
     }
 
     fn chat_completion_turn_streaming(
@@ -307,43 +240,12 @@ impl ProviderClient for GoogleClient {
             cancel_rx,
             on_chunk,
         );
-        crate::providers::timed_result(
-            api_start,
-            model,
-            "google",
-            result,
-            error_type_label,
-            google_error_to_inference,
-        )
+        crate::providers::shared::timed_result(api_start, model, "google", result)
     }
 
     fn list_models(&self) -> Result<Vec<String>, InferenceError> {
         let result = self.validate_and_list_models();
-        result.map_err(google_error_to_inference)
-    }
-}
-
-fn google_error_to_inference(e: GoogleError) -> InferenceError {
-    match e {
-        GoogleError::Unauthorized { status, detail } => {
-            InferenceError::Unauthorized { status, detail }
-        }
-        GoogleError::RateLimited {
-            retry_after_secs,
-            detail,
-        } => InferenceError::RateLimited {
-            retry_after_secs,
-            detail,
-        },
-        GoogleError::ServerError { status, detail } => {
-            InferenceError::ServerError { status, detail }
-        }
-        GoogleError::ClientError { status, detail } => {
-            InferenceError::ClientError { status, detail }
-        }
-        GoogleError::EmptyResponse => InferenceError::EmptyResponse,
-        GoogleError::Cancelled => InferenceError::Cancelled,
-        GoogleError::Io(e) => InferenceError::Io(e.to_string()),
+        result.map_err(crate::providers::shared::provider_error_to_inference)
     }
 }
 

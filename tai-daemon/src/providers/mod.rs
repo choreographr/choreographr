@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 
 use crate::anthropic::AnthropicClient;
+use crate::mistral::MistralClient;
 use crate::openai::{
     ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind, OpenAiClient,
     RetryCallback,
@@ -10,6 +11,7 @@ use crate::openai::{
 use tai_proto::{InferenceError, ThinkingEffort};
 
 mod catalog;
+pub(crate) mod shared;
 mod traits;
 
 pub use catalog::{
@@ -31,6 +33,12 @@ impl InferenceProvider {
     }
 
     pub fn from_anthropic(client: AnthropicClient) -> Self {
+        Self {
+            client: Arc::new(client),
+        }
+    }
+
+    pub fn from_mistral(client: MistralClient) -> Self {
         Self {
             client: Arc::new(client),
         }
@@ -94,6 +102,20 @@ impl InferenceProvider {
                     client: Arc::new(client),
                 })
             }
+            ProviderProtocol::Mistral => {
+                let key = api_key
+                    .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
+                let mut mistral_cfg = crate::mistral::MistralConfig::default();
+                if config.base_url.is_none() {
+                    mistral_cfg.base_url = entry.default_base_url.to_string();
+                }
+                mistral_cfg.apply_overrides(config);
+                let client = MistralClient::new(mistral_cfg, key)
+                    .map_err(|e| format!("failed to create Mistral client: {e}"))?;
+                Ok(Self {
+                    client: Arc::new(client),
+                })
+            }
         }
     }
 
@@ -147,28 +169,6 @@ impl InferenceProvider {
     }
 }
 
-/// Wrapper that records timing and metrics for a provider call, then maps
-/// the provider-specific error type to the shared `InferenceError`.
-/// Keeps instrumentation uniform across every `ProviderClient` implementation.
-pub(crate) fn timed_result<T, E>(
-    start: std::time::Instant,
-    model: &str,
-    label: &str,
-    result: Result<T, E>,
-    error_label: fn(&E) -> &'static str,
-    error_convert: fn(E) -> InferenceError,
-) -> Result<T, InferenceError> {
-    let elapsed = start.elapsed().as_secs_f64();
-    match &result {
-        Ok(_) => crate::metrics::record_api_call(model, label, elapsed),
-        Err(e) => {
-            crate::metrics::record_api_call(model, label, elapsed);
-            crate::metrics::record_api_error(model, error_label(e));
-        }
-    }
-    result.map_err(error_convert)
-}
-
 /// Try to list models via the API; fall back to the static known list on any
 /// error.  Used by provider implementations to gracefully degrade when the
 /// models endpoint is unreachable or the API key lacks permission.
@@ -200,6 +200,7 @@ mod tests {
     use super::*;
     use crate::accounts::AccountConfig;
     use crate::anthropic::AnthropicConfig;
+    use crate::mistral::MistralClient;
     use crate::openai::ServiceConfig;
 
     #[test]
@@ -301,5 +302,42 @@ mod tests {
         let models = provider.list_models().unwrap();
         assert!(!models.is_empty());
         assert!(models.contains(&"claude-sonnet-4-20250514".to_string()));
+    }
+
+    #[test]
+    fn from_mistral_constructs_provider() {
+        let config = crate::mistral::MistralConfig::default();
+        let client = MistralClient::new(config, "test-key".into()).unwrap();
+        let _provider = InferenceProvider::from_mistral(client);
+    }
+
+    #[test]
+    fn from_account_config_mistral_missing_key_errors() {
+        let cfg = AccountConfig {
+            name: "mistral".to_string(),
+            provider: "mistral".to_string(),
+            base_url: None,
+            streaming: None,
+            retry_max_attempts: None,
+            connect_timeout_secs: None,
+            request_timeout_secs: None,
+        };
+        let err = InferenceProvider::from_account_config(&cfg, None).unwrap_err();
+        assert!(err.contains("no API key"), "{err}");
+    }
+
+    #[test]
+    fn from_account_config_mistral_succeeds() {
+        let cfg = AccountConfig {
+            name: "mistral".to_string(),
+            provider: "mistral".to_string(),
+            base_url: None,
+            streaming: None,
+            retry_max_attempts: None,
+            connect_timeout_secs: None,
+            request_timeout_secs: None,
+        };
+        let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 }

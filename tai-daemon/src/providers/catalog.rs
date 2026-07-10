@@ -6,6 +6,7 @@ pub enum ProviderProtocol {
     OpenAiCompatible,
     AnthropicMessages,
     GoogleGenerativeAi,
+    Mistral,
 }
 
 /// Declares which reasoning parameter protocol a provider speaks.
@@ -102,7 +103,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
     ProviderEntry {
         slug: "mistral",
         display_name: "Mistral",
-        protocol: ProviderProtocol::OpenAiCompatible,
+        protocol: ProviderProtocol::Mistral,
         default_base_url: "https://api.mistral.ai/v1",
         default_model: "mistral-large-latest",
         reasoning: ReasoningSupport::ReasoningEffort,
@@ -283,6 +284,7 @@ impl fmt::Display for ProviderProtocol {
             ProviderProtocol::OpenAiCompatible => write!(f, "OpenAI-compatible"),
             ProviderProtocol::AnthropicMessages => write!(f, "Anthropic Messages"),
             ProviderProtocol::GoogleGenerativeAi => write!(f, "Google Generative AI"),
+            ProviderProtocol::Mistral => write!(f, "Mistral"),
         }
     }
 }
@@ -310,6 +312,7 @@ pub fn effective_reasoning_support(model: &str, provider: ReasoningSupport) -> R
                 || lower.starts_with("gpt-5")
                 || lower.contains("deepseek-reasoner")
                 || lower.contains("grok") && lower.contains("reasoning")
+                || lower.contains("mistral-large")
             {
                 ReasoningSupport::ReasoningEffort
             } else {

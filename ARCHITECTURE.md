@@ -15,9 +15,12 @@ over a Unix domain socket using a custom length-prefixed binary protocol.
 │ tai-dioxus   │◄──────────────────►│              │                ├──────────────────────┤
 │  (desktop)   │    Unix socket     │              │◄──────────────►│  Google Gemini API    │
 ├──────────────┤                    │              │                ├──────────────────────┤
-│   tai-im     │◄──────────────────►│              │◄──────────────►│  30+ OpenAI-compat    │
-│ (IM bridge)  │    Unix socket     │              │                │  providers via catalog│
+│   tai-im     │◄──────────────────►│              │◄──────────────►│  Mistral API          │
+│ (IM bridge)  │    Unix socket     │              │                ├──────────────────────┤
 └──────────────┘                    └──────────────┘                └──────────────────────┘
+                                                                    │  30+ OpenAI-compat    │
+                                                                    │  providers via catalog│
+                                                                    └──────────────────────┘
 ```
 
 ---
@@ -190,10 +193,12 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. |
-| `providers/` | `ProviderClient` trait + `ProviderCatalog` system. `InferenceProvider` struct wraps `Arc<dyn ProviderClient>`. Static `PROVIDER_CATALOG` maps ~30 slugs to protocol type, default base URL, and default model. Dispatches to the correct client based on protocol. |
+| `providers/` | `ProviderClient` trait + `ProviderCatalog` system. `InferenceProvider` struct wraps `Arc<dyn ProviderClient>`. Static `PROVIDER_CATALOG` maps ~31 slugs to protocol type, default base URL, and default model. Dispatches to the correct client based on protocol. |
+| `providers/shared.rs` | Shared provider infrastructure: `ProviderError` (unified error type used by all providers), `build_http_client()`, `error_type_label()`, `provider_error_to_inference()`, `timed_result()` (metrics instrumentation wrapper). Eliminates duplicated error types, `From<ProviderHttpError>` impls, and error conversion functions across provider implementations. |
 | `anthropic/` | Anthropic Messages API client (`AnthropicClient`). Implements `ProviderClient`. |
 | `google/` | Google Gemini API client (`GoogleClient`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
-| `retry/` | Shared HTTP retry logic extracted from the OpenAI module. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. Both `openai` and `anthropic` modules use this via their own error type conversions. |
+| `mistral/` | Mistral API client (`MistralClient`). Implements `ProviderClient`. Uses OpenAI-compatible SSE reader for streaming. |
+| `retry/` | Shared HTTP retry logic extracted from the OpenAI module. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. All provider modules use this via the shared `ProviderError` type conversion. |
 | `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Each session has a control thread; request work runs on separate worker threads. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
@@ -221,6 +226,7 @@ Each client implementation maps `ThinkingEffort` to its wire format:
 - **OpenAI**: `reasoning_effort` field (`"low"`, `"medium"`, `"high"`)
 - **Anthropic**: `thinking` block with `budget_tokens` (clamped to `max_tokens - 1024`)
 - **Google**: `thinkingConfig` with `includeThoughts: true`
+- **Mistral**: `reasoning_effort` field (`"low"`, `"medium"`, `"high"`)
 
 **2. `InferenceProvider` struct (`providers/mod.rs`):**
 ```rust
@@ -236,6 +242,7 @@ pub enum ProviderProtocol {
     OpenAiCompatible,
     AnthropicMessages,
     GoogleGenerativeAi,
+    Mistral,
 }
 ```
 
@@ -254,9 +261,10 @@ Currently supports ~30 providers. Adding a new OpenAI-compatible provider requir
 
 | Protocol | Providers |
 |---|---|
-| OpenAI-compatible | OpenAI, DeepSeek, xAI/Grok, Groq, Together AI, Mistral, Ollama (local/cloud), OpenRouter, HuggingFace, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, DashScope, Moonshot AI, Perplexity, Z.ai, Venice AI, Novita AI, LM Studio, OpenCode Zen, OpenCode Go, Atomic Chat, and custom OpenAI-compatible |
+| OpenAI-compatible | OpenAI, DeepSeek, xAI/Grok, Groq, Together AI, Ollama (local/cloud), OpenRouter, HuggingFace, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, DashScope, Moonshot AI, Perplexity, Z.ai, Venice AI, Novita AI, LM Studio, OpenCode Zen, OpenCode Go, Atomic Chat, and custom OpenAI-compatible |
 | Anthropic Messages | Anthropic Claude, MiniMax, custom Anthropic-compatible |
 | Google Generative AI | Google Gemini |
+| Mistral | Mistral |
 
 > **Note:** Amazon Bedrock support is deferred pending multi-field credential support (needs AWS access key + secret key + region).
 
@@ -654,9 +662,7 @@ and exits cleanly when the daemon shuts down.
 | `sessions.rs` — `run_request_worker` | `record_request_total`, `record_request_duration` | request status + latency |
 | `requests.rs` — `run_agent_loop` turn | `record_turn` | turn count per model |
 | `requests.rs` — `execute_tool_with_timeout` | `record_tool_execution` | tool duration + status |
-| `openai/requests.rs` — `chat_completion_turn_streaming` | `record_api_call`, `record_api_error` | API latency + errors |
-| `anthropic/mod.rs` — `chat_completion_turn_streaming` | `record_api_call`, `record_api_error` | API latency + errors |
-| `google/mod.rs` — `ProviderClient` impl | `record_api_call`, `record_api_error` | API latency + errors |
+| `providers/shared.rs` — `timed_result` | `record_api_call`, `record_api_error` | API latency + errors (all providers) |
 
 ---
 
@@ -778,8 +784,8 @@ User presses Enter on a session in the session manager
     endpoints, selectable per-model. This lets users route different models to their best-supported
     endpoint.
 
-12. **Pluggable providers via `InferenceProvider`** — the provider enum now supports both
-    OpenAI-compatible and Anthropic APIs. Each provider implements the same interface
+12. **Pluggable providers via `InferenceProvider`** — the provider system supports OpenAI-compatible,
+    Anthropic Messages, Google Gemini, and Mistral APIs. Each provider implements the same interface
     (`chat_completion_turn`, `chat_completion_turn_streaming`, `list_models`) and is constructed
     from an `AccountConfig` + credential. Accounts are defined in `accounts.toml` with a
     `provider` field (`"openai"`, `"opencode"`, `"anthropic"`, etc.). The TUI new-account form

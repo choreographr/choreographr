@@ -341,33 +341,36 @@ fn model_url_with_trailing_slash() {
 #[test]
 fn error_type_label_maps_correctly() {
     assert_eq!(
-        error_type_label(&GoogleError::Unauthorized {
+        crate::providers::shared::error_type_label(&GoogleError::Unauthorized {
             status: 401,
             detail: "bad key".into(),
         }),
         "unauthorized"
     );
     assert_eq!(
-        error_type_label(&GoogleError::RateLimited {
+        crate::providers::shared::error_type_label(&GoogleError::RateLimited {
             retry_after_secs: None,
             detail: "too many".into(),
         }),
         "rate_limited"
     );
     assert_eq!(
-        error_type_label(&GoogleError::ServerError {
+        crate::providers::shared::error_type_label(&GoogleError::ServerError {
             status: 500,
             detail: "oops".into(),
         }),
         "server_error"
     );
-    assert_eq!(error_type_label(&GoogleError::Cancelled), "cancelled");
     assert_eq!(
-        error_type_label(&GoogleError::Io(std::io::Error::other("oops"))),
+        crate::providers::shared::error_type_label(&GoogleError::Cancelled),
+        "cancelled"
+    );
+    assert_eq!(
+        crate::providers::shared::error_type_label(&GoogleError::Io(std::io::Error::other("oops"))),
         "other"
     );
     assert_eq!(
-        error_type_label(&GoogleError::EmptyResponse),
+        crate::providers::shared::error_type_label(&GoogleError::EmptyResponse),
         "empty_response"
     );
 }

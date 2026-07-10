@@ -3,39 +3,13 @@ use std::sync::mpsc;
 pub use crate::retry::{RetryCallback, RetryConfig};
 
 use super::{OpenAiError, ServiceConfig};
-use crate::retry::{self, ProviderHttpError};
+use crate::retry;
 
 pub(crate) fn retry_config_from_config(config: &ServiceConfig) -> RetryConfig {
     RetryConfig {
         max_attempts: config.retry_max_attempts,
         initial_backoff_ms: config.retry_initial_backoff_ms,
         max_backoff_ms: config.retry_max_backoff_ms,
-    }
-}
-
-impl From<ProviderHttpError> for OpenAiError {
-    fn from(err: ProviderHttpError) -> Self {
-        match err {
-            ProviderHttpError::Unauthorized { status, detail } => {
-                OpenAiError::Unauthorized { status, detail }
-            }
-            ProviderHttpError::RateLimited {
-                retry_after_secs,
-                detail,
-            } => OpenAiError::RateLimited {
-                retry_after_secs,
-                detail,
-            },
-            ProviderHttpError::ServerError { status, detail } => {
-                OpenAiError::ServerError { status, detail }
-            }
-            ProviderHttpError::ClientError { status, detail } => {
-                OpenAiError::ClientError { status, detail }
-            }
-            ProviderHttpError::EmptyResponse => OpenAiError::EmptyResponse,
-            ProviderHttpError::Cancelled => OpenAiError::Cancelled,
-            ProviderHttpError::Io(e) => OpenAiError::Io(e),
-        }
     }
 }
 

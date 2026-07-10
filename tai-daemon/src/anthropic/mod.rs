@@ -4,7 +4,6 @@ mod tests;
 
 use std::io;
 use std::sync::mpsc;
-use std::time::Duration;
 use tracing::{debug, warn};
 
 use serde::{Deserialize, Serialize};
@@ -70,65 +69,7 @@ impl AnthropicConfig {
 }
 
 /// Errors from the Anthropic Messages API.
-#[derive(Debug, thiserror::Error)]
-pub enum AnthropicError {
-    #[error("unauthorized ({status}): {detail}")]
-    Unauthorized { status: u16, detail: String },
-    #[error("rate limited: {detail}")]
-    RateLimited {
-        retry_after_secs: Option<u64>,
-        detail: String,
-    },
-    #[error("server error ({status}): {detail}")]
-    ServerError { status: u16, detail: String },
-    #[error("client error ({status}): {detail}")]
-    ClientError { status: u16, detail: String },
-    #[error("provider returned an empty response")]
-    EmptyResponse,
-    #[error("request cancelled during retry backoff")]
-    Cancelled,
-    #[error("{0}")]
-    Io(#[from] std::io::Error),
-}
-
-impl From<crate::retry::ProviderHttpError> for AnthropicError {
-    fn from(err: crate::retry::ProviderHttpError) -> Self {
-        match err {
-            crate::retry::ProviderHttpError::Unauthorized { status, detail } => {
-                AnthropicError::Unauthorized { status, detail }
-            }
-            crate::retry::ProviderHttpError::RateLimited {
-                retry_after_secs,
-                detail,
-            } => AnthropicError::RateLimited {
-                retry_after_secs,
-                detail,
-            },
-            crate::retry::ProviderHttpError::ServerError { status, detail } => {
-                AnthropicError::ServerError { status, detail }
-            }
-            crate::retry::ProviderHttpError::ClientError { status, detail } => {
-                AnthropicError::ClientError { status, detail }
-            }
-            crate::retry::ProviderHttpError::EmptyResponse => AnthropicError::EmptyResponse,
-            crate::retry::ProviderHttpError::Cancelled => AnthropicError::Cancelled,
-            crate::retry::ProviderHttpError::Io(e) => AnthropicError::Io(e),
-        }
-    }
-}
-
-/// Map an Anthropic error to a stable label for metrics.
-pub(crate) fn error_type_label(e: &AnthropicError) -> &'static str {
-    match e {
-        AnthropicError::Unauthorized { .. } => "unauthorized",
-        AnthropicError::RateLimited { .. } => "rate_limited",
-        AnthropicError::ServerError { .. } => "server_error",
-        AnthropicError::ClientError { .. } => "client_error",
-        AnthropicError::EmptyResponse => "empty_response",
-        AnthropicError::Cancelled => "cancelled",
-        AnthropicError::Io(_) => "other",
-    }
-}
+pub use crate::providers::shared::ProviderError as AnthropicError;
 
 /// The Anthropic Messages API client.
 #[derive(Clone, Debug)]
@@ -160,14 +101,7 @@ impl ProviderClient for AnthropicClient {
         let api_start = std::time::Instant::now();
         let result =
             self.chat_completion_turn(model, messages, tools, thinking_effort, on_retry, cancel_rx);
-        crate::providers::timed_result(
-            api_start,
-            model,
-            "anthropic",
-            result,
-            error_type_label,
-            anthropic_error_to_inference,
-        )
+        crate::providers::shared::timed_result(api_start, model, "anthropic", result)
     }
 
     fn chat_completion_turn_streaming(
@@ -190,53 +124,21 @@ impl ProviderClient for AnthropicClient {
             cancel_rx,
             on_chunk,
         );
-        crate::providers::timed_result(
-            api_start,
-            model,
-            "anthropic",
-            result,
-            error_type_label,
-            anthropic_error_to_inference,
-        )
+        crate::providers::shared::timed_result(api_start, model, "anthropic", result)
     }
 
     fn list_models(&self) -> Result<Vec<String>, InferenceError> {
         let result = self.validate_and_list_models();
-        result.map_err(anthropic_error_to_inference)
-    }
-}
-
-fn anthropic_error_to_inference(e: AnthropicError) -> InferenceError {
-    match e {
-        AnthropicError::Unauthorized { status, detail } => {
-            InferenceError::Unauthorized { status, detail }
-        }
-        AnthropicError::RateLimited {
-            retry_after_secs,
-            detail,
-        } => InferenceError::RateLimited {
-            retry_after_secs,
-            detail,
-        },
-        AnthropicError::ServerError { status, detail } => {
-            InferenceError::ServerError { status, detail }
-        }
-        AnthropicError::ClientError { status, detail } => {
-            InferenceError::ClientError { status, detail }
-        }
-        AnthropicError::EmptyResponse => InferenceError::EmptyResponse,
-        AnthropicError::Cancelled => InferenceError::Cancelled,
-        AnthropicError::Io(e) => InferenceError::Io(e.to_string()),
+        result.map_err(crate::providers::shared::provider_error_to_inference)
     }
 }
 
 impl AnthropicClient {
     pub fn new(config: AnthropicConfig, api_key: String) -> io::Result<Self> {
-        let http = reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-            .timeout(Duration::from_secs(config.request_timeout_secs))
-            .build()
-            .map_err(io::Error::other)?;
+        let http = crate::providers::shared::build_http_client(
+            config.connect_timeout_secs,
+            config.request_timeout_secs,
+        )?;
         Ok(Self {
             config,
             api_key,
