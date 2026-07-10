@@ -14,4 +14,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 frankenstein = { version = "0.50", features = ["client-ureq"] }
 ammonia.workspace = true
-tempfile = "3"
+tempfile.workspace = true

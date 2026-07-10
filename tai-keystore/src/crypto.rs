@@ -7,7 +7,6 @@ use aes_gcm::{
 use argon2::Argon2;
 use hkdf::Hkdf;
 use rand::Rng;
-use rand_core::OsRng;
 use sha2::Sha256;
 use tracing::{debug, trace};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -18,7 +17,7 @@ const KEY_LEN: usize = 32;
 
 /// Generate a new X25519 keypair. Returns (secret, public).
 pub fn generate_keypair() -> ([u8; 32], [u8; 32]) {
-    let secret = StaticSecret::random_from_rng(OsRng);
+    let secret = StaticSecret::random_from_rng(&mut rand::rng());
     let public = PublicKey::from(&secret);
     let pk_bytes = public.to_bytes();
     trace!(?pk_bytes, "generated new X25519 keypair");
@@ -65,7 +64,7 @@ pub fn encrypt_with_public_key(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, KeystoreError> {
     debug!(pt_len = plaintext.len(), "encrypting with public key");
-    let eph_secret = StaticSecret::random_from_rng(OsRng);
+    let eph_secret = StaticSecret::random_from_rng(&mut rand::rng());
     let eph_public = PublicKey::from(&eph_secret);
     let recipient = PublicKey::from(*pub_key);
 

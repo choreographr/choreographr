@@ -43,7 +43,7 @@ tracing-subscriber.workspace = true
 prometheus = { version = "0.14", features = ["process"] }
 tiny_http = "0.12"
 ckb-vm = { version = "0.24.14", features = ["asm", "detect-asm"] }
-tempfile = "3"
+tempfile.workspace = true
 postcard.workspace = true
 
 [dev-dependencies]
