@@ -693,10 +693,13 @@ fn inline_plain_text(inlines: &[MarkdownInline]) -> String {
 fn append_inline_plain_text(inlines: &[MarkdownInline], text: &mut String) {
     for inline in inlines {
         match inline {
-            MarkdownInline::Text(value) | MarkdownInline::Code(value) => text.push_str(value),
-            MarkdownInline::Emphasis(content) | MarkdownInline::Strong(content) => {
-                append_inline_plain_text(content, text)
-            }
+            MarkdownInline::Text(value)
+            | MarkdownInline::Code(value)
+            | MarkdownInline::InlineMath(value)
+            | MarkdownInline::DisplayMath(value) => text.push_str(value),
+            MarkdownInline::Strikethrough(content)
+            | MarkdownInline::Emphasis(content)
+            | MarkdownInline::Strong(content) => append_inline_plain_text(content, text),
             MarkdownInline::Link {
                 content,
                 destination,
@@ -814,7 +817,9 @@ fn render_inlines_to_lines(
                     width,
                 );
             }
-            MarkdownInline::Code(text) => {
+            MarkdownInline::Code(text)
+            | MarkdownInline::InlineMath(text)
+            | MarkdownInline::DisplayMath(text) => {
                 render_code_inline(
                     text,
                     lines,
@@ -825,7 +830,9 @@ fn render_inlines_to_lines(
                     width,
                 );
             }
-            MarkdownInline::Emphasis(content) | MarkdownInline::Strong(content) => {
+            MarkdownInline::Strikethrough(content)
+            | MarkdownInline::Emphasis(content)
+            | MarkdownInline::Strong(content) => {
                 render_style_inline(
                     content,
                     lines,

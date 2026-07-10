@@ -1,60 +1,115 @@
+use std::fmt::{self, Display, Formatter};
+use std::str::FromStr;
+use std::sync::OnceLock;
+
 use ammonia::Builder as HtmlSanitizer;
 use pulldown_cmark::{
     Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html,
 };
 
+/// A parsed Markdown document, represented as an ordered list of block-level nodes.
+///
+/// Use [`MarkdownDocument::parse`] to build a document from a raw markdown string,
+/// then call [`MarkdownDocument::to_markdown`] or [`MarkdownDocument::to_html`]
+/// to serialize it back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownDocument {
+    /// The top-level block nodes in document order.
     pub blocks: Vec<MarkdownBlock>,
 }
 
+/// A block-level node in a Markdown document.
+///
+/// Each variant holds its own typed children, forming a recursive tree structure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkdownBlock {
+    /// A plain paragraph of inline content.
     Paragraph(Vec<MarkdownInline>),
+    /// A section heading.
     Heading {
+        /// The heading level (1–6).
         level: u8,
+        /// The inline content of the heading.
         content: Vec<MarkdownInline>,
     },
+    /// A fenced or indented code block.
     CodeBlock {
+        /// The language annotation, if any (e.g. `"rust"` for `` ```rust ```).
         language: Option<String>,
+        /// The raw code text.
         code: String,
     },
+    /// A block quote containing nested blocks.
     BlockQuote(Vec<MarkdownBlock>),
+    /// A list (ordered or unordered).
     List {
+        /// Whether the list uses numeric ordering.
         ordered: bool,
+        /// The starting index for an ordered list (1-based).
         start: usize,
+        /// The list items, each a sequence of blocks.
         items: Vec<Vec<MarkdownBlock>>,
     },
+    /// A table with optional column alignment.
     Table {
+        /// Per-column alignment hints.
         alignments: Vec<MarkdownAlignment>,
+        /// The header row cells.
         header: Vec<Vec<MarkdownInline>>,
+        /// The data rows.
         rows: Vec<Vec<Vec<MarkdownInline>>>,
     },
+    /// A thematic break (`---`, `***`, `___`).
     Rule,
 }
 
+/// Column alignment for a table cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkdownAlignment {
+    /// No explicit alignment (default).
     None,
+    /// Left-aligned.
     Left,
+    /// Center-aligned.
     Center,
+    /// Right-aligned.
     Right,
 }
 
+/// An inline node within a Markdown block.
+///
+/// Inline nodes can be nested (e.g. emphasis inside bold inside a link).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkdownInline {
+    /// Plain text.
     Text(String),
+    /// Inline code (backtick-delimited).
     Code(String),
+    /// Inline math (`$...$`).
+    InlineMath(String),
+    /// Display math (`$$...$$`).
+    DisplayMath(String),
+    /// Strikethrough text (`~~text~~`).
+    Strikethrough(Vec<MarkdownInline>),
+    /// Emphasized text (`*text*` or `_text_`).
     Emphasis(Vec<MarkdownInline>),
+    /// Strongly emphasized text (`**text**` or `__text__`).
     Strong(Vec<MarkdownInline>),
+    /// A hyperlink.
     Link {
+        /// The link text.
         content: Vec<MarkdownInline>,
+        /// The URL destination.
         destination: String,
     },
+    /// An image.
     Image {
+        /// The alt text.
         alt: Vec<MarkdownInline>,
+        /// The image URL.
         destination: String,
     },
+    /// A line break.
     LineBreak,
 }
 
@@ -90,6 +145,7 @@ enum BlockContext {
 enum InlineContext {
     Emphasis(Vec<MarkdownInline>),
     Strong(Vec<MarkdownInline>),
+    Strikethrough(Vec<MarkdownInline>),
     Link {
         destination: String,
         content: Vec<MarkdownInline>,
@@ -100,6 +156,10 @@ enum InlineContext {
     },
 }
 
+/// Parse a markdown string and render it to sanitized HTML in one step.
+///
+/// This is a convenience function that combines parsing and HTML rendering.
+/// It sanitizes the output with [`ammonia`] to prevent XSS attacks.
 pub fn render_markdown_html(input: &str) -> String {
     let mut html_output = String::new();
     html::push_html(&mut html_output, Parser::new_ext(input, markdown_options()));
@@ -107,6 +167,10 @@ pub fn render_markdown_html(input: &str) -> String {
 }
 
 impl MarkdownDocument {
+    /// Parse a raw markdown string into an AST.
+    ///
+    /// Uses `pulldown-cmark` with a curated set of extensions enabled.
+    /// The returned document can be inspected, modified, and re-serialized.
     pub fn parse(input: &str) -> Self {
         let parser = Parser::new_ext(input, markdown_options());
         let mut blocks = Vec::new();
@@ -156,6 +220,9 @@ impl MarkdownDocument {
                     Tag::TableCell => block_stack.push(BlockContext::TableCell(Vec::new())),
                     Tag::Emphasis => inline_stack.push(InlineContext::Emphasis(Vec::new())),
                     Tag::Strong => inline_stack.push(InlineContext::Strong(Vec::new())),
+                    Tag::Strikethrough => {
+                        inline_stack.push(InlineContext::Strikethrough(Vec::new()))
+                    }
                     Tag::Link { dest_url, .. } => inline_stack.push(InlineContext::Link {
                         destination: dest_url.to_string(),
                         content: Vec::new(),
@@ -271,10 +338,17 @@ impl MarkdownDocument {
                         }
                     }
                     TagEnd::TableCell => {
-                        if let Some(BlockContext::TableCell(cell)) = block_stack.pop()
-                            && let Some(BlockContext::TableRow(row)) = block_stack.last_mut()
-                        {
-                            row.push(cell);
+                        if let Some(BlockContext::TableCell(cell)) = block_stack.pop() {
+                            // Header cells in pulldown-cmark sit directly under
+                            // TableHead without a wrapping TableRow, so fall back
+                            // to pushing directly into the table's header row.
+                            if let Some(BlockContext::TableRow(row)) = block_stack.last_mut() {
+                                row.push(cell);
+                            } else if let Some(BlockContext::Table { header, .. }) =
+                                block_stack.last_mut()
+                            {
+                                header.push(cell);
+                            }
                         }
                     }
                     TagEnd::Emphasis => {
@@ -292,6 +366,15 @@ impl MarkdownDocument {
                                 &mut block_stack,
                                 &mut inline_stack,
                                 MarkdownInline::Strong(content),
+                            );
+                        }
+                    }
+                    TagEnd::Strikethrough => {
+                        if let Some(InlineContext::Strikethrough(content)) = inline_stack.pop() {
+                            push_inline(
+                                &mut block_stack,
+                                &mut inline_stack,
+                                MarkdownInline::Strikethrough(content),
                             );
                         }
                     }
@@ -337,9 +420,16 @@ impl MarkdownDocument {
                     MarkdownInline::LineBreak,
                 ),
                 Event::Rule => push_block(&mut blocks, &mut block_stack, MarkdownBlock::Rule),
-                Event::InlineMath(text) | Event::DisplayMath(text) => {
-                    push_text(&mut block_stack, &mut inline_stack, &text)
-                }
+                Event::InlineMath(text) => push_inline(
+                    &mut block_stack,
+                    &mut inline_stack,
+                    MarkdownInline::InlineMath(text.to_string()),
+                ),
+                Event::DisplayMath(text) => push_inline(
+                    &mut block_stack,
+                    &mut inline_stack,
+                    MarkdownInline::DisplayMath(text.to_string()),
+                ),
                 Event::FootnoteReference(text) => {
                     push_text(&mut block_stack, &mut inline_stack, &format!("[{text}]"))
                 }
@@ -354,10 +444,17 @@ impl MarkdownDocument {
         Self { blocks }
     }
 
+    /// Convert the AST back to markdown, then render that to sanitized HTML.
+    ///
+    /// This is useful when you need to modify the AST and then produce HTML output.
     pub fn to_html(&self) -> String {
         render_markdown_html(&self.to_markdown())
     }
 
+    /// Serialize the AST back to a markdown string.
+    ///
+    /// The output uses `*` for emphasis, `**` for strong, and standard GFM
+    /// formatting throughout.
     pub fn to_markdown(&self) -> String {
         let mut markdown = String::new();
         for (index, block) in self.blocks.iter().enumerate() {
@@ -370,15 +467,43 @@ impl MarkdownDocument {
     }
 }
 
+impl Display for MarkdownDocument {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_markdown())
+    }
+}
+
+impl FromStr for MarkdownDocument {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::parse(s))
+    }
+}
+
 fn markdown_options() -> Options {
-    Options::all()
+    // Enable a curated set of extensions that we handle explicitly in the AST.
+    // Features like YAML metadata blocks, plus-delimited metadata, and definition
+    // lists are excluded because they either have no structural representation in
+    // our AST or are rare in the primary use case (LLM-generated markdown).
+    Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_SMART_PUNCTUATION
+        | Options::ENABLE_MATH
+        | Options::ENABLE_HEADING_ATTRIBUTES
 }
 
 fn sanitize_html(html: &str) -> String {
-    let mut sanitizer = HtmlSanitizer::default();
-    sanitizer.add_tags(["table", "thead", "tbody", "tr", "th", "td"]);
-    sanitizer.add_tag_attributes("th", ["align"]);
-    sanitizer.add_tag_attributes("td", ["align"]);
+    static SANITIZER: OnceLock<HtmlSanitizer> = OnceLock::new();
+    let sanitizer = SANITIZER.get_or_init(|| {
+        let mut s = HtmlSanitizer::default();
+        s.add_tags(["table", "thead", "tbody", "tr", "th", "td"]);
+        s.add_tag_attributes("th", ["align"]);
+        s.add_tag_attributes("td", ["align"]);
+        s
+    });
     sanitizer.clean(html).to_string()
 }
 
@@ -403,19 +528,9 @@ fn heading_level(level: HeadingLevel) -> u8 {
 }
 
 fn push_block(root: &mut Vec<MarkdownBlock>, stack: &mut [BlockContext], block: MarkdownBlock) {
-    if let Some(context) = stack.last_mut() {
-        match context {
-            BlockContext::Quote(blocks) | BlockContext::Item(blocks) => blocks.push(block),
-            BlockContext::List { .. }
-            | BlockContext::Paragraph(_)
-            | BlockContext::Heading { .. }
-            | BlockContext::CodeBlock { .. }
-            | BlockContext::Table { .. }
-            | BlockContext::TableRow(_)
-            | BlockContext::TableCell(_) => root.push(block),
-        }
-    } else {
-        root.push(block);
+    match stack.last_mut() {
+        Some(BlockContext::Quote(blocks) | BlockContext::Item(blocks)) => blocks.push(block),
+        _ => root.push(block),
     }
 }
 
@@ -434,33 +549,50 @@ fn push_inline(
     inline_stack: &mut [InlineContext],
     inline: MarkdownInline,
 ) {
+    // If there's an open inline formatting context, push into that first.
     if let Some(context) = inline_stack.last_mut() {
         match context {
             InlineContext::Emphasis(content)
             | InlineContext::Strong(content)
+            | InlineContext::Strikethrough(content)
             | InlineContext::Link { content, .. }
             | InlineContext::Image { alt: content, .. } => content.push(inline),
         }
         return;
     }
 
+    // Otherwise route the inline into the active block context.
     if let Some(context) = block_stack.last_mut() {
         match context {
             BlockContext::Paragraph(content)
             | BlockContext::Heading { content, .. }
             | BlockContext::TableCell(content) => content.push(inline),
-            BlockContext::Item(blocks) => item_paragraph_inlines(blocks).push(inline),
+            BlockContext::Item(blocks) => {
+                // List items wrap inline content in a Paragraph block.
+                // Ensure one exists so we have somewhere to push.
+                if !matches!(blocks.last(), Some(MarkdownBlock::Paragraph(_))) {
+                    blocks.push(MarkdownBlock::Paragraph(Vec::new()));
+                }
+                // At this point the last block is guaranteed to be a Paragraph.
+                if let Some(MarkdownBlock::Paragraph(content)) = blocks.last_mut() {
+                    content.push(inline);
+                }
+            }
             BlockContext::CodeBlock { code, .. } => match inline {
-                MarkdownInline::Text(text) | MarkdownInline::Code(text) => code.push_str(&text),
+                MarkdownInline::Text(text)
+                | MarkdownInline::Code(text)
+                | MarkdownInline::InlineMath(text)
+                | MarkdownInline::DisplayMath(text) => code.push_str(&text),
                 MarkdownInline::LineBreak => code.push('\n'),
-                MarkdownInline::Emphasis(content)
+                MarkdownInline::Strikethrough(content)
+                | MarkdownInline::Emphasis(content)
                 | MarkdownInline::Strong(content)
                 | MarkdownInline::Link { content, .. }
                 | MarkdownInline::Image { alt: content, .. } => {
-                    let text = inline_text(&content);
-                    code.push_str(&text);
+                    code.push_str(&inline_text(&content));
                 }
             },
+            // Quote, List, Table, and TableRow contexts don't accept inlines directly.
             BlockContext::Quote(_)
             | BlockContext::List { .. }
             | BlockContext::Table { .. }
@@ -469,24 +601,20 @@ fn push_inline(
     }
 }
 
-fn item_paragraph_inlines(blocks: &mut Vec<MarkdownBlock>) -> &mut Vec<MarkdownInline> {
-    let needs_paragraph = !matches!(blocks.last(), Some(MarkdownBlock::Paragraph(_)));
-    if needs_paragraph {
-        blocks.push(MarkdownBlock::Paragraph(Vec::new()));
-    }
-
-    match blocks.last_mut() {
-        Some(MarkdownBlock::Paragraph(content)) => content,
-        _ => unreachable!("item paragraphs are created on demand"),
-    }
-}
-
+/// Extract the plain text content from a sequence of inline nodes.
+///
+/// Recursively flattens all inline formatting (emphasis, links, etc.)
+/// and returns only the raw text without any markdown delimiters.
 pub fn inline_text(inlines: &[MarkdownInline]) -> String {
     let mut text = String::new();
     for inline in inlines {
         match inline {
-            MarkdownInline::Text(value) | MarkdownInline::Code(value) => text.push_str(value),
-            MarkdownInline::Emphasis(content)
+            MarkdownInline::Text(value)
+            | MarkdownInline::Code(value)
+            | MarkdownInline::InlineMath(value)
+            | MarkdownInline::DisplayMath(value) => text.push_str(value),
+            MarkdownInline::Strikethrough(content)
+            | MarkdownInline::Emphasis(content)
             | MarkdownInline::Strong(content)
             | MarkdownInline::Link { content, .. }
             | MarkdownInline::Image { alt: content, .. } => text.push_str(&inline_text(content)),
@@ -582,9 +710,7 @@ fn write_markdown_block(block: &MarkdownBlock, markdown: &mut String) {
                     MarkdownAlignment::Center => ":---:",
                     MarkdownAlignment::Right => "---:",
                 };
-                markdown.push(' ');
                 markdown.push_str(separator);
-                markdown.push(' ');
                 markdown.push('|');
             }
             for row in rows {
@@ -614,6 +740,21 @@ fn write_markdown_inlines(inlines: &[MarkdownInline], markdown: &mut String) {
                 markdown.push('`');
                 markdown.push_str(code);
                 markdown.push('`');
+            }
+            MarkdownInline::InlineMath(text) => {
+                markdown.push('$');
+                markdown.push_str(text);
+                markdown.push('$');
+            }
+            MarkdownInline::DisplayMath(text) => {
+                markdown.push_str("$$");
+                markdown.push_str(text);
+                markdown.push_str("$$");
+            }
+            MarkdownInline::Strikethrough(content) => {
+                markdown.push_str("~~");
+                write_markdown_inlines(content, markdown);
+                markdown.push_str("~~");
             }
             MarkdownInline::Emphasis(content) => {
                 markdown.push('*');
@@ -752,5 +893,84 @@ mod tests {
         assert!(html.contains("<table>"));
         assert!(html.contains("<td>Ada</td>"));
         assert!(html.contains("<td>Grace</td>"));
+    }
+
+    #[test]
+    fn markdown_round_trip_paragraph() {
+        let input = "Hello **world**.";
+        let doc = MarkdownDocument::parse(input);
+        assert_eq!(doc.to_markdown(), input);
+    }
+
+    #[test]
+    fn markdown_round_trip_heading() {
+        let input = "# Heading\n\n## Subheading\n\n### Deep";
+        let doc = MarkdownDocument::parse(input);
+        assert_eq!(doc.to_markdown(), input);
+    }
+
+    #[test]
+    fn markdown_round_trip_code_block() {
+        let input = "```rust\nfn main() {\n    println!(\"hi\");\n}\n```";
+        let doc = MarkdownDocument::parse(input);
+        assert_eq!(doc.to_markdown(), input);
+    }
+
+    #[test]
+    fn markdown_round_trip_list() {
+        let input = "- one\n- two\n- three";
+        let doc = MarkdownDocument::parse(input);
+        assert_eq!(doc.to_markdown(), input);
+    }
+
+    #[test]
+    fn markdown_round_trip_table() {
+        let input = "| Name | Role |\n|---|---|\n| Ada | Math |\n| Grace | CS |";
+        let doc = MarkdownDocument::parse(input);
+        assert_eq!(doc.to_markdown(), input);
+    }
+
+    #[test]
+    fn markdown_round_trip_strikethrough() {
+        let input = "~~struck~~";
+        let doc = MarkdownDocument::parse(input);
+        assert_eq!(doc.to_markdown(), input);
+    }
+
+    #[test]
+    fn markdown_parser_supports_strikethrough() {
+        let document = MarkdownDocument::parse("~~struck~~");
+
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(content[0], MarkdownInline::Strikethrough(_)));
+        assert_eq!(inline_text(content), "struck");
+    }
+
+    #[test]
+    fn markdown_round_trip_math() {
+        let input = "$x^2$";
+        let doc = MarkdownDocument::parse(input);
+        assert_eq!(doc.to_markdown(), input);
+    }
+
+    #[test]
+    fn markdown_parser_supports_math() {
+        let document = MarkdownDocument::parse("$x^2$ and $$\\sum$$");
+
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert!(matches!(content[0], MarkdownInline::InlineMath(_)));
+        assert!(matches!(content[2], MarkdownInline::DisplayMath(_)));
+        assert_eq!(inline_text(content), "x^2 and \\sum");
+    }
+
+    #[test]
+    fn markdown_display_from_str() {
+        let input = "# Hello\n\nWorld.";
+        let doc: MarkdownDocument = input.parse().unwrap();
+        assert_eq!(doc.to_string(), input);
     }
 }
