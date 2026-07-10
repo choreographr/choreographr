@@ -2,7 +2,7 @@ use anyhow::{Context, bail};
 use std::env;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
-use tai_proto::{ClientMessage, DaemonMessage, read_message_sync, socket_path, write_message_sync};
+use tai_proto::{ClientMessage, DaemonMessage, read_message, socket_path, write_message};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -45,7 +45,7 @@ fn main() -> anyhow::Result<()> {
         let private_key = tai_keystore::crypto::decrypt_private_key(&enc_data, passphrase)
             .context("failed to decrypt private key")?;
         let private_key_vec: Vec<u8> = private_key.to_vec();
-        write_message_sync(
+        write_message(
             &mut writer,
             &ClientMessage::Unlock {
                 private_key: private_key_vec,
@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         )
         .context("failed to send unlock message")?;
         writer.flush().context("failed to flush unlock message")?;
-        match read_message_sync::<_, DaemonMessage>(&mut reader) {
+        match read_message::<_, DaemonMessage>(&mut reader) {
             Ok(DaemonMessage::Unlocked) => {
                 info!("daemon unlocked");
             }
@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     info!(%platform, "requesting credential from daemon");
-    write_message_sync(
+    write_message(
         &mut writer,
         &ClientMessage::GetCredential {
             service: platform.clone(),
@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
     writer
         .flush()
         .context("failed to flush credential request")?;
-    match read_message_sync::<_, DaemonMessage>(&mut reader) {
+    match read_message::<_, DaemonMessage>(&mut reader) {
         Ok(DaemonMessage::Credential {
             key: Some(bot_token),
             ..

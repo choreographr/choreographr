@@ -139,7 +139,7 @@ pub fn run_server(
     for stream in client_streams.iter() {
         if let Ok(writer) = stream.try_clone() {
             let mut writer = BufWriter::new(writer);
-            let _ = tai_proto::write_message_sync(&mut writer, &DaemonMessage::ShuttingDown);
+            let _ = tai_proto::write_message(&mut writer, &DaemonMessage::ShuttingDown);
         }
         let _ = stream.shutdown(Shutdown::Both);
     }

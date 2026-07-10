@@ -14,7 +14,7 @@ pub(crate) fn socket_path_impl(get_env: impl Fn() -> Option<String>) -> String {
     get_env().unwrap_or_else(|| DEFAULT_SOCKET_PATH.to_string())
 }
 
-pub fn write_message_sync<W, T>(writer: &mut W, message: &T) -> Result<(), ProtoError>
+pub fn write_message<W, T>(writer: &mut W, message: &T) -> Result<(), ProtoError>
 where
     W: Write,
     T: Serialize,
@@ -24,16 +24,16 @@ where
     Ok(())
 }
 
-pub fn read_message_sync<R, T>(reader: &mut R) -> Result<T, ProtoError>
+pub fn read_message<R, T>(reader: &mut R) -> Result<T, ProtoError>
 where
     R: Read,
     T: for<'de> Deserialize<'de>,
 {
-    let payload = read_payload_sync(reader)?;
+    let payload = read_payload(reader)?;
     decode_frame(&payload)
 }
 
-pub fn read_payload_sync<R>(reader: &mut R) -> Result<Vec<u8>, ProtoError>
+pub fn read_payload<R>(reader: &mut R) -> Result<Vec<u8>, ProtoError>
 where
     R: Read,
 {

@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use tai_proto::{DaemonMessage, ProtoError, read_message_sync, write_message_sync};
+use tai_proto::{DaemonMessage, ProtoError, read_message, write_message};
 use tracing::{debug, info, warn};
 
 /// Read DaemonMessages from `reader` in a blocking loop, calling
@@ -18,7 +18,7 @@ pub fn run_daemon_reader<R: BufRead>(
 ) -> Result<(), ClientError> {
     loop {
         debug!("daemon reader waiting for message");
-        match read_message_sync::<_, DaemonMessage>(&mut reader) {
+        match read_message::<_, DaemonMessage>(&mut reader) {
             Ok(message) => {
                 debug!("received daemon message");
                 handle_daemon_message(message);
@@ -59,7 +59,7 @@ pub fn run_daemon_connection(
         loop {
             match from_ui.recv_timeout(SHUTDOWN_POLL_INTERVAL) {
                 Ok(msg) => {
-                    if let Err(e) = write_message_sync(&mut writer, &msg) {
+                    if let Err(e) = write_message(&mut writer, &msg) {
                         warn!("writer thread write error: {e}");
                         break;
                     }

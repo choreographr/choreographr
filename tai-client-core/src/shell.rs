@@ -334,10 +334,10 @@ fn parse_command(
                 ));
             }
         };
-        return ShellCommand::Send(ClientMessage::set_reasoning_effort(effort));
+        return ShellCommand::Send(ClientMessage::SetReasoningEffort { effort });
     }
     if rest == "reasoning" {
-        return ShellCommand::Send(ClientMessage::get_reasoning_effort());
+        return ShellCommand::Send(ClientMessage::GetReasoningEffort);
     }
 
     ShellCommand::UnknownCommand(format!("unknown command: /{rest}"))

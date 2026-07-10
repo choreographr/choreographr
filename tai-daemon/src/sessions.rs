@@ -835,7 +835,7 @@ fn process_command(
                 );
                 broadcast(
                     &state.subscribers,
-                    DaemonMessage::reasoning_effort_set(effort),
+                    DaemonMessage::ReasoningEffortSet { effort },
                 );
             } else {
                 let model = state.selected_model.as_deref().unwrap_or("(none)");
@@ -847,7 +847,10 @@ fn process_command(
                 warn!(session_id, error = %msg, "reasoning effort rejected");
                 broadcast(
                     &state.subscribers,
-                    DaemonMessage::reasoning_effort_set_failed(effort.as_label(), msg),
+                    DaemonMessage::ReasoningEffortSetFailed {
+                        effort: effort.as_label().to_string(),
+                        error: msg,
+                    },
                 );
             }
             false

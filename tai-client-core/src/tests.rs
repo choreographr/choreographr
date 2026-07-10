@@ -535,7 +535,7 @@ fn reasoning_get() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning", &mut next, None),
-        ShellCommand::Send(ClientMessage::get_reasoning_effort())
+        ShellCommand::Send(ClientMessage::GetReasoningEffort)
     );
     assert_eq!(next, 3);
 }
@@ -545,7 +545,9 @@ fn reasoning_set_off() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning off", &mut next, None),
-        ShellCommand::Send(ClientMessage::set_reasoning_effort(ThinkingEffort::Off))
+        ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: ThinkingEffort::Off
+        })
     );
     assert_eq!(next, 3);
 }
@@ -555,7 +557,9 @@ fn reasoning_set_low() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning low", &mut next, None),
-        ShellCommand::Send(ClientMessage::set_reasoning_effort(ThinkingEffort::Low))
+        ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: ThinkingEffort::Low
+        })
     );
     assert_eq!(next, 3);
 }
@@ -565,7 +569,9 @@ fn reasoning_set_medium() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning medium", &mut next, None),
-        ShellCommand::Send(ClientMessage::set_reasoning_effort(ThinkingEffort::Medium))
+        ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: ThinkingEffort::Medium
+        })
     );
     assert_eq!(next, 3);
 }
@@ -575,7 +581,9 @@ fn reasoning_set_high() {
     let mut next = 3;
     assert_eq!(
         parse_input_line("/reasoning high", &mut next, None),
-        ShellCommand::Send(ClientMessage::set_reasoning_effort(ThinkingEffort::High))
+        ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: ThinkingEffort::High
+        })
     );
     assert_eq!(next, 3);
 }

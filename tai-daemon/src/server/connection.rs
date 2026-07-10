@@ -4,7 +4,7 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use tai_proto::{
-    ClientMessage, DaemonMessage, ProtoError, ThinkingEffort, read_message_sync, write_message_sync,
+    ClientMessage, DaemonMessage, ProtoError, ThinkingEffort, read_message, write_message,
 };
 use tracing::{debug, error, info, warn};
 
@@ -18,7 +18,7 @@ pub(crate) fn client_thread(
     let (writer_tx, writer_rx) = mpsc::channel::<DaemonMessage>();
     let writer_handle = std::thread::spawn(move || {
         for msg in writer_rx {
-            if write_message_sync(&mut writer, &msg).is_err() {
+            if write_message(&mut writer, &msg).is_err() {
                 break;
             }
             let _ = writer.flush();
@@ -33,7 +33,7 @@ pub(crate) fn client_thread(
 
     let mut reader = reader;
     loop {
-        match read_message_sync::<_, ClientMessage>(&mut reader) {
+        match read_message::<_, ClientMessage>(&mut reader) {
             Ok(msg) => {
                 match msg {
                     ClientMessage::CreateSession {
@@ -178,10 +178,10 @@ pub(crate) fn client_thread(
                         if let Some(ref tx) = attached_session_tx {
                             let _ = tx.send(SessionCommand::SetReasoningEffort { effort });
                         } else {
-                            let _ = writer_tx.send(DaemonMessage::reasoning_effort_set_failed(
-                                effort.as_label(),
-                                "no session attached",
-                            ));
+                            let _ = writer_tx.send(DaemonMessage::ReasoningEffortSetFailed {
+                                effort: effort.as_label().to_string(),
+                                error: "no session attached".to_string(),
+                            });
                         }
                     }
                     ClientMessage::GetReasoningEffort => {
@@ -189,11 +189,13 @@ pub(crate) fn client_thread(
                             let (reply, rx) = mpsc::channel();
                             let _ = tx.send(SessionCommand::GetReasoningEffort { reply });
                             if let Ok(effort) = rx.recv() {
-                                let _ = writer_tx.send(DaemonMessage::reasoning_effort_set(effort));
+                                let _ =
+                                    writer_tx.send(DaemonMessage::ReasoningEffortSet { effort });
                             }
                         } else {
-                            let _ = writer_tx
-                                .send(DaemonMessage::reasoning_effort_set(ThinkingEffort::Off));
+                            let _ = writer_tx.send(DaemonMessage::ReasoningEffortSet {
+                                effort: ThinkingEffort::Off,
+                            });
                         }
                     }
                     ClientMessage::Unlock { private_key } => {

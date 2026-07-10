@@ -3,7 +3,7 @@ use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use tai_client_core::{ImageAssembler, StreamingText};
-use tai_proto::{ClientMessage, DaemonMessage, ImageMetadata, write_message_sync};
+use tai_proto::{ClientMessage, DaemonMessage, ImageMetadata, write_message};
 use tracing::{debug, error, info, warn};
 
 pub struct DaemonBridge {
@@ -56,7 +56,7 @@ impl DaemonBridge {
             let client_rx = client_rx;
             while let Ok(msg) = client_rx.recv() {
                 debug!(?msg, "sending message to daemon");
-                if let Err(e) = write_message_sync(&mut writer, &msg) {
+                if let Err(e) = write_message(&mut writer, &msg) {
                     error!(%e, "write error, bridge writer shutting down");
                     if let Err(send_err) =
                         writer_event_tx.send(BridgeEvent::Error(format!("write error: {e}")))

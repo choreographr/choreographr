@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 use tai_daemon::accounts::AccountManager;
 use tai_daemon::{DaemonState, run_server};
-use tai_proto::{ClientMessage, DaemonMessage, read_message_sync, write_message_sync};
+use tai_proto::{ClientMessage, DaemonMessage, read_message, write_message};
 
 /// Build a minimal [`DaemonState`] suitable for testing the server lifecycle.
 fn test_daemon_state() -> DaemonState {
@@ -64,10 +64,10 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
     let mut reader = BufReader::new(client.try_clone().expect("clone for reader"));
     let mut writer = BufWriter::new(client);
 
-    write_message_sync(&mut writer, &ClientMessage::Ping).expect("write Ping");
+    write_message(&mut writer, &ClientMessage::Ping).expect("write Ping");
     writer.flush().expect("flush Ping");
 
-    let response: DaemonMessage = read_message_sync(&mut reader).expect("read response");
+    let response: DaemonMessage = read_message(&mut reader).expect("read response");
     assert_eq!(response, DaemonMessage::Pong);
 
     // Trigger graceful shutdown by sending SIGINT.

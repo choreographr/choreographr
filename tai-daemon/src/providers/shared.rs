@@ -105,7 +105,7 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
         }
         ProviderError::EmptyResponse => InferenceError::EmptyResponse,
         ProviderError::Cancelled => InferenceError::Cancelled,
-        ProviderError::Io(e) => InferenceError::Io(e.to_string()),
+        ProviderError::Io(e) => InferenceError::Io(e),
     }
 }
 

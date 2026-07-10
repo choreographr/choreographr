@@ -766,15 +766,15 @@ fn handle_ai_providers_new_form_key(
 
                     // Send AddAccount
                     client_tx
-                        .send(ClientMessage::add_account(
-                            &name,
-                            provider_str,
-                            None, // no base_url
-                            None, // streaming
-                            None, // retry_max_attempts
-                            None, // connect_timeout_secs
-                            None, // request_timeout_secs
-                        ))
+                        .send(ClientMessage::AddAccount {
+                            name: name.clone(),
+                            provider: provider_str.to_string(),
+                            base_url: None,
+                            streaming: None,
+                            retry_max_attempts: None,
+                            connect_timeout_secs: None,
+                            request_timeout_secs: None,
+                        })
                         .map_err(broken_pipe)?;
 
                     // If an API key was provided, send AddCredential too.

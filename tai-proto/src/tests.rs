@@ -48,7 +48,7 @@ fn sync_read_write_round_trip() {
 
     let frame = encode_frame(&expected).expect("encode");
     let mut cursor = Cursor::new(&frame[..]);
-    let actual = read_message_sync::<_, DaemonMessage>(&mut cursor).expect("read");
+    let actual = read_message::<_, DaemonMessage>(&mut cursor).expect("read");
     assert_eq!(actual, expected);
 }
 
@@ -56,21 +56,21 @@ fn sync_read_write_round_trip() {
 fn read_payload_rejects_oversized_frame() {
     let oversized_len = (MAX_FRAME_SIZE as u32) + 1;
     let mut cursor = Cursor::new(oversized_len.to_be_bytes().to_vec());
-    let err = read_payload_sync(&mut cursor).expect_err("should fail");
+    let err = read_payload(&mut cursor).expect_err("should fail");
     assert!(matches!(err, ProtoError::FrameTooLarge));
 }
 
 #[test]
 fn socket_path_uses_env_override() {
     assert_eq!(
-        socket_path_impl(|| Some("/tmp/custom-tai.sock".to_string())),
+        crate::io::socket_path_impl(|| Some("/tmp/custom-tai.sock".to_string())),
         "/tmp/custom-tai.sock"
     );
 }
 
 #[test]
 fn socket_path_default_when_env_not_set() {
-    assert_eq!(socket_path_impl(|| None), DEFAULT_SOCKET_PATH);
+    assert_eq!(crate::io::socket_path_impl(|| None), DEFAULT_SOCKET_PATH);
 }
 
 #[test]
@@ -163,8 +163,11 @@ fn token_usage_in_daemon_message_done_backward_compat() {
 }
 
 #[test]
-fn daemon_message_done_constructor() {
-    let msg = DaemonMessage::done(7);
+fn daemon_message_done_without_usage() {
+    let msg = DaemonMessage::Done {
+        request_id: 7,
+        token_usage: None,
+    };
     match msg {
         DaemonMessage::Done {
             request_id,
@@ -200,4 +203,22 @@ fn daemon_message_done_with_usage_round_trip() {
         }
         _ => panic!("expected Done"),
     }
+}
+
+// ── ThinkingEffort tests ─────────────────────────────────────────────────
+
+#[test]
+fn thinking_effort_labels() {
+    assert_eq!(ThinkingEffort::Off.as_label(), "off");
+    assert_eq!(ThinkingEffort::Low.as_label(), "low");
+    assert_eq!(ThinkingEffort::Medium.as_label(), "medium");
+    assert_eq!(ThinkingEffort::High.as_label(), "high");
+}
+
+#[test]
+fn thinking_effort_serialization() {
+    let json = serde_json::to_string(&ThinkingEffort::Medium).unwrap();
+    assert_eq!(json, "\"medium\"");
+    let deserialized: ThinkingEffort = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized, ThinkingEffort::Medium);
 }

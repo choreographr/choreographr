@@ -63,7 +63,10 @@ pub struct TokenUsage {
 }
 
 /// Unified error type for all inference providers.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+/// NOTE: does NOT derive Serialize/Deserialize — this error type is never
+/// sent over the wire.  Provider errors are stringified before being placed
+/// into protocol messages (e.g. `DaemonMessage::Failed { error }`).
+#[derive(Debug, thiserror::Error)]
 pub enum InferenceError {
     #[error("unauthorized ({status}): {detail}")]
     Unauthorized { status: u16, detail: String },
@@ -81,12 +84,15 @@ pub enum InferenceError {
     #[error("request cancelled during retry backoff")]
     Cancelled,
     #[error("{0}")]
-    Io(String),
+    Io(#[from] std::io::Error),
 }
 
 impl From<InferenceError> for std::io::Error {
     fn from(e: InferenceError) -> Self {
-        std::io::Error::other(e.to_string())
+        match e {
+            InferenceError::Io(io) => io,
+            other => std::io::Error::other(other.to_string()),
+        }
     }
 }
 
@@ -140,7 +146,7 @@ pub enum SessionMessage {
         content: String,
         reasoning: Option<String>,
         /// Token usage for this assistant response, if reported by the provider.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         token_usage: Option<TokenUsage>,
     },
     AssistantToolUse {
@@ -148,7 +154,7 @@ pub enum SessionMessage {
         tool_calls: Vec<AssistantToolCallRecord>,
         reasoning: Option<String>,
         /// Token usage for this assistant response, if reported by the provider.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         token_usage: Option<TokenUsage>,
     },
     ToolResult {
@@ -176,7 +182,7 @@ pub struct SessionSummary {
     /// The AI provider account name associated with this session, if any.
     pub account_name: Option<String>,
     /// Total token usage accumulated across all turns in this session.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
 }
 
@@ -300,7 +306,7 @@ pub enum DaemonMessage {
         messages: Vec<SessionMessage>,
         active_tool_groups: Vec<String>,
         /// Accumulated token usage for this session, if available.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         token_usage: Option<TokenUsage>,
     },
     SessionMessageAppended {
@@ -446,461 +452,4 @@ pub enum DaemonMessage {
         error: String,
     },
     ShuttingDown,
-}
-
-impl DaemonMessage {
-    pub fn session_created(
-        session_id: u64,
-        title: Option<String>,
-        parent_session_id: Option<u64>,
-        cwd: Option<String>,
-        max_turns: Option<u32>,
-    ) -> Self {
-        Self::SessionCreated {
-            session_id,
-            title,
-            parent_session_id,
-            cwd,
-            max_turns,
-        }
-    }
-
-    pub fn sessions(sessions: Vec<SessionSummary>) -> Self {
-        Self::Sessions { sessions }
-    }
-
-    pub fn session_attached(session_id: u64) -> Self {
-        Self::SessionAttached { session_id }
-    }
-
-    pub fn session_message_appended(message: SessionMessage) -> Self {
-        Self::SessionMessageAppended { message }
-    }
-
-    pub fn session_status_changed(session_id: u64, status: SessionStatus) -> Self {
-        Self::SessionStatusChanged { session_id, status }
-    }
-
-    pub fn session_failed(operation: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::SessionFailed {
-            operation: operation.into(),
-            error: error.into(),
-        }
-    }
-
-    pub fn started(request_id: u32) -> Self {
-        Self::Started { request_id }
-    }
-
-    pub fn tool_call_started(
-        request_id: u32,
-        call_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        arguments_json: impl Into<String>,
-    ) -> Self {
-        Self::ToolCallStarted {
-            request_id,
-            call_id: call_id.into(),
-            tool_name: tool_name.into(),
-            arguments_json: arguments_json.into(),
-        }
-    }
-
-    pub fn tool_call_finished(
-        request_id: u32,
-        call_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        output: impl Into<String>,
-    ) -> Self {
-        Self::ToolCallFinished {
-            request_id,
-            call_id: call_id.into(),
-            tool_name: tool_name.into(),
-            output: output.into(),
-        }
-    }
-
-    pub fn tool_call_failed(
-        request_id: u32,
-        call_id: impl Into<String>,
-        tool_name: impl Into<String>,
-        error: impl Into<String>,
-    ) -> Self {
-        Self::ToolCallFailed {
-            request_id,
-            call_id: call_id.into(),
-            tool_name: tool_name.into(),
-            error: error.into(),
-        }
-    }
-
-    pub fn tool_call_output(request_id: u32, call_id: impl Into<String>, data: Vec<u8>) -> Self {
-        Self::ToolCallOutput {
-            request_id,
-            call_id: call_id.into(),
-            data,
-        }
-    }
-
-    pub fn output_chunk(request_id: u32, stream: OutputStream, data: Vec<u8>) -> Self {
-        Self::OutputChunk {
-            request_id,
-            stream,
-            data,
-        }
-    }
-
-    pub fn image_start(request_id: u32, metadata: ImageMetadata) -> Self {
-        Self::ImageStart {
-            request_id,
-            metadata,
-        }
-    }
-
-    pub fn image_chunk(request_id: u32, image_id: u32, data: Vec<u8>) -> Self {
-        Self::ImageChunk {
-            request_id,
-            image_id,
-            data,
-        }
-    }
-
-    pub fn image_end(request_id: u32, image_id: u32) -> Self {
-        Self::ImageEnd {
-            request_id,
-            image_id,
-        }
-    }
-
-    /// Construct a Done message without token usage information.
-    ///
-    /// This is a convenience constructor for callers that don't track usage.
-    /// When token usage is available (e.g. from the request worker after
-    /// completing a turn), construct `DaemonMessage::Done { request_id,
-    /// token_usage: Some(…) }` directly instead.
-    pub fn done(request_id: u32) -> Self {
-        Self::Done {
-            request_id,
-            token_usage: None,
-        }
-    }
-
-    pub fn failed(request_id: u32, error: impl Into<String>) -> Self {
-        Self::Failed {
-            request_id,
-            error: error.into(),
-        }
-    }
-
-    pub fn cancelled(request_id: u32) -> Self {
-        Self::Cancelled { request_id }
-    }
-
-    pub fn pong() -> Self {
-        Self::Pong
-    }
-
-    pub fn models(models: Vec<String>, selected_model: Option<String>) -> Self {
-        Self::Models {
-            models,
-            selected_model,
-        }
-    }
-
-    pub fn models_failed(error: impl Into<String>) -> Self {
-        Self::ModelsFailed {
-            error: error.into(),
-        }
-    }
-
-    pub fn model_selected(model: impl Into<String>) -> Self {
-        Self::ModelSelected {
-            model: model.into(),
-        }
-    }
-
-    pub fn model_selection_failed(model: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::ModelSelectionFailed {
-            model: model.into(),
-            error: error.into(),
-        }
-    }
-
-    pub fn unlocked() -> Self {
-        Self::Unlocked
-    }
-
-    pub fn locked() -> Self {
-        Self::Locked
-    }
-
-    pub fn locked_error(error: impl Into<String>) -> Self {
-        Self::LockedError {
-            error: error.into(),
-        }
-    }
-
-    pub fn credential_added(service: impl Into<String>) -> Self {
-        Self::CredentialAdded {
-            service: service.into(),
-        }
-    }
-
-    pub fn credential_add_failed(service: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::CredentialAddFailed {
-            service: service.into(),
-            error: error.into(),
-        }
-    }
-
-    pub fn credential_removed(service: impl Into<String>) -> Self {
-        Self::CredentialRemoved {
-            service: service.into(),
-        }
-    }
-
-    pub fn credential_remove_failed(service: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::CredentialRemoveFailed {
-            service: service.into(),
-            error: error.into(),
-        }
-    }
-
-    pub fn session_deleted(session_id: u64) -> Self {
-        Self::SessionDeleted { session_id }
-    }
-
-    pub fn session_delete_failed(session_id: u64, error: impl Into<String>) -> Self {
-        Self::SessionDeleteFailed {
-            session_id,
-            error: error.into(),
-        }
-    }
-
-    pub fn credential(service: impl Into<String>, key: Option<String>) -> Self {
-        Self::Credential {
-            service: service.into(),
-            key,
-        }
-    }
-
-    pub fn shutting_down() -> Self {
-        Self::ShuttingDown
-    }
-
-    pub fn account_added(name: impl Into<String>) -> Self {
-        Self::AccountAdded { name: name.into() }
-    }
-
-    pub fn account_add_failed(name: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::AccountAddFailed {
-            name: name.into(),
-            error: error.into(),
-        }
-    }
-
-    pub fn account_removed(name: impl Into<String>) -> Self {
-        Self::AccountRemoved { name: name.into() }
-    }
-
-    pub fn account_remove_failed(name: impl Into<String>, error: impl Into<String>) -> Self {
-        Self::AccountRemoveFailed {
-            name: name.into(),
-            error: error.into(),
-        }
-    }
-
-    pub fn accounts(accounts: Vec<AccountInfo>) -> Self {
-        Self::Accounts { accounts }
-    }
-
-    pub fn account_list_failed(error: impl Into<String>) -> Self {
-        Self::AccountListFailed {
-            error: error.into(),
-        }
-    }
-
-    pub fn session_account_set(account: impl Into<String>) -> Self {
-        Self::SessionAccountSet {
-            account: account.into(),
-        }
-    }
-
-    pub fn reasoning_effort_set(effort: ThinkingEffort) -> Self {
-        Self::ReasoningEffortSet { effort }
-    }
-
-    pub fn reasoning_effort_set_failed(
-        effort: impl Into<String>,
-        error: impl Into<String>,
-    ) -> Self {
-        Self::ReasoningEffortSetFailed {
-            effort: effort.into(),
-            error: error.into(),
-        }
-    }
-}
-
-impl ClientMessage {
-    pub fn create_session(
-        title: Option<String>,
-        parent_session_id: Option<u64>,
-        cwd: Option<String>,
-        max_turns: Option<u32>,
-        context_config: Option<ContextConfig>,
-        account_name: Option<String>,
-    ) -> Self {
-        Self::CreateSession {
-            title,
-            parent_session_id,
-            cwd,
-            max_turns,
-            context_config,
-            account_name,
-        }
-    }
-
-    pub fn list_sessions() -> Self {
-        Self::ListSessions
-    }
-
-    pub fn subscribe_sessions_summary() -> Self {
-        Self::SubscribeSessionsSummary
-    }
-
-    pub fn unsubscribe_sessions_summary() -> Self {
-        Self::UnsubscribeSessionsSummary
-    }
-
-    pub fn attach_session(session_id: u64) -> Self {
-        Self::AttachSession { session_id }
-    }
-
-    pub fn get_session_state(session_id: u64) -> Self {
-        Self::GetSessionState { session_id }
-    }
-
-    pub fn run_input(request_id: u32, input: Vec<u8>) -> Self {
-        Self::RunInput { request_id, input }
-    }
-
-    pub fn test_image(request_id: u32) -> Self {
-        Self::TestImage { request_id }
-    }
-
-    pub fn cancel(request_id: u32) -> Self {
-        Self::Cancel { request_id }
-    }
-
-    pub fn ping() -> Self {
-        Self::Ping
-    }
-
-    pub fn get_credential(service: impl Into<String>) -> Self {
-        Self::GetCredential {
-            service: service.into(),
-        }
-    }
-
-    pub fn list_models() -> Self {
-        Self::ListModels
-    }
-
-    pub fn set_model(model: impl Into<String>) -> Self {
-        Self::SetModel {
-            model: model.into(),
-        }
-    }
-
-    pub fn unlock(private_key: Vec<u8>) -> Self {
-        Self::Unlock { private_key }
-    }
-
-    pub fn lock() -> Self {
-        Self::Lock
-    }
-
-    pub fn delete_session(session_id: u64) -> Self {
-        Self::DeleteSession { session_id }
-    }
-
-    pub fn add_credential(
-        service: impl Into<String>,
-        encrypted_payload: Vec<u8>,
-        unlock_key: Option<Vec<u8>>,
-    ) -> Self {
-        Self::AddCredential {
-            service: service.into(),
-            encrypted_payload,
-            unlock_key,
-        }
-    }
-
-    pub fn remove_credential(service: impl Into<String>) -> Self {
-        Self::RemoveCredential {
-            service: service.into(),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn add_account(
-        name: impl Into<String>,
-        provider: impl Into<String>,
-        base_url: Option<String>,
-        streaming: Option<bool>,
-        retry_max_attempts: Option<u32>,
-        connect_timeout_secs: Option<u64>,
-        request_timeout_secs: Option<u64>,
-    ) -> Self {
-        Self::AddAccount {
-            name: name.into(),
-            provider: provider.into(),
-            base_url,
-            streaming,
-            retry_max_attempts,
-            connect_timeout_secs,
-            request_timeout_secs,
-        }
-    }
-
-    pub fn remove_account(name: impl Into<String>) -> Self {
-        Self::RemoveAccount { name: name.into() }
-    }
-
-    pub fn list_accounts() -> Self {
-        Self::ListAccounts
-    }
-
-    pub fn set_session_account(name: impl Into<String>) -> Self {
-        Self::SetSessionAccount { name: name.into() }
-    }
-
-    pub fn set_reasoning_effort(effort: ThinkingEffort) -> Self {
-        Self::SetReasoningEffort { effort }
-    }
-
-    pub fn get_reasoning_effort() -> Self {
-        Self::GetReasoningEffort
-    }
-}
-
-#[cfg(test)]
-mod thinking_tests {
-    use super::*;
-
-    #[test]
-    fn thinking_effort_labels() {
-        assert_eq!(ThinkingEffort::Off.as_label(), "off");
-        assert_eq!(ThinkingEffort::Low.as_label(), "low");
-        assert_eq!(ThinkingEffort::Medium.as_label(), "medium");
-        assert_eq!(ThinkingEffort::High.as_label(), "high");
-    }
-
-    #[test]
-    fn thinking_effort_serialization() {
-        let json = serde_json::to_string(&ThinkingEffort::Medium).unwrap();
-        assert_eq!(json, "\"medium\"");
-        let deserialized: ThinkingEffort = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized, ThinkingEffort::Medium);
-    }
 }
