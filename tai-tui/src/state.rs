@@ -91,37 +91,142 @@ pub(crate) enum AIProvidersView {
     NewForm,
 }
 
-/// Available provider options in the new-account form.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProviderOption {
-    OpenCodeZen,
-    OpenCodeGo,
-    Anthropic,
+/// A provider entry in the new-account form dropdown.
+///
+/// Note: This list must be kept in sync with `tai-daemon/src/providers/catalog.rs`.
+/// There is no compile-time cross-crate sharing, so the daemon catalog is the
+/// source of truth and this list should be updated whenever providers are added
+/// or removed there.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProviderInfo {
+    pub(crate) slug: &'static str,
+    pub(crate) display_name: &'static str,
 }
 
-impl ProviderOption {
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            ProviderOption::OpenCodeZen => "opencode zen",
-            ProviderOption::OpenCodeGo => "opencode go",
-            ProviderOption::Anthropic => "anthropic",
-        }
-    }
-
-    /// The internal provider string sent to the daemon.
-    pub(crate) fn provider_str(&self) -> &'static str {
-        match self {
-            ProviderOption::OpenCodeZen => "opencode",
-            ProviderOption::OpenCodeGo => "opencode-go",
-            ProviderOption::Anthropic => "anthropic",
-        }
-    }
-}
-
-pub(crate) const PROVIDER_OPTIONS: &[ProviderOption] = &[
-    ProviderOption::OpenCodeZen,
-    ProviderOption::OpenCodeGo,
-    ProviderOption::Anthropic,
+pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
+    // Core providers first
+    ProviderInfo {
+        slug: "openai",
+        display_name: "OpenAI",
+    },
+    ProviderInfo {
+        slug: "anthropic",
+        display_name: "Anthropic",
+    },
+    ProviderInfo {
+        slug: "google",
+        display_name: "Google Gemini",
+    },
+    // OpenAI-compatible, roughly alphabetical
+    ProviderInfo {
+        slug: "cerebras",
+        display_name: "Cerebras",
+    },
+    ProviderInfo {
+        slug: "custom-openai",
+        display_name: "Custom OpenAI-Compatible",
+    },
+    ProviderInfo {
+        slug: "dashscope",
+        display_name: "DashScope (Alibaba)",
+    },
+    ProviderInfo {
+        slug: "deepseek",
+        display_name: "DeepSeek",
+    },
+    ProviderInfo {
+        slug: "fireworks",
+        display_name: "Fireworks AI",
+    },
+    ProviderInfo {
+        slug: "github",
+        display_name: "GitHub Models",
+    },
+    ProviderInfo {
+        slug: "groq",
+        display_name: "Groq",
+    },
+    ProviderInfo {
+        slug: "huggingface",
+        display_name: "Hugging Face",
+    },
+    ProviderInfo {
+        slug: "lmstudio",
+        display_name: "LM Studio",
+    },
+    ProviderInfo {
+        slug: "mistral",
+        display_name: "Mistral",
+    },
+    ProviderInfo {
+        slug: "moonshot",
+        display_name: "Moonshot AI (Kimi)",
+    },
+    ProviderInfo {
+        slug: "novita",
+        display_name: "Novita AI",
+    },
+    ProviderInfo {
+        slug: "nvidia",
+        display_name: "NVIDIA NIM",
+    },
+    ProviderInfo {
+        slug: "ollama",
+        display_name: "Ollama (Local)",
+    },
+    ProviderInfo {
+        slug: "ollama-cloud",
+        display_name: "Ollama Cloud",
+    },
+    ProviderInfo {
+        slug: "opencode",
+        display_name: "OpenCode Zen",
+    },
+    ProviderInfo {
+        slug: "opencode-go",
+        display_name: "OpenCode Go",
+    },
+    ProviderInfo {
+        slug: "openai_compatible",
+        display_name: "OpenAI Compatible",
+    },
+    ProviderInfo {
+        slug: "openrouter",
+        display_name: "OpenRouter",
+    },
+    ProviderInfo {
+        slug: "perplexity",
+        display_name: "Perplexity",
+    },
+    ProviderInfo {
+        slug: "together",
+        display_name: "Together AI",
+    },
+    ProviderInfo {
+        slug: "venice",
+        display_name: "Venice AI",
+    },
+    ProviderInfo {
+        slug: "xiaomi-mimo",
+        display_name: "Xiaomi MiMo",
+    },
+    ProviderInfo {
+        slug: "xai",
+        display_name: "xAI Grok",
+    },
+    ProviderInfo {
+        slug: "zai",
+        display_name: "Z.ai (GLM)",
+    },
+    // Anthropic-compatible
+    ProviderInfo {
+        slug: "minimax",
+        display_name: "MiniMax",
+    },
+    ProviderInfo {
+        slug: "custom-anthropic",
+        display_name: "Custom Anthropic-Compatible",
+    },
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

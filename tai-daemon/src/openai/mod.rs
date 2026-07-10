@@ -20,6 +20,7 @@ pub(crate) use crate::retry::{
 pub use retry::RetryCallback;
 
 use serde::{Deserialize, Serialize};
+use std::sync::mpsc;
 use std::{io, time::Duration};
 
 #[derive(Debug, thiserror::Error)]
@@ -340,5 +341,83 @@ impl OpenAiClient {
 
     pub fn api_key(&self) -> &str {
         &self.api_key
+    }
+}
+
+// ── ProviderClient trait impl ───────────────────────────────────────────
+
+use crate::providers::ProviderClient;
+use tai_proto::InferenceError;
+
+impl ProviderClient for OpenAiClient {
+    fn chat_completion_turn(
+        &self,
+        model: &str,
+        messages: &[ChatRequestMessage],
+        tools: &[ChatToolDefinition],
+        on_retry: &mut Option<RetryCallback>,
+        cancel_rx: Option<&mpsc::Receiver<()>>,
+    ) -> Result<ChatTurnResult, InferenceError> {
+        let api_start = std::time::Instant::now();
+        let result = self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx);
+        crate::providers::timed_result(
+            api_start,
+            model,
+            "openai",
+            result,
+            error_type_label,
+            openai_error_to_inference,
+        )
+    }
+
+    fn chat_completion_turn_streaming(
+        &self,
+        model: &str,
+        messages: &[ChatRequestMessage],
+        tools: &[ChatToolDefinition],
+        on_retry: &mut Option<RetryCallback>,
+        cancel_rx: Option<&mpsc::Receiver<()>>,
+        on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    ) -> Result<ChatTurnResult, InferenceError> {
+        let api_start = std::time::Instant::now();
+        let result = self
+            .chat_completion_turn_streaming(model, messages, tools, on_retry, cancel_rx, on_chunk);
+        crate::providers::timed_result(
+            api_start,
+            model,
+            "openai",
+            result,
+            error_type_label,
+            openai_error_to_inference,
+        )
+    }
+
+    fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+        let result = self.validate_and_list_models();
+        result.map_err(openai_error_to_inference)
+    }
+}
+
+fn openai_error_to_inference(e: OpenAiError) -> InferenceError {
+    match e {
+        OpenAiError::Unauthorized { status, detail } => {
+            InferenceError::Unauthorized { status, detail }
+        }
+        OpenAiError::RateLimited {
+            retry_after_secs,
+            detail,
+        } => InferenceError::RateLimited {
+            retry_after_secs,
+            detail,
+        },
+        OpenAiError::ServerError { status, detail } => {
+            InferenceError::ServerError { status, detail }
+        }
+        OpenAiError::ClientError { status, detail } => {
+            InferenceError::ClientError { status, detail }
+        }
+        OpenAiError::EmptyResponse => InferenceError::EmptyResponse,
+        OpenAiError::Cancelled => InferenceError::Cancelled,
+        OpenAiError::Io(e) => InferenceError::Io(e.to_string()),
     }
 }

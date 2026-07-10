@@ -156,7 +156,7 @@ pub(crate) fn run_agent_loop(
             &tools,
             &mut retry_cb,
             Some(cancel_rx),
-            |kind, text| {
+            &mut |kind, text| {
                 let stream = match kind {
                     CompletionChunkKind::Answer => OutputStream::Answer,
                     CompletionChunkKind::Reasoning => OutputStream::Reasoning,

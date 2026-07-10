@@ -3,21 +3,21 @@
 ## Overview
 
 `tai` is a local-first AI assistant built as a Rust workspace. A **daemon** process
-communicates with an OpenAI-compatible HTTP API, while **clients** (terminal,
-desktop, and IM platforms) connect to the daemon over a Unix domain socket using a
-custom length-prefixed binary protocol.
+communicates with multiple LLM providers through a pluggable trait-based provider
+system, while **clients** (terminal, desktop, and IM platforms) connect to the daemon
+over a Unix domain socket using a custom length-prefixed binary protocol.
 
 ```
-┌──────────────┐    Unix socket     ┌──────────────┐    HTTP/SSE     ┌───────────────────┐
-│   tai-tui     │◄──────────────────►│              │◄──────────────►│  OpenAI API       │
-│  (terminal)  │                    │              │               │  Anthropic API    │
-├──────────────┤                    │  tai-daemon  │                └───────────────────┘
-│ tai-dioxus   │◄──────────────────►│              │
-│  (desktop)   │    Unix socket     │              │
-├──────────────┤                    │              │
-│   tai-im     │◄──────────────────►│              │
-│ (IM bridge)  │    Unix socket     │              │
-└──────────────┘                    └──────────────┘
+┌──────────────┐    Unix socket     ┌──────────────┐    HTTP/SSE     ┌──────────────────────┐
+│   tai-tui     │◄──────────────────►│              │◄──────────────►│  OpenAI API          │
+│  (terminal)  │                    │              │                ├──────────────────────┤
+├──────────────┤                    │  tai-daemon  │◄──────────────►│  Anthropic Messages   │
+│ tai-dioxus   │◄──────────────────►│              │                ├──────────────────────┤
+│  (desktop)   │    Unix socket     │              │◄──────────────►│  Google Gemini API    │
+├──────────────┤                    │              │                ├──────────────────────┤
+│   tai-im     │◄──────────────────►│              │◄──────────────►│  30+ OpenAI-compat    │
+│ (IM bridge)  │    Unix socket     │              │                │  providers via catalog│
+└──────────────┘                    └──────────────┘                └──────────────────────┘
 ```
 
 ---
@@ -188,8 +188,9 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. |
-| `providers/` | `InferenceProvider` enum wrapping provider-specific clients (OpenAI, Anthropic). Provides a uniform interface for chat completion, streaming, and model listing. |
-| `anthropic/` | Anthropic Messages API client. Implements `AnthropicClient`, request/response types for the Messages API (`/v1/messages`), content block handling (text, tool_use, thinking), and Anthropic SSE streaming (event-type-aware parser). Auth via `x-api-key` header with `anthropic-version`. Model list is a curated static set. |
+| `providers/` | `ProviderClient` trait + `ProviderCatalog` system. `InferenceProvider` struct wraps `Arc<dyn ProviderClient>`. Static `PROVIDER_CATALOG` maps ~30 slugs to protocol type, default base URL, and default model. Dispatches to the correct client based on protocol. |
+| `anthropic/` | Anthropic Messages API client (`AnthropicClient`). Implements `ProviderClient`. |
+| `google/` | Google Gemini API client (`GoogleClient`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
 | `retry/` | Shared HTTP retry logic extracted from the OpenAI module. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. Both `openai` and `anthropic` modules use this via their own error type conversions. |
 | `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Each session has a control thread; request work runs on separate worker threads. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
@@ -198,6 +199,56 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
 | `tools/` | Tool trait, registry, and 20 registered tools. |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
+
+### Provider Architecture
+
+The provider system has three layers:
+
+**1. `ProviderClient` trait (`providers/traits.rs`):**
+```rust
+pub trait ProviderClient: Debug + Send + Sync {
+    fn chat_completion_turn(...) -> Result<ChatTurnResult, InferenceError>;
+    fn chat_completion_turn_streaming(&self, ..., on_chunk: &mut dyn FnMut(...)) -> Result<ChatTurnResult, InferenceError>;
+    fn list_models(&self) -> Result<Vec<String>, InferenceError>;
+}
+```
+
+Uses `&mut dyn FnMut` for the streaming callback to keep the trait object-safe.
+
+**2. `InferenceProvider` struct (`providers/mod.rs`):**
+```rust
+pub struct InferenceProvider {
+    client: Arc<dyn ProviderClient>,
+}
+```
+Created via `from_account_config()` which looks up the provider slug in the catalog and dispatches to the appropriate client constructor by protocol type.
+
+**3. Provider Catalog (`providers/catalog.rs`):**
+```rust
+pub enum ProviderProtocol {
+    OpenAiCompatible,
+    AnthropicMessages,
+    GoogleGenerativeAi,
+}
+```
+
+A static `PROVIDER_CATALOG: &[ProviderEntry]` maps each provider slug to:
+- `display_name` — human-readable name for UIs
+- `protocol` — which wire protocol to use
+- `default_base_url` — well-known API endpoint
+- `default_model` — sensible default model name
+
+Currently supports ~30 providers. Adding a new OpenAI-compatible provider requires only a catalog entry — zero client code.
+
+**Supported providers by protocol:**
+
+| Protocol | Providers |
+|---|---|
+| OpenAI-compatible | OpenAI, DeepSeek, xAI/Grok, Groq, Together AI, Mistral, Ollama (local/cloud), OpenRouter, HuggingFace, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, DashScope, Moonshot AI, Perplexity, Z.ai, Venice AI, Novita AI, LM Studio, OpenCode Zen, OpenCode Go, Atomic Chat, and custom OpenAI-compatible |
+| Anthropic Messages | Anthropic Claude, MiniMax, custom Anthropic-compatible |
+| Google Generative AI | Google Gemini |
+
+> **Note:** Amazon Bedrock support is deferred pending multi-field credential support (needs AWS access key + secret key + region).
 
 **Per-client architecture (OS threads):**
 
@@ -595,6 +646,7 @@ and exits cleanly when the daemon shuts down.
 | `requests.rs` — `execute_tool_with_timeout` | `record_tool_execution` | tool duration + status |
 | `openai/requests.rs` — `chat_completion_turn_streaming` | `record_api_call`, `record_api_error` | API latency + errors |
 | `anthropic/mod.rs` — `chat_completion_turn_streaming` | `record_api_call`, `record_api_error` | API latency + errors |
+| `google/mod.rs` — `ProviderClient` impl | `record_api_call`, `record_api_error` | API latency + errors |
 
 ---
 

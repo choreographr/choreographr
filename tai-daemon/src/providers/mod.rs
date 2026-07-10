@@ -9,19 +9,31 @@ use crate::openai::{
 };
 use tai_proto::InferenceError;
 
-#[derive(Debug, Clone)]
-pub enum InferenceProvider {
-    OpenAi(Arc<OpenAiClient>),
-    Anthropic(Arc<AnthropicClient>),
+mod catalog;
+mod traits;
+
+pub use catalog::{
+    PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, all_display_names, all_slugs,
+    lookup_provider,
+};
+pub use traits::ProviderClient;
+
+#[derive(Clone, Debug)]
+pub struct InferenceProvider {
+    client: Arc<dyn ProviderClient>,
 }
 
 impl InferenceProvider {
     pub fn from_openai(client: OpenAiClient) -> Self {
-        Self::OpenAi(Arc::new(client))
+        Self {
+            client: Arc::new(client),
+        }
     }
 
     pub fn from_anthropic(client: AnthropicClient) -> Self {
-        Self::Anthropic(Arc::new(client))
+        Self {
+            client: Arc::new(client),
+        }
     }
 
     /// Create a provider from an account config + credential key.
@@ -31,24 +43,57 @@ impl InferenceProvider {
         config: &crate::accounts::AccountConfig,
         api_key: Option<String>,
     ) -> Result<Self, String> {
-        match config.provider.as_str() {
-            "openai" | "openai_compatible" | "opencode" | "opencode-go" => {
+        let entry = lookup_provider(&config.provider)
+            .ok_or_else(|| format!("unknown provider: {}", config.provider))?;
+
+        match entry.protocol {
+            ProviderProtocol::OpenAiCompatible => {
                 let mut svc_config = crate::openai::load_service_config().unwrap_or_default();
+                // If the account doesn't specify a base_url, use the catalog default.
+                // This is important for non-OpenAI providers (e.g. opencode) that
+                // have different default base URLs from the ServiceConfig default.
+                if config.base_url.is_none() {
+                    svc_config.base_url = entry.default_base_url.to_string();
+                }
                 config.apply_overrides(&mut svc_config);
-                let key = api_key.ok_or_else(|| "no API key for OpenAI provider".to_string())?;
+                let key = api_key
+                    .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
                 let client = OpenAiClient::new(svc_config, key)
                     .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
-                Ok(Self::OpenAi(Arc::new(client)))
+                Ok(Self {
+                    client: Arc::new(client),
+                })
             }
-            "anthropic" => {
-                let key = api_key.ok_or_else(|| "no API key for Anthropic provider".to_string())?;
-                let mut anthropic_cfg = crate::anthropic::AnthropicConfig::default();
-                anthropic_cfg.apply_overrides(config);
-                let client = AnthropicClient::new(anthropic_cfg, key)
+            ProviderProtocol::AnthropicMessages => {
+                let key = api_key
+                    .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
+                let mut anthro_cfg = crate::anthropic::AnthropicConfig::default();
+                // If the account doesn't specify a base_url, use the catalog default.
+                if config.base_url.is_none() {
+                    anthro_cfg.base_url = entry.default_base_url.to_string();
+                }
+                anthro_cfg.apply_overrides(config);
+                let client = AnthropicClient::new(anthro_cfg, key)
                     .map_err(|e| format!("failed to create Anthropic client: {e}"))?;
-                Ok(Self::Anthropic(Arc::new(client)))
+                Ok(Self {
+                    client: Arc::new(client),
+                })
             }
-            other => Err(format!("unknown provider: {other}")),
+            ProviderProtocol::GoogleGenerativeAi => {
+                let key = api_key
+                    .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
+                let mut google_cfg = crate::google::GoogleConfig::default();
+                // If the account doesn't specify a base_url, use the catalog default.
+                if config.base_url.is_none() {
+                    google_cfg.base_url = entry.default_base_url.to_string();
+                }
+                google_cfg.apply_overrides(config);
+                let client = crate::google::GoogleClient::new(google_cfg, key)
+                    .map_err(|e| format!("failed to create Google client: {e}"))?;
+                Ok(Self {
+                    client: Arc::new(client),
+                })
+            }
         }
     }
 
@@ -60,122 +105,71 @@ impl InferenceProvider {
         on_retry: &mut Option<RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        match self {
-            Self::OpenAi(client) => client
-                .chat_completion_turn(model, messages, tools, on_retry, cancel_rx)
-                .map_err(inference_error_from_openai),
-            Self::Anthropic(client) => client
-                .chat_completion_turn(model, messages, tools, on_retry, cancel_rx)
-                .map_err(inference_error_from_anthropic),
-        }
+        self.client
+            .chat_completion_turn(model, messages, tools, on_retry, cancel_rx)
     }
 
-    pub fn chat_completion_turn_streaming<F>(
+    pub fn chat_completion_turn_streaming(
         &self,
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
         on_retry: &mut Option<RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
-        on_chunk: F,
-    ) -> Result<ChatTurnResult, InferenceError>
-    where
-        F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
-    {
-        match self {
-            Self::OpenAi(client) => client
-                .chat_completion_turn_streaming(
-                    model, messages, tools, on_retry, cancel_rx, on_chunk,
-                )
-                .map_err(inference_error_from_openai),
-            Self::Anthropic(client) => client
-                .chat_completion_turn_streaming(
-                    model, messages, tools, on_retry, cancel_rx, on_chunk,
-                )
-                .map_err(inference_error_from_anthropic),
-        }
+        on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    ) -> Result<ChatTurnResult, InferenceError> {
+        self.client
+            .chat_completion_turn_streaming(model, messages, tools, on_retry, cancel_rx, on_chunk)
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, InferenceError> {
-        match self {
-            Self::OpenAi(client) => client
-                .validate_and_list_models()
-                .map_err(inference_error_from_openai),
-            Self::Anthropic(client) => client
-                .validate_and_list_models()
-                .map_err(inference_error_from_anthropic),
-        }
+        self.client.list_models()
     }
 }
 
-fn inference_error_from_openai(e: crate::openai::OpenAiError) -> InferenceError {
-    match e {
-        crate::openai::OpenAiError::Unauthorized { status, detail } => {
-            InferenceError::Unauthorized { status, detail }
+/// Wrapper that records timing and metrics for a provider call, then maps
+/// the provider-specific error type to the shared `InferenceError`.
+/// Keeps instrumentation uniform across every `ProviderClient` implementation.
+pub(crate) fn timed_result<T, E>(
+    start: std::time::Instant,
+    model: &str,
+    label: &str,
+    result: Result<T, E>,
+    error_label: fn(&E) -> &'static str,
+    error_convert: fn(E) -> InferenceError,
+) -> Result<T, InferenceError> {
+    let elapsed = start.elapsed().as_secs_f64();
+    match &result {
+        Ok(_) => crate::metrics::record_api_call(model, label, elapsed),
+        Err(e) => {
+            crate::metrics::record_api_call(model, label, elapsed);
+            crate::metrics::record_api_error(model, error_label(e));
         }
-        crate::openai::OpenAiError::RateLimited {
-            retry_after_secs,
-            detail,
-        } => InferenceError::RateLimited {
-            retry_after_secs,
-            detail,
-        },
-        crate::openai::OpenAiError::ServerError { status, detail } => {
-            InferenceError::ServerError { status, detail }
-        }
-        crate::openai::OpenAiError::ClientError { status, detail } => {
-            InferenceError::ClientError { status, detail }
-        }
-        crate::openai::OpenAiError::EmptyResponse => InferenceError::EmptyResponse,
-        crate::openai::OpenAiError::Cancelled => InferenceError::Cancelled,
-        crate::openai::OpenAiError::Io(e) => InferenceError::Io(e.to_string()),
     }
-}
-
-fn inference_error_from_anthropic(e: crate::anthropic::AnthropicError) -> InferenceError {
-    match e {
-        crate::anthropic::AnthropicError::Unauthorized { status, detail } => {
-            InferenceError::Unauthorized { status, detail }
-        }
-        crate::anthropic::AnthropicError::RateLimited {
-            retry_after_secs,
-            detail,
-        } => InferenceError::RateLimited {
-            retry_after_secs,
-            detail,
-        },
-        crate::anthropic::AnthropicError::ServerError { status, detail } => {
-            InferenceError::ServerError { status, detail }
-        }
-        crate::anthropic::AnthropicError::ClientError { status, detail } => {
-            InferenceError::ClientError { status, detail }
-        }
-        crate::anthropic::AnthropicError::EmptyResponse => InferenceError::EmptyResponse,
-        crate::anthropic::AnthropicError::Cancelled => InferenceError::Cancelled,
-        crate::anthropic::AnthropicError::Io(e) => InferenceError::Io(e.to_string()),
-    }
+    result.map_err(error_convert)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::accounts::AccountConfig;
+    use crate::anthropic::AnthropicConfig;
     use crate::openai::ServiceConfig;
 
     #[test]
     fn from_openai_constructs_provider() {
         let config = ServiceConfig::default();
         let client = OpenAiClient::new(config, "test-key".into()).unwrap();
-        let provider = InferenceProvider::from_openai(client);
-        assert!(matches!(provider, InferenceProvider::OpenAi(_)));
+        let _provider = InferenceProvider::from_openai(client);
+        // Construction succeeds — no panic.
     }
 
     #[test]
     fn from_anthropic_constructs_provider() {
-        let config = crate::anthropic::AnthropicConfig::default();
+        let config = AnthropicConfig::default();
         let client = AnthropicClient::new(config, "test-key".into()).unwrap();
-        let provider = InferenceProvider::from_anthropic(client);
-        assert!(matches!(provider, InferenceProvider::Anthropic(_)));
+        let _provider = InferenceProvider::from_anthropic(client);
+        // Construction succeeds — no panic.
     }
 
     #[test]
@@ -224,67 +218,42 @@ mod tests {
     }
 
     #[test]
-    fn inference_error_from_openai_roundtrip() {
-        let cases: Vec<(crate::openai::OpenAiError, &str)> = vec![
-            (
-                crate::openai::OpenAiError::Unauthorized {
-                    status: 401,
-                    detail: "bad key".into(),
-                },
-                "unauthorized",
-            ),
-            (crate::openai::OpenAiError::Cancelled, "cancelled"),
-            (
-                crate::openai::OpenAiError::Io(std::io::Error::other("wire error")),
-                "wire error",
-            ),
-        ];
-        for (openai_err, expected) in cases {
-            let ie: InferenceError = inference_error_from_openai(openai_err);
-            let msg = ie.to_string().to_lowercase();
-            assert!(msg.contains(expected), "expected '{expected}' in '{msg}'");
-        }
+    fn from_account_config_openai_succeeds() {
+        let cfg = AccountConfig {
+            name: "openai".to_string(),
+            provider: "openai".to_string(),
+            base_url: None,
+            streaming: None,
+            retry_max_attempts: None,
+            connect_timeout_secs: None,
+            request_timeout_secs: None,
+        };
+        let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
-    fn inference_error_from_anthropic_roundtrip() {
-        let cases: Vec<(crate::anthropic::AnthropicError, &str)> = vec![
-            (
-                crate::anthropic::AnthropicError::Unauthorized {
-                    status: 401,
-                    detail: "bad key".into(),
-                },
-                "unauthorized",
-            ),
-            (crate::anthropic::AnthropicError::Cancelled, "cancelled"),
-            (
-                crate::anthropic::AnthropicError::Io(std::io::Error::other("wire error")),
-                "wire error",
-            ),
-        ];
-        for (err, expected) in cases {
-            let ie: InferenceError = inference_error_from_anthropic(err);
-            let msg = ie.to_string().to_lowercase();
-            assert!(msg.contains(expected), "expected '{expected}' in '{msg}'");
-        }
+    fn from_account_config_anthropic_succeeds() {
+        let cfg = AccountConfig {
+            name: "claude".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: None,
+            streaming: None,
+            retry_max_attempts: None,
+            connect_timeout_secs: None,
+            request_timeout_secs: None,
+        };
+        let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
     fn anthropic_provider_list_models_returns_known() {
-        let config = crate::anthropic::AnthropicConfig::default();
+        let config = AnthropicConfig::default();
         let client = AnthropicClient::new(config, "test-key".into()).unwrap();
-        let provider = InferenceProvider::Anthropic(Arc::new(client));
+        let provider = InferenceProvider::from_anthropic(client);
         let models = provider.list_models().unwrap();
         assert!(!models.is_empty());
         assert!(models.contains(&"claude-sonnet-4-20250514".to_string()));
-    }
-
-    #[test]
-    fn anthropic_provider_errors_on_empty_response() {
-        let config = crate::anthropic::AnthropicConfig::default();
-        let client = AnthropicClient::new(config, "test-key".into()).unwrap();
-        let provider = InferenceProvider::Anthropic(Arc::new(client));
-        // list_models should work fine with the static list.
-        assert!(provider.list_models().is_ok());
     }
 }

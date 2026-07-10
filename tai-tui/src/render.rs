@@ -951,7 +951,7 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
             Style::default().fg(Color::DarkGray)
         };
         lines.push(Line::from(Span::styled(
-            format!("    {bullet} {}", option.label()),
+            format!("    {bullet} {}", option.display_name),
             row_style,
         )));
     }

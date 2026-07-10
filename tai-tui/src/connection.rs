@@ -757,7 +757,7 @@ fn handle_ai_providers_new_form_key(
 
                     // Get the selected provider string
                     let provider_idx = app.ai_providers.new_provider_idx;
-                    let provider_str = PROVIDER_OPTIONS[provider_idx].provider_str();
+                    let provider_str = PROVIDER_OPTIONS[provider_idx].slug;
 
                     // Collect the API key
                     let api_key = app.ai_providers.new_api_key.text.trim().to_string();

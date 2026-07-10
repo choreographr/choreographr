@@ -4,6 +4,7 @@ pub mod context;
 pub mod daemon;
 pub mod db;
 pub mod diff_util;
+pub mod google;
 pub mod metrics;
 pub mod openai;
 pub mod providers;

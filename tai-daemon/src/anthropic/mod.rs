@@ -137,6 +137,84 @@ pub struct AnthropicClient {
     http: reqwest::blocking::Client,
 }
 
+// ── ProviderClient trait impl ───────────────────────────────────────────
+
+use crate::providers::ProviderClient;
+use tai_proto::InferenceError;
+
+impl ProviderClient for AnthropicClient {
+    fn chat_completion_turn(
+        &self,
+        model: &str,
+        messages: &[ChatRequestMessage],
+        tools: &[ChatToolDefinition],
+        on_retry: &mut Option<crate::retry::RetryCallback>,
+        cancel_rx: Option<&mpsc::Receiver<()>>,
+    ) -> Result<ChatTurnResult, InferenceError> {
+        let api_start = std::time::Instant::now();
+        let result = self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx);
+        crate::providers::timed_result(
+            api_start,
+            model,
+            "anthropic",
+            result,
+            error_type_label,
+            anthropic_error_to_inference,
+        )
+    }
+
+    fn chat_completion_turn_streaming(
+        &self,
+        model: &str,
+        messages: &[ChatRequestMessage],
+        tools: &[ChatToolDefinition],
+        on_retry: &mut Option<crate::retry::RetryCallback>,
+        cancel_rx: Option<&mpsc::Receiver<()>>,
+        on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    ) -> Result<ChatTurnResult, InferenceError> {
+        let api_start = std::time::Instant::now();
+        let result = self
+            .chat_completion_turn_streaming(model, messages, tools, on_retry, cancel_rx, on_chunk);
+        crate::providers::timed_result(
+            api_start,
+            model,
+            "anthropic",
+            result,
+            error_type_label,
+            anthropic_error_to_inference,
+        )
+    }
+
+    fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+        let result = self.validate_and_list_models();
+        result.map_err(anthropic_error_to_inference)
+    }
+}
+
+fn anthropic_error_to_inference(e: AnthropicError) -> InferenceError {
+    match e {
+        AnthropicError::Unauthorized { status, detail } => {
+            InferenceError::Unauthorized { status, detail }
+        }
+        AnthropicError::RateLimited {
+            retry_after_secs,
+            detail,
+        } => InferenceError::RateLimited {
+            retry_after_secs,
+            detail,
+        },
+        AnthropicError::ServerError { status, detail } => {
+            InferenceError::ServerError { status, detail }
+        }
+        AnthropicError::ClientError { status, detail } => {
+            InferenceError::ClientError { status, detail }
+        }
+        AnthropicError::EmptyResponse => InferenceError::EmptyResponse,
+        AnthropicError::Cancelled => InferenceError::Cancelled,
+        AnthropicError::Io(e) => InferenceError::Io(e.to_string()),
+    }
+}
+
 impl AnthropicClient {
     pub fn new(config: AnthropicConfig, api_key: String) -> io::Result<Self> {
         let http = reqwest::blocking::Client::builder()
@@ -200,63 +278,44 @@ impl AnthropicClient {
     where
         F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
     {
-        let api_start = std::time::Instant::now();
-        let result: Result<ChatTurnResult, AnthropicError> = (|| {
-            if !self.config.streaming {
-                let mut on_chunk = on_chunk;
-                let result =
-                    self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx)?;
-                match &result {
-                    ChatTurnResult::FinalText(final_text) => {
-                        if !final_text.content.is_empty() {
-                            on_chunk(CompletionChunkKind::Answer, final_text.content.clone())?;
-                        }
-                        if let Some(reasoning) =
-                            final_text.reasoning.as_ref().filter(|r| !r.is_empty())
-                        {
-                            on_chunk(CompletionChunkKind::Reasoning, reasoning.clone())?;
-                        }
+        if !self.config.streaming {
+            let mut on_chunk = on_chunk;
+            let result = self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx)?;
+            match &result {
+                ChatTurnResult::FinalText(final_text) => {
+                    if !final_text.content.is_empty() {
+                        on_chunk(CompletionChunkKind::Answer, final_text.content.clone())?;
                     }
-                    ChatTurnResult::ToolUse(tool_use) => {
-                        if let Some(ref content) = tool_use.content
-                            && !content.is_empty()
-                        {
-                            on_chunk(CompletionChunkKind::Answer, content.clone())?;
-                        }
-                        if let Some(reasoning) =
-                            tool_use.reasoning.as_ref().filter(|r| !r.is_empty())
-                        {
-                            on_chunk(CompletionChunkKind::Reasoning, reasoning.clone())?;
-                        }
+                    if let Some(reasoning) = final_text.reasoning.as_ref().filter(|r| !r.is_empty())
+                    {
+                        on_chunk(CompletionChunkKind::Reasoning, reasoning.clone())?;
                     }
                 }
-                return Ok(result);
+                ChatTurnResult::ToolUse(tool_use) => {
+                    if let Some(ref content) = tool_use.content
+                        && !content.is_empty()
+                    {
+                        on_chunk(CompletionChunkKind::Answer, content.clone())?;
+                    }
+                    if let Some(reasoning) = tool_use.reasoning.as_ref().filter(|r| !r.is_empty()) {
+                        on_chunk(CompletionChunkKind::Reasoning, reasoning.clone())?;
+                    }
+                }
             }
-
-            requests::messages_request_streaming(
-                &self.http,
-                &self.config,
-                &self.api_key,
-                model,
-                messages,
-                tools,
-                on_retry,
-                cancel_rx,
-                on_chunk,
-            )
-        })();
-
-        let elapsed = api_start.elapsed().as_secs_f64();
-        match &result {
-            Ok(_) => {
-                crate::metrics::record_api_call(model, "anthropic/messages", elapsed);
-            }
-            Err(e) => {
-                crate::metrics::record_api_call(model, "anthropic/messages", elapsed);
-                crate::metrics::record_api_error(model, error_type_label(e));
-            }
+            return Ok(result);
         }
-        result
+
+        requests::messages_request_streaming(
+            &self.http,
+            &self.config,
+            &self.api_key,
+            model,
+            messages,
+            tools,
+            on_retry,
+            cancel_rx,
+            on_chunk,
+        )
     }
 }
 
@@ -478,8 +537,7 @@ fn build_message_payloads<'a>(
                             r#type: "tool_use",
                             id: &tc.id,
                             name: &tc.function.name,
-                            input: serde_json::from_str(&tc.function.arguments)
-                                .unwrap_or(serde_json::Value::Null),
+                            input: serde_json::from_str(&tc.function.arguments).unwrap_or_default(),
                         });
                     }
                 }
