@@ -612,7 +612,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
   `Err(String)` carries the error message
 - **Tool call frame (VM → host):** `[tool_name: postcard String][args: postcard-encoded Args]`
 
-### Available tools (up to 34 total, some dependent on installed binaries)
+### Available tools (up to 35 total, some dependent on installed binaries)
 
 | Group | Tools |
 |---|---|
@@ -623,6 +623,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 | **EVM** | `evm_chain`, `evm_balance`, `evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`, `evm_logs`, `evm_nonce`, `evm_resolve` |
 | **File search** | `fff` (file finding) |
 | **RISC-V VM** | `run_riscv` (compile & run Rust code in a sandboxed RISC-V VM with access to all registered tools) |
+| **Random** | `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed for reproducibility) |
 | **Shell** | `exec` (direct program execution), `sh` (bash/dash/zsh — detected at startup), `nushell` (if `nu` is installed), `fish` (if `fish` is installed) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
 | **DB** | `db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count` |

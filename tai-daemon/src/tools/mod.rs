@@ -62,6 +62,7 @@ pub(crate) mod groups;
 pub(crate) mod http;
 mod image;
 pub(crate) mod nu;
+pub(crate) mod random;
 pub(crate) mod sessions;
 pub(crate) mod sh;
 pub(crate) mod shell_util;
@@ -393,6 +394,7 @@ impl ToolRegistry {
         }
         reg.register(exec::Exec);
         reg.register(fff::Fff::new(Arc::clone(&reg.fff_cache)));
+        reg.register(random::Random);
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);
         reg.register(x::XUserLookup);
