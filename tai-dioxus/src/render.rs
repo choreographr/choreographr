@@ -187,13 +187,14 @@ fn render_session_message(message: SessionMessage) -> Element {
     match message {
         SessionMessage::SystemText { content } => render_system_text(&content),
         SessionMessage::UserText { content } => render_user_text(&content),
-        SessionMessage::AssistantText { content, reasoning } => {
-            render_assistant_text(&content, &reasoning)
-        }
+        SessionMessage::AssistantText {
+            content, reasoning, ..
+        } => render_assistant_text(&content, &reasoning),
         SessionMessage::AssistantToolUse {
             content,
             tool_calls,
             reasoning,
+            ..
         } => {
             let name = tool_calls
                 .iter()

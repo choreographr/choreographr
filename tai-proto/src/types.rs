@@ -54,6 +54,14 @@ fn default_context_file_max_bytes() -> usize {
     32 * 1024
 }
 
+/// Token usage for a single LLM turn or accumulated for a session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+}
+
 /// Unified error type for all inference providers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub enum InferenceError {
@@ -131,11 +139,17 @@ pub enum SessionMessage {
     AssistantText {
         content: String,
         reasoning: Option<String>,
+        /// Token usage for this assistant response, if reported by the provider.
+        #[serde(default)]
+        token_usage: Option<TokenUsage>,
     },
     AssistantToolUse {
         content: Option<String>,
         tool_calls: Vec<AssistantToolCallRecord>,
         reasoning: Option<String>,
+        /// Token usage for this assistant response, if reported by the provider.
+        #[serde(default)]
+        token_usage: Option<TokenUsage>,
     },
     ToolResult {
         call_id: String,
@@ -161,6 +175,9 @@ pub struct SessionSummary {
     pub active_tool_groups: Vec<String>,
     /// The AI provider account name associated with this session, if any.
     pub account_name: Option<String>,
+    /// Total token usage accumulated across all turns in this session.
+    #[serde(default)]
+    pub token_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,6 +299,9 @@ pub enum DaemonMessage {
         max_turns: Option<u32>,
         messages: Vec<SessionMessage>,
         active_tool_groups: Vec<String>,
+        /// Accumulated token usage for this session, if available.
+        #[serde(default)]
+        token_usage: Option<TokenUsage>,
     },
     SessionMessageAppended {
         message: SessionMessage,
@@ -340,6 +360,8 @@ pub enum DaemonMessage {
     },
     Done {
         request_id: u32,
+        /// Token usage for the completed request, if reported by the provider.
+        token_usage: Option<TokenUsage>,
     },
     Failed {
         request_id: u32,
@@ -550,8 +572,17 @@ impl DaemonMessage {
         }
     }
 
+    /// Construct a Done message without token usage information.
+    ///
+    /// This is a convenience constructor for callers that don't track usage.
+    /// When token usage is available (e.g. from the request worker after
+    /// completing a turn), construct `DaemonMessage::Done { request_id,
+    /// token_usage: Some(…) }` directly instead.
     pub fn done(request_id: u32) -> Self {
-        Self::Done { request_id }
+        Self::Done {
+            request_id,
+            token_usage: None,
+        }
     }
 
     pub fn failed(request_id: u32, error: impl Into<String>) -> Self {

@@ -14,7 +14,7 @@ pub use io::{
 pub use types::{
     AccountInfo, AssistantToolCallRecord, ClientMessage, ContextConfig, DaemonMessage,
     DisplayedImageRecord, ImageMetadata, InferenceError, MAX_IMAGE_CHUNK_SIZE, OutputStream,
-    SessionMessage, SessionStatus, SessionSummary, ThinkingEffort,
+    SessionMessage, SessionStatus, SessionSummary, ThinkingEffort, TokenUsage,
 };
 
 #[cfg(test)]

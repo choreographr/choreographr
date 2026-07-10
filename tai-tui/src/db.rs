@@ -2,6 +2,22 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+/// Thread-local override for test database path.
+///
+/// Each test thread sets its own temp directory so parallel tests don't
+/// collide on the same database file and don't read/write the real one.
+#[cfg(test)]
+thread_local! {
+    static TEST_DB_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub fn set_test_db_path(path: PathBuf) {
+    TEST_DB_PATH.with(|cell| {
+        *cell.borrow_mut() = Some(path);
+    });
+}
+
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +38,13 @@ pub struct CommandEntry {
 /// Uses `TAI_TUI_DB_PATH` env var if set, otherwise
 /// `~/.local/share/tai-tui/state.redb`.
 pub fn db_path() -> io::Result<PathBuf> {
+    // When a test thread has registered an override, use that instead of the
+    // real or env-var path.  Thread-local storage keeps parallel tests isolated.
+    #[cfg(test)]
+    if let Some(path) = TEST_DB_PATH.with(|cell| cell.borrow().clone()) {
+        return Ok(path);
+    }
+
     if let Ok(override_path) = std::env::var("TAI_TUI_DB_PATH") {
         return Ok(PathBuf::from(override_path));
     }
@@ -265,5 +288,14 @@ mod tests {
         assert_eq!(loaded[0].command, format!("cmd-{}", MAX_HISTORY + 9));
         // The oldest entry should be cmd-9 or older (not cmd-0)
         assert_ne!(loaded.last().unwrap().command, "cmd-0");
+    }
+
+    #[test]
+    fn db_path_uses_thread_local_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom_path = dir.path().join("custom.redb");
+        super::set_test_db_path(custom_path.clone());
+        let path = db_path().unwrap();
+        assert_eq!(path, custom_path);
     }
 }

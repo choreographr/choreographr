@@ -11,7 +11,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 use tai_keystore::ServiceCredential;
-use tai_proto::{AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary};
+use tai_proto::{
+    AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary, TokenUsage,
+};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
@@ -173,6 +175,7 @@ impl DaemonState {
                     active_tool_groups: active_cats.clone(),
                     context_config: context_config.clone().unwrap_or_default(),
                     account_name: account_name.clone(),
+                    accumulated_usage: TokenUsage::default(),
                 };
 
                 if let Err(e) = db::write_session(&self.db, sid, &record) {
@@ -191,6 +194,7 @@ impl DaemonState {
                     status: SessionStatus::Inactive,
                     active_tool_groups: active_cats.clone(),
                     account_name: account_name.clone(),
+                    accumulated_usage: TokenUsage::default(),
                 };
                 let session_tx = self.spawn_session(sid, record, metadata);
 
@@ -256,6 +260,7 @@ impl DaemonState {
                         status: meta.status.clone(),
                         active_tool_groups: meta.active_tool_groups.clone(),
                         account_name: meta.account_name.clone(),
+                        token_usage: Some(meta.accumulated_usage.clone()),
                     })
                     .collect();
 
@@ -279,6 +284,7 @@ impl DaemonState {
                         status: meta.status.clone(),
                         active_tool_groups: meta.active_tool_groups.clone(),
                         account_name: meta.account_name.clone(),
+                        token_usage: Some(meta.accumulated_usage.clone()),
                     });
                 let _ = reply.send(summary);
             }
@@ -802,6 +808,7 @@ mod tests {
                 status: SessionStatus::Inactive,
                 active_tool_groups: vec!["core".into()],
                 account_name: None,
+                accumulated_usage: TokenUsage::default(),
             },
         );
         let (reply, rx) = mpsc::channel();
@@ -841,6 +848,7 @@ mod tests {
                 status: SessionStatus::Inactive,
                 active_tool_groups: vec!["core".into()],
                 account_name: None,
+                accumulated_usage: TokenUsage::default(),
             },
         );
         let new_meta = SessionMetadata {
@@ -855,6 +863,7 @@ mod tests {
             status: SessionStatus::Inference,
             active_tool_groups: vec!["core".into(), "git".into()],
             account_name: None,
+            accumulated_usage: TokenUsage::default(),
         };
         state.handle_command(DaemonCommand::UpdateMetadata {
             session_id: 1,

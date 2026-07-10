@@ -94,3 +94,110 @@ fn session_status_retrying_serde_round_trip() {
     let decoded: SessionStatus = decode_frame(&frame[4..]).expect("decode");
     assert_eq!(decoded, status);
 }
+
+// ── TokenUsage tests ──────────────────────────────────────────────────
+
+#[test]
+fn token_usage_default_is_zero() {
+    let u = TokenUsage::default();
+    assert_eq!(u.input_tokens, 0);
+    assert_eq!(u.output_tokens, 0);
+    assert_eq!(u.total_tokens, 0);
+}
+
+#[test]
+fn token_usage_serde_round_trip() {
+    let usage = TokenUsage {
+        input_tokens: 150,
+        output_tokens: 75,
+        total_tokens: 225,
+    };
+    let frame = encode_frame(&usage).expect("encode");
+    let decoded: TokenUsage = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, usage);
+}
+
+#[test]
+fn token_usage_in_session_message_assistant_text_backward_compat() {
+    // Old JSON (before token_usage was added) should deserialize with token_usage = None
+    let json = r#"{"AssistantText":{"content":"hello","reasoning":null}}"#;
+    let msg: SessionMessage = serde_json::from_str(json).unwrap();
+    match msg {
+        SessionMessage::AssistantText {
+            content,
+            reasoning,
+            token_usage,
+        } => {
+            assert_eq!(content, "hello");
+            assert_eq!(reasoning, None);
+            assert_eq!(token_usage, None);
+        }
+        _ => panic!("expected AssistantText"),
+    }
+}
+
+#[test]
+fn token_usage_in_session_summary_backward_compat() {
+    // Old JSON (before token_usage was added to SessionSummary)
+    let json = r#"{"session_id":1,"title":null,"selected_model":null,"reasoning_effort":null,"parent_session_id":null,"cwd":null,"created_at":0,"message_count":0,"max_turns":null,"status":"Inactive","active_tool_groups":[],"account_name":null}"#;
+    let summary: SessionSummary = serde_json::from_str(json).unwrap();
+    assert_eq!(summary.session_id, 1);
+    assert_eq!(summary.token_usage, None);
+}
+
+#[test]
+fn token_usage_in_daemon_message_done_backward_compat() {
+    // Old JSON (before token_usage was added to Done)
+    let json = r#"{"Done":{"request_id":42}}"#;
+    let msg: DaemonMessage = serde_json::from_str(json).unwrap();
+    match msg {
+        DaemonMessage::Done {
+            request_id,
+            token_usage,
+        } => {
+            assert_eq!(request_id, 42);
+            assert_eq!(token_usage, None);
+        }
+        _ => panic!("expected Done"),
+    }
+}
+
+#[test]
+fn daemon_message_done_constructor() {
+    let msg = DaemonMessage::done(7);
+    match msg {
+        DaemonMessage::Done {
+            request_id,
+            token_usage,
+        } => {
+            assert_eq!(request_id, 7);
+            assert_eq!(token_usage, None);
+        }
+        _ => panic!("expected Done"),
+    }
+}
+
+#[test]
+fn daemon_message_done_with_usage_round_trip() {
+    let usage = TokenUsage {
+        input_tokens: 100,
+        output_tokens: 50,
+        total_tokens: 150,
+    };
+    let msg = DaemonMessage::Done {
+        request_id: 3,
+        token_usage: Some(usage.clone()),
+    };
+    let frame = encode_frame(&msg).expect("encode");
+    let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
+    match decoded {
+        DaemonMessage::Done {
+            request_id,
+            token_usage,
+        } => {
+            assert_eq!(request_id, 3);
+            assert_eq!(token_usage, Some(usage));
+        }
+        _ => panic!("expected Done"),
+    }
+}

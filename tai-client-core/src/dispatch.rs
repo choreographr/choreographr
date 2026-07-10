@@ -74,6 +74,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             cwd,
             max_turns,
             active_tool_groups: _,
+            token_usage: _,
             messages,
         } => {
             let title = title.unwrap_or_else(|| "untitled".to_string());
@@ -196,7 +197,10 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             handler.handle_image_end(request_id, image_id)?;
             Ok(None)
         }
-        DaemonMessage::Done { request_id } => {
+        DaemonMessage::Done {
+            request_id,
+            token_usage: _,
+        } => {
             handler.push_text(format!("[{request_id}] done"));
             handler.drop_request(request_id);
             Ok(None)
@@ -481,6 +485,7 @@ mod tests {
             max_turns: None,
             messages,
             active_tool_groups: vec![],
+            token_usage: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
 
@@ -508,6 +513,7 @@ mod tests {
             SessionMessage::AssistantText {
                 content: "assistant msg".into(),
                 reasoning: None,
+                token_usage: None,
             },
             SessionMessage::ToolResult {
                 call_id: "c1".into(),
@@ -525,6 +531,7 @@ mod tests {
             max_turns: None,
             messages,
             active_tool_groups: vec![],
+            token_usage: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
 
@@ -552,6 +559,7 @@ mod tests {
             max_turns: None,
             messages: vec![],
             active_tool_groups: vec![],
+            token_usage: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
         let events = h.collect_events();
@@ -574,6 +582,7 @@ mod tests {
             max_turns: Some(10),
             messages: vec![],
             active_tool_groups: vec![],
+            token_usage: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
         let events = h.collect_events();
@@ -659,6 +668,7 @@ mod tests {
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
             account_name: None,
+            token_usage: None,
         }];
         dispatch_daemon_message(&mut h, DaemonMessage::Sessions { sessions }).unwrap();
         let events = h.collect_events();
@@ -761,7 +771,14 @@ mod tests {
     #[test]
     fn done_pushes_text_and_drops_request() {
         let mut h = TestHandler::new();
-        dispatch_daemon_message(&mut h, DaemonMessage::Done { request_id: 7 }).unwrap();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::Done {
+                request_id: 7,
+                token_usage: None,
+            },
+        )
+        .unwrap();
         let events = h.collect_events();
         assert!(
             events

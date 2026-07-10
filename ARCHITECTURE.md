@@ -87,6 +87,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 | `ImageMetadata` | Mime type, dimensions, byte length for streamed images |
 | `DisplayedImageRecord` | Binary image data + `ImageMetadata` for persisted image replay (carried inside `SessionMessage::DisplayedImage`) |
 | `ThinkingEffort` | Enum controlling how much reasoning/thinking the model performs: `Off`, `Low`, `Medium`, `High`. Stored per-session and passed through to each provider's wire format. |
+| `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessage::AssistantText` and `AssistantToolUse` for per-turn accounting, and in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals. |
 
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
@@ -318,6 +319,51 @@ RunInput received
      └► if responses or chat_completions (no tools):
         └► stream chunks via SSE → emit OutputChunk per token → Done
 ```
+
+### Token Usage Tracking
+
+Token usage flows from providers through the daemon to all clients:
+
+```
+LLM provider (API response)
+  └► usage extracted per-turn in provider client
+     ├─ OpenAI non-streaming:    ChatCompletionsResponse.usage
+     ├─ OpenAI streaming:        final SSE chunk with usage (stream_options.include_usage=true)
+     ├─ Anthropic non-streaming: MessagesResponse.usage (input + output tokens)
+     ├─ Anthropic streaming:     message_start (input) + message_delta (output)
+     ├─ Mistral:                 ChatCompletionResponse.usage
+     └─ Google:                 Not yet supported (usage = None)
+       │
+       ▼
+     ChatTurnResult (FinalText | ToolUse).usage: Option<TokenUsage>
+       │
+       ▼
+     run_agent_loop (tai-daemon/src/requests.rs)
+       ├─ embeds per-turn TokenUsage into SessionMessage::AssistantText / AssistantToolUse
+       └─ accumulates into SessionState.accumulated_usage (TokenUsage)
+       │
+       ▼
+     SessionState (tai-daemon/src/sessions.rs)
+       ├─ persisted via SessionRecord.accumulated_usage
+       ├─ sent to subscribers via DaemonMessage::SessionState.token_usage
+       ├─ sent to clients via DaemonMessage::Done.token_usage
+       └─ included in SessionSummary.token_usage (listing / get-session)
+       │
+       ▼
+     Clients (tai-tui, tai-dioxus, tai-im)
+       └─ tai-tui: displays in session detail view (render.rs:render_session_detail_view)
+```
+
+**Key type** — `TokenUsage` (tai-proto/src/types.rs):
+```rust
+pub struct TokenUsage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u32,
+}
+```
+
+All new fields use `#[serde(default)]` so old persisted sessions remain compatible (deserialize to zero usage).
 
 ### `tai-tui` — Terminal client
 

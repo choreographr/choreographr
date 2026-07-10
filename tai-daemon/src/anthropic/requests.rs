@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tai_proto::ThinkingEffort;
+use tai_proto::{ThinkingEffort, TokenUsage};
 use tracing::debug;
 
 use crate::openai::{
@@ -210,6 +210,9 @@ where
     // Accumulates tool call fields across content_block_delta chunks keyed
     // by the content block index.
     let mut pending_tool_calls: Vec<StreamToolCall> = Vec::new();
+    // Track input/output tokens delivered via message_start and message_delta.
+    let mut input_tokens: Option<u32> = None;
+    let mut output_tokens: Option<u32> = None;
 
     while let Some((event_type, data)) = reader.next_event()? {
         match event_type.as_str() {
@@ -277,13 +280,45 @@ where
                     }
                 }
             }
+            "message_start" => {
+                // Parse input_tokens from the message_start event.
+                let start: MessageStart = serde_json::from_str(&data)
+                    .map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
+                input_tokens = start.message.usage.map(|u| u.input_tokens);
+            }
+            "message_delta" => {
+                // Parse output_tokens from the message_delta event.
+                let delta_msg: MessageDelta = serde_json::from_str(&data)
+                    .map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
+                output_tokens = delta_msg.usage.map(|u| u.output_tokens);
+            }
             "message_stop" => {
                 break;
             }
-            // message_start, content_block_stop, message_delta, ping — skip
+            // content_block_stop, ping — skip
             _ => {}
         }
     }
+
+    // Build usage from the tokens collected during message_start and
+    // message_delta events.
+    let usage: Option<TokenUsage> = match (input_tokens, output_tokens) {
+        (Some(in_tok), Some(out_tok)) => {
+            let total = in_tok + out_tok;
+            debug!(
+                input_tokens = in_tok,
+                output_tokens = out_tok,
+                total_tokens = total,
+                "Anthropic streaming turn usage"
+            );
+            Some(TokenUsage {
+                input_tokens: in_tok,
+                output_tokens: out_tok,
+                total_tokens: total,
+            })
+        }
+        _ => None,
+    };
 
     if !saw_text {
         return Err(AnthropicError::EmptyResponse);
@@ -312,6 +347,7 @@ where
             } else {
                 Some(full_reasoning)
             },
+            usage,
         }));
     }
 
@@ -326,6 +362,7 @@ where
         } else {
             Some(full_reasoning)
         },
+        usage,
     }))
 }
 
@@ -494,4 +531,36 @@ impl AnthropicSseReader {
         self.current_data.clear();
         Some((event, data))
     }
+}
+
+// ── Streaming usage types ─────────────────────────────────────────────
+
+/// SSE event for message_start — carries input_tokens.
+#[derive(Debug, Deserialize)]
+struct MessageStart {
+    #[serde(rename = "message")]
+    message: MessageStartMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageStartMessage {
+    #[serde(default)]
+    usage: Option<AnthropicStreamUsage>,
+}
+
+/// SSE event for message_delta — carries output_tokens.
+#[derive(Debug, Deserialize)]
+struct MessageDelta {
+    #[serde(default)]
+    usage: Option<AnthropicStreamUsageDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamUsage {
+    input_tokens: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicStreamUsageDelta {
+    output_tokens: u32,
 }

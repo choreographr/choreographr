@@ -544,6 +544,7 @@ fn response_to_turn_result(
             content,
             tool_calls,
             reasoning,
+            usage: None,
         }));
     }
 
@@ -555,5 +556,6 @@ fn response_to_turn_result(
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
         reasoning,
+        usage: None,
     }))
 }

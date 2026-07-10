@@ -24,3 +24,5 @@ fn main() -> anyhow::Result<()> {
 mod app_tests;
 #[cfg(test)]
 mod render_tests;
+#[cfg(test)]
+mod test_util;

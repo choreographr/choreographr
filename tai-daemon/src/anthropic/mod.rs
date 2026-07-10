@@ -12,6 +12,7 @@ use crate::openai::{
     CompletionChunkKind, FinalTextResult,
 };
 use crate::providers::ChatTurnRequest;
+use tai_proto::TokenUsage;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_API_VERSION: &str = "2023-06-01";
@@ -386,6 +387,24 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
         Some(reasoning_parts.join("\n"))
     };
 
+    // Convert Anthropic's usage info (input_tokens + output_tokens) to our
+    // canonical TokenUsage struct. Anthropic does not provide total_tokens,
+    // so we compute it.
+    let usage: Option<TokenUsage> = response.usage.map(|u| {
+        let total = u.input_tokens + u.output_tokens;
+        debug!(
+            input_tokens = u.input_tokens,
+            output_tokens = u.output_tokens,
+            total_tokens = total,
+            "Anthropic turn usage"
+        );
+        TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            total_tokens: total,
+        }
+    });
+
     if !tool_uses.is_empty() {
         let content = if text_parts.is_empty() {
             None
@@ -396,6 +415,7 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
             content,
             tool_calls: tool_uses,
             reasoning,
+            usage,
         }));
     }
 
@@ -407,6 +427,7 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
         reasoning,
+        usage,
     }))
 }
 

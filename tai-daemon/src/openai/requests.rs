@@ -13,6 +13,7 @@ use crate::providers::ChatTurnRequest;
 use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc;
+use tai_proto::TokenUsage;
 
 impl OpenAiClient {
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, super::OpenAiError> {
@@ -297,6 +298,13 @@ fn chat_completions_request_with_tools(
     // Extract reasoning early (before partial moves into tool_calls / content)
     let reasoning = choice.message.take_reasoning();
 
+    // Extract token usage from the API response for cost tracking / display.
+    let turn_usage: Option<TokenUsage> = payload.usage.map(|u| TokenUsage {
+        input_tokens: u.prompt_tokens,
+        output_tokens: u.completion_tokens,
+        total_tokens: u.total_tokens,
+    });
+
     if !choice.message.tool_calls.is_empty() {
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
             content: choice.message.content,
@@ -311,6 +319,7 @@ fn chat_completions_request_with_tools(
                 })
                 .collect(),
             reasoning,
+            usage: turn_usage,
         }));
     }
 
@@ -327,6 +336,7 @@ fn chat_completions_request_with_tools(
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
         reasoning,
+        usage: turn_usage,
     }))
 }
 
@@ -533,9 +543,29 @@ where
     let mut raw_tool_call_deltas: Vec<StreamToolCallDelta> = Vec::new();
 
     let mut reader = SseReader::from_reader(response);
+    // Track usage from the final SSE chunk (OpenAI sends a usage chunk with
+    // choices: [] when stream_options.include_usage is true).
+    let mut last_usage: Option<TokenUsage> = None;
     while let Some(data) = reader.next_event()? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
+
+        // Capture usage from the final chunk (OpenAI sends a usage chunk
+        // with choices: []).
+        if let Some(ref u) = payload.usage {
+            debug!(
+                prompt_tokens = u.prompt_tokens,
+                completion_tokens = u.completion_tokens,
+                total_tokens = u.total_tokens,
+                "OpenAI streaming turn usage"
+            );
+            last_usage = Some(TokenUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+            });
+        }
+
         for choice in payload.choices {
             let Some(delta) = choice.delta else {
                 continue;
@@ -591,6 +621,7 @@ where
             } else {
                 Some(full_reasoning)
             },
+            usage: last_usage,
         }));
     }
 
@@ -601,6 +632,7 @@ where
         } else {
             Some(full_reasoning)
         },
+        usage: last_usage,
     }))
 }
 
@@ -845,6 +877,7 @@ mod tests {
             content: Some("I'll search for that.".into()),
             tool_calls,
             reasoning: None,
+            usage: None,
         });
         match result {
             ChatTurnResult::ToolUse(use_) => {
@@ -898,6 +931,40 @@ mod tests {
         })
         .unwrap();
         assert!(body.get("reasoning_effort").is_none(), "should be omitted");
+    }
+
+    // -- token usage streaming response tests ----------------------------
+
+    #[test]
+    fn stream_response_deserializes_usage_chunk() {
+        // OpenAI sends a usage-only chunk at the end of a stream with
+        // stream_options.include_usage=true.
+        let json = r#"{"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":25,"total_tokens":75}}"#;
+        let payload: ChatCompletionsStreamResponse = serde_json::from_str(json).unwrap();
+        assert!(payload.choices.is_empty());
+        let usage = payload.usage.expect("usage should be present");
+        assert_eq!(usage.prompt_tokens, 50);
+        assert_eq!(usage.completion_tokens, 25);
+        assert_eq!(usage.total_tokens, 75);
+    }
+
+    #[test]
+    fn stream_response_without_usage_defaults_to_none() {
+        let json = r#"{"choices":[{"delta":{"content":"hello"}}]}"#;
+        let payload: ChatCompletionsStreamResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.choices.len(), 1);
+        assert!(payload.usage.is_none());
+    }
+
+    #[test]
+    fn test_chat_completions_response_non_streaming_with_usage() {
+        // Non-streaming response with usage
+        let json = r#"{"choices":[{"message":{"content":"Hello","tool_calls":[],"reasoning_content":null,"reasoning":null,"reasoning_text":null}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        let resp: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.expect("usage should be present");
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
     }
 
     #[test]

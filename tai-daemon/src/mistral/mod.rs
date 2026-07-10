@@ -12,6 +12,7 @@ use crate::openai::{
     CompletionChunkKind, FinalTextResult,
 };
 use crate::providers::ChatTurnRequest;
+use tai_proto::TokenUsage;
 
 const DEFAULT_BASE_URL: &str = "https://api.mistral.ai/v1";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -289,7 +290,7 @@ struct ChatCompletionResponse {
     _id: String,
     choices: Vec<Choice>,
     #[serde(default, rename = "usage")]
-    _usage: Option<UsageInfo>,
+    usage: Option<UsageInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,11 +328,11 @@ struct ToolCallFunctionResponse {
 #[derive(Debug, Deserialize)]
 pub(crate) struct UsageInfo {
     #[serde(default, rename = "prompt_tokens")]
-    _prompt_tokens: u32,
+    prompt_tokens: u32,
     #[serde(default, rename = "completion_tokens")]
-    _completion_tokens: u32,
+    completion_tokens: u32,
     #[serde(default, rename = "total_tokens")]
-    _total_tokens: u32,
+    total_tokens: u32,
 }
 
 // Streaming types
@@ -496,6 +497,22 @@ fn response_to_turn_result(
         })
         .collect();
 
+    // Extract token usage from the response for cost tracking / display.
+    let usage: Option<TokenUsage> = response.usage.map(|u| {
+        let usage = TokenUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+        };
+        debug!(
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            total_tokens = usage.total_tokens,
+            "Mistral turn usage"
+        );
+        usage
+    });
+
     if !tool_calls.is_empty() {
         let text = if content.is_empty() {
             None
@@ -506,6 +523,7 @@ fn response_to_turn_result(
             content: text,
             tool_calls,
             reasoning: None,
+            usage,
         }));
     }
 
@@ -516,6 +534,7 @@ fn response_to_turn_result(
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
         reasoning: None,
+        usage,
     }))
 }
 

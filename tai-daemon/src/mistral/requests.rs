@@ -302,6 +302,7 @@ where
                                             },
                                             tool_calls: calls,
                                             reasoning: None,
+                                            usage: None,
                                         },
                                     ));
                                 }
@@ -350,6 +351,7 @@ where
                     },
                     tool_calls: calls,
                     reasoning: None,
+                    usage: None,
                 },
             ));
         }
@@ -362,6 +364,7 @@ where
     Ok(ChatTurnResult::FinalText(crate::openai::FinalTextResult {
         content: text_accumulated,
         reasoning: None,
+        usage: None,
     }))
 }
 

@@ -100,7 +100,9 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             labeled_text_lines("system", content, Color::DarkGray)
         }
         SessionMessage::UserText { content } => labeled_text_lines("user", content, Color::Green),
-        SessionMessage::AssistantText { content, reasoning } => {
+        SessionMessage::AssistantText {
+            content, reasoning, ..
+        } => {
             let mut lines = Vec::new();
             if let Some(reasoning_text) = reasoning
                 .as_deref()
@@ -121,6 +123,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             content,
             tool_calls,
             reasoning,
+            ..
         } => {
             let mut lines = vec![Line::from(Span::styled(
                 format!(
@@ -1422,6 +1425,7 @@ mod tests {
         let msg = SessionMessage::AssistantText {
             content: "The answer is 42.".into(),
             reasoning: Some("Let me think step by step.".into()),
+            token_usage: None,
         };
         let lines = session_message_lines(&msg, 80);
         // First line should be the "reasoning" label
@@ -1452,6 +1456,7 @@ mod tests {
         let msg = SessionMessage::AssistantText {
             content: "Just an answer.".into(),
             reasoning: None,
+            token_usage: None,
         };
         let lines = session_message_lines(&msg, 80);
         // Should start directly with the assistant label

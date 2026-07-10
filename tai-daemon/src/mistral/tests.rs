@@ -169,7 +169,7 @@ fn test_response_to_turn_result_empty_choices_errors() {
     let response = ChatCompletionResponse {
         _id: "test".into(),
         choices: vec![],
-        _usage: None,
+        usage: None,
     };
     assert!(response_to_turn_result(response).is_err());
 }
@@ -186,11 +186,45 @@ fn test_response_to_turn_result_text() {
             },
             _finish_reason: Some("stop".into()),
         }],
-        _usage: None,
+        usage: None,
     };
     let result = response_to_turn_result(response).unwrap();
     match result {
-        ChatTurnResult::FinalText(ft) => assert_eq!(ft.content, "Hello world"),
+        ChatTurnResult::FinalText(ft) => {
+            assert_eq!(ft.content, "Hello world");
+            assert_eq!(ft.usage, None);
+        }
+        _ => panic!("expected FinalText"),
+    }
+}
+
+#[test]
+fn test_response_to_turn_result_text_with_usage() {
+    let response = ChatCompletionResponse {
+        _id: "test".into(),
+        choices: vec![Choice {
+            _index: 0,
+            message: AssistantMessageResponse {
+                content: Some("Hello world".into()),
+                tool_calls: vec![],
+            },
+            _finish_reason: Some("stop".into()),
+        }],
+        usage: Some(UsageInfo {
+            prompt_tokens: 20,
+            completion_tokens: 10,
+            total_tokens: 30,
+        }),
+    };
+    let result = response_to_turn_result(response).unwrap();
+    match result {
+        ChatTurnResult::FinalText(ft) => {
+            assert_eq!(ft.content, "Hello world");
+            let usage = ft.usage.expect("usage should be present");
+            assert_eq!(usage.input_tokens, 20);
+            assert_eq!(usage.output_tokens, 10);
+            assert_eq!(usage.total_tokens, 30);
+        }
         _ => panic!("expected FinalText"),
     }
 }
@@ -207,7 +241,7 @@ fn test_response_to_turn_result_empty_content_errors() {
             },
             _finish_reason: Some("stop".into()),
         }],
-        _usage: None,
+        usage: None,
     };
     assert!(response_to_turn_result(response).is_err());
 }
@@ -231,13 +265,52 @@ fn test_response_to_turn_result_tool_calls() {
             },
             _finish_reason: Some("tool_calls".into()),
         }],
-        _usage: None,
+        usage: None,
     };
     let result = response_to_turn_result(response).unwrap();
     match result {
         ChatTurnResult::ToolUse(tu) => {
             assert_eq!(tu.tool_calls.len(), 1);
             assert_eq!(tu.tool_calls[0].name, "get_weather");
+            assert_eq!(tu.usage, None);
+        }
+        _ => panic!("expected ToolUse"),
+    }
+}
+
+#[test]
+fn test_response_to_turn_result_tool_with_usage() {
+    let response = ChatCompletionResponse {
+        _id: "test".into(),
+        choices: vec![Choice {
+            _index: 0,
+            message: AssistantMessageResponse {
+                content: Some("Using tool".into()),
+                tool_calls: vec![ToolCallResponse {
+                    _id: "call_1".into(),
+                    _kind: "function".into(),
+                    function: ToolCallFunctionResponse {
+                        name: "get_weather".into(),
+                        arguments: "{\"loc\": \"Paris\"}".into(),
+                    },
+                }],
+            },
+            _finish_reason: Some("tool_calls".into()),
+        }],
+        usage: Some(UsageInfo {
+            prompt_tokens: 30,
+            completion_tokens: 15,
+            total_tokens: 45,
+        }),
+    };
+    let result = response_to_turn_result(response).unwrap();
+    match result {
+        ChatTurnResult::ToolUse(tu) => {
+            assert_eq!(tu.tool_calls.len(), 1);
+            let usage = tu.usage.expect("usage should be present");
+            assert_eq!(usage.input_tokens, 30);
+            assert_eq!(usage.output_tokens, 15);
+            assert_eq!(usage.total_tokens, 45);
         }
         _ => panic!("expected ToolUse"),
     }

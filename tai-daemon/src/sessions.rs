@@ -13,6 +13,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tai_proto::{
     ContextConfig, DaemonMessage, SessionMessage, SessionStatus, SessionSummary, ThinkingEffort,
+    TokenUsage,
 };
 use tracing::{debug, error, info, warn};
 
@@ -84,6 +85,7 @@ pub struct SessionMetadata {
     pub status: SessionStatus,
     pub active_tool_groups: Vec<String>,
     pub account_name: Option<String>,
+    pub accumulated_usage: TokenUsage,
 }
 
 /// Convert a persisted record into metadata. New sessions loaded from the
@@ -103,6 +105,7 @@ impl From<SessionRecord> for SessionMetadata {
             status: SessionStatus::Sleeping,
             active_tool_groups: record.active_tool_groups,
             account_name: record.account_name,
+            accumulated_usage: record.accumulated_usage,
         }
     }
 }
@@ -122,6 +125,7 @@ impl From<SessionMetadata> for SessionRecord {
             active_tool_groups: meta.active_tool_groups,
             context_config: ContextConfig::default(),
             account_name: meta.account_name,
+            accumulated_usage: meta.accumulated_usage,
         }
     }
 }
@@ -146,6 +150,7 @@ impl From<&SessionState> for SessionMetadata {
             status: state.status.clone(),
             active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
             account_name: state.account_name.clone(),
+            accumulated_usage: state.accumulated_usage.clone(),
         }
     }
 }
@@ -180,6 +185,7 @@ pub struct SessionSnapshot {
     pub active_tool_groups: std::collections::HashSet<String>,
     pub context_config: ContextConfig,
     pub account_name: Option<String>,
+    pub accumulated_usage: TokenUsage,
 }
 
 pub(crate) struct ActiveRequest {
@@ -209,6 +215,7 @@ pub struct SessionState {
     pub active_tool_groups: std::collections::HashSet<String>,
     pub context_config: ContextConfig,
     pub account_name: Option<String>,
+    pub accumulated_usage: TokenUsage,
     pub provider: Option<InferenceProvider>,
 }
 
@@ -230,6 +237,7 @@ impl SessionState {
             active_tool_groups: self.active_tool_groups.clone(),
             context_config: self.context_config.clone(),
             account_name: self.account_name.clone(),
+            accumulated_usage: self.accumulated_usage.clone(),
         }
     }
 
@@ -255,6 +263,7 @@ impl SessionState {
             active_tool_groups: snapshot.active_tool_groups,
             context_config: snapshot.context_config,
             account_name: snapshot.account_name,
+            accumulated_usage: snapshot.accumulated_usage,
             provider: None,
         }
     }
@@ -275,6 +284,7 @@ impl SessionState {
         self.active_tool_groups = snapshot.active_tool_groups;
         self.context_config = snapshot.context_config;
         self.account_name = snapshot.account_name;
+        self.accumulated_usage = snapshot.accumulated_usage;
     }
 
     /// Read-only access to messages.
@@ -319,6 +329,7 @@ impl SessionState {
             active_tool_groups: HashSet::new(),
             context_config: ContextConfig::default(),
             account_name: None,
+            accumulated_usage: TokenUsage::default(),
             provider: None,
         }
     }
@@ -401,6 +412,10 @@ pub fn session_main(
             .map(|r| r.context_config.clone())
             .unwrap_or_default(),
         account_name,
+        accumulated_usage: init_record
+            .as_ref()
+            .map(|r| r.accumulated_usage.clone())
+            .unwrap_or_default(),
         provider,
     };
 
@@ -691,6 +706,7 @@ fn process_command(
                 max_turns: state.max_turns,
                 messages: state.messages.clone(),
                 active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
+                token_usage: Some(state.accumulated_usage.clone()),
             };
             if let Some(tx) = state.subscribers.get(&client_id) {
                 let _ = tx.send(snapshot);
@@ -717,6 +733,7 @@ fn process_command(
                 status: state.status.clone(),
                 active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
                 account_name: state.account_name.clone(),
+                token_usage: Some(state.accumulated_usage.clone()),
             });
             false
         }
@@ -908,8 +925,20 @@ fn run_request_worker(
         RequestOutcome::Done => {
             info!(session_id, request_id, "request completed");
             // Route through the main session thread so detach is respected.
+            // Include the worker's accumulated token usage so subscribers
+            // (e.g. the TUI) can show per-request token counts.
+            let usage = &session.accumulated_usage;
+            debug!(
+                session_id,
+                request_id,
+                input_tokens = usage.input_tokens,
+                output_tokens = usage.output_tokens,
+                total_tokens = usage.total_tokens,
+                "broadcasting Done with accumulated token usage"
+            );
             let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::Done {
                 request_id,
+                token_usage: Some(usage.clone()),
             }));
         }
         RequestOutcome::Failed(error) => {
@@ -1005,6 +1034,7 @@ mod tests {
             active_tool_groups: vec!["core".into(), "shell".into()],
             context_config: ContextConfig::default(),
             account_name: None,
+            accumulated_usage: TokenUsage::default(),
         }
     }
 
@@ -1027,6 +1057,7 @@ mod tests {
                 SessionMessage::AssistantText {
                     content: "hi".into(),
                     reasoning: None,
+                    token_usage: None,
                 },
             ],
             subscribers: HashMap::new(),
@@ -1038,6 +1069,7 @@ mod tests {
             active_tool_groups: ["core".into(), "shell".into()].into(),
             context_config: ContextConfig::default(),
             account_name: None,
+            accumulated_usage: TokenUsage::default(),
             provider: None,
         }
     }
@@ -1069,6 +1101,7 @@ mod tests {
             status: SessionStatus::Inactive,
             active_tool_groups: vec!["git".into()],
             account_name: None,
+            accumulated_usage: TokenUsage::default(),
         };
         let record: SessionRecord = meta.clone().into();
         // Status field does not exist in record
@@ -1151,7 +1184,10 @@ mod tests {
 
         let mut shutdown = false;
         process_command(
-            SessionCommand::Broadcast(DaemonMessage::Done { request_id: 5 }),
+            SessionCommand::Broadcast(DaemonMessage::Done {
+                request_id: 5,
+                token_usage: None,
+            }),
             &mut state,
             1,
             &db,
@@ -1162,8 +1198,20 @@ mod tests {
             25,
         );
 
-        assert_eq!(rx1.recv().unwrap(), DaemonMessage::Done { request_id: 5 });
-        assert_eq!(rx2.recv().unwrap(), DaemonMessage::Done { request_id: 5 });
+        assert_eq!(
+            rx1.recv().unwrap(),
+            DaemonMessage::Done {
+                request_id: 5,
+                token_usage: None,
+            }
+        );
+        assert_eq!(
+            rx2.recv().unwrap(),
+            DaemonMessage::Done {
+                request_id: 5,
+                token_usage: None,
+            }
+        );
         assert!(!shutdown);
     }
 
@@ -1220,7 +1268,10 @@ mod tests {
 
         let mut shutdown = false;
         process_command(
-            SessionCommand::Broadcast(DaemonMessage::Done { request_id: 0 }),
+            SessionCommand::Broadcast(DaemonMessage::Done {
+                request_id: 0,
+                token_usage: None,
+            }),
             &mut state,
             1,
             &db,
@@ -1433,5 +1484,140 @@ mod tests {
         let msgs: Vec<DaemonMessage> = (0..2).map(|_| sub_rx.recv().unwrap()).collect();
         assert!(msgs.contains(&DaemonMessage::Cancelled { request_id: 1 }));
         assert!(msgs.contains(&DaemonMessage::Cancelled { request_id: 2 }));
+    }
+
+    // ── Token accumulation tests ──────────────────────────────────────────
+
+    #[test]
+    fn accumulated_usage_starts_at_zero() {
+        let state = SessionState::empty();
+        assert_eq!(state.accumulated_usage.input_tokens, 0);
+        assert_eq!(state.accumulated_usage.output_tokens, 0);
+        assert_eq!(state.accumulated_usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn accumulated_usage_persists_through_session_record_round_trip() {
+        let meta = SessionMetadata {
+            title: Some("test".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            cwd: Some("/tmp".into()),
+            max_turns: None,
+            created_at: 1000,
+            message_count: 0,
+            status: SessionStatus::Sleeping,
+            active_tool_groups: vec!["core".into()],
+            account_name: None,
+            accumulated_usage: TokenUsage {
+                input_tokens: 200,
+                output_tokens: 100,
+                total_tokens: 300,
+            },
+        };
+        // Round-trip through SessionRecord (persisted form)
+        let record: SessionRecord = meta.clone().into();
+        let restored: SessionMetadata = record.into();
+        assert_eq!(
+            restored.accumulated_usage.input_tokens, 200,
+            "input_tokens should survive round-trip"
+        );
+        assert_eq!(
+            restored.accumulated_usage.output_tokens, 100,
+            "output_tokens should survive round-trip"
+        );
+        assert_eq!(
+            restored.accumulated_usage.total_tokens, 300,
+            "total_tokens should survive round-trip"
+        );
+    }
+
+    #[test]
+    fn accumulated_usage_in_snapshot() {
+        let mut state = SessionState::empty();
+        state.accumulated_usage = TokenUsage {
+            input_tokens: 50,
+            output_tokens: 25,
+            total_tokens: 75,
+        };
+        let snap = state.snapshot();
+        assert_eq!(snap.accumulated_usage.input_tokens, 50);
+        assert_eq!(snap.accumulated_usage.output_tokens, 25);
+        assert_eq!(snap.accumulated_usage.total_tokens, 75);
+    }
+
+    #[test]
+    fn accumulated_usage_in_session_summary() {
+        // The SessionSummary sent via GetSummary includes the accumulated
+        // token usage.
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        state.accumulated_usage = TokenUsage {
+            input_tokens: 80,
+            output_tokens: 40,
+            total_tokens: 120,
+        };
+
+        let (reply, rx) = mpsc::channel();
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::GetSummary { reply },
+            &mut state,
+            1,
+            &db,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
+        );
+
+        let summary: SessionSummary = rx.recv().unwrap();
+        let summary_usage = summary
+            .token_usage
+            .expect("token_usage should be present in SessionSummary");
+        assert_eq!(summary_usage.input_tokens, 80);
+        assert_eq!(summary_usage.output_tokens, 40);
+        assert_eq!(summary_usage.total_tokens, 120);
+    }
+
+    #[test]
+    fn accumulated_usage_in_attach_snapshot() {
+        // When a client attaches, it receives a SessionState message that
+        // includes accumulated token usage.
+        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        state.accumulated_usage = TokenUsage {
+            input_tokens: 30,
+            output_tokens: 15,
+            total_tokens: 45,
+        };
+
+        let (sub_tx, sub_rx) = mpsc::channel();
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Attach {
+                client_id: 42,
+                tx: sub_tx,
+            },
+            &mut state,
+            42,
+            &db,
+            &tool_registry,
+            &daemon_tx,
+            &cmd_tx,
+            &mut shutdown,
+            25,
+        );
+
+        let msg = sub_rx.recv().unwrap();
+        match msg {
+            DaemonMessage::SessionState { token_usage, .. } => {
+                let usage = token_usage.expect("token_usage in SessionState");
+                assert_eq!(usage.input_tokens, 30);
+                assert_eq!(usage.output_tokens, 15);
+                assert_eq!(usage.total_tokens, 45);
+            }
+            other => panic!("expected SessionState, got {other:?}"),
+        }
     }
 }

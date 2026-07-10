@@ -7,7 +7,7 @@ use tai_client_core::{
 };
 use tai_proto::{
     AccountInfo, ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionStatus,
-    SessionSummary, ThinkingEffort,
+    SessionSummary, ThinkingEffort, TokenUsage,
 };
 use tai_tui::{ImageAssembler, RenderedImage, StreamingText, build_rendered_image};
 use unicode_segmentation::UnicodeSegmentation;
@@ -388,6 +388,8 @@ pub(crate) struct SessionDetailData {
     pub(crate) active_tool_groups: Vec<String>,
     /// The AI provider account associated with this session, if any.
     pub(crate) account_name: Option<String>,
+    /// Accumulated token usage for this session, if tracked.
+    pub(crate) accumulated_usage: Option<TokenUsage>,
 }
 
 pub(crate) struct SessionManagerState {
@@ -712,6 +714,7 @@ impl SessionManagerState {
                 status: s.status.clone(),
                 active_tool_groups: s.active_tool_groups.clone(),
                 account_name: s.account_name.clone(),
+                accumulated_usage: s.token_usage.clone(),
             }
         });
         if self.detail_data.is_some() {
@@ -1623,6 +1626,7 @@ pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::test_app;
     use tai_proto::DisplayedImageRecord;
 
     fn make_session(id: u64, title: &str) -> SessionSummary {
@@ -1639,6 +1643,7 @@ mod tests {
             status: SessionStatus::Inactive,
             active_tool_groups: vec!["core".into()],
             account_name: None,
+            token_usage: None,
         }
     }
 
@@ -1656,6 +1661,7 @@ mod tests {
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
             account_name: None,
+            accumulated_usage: None,
         }
     }
 
@@ -1765,7 +1771,7 @@ mod tests {
 
     #[test]
     fn push_tool_text_with_diff_creates_diff_item() {
-        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1780,7 +1786,7 @@ mod tests {
 
     #[test]
     fn push_tool_text_with_plain_text_creates_text_item() {
-        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1796,7 +1802,7 @@ mod tests {
 
     #[test]
     fn push_session_message_tool_result_with_diff_creates_diff_item() {
-        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1816,7 +1822,7 @@ mod tests {
 
     #[test]
     fn push_session_message_tool_result_with_error_stays_session_message() {
-        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1836,7 +1842,7 @@ mod tests {
 
     #[test]
     fn push_session_message_plain_text_stays_session_message() {
-        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1858,7 +1864,7 @@ mod tests {
 
     #[test]
     fn push_session_message_displayed_image_no_picker() {
-        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         // App::new() initialises picker to None.
@@ -1887,7 +1893,7 @@ mod tests {
     fn push_session_message_displayed_image_decode_failure() {
         use ratatui_image::picker::Picker;
 
-        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.picker = Some(Picker::halfblocks());
@@ -1916,7 +1922,7 @@ mod tests {
     fn push_session_message_displayed_image_svg() {
         use ratatui_image::picker::Picker;
 
-        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.picker = Some(Picker::halfblocks());
@@ -1943,7 +1949,7 @@ mod tests {
 
     #[test]
     fn reset_for_session_switch_clears_state() {
-        let mut app = App::new("/tmp/tai.sock".to_string(), "Halfblocks".to_string());
+        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 

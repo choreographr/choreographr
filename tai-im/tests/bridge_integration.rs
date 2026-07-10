@@ -80,7 +80,14 @@ fn bridge_text_streaming() {
     )
     .unwrap();
 
-    write_message_sync(&mut daemon_writer, &DaemonMessage::Done { request_id: 1 }).unwrap();
+    write_message_sync(
+        &mut daemon_writer,
+        &DaemonMessage::Done {
+            request_id: 1,
+            token_usage: None,
+        },
+    )
+    .unwrap();
     use std::io::Write;
     let _ = daemon_writer.flush();
 

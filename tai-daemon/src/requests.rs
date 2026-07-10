@@ -18,7 +18,7 @@ use std::time::Duration;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata,
-    MAX_IMAGE_CHUNK_SIZE, OutputStream, SessionMessage, SessionStatus, ThinkingEffort,
+    MAX_IMAGE_CHUNK_SIZE, OutputStream, SessionMessage, SessionStatus, ThinkingEffort, TokenUsage,
 };
 use tracing::{debug, warn};
 
@@ -210,9 +210,28 @@ pub(crate) fn run_agent_loop(
                     reasoning = final_text.reasoning.as_deref().unwrap_or_default(),
                     "model returned final text",
                 );
+                // Embed per-message token usage into the session message.
+                let token_usage = final_text.usage;
+                // Accumulate into session-level total.
+                if let Some(ref u) = token_usage {
+                    session.accumulated_usage.input_tokens += u.input_tokens;
+                    session.accumulated_usage.output_tokens += u.output_tokens;
+                    session.accumulated_usage.total_tokens += u.total_tokens;
+                    debug!(
+                        session_id,
+                        turn,
+                        input_tokens = u.input_tokens,
+                        output_tokens = u.output_tokens,
+                        total_tokens = u.total_tokens,
+                        accumulated_input = session.accumulated_usage.input_tokens,
+                        accumulated_output = session.accumulated_usage.output_tokens,
+                        "accumulated token usage after FinalText"
+                    );
+                }
                 let msg = SessionMessage::AssistantText {
                     content: final_text.content,
                     reasoning: final_text.reasoning,
+                    token_usage,
                 };
                 let idx = session.push_message(msg.clone());
                 if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
@@ -221,7 +240,23 @@ pub(crate) fn run_agent_loop(
                 return Ok(false);
             }
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
-                persist_assistant_tool_use_sync(session, session_id, db, &tool_use);
+                let token_usage = tool_use.usage.clone();
+                if let Some(ref u) = token_usage {
+                    session.accumulated_usage.input_tokens += u.input_tokens;
+                    session.accumulated_usage.output_tokens += u.output_tokens;
+                    session.accumulated_usage.total_tokens += u.total_tokens;
+                    debug!(
+                        session_id,
+                        turn,
+                        input_tokens = u.input_tokens,
+                        output_tokens = u.output_tokens,
+                        total_tokens = u.total_tokens,
+                        accumulated_input = session.accumulated_usage.input_tokens,
+                        accumulated_output = session.accumulated_usage.output_tokens,
+                        "accumulated token usage after ToolUse"
+                    );
+                }
+                persist_assistant_tool_use_sync(session, session_id, db, &tool_use, token_usage);
                 for tool_call in tool_use.tool_calls {
                     if is_cancelled(cancel_rx, &mut false) {
                         return Ok(true);
@@ -950,6 +985,7 @@ fn persist_assistant_tool_use_sync(
     session_id: u64,
     db: &Arc<redb::Database>,
     tool_use: &ChatAssistantToolUse,
+    token_usage: Option<TokenUsage>,
 ) {
     let msg = SessionMessage::AssistantToolUse {
         content: tool_use.content.clone(),
@@ -963,6 +999,7 @@ fn persist_assistant_tool_use_sync(
             })
             .collect(),
         reasoning: tool_use.reasoning.clone(),
+        token_usage,
     };
     let idx = session.push_message(msg.clone());
     if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
@@ -983,7 +1020,9 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
             SessionMessage::UserText { content } => {
                 Some(ChatRequestMessage::simple("user", content.clone()))
             }
-            SessionMessage::AssistantText { content, reasoning } => Some(ChatRequestMessage {
+            SessionMessage::AssistantText {
+                content, reasoning, ..
+            } => Some(ChatRequestMessage {
                 role: "assistant",
                 content: Some(content.clone()),
                 tool_call_id: None,
@@ -996,6 +1035,7 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
                 content,
                 tool_calls,
                 reasoning,
+                ..
             } => Some(ChatRequestMessage {
                 role: "assistant",
                 content: content.clone(),
@@ -1079,6 +1119,7 @@ mod tests {
         let msgs = [SessionMessage::AssistantText {
             content: "hi".into(),
             reasoning: Some("thinking".into()),
+            token_usage: None,
         }];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
@@ -1097,6 +1138,7 @@ mod tests {
                 arguments_json: r#"{"path": "/tmp/test"}"#.into(),
             }],
             reasoning: None,
+            token_usage: None,
         }];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
@@ -1146,6 +1188,7 @@ mod tests {
             SessionMessage::AssistantText {
                 content: "hi".into(),
                 reasoning: None,
+                token_usage: None,
             },
         ];
         let result = build_chat_request_messages(&msgs);
@@ -1185,6 +1228,7 @@ mod tests {
                     status: SessionStatus::Inactive,
                     active_tool_groups: vec!["core".into()],
                     account_name: None,
+                    token_usage: None,
                 }];
                 let _ = reply.send(sessions);
             }
@@ -1246,6 +1290,7 @@ mod tests {
                     status: SessionStatus::Inactive,
                     active_tool_groups: vec!["core".into()],
                     account_name: None,
+                    token_usage: None,
                 }));
             }
         });

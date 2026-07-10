@@ -270,6 +270,7 @@ where
                 } else {
                     Some(full_reasoning)
                 },
+                usage: None,
             },
         ));
     }
@@ -285,6 +286,7 @@ where
         } else {
             Some(full_reasoning)
         },
+        usage: None,
     }))
 }
 

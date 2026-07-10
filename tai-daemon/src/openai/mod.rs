@@ -22,6 +22,7 @@ pub use retry::RetryCallback;
 
 use serde::{Deserialize, Serialize};
 use std::io;
+use tai_proto::TokenUsage;
 
 /// Re-export the shared provider error type so all OpenAI code continues to
 /// use `super::OpenAiError` without structural changes.
@@ -205,12 +206,14 @@ pub struct ChatAssistantToolUse {
     pub content: Option<String>,
     pub tool_calls: Vec<ChatToolCall>,
     pub reasoning: Option<String>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinalTextResult {
     pub content: String,
     pub reasoning: Option<String>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +225,8 @@ pub enum ChatTurnResult {
 #[derive(Debug, Deserialize)]
 struct ChatCompletionsStreamResponse {
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -697,6 +697,13 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                 "Account:       {}",
                 detail.account_name.as_deref().unwrap_or("-")
             )),
+            Line::from(match &detail.accumulated_usage {
+                Some(usage) => format!(
+                    "Tokens:        {} in / {} out ({} total)",
+                    usage.input_tokens, usage.output_tokens, usage.total_tokens
+                ),
+                None => "Tokens:        -".to_string(),
+            }),
             Line::from(format!("Status:        {}", format_status(&detail.status))),
             Line::from(format!(
                 "Tool Groups:   {}",

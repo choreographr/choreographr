@@ -121,7 +121,10 @@ fn daemon_to_bridge_events(
             entry.append(stream, &text);
             None
         }
-        DaemonMessage::Done { request_id } => {
+        DaemonMessage::Done {
+            request_id,
+            token_usage: _,
+        } => {
             if let Some(entry) = buffers.remove(&request_id) {
                 let mut text = String::new();
                 if !entry.reasoning.is_empty() {
@@ -268,7 +271,10 @@ mod tests {
         assert!(events2.is_none());
 
         let events3 = daemon_to_bridge_events(
-            DaemonMessage::Done { request_id: 1 },
+            DaemonMessage::Done {
+                request_id: 1,
+                token_usage: None,
+            },
             &mut assembler,
             &mut buffers,
         );
@@ -285,7 +291,10 @@ mod tests {
         let mut buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Done { request_id: 999 },
+            DaemonMessage::Done {
+                request_id: 999,
+                token_usage: None,
+            },
             &mut assembler,
             &mut buffers,
         );
@@ -319,7 +328,10 @@ mod tests {
         assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Error(msg) if msg == "oops"));
 
         let events2 = daemon_to_bridge_events(
-            DaemonMessage::Done { request_id: 1 },
+            DaemonMessage::Done {
+                request_id: 1,
+                token_usage: None,
+            },
             &mut assembler,
             &mut buffers,
         );
@@ -350,7 +362,10 @@ mod tests {
         assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Error(msg) if msg == "cancelled"));
 
         let events2 = daemon_to_bridge_events(
-            DaemonMessage::Done { request_id: 2 },
+            DaemonMessage::Done {
+                request_id: 2,
+                token_usage: None,
+            },
             &mut assembler,
             &mut buffers,
         );
