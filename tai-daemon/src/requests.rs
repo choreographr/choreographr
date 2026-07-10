@@ -551,8 +551,10 @@ fn execute_tool_with_timeout(
     let tr = Arc::clone(&ctx.tool_registry);
     let xc = x_credentials.cloned();
     let c = cwd.map(|p| p.to_path_buf());
+    let tool_ctx = crate::tools::context::ToolContext::new(ctx.session_id, Arc::clone(&ctx.db));
     std::thread::spawn(move || {
-        let result = tr.execute_streaming(&tc, output_tx, xc.as_ref(), c.as_deref());
+        let result =
+            tr.execute_streaming(&tc, output_tx, xc.as_ref(), c.as_deref(), Some(&tool_ctx));
         let _ = result_tx.send(result);
     });
 

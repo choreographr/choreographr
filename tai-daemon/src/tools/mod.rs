@@ -40,6 +40,8 @@ macro_rules! define_tool {
 mod error;
 pub(crate) use error::{ToolError, tool_err, tool_ok};
 
+pub(crate) mod context;
+pub(crate) mod db;
 pub(crate) mod exec;
 mod fff;
 pub(crate) mod fish;
@@ -107,12 +109,48 @@ pub trait Tool: Send + Sync {
     ) -> ToolExecutionOutput {
         self.execute(arguments_json, x_credentials, cwd)
     }
+
+    /// Execute a tool with optional session context.
+    ///
+    /// The default implementation delegates to `execute()` for backward
+    /// compatibility. Tools that need session context (e.g. DB tools)
+    /// override this method instead.
+    fn execute_with_context(
+        &self,
+        arguments_json: &str,
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        _ctx: Option<&context::ToolContext>,
+    ) -> ToolExecutionOutput {
+        self.execute(arguments_json, x_credentials, cwd)
+    }
+
+    /// Execute a tool with streaming output and optional session context.
+    ///
+    /// The default implementation delegates to `execute_streaming()` for
+    /// backward compatibility with tools that override the old method.
+    /// Tools that need both streaming and session context (e.g. RISC-V)
+    /// override this method directly.
+    fn execute_streaming_with_context(
+        &self,
+        arguments_json: &str,
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        _ctx: Option<&context::ToolContext>,
+    ) -> ToolExecutionOutput {
+        self.execute_streaming(arguments_json, x_credentials, cwd, output_tx)
+    }
 }
 
 pub const GROUPS: &[ToolGroup] = &[
     ToolGroup {
         name: "core",
         description: "File system operations, HTTP requests, image display, and file search",
+    },
+    ToolGroup {
+        name: "db",
+        description: "Session-scoped key-value database (redb)",
     },
     ToolGroup {
         name: "git",
@@ -181,6 +219,13 @@ impl ToolRegistry {
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);
         reg.register(x::XUserLookup);
+        reg.register(db::DbSet);
+        reg.register(db::DbGet);
+        reg.register(db::DbDelete);
+        reg.register(db::DbDeleteRange);
+        reg.register(db::DbGetRange);
+        reg.register(db::DbList);
+        reg.register(db::DbCount);
         reg
     }
 
@@ -206,9 +251,12 @@ impl ToolRegistry {
         tool_call: &ChatToolCall,
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
+        ctx: Option<&context::ToolContext>,
     ) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
-            Some(tool) => tool.execute(&tool_call.arguments_json, x_credentials, cwd),
+            Some(tool) => {
+                tool.execute_with_context(&tool_call.arguments_json, x_credentials, cwd, ctx)
+            }
             None => ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("unknown tool: {}", tool_call.name),
@@ -225,11 +273,16 @@ impl ToolRegistry {
         output_tx: mpsc::Sender<Vec<u8>>,
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
+        ctx: Option<&context::ToolContext>,
     ) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
-            Some(tool) => {
-                tool.execute_streaming(&tool_call.arguments_json, x_credentials, cwd, output_tx)
-            }
+            Some(tool) => tool.execute_streaming_with_context(
+                &tool_call.arguments_json,
+                x_credentials,
+                cwd,
+                output_tx,
+                ctx,
+            ),
             None => ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("unknown tool: {}", tool_call.name),

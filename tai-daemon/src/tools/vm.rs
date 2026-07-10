@@ -247,6 +247,7 @@ struct TaiSyscall {
     cwd: Option<PathBuf>,
     output_tx: mpsc::Sender<Vec<u8>>,
     write_tx: Option<mpsc::Sender<Vec<u8>>>,
+    ctx: Option<crate::tools::context::ToolContext>,
 }
 
 impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
@@ -290,6 +291,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                     &tool_call,
                     self.x_credentials.as_ref(),
                     self.cwd.as_deref(),
+                    self.ctx.as_ref(),
                 );
 
                 let content = exec_output.result.content.as_bytes();
@@ -408,6 +410,7 @@ fn run_riscv_impl(
     cwd: Option<&Path>,
     write_tx: Option<mpsc::Sender<Vec<u8>>>,
     registry: Arc<ToolRegistry>,
+    ctx: Option<crate::tools::context::ToolContext>,
 ) -> ToolExecutionOutput {
     let input: RunRiscVInput = match serde_json::from_str(args) {
         Ok(i) => i,
@@ -487,6 +490,7 @@ fn run_riscv_impl(
         cwd: cwd.map(|p| p.to_path_buf()),
         output_tx,
         write_tx,
+        ctx,
     };
 
     let core = DefaultCoreMachine::<u64, FlatMemory<u64>>::new_with_memory(
@@ -629,13 +633,7 @@ impl Tool for RunRiscV {
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&Path>,
     ) -> ToolExecutionOutput {
-        match self.registry.upgrade() {
-            Some(registry) => run_riscv_impl(args, x_credentials, cwd, None, registry),
-            None => ToolExecutionOutput {
-                result: tool_err("ToolRegistry no longer available"),
-                image: None,
-            },
-        }
+        self.execute_with_context(args, x_credentials, cwd, None)
     }
 
     fn execute_streaming(
@@ -645,8 +643,44 @@ impl Tool for RunRiscV {
         cwd: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
     ) -> ToolExecutionOutput {
+        self.execute_streaming_with_context(args, x_credentials, cwd, output_tx, None)
+    }
+
+    fn execute_with_context(
+        &self,
+        args: &str,
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&Path>,
+        ctx: Option<&crate::tools::context::ToolContext>,
+    ) -> ToolExecutionOutput {
         match self.registry.upgrade() {
-            Some(registry) => run_riscv_impl(args, x_credentials, cwd, Some(output_tx), registry),
+            Some(registry) => {
+                run_riscv_impl(args, x_credentials, cwd, None, registry, ctx.cloned())
+            }
+            None => ToolExecutionOutput {
+                result: tool_err("ToolRegistry no longer available"),
+                image: None,
+            },
+        }
+    }
+
+    fn execute_streaming_with_context(
+        &self,
+        args: &str,
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        ctx: Option<&crate::tools::context::ToolContext>,
+    ) -> ToolExecutionOutput {
+        match self.registry.upgrade() {
+            Some(registry) => run_riscv_impl(
+                args,
+                x_credentials,
+                cwd,
+                Some(output_tx),
+                registry,
+                ctx.cloned(),
+            ),
             None => ToolExecutionOutput {
                 result: tool_err("ToolRegistry no longer available"),
                 image: None,
@@ -657,7 +691,7 @@ impl Tool for RunRiscV {
 
 pub fn execute_run_riscv_tool(args: &str, cwd: Option<&Path>) -> ToolResult {
     let registry = Arc::new(ToolRegistry::new());
-    run_riscv_impl(args, None, cwd, None, registry).result
+    run_riscv_impl(args, None, cwd, None, registry, None).result
 }
 
 #[cfg(test)]
@@ -763,7 +797,7 @@ mod tests {
 
     #[test]
     fn run_riscv_rejects_invalid_json() {
-        let result = run_riscv_impl(r#"not json"#, None, None, None, dummy_registry());
+        let result = run_riscv_impl(r#"not json"#, None, None, None, dummy_registry(), None);
         assert!(
             result.result.is_error,
             "expected error: {}",
@@ -778,7 +812,7 @@ mod tests {
 
     #[test]
     fn run_riscv_requires_source_or_program() {
-        let result = run_riscv_impl(r#"{}"#, None, None, None, dummy_registry());
+        let result = run_riscv_impl(r#"{}"#, None, None, None, dummy_registry(), None);
         assert!(
             result.result.is_error,
             "expected error: {}",
@@ -799,6 +833,7 @@ mod tests {
             None,
             None,
             dummy_registry(),
+            None,
         );
         assert!(
             result.result.is_error,
@@ -820,6 +855,7 @@ mod tests {
             None,
             None,
             dummy_registry(),
+            None,
         );
         assert!(
             result.result.is_error,
@@ -841,6 +877,7 @@ mod tests {
             None,
             None,
             dummy_registry(),
+            None,
         );
         assert!(
             result.result.is_error,
@@ -862,6 +899,7 @@ mod tests {
             None,
             None,
             dummy_registry(),
+            None,
         );
         assert!(
             result.result.is_error,
@@ -886,6 +924,7 @@ mod tests {
             None,
             None,
             dummy_registry(),
+            None,
         );
         // Should fail at ELF load, not at input validation
         assert!(

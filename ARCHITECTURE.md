@@ -205,7 +205,9 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
-| `tools/` | `Tool` trait, `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 20 registered tools. |
+| `tools/` | `Tool` trait, `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 27 registered tools. |
+| `tools/context.rs` | `ToolContext` — session-scoped context (session ID + `Arc<Database>`) passed to tools that need DB access. |
+| `tools/db.rs` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
 
 ### Provider Architecture
@@ -492,8 +494,20 @@ startup                    /unlock [passphrase]
 trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
-    fn schema(&self) -> serde_json::Value;       // JSON Schema for the model
+    fn schema(&self) -> serde_json::Value;
     fn execute(&self, arguments_json: &str, x_credentials: Option<&ServiceCredential>, cwd: Option<&Path>) -> ToolExecutionOutput;
+
+    fn execute_streaming(&self, arguments_json: &str, x_credentials: Option<&ServiceCredential>, cwd: Option<&Path>, output_tx: mpsc::Sender<Vec<u8>>) -> ToolExecutionOutput {
+        self.execute(arguments_json, x_credentials, cwd)
+    }
+
+    fn execute_with_context(&self, arguments_json: &str, x_credentials: Option<&ServiceCredential>, cwd: Option<&Path>, ctx: Option<&ToolContext>) -> ToolExecutionOutput {
+        self.execute(arguments_json, x_credentials, cwd)
+    }
+
+    fn execute_streaming_with_context(&self, arguments_json: &str, x_credentials: Option<&ServiceCredential>, cwd: Option<&Path>, output_tx: mpsc::Sender<Vec<u8>>, ctx: Option<&ToolContext>) -> ToolExecutionOutput {
+        self.execute_streaming(arguments_json, x_credentials, cwd, output_tx)
+    }
 }
 ```
 
@@ -519,6 +533,7 @@ working directory. Filesystem and Git tools resolve relative paths against this 
 | **RISC-V VM** | `run_riscv` (compile & run Rust code in a sandboxed RISC-V VM with access to all registered tools) |
 | **Shell** | `exec` (direct program execution), `sh` (bash/dash/zsh — detected at startup), `nushell` (if `nu` is installed), `fish` (if `fish` is installed) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
+| **DB** | `db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count` |
 | **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
 | **Skills** | `load_skill` (loads the full instructions for a skill by name, following the Agent Skills standard) |
 
@@ -530,6 +545,7 @@ via `fn group() -> &'static str` on the `Tool` trait. Groups are:
 | Group | Default | Description |
 |---|---|---|
 | `core` | always on | File system, HTTP, images, file search |
+| `db` | off | Session-scoped key-value database |
 | `git` | on | Local Git operations |
 | `shell` | on | Shell and exec |
 | `x` | off | X/Twitter API |
@@ -572,12 +588,14 @@ intercepted in `run_agent_loop()` and handled with full access to `DaemonState` 
 ### Data model
 
 Sessions are persisted to a `redb` (v4) embedded key-value store at
-`~/.local/share/tai-daemon/state.redb`. Three tables:
+`~/.local/share/tai-daemon/state.redb`. Five tables:
 
 | Table | Key | Value |
 |---|---|---|
 | `sessions` | `u64` session ID | bincode(`SessionRecord`) |
 | `session_messages` | `(u64, u32)` (session ID, index) | bincode(`SessionMessage`) |
+| `credentials` | `&str` service name | encrypted blob |
+| `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
 | `meta` | `&str` | `u64` counter |
 
 `SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `cwd`,
