@@ -145,7 +145,7 @@ credential ──► bincode serialize ──► ECDH (ephemeral + recipient pub
 
 Output format for each credential:
 ```
-eph_public(32) || nonce(12) || ciphertext(rest)
+eph_public(32) || salt(32) || nonce(12) || ciphertext(rest)
 ```
 
 Credentials are encrypted per-credential, using ECDH key agreement so only the
@@ -156,7 +156,7 @@ in the `redb` database alongside sessions.
 
 | Module | Purpose |
 |---|---|
-| `crypto.rs` | X25519 keypair generation, ECDH + HKDF + AES-256-GCM encrypt/decrypt, passphrase-based private key encryption |
+| `crypto.rs` | X25519 keypair generation, ECDH + HKDF + AES-256-GCM encrypt/decrypt, passphrase-based private key encryption; shared AES-256-GCM helpers |
 | `paths.rs` | Resolves filesystem paths for identity key files |
 | `error.rs` | `KeystoreError` enum |
 

@@ -124,3 +124,12 @@ fn decrypt_too_short_data_fails() {
         result
     );
 }
+
+#[test]
+#[ignore]
+fn ensure_keypair_idempotent() {
+    // Uses the real config dir — verifies that ensure_keypair succeeds
+    // even when keys already exist or don't exist yet.
+    let result = tai_keystore::ensure_keypair();
+    assert!(result.is_ok(), "ensure_keypair should succeed");
+}

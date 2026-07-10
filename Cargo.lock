@@ -8085,7 +8085,6 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
- "bincode 2.0.1",
  "dirs 6.0.0",
  "hkdf",
  "rand 0.10.2",
@@ -8094,6 +8093,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.18",
+ "tracing",
  "x25519-dalek",
  "zeroize",
 ]

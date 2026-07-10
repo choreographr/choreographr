@@ -1,3 +1,5 @@
+use std::fmt;
+
 pub mod crypto;
 pub mod error;
 pub mod paths;
@@ -5,6 +7,8 @@ pub mod paths;
 pub use error::KeystoreError;
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, info};
+use zeroize::Zeroize;
 
 /// Ensure that a keypair exists at the standard paths.
 ///
@@ -19,6 +23,7 @@ pub fn ensure_keypair() -> Result<(), KeystoreError> {
 
     // If both files already exist, there is nothing to do.
     if pk_path.exists() && pub_path.exists() {
+        debug!("keypair files already exist, skipping generation");
         return Ok(());
     }
 
@@ -31,10 +36,13 @@ pub fn ensure_keypair() -> Result<(), KeystoreError> {
 
     std::fs::write(&pk_path, secret)?;
     std::fs::write(&pub_path, public)?;
+    info!(
+        "generated and wrote new X25519 keypair to {}",
+        pk_path.display()
+    );
 
     Ok(())
 }
-use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
@@ -49,6 +57,25 @@ pub enum ServiceCredential {
         access_token_secret: String,
         bearer_token: Option<String>,
     },
+}
+
+/// Redacting display to prevent secret leakage in logs.
+impl fmt::Display for ServiceCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServiceCredential::ApiKey { .. } => {
+                write!(f, "ApiKey {{ key: *** }}")
+            }
+            ServiceCredential::X { .. } => {
+                write!(
+                    f,
+                    "X {{ api_key: ***, api_key_secret: ***, \
+                     access_token: ***, access_token_secret: ***, \
+                     bearer_token: *** }}"
+                )
+            }
+        }
+    }
 }
 
 /// Borrowed view of X credential fields. Avoids allocating a separate struct.
@@ -142,11 +169,74 @@ mod tests {
     }
 
     #[test]
-    fn ensure_keypair_idempotent() {
-        // Ensure that calling ensure_keypair succeeds even when files already
-        // exist (the standard config dir may or may not have keys — either
-        // way the function should return Ok).
-        let result = ensure_keypair();
-        assert!(result.is_ok(), "ensure_keypair should succeed");
+    fn service_credential_display_redacts_secrets() {
+        let cred = ServiceCredential::ApiKey {
+            key: "sk-supersecret".into(),
+        };
+        let display = format!("{cred}");
+        assert!(!display.contains("sk-supersecret"));
+        assert!(display.contains("***"));
+
+        let cred_x = ServiceCredential::X {
+            api_key: "ak".into(),
+            api_key_secret: "aks".into(),
+            access_token: "at".into(),
+            access_token_secret: "ats".into(),
+            bearer_token: Some("bt".into()),
+        };
+        let display_x = format!("{cred_x}");
+        assert!(!display_x.contains("ak"));
+        assert!(!display_x.contains("ats"));
+        assert!(!display_x.contains("bt"));
+        assert_eq!(display_x.matches("***").count(), 5);
+    }
+
+    #[test]
+    fn service_credential_zeroize_clears_api_key() {
+        let mut cred = ServiceCredential::ApiKey {
+            key: "sk-test".to_string(),
+        };
+        cred.zeroize();
+        match &cred {
+            ServiceCredential::ApiKey { key } => {
+                assert!(
+                    key.as_bytes().iter().all(|&b| b == 0),
+                    "key bytes should be zeroed after zeroize"
+                );
+            }
+            _ => panic!("expected ApiKey variant"),
+        }
+    }
+
+    #[test]
+    fn service_credential_zeroize_clears_x_fields() {
+        let mut cred = ServiceCredential::X {
+            api_key: "ak".into(),
+            api_key_secret: "aks".into(),
+            access_token: "at".into(),
+            access_token_secret: "ats".into(),
+            bearer_token: Some("bt".into()),
+        };
+        cred.zeroize();
+        match &cred {
+            ServiceCredential::X {
+                api_key,
+                api_key_secret,
+                access_token,
+                access_token_secret,
+                bearer_token,
+            } => {
+                assert!(api_key.as_bytes().iter().all(|&b| b == 0));
+                assert!(api_key_secret.as_bytes().iter().all(|&b| b == 0));
+                assert!(access_token.as_bytes().iter().all(|&b| b == 0));
+                assert!(access_token_secret.as_bytes().iter().all(|&b| b == 0));
+                assert!(
+                    bearer_token
+                        .as_ref()
+                        .map_or(true, |s| s.as_bytes().iter().all(|&b| b == 0))
+                );
+            }
+            _ => panic!("expected X variant"),
+        }
     }
 }
