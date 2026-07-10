@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::mpsc;
-use tai_daemon::{SessionCommand, session_main};
+use tai_daemon::{RequestContext, SessionCommand, session_main};
 use tai_proto::DaemonMessage;
 
 mod common;
@@ -13,22 +13,22 @@ fn spawn_session(
     let (session_tx, session_rx) = mpsc::channel();
 
     let tool_registry = tai_daemon::tools::ToolRegistry::new().build();
-    let db2 = Arc::clone(&db);
-    let daemon_tx2 = daemon_tx.clone();
     let cmd_tx = session_tx.clone();
 
     let handle = std::thread::spawn(move || {
         session_main(
-            cmd_tx,
             session_rx,
-            session_id,
-            db2,
             None,
             None,
-            tool_registry,
-            daemon_tx2,
             None,
-            25,
+            RequestContext {
+                cmd_tx,
+                session_id,
+                db,
+                tool_registry,
+                daemon_tx,
+                max_turns_default: 25,
+            },
         );
     });
 

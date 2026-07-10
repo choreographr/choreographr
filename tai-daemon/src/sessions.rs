@@ -24,7 +24,6 @@ pub enum SessionCommand {
     },
     RunChildInput {
         request_id: u32,
-        input_tokens: Vec<u8>,
         reply: std::sync::mpsc::Sender<io::Result<ChildResult>>,
     },
     Cancel {
@@ -67,6 +66,24 @@ pub enum SessionCommand {
     Shutdown,
 }
 
+/// Bundles parameters that are threaded through the session/request pipeline,
+/// reducing argument count and making the dependency flow explicit.
+#[derive(Clone)]
+pub struct RequestContext {
+    /// Channel to send SessionCommands back to the session main loop.
+    pub cmd_tx: mpsc::Sender<SessionCommand>,
+    /// The session ID scoping all operations.
+    pub session_id: u64,
+    /// Database handle for persisting state.
+    pub db: Arc<redb::Database>,
+    /// Registry of available tools.
+    pub tool_registry: Arc<ToolRegistry>,
+    /// Channel to the daemon command loop.
+    pub daemon_tx: mpsc::Sender<DaemonCommand>,
+    /// Default max agent loop turns when the session doesn't specify one.
+    pub max_turns_default: u32,
+}
+
 pub struct ChildResult {
     pub output: String,
     pub is_error: bool,
@@ -93,20 +110,30 @@ pub struct SessionMetadata {
 /// override if needed (e.g. `AttachSession` sets `Inactive`).
 impl From<SessionRecord> for SessionMetadata {
     fn from(record: SessionRecord) -> Self {
-        SessionMetadata {
+        // Build a SessionConfig from the record, then delegate to the
+        // From<&SessionConfig> impl to avoid duplicating field mappings.
+        let config = SessionConfig {
             title: record.title,
             selected_model: record.selected_model,
             reasoning_effort: record.reasoning_effort,
             parent_session_id: record.parent_session_id,
-            cwd: record.cwd,
-            created_at: record.created_at,
-            message_count: record.message_count,
+            cwd: record.cwd.map(PathBuf::from),
             max_turns: record.max_turns,
+            created_at: record.created_at,
+            context_fingerprint: None,
+            context_file_paths: Vec::new(),
+            context_message_index: None,
             status: SessionStatus::Sleeping,
-            active_tool_groups: record.active_tool_groups,
+            active_tool_groups: record.active_tool_groups.into_iter().collect(),
+            context_config: record.context_config,
             account_name: record.account_name,
             accumulated_usage: record.accumulated_usage,
-        }
+        };
+        let mut meta = SessionMetadata::from(&config);
+        // message_count is a runtime field not stored in SessionConfig,
+        // so patch it from the record after the delegate conversion.
+        meta.message_count = record.message_count;
+        meta
     }
 }
 
@@ -138,19 +165,75 @@ impl From<SessionMetadata> for SessionRecord {
 /// stringified.
 impl From<&SessionState> for SessionMetadata {
     fn from(state: &SessionState) -> Self {
+        // Build from SessionConfig first, then patch in the live message count.
+        let mut meta = SessionMetadata::from(&state.config);
+        meta.message_count = state.messages.len() as u32;
+        meta
+    }
+}
+
+/// Persistent configuration fields for a session.
+/// Bundled to avoid duplication across snapshot/restore, metadata conversion,
+/// and record persistence.
+#[derive(Clone, Debug)]
+pub struct SessionConfig {
+    pub title: Option<String>,
+    pub selected_model: Option<String>,
+    pub reasoning_effort: Option<ThinkingEffort>,
+    pub parent_session_id: Option<u64>,
+    pub cwd: Option<PathBuf>,
+    pub max_turns: Option<u32>,
+    pub created_at: i64,
+    pub context_fingerprint: Option<u64>,
+    pub context_file_paths: Vec<PathBuf>,
+    pub context_message_index: Option<usize>,
+    pub status: SessionStatus,
+    pub active_tool_groups: HashSet<String>,
+    pub context_config: ContextConfig,
+    pub account_name: Option<String>,
+    pub accumulated_usage: TokenUsage,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            title: None,
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            cwd: None,
+            max_turns: None,
+            created_at: 0,
+            context_fingerprint: None,
+            context_file_paths: Vec::new(),
+            context_message_index: None,
+            status: SessionStatus::Inactive,
+            active_tool_groups: HashSet::new(),
+            context_config: ContextConfig::default(),
+            account_name: None,
+            accumulated_usage: TokenUsage::default(),
+        }
+    }
+}
+
+/// Delegate conversion from [`SessionConfig`] to [`SessionMetadata`] so
+/// that both `From<&SessionState>` and `From<SessionRecord>` share the
+/// same field mapping.
+impl From<&SessionConfig> for SessionMetadata {
+    fn from(config: &SessionConfig) -> Self {
         SessionMetadata {
-            title: state.title.clone(),
-            selected_model: state.selected_model.clone(),
-            reasoning_effort: state.reasoning_effort,
-            parent_session_id: state.parent_session_id,
-            cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
-            created_at: state.created_at,
-            message_count: state.messages.len() as u32,
-            max_turns: state.max_turns,
-            status: state.status.clone(),
-            active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
-            account_name: state.account_name.clone(),
-            accumulated_usage: state.accumulated_usage.clone(),
+            title: config.title.clone(),
+            selected_model: config.selected_model.clone(),
+            reasoning_effort: config.reasoning_effort,
+            parent_session_id: config.parent_session_id,
+            cwd: config.cwd.as_ref().map(|p| p.display().to_string()),
+            created_at: config.created_at,
+            message_count: 0,
+            max_turns: config.max_turns,
+            status: config.status.clone(),
+            active_tool_groups: config.active_tool_groups.iter().cloned().collect(),
+            account_name: config.account_name.clone(),
+            accumulated_usage: config.accumulated_usage.clone(),
         }
     }
 }
@@ -163,29 +246,15 @@ impl From<&SessionState> for SessionRecord {
     fn from(state: &SessionState) -> Self {
         let meta: SessionMetadata = state.into();
         let mut record: SessionRecord = meta.into();
-        record.context_config = state.context_config.clone();
+        record.context_config = state.config.context_config.clone();
         record
     }
 }
 
 #[derive(Clone)]
 pub struct SessionSnapshot {
-    pub title: Option<String>,
-    pub selected_model: Option<String>,
-    pub reasoning_effort: Option<ThinkingEffort>,
-    pub parent_session_id: Option<u64>,
-    pub cwd: Option<PathBuf>,
-    pub max_turns: Option<u32>,
-    pub created_at: i64,
+    pub config: SessionConfig,
     pub messages: Vec<SessionMessage>,
-    pub context_fingerprint: Option<u64>,
-    pub context_file_paths: Vec<PathBuf>,
-    pub context_message_index: Option<usize>,
-    pub status: SessionStatus,
-    pub active_tool_groups: std::collections::HashSet<String>,
-    pub context_config: ContextConfig,
-    pub account_name: Option<String>,
-    pub accumulated_usage: TokenUsage,
 }
 
 pub(crate) struct ActiveRequest {
@@ -198,46 +267,18 @@ pub struct ActiveSessionEntry {
 }
 
 pub struct SessionState {
-    pub title: Option<String>,
-    pub selected_model: Option<String>,
-    pub reasoning_effort: Option<ThinkingEffort>,
-    pub parent_session_id: Option<u64>,
-    pub cwd: Option<PathBuf>,
-    pub max_turns: Option<u32>,
-    pub created_at: i64,
+    pub config: SessionConfig,
     messages: Vec<SessionMessage>,
     subscribers: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
     pub(crate) active_requests: HashMap<u32, ActiveRequest>,
-    pub context_fingerprint: Option<u64>,
-    pub context_file_paths: Vec<PathBuf>,
-    pub context_message_index: Option<usize>,
-    pub status: SessionStatus,
-    pub active_tool_groups: std::collections::HashSet<String>,
-    pub context_config: ContextConfig,
-    pub account_name: Option<String>,
-    pub accumulated_usage: TokenUsage,
     pub provider: Option<InferenceProvider>,
 }
 
 impl SessionState {
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
-            title: self.title.clone(),
-            selected_model: self.selected_model.clone(),
-            reasoning_effort: self.reasoning_effort,
-            parent_session_id: self.parent_session_id,
-            cwd: self.cwd.clone(),
-            max_turns: self.max_turns,
-            created_at: self.created_at,
+            config: self.config.clone(),
             messages: self.messages.clone(),
-            context_fingerprint: self.context_fingerprint,
-            context_file_paths: self.context_file_paths.clone(),
-            context_message_index: self.context_message_index,
-            status: self.status.clone(),
-            active_tool_groups: self.active_tool_groups.clone(),
-            context_config: self.context_config.clone(),
-            account_name: self.account_name.clone(),
-            accumulated_usage: self.accumulated_usage.clone(),
         }
     }
 
@@ -246,45 +287,17 @@ impl SessionState {
         subscribers: HashMap<u64, std::sync::mpsc::Sender<DaemonMessage>>,
     ) -> Self {
         Self {
-            title: snapshot.title,
-            selected_model: snapshot.selected_model,
-            reasoning_effort: snapshot.reasoning_effort,
-            parent_session_id: snapshot.parent_session_id,
-            cwd: snapshot.cwd,
-            max_turns: snapshot.max_turns,
-            created_at: snapshot.created_at,
+            config: snapshot.config,
             messages: snapshot.messages,
             subscribers,
             active_requests: HashMap::new(),
-            context_fingerprint: snapshot.context_fingerprint,
-            context_file_paths: snapshot.context_file_paths,
-            context_message_index: snapshot.context_message_index,
-            status: snapshot.status,
-            active_tool_groups: snapshot.active_tool_groups,
-            context_config: snapshot.context_config,
-            account_name: snapshot.account_name,
-            accumulated_usage: snapshot.accumulated_usage,
             provider: None,
         }
     }
 
     fn apply_snapshot(&mut self, snapshot: SessionSnapshot) {
-        self.title = snapshot.title;
-        self.selected_model = snapshot.selected_model;
-        self.reasoning_effort = snapshot.reasoning_effort;
-        self.parent_session_id = snapshot.parent_session_id;
-        self.cwd = snapshot.cwd;
-        self.max_turns = snapshot.max_turns;
-        self.created_at = snapshot.created_at;
+        self.config = snapshot.config;
         self.messages = snapshot.messages;
-        self.context_fingerprint = snapshot.context_fingerprint;
-        self.context_file_paths = snapshot.context_file_paths;
-        self.context_message_index = snapshot.context_message_index;
-        self.status = snapshot.status;
-        self.active_tool_groups = snapshot.active_tool_groups;
-        self.context_config = snapshot.context_config;
-        self.account_name = snapshot.account_name;
-        self.accumulated_usage = snapshot.accumulated_usage;
     }
 
     /// Read-only access to messages.
@@ -312,24 +325,10 @@ impl SessionState {
     /// Create an empty session state.
     pub fn empty() -> Self {
         Self {
-            title: None,
-            selected_model: None,
-            reasoning_effort: None,
-            parent_session_id: None,
-            cwd: None,
-            max_turns: None,
-            created_at: 0,
+            config: SessionConfig::default(),
             messages: Vec::new(),
             subscribers: HashMap::new(),
             active_requests: HashMap::new(),
-            context_fingerprint: None,
-            context_file_paths: Vec::new(),
-            context_message_index: None,
-            status: SessionStatus::Inactive,
-            active_tool_groups: HashSet::new(),
-            context_config: ContextConfig::default(),
-            account_name: None,
-            accumulated_usage: TokenUsage::default(),
             provider: None,
         }
     }
@@ -362,20 +361,14 @@ fn fail_request(
     false
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn session_main(
-    cmd_tx: mpsc::Sender<SessionCommand>,
     rx: std::sync::mpsc::Receiver<SessionCommand>,
-    session_id: u64,
-    db: Arc<redb::Database>,
     provider: Option<InferenceProvider>,
     account_name: Option<String>,
-    tool_registry: Arc<ToolRegistry>,
-    daemon_tx: mpsc::Sender<DaemonCommand>,
     init_record: Option<SessionRecord>,
-    max_turns_default: u32,
+    ctx: RequestContext,
 ) {
-    let mut state = SessionState {
+    let config = SessionConfig {
         title: init_record.as_ref().and_then(|r| r.title.clone()),
         selected_model: init_record.as_ref().and_then(|r| r.selected_model.clone()),
         reasoning_effort: init_record.as_ref().and_then(|r| r.reasoning_effort),
@@ -393,9 +386,6 @@ pub fn session_main(
                     .unwrap_or_default()
                     .as_secs() as i64
             }),
-        messages: Vec::new(),
-        subscribers: HashMap::new(),
-        active_requests: HashMap::new(),
         context_fingerprint: None,
         context_file_paths: Vec::new(),
         context_message_index: None,
@@ -416,22 +406,32 @@ pub fn session_main(
             .as_ref()
             .map(|r| r.accumulated_usage.clone())
             .unwrap_or_default(),
+    };
+    let mut state = SessionState {
+        config,
+        messages: Vec::new(),
+        subscribers: HashMap::new(),
+        active_requests: HashMap::new(),
         provider,
     };
 
-    match db::read_messages(&db, session_id) {
+    match db::read_messages(&ctx.db, ctx.session_id) {
         Ok(msgs) => state.messages = msgs,
-        Err(e) => warn!(session_id, error = %e, "failed to load messages from DB"),
+        Err(e) => warn!(ctx.session_id, error = %e, "failed to load messages from DB"),
     }
 
     if init_record.is_none() || state.messages.is_empty() {
-        let effective_cwd = state.cwd.as_deref().unwrap_or_else(|| Path::new("."));
+        let effective_cwd = state
+            .config
+            .cwd
+            .as_deref()
+            .unwrap_or_else(|| Path::new("."));
         let skills = context::discover_skills(effective_cwd);
-        let base_prompt = context::build_base_prompt(&skills, tool_registry.groups());
+        let base_prompt = context::build_base_prompt(&skills, ctx.tool_registry.groups());
         state.messages.push(SessionMessage::SystemText {
             content: base_prompt,
         });
-        write_message_retry(&db, session_id, 0, &state.messages[0]).ok();
+        write_message_retry(&ctx.db, ctx.session_id, 0, &state.messages[0]).ok();
 
         if let Ok(bundle) = context::discover_context(effective_cwd, &Default::default()) {
             let context_str = context::assemble_context(&bundle);
@@ -439,452 +439,525 @@ pub fn session_main(
                 state.messages.push(SessionMessage::SystemText {
                     content: context_str,
                 });
-                write_message_retry(&db, session_id, 1, &state.messages[1]).ok();
-                state.context_fingerprint = Some(bundle.fingerprint);
-                state.context_file_paths = bundle.files.iter().map(|f| f.path.clone()).collect();
-                state.context_message_index = Some(1);
+                write_message_retry(&ctx.db, ctx.session_id, 1, &state.messages[1]).ok();
+                state.config.context_fingerprint = Some(bundle.fingerprint);
+                state.config.context_file_paths =
+                    bundle.files.iter().map(|f| f.path.clone()).collect();
+                state.config.context_message_index = Some(1);
             }
         }
     }
 
-    let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
-        session_id,
+    let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
+        session_id: ctx.session_id,
         metadata: SessionMetadata::from(&state),
     });
 
-    info!("session {} started", session_id);
+    info!("session {} started", ctx.session_id);
 
     let mut shutdown_requested = false;
     while let Ok(cmd) = rx.recv() {
-        if process_command(
-            cmd,
-            &mut state,
-            session_id,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
-            &mut shutdown_requested,
-            max_turns_default,
-        ) {
+        if process_command(cmd, &mut state, &mut shutdown_requested, &ctx) {
             break;
         }
     }
 
-    info!("session {} exiting", session_id);
-    persist_and_exit(&state, &db, session_id, &daemon_tx);
+    info!("session {} exiting", ctx.session_id);
+    persist_and_exit(&state, &ctx.db, ctx.session_id, &ctx.daemon_tx);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_command(
     cmd: SessionCommand,
     state: &mut SessionState,
-    session_id: u64,
-    db: &Arc<redb::Database>,
-    tool_registry: &Arc<ToolRegistry>,
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
-    cmd_tx: &mpsc::Sender<SessionCommand>,
     shutdown_requested: &mut bool,
-    max_turns_default: u32,
+    ctx: &RequestContext,
 ) -> bool {
     match cmd {
         SessionCommand::RunInput { request_id, input } => {
-            debug!("session {}: RunInput id={}", session_id, request_id);
-            let text = String::from_utf8_lossy(&input).trim().to_string();
-            info!(
-                session_id,
-                input_len = text.len(),
-                input_preview = %text.chars().take(120).collect::<String>(),
-                "session received input",
-            );
-            if text.is_empty() {
-                return fail_request(&state.subscribers, request_id, "empty input");
-            }
-            let provider = if let Some(p) = state.provider.as_ref() {
-                p
-            } else if let Some(ref name) = state.account_name {
-                // No cached provider yet — try lazy resolution via the daemon.
-                let (reply, rx) = mpsc::channel();
-                let _ = daemon_tx.send(DaemonCommand::ResolveProviderCmd {
-                    account: name.clone(),
-                    reply,
-                });
-                match rx.recv() {
-                    Ok(Some(provider)) => {
-                        state.provider = Some(provider);
-                        let Some(p) = state.provider.as_ref() else {
-                            return fail_request(
-                                &state.subscribers,
-                                request_id,
-                                "internal error: provider not set after resolution".to_string(),
-                            );
-                        };
-                        p
-                    }
-                    _ => {
-                        return fail_request(
-                            &state.subscribers,
-                            request_id,
-                            format!(
-                                "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
-                            ),
-                        );
-                    }
-                }
-            } else {
-                return fail_request(
-                    &state.subscribers,
-                    request_id,
-                    "no account configured on this session — use /account <name> to set one",
-                );
-            };
-            let model = match &state.selected_model {
-                Some(m) => m.clone(),
-                None => {
-                    return fail_request(&state.subscribers, request_id, "no model selected");
-                }
-            };
-            if *shutdown_requested {
-                return fail_request(&state.subscribers, request_id, "session is shutting down");
-            }
-            if !state.active_requests.is_empty() {
-                return fail_request(
-                    &state.subscribers,
-                    request_id,
-                    "session already has an active request",
-                );
-            }
-
-            let user_msg = SessionMessage::UserText {
-                content: text.clone(),
-            };
-            let msg_idx = state.messages.len() as u32;
-            state.messages.push(user_msg.clone());
-            write_message_retry(db, session_id, msg_idx, &user_msg).ok();
-            broadcast(
-                &state.subscribers,
-                DaemonMessage::SessionMessageAppended { message: user_msg },
-            );
-
-            broadcast(&state.subscribers, DaemonMessage::Started { request_id });
-            let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
-            state
-                .active_requests
-                .insert(request_id, ActiveRequest { cancel_tx });
-
-            let cwd = state.cwd.clone();
-            // Workers don't need their own subscriber map — all broadcasts
-            // are routed through SessionCommand::Broadcast to this main
-            // session thread which holds the live subscriber set.
-            let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
-            let db = Arc::clone(db);
-            let provider = provider.clone();
-            let tool_registry = Arc::clone(tool_registry);
-            let daemon_tx = daemon_tx.clone();
-            let cmd_tx = cmd_tx.clone();
-            std::thread::spawn(move || {
-                let _ = run_request_worker(
-                    session_id,
-                    request_id,
-                    provider,
-                    &mut worker_session,
-                    db,
-                    model,
-                    cwd,
-                    cancel_rx,
-                    tool_registry,
-                    daemon_tx,
-                    max_turns_default,
-                    cmd_tx,
-                    None,
-                );
-            });
-            false
+            handle_run_input(request_id, input, state, shutdown_requested, ctx)
         }
-        SessionCommand::RunChildInput {
-            request_id,
-            input_tokens: _,
-            reply,
-        } => {
-            let Some(provider) = state.provider.as_ref() else {
-                let _ = reply.send(Err(io::Error::other("daemon locked")));
-                return false;
-            };
-            let model = state.selected_model.clone().unwrap_or_default();
-            if *shutdown_requested {
-                let _ = reply.send(Err(io::Error::other("session is shutting down")));
-                return false;
-            }
-            if !state.active_requests.is_empty() {
-                let _ = reply.send(Err(io::Error::other(
-                    "session already has an active request",
-                )));
-                return false;
-            }
-            broadcast(&state.subscribers, DaemonMessage::Started { request_id });
-            let cwd = state.cwd.clone();
-            let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
-            state
-                .active_requests
-                .insert(request_id, ActiveRequest { cancel_tx });
-            let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
-            let db = Arc::clone(db);
-            let provider = provider.clone();
-            let tool_registry = Arc::clone(tool_registry);
-            let daemon_tx = daemon_tx.clone();
-            let cmd_tx = cmd_tx.clone();
-            std::thread::spawn(move || {
-                let result = run_request_worker(
-                    session_id,
-                    request_id,
-                    provider,
-                    &mut worker_session,
-                    db,
-                    model,
-                    cwd,
-                    cancel_rx,
-                    tool_registry,
-                    daemon_tx,
-                    max_turns_default,
-                    cmd_tx,
-                    Some(reply),
-                );
-                let _ = result;
-            });
-            false
+        SessionCommand::RunChildInput { request_id, reply } => {
+            handle_run_child_input(request_id, reply, state, shutdown_requested, ctx)
         }
-        SessionCommand::Cancel { request_id } => {
-            if let Some(active) = state.active_requests.get(&request_id) {
-                let _ = active.cancel_tx.send(());
-                broadcast(&state.subscribers, DaemonMessage::Cancelled { request_id });
-            }
-            false
-        }
-        SessionCommand::SetModel { model } => {
-            info!("session {}: SetModel model={}", session_id, model);
-            state.selected_model = Some(model.clone());
-            debug!(
-                "session {}: broadcasting ModelSelected model={}",
-                session_id, model
-            );
-            broadcast(
-                &state.subscribers,
-                DaemonMessage::ModelSelected {
-                    model: model.clone(),
-                },
-            );
-            let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
-                session_id,
-                metadata: SessionMetadata::from(&*state),
-            });
-            false
-        }
-        SessionCommand::StatusChanged(new_status) => {
-            state.status = new_status.clone();
-            broadcast(
-                &state.subscribers,
-                DaemonMessage::SessionStatusChanged {
-                    session_id,
-                    status: new_status.clone(),
-                },
-            );
-            let _ = daemon_tx.send(DaemonCommand::BroadcastSessionStatus {
-                session_id,
-                status: new_status,
-            });
-            false
-        }
-        SessionCommand::Attach { client_id, tx } => {
-            info!("session {}: client {} attached", session_id, client_id);
-            state.subscribers.insert(client_id, tx);
-            let snapshot = DaemonMessage::SessionState {
-                session_id,
-                title: state.title.clone(),
-                selected_model: state.selected_model.clone(),
-                parent_session_id: state.parent_session_id,
-                cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
-                max_turns: state.max_turns,
-                messages: state.messages.clone(),
-                active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
-                token_usage: Some(state.accumulated_usage.clone()),
-            };
-            if let Some(tx) = state.subscribers.get(&client_id) {
-                let _ = tx.send(snapshot);
-            }
-            false
-        }
+        SessionCommand::Cancel { request_id } => handle_cancel(request_id, state, ctx),
+        SessionCommand::SetModel { model } => handle_set_model(model, state, ctx),
+        SessionCommand::StatusChanged(new_status) => handle_status_changed(new_status, state, ctx),
+        SessionCommand::Attach { client_id, tx } => handle_attach(client_id, tx, state, ctx),
         SessionCommand::Detach { client_id } => {
-            info!("session {}: client {} detached", session_id, client_id);
-            state.subscribers.remove(&client_id);
-            state.active_requests.is_empty()
-                && (state.subscribers.is_empty() || *shutdown_requested)
+            handle_detach(client_id, state, shutdown_requested, ctx)
         }
-        SessionCommand::GetSummary { reply } => {
-            let _ = reply.send(SessionSummary {
-                session_id,
-                title: state.title.clone(),
-                selected_model: state.selected_model.clone(),
-                reasoning_effort: state.reasoning_effort,
-                parent_session_id: state.parent_session_id,
-                cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
-                created_at: state.created_at,
-                message_count: state.messages.len() as u32,
-                max_turns: state.max_turns,
-                status: state.status.clone(),
-                active_tool_groups: state.active_tool_groups.iter().cloned().collect(),
-                account_name: state.account_name.clone(),
-                token_usage: Some(state.accumulated_usage.clone()),
-            });
-            false
-        }
-        SessionCommand::AppendMessage { message } => {
-            let idx = state.messages.len() as u32;
-            state.messages.push(message.clone());
-            write_message_retry(db, session_id, idx, &message).ok();
-            false
-        }
+        SessionCommand::GetSummary { reply } => handle_get_summary(reply, state, ctx),
+        SessionCommand::AppendMessage { message } => handle_append_message(message, state, ctx),
         SessionCommand::RequestFinished {
             request_id,
             snapshot,
-        } => {
-            state.apply_snapshot(snapshot);
-            state.active_requests.remove(&request_id);
-            state.status = SessionStatus::Inactive;
-            let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
-                session_id,
-                metadata: SessionMetadata::from(&*state),
-            });
-            broadcast(
-                &state.subscribers,
-                DaemonMessage::SessionStatusChanged {
-                    session_id,
-                    status: SessionStatus::Inactive,
-                },
-            );
-            let _ = daemon_tx.send(DaemonCommand::BroadcastSessionStatus {
-                session_id,
-                status: SessionStatus::Inactive,
-            });
-            state.active_requests.is_empty()
-                && (state.subscribers.is_empty() || *shutdown_requested)
-        }
-        SessionCommand::Broadcast(message) => {
-            // Broadcast through the main session thread's live subscriber
-            // map so that in-flight worker broadcasts respect detach.
-            broadcast(&state.subscribers, message);
-            false
-        }
-        SessionCommand::SetAccount { name } => {
-            info!("session {}: SetAccount account={}", session_id, name);
-            // Try to resolve the provider from the daemon by name.
-            let (reply, rx) = mpsc::channel();
-            let _ = daemon_tx.send(DaemonCommand::ResolveProviderCmd {
-                account: name.clone(),
-                reply,
-            });
-            if let Ok(Some(provider)) = rx.recv() {
-                state.provider = Some(provider);
-            }
-            // Always store the account name on the session, even if the
-            // provider wasn't resolvable yet (e.g. no credential stored,
-            // or daemon hasn't unlocked).  The provider can be resolved
-            // lazily when RunInput is called.  This way the user can set
-            // an account on a session before unlocking.
-            state.account_name = Some(name.clone());
-            broadcast(
-                &state.subscribers,
-                DaemonMessage::SessionAccountSet { account: name },
-            );
-            let _ = daemon_tx.send(DaemonCommand::UpdateMetadata {
-                session_id,
-                metadata: SessionMetadata::from(&*state),
-            });
-            false
-        }
+        } => handle_request_finished(request_id, snapshot, state, shutdown_requested, ctx),
+        SessionCommand::Broadcast(message) => handle_broadcast(message, state, ctx),
+        SessionCommand::SetAccount { name } => handle_set_account(name, state, ctx),
         SessionCommand::SetReasoningEffort { effort } => {
-            info!(
-                session_id,
-                effort = %effort.as_label(),
-                "setting reasoning effort"
-            );
-
-            // Check if the current model supports reasoning
-            let supported = if let (Some(model), Some(provider)) =
-                (state.selected_model.as_ref(), state.provider.as_ref())
-            {
-                // Get the provider slug
-                let slug = provider.provider_slug();
-                let catalog_entry = lookup_provider(slug);
-                let reasoning_support = catalog_entry
-                    .map(|e| e.reasoning)
-                    .unwrap_or(ReasoningSupport::None);
-                let effective = effective_reasoning_support(model, reasoning_support);
-                effective != ReasoningSupport::None
-            } else {
-                // If no model or provider is set yet, accept the preference
-                // (it will be validated when inference actually runs)
-                true
-            };
-
-            if supported || effort == ThinkingEffort::Off {
-                state.reasoning_effort = Some(effort);
-                debug!(
-                    session_id,
-                    effort = %effort.as_label(),
-                    "reasoning effort stored"
-                );
-                broadcast(
-                    &state.subscribers,
-                    DaemonMessage::ReasoningEffortSet { effort },
-                );
-            } else {
-                let model = state.selected_model.as_deref().unwrap_or("(none)");
-                let msg = format!(
-                    "model '{}' does not support reasoning effort '{}'",
-                    model,
-                    effort.as_label(),
-                );
-                warn!(session_id, error = %msg, "reasoning effort rejected");
-                broadcast(
-                    &state.subscribers,
-                    DaemonMessage::ReasoningEffortSetFailed {
-                        effort: effort.as_label().to_string(),
-                        error: msg,
-                    },
-                );
-            }
-            false
+            handle_set_reasoning_effort(effort, state, ctx)
         }
         SessionCommand::GetReasoningEffort { reply } => {
-            let current = state.reasoning_effort.unwrap_or(ThinkingEffort::Off);
-            let _ = reply.send(current);
-            false
+            handle_get_reasoning_effort(reply, state, ctx)
         }
-        SessionCommand::Shutdown => {
-            *shutdown_requested = true;
-            for (&request_id, active) in &state.active_requests {
-                let _ = active.cancel_tx.send(());
-                broadcast(&state.subscribers, DaemonMessage::Cancelled { request_id });
-            }
-            state.active_requests.is_empty()
-        }
+        SessionCommand::Shutdown => handle_shutdown(state, shutdown_requested),
     }
+}
+
+// ── SessionCommand handler functions ─────────────────────────────────────────
+
+/// Process a user input: validate, resolve provider, spawn a request worker.
+fn handle_run_input(
+    request_id: u32,
+    input: Vec<u8>,
+    state: &mut SessionState,
+    shutdown_requested: &mut bool,
+    ctx: &RequestContext,
+) -> bool {
+    debug!("session {}: RunInput id={}", ctx.session_id, request_id);
+    let text = String::from_utf8_lossy(&input).trim().to_string();
+    info!(
+        session_id = ctx.session_id,
+        input_len = text.len(),
+        input_preview = %text.chars().take(120).collect::<String>(),
+        "session received input",
+    );
+    if text.is_empty() {
+        return fail_request(&state.subscribers, request_id, "empty input");
+    }
+    let provider = if let Some(p) = state.provider.as_ref() {
+        p
+    } else if let Some(ref name) = state.config.account_name {
+        // No cached provider yet — try lazy resolution via the daemon.
+        let (reply, rx) = mpsc::channel();
+        let _ = ctx.daemon_tx.send(DaemonCommand::ResolveProviderCmd {
+            account: name.clone(),
+            reply,
+        });
+        match rx.recv() {
+            Ok(Some(provider)) => {
+                state.provider = Some(provider);
+                let Some(p) = state.provider.as_ref() else {
+                    return fail_request(
+                        &state.subscribers,
+                        request_id,
+                        "internal error: provider not set after resolution".to_string(),
+                    );
+                };
+                p
+            }
+            _ => {
+                return fail_request(
+                    &state.subscribers,
+                    request_id,
+                    format!(
+                        "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
+                    ),
+                );
+            }
+        }
+    } else {
+        return fail_request(
+            &state.subscribers,
+            request_id,
+            "no account configured on this session — use /account <name> to set one",
+        );
+    };
+    let model = match &state.config.selected_model {
+        Some(m) => m.clone(),
+        None => {
+            return fail_request(&state.subscribers, request_id, "no model selected");
+        }
+    };
+    if *shutdown_requested {
+        return fail_request(&state.subscribers, request_id, "session is shutting down");
+    }
+    if !state.active_requests.is_empty() {
+        return fail_request(
+            &state.subscribers,
+            request_id,
+            "session already has an active request",
+        );
+    }
+
+    let user_msg = SessionMessage::UserText {
+        content: text.clone(),
+    };
+    let msg_idx = state.messages.len() as u32;
+    state.messages.push(user_msg.clone());
+    write_message_retry(&ctx.db, ctx.session_id, msg_idx, &user_msg).ok();
+    broadcast(
+        &state.subscribers,
+        DaemonMessage::SessionMessageAppended { message: user_msg },
+    );
+
+    broadcast(&state.subscribers, DaemonMessage::Started { request_id });
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    state
+        .active_requests
+        .insert(request_id, ActiveRequest { cancel_tx });
+
+    let cwd = state.config.cwd.clone();
+    // Workers don't need their own subscriber map — all broadcasts
+    // are routed through SessionCommand::Broadcast to this main
+    // session thread which holds the live subscriber set.
+    let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
+    let ctx = ctx.clone();
+    let provider = provider.clone();
+    std::thread::spawn(move || {
+        let _ = run_request_worker(
+            request_id,
+            provider,
+            &mut worker_session,
+            model,
+            cwd,
+            cancel_rx,
+            ctx,
+            None,
+        );
+    });
+    false
+}
+
+/// Run the agent loop on a pre-populated child session and return the result.
+///
+/// The caller is responsible for injecting any prompt into the session via
+/// [`SessionCommand::AppendMessage`] before sending this command — this
+/// command only triggers the agent loop on whatever messages are already
+/// queued. The response is delivered through the `reply` channel.
+fn handle_run_child_input(
+    request_id: u32,
+    reply: std::sync::mpsc::Sender<io::Result<ChildResult>>,
+    state: &mut SessionState,
+    shutdown_requested: &mut bool,
+    ctx: &RequestContext,
+) -> bool {
+    let Some(provider) = state.provider.as_ref() else {
+        let _ = reply.send(Err(io::Error::other("daemon locked")));
+        return false;
+    };
+    let model = state.config.selected_model.clone().unwrap_or_default();
+    if *shutdown_requested {
+        let _ = reply.send(Err(io::Error::other("session is shutting down")));
+        return false;
+    }
+    if !state.active_requests.is_empty() {
+        let _ = reply.send(Err(io::Error::other(
+            "session already has an active request",
+        )));
+        return false;
+    }
+    broadcast(&state.subscribers, DaemonMessage::Started { request_id });
+    let cwd = state.config.cwd.clone();
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+    state
+        .active_requests
+        .insert(request_id, ActiveRequest { cancel_tx });
+    let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
+    let ctx = ctx.clone();
+    let provider = provider.clone();
+    std::thread::spawn(move || {
+        let result = run_request_worker(
+            request_id,
+            provider,
+            &mut worker_session,
+            model,
+            cwd,
+            cancel_rx,
+            ctx,
+            Some(reply),
+        );
+        let _ = result;
+    });
+    false
+}
+
+/// Cancel an active request by sending on its cancel channel.
+fn handle_cancel(request_id: u32, state: &mut SessionState, ctx: &RequestContext) -> bool {
+    let _ = ctx;
+    if let Some(active) = state.active_requests.get(&request_id) {
+        let _ = active.cancel_tx.send(());
+        broadcast(&state.subscribers, DaemonMessage::Cancelled { request_id });
+    }
+    false
+}
+
+/// Set the model for this session and broadcast the change.
+fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
+    info!("session {}: SetModel model={}", ctx.session_id, model);
+    state.config.selected_model = Some(model.clone());
+    debug!(
+        "session {}: broadcasting ModelSelected model={}",
+        ctx.session_id, model
+    );
+    broadcast(
+        &state.subscribers,
+        DaemonMessage::ModelSelected {
+            model: model.clone(),
+        },
+    );
+    let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
+        session_id: ctx.session_id,
+        metadata: SessionMetadata::from(&*state),
+    });
+    false
+}
+
+/// Update the session status and broadcast to subscribers and daemon.
+fn handle_status_changed(
+    new_status: SessionStatus,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    state.config.status = new_status.clone();
+    broadcast(
+        &state.subscribers,
+        DaemonMessage::SessionStatusChanged {
+            session_id: ctx.session_id,
+            status: new_status.clone(),
+        },
+    );
+    let _ = ctx.daemon_tx.send(DaemonCommand::BroadcastSessionStatus {
+        session_id: ctx.session_id,
+        status: new_status,
+    });
+    false
+}
+
+/// Attach a client to this session, sending the full session state snapshot.
+fn handle_attach(
+    client_id: u64,
+    tx: std::sync::mpsc::Sender<DaemonMessage>,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    info!("session {}: client {} attached", ctx.session_id, client_id);
+    state.subscribers.insert(client_id, tx);
+    let snapshot = DaemonMessage::SessionState {
+        session_id: ctx.session_id,
+        title: state.config.title.clone(),
+        selected_model: state.config.selected_model.clone(),
+        parent_session_id: state.config.parent_session_id,
+        cwd: state.config.cwd.as_ref().map(|p| p.display().to_string()),
+        max_turns: state.config.max_turns,
+        messages: state.messages.clone(),
+        active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
+        token_usage: Some(state.config.accumulated_usage.clone()),
+    };
+    if let Some(tx) = state.subscribers.get(&client_id) {
+        let _ = tx.send(snapshot);
+    }
+    false
+}
+
+/// Detach a client from this session.
+fn handle_detach(
+    client_id: u64,
+    state: &mut SessionState,
+    shutdown_requested: &bool,
+    ctx: &RequestContext,
+) -> bool {
+    info!("session {}: client {} detached", ctx.session_id, client_id);
+    let _ = ctx;
+    state.subscribers.remove(&client_id);
+    state.active_requests.is_empty() && (state.subscribers.is_empty() || *shutdown_requested)
+}
+
+/// Return a SessionSummary for this session via the reply channel.
+fn handle_get_summary(
+    reply: std::sync::mpsc::Sender<SessionSummary>,
+    state: &SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    let _ = reply.send(SessionSummary {
+        session_id: ctx.session_id,
+        title: state.config.title.clone(),
+        selected_model: state.config.selected_model.clone(),
+        reasoning_effort: state.config.reasoning_effort,
+        parent_session_id: state.config.parent_session_id,
+        cwd: state.config.cwd.as_ref().map(|p| p.display().to_string()),
+        created_at: state.config.created_at,
+        message_count: state.messages.len() as u32,
+        max_turns: state.config.max_turns,
+        status: state.config.status.clone(),
+        active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
+        account_name: state.config.account_name.clone(),
+        token_usage: Some(state.config.accumulated_usage.clone()),
+    });
+    false
+}
+
+/// Append a message to the session and persist it.
+fn handle_append_message(
+    message: SessionMessage,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    let idx = state.messages.len() as u32;
+    state.messages.push(message.clone());
+    write_message_retry(&ctx.db, ctx.session_id, idx, &message).ok();
+    false
+}
+
+/// Apply the worker's snapshot and broadcast inactive status.
+fn handle_request_finished(
+    request_id: u32,
+    snapshot: SessionSnapshot,
+    state: &mut SessionState,
+    shutdown_requested: &bool,
+    ctx: &RequestContext,
+) -> bool {
+    state.apply_snapshot(snapshot);
+    state.active_requests.remove(&request_id);
+    state.config.status = SessionStatus::Inactive;
+    let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
+        session_id: ctx.session_id,
+        metadata: SessionMetadata::from(&*state),
+    });
+    broadcast(
+        &state.subscribers,
+        DaemonMessage::SessionStatusChanged {
+            session_id: ctx.session_id,
+            status: SessionStatus::Inactive,
+        },
+    );
+    let _ = ctx.daemon_tx.send(DaemonCommand::BroadcastSessionStatus {
+        session_id: ctx.session_id,
+        status: SessionStatus::Inactive,
+    });
+    state.active_requests.is_empty() && (state.subscribers.is_empty() || *shutdown_requested)
+}
+
+/// Broadcast a message through the live subscriber map.
+fn handle_broadcast(message: DaemonMessage, state: &SessionState, ctx: &RequestContext) -> bool {
+    let _ = ctx;
+    // Broadcast through the main session thread's live subscriber
+    // map so that in-flight worker broadcasts respect detach.
+    broadcast(&state.subscribers, message);
+    false
+}
+
+/// Set the account for this session and try to resolve its provider.
+fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
+    info!("session {}: SetAccount account={}", ctx.session_id, name);
+    // Try to resolve the provider from the daemon by name.
+    let (reply, rx) = mpsc::channel();
+    let _ = ctx.daemon_tx.send(DaemonCommand::ResolveProviderCmd {
+        account: name.clone(),
+        reply,
+    });
+    if let Ok(Some(provider)) = rx.recv() {
+        state.provider = Some(provider);
+    }
+    // Always store the account name on the session, even if the
+    // provider wasn't resolvable yet (e.g. no credential stored,
+    // or daemon hasn't unlocked).  The provider can be resolved
+    // lazily when RunInput is called.  This way the user can set
+    // an account on a session before unlocking.
+    state.config.account_name = Some(name.clone());
+    broadcast(
+        &state.subscribers,
+        DaemonMessage::SessionAccountSet { account: name },
+    );
+    let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
+        session_id: ctx.session_id,
+        metadata: SessionMetadata::from(&*state),
+    });
+    false
+}
+
+/// Set the reasoning effort for this session, validating against the model.
+fn handle_set_reasoning_effort(
+    effort: ThinkingEffort,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    info!(
+        session_id = ctx.session_id,
+        effort = %effort.as_label(),
+        "setting reasoning effort"
+    );
+
+    // Check if the current model supports reasoning
+    let supported = if let (Some(model), Some(provider)) = (
+        state.config.selected_model.as_ref(),
+        state.provider.as_ref(),
+    ) {
+        // Get the provider slug
+        let slug = provider.provider_slug();
+        let catalog_entry = lookup_provider(slug);
+        let reasoning_support = catalog_entry
+            .map(|e| e.reasoning)
+            .unwrap_or(ReasoningSupport::None);
+        let effective = effective_reasoning_support(model, reasoning_support);
+        effective != ReasoningSupport::None
+    } else {
+        // If no model or provider is set yet, accept the preference
+        // (it will be validated when inference actually runs)
+        true
+    };
+
+    if supported || effort == ThinkingEffort::Off {
+        state.config.reasoning_effort = Some(effort);
+        debug!(
+            session_id = ctx.session_id,
+            effort = %effort.as_label(),
+            "reasoning effort stored"
+        );
+        broadcast(
+            &state.subscribers,
+            DaemonMessage::ReasoningEffortSet { effort },
+        );
+    } else {
+        let model = state.config.selected_model.as_deref().unwrap_or("(none)");
+        let msg = format!(
+            "model '{}' does not support reasoning effort '{}'",
+            model,
+            effort.as_label(),
+        );
+        warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
+        broadcast(
+            &state.subscribers,
+            DaemonMessage::ReasoningEffortSetFailed {
+                effort: effort.as_label().to_string(),
+                error: msg,
+            },
+        );
+    }
+    false
+}
+
+/// Return the current reasoning effort via the reply channel.
+fn handle_get_reasoning_effort(
+    reply: mpsc::Sender<ThinkingEffort>,
+    state: &SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    let _ = ctx;
+    let current = state.config.reasoning_effort.unwrap_or(ThinkingEffort::Off);
+    let _ = reply.send(current);
+    false
+}
+
+/// Signal shutdown: cancel all active requests and check if the loop should exit.
+fn handle_shutdown(state: &mut SessionState, shutdown_requested: &mut bool) -> bool {
+    *shutdown_requested = true;
+    for (&request_id, active) in &state.active_requests {
+        let _ = active.cancel_tx.send(());
+        broadcast(&state.subscribers, DaemonMessage::Cancelled { request_id });
+    }
+    state.active_requests.is_empty()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_request_worker(
-    session_id: u64,
     request_id: u32,
     client: InferenceProvider,
     session: &mut SessionState,
-    db: Arc<redb::Database>,
     model: String,
     cwd: Option<PathBuf>,
     cancel_rx: mpsc::Receiver<()>,
-    tool_registry: Arc<ToolRegistry>,
-    daemon_tx: mpsc::Sender<DaemonCommand>,
-    max_turns_default: u32,
-    cmd_tx: mpsc::Sender<SessionCommand>,
+    ctx: RequestContext,
     child_reply: Option<mpsc::Sender<io::Result<ChildResult>>>,
 ) -> io::Result<()> {
     let request_start = std::time::Instant::now();
@@ -893,16 +966,11 @@ fn run_request_worker(
         run_agent_loop(
             &client,
             session,
-            session_id,
-            &db,
             &model,
             request_id,
             cwd.as_deref(),
             &cancel_rx,
-            &tool_registry,
-            &daemon_tx,
-            max_turns_default,
-            &cmd_tx,
+            &ctx,
         )
     }));
 
@@ -926,34 +994,38 @@ fn run_request_worker(
 
     match &outcome {
         RequestOutcome::Done => {
-            info!(session_id, request_id, "request completed");
+            info!(session_id = ctx.session_id, request_id, "request completed");
             // Route through the main session thread so detach is respected.
             // Include the worker's accumulated token usage so subscribers
             // (e.g. the TUI) can show per-request token counts.
-            let usage = &session.accumulated_usage;
+            let usage = &session.config.accumulated_usage;
             debug!(
-                session_id,
+                session_id = ctx.session_id,
                 request_id,
                 input_tokens = usage.input_tokens,
                 output_tokens = usage.output_tokens,
                 total_tokens = usage.total_tokens,
                 "broadcasting Done with accumulated token usage"
             );
-            let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::Done {
-                request_id,
-                token_usage: Some(usage.clone()),
-            }));
+            let _ = ctx
+                .cmd_tx
+                .send(SessionCommand::Broadcast(DaemonMessage::Done {
+                    request_id,
+                    token_usage: Some(usage.clone()),
+                }));
         }
         RequestOutcome::Failed(error) => {
-            info!(session_id, request_id, error = %error, "request failed");
+            info!(session_id = ctx.session_id, request_id, error = %error, "request failed");
             // Route through the main session thread so detach is respected.
-            let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::Failed {
-                request_id,
-                error: error.to_string(),
-            }));
+            let _ = ctx
+                .cmd_tx
+                .send(SessionCommand::Broadcast(DaemonMessage::Failed {
+                    request_id,
+                    error: error.to_string(),
+                }));
         }
         RequestOutcome::Cancelled => {
-            info!(session_id, request_id, "request cancelled");
+            info!(session_id = ctx.session_id, request_id, "request cancelled");
         }
     }
 
@@ -986,7 +1058,7 @@ fn run_request_worker(
         let _ = reply.send(child_result);
     }
 
-    let _ = cmd_tx.send(SessionCommand::RequestFinished {
+    let _ = ctx.cmd_tx.send(SessionCommand::RequestFinished {
         request_id,
         snapshot,
     });
@@ -1043,13 +1115,23 @@ mod tests {
 
     fn test_state() -> SessionState {
         SessionState {
-            title: Some("test session".into()),
-            selected_model: Some("gpt-4".into()),
-            reasoning_effort: None,
-            parent_session_id: None,
-            cwd: Some(std::path::PathBuf::from("/tmp")),
-            max_turns: Some(10),
-            created_at: 1000,
+            config: SessionConfig {
+                title: Some("test session".into()),
+                selected_model: Some("gpt-4".into()),
+                reasoning_effort: None,
+                parent_session_id: None,
+                cwd: Some(std::path::PathBuf::from("/tmp")),
+                max_turns: Some(10),
+                created_at: 1000,
+                context_fingerprint: None,
+                context_file_paths: Vec::new(),
+                context_message_index: None,
+                status: SessionStatus::Inactive,
+                active_tool_groups: ["core".into(), "shell".into()].into(),
+                context_config: ContextConfig::default(),
+                account_name: None,
+                accumulated_usage: TokenUsage::default(),
+            },
             messages: vec![
                 SessionMessage::SystemText {
                     content: "prompt".into(),
@@ -1065,14 +1147,6 @@ mod tests {
             ],
             subscribers: HashMap::new(),
             active_requests: HashMap::new(),
-            context_fingerprint: None,
-            context_file_paths: Vec::new(),
-            context_message_index: None,
-            status: SessionStatus::Inactive,
-            active_tool_groups: ["core".into(), "shell".into()].into(),
-            context_config: ContextConfig::default(),
-            account_name: None,
-            accumulated_usage: TokenUsage::default(),
             provider: None,
         }
     }
@@ -1087,7 +1161,11 @@ mod tests {
         assert_eq!(meta.selected_model, record.selected_model);
         assert_eq!(meta.cwd, record.cwd);
         assert_eq!(meta.message_count, record.message_count);
-        assert_eq!(meta.active_tool_groups, record.active_tool_groups);
+        let mut expected = record.active_tool_groups.clone();
+        let mut actual = meta.active_tool_groups.clone();
+        expected.sort();
+        actual.sort();
+        assert_eq!(expected, actual);
     }
 
     #[test]
@@ -1125,27 +1203,31 @@ mod tests {
         assert_eq!(record.max_turns, record2.max_turns);
         assert_eq!(record.message_count, record2.message_count);
         assert_eq!(record.created_at, record2.created_at);
-        assert_eq!(record.active_tool_groups, record2.active_tool_groups);
+        let mut expected = record.active_tool_groups.clone();
+        let mut actual = record2.active_tool_groups.clone();
+        expected.sort();
+        actual.sort();
+        assert_eq!(expected, actual);
     }
 
     #[test]
     fn session_state_to_metadata() {
         let state = test_state();
         let meta: SessionMetadata = (&state).into();
-        assert_eq!(meta.title, state.title);
-        assert_eq!(meta.selected_model, state.selected_model);
+        assert_eq!(meta.title, state.config.title);
+        assert_eq!(meta.selected_model, state.config.selected_model);
         assert_eq!(meta.message_count, 3);
-        assert_eq!(meta.status, state.status);
+        assert_eq!(meta.status, state.config.status);
         assert_eq!(meta.cwd, Some("/tmp".into()));
-        assert_eq!(meta.parent_session_id, state.parent_session_id);
+        assert_eq!(meta.parent_session_id, state.config.parent_session_id);
     }
 
     #[test]
     fn session_state_to_record() {
         let state = test_state();
         let record: SessionRecord = (&state).into();
-        assert_eq!(record.title, state.title);
-        assert_eq!(record.selected_model, state.selected_model);
+        assert_eq!(record.title, state.config.title);
+        assert_eq!(record.selected_model, state.config.selected_model);
         assert_eq!(record.message_count, 3);
         assert_eq!(record.cwd, Some("/tmp".into()));
     }
@@ -1155,33 +1237,39 @@ mod tests {
         let record = test_record();
         let meta: SessionMetadata = record.clone().into();
         let record2: SessionRecord = meta.into();
-        assert_eq!(record.active_tool_groups, record2.active_tool_groups);
+        let mut expected = record.active_tool_groups.clone();
+        let mut actual = record2.active_tool_groups.clone();
+        expected.sort();
+        actual.sort();
+        assert_eq!(expected, actual);
         assert_eq!(record2.active_tool_groups.len(), 2);
     }
 
     // -- SessionCommand::Broadcast tests -----------------------------------
 
     /// Build minimal stubs needed to call `process_command` with a Broadcast.
-    fn broadcast_setup() -> (
-        SessionState,
-        Arc<redb::Database>,
-        Arc<ToolRegistry>,
-        mpsc::Sender<DaemonCommand>,
-        mpsc::Sender<SessionCommand>,
-    ) {
+    fn broadcast_setup() -> (SessionState, RequestContext) {
         let dir = tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let tool_registry = ToolRegistry::new().build();
         let (daemon_tx, _) = mpsc::channel();
         let (cmd_tx, _) = mpsc::channel();
-        (test_state(), db, tool_registry, daemon_tx, cmd_tx)
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db,
+            tool_registry,
+            daemon_tx,
+            max_turns_default: 25,
+        };
+        (test_state(), ctx)
     }
 
     #[test]
     fn broadcast_delivers_message_to_all_subscribers() {
         let (tx1, rx1) = mpsc::channel();
         let (tx2, rx2) = mpsc::channel();
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        let (mut state, ctx) = broadcast_setup();
         state.subscribers.insert(10, tx1);
         state.subscribers.insert(20, tx2);
 
@@ -1192,13 +1280,8 @@ mod tests {
                 token_usage: None,
             }),
             &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
             &mut shutdown,
-            25,
+            &ctx,
         );
 
         assert_eq!(
@@ -1222,7 +1305,7 @@ mod tests {
     fn broadcast_does_not_deliver_to_detached_client() {
         let (tx1, rx1) = mpsc::channel();
         let (tx2, rx2) = mpsc::channel();
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        let (mut state, ctx) = broadcast_setup();
         state.subscribers.insert(10, tx1);
         state.subscribers.insert(20, tx2);
 
@@ -1237,13 +1320,8 @@ mod tests {
                 data: b"hello".to_vec(),
             }),
             &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
             &mut shutdown,
-            25,
+            &ctx,
         );
 
         // Client 20 (still attached) receives the message.
@@ -1266,7 +1344,7 @@ mod tests {
 
     #[test]
     fn broadcast_with_no_subscribers_does_not_panic() {
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        let (mut state, ctx) = broadcast_setup();
         // subscribers is already empty
 
         let mut shutdown = false;
@@ -1276,13 +1354,8 @@ mod tests {
                 token_usage: None,
             }),
             &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
             &mut shutdown,
-            25,
+            &ctx,
         );
 
         assert!(!shutdown);
@@ -1294,20 +1367,15 @@ mod tests {
         // disconnected without properly detaching) should not panic or crash.
         let (tx, _rx) = mpsc::channel();
         drop(_rx);
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        let (mut state, ctx) = broadcast_setup();
         state.subscribers.insert(99, tx);
 
         let mut shutdown = false;
         process_command(
             SessionCommand::Broadcast(DaemonMessage::Pong),
             &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
             &mut shutdown,
-            25,
+            &ctx,
         );
 
         assert!(!shutdown);
@@ -1318,20 +1386,15 @@ mod tests {
     #[test]
     fn cancel_sends_through_channel() {
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        let (mut state, ctx) = broadcast_setup();
         state.active_requests.insert(1, ActiveRequest { cancel_tx });
 
         let mut shutdown = false;
         process_command(
             SessionCommand::Cancel { request_id: 1 },
             &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
             &mut shutdown,
-            25,
+            &ctx,
         );
 
         // The cancellation signal should be delivered on the channel.
@@ -1342,7 +1405,7 @@ mod tests {
     #[test]
     fn cancel_broadcasts_cancelled_to_subscribers() {
         let (cancel_tx, _cancel_rx) = mpsc::channel::<()>();
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        let (mut state, ctx) = broadcast_setup();
         state.active_requests.insert(1, ActiveRequest { cancel_tx });
 
         let (sub_tx, sub_rx) = mpsc::channel();
@@ -1352,13 +1415,8 @@ mod tests {
         process_command(
             SessionCommand::Cancel { request_id: 1 },
             &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
             &mut shutdown,
-            25,
+            &ctx,
         );
 
         assert_eq!(
@@ -1369,20 +1427,15 @@ mod tests {
 
     #[test]
     fn cancel_unknown_request_id_is_noop() {
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        let (mut state, ctx) = broadcast_setup();
         // No active requests — cancel on a non-existent ID should not fail.
 
         let mut shutdown = false;
         process_command(
             SessionCommand::Cancel { request_id: 99 },
             &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
             &mut shutdown,
-            25,
+            &ctx,
         );
 
         assert!(!shutdown);
@@ -1392,7 +1445,7 @@ mod tests {
     fn shutdown_cancels_all_active_requests() {
         let (cancel_tx1, cancel_rx1) = mpsc::channel::<()>();
         let (cancel_tx2, cancel_rx2) = mpsc::channel::<()>();
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        let (mut state, ctx) = broadcast_setup();
         state.active_requests.insert(
             1,
             ActiveRequest {
@@ -1407,17 +1460,7 @@ mod tests {
         );
 
         let mut shutdown = false;
-        process_command(
-            SessionCommand::Shutdown,
-            &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
-            &mut shutdown,
-            25,
-        );
+        process_command(SessionCommand::Shutdown, &mut state, &mut shutdown, &ctx);
 
         assert!(shutdown);
         // Both requests should have received cancellation signals.
@@ -1429,21 +1472,12 @@ mod tests {
     fn shutdown_with_empty_active_requests_returns_true() {
         // When there are no active requests, Shutdown should signal
         // that the session loop can exit (return true).
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        let (mut state, ctx) = broadcast_setup();
         // active_requests is already empty.
 
         let mut shutdown = false;
-        let should_exit = process_command(
-            SessionCommand::Shutdown,
-            &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
-            &mut shutdown,
-            25,
-        );
+        let should_exit =
+            process_command(SessionCommand::Shutdown, &mut state, &mut shutdown, &ctx);
 
         assert!(shutdown);
         assert!(should_exit);
@@ -1453,7 +1487,7 @@ mod tests {
     fn shutdown_broadcasts_cancelled_for_each_active_request() {
         let (cancel_tx1, _) = mpsc::channel::<()>();
         let (cancel_tx2, _) = mpsc::channel::<()>();
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
+        let (mut state, ctx) = broadcast_setup();
         state.active_requests.insert(
             1,
             ActiveRequest {
@@ -1471,17 +1505,7 @@ mod tests {
         state.subscribers.insert(10, sub_tx);
 
         let mut shutdown = false;
-        process_command(
-            SessionCommand::Shutdown,
-            &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
-            &mut shutdown,
-            25,
-        );
+        process_command(SessionCommand::Shutdown, &mut state, &mut shutdown, &ctx);
 
         // Should receive two Cancelled broadcasts (order not guaranteed).
         let msgs: Vec<DaemonMessage> = (0..2).map(|_| sub_rx.recv().unwrap()).collect();
@@ -1494,9 +1518,9 @@ mod tests {
     #[test]
     fn accumulated_usage_starts_at_zero() {
         let state = SessionState::empty();
-        assert_eq!(state.accumulated_usage.input_tokens, 0);
-        assert_eq!(state.accumulated_usage.output_tokens, 0);
-        assert_eq!(state.accumulated_usage.total_tokens, 0);
+        assert_eq!(state.config.accumulated_usage.input_tokens, 0);
+        assert_eq!(state.config.accumulated_usage.output_tokens, 0);
+        assert_eq!(state.config.accumulated_usage.total_tokens, 0);
     }
 
     #[test]
@@ -1539,23 +1563,23 @@ mod tests {
     #[test]
     fn accumulated_usage_in_snapshot() {
         let mut state = SessionState::empty();
-        state.accumulated_usage = TokenUsage {
+        state.config.accumulated_usage = TokenUsage {
             input_tokens: 50,
             output_tokens: 25,
             total_tokens: 75,
         };
         let snap = state.snapshot();
-        assert_eq!(snap.accumulated_usage.input_tokens, 50);
-        assert_eq!(snap.accumulated_usage.output_tokens, 25);
-        assert_eq!(snap.accumulated_usage.total_tokens, 75);
+        assert_eq!(snap.config.accumulated_usage.input_tokens, 50);
+        assert_eq!(snap.config.accumulated_usage.output_tokens, 25);
+        assert_eq!(snap.config.accumulated_usage.total_tokens, 75);
     }
 
     #[test]
     fn accumulated_usage_in_session_summary() {
         // The SessionSummary sent via GetSummary includes the accumulated
         // token usage.
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
-        state.accumulated_usage = TokenUsage {
+        let (mut state, ctx) = broadcast_setup();
+        state.config.accumulated_usage = TokenUsage {
             input_tokens: 80,
             output_tokens: 40,
             total_tokens: 120,
@@ -1566,13 +1590,8 @@ mod tests {
         process_command(
             SessionCommand::GetSummary { reply },
             &mut state,
-            1,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
             &mut shutdown,
-            25,
+            &ctx,
         );
 
         let summary: SessionSummary = rx.recv().unwrap();
@@ -1588,8 +1607,8 @@ mod tests {
     fn accumulated_usage_in_attach_snapshot() {
         // When a client attaches, it receives a SessionState message that
         // includes accumulated token usage.
-        let (mut state, db, tool_registry, daemon_tx, cmd_tx) = broadcast_setup();
-        state.accumulated_usage = TokenUsage {
+        let (mut state, ctx) = broadcast_setup();
+        state.config.accumulated_usage = TokenUsage {
             input_tokens: 30,
             output_tokens: 15,
             total_tokens: 45,
@@ -1603,13 +1622,8 @@ mod tests {
                 tx: sub_tx,
             },
             &mut state,
-            42,
-            &db,
-            &tool_registry,
-            &daemon_tx,
-            &cmd_tx,
             &mut shutdown,
-            25,
+            &ctx,
         );
 
         let msg = sub_rx.recv().unwrap();

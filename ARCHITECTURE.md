@@ -200,12 +200,12 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `google/` | Google Gemini API client (`GoogleClient`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
 | `mistral/` | Mistral API client (`MistralClient`). Implements `ProviderClient`. Uses OpenAI-compatible SSE reader for streaming. |
 | `retry/` | Shared HTTP retry logic extracted from the OpenAI module. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. All provider modules use this via the shared `ProviderError` type conversion. |
-| `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Each session has a control thread; request work runs on separate worker threads. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
+| `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
-| `tools/` | Tool trait, registry, and 20 registered tools. |
+| `tools/` | `Tool` trait, `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 20 registered tools. |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
 
 ### Provider Architecture
@@ -338,13 +338,13 @@ LLM provider (API response)
      ChatTurnResult (FinalText | ToolUse).usage: Option<TokenUsage>
        │
        ▼
-     run_agent_loop (tai-daemon/src/requests.rs)
-       ├─ embeds per-turn TokenUsage into SessionMessage::AssistantText / AssistantToolUse
-       └─ accumulates into SessionState.accumulated_usage (TokenUsage)
-       │
-       ▼
-     SessionState (tai-daemon/src/sessions.rs)
-       ├─ persisted via SessionRecord.accumulated_usage
+      run_agent_loop (tai-daemon/src/requests.rs)
+        ├─ embeds per-turn TokenUsage into SessionMessage::AssistantText / AssistantToolUse
+        └─ accumulates into SessionState.config.accumulated_usage (TokenUsage)
+        │
+        ▼
+      SessionState (tai-daemon/src/sessions.rs)
+        ├─ persisted via SessionRecord.accumulated_usage (through SessionConfig)
        ├─ sent to subscribers via DaemonMessage::SessionState.token_usage
        ├─ sent to clients via DaemonMessage::Done.token_usage
        └─ included in SessionSummary.token_usage (listing / get-session)
@@ -585,21 +585,34 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 
 ### Session state (in-memory)
 
-Each active session has a `SessionState` owned by its control thread:
+Each active session has a `SessionState` owned by its control thread. Persistent
+configuration fields are extracted into `SessionConfig` to avoid duplication
+across snapshot/restore, metadata conversion, and record persistence:
+
+**`SessionConfig` (persisted):**
 
 - `title: Option<String>` — display name
 - `selected_model: Option<String>` — AI model for this session
+- `reasoning_effort: Option<ThinkingEffort>` — per-session reasoning effort
 - `parent_session_id: Option<u64>` — parent session for sub-sessions
 - `cwd: Option<PathBuf>` — working directory for filesystem tools
 - `max_turns: Option<u32>` — per-session tool loop iteration cap (inherits from parent)
 - `created_at: i64` — Unix timestamp of creation
+- `context_fingerprint: Option<u64>` — fingerprint for context file refresh
+- `context_file_paths: Vec<PathBuf>` — tracked context file paths
+- `context_message_index: Option<usize>` — index of the context system message
+- `status: SessionStatus` — current status (Inactive, Inference, Retrying, Sleeping, …)
+- `active_tool_groups: HashSet<String>` — tool groups active for this session
 - `context_config: ContextConfig` — file discovery settings (context file names, max bytes)
 - `account_name: Option<String>` — inference account assigned to this session
-- `provider: Option<InferenceProvider>` — resolved inference provider for the account
-- `messages: Vec<SessionMessage>` — conversation history (also persisted to DB)
-- `active_requests: HashMap<u32, ActiveRequest>` — running request cancel flags
+- `accumulated_usage: TokenUsage` — session-level token counter
+
+**Runtime fields (not persisted directly):**
+
+- `messages: Vec<SessionMessage>` — conversation history (persisted to DB separately)
 - `subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>` — attached clients
-- `active_tool_groups: HashSet<String>` — tool groups active for this session
+- `active_requests: HashMap<u32, ActiveRequest>` — running request cancel flags
+- `provider: Option<InferenceProvider>` — resolved inference provider for the account
 
 ### Hierarchy and CWD inheritance
 

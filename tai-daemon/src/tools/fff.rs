@@ -1,12 +1,14 @@
-use super::{ToolError, ToolResult, tool_ok, truncate_tool_output};
+use super::{ToolError, tool_ok, truncate_tool_output};
+use crate::tools::ToolExecutionOutput;
 use fff_search::*;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, RwLock},
     time::Duration,
 };
+use tai_keystore::ServiceCredential;
 
 const FFF_SCAN_TIMEOUT_SECS: u64 = 60;
 const FFF_DEFAULT_MAX_RESULTS: usize = 50;
@@ -21,7 +23,7 @@ struct FffArgs {
     max_results: Option<usize>,
 }
 
-struct FffState {
+pub(crate) struct FffState {
     shared_picker: SharedFilePicker,
     _shared_frecency: SharedFrecency,
 }
@@ -78,169 +80,217 @@ fn init_new_state(abs_path: &Path) -> std::result::Result<FffState, ToolError> {
     })
 }
 
-fn get_or_init_state(path: &str) -> std::result::Result<Arc<FffState>, ToolError> {
-    static CACHE: OnceLock<RwLock<HashMap<PathBuf, Arc<FffState>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+/// A cache of `FffState` keyed by canonicalised search root path.
+///
+/// Wrapping the cache in its own type makes it injectable via `ToolRegistry`
+/// instead of relying on a global `OnceLock` singleton, which improves
+/// testability.
+pub(crate) struct FffStateCache {
+    cache: RwLock<HashMap<PathBuf, Arc<FffState>>>,
+}
 
-    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+impl FffStateCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            cache: RwLock::new(HashMap::new()),
+        }
+    }
 
-    {
-        let guard = cache
+    /// Return an existing `FffState` for the given path, or initialise a new
+    /// one (scanning the file tree) and cache it.
+    pub(crate) fn get_or_init(&self, path: &str) -> std::result::Result<Arc<FffState>, ToolError> {
+        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+
+        {
+            let guard = self
+                .cache
+                .read()
+                .map_err(|e| ToolError::Other(format!("cache lock: {e}")))?;
+            if let Some(state) = guard.get(&abs) {
+                return Ok(state.clone());
+            }
+        }
+
+        let state = Arc::new(init_new_state(&abs)?);
+        self.cache
+            .write()
+            .map_err(|e| ToolError::Other(format!("cache lock: {e}")))?
+            .insert(abs, state.clone());
+        Ok(state)
+    }
+}
+
+pub(crate) struct Fff {
+    cache: Arc<FffStateCache>,
+}
+
+impl Fff {
+    pub(crate) fn new(cache: Arc<FffStateCache>) -> Self {
+        Self { cache }
+    }
+
+    fn execute_inner(
+        &self,
+        arguments_json: &str,
+        cwd: Option<&Path>,
+    ) -> std::result::Result<String, ToolError> {
+        let args: FffArgs = serde_json::from_str(arguments_json)?;
+
+        let path = args.path.as_deref().unwrap_or(".");
+        let resolved = super::resolve_path(path, cwd);
+        let state = self.cache.get_or_init(&resolved.display().to_string())?;
+
+        let guard = state
+            .shared_picker
             .read()
-            .map_err(|e| ToolError::Other(format!("cache lock: {e}")))?;
-        if let Some(state) = guard.get(&abs) {
-            return Ok(state.clone());
-        }
-    }
+            .map_err(|e| ToolError::Other(format!("picker lock error: {e}")))?;
+        let picker = guard.as_ref().ok_or_else(|| {
+            ToolError::Other(
+                "fff picker not yet initialized (scan may still be in progress)".to_string(),
+            )
+        })?;
 
-    let state = Arc::new(init_new_state(&abs)?);
-    cache
-        .write()
-        .map_err(|e| ToolError::Other(format!("cache lock: {e}")))?
-        .insert(abs, state.clone());
-    Ok(state)
-}
+        let mode = args.mode.as_deref().unwrap_or("grep");
+        let max_results = args
+            .max_results
+            .unwrap_or(FFF_DEFAULT_MAX_RESULTS)
+            .min(FFF_MAX_RESULTS_CAP);
 
-define_tool!(
-    Fff,
-    "fff",
-    "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes.",
-    execute_fff_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "Search query. Supports advanced syntax like 'ext:rs my_function' or 'path:src/**'. For file name search, this is a fuzzy pattern."
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["grep", "files"],
-                "description": "Search mode: 'grep' for content search (default), 'files' for file name fuzzy search",
-                "default": "grep"
-            },
-            "path": {
-                "type": "string",
-                "description": "Root path for the search (default: current directory)"
-            },
-            "pattern_type": {
-                "type": "string",
-                "enum": ["plain", "regex", "fuzzy"],
-                "description": "Pattern matching mode for grep: 'plain' (default), 'regex', or 'fuzzy'",
-                "default": "plain"
-            },
-            "max_results": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 100,
-                "default": 50
-            }
-        },
-        "required": ["query"],
-        "additionalProperties": false
-    }),
-    "core"
-);
+        match mode {
+            "files" => {
+                let parser = QueryParser::new(FileSearchConfig);
+                let query = parser.parse(&args.query);
 
-pub(crate) fn execute_fff_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_fff_inner(arguments_json, cwd) {
-        Ok(content) => tool_ok(content),
-        Err(error) => error.into(),
-    }
-}
-
-fn execute_fff_inner(
-    arguments_json: &str,
-    cwd: Option<&std::path::Path>,
-) -> std::result::Result<String, ToolError> {
-    let args: FffArgs = serde_json::from_str(arguments_json)?;
-
-    let path = args.path.as_deref().unwrap_or(".");
-    let resolved = super::resolve_path(path, cwd);
-    let state = get_or_init_state(&resolved.display().to_string())?;
-
-    let guard = state
-        .shared_picker
-        .read()
-        .map_err(|e| ToolError::Other(format!("picker lock error: {e}")))?;
-    let picker = guard.as_ref().ok_or_else(|| {
-        ToolError::Other(
-            "fff picker not yet initialized (scan may still be in progress)".to_string(),
-        )
-    })?;
-
-    let mode = args.mode.as_deref().unwrap_or("grep");
-    let max_results = args
-        .max_results
-        .unwrap_or(FFF_DEFAULT_MAX_RESULTS)
-        .min(FFF_MAX_RESULTS_CAP);
-
-    match mode {
-        "files" => {
-            let parser = QueryParser::new(FileSearchConfig);
-            let query = parser.parse(&args.query);
-
-            let result = picker.fuzzy_search(
-                &query,
-                None,
-                FuzzySearchOptions {
-                    pagination: PaginationArgs {
-                        offset: 0,
-                        limit: max_results,
+                let result = picker.fuzzy_search(
+                    &query,
+                    None,
+                    FuzzySearchOptions {
+                        pagination: PaginationArgs {
+                            offset: 0,
+                            limit: max_results,
+                        },
+                        ..Default::default()
                     },
-                    ..Default::default()
-                },
-            );
+                );
 
-            if result.items.is_empty() {
-                return Ok(String::new());
-            }
-
-            let mut lines: Vec<String> = Vec::with_capacity(result.items.len());
-            for item in &result.items {
-                lines.push(item.relative_path(picker));
-            }
-
-            Ok(truncate_tool_output(&lines.join("\n")))
-        }
-        _ => {
-            let parser = QueryParser::new(AiGrepConfig);
-            let query = parser.parse(&args.query);
-
-            let pattern_type = args.pattern_type.as_deref().unwrap_or("plain");
-            let grep_mode = match pattern_type {
-                "regex" => GrepMode::Regex,
-                "fuzzy" => GrepMode::Fuzzy,
-                _ => GrepMode::PlainText,
-            };
-
-            let result = picker.grep(
-                &query,
-                &GrepSearchOptions {
-                    page_limit: max_results,
-                    mode: grep_mode,
-                    trim_whitespace: true,
-                    ..Default::default()
-                },
-            );
-
-            if result.matches.is_empty() {
-                return Ok(String::new());
-            }
-
-            let mut lines: Vec<String> = Vec::with_capacity(result.matches.len());
-            for m in &result.matches {
-                if let Some(file_item) = result.files.get(m.file_index) {
-                    lines.push(format!(
-                        "{}:{}:{}",
-                        file_item.relative_path(picker),
-                        m.line_number,
-                        m.line_content
-                    ));
+                if result.items.is_empty() {
+                    return Ok(String::new());
                 }
-            }
 
-            Ok(truncate_tool_output(&lines.join("\n")))
+                let mut lines: Vec<String> = Vec::with_capacity(result.items.len());
+                for item in &result.items {
+                    lines.push(item.relative_path(picker));
+                }
+
+                Ok(truncate_tool_output(&lines.join("\n")))
+            }
+            _ => {
+                let parser = QueryParser::new(AiGrepConfig);
+                let query = parser.parse(&args.query);
+
+                let pattern_type = args.pattern_type.as_deref().unwrap_or("plain");
+                let grep_mode = match pattern_type {
+                    "regex" => GrepMode::Regex,
+                    "fuzzy" => GrepMode::Fuzzy,
+                    _ => GrepMode::PlainText,
+                };
+
+                let result = picker.grep(
+                    &query,
+                    &GrepSearchOptions {
+                        page_limit: max_results,
+                        mode: grep_mode,
+                        trim_whitespace: true,
+                        ..Default::default()
+                    },
+                );
+
+                if result.matches.is_empty() {
+                    return Ok(String::new());
+                }
+
+                let mut lines: Vec<String> = Vec::with_capacity(result.matches.len());
+                for m in &result.matches {
+                    if let Some(file_item) = result.files.get(m.file_index) {
+                        lines.push(format!(
+                            "{}:{}:{}",
+                            file_item.relative_path(picker),
+                            m.line_number,
+                            m.line_content
+                        ));
+                    }
+                }
+
+                Ok(truncate_tool_output(&lines.join("\n")))
+            }
+        }
+    }
+}
+
+impl super::Tool for Fff {
+    fn name(&self) -> &'static str {
+        "fff"
+    }
+
+    fn group(&self) -> &'static str {
+        "core"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes."
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query. Supports advanced syntax like 'ext:rs my_function' or 'path:src/**'. For file name search, this is a fuzzy pattern."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["grep", "files"],
+                    "description": "Search mode: 'grep' for content search (default), 'files' for file name fuzzy search",
+                    "default": "grep"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Root path for the search (default: current directory)"
+                },
+                "pattern_type": {
+                    "type": "string",
+                    "enum": ["plain", "regex", "fuzzy"],
+                    "description": "Pattern matching mode for grep: 'plain' (default), 'regex', or 'fuzzy'",
+                    "default": "plain"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 50
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+    }
+
+    fn execute(
+        &self,
+        arguments_json: &str,
+        _x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&Path>,
+    ) -> ToolExecutionOutput {
+        match self.execute_inner(arguments_json, cwd) {
+            Ok(content) => ToolExecutionOutput {
+                result: tool_ok(content),
+                image: None,
+            },
+            Err(error) => ToolExecutionOutput {
+                result: error.into(),
+                image: None,
+            },
         }
     }
 }

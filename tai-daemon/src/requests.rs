@@ -8,8 +8,8 @@ use crate::providers::{
     ChatTurnRequest, InferenceProvider, ReasoningSupport, effective_reasoning_support,
     lookup_provider,
 };
-use crate::sessions::{SessionCommand, SessionMetadata, SessionState};
-use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
+use crate::sessions::{RequestContext, SessionCommand, SessionMetadata, SessionState};
+use crate::tools::{PreparedImage, ToolExecutionOutput, ToolResult};
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -81,8 +81,8 @@ fn refresh_session_context(
     cwd: &Path,
     context_config: &tai_proto::ContextConfig,
 ) {
-    if let Some(old_fp) = session.context_fingerprint
-        && let Some(idx) = session.context_message_index
+    if let Some(old_fp) = session.config.context_fingerprint
+        && let Some(idx) = session.config.context_message_index
         && let Ok(Some(new_bundle)) = context::recheck_context(cwd, context_config, old_fp)
     {
         let new_content = context::assemble_context(&new_bundle);
@@ -94,32 +94,30 @@ fn refresh_session_context(
                 },
             );
         }
-        session.context_fingerprint = Some(new_bundle.fingerprint);
-        session.context_file_paths = new_bundle.files.iter().map(|f| f.path.clone()).collect();
+        session.config.context_fingerprint = Some(new_bundle.fingerprint);
+        session.config.context_file_paths =
+            new_bundle.files.iter().map(|f| f.path.clone()).collect();
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_agent_loop(
     client: &InferenceProvider,
     session: &mut SessionState,
-    session_id: u64,
-    db: &Arc<redb::Database>,
     model: &str,
     request_id: u32,
     cwd: Option<&Path>,
     cancel_rx: &mpsc::Receiver<()>,
-    tool_registry: &Arc<ToolRegistry>,
-    daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
-    max_turns_default: u32,
-    cmd_tx: &std::sync::mpsc::Sender<SessionCommand>,
+    ctx: &RequestContext,
 ) -> io::Result<bool> {
     let mut next_image_id = 1u32;
-    let max_turns = session.max_turns.unwrap_or(max_turns_default);
+    let max_turns = session.config.max_turns.unwrap_or(ctx.max_turns_default);
 
     for turn in 0..max_turns {
-        let mut thinking_effort = session.reasoning_effort.unwrap_or(ThinkingEffort::Off);
-        debug!(session_id, turn, "agent loop turn");
+        let mut thinking_effort = session
+            .config
+            .reasoning_effort
+            .unwrap_or(ThinkingEffort::Off);
+        debug!(session_id = ctx.session_id, turn, "agent loop turn");
         if thinking_effort != ThinkingEffort::Off {
             // Validate that the current model actually supports the requested
             // reasoning effort at inference time.  The set-time check in
@@ -133,31 +131,34 @@ pub(crate) fn run_agent_loop(
             let effective = effective_reasoning_support(model, reasoning_support);
             if effective == ReasoningSupport::None {
                 warn!(
-                    session_id, turn, model,
+                    session_id = ctx.session_id, turn, model,
                     effort = %thinking_effort.as_label(),
                     "model does not support reasoning effort, disabling",
                 );
                 thinking_effort = ThinkingEffort::Off;
             } else {
                 debug!(
-                    session_id, turn,
+                    session_id = ctx.session_id, turn,
                     effort = %thinking_effort.as_label(),
                     "reasoning effort active in agent loop",
                 );
             }
         }
         crate::metrics::record_turn(model);
-        let tools = tool_registry.available_definitions(&session.active_tool_groups);
+        let tools = ctx
+            .tool_registry
+            .available_definitions(&session.config.active_tool_groups);
         if is_cancelled(cancel_rx, &mut false) {
             return Ok(true);
         }
 
-        if let Some(session_cwd) = session.cwd.clone() {
-            let context_config = session.context_config.clone();
+        if let Some(session_cwd) = session.config.cwd.clone() {
+            let context_config = session.config.context_config.clone();
             refresh_session_context(session, &session_cwd, &context_config);
         }
 
-        if cmd_tx
+        if ctx
+            .cmd_tx
             .send(SessionCommand::StatusChanged(SessionStatus::Inference))
             .is_err()
         {
@@ -170,7 +171,7 @@ pub(crate) fn run_agent_loop(
         // through the session command channel so the TUI can display the
         // retry progress and the user can cancel during backoff.
         let mut retry_cb: Option<crate::openai::RetryCallback> = Some(Box::new({
-            let cmd_tx = cmd_tx.clone();
+            let cmd_tx = ctx.cmd_tx.clone();
             move |attempt, max_attempts, delay| {
                 let _ = cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Retrying {
                     attempt,
@@ -194,17 +195,19 @@ pub(crate) fn run_agent_loop(
                     CompletionChunkKind::Answer => OutputStream::Answer,
                     CompletionChunkKind::Reasoning => OutputStream::Reasoning,
                 };
-                let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::OutputChunk {
-                    request_id,
-                    stream,
-                    data: text.into_bytes(),
-                }));
+                let _ = ctx
+                    .cmd_tx
+                    .send(SessionCommand::Broadcast(DaemonMessage::OutputChunk {
+                        request_id,
+                        stream,
+                        data: text.into_bytes(),
+                    }));
                 Ok(())
             },
         ) {
             Ok(ChatTurnResult::FinalText(final_text)) => {
                 debug!(
-                    session_id,
+                    session_id = ctx.session_id,
                     turn,
                     response_len = final_text.content.len(),
                     reasoning = final_text.reasoning.as_deref().unwrap_or_default(),
@@ -214,17 +217,17 @@ pub(crate) fn run_agent_loop(
                 let token_usage = final_text.usage;
                 // Accumulate into session-level total.
                 if let Some(ref u) = token_usage {
-                    session.accumulated_usage.input_tokens += u.input_tokens;
-                    session.accumulated_usage.output_tokens += u.output_tokens;
-                    session.accumulated_usage.total_tokens += u.total_tokens;
+                    session.config.accumulated_usage.input_tokens += u.input_tokens;
+                    session.config.accumulated_usage.output_tokens += u.output_tokens;
+                    session.config.accumulated_usage.total_tokens += u.total_tokens;
                     debug!(
-                        session_id,
+                        session_id = ctx.session_id,
                         turn,
                         input_tokens = u.input_tokens,
                         output_tokens = u.output_tokens,
                         total_tokens = u.total_tokens,
-                        accumulated_input = session.accumulated_usage.input_tokens,
-                        accumulated_output = session.accumulated_usage.output_tokens,
+                        accumulated_input = session.config.accumulated_usage.input_tokens,
+                        accumulated_output = session.config.accumulated_usage.output_tokens,
                         "accumulated token usage after FinalText"
                     );
                 }
@@ -234,41 +237,42 @@ pub(crate) fn run_agent_loop(
                     token_usage,
                 };
                 let idx = session.push_message(msg.clone());
-                if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
-                    tracing::warn!(session_id, error = %e, "failed to persist assistant text");
+                if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, idx, &msg) {
+                    tracing::warn!(session_id = ctx.session_id, error = %e, "failed to persist assistant text");
                 }
                 return Ok(false);
             }
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 let token_usage = tool_use.usage.clone();
                 if let Some(ref u) = token_usage {
-                    session.accumulated_usage.input_tokens += u.input_tokens;
-                    session.accumulated_usage.output_tokens += u.output_tokens;
-                    session.accumulated_usage.total_tokens += u.total_tokens;
+                    session.config.accumulated_usage.input_tokens += u.input_tokens;
+                    session.config.accumulated_usage.output_tokens += u.output_tokens;
+                    session.config.accumulated_usage.total_tokens += u.total_tokens;
                     debug!(
-                        session_id,
+                        session_id = ctx.session_id,
                         turn,
                         input_tokens = u.input_tokens,
                         output_tokens = u.output_tokens,
                         total_tokens = u.total_tokens,
-                        accumulated_input = session.accumulated_usage.input_tokens,
-                        accumulated_output = session.accumulated_usage.output_tokens,
+                        accumulated_input = session.config.accumulated_usage.input_tokens,
+                        accumulated_output = session.config.accumulated_usage.output_tokens,
                         "accumulated token usage after ToolUse"
                     );
                 }
-                persist_assistant_tool_use_sync(session, session_id, db, &tool_use, token_usage);
+                persist_assistant_tool_use_sync(session, &tool_use, token_usage, ctx);
                 for tool_call in tool_use.tool_calls {
                     if is_cancelled(cancel_rx, &mut false) {
                         return Ok(true);
                     }
 
-                    let _ =
-                        cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::ToolCallStarted {
+                    let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                        DaemonMessage::ToolCallStarted {
                             request_id,
                             call_id: tool_call.id.clone(),
                             tool_name: tool_call.name.clone(),
                             arguments_json: tool_call.arguments_json.clone(),
-                        }));
+                        },
+                    ));
 
                     let tool_timeout = if tool_call.name == "spawn_subsession" {
                         Duration::from_secs(120)
@@ -282,7 +286,8 @@ pub(crate) fn run_agent_loop(
                         Duration::from_secs(60)
                     };
 
-                    if cmd_tx
+                    if ctx
+                        .cmd_tx
                         .send(SessionCommand::StatusChanged(SessionStatus::ToolCall(
                             tool_call.name.clone(),
                         )))
@@ -292,7 +297,7 @@ pub(crate) fn run_agent_loop(
                     }
 
                     debug!(
-                        session_id,
+                        session_id = ctx.session_id,
                         turn,
                         tool_name = %tool_call.name,
                         tool_call_id = %tool_call.id,
@@ -302,26 +307,21 @@ pub(crate) fn run_agent_loop(
 
                     let tool_start = std::time::Instant::now();
                     let mut output = execute_tool_with_timeout(
-                        tool_registry,
                         &tool_call,
                         None,
                         cwd,
                         tool_timeout,
                         request_id,
-                        daemon_tx,
                         client,
-                        db,
                         session,
-                        session_id,
                         model,
-                        max_turns_default,
                         cancel_rx,
-                        cmd_tx,
+                        ctx,
                     );
 
                     let elapsed = tool_start.elapsed();
                     debug!(
-                        session_id,
+                        session_id = ctx.session_id,
                         turn,
                         tool_name = %tool_call.name,
                         tool_call_id = %tool_call.id,
@@ -332,14 +332,12 @@ pub(crate) fn run_agent_loop(
                     );
 
                     finish_tool_call(
-                        cmd_tx,
                         request_id,
                         session,
-                        session_id,
-                        db,
                         &tool_call,
                         &mut output,
                         &mut next_image_id,
+                        ctx,
                     );
                 }
             }
@@ -358,22 +356,19 @@ pub(crate) fn run_agent_loop(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finish_tool_call(
-    cmd_tx: &mpsc::Sender<SessionCommand>,
     request_id: u32,
     session: &mut SessionState,
-    session_id: u64,
-    db: &redb::Database,
     tool_call: &ChatToolCall,
     output: &mut ToolExecutionOutput,
     next_image_id: &mut u32,
+    ctx: &RequestContext,
 ) {
     if let Some(hint) = context::subdirectory_hints(
         &tool_call.name,
         &tool_call.arguments_json,
-        session.cwd.as_deref(),
-        &session.context_file_paths,
+        session.config.cwd.as_deref(),
+        &session.config.context_file_paths,
     ) {
         output.result.content = format!("{}\n\n---\n{}", output.result.content, hint);
     }
@@ -388,7 +383,7 @@ fn finish_tool_call(
         } = image;
 
         emit_prepared_image_sync(
-            cmd_tx,
+            &ctx.cmd_tx,
             request_id,
             *next_image_id,
             PreparedImage {
@@ -413,9 +408,9 @@ fn finish_tool_call(
             data,
         });
         let img_idx = session.messages().len() as u32;
-        if let Err(e) = write_message_retry(db, session_id, img_idx, &persisted) {
+        if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, img_idx, &persisted) {
             tracing::warn!(
-                session_id, error = %e,
+                session_id = ctx.session_id, error = %e,
                 "failed to persist displayed image",
             );
         }
@@ -429,9 +424,9 @@ fn finish_tool_call(
         is_error: output.result.is_error,
     };
     let idx = session.push_message(msg.clone());
-    if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
+    if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, idx, &msg) {
         tracing::warn!(
-            session_id, tool_name = %tool_call.name, error = %e,
+            session_id = ctx.session_id, tool_name = %tool_call.name, error = %e,
             "failed to persist tool result",
         );
     }
@@ -451,26 +446,21 @@ fn finish_tool_call(
             output: output.result.content.clone(),
         }
     };
-    let _ = cmd_tx.send(SessionCommand::Broadcast(event));
+    let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(event));
 }
 
 #[allow(clippy::too_many_arguments)]
 fn execute_tool_with_timeout(
-    tool_registry: &Arc<ToolRegistry>,
     tool_call: &crate::openai::ChatToolCall,
     x_credentials: Option<&ServiceCredential>,
     cwd: Option<&Path>,
     timeout_dur: Duration,
     request_id: u32,
-    daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
     client: &InferenceProvider,
-    db: &redb::Database,
     session: &mut SessionState,
-    session_id: u64,
     model: &str,
-    max_turns_default: u32,
     cancel_rx: &mpsc::Receiver<()>,
-    cmd_tx: &mpsc::Sender<SessionCommand>,
+    ctx: &RequestContext,
 ) -> ToolExecutionOutput {
     // Capture start time for tool execution metrics.
     // Admin tools (list_sessions, get_session, spawn_subsession, load_skill,
@@ -479,24 +469,14 @@ fn execute_tool_with_timeout(
     let exec_start = std::time::Instant::now();
     match tool_call.name.as_str() {
         "list_sessions" => {
-            return execute_list_sessions_sync(daemon_tx);
+            return execute_list_sessions_sync(&ctx.daemon_tx);
         }
         "get_session" => {
-            return execute_get_session_sync(daemon_tx, &tool_call.arguments_json);
+            return execute_get_session_sync(&ctx.daemon_tx, &tool_call.arguments_json);
         }
         "spawn_subsession" => {
             return execute_spawn_subsession_sync(
-                client,
-                daemon_tx,
-                session,
-                session_id,
-                db,
-                model,
-                tool_call,
-                None,
-                cwd,
-                max_turns_default,
-                cancel_rx,
+                client, session, model, tool_call, None, cwd, cancel_rx, ctx,
             );
         }
         "load_skill" => {
@@ -504,13 +484,15 @@ fn execute_tool_with_timeout(
         }
         "load_tools" => {
             let result = crate::tools::groups::execute_load_tools(
-                &mut session.active_tool_groups,
+                &mut session.config.active_tool_groups,
                 &tool_call.arguments_json,
             );
-            let _ = daemon_tx.send(crate::daemon::DaemonCommand::UpdateMetadata {
-                session_id,
-                metadata: SessionMetadata::from(&*session),
-            });
+            let _ = ctx
+                .daemon_tx
+                .send(crate::daemon::DaemonCommand::UpdateMetadata {
+                    session_id: ctx.session_id,
+                    metadata: SessionMetadata::from(&*session),
+                });
             return ToolExecutionOutput {
                 result: ToolResult {
                     content: result,
@@ -521,13 +503,15 @@ fn execute_tool_with_timeout(
         }
         "unload_tools" => {
             let result = crate::tools::groups::execute_unload_tools(
-                &mut session.active_tool_groups,
+                &mut session.config.active_tool_groups,
                 &tool_call.arguments_json,
             );
-            let _ = daemon_tx.send(crate::daemon::DaemonCommand::UpdateMetadata {
-                session_id,
-                metadata: SessionMetadata::from(&*session),
-            });
+            let _ = ctx
+                .daemon_tx
+                .send(crate::daemon::DaemonCommand::UpdateMetadata {
+                    session_id: ctx.session_id,
+                    metadata: SessionMetadata::from(&*session),
+                });
             return ToolExecutionOutput {
                 result: ToolResult {
                     content: result,
@@ -544,7 +528,7 @@ fn execute_tool_with_timeout(
 
     // Forward streaming output to subscribers as it arrives (event-driven,
     // blocks on the channel — no polling).
-    let fwd_cmd_tx = cmd_tx.clone();
+    let fwd_cmd_tx = ctx.cmd_tx.clone();
     let fwd_request_id = request_id;
     let fwd_call_id = tool_call.id.clone();
     std::thread::spawn(move || {
@@ -564,7 +548,7 @@ fn execute_tool_with_timeout(
 
     // Tool execution thread
     let tc = tool_call.clone();
-    let tr = Arc::clone(tool_registry);
+    let tr = Arc::clone(&ctx.tool_registry);
     let xc = x_credentials.cloned();
     let c = cwd.map(|p| p.to_path_buf());
     std::thread::spawn(move || {
@@ -759,16 +743,13 @@ fn execute_get_session_sync(
 #[allow(clippy::too_many_arguments)]
 fn execute_spawn_subsession_sync(
     _client: &InferenceProvider,
-    daemon_tx: &mpsc::Sender<crate::daemon::DaemonCommand>,
     parent_session: &SessionState,
-    parent_session_id: u64,
-    _db: &redb::Database,
     _model: &str,
     tool_call: &crate::openai::ChatToolCall,
     _x_credentials: Option<&ServiceCredential>,
     cwd: Option<&Path>,
-    _max_turns_default: u32,
     cancel_rx: &mpsc::Receiver<()>,
+    ctx: &RequestContext,
 ) -> ToolExecutionOutput {
     // Note: The child session does not inherit the parent's `reasoning_effort`
     // because the `CreateSession` daemon command has no field for it. The child
@@ -776,10 +757,10 @@ fn execute_spawn_subsession_sync(
     // the `/reasoning` command. Properly threading this through requires adding
     // a `reasoning_effort` field to `DaemonCommand::CreateSession` and plumbing
     // it through `session_main()`.
-    if parent_session.reasoning_effort != Some(ThinkingEffort::Off) {
+    if parent_session.config.reasoning_effort != Some(ThinkingEffort::Off) {
         debug!(
-            parent_session_id,
-            effort = ?parent_session.reasoning_effort,
+            parent_session_id = ctx.session_id,
+            effort = ?parent_session.config.reasoning_effort,
             "spawn_subsession: parent has non-default reasoning effort; child will use default",
         );
     }
@@ -827,19 +808,28 @@ fn execute_spawn_subsession_sync(
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect()
         })
-        .unwrap_or_else(|| parent_session.active_tool_groups.iter().cloned().collect());
+        .unwrap_or_else(|| {
+            parent_session
+                .config
+                .active_tool_groups
+                .iter()
+                .cloned()
+                .collect()
+        });
 
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    let _ = daemon_tx.send(crate::daemon::DaemonCommand::CreateSession {
-        title,
-        parent_session_id: Some(parent_session_id),
-        cwd: child_cwd.clone(),
-        max_turns,
-        context_config: None,
-        account_name: None,
-        active_tool_groups: categories,
-        reply: reply_tx,
-    });
+    let _ = ctx
+        .daemon_tx
+        .send(crate::daemon::DaemonCommand::CreateSession {
+            title,
+            parent_session_id: Some(ctx.session_id),
+            cwd: child_cwd.clone(),
+            max_turns,
+            context_config: None,
+            account_name: None,
+            active_tool_groups: categories,
+            reply: reply_tx,
+        });
 
     match reply_rx.recv() {
         Ok(Ok((child_id, child_tx))) => {
@@ -850,7 +840,6 @@ fn execute_spawn_subsession_sync(
             let (result_tx, result_rx) = std::sync::mpsc::channel();
             let _ = child_tx.send(crate::sessions::SessionCommand::RunChildInput {
                 request_id: 1,
-                input_tokens: Vec::new(),
                 reply: result_tx,
             });
             let mut was_cancelled = false;
@@ -982,10 +971,9 @@ fn execute_load_skill_sync(
 
 fn persist_assistant_tool_use_sync(
     session: &mut SessionState,
-    session_id: u64,
-    db: &Arc<redb::Database>,
     tool_use: &ChatAssistantToolUse,
     token_usage: Option<TokenUsage>,
+    ctx: &RequestContext,
 ) {
     let msg = SessionMessage::AssistantToolUse {
         content: tool_use.content.clone(),
@@ -1002,8 +990,8 @@ fn persist_assistant_tool_use_sync(
         token_usage,
     };
     let idx = session.push_message(msg.clone());
-    if let Err(e) = write_message_retry(db, session_id, idx, &msg) {
-        tracing::warn!(session_id, error = %e, "failed to persist assistant tool use");
+    if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, idx, &msg) {
+        tracing::warn!(session_id = ctx.session_id, error = %e, "failed to persist assistant tool use");
     }
 }
 
@@ -1082,7 +1070,7 @@ pub const REQUEST_IMAGE_HEIGHT: u32 = 640;
 mod tests {
     use super::*;
     use crate::daemon::DaemonCommand;
-    use crate::tools::Tool;
+    use crate::tools::{Tool, ToolRegistry};
     use std::sync::mpsc;
     use tai_proto::SessionSummary;
 
@@ -1535,22 +1523,25 @@ mod tests {
             arguments_json: tool_args.into(),
         };
 
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db: Arc::new(db),
+            tool_registry: registry,
+            daemon_tx,
+            max_turns_default: 25,
+        };
         let result = execute_tool_with_timeout(
-            &registry,
             &tool_call,
             None, // x_credentials
             None, // cwd
             timeout_dur,
             1, // request_id
-            &daemon_tx,
             &client,
-            &db,
             &mut session,
-            1, // session_id
             "test-model",
-            25, // max_turns_default
             &cancel_rx,
-            &cmd_tx,
+            &ctx,
         );
         (result, cmd_rx)
     }

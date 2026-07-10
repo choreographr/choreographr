@@ -134,6 +134,7 @@ pub const GROUPS: &[ToolGroup] = &[
 
 pub struct ToolRegistry {
     tools: HashMap<&'static str, Box<dyn Tool>>,
+    fff_cache: Arc<fff::FffStateCache>,
 }
 
 impl Default for ToolRegistry {
@@ -146,6 +147,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
             tools: HashMap::new(),
+            fff_cache: Arc::new(fff::FffStateCache::new()),
         };
         reg.register(fs::ReadFile);
         reg.register(fs::ReadFileRange);
@@ -175,7 +177,7 @@ impl ToolRegistry {
             reg.register(fish::FishShell);
         }
         reg.register(exec::Exec);
-        reg.register(fff::Fff);
+        reg.register(fff::Fff::new(Arc::clone(&reg.fff_cache)));
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);
         reg.register(x::XUserLookup);

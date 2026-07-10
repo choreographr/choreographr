@@ -1,7 +1,9 @@
 use crate::accounts::{AccountConfig, AccountManager, accounts_config_path};
 use crate::db::{self, SessionRecord};
 use crate::providers::InferenceProvider;
-use crate::sessions::{ActiveSessionEntry, SessionCommand, SessionMetadata, session_main};
+use crate::sessions::{
+    ActiveSessionEntry, RequestContext, SessionCommand, SessionMetadata, session_main,
+};
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::UnixStream;
@@ -144,292 +146,55 @@ impl DaemonState {
                 account_name,
                 active_tool_groups,
                 reply,
-            } => {
-                // A session is just a conversation container — it can be
-                // created regardless of whether the daemon is locked.
-                // Credentials are only needed when running models (RunInput).
-                // The daemon may be locked, but the user can still browse,
-                // create, and delete sessions freely.
-                let sid = self.next_session_id;
-                self.next_session_id += 1;
-                info!("CreateSession: id={}, title={:?}", sid, title);
-
-                let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
-                let active_cats = if active_tool_groups.is_empty() {
-                    vec!["core".into(), "git".into(), "shell".into()]
-                } else {
-                    active_tool_groups.clone()
-                };
-                let record = SessionRecord {
-                    title: title.clone(),
-                    selected_model: None,
-                    reasoning_effort: None,
-                    parent_session_id,
-                    cwd: cwd_str.clone(),
-                    max_turns,
-                    message_count: 0,
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64,
-                    active_tool_groups: active_cats.clone(),
-                    context_config: context_config.clone().unwrap_or_default(),
-                    account_name: account_name.clone(),
-                    accumulated_usage: TokenUsage::default(),
-                };
-
-                if let Err(e) = db::write_session(&self.db, sid, &record) {
-                    error!("CreateSession: failed to persist session {}: {e}", sid);
-                }
-
-                let metadata = SessionMetadata {
-                    title: title.clone(),
-                    selected_model: None,
-                    reasoning_effort: None,
-                    parent_session_id,
-                    cwd: cwd_str.clone(),
-                    created_at: record.created_at,
-                    message_count: 0,
-                    max_turns,
-                    status: SessionStatus::Inactive,
-                    active_tool_groups: active_cats.clone(),
-                    account_name: account_name.clone(),
-                    accumulated_usage: TokenUsage::default(),
-                };
-                let session_tx = self.spawn_session(sid, record, metadata);
-
-                let _ = reply.send(Ok((sid, session_tx)));
-                crate::metrics::record_session_created();
-                let created_msg = DaemonMessage::SessionCreated {
-                    session_id: sid,
-                    title,
-                    parent_session_id,
-                    cwd: cwd_str,
-                    max_turns,
-                };
-                let status_msg = DaemonMessage::SessionStatusChanged {
-                    session_id: sid,
-                    status: SessionStatus::Inactive,
-                };
-                self.broadcast(created_msg);
-                self.broadcast(status_msg);
-            }
+            } => self.handle_create_session(
+                title,
+                parent_session_id,
+                cwd,
+                max_turns,
+                context_config,
+                account_name,
+                active_tool_groups,
+                reply,
+            ),
             DaemonCommand::AttachSession { session_id, reply } => {
-                debug!("AttachSession: id={}", session_id);
-                // Attaching to a session is allowed regardless of lock state.
-                // Credentials are only needed to run models (RunInput), not
-                // to browse or attach to existing sessions.
-                match self.active_sessions.get(&session_id) {
-                    Some(entry) => {
-                        let _ = reply.send(Ok(entry.cmd_tx.clone()));
-                    }
-                    None => match db::read_session(&self.db, session_id) {
-                        Ok(Some(record)) => {
-                            let mut metadata: SessionMetadata = record.clone().into();
-                            metadata.status = SessionStatus::Inactive;
-                            let session_tx = self.spawn_session(session_id, record, metadata);
-                            info!("AttachSession: loaded session {} from db", session_id);
-                            let _ = reply.send(Ok(session_tx));
-                        }
-                        Ok(None) => {
-                            let _ = reply.send(Err(io::Error::new(
-                                io::ErrorKind::NotFound,
-                                "session not found",
-                            )));
-                        }
-                        Err(e) => {
-                            let _ = reply.send(Err(e));
-                        }
-                    },
-                }
+                self.handle_attach_session(session_id, reply)
             }
-            DaemonCommand::ListSessions { reply } => {
-                let mut summaries: Vec<SessionSummary> = self
-                    .session_metadata
-                    .iter()
-                    .map(|(id, meta)| SessionSummary {
-                        session_id: *id,
-                        title: meta.title.clone(),
-                        selected_model: meta.selected_model.clone(),
-                        reasoning_effort: meta.reasoning_effort,
-                        parent_session_id: meta.parent_session_id,
-                        cwd: meta.cwd.clone(),
-                        created_at: meta.created_at,
-                        message_count: meta.message_count,
-                        max_turns: meta.max_turns,
-                        status: meta.status.clone(),
-                        active_tool_groups: meta.active_tool_groups.clone(),
-                        account_name: meta.account_name.clone(),
-                        token_usage: Some(meta.accumulated_usage.clone()),
-                    })
-                    .collect();
-
-                summaries.sort_by_key(|s| s.session_id);
-                let _ = reply.send(summaries);
-            }
+            DaemonCommand::ListSessions { reply } => self.handle_list_sessions(reply),
             DaemonCommand::GetSession { session_id, reply } => {
-                let summary = self
-                    .session_metadata
-                    .get(&session_id)
-                    .map(|meta| SessionSummary {
-                        session_id,
-                        title: meta.title.clone(),
-                        selected_model: meta.selected_model.clone(),
-                        reasoning_effort: meta.reasoning_effort,
-                        parent_session_id: meta.parent_session_id,
-                        cwd: meta.cwd.clone(),
-                        created_at: meta.created_at,
-                        message_count: meta.message_count,
-                        max_turns: meta.max_turns,
-                        status: meta.status.clone(),
-                        active_tool_groups: meta.active_tool_groups.clone(),
-                        account_name: meta.account_name.clone(),
-                        token_usage: Some(meta.accumulated_usage.clone()),
-                    });
-                let _ = reply.send(summary);
+                self.handle_get_session(session_id, reply)
             }
             DaemonCommand::UpdateMetadata {
                 session_id,
                 metadata,
-            } => {
-                debug!(
-                    "UpdateMetadata: id={}, model={:?}",
-                    session_id, metadata.selected_model
-                );
-                self.session_metadata.insert(session_id, metadata);
-            }
-            DaemonCommand::SessionExited { session_id } => {
-                info!("SessionExited: id={}", session_id);
-                crate::metrics::record_session_exited();
-                self.active_sessions.remove(&session_id);
-                if let Some(meta) = self.session_metadata.get_mut(&session_id) {
-                    meta.status = SessionStatus::Sleeping;
-                }
-                let msg = DaemonMessage::SessionStatusChanged {
-                    session_id,
-                    status: SessionStatus::Sleeping,
-                };
-                self.broadcast(msg);
-            }
-            DaemonCommand::Unlock { private_key, reply } => {
-                info!("Unlock attempt");
-                let result = handle_unlock_inner(self, private_key);
-                info!("Unlock result: success={}", result.is_ok());
-                let _ = reply.send(result);
-            }
+            } => self.handle_update_metadata(session_id, metadata),
+            DaemonCommand::SessionExited { session_id } => self.handle_session_exited(session_id),
+            DaemonCommand::Unlock { private_key, reply } => self.handle_unlock(private_key, reply),
             DaemonCommand::SaveCredential {
                 service,
                 encrypted_blob,
                 unlock_key,
                 reply,
-            } => {
-                // Write to DB
-                if let Err(e) = db::set_credential_blob(&self.db, &service, &encrypted_blob) {
-                    let _ = reply.send(Err(format!("failed to save credential: {e}")));
-                    return;
-                }
-                // Optionally decrypt into memory
-                if let Some(mut uk) = unlock_key {
-                    let key: [u8; 32] = match uk.as_slice().try_into() {
-                        Ok(k) => k,
-                        Err(_) => {
-                            uk.zeroize();
-                            let _ = reply.send(Ok(()));
-                            return;
-                        }
-                    };
-                    uk.zeroize();
-                    if let Ok(plaintext) =
-                        tai_keystore::crypto::decrypt_with_private_key(&key, &encrypted_blob)
-                        && let Ok((cred, _)) =
-                            bincode::serde::decode_from_slice::<ServiceCredential, _>(
-                                &plaintext,
-                                bincode::config::standard(),
-                            )
-                    {
-                        // Update in-memory state
-                        if matches!(&cred, ServiceCredential::X { .. }) && service == "twitter" {
-                            self.x_credentials = Some(cred.clone());
-                        }
-                        self.credentials.insert(service.clone(), cred.clone());
-                        // Resolve provider for any account matching this service name
-                        if let ServiceCredential::ApiKey { key: api_key } = &cred
-                            && let Some(config) = self.accounts.get(&service)
-                            && let Ok(provider) = InferenceProvider::from_account_config(
-                                config,
-                                Some(api_key.clone()),
-                            )
-                        {
-                            self.providers.insert(service.clone(), provider);
-                        }
-                    }
-                }
-                let _ = reply.send(Ok(()));
-            }
+            } => self.handle_save_credential(service, encrypted_blob, unlock_key, reply),
             DaemonCommand::RemoveCredentialCmd { service, reply } => {
-                // Remove from DB
-                if let Err(e) = db::remove_credential_blob(&self.db, &service) {
-                    let _ = reply.send(Err(format!("failed to remove credential: {e}")));
-                    return;
-                }
-                // Remove from in-memory state
-                self.credentials.remove(&service);
-                self.providers.remove(&service);
-                if service == "twitter" {
-                    self.x_credentials = None;
-                }
-                let _ = reply.send(Ok(()));
+                self.handle_remove_credential(service, reply)
             }
             DaemonCommand::ListModels { session_id, reply } => {
-                debug!("ListModels: session_id={:?}", session_id);
-                let result = handle_list_models_inner(self, session_id);
-                let _ = reply.send(result);
+                self.handle_list_models(session_id, reply)
             }
             DaemonCommand::GetCredential { service, reply } => {
-                let key = self.credentials.get(&service).and_then(|c| match c {
-                    ServiceCredential::ApiKey { key } => Some(key.clone()),
-                    _ => None,
-                });
-                let _ = reply.send(key);
+                self.handle_get_credential(service, reply)
             }
             DaemonCommand::RegisterSummarySubscriber { client_id, writer } => {
-                self.summary_subscribers.insert(client_id, writer);
+                self.handle_register_summary_subscriber(client_id, writer)
             }
             DaemonCommand::UnregisterSummarySubscriber { client_id } => {
-                self.summary_subscribers.remove(&client_id);
+                self.handle_unregister_summary_subscriber(client_id)
             }
             DaemonCommand::BroadcastSessionStatus { session_id, status } => {
-                let msg = DaemonMessage::SessionStatusChanged { session_id, status };
-                self.broadcast(msg);
+                self.handle_broadcast_session_status(session_id, status)
             }
             DaemonCommand::DeleteSession { session_id, reply } => {
-                info!("DeleteSession: id={}", session_id);
-                if let Err(e) = self.ensure_unlocked() {
-                    let _ = reply.send(Err(e));
-                    return;
-                }
-                // Gracefully shut down the session thread so it can persist its
-                // final state before we delete from the DB — otherwise the
-                // session's persist_and_exit would re-write the session
-                // back to the DB after we delete it.
-                if let Some(entry) = self.active_sessions.remove(&session_id) {
-                    let _ = entry.cmd_tx.send(SessionCommand::Shutdown);
-                    let _ = entry.handle.join();
-                }
-                // Remove from in-memory metadata
-                self.session_metadata.remove(&session_id);
-                // Remove from database
-                if let Err(e) = db::delete_session(&self.db, session_id) {
-                    error!(
-                        "DeleteSession: failed to delete session {} from db: {e}",
-                        session_id
-                    );
-                    let _ = reply.send(Err(e));
-                    return;
-                }
-                // Broadcast deletion to subscribers
-                self.broadcast(DaemonMessage::SessionDeleted { session_id });
-                let _ = reply.send(Ok(()));
+                self.handle_delete_session(session_id, reply)
             }
             DaemonCommand::AddAccountCmd {
                 name,
@@ -440,72 +205,27 @@ impl DaemonState {
                 connect_timeout_secs,
                 request_timeout_secs,
                 reply,
-            } => {
-                let config = AccountConfig {
-                    name: name.clone(),
-                    provider: provider.clone(),
-                    base_url,
-                    streaming,
-                    retry_max_attempts,
-                    connect_timeout_secs,
-                    request_timeout_secs,
-                };
-                let result = self.accounts.add(config);
-                match &result {
-                    Ok(()) => info!(
-                        account = %name,
-                        provider = %provider,
-                        "added inference account"
-                    ),
-                    Err(e) => error!(
-                        account = %name,
-                        provider = %provider,
-                        error = %e,
-                        "failed to add inference account"
-                    ),
-                }
-                // If account was added and there's a matching credential,
-                // resolve the provider immediately.
-                if result.is_ok()
-                    && let Some(ServiceCredential::ApiKey { key }) = self.credentials.get(&name)
-                {
-                    self.resolve_account_provider(&name, Some(key.clone()));
-                }
-                let _ = reply.send(result);
-            }
+            } => self.handle_add_account(
+                name,
+                provider,
+                base_url,
+                streaming,
+                retry_max_attempts,
+                connect_timeout_secs,
+                request_timeout_secs,
+                reply,
+            ),
             DaemonCommand::RemoveAccountCmd { name, reply } => {
-                let result = self.accounts.remove(&name);
-                match &result {
-                    Ok(()) => info!(account = %name, "removed inference account"),
-                    Err(e) => {
-                        error!(account = %name, error = %e, "failed to remove inference account")
-                    }
-                }
-                if result.is_ok() {
-                    self.providers.remove(&name);
-                }
-                let _ = reply.send(result);
+                self.handle_remove_account(name, reply)
             }
-            DaemonCommand::ListAccountsCmd { reply } => {
-                // Collect the set of account names that have credentials
-                // (either decrypted in memory or stored as encrypted blobs
-                // in the DB) so the TUI can show whether each account has
-                // had a credential supplied, regardless of unlock state.
-                let mut credentialed: std::collections::HashSet<String> =
-                    self.credentials.keys().cloned().collect();
-                // Also check the DB for stored-but-not-yet-decrypted blobs.
-                if let Ok(blobs) = db::get_all_credential_blobs(&self.db) {
-                    credentialed.extend(blobs.into_keys());
-                }
-                let _ = reply.send(Ok(self.accounts.list(&credentialed)));
-            }
+            DaemonCommand::ListAccountsCmd { reply } => self.handle_list_accounts(reply),
             DaemonCommand::ResolveProviderCmd { account, reply } => {
-                let _ = reply.send(self.providers.get(&account).cloned());
+                self.handle_resolve_provider(account, reply)
             }
-            DaemonCommand::AccountExists { name, reply } => {
-                let _ = reply.send(self.accounts.contains(&name));
+            DaemonCommand::AccountExists { name, reply } => self.handle_account_exists(name, reply),
+            DaemonCommand::Shutdown => {
+                warn!("unexpected Shutdown command in handle_command; handled at loop level");
             }
-            DaemonCommand::Shutdown => unreachable!("handled by command loop"),
         }
     }
 
@@ -541,16 +261,18 @@ impl DaemonState {
 
         let handle = thread::spawn(move || {
             session_main(
-                cmd_tx,
                 session_rx,
-                session_id,
-                db,
                 provider,
                 account_name,
-                tool_registry,
-                daemon_tx,
                 Some(record),
-                max_turns_default,
+                RequestContext {
+                    cmd_tx,
+                    session_id,
+                    db,
+                    tool_registry,
+                    daemon_tx,
+                    max_turns_default,
+                },
             );
         });
 
@@ -580,17 +302,467 @@ impl DaemonState {
         self.summary_subscribers
             .retain(|_id, tx| tx.send(msg.clone()).is_ok());
     }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Create a new session. Sessions are lightweight containers that can be
+    /// created regardless of lock state.
+    fn handle_create_session(
+        &mut self,
+        title: Option<String>,
+        parent_session_id: Option<u64>,
+        cwd: Option<PathBuf>,
+        max_turns: Option<u32>,
+        context_config: Option<ContextConfig>,
+        account_name: Option<String>,
+        active_tool_groups: Vec<String>,
+        reply: std::sync::mpsc::Sender<io::Result<(u64, std::sync::mpsc::Sender<SessionCommand>)>>,
+    ) {
+        // A session is just a conversation container — it can be
+        // created regardless of whether the daemon is locked.
+        // Credentials are only needed when running models (RunInput).
+        // The daemon may be locked, but the user can still browse,
+        // create, and delete sessions freely.
+        let sid = self.next_session_id;
+        self.next_session_id += 1;
+        info!("CreateSession: id={}, title={:?}", sid, title);
+
+        let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
+        let active_cats = if active_tool_groups.is_empty() {
+            vec!["core".into(), "git".into(), "shell".into()]
+        } else {
+            active_tool_groups.clone()
+        };
+        let record = SessionRecord {
+            title: title.clone(),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id,
+            cwd: cwd_str.clone(),
+            max_turns,
+            message_count: 0,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            active_tool_groups: active_cats.clone(),
+            context_config: context_config.clone().unwrap_or_default(),
+            account_name: account_name.clone(),
+            accumulated_usage: TokenUsage::default(),
+        };
+
+        if let Err(e) = db::write_session(&self.db, sid, &record) {
+            error!("CreateSession: failed to persist session {}: {e}", sid);
+        }
+
+        let metadata = SessionMetadata {
+            title: title.clone(),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id,
+            cwd: cwd_str.clone(),
+            created_at: record.created_at,
+            message_count: 0,
+            max_turns,
+            status: SessionStatus::Inactive,
+            active_tool_groups: active_cats.clone(),
+            account_name: account_name.clone(),
+            accumulated_usage: TokenUsage::default(),
+        };
+        let session_tx = self.spawn_session(sid, record, metadata);
+
+        let _ = reply.send(Ok((sid, session_tx)));
+        crate::metrics::record_session_created();
+        let created_msg = DaemonMessage::SessionCreated {
+            session_id: sid,
+            title,
+            parent_session_id,
+            cwd: cwd_str,
+            max_turns,
+        };
+        let status_msg = DaemonMessage::SessionStatusChanged {
+            session_id: sid,
+            status: SessionStatus::Inactive,
+        };
+        self.broadcast(created_msg);
+        self.broadcast(status_msg);
+    }
+
+    /// Attach to an existing session by ID. Loads from the database if the
+    /// session is not currently active.
+    fn handle_attach_session(
+        &mut self,
+        session_id: u64,
+        reply: std::sync::mpsc::Sender<io::Result<std::sync::mpsc::Sender<SessionCommand>>>,
+    ) {
+        debug!("AttachSession: id={}", session_id);
+        // Attaching to a session is allowed regardless of lock state.
+        // Credentials are only needed to run models (RunInput), not
+        // to browse or attach to existing sessions.
+        match self.active_sessions.get(&session_id) {
+            Some(entry) => {
+                let _ = reply.send(Ok(entry.cmd_tx.clone()));
+            }
+            None => match db::read_session(&self.db, session_id) {
+                Ok(Some(record)) => {
+                    let mut metadata: SessionMetadata = record.clone().into();
+                    metadata.status = SessionStatus::Inactive;
+                    let session_tx = self.spawn_session(session_id, record, metadata);
+                    info!("AttachSession: loaded session {} from db", session_id);
+                    let _ = reply.send(Ok(session_tx));
+                }
+                Ok(None) => {
+                    let _ = reply.send(Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "session not found",
+                    )));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            },
+        }
+    }
+
+    /// Return a list of all active session summaries.
+    fn handle_list_sessions(&mut self, reply: std::sync::mpsc::Sender<Vec<SessionSummary>>) {
+        let mut summaries: Vec<SessionSummary> = self
+            .session_metadata
+            .iter()
+            .map(|(id, meta)| SessionSummary {
+                session_id: *id,
+                title: meta.title.clone(),
+                selected_model: meta.selected_model.clone(),
+                reasoning_effort: meta.reasoning_effort,
+                parent_session_id: meta.parent_session_id,
+                cwd: meta.cwd.clone(),
+                created_at: meta.created_at,
+                message_count: meta.message_count,
+                max_turns: meta.max_turns,
+                status: meta.status.clone(),
+                active_tool_groups: meta.active_tool_groups.clone(),
+                account_name: meta.account_name.clone(),
+                token_usage: Some(meta.accumulated_usage.clone()),
+            })
+            .collect();
+
+        summaries.sort_by_key(|s| s.session_id);
+        let _ = reply.send(summaries);
+    }
+
+    /// Get a single session summary by ID.
+    fn handle_get_session(
+        &mut self,
+        session_id: u64,
+        reply: std::sync::mpsc::Sender<Option<SessionSummary>>,
+    ) {
+        let summary = self
+            .session_metadata
+            .get(&session_id)
+            .map(|meta| SessionSummary {
+                session_id,
+                title: meta.title.clone(),
+                selected_model: meta.selected_model.clone(),
+                reasoning_effort: meta.reasoning_effort,
+                parent_session_id: meta.parent_session_id,
+                cwd: meta.cwd.clone(),
+                created_at: meta.created_at,
+                message_count: meta.message_count,
+                max_turns: meta.max_turns,
+                status: meta.status.clone(),
+                active_tool_groups: meta.active_tool_groups.clone(),
+                account_name: meta.account_name.clone(),
+                token_usage: Some(meta.accumulated_usage.clone()),
+            });
+        let _ = reply.send(summary);
+    }
+
+    /// Update the in-memory metadata for a session.
+    fn handle_update_metadata(&mut self, session_id: u64, metadata: SessionMetadata) {
+        debug!(
+            "UpdateMetadata: id={}, model={:?}",
+            session_id, metadata.selected_model
+        );
+        self.session_metadata.insert(session_id, metadata);
+    }
+
+    /// Mark a session as exited (sleeping) and broadcast the status change.
+    fn handle_session_exited(&mut self, session_id: u64) {
+        info!("SessionExited: id={}", session_id);
+        crate::metrics::record_session_exited();
+        self.active_sessions.remove(&session_id);
+        if let Some(meta) = self.session_metadata.get_mut(&session_id) {
+            meta.status = SessionStatus::Sleeping;
+        }
+        let msg = DaemonMessage::SessionStatusChanged {
+            session_id,
+            status: SessionStatus::Sleeping,
+        };
+        self.broadcast(msg);
+    }
+
+    /// Attempt to unlock the daemon with the given private key.
+    fn handle_unlock(
+        &mut self,
+        private_key: Vec<u8>,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    ) {
+        info!("Unlock attempt");
+        let result = handle_unlock_inner(self, private_key).map_err(|e| e.to_string());
+        info!("Unlock result: success={}", result.is_ok());
+        let _ = reply.send(result);
+    }
+
+    /// Save an encrypted credential blob for a service.
+    fn handle_save_credential(
+        &mut self,
+        service: String,
+        encrypted_blob: Vec<u8>,
+        unlock_key: Option<Vec<u8>>,
+        reply: mpsc::Sender<Result<(), String>>,
+    ) {
+        // Write to DB
+        if let Err(e) = db::set_credential_blob(&self.db, &service, &encrypted_blob) {
+            let _ = reply.send(Err(format!("failed to save credential: {e}")));
+            return;
+        }
+        // Optionally decrypt into memory
+        if let Some(mut uk) = unlock_key {
+            let key: [u8; 32] = match uk.as_slice().try_into() {
+                Ok(k) => k,
+                Err(_) => {
+                    uk.zeroize();
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
+            };
+            uk.zeroize();
+            if let Ok(plaintext) =
+                tai_keystore::crypto::decrypt_with_private_key(&key, &encrypted_blob)
+                && let Ok((cred, _)) = bincode::serde::decode_from_slice::<ServiceCredential, _>(
+                    &plaintext,
+                    bincode::config::standard(),
+                )
+            {
+                // Update in-memory state
+                if matches!(&cred, ServiceCredential::X { .. }) && service == "twitter" {
+                    self.x_credentials = Some(cred.clone());
+                }
+                self.credentials.insert(service.clone(), cred.clone());
+                // Resolve provider for any account matching this service name
+                if let ServiceCredential::ApiKey { key: api_key } = &cred
+                    && let Some(config) = self.accounts.get(&service)
+                    && let Ok(provider) =
+                        InferenceProvider::from_account_config(config, Some(api_key.clone()))
+                {
+                    self.providers.insert(service.clone(), provider);
+                }
+            }
+        }
+        let _ = reply.send(Ok(()));
+    }
+
+    /// Remove a stored credential for a service.
+    fn handle_remove_credential(
+        &mut self,
+        service: String,
+        reply: mpsc::Sender<Result<(), String>>,
+    ) {
+        // Remove from DB
+        if let Err(e) = db::remove_credential_blob(&self.db, &service) {
+            let _ = reply.send(Err(format!("failed to remove credential: {e}")));
+            return;
+        }
+        // Remove from in-memory state
+        self.credentials.remove(&service);
+        self.providers.remove(&service);
+        if service == "twitter" {
+            self.x_credentials = None;
+        }
+        let _ = reply.send(Ok(()));
+    }
+
+    /// List available models, optionally scoped to a session's account.
+    fn handle_list_models(&mut self, session_id: Option<u64>, reply: ListModelsReply) {
+        debug!("ListModels: session_id={:?}", session_id);
+        let result = handle_list_models_inner(self, session_id);
+        let _ = reply.send(result);
+    }
+
+    /// Get the API key for a stored credential (returns None if not found).
+    fn handle_get_credential(
+        &mut self,
+        service: String,
+        reply: std::sync::mpsc::Sender<Option<String>>,
+    ) {
+        let key = self.credentials.get(&service).and_then(|c| match c {
+            ServiceCredential::ApiKey { key } => Some(key.clone()),
+            _ => None,
+        });
+        let _ = reply.send(key);
+    }
+
+    /// Register a client to receive session summary broadcasts.
+    fn handle_register_summary_subscriber(
+        &mut self,
+        client_id: u64,
+        writer: std::sync::mpsc::Sender<DaemonMessage>,
+    ) {
+        self.summary_subscribers.insert(client_id, writer);
+    }
+
+    /// Unregister a client from session summary broadcasts.
+    fn handle_unregister_summary_subscriber(&mut self, client_id: u64) {
+        self.summary_subscribers.remove(&client_id);
+    }
+
+    /// Broadcast a session status change to all summary subscribers.
+    fn handle_broadcast_session_status(&mut self, session_id: u64, status: SessionStatus) {
+        let msg = DaemonMessage::SessionStatusChanged { session_id, status };
+        self.broadcast(msg);
+    }
+
+    /// Delete a session, shutting down its thread and removing it from the DB.
+    fn handle_delete_session(
+        &mut self,
+        session_id: u64,
+        reply: std::sync::mpsc::Sender<io::Result<()>>,
+    ) {
+        info!("DeleteSession: id={}", session_id);
+        if let Err(e) = self.ensure_unlocked() {
+            let _ = reply.send(Err(e));
+            return;
+        }
+        // Gracefully shut down the session thread so it can persist its
+        // final state before we delete from the DB — otherwise the
+        // session's persist_and_exit would re-write the session
+        // back to the DB after we delete it.
+        if let Some(entry) = self.active_sessions.remove(&session_id) {
+            let _ = entry.cmd_tx.send(SessionCommand::Shutdown);
+            let _ = entry.handle.join();
+        }
+        // Remove from in-memory metadata
+        self.session_metadata.remove(&session_id);
+        // Remove from database
+        if let Err(e) = db::delete_session(&self.db, session_id) {
+            error!(
+                "DeleteSession: failed to delete session {} from db: {e}",
+                session_id
+            );
+            let _ = reply.send(Err(e));
+            return;
+        }
+        // Broadcast deletion to subscribers
+        self.broadcast(DaemonMessage::SessionDeleted { session_id });
+        let _ = reply.send(Ok(()));
+    }
+
+    /// Add a new inference account.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_add_account(
+        &mut self,
+        name: String,
+        provider: String,
+        base_url: Option<String>,
+        streaming: Option<bool>,
+        retry_max_attempts: Option<u32>,
+        connect_timeout_secs: Option<u64>,
+        request_timeout_secs: Option<u64>,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    ) {
+        let config = AccountConfig {
+            name: name.clone(),
+            provider: provider.clone(),
+            base_url,
+            streaming,
+            retry_max_attempts,
+            connect_timeout_secs,
+            request_timeout_secs,
+        };
+        let result = self.accounts.add(config);
+        match &result {
+            Ok(()) => info!(
+                account = %name,
+                provider = %provider,
+                "added inference account"
+            ),
+            Err(e) => error!(
+                account = %name,
+                provider = %provider,
+                error = %e,
+                "failed to add inference account"
+            ),
+        }
+        // If account was added and there's a matching credential,
+        // resolve the provider immediately.
+        if result.is_ok()
+            && let Some(ServiceCredential::ApiKey { key }) = self.credentials.get(&name)
+        {
+            self.resolve_account_provider(&name, Some(key.clone()));
+        }
+        let _ = reply.send(result);
+    }
+
+    /// Remove an inference account.
+    fn handle_remove_account(
+        &mut self,
+        name: String,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    ) {
+        let result = self.accounts.remove(&name);
+        match &result {
+            Ok(()) => info!(account = %name, "removed inference account"),
+            Err(e) => {
+                error!(account = %name, error = %e, "failed to remove inference account")
+            }
+        }
+        if result.is_ok() {
+            self.providers.remove(&name);
+        }
+        let _ = reply.send(result);
+    }
+
+    /// List all inference accounts (with credential status).
+    fn handle_list_accounts(
+        &mut self,
+        reply: std::sync::mpsc::Sender<Result<Vec<AccountInfo>, String>>,
+    ) {
+        // Collect the set of account names that have credentials
+        // (either decrypted in memory or stored as encrypted blobs
+        // in the DB) so the TUI can show whether each account has
+        // had a credential supplied, regardless of unlock state.
+        let mut credentialed: std::collections::HashSet<String> =
+            self.credentials.keys().cloned().collect();
+        // Also check the DB for stored-but-not-yet-decrypted blobs.
+        if let Ok(blobs) = db::get_all_credential_blobs(&self.db) {
+            credentialed.extend(blobs.into_keys());
+        }
+        let _ = reply.send(Ok(self.accounts.list(&credentialed)));
+    }
+
+    /// Resolve a cached provider for the given account name.
+    fn handle_resolve_provider(
+        &mut self,
+        account: String,
+        reply: std::sync::mpsc::Sender<Option<InferenceProvider>>,
+    ) {
+        let _ = reply.send(self.providers.get(&account).cloned());
+    }
+
+    /// Check whether an account with the given name exists.
+    fn handle_account_exists(&mut self, name: String, reply: std::sync::mpsc::Sender<bool>) {
+        let _ = reply.send(self.accounts.contains(&name));
+    }
 }
 
-fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> Result<(), String> {
+fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Result<()> {
     let mut key: [u8; 32] = private_key
         .as_slice()
         .try_into()
-        .map_err(|_| "invalid private key: expected 32 bytes".to_string())?;
+        .map_err(|_| io::Error::other("invalid private key: expected 32 bytes"))?;
     drop(private_key);
 
     let blobs = db::get_all_credential_blobs(&state.db)
-        .map_err(|e| format!("failed to read credentials from database: {e}"))?;
+        .map_err(|e| io::Error::other(format!("failed to read credentials from database: {e}")))?;
 
     info!("Unlock: {} credential blobs in DB", blobs.len());
 
@@ -641,10 +813,10 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> Result<
     state.credentials = credentials;
 
     // Load accounts from TOML
-    let accounts_path =
-        accounts_config_path().map_err(|e| format!("failed to get accounts config path: {e}"))?;
+    let accounts_path = accounts_config_path()
+        .map_err(|e| io::Error::other(format!("failed to get accounts config path: {e}")))?;
     state.accounts = AccountManager::load(&accounts_path)
-        .map_err(|e| format!("failed to load accounts: {e}"))?;
+        .map_err(|e| io::Error::other(format!("failed to load accounts: {e}")))?;
 
     // If no accounts configured but an "openai" credential exists, create a
     // default account automatically so the user doesn't have to set one up.
