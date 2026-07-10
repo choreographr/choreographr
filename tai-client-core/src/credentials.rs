@@ -1,52 +1,64 @@
 use tai_keystore::ServiceCredential;
 use tai_proto::ClientMessage;
+use tracing::{debug, info};
 
+use crate::error::ClientError;
 use crate::shell::UnlockMethod;
 
 /// Resolve a private key from the given unlock method.
 ///
 /// For `UnlockMethod::Raw`, reads the raw private key file.
 /// For `UnlockMethod::Passphrase`, reads the encrypted key file and decrypts it.
-pub fn resolve_private_key(method: &UnlockMethod) -> Result<Vec<u8>, String> {
+pub fn resolve_private_key(method: &UnlockMethod) -> Result<Vec<u8>, ClientError> {
     match method {
         UnlockMethod::Raw => {
-            let path = tai_keystore::paths::private_key_path().map_err(|e| e.to_string())?;
+            info!("reading raw private key");
+            let path = tai_keystore::paths::private_key_path()
+                .map_err(|e| ClientError::PrivateKeyRead(e.to_string()))?;
             let data =
-                std::fs::read(&path).map_err(|e| format!("failed to read private key: {e}"))?;
+                std::fs::read(&path).map_err(|e| ClientError::PrivateKeyRead(e.to_string()))?;
             if data.len() != 32 {
-                return Err("invalid private key file: expected 32 bytes".to_string());
+                return Err(ClientError::PrivateKeyInvalid);
             }
             Ok(data)
         }
         UnlockMethod::Passphrase(passphrase) => {
-            let enc_path =
-                tai_keystore::paths::private_key_enc_path().map_err(|e| e.to_string())?;
+            info!("reading encrypted private key");
+            let enc_path = tai_keystore::paths::private_key_enc_path()
+                .map_err(|e| ClientError::PrivateKeyEncRead(e.to_string()))?;
             let data = std::fs::read(&enc_path)
-                .map_err(|e| format!("failed to read encrypted private key: {e}"))?;
+                .map_err(|e| ClientError::PrivateKeyEncRead(e.to_string()))?;
             let key = tai_keystore::crypto::decrypt_private_key(&data, passphrase)
-                .map_err(|e| format!("failed to decrypt private key: {e}"))?;
+                .map_err(|e| ClientError::PrivateKeyDecrypt(e.to_string()))?;
             Ok(key.to_vec())
         }
     }
 }
 
 /// Read and validate the public key file. Returns the 32-byte public key.
-pub fn read_public_key_bytes() -> Result<[u8; 32], String> {
-    let path = tai_keystore::paths::public_key_path().map_err(|e| e.to_string())?;
-    let data = std::fs::read(&path).map_err(|e| format!("failed to read public key: {e}"))?;
+pub fn read_public_key_bytes() -> Result<[u8; 32], ClientError> {
+    info!("reading public key");
+    let path = tai_keystore::paths::public_key_path()
+        .map_err(|e| ClientError::PublicKeyRead(e.to_string()))?;
+    let data = std::fs::read(&path).map_err(|e| ClientError::PublicKeyRead(e.to_string()))?;
     if data.len() != 32 {
-        return Err("invalid public key file".to_string());
+        return Err(ClientError::PublicKeyInvalid);
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&data);
     Ok(key)
 }
 
-fn parse_credential(credential_type: &str, fields: &[String]) -> Result<ServiceCredential, String> {
+fn parse_credential(
+    credential_type: &str,
+    fields: &[String],
+) -> Result<ServiceCredential, ClientError> {
     match credential_type {
         "api_key" => {
             if fields.is_empty() {
-                return Err("missing api_key field".to_string());
+                return Err(ClientError::CredentialParse(
+                    "missing api_key field".to_string(),
+                ));
             }
             Ok(ServiceCredential::ApiKey {
                 key: fields[0].clone(),
@@ -54,7 +66,9 @@ fn parse_credential(credential_type: &str, fields: &[String]) -> Result<ServiceC
         }
         "x" => {
             if fields.len() < 5 {
-                return Err("missing X credential fields".to_string());
+                return Err(ClientError::CredentialParse(
+                    "missing X credential fields".to_string(),
+                ));
             }
             let bearer = if fields[4] == "-" {
                 None
@@ -69,7 +83,9 @@ fn parse_credential(credential_type: &str, fields: &[String]) -> Result<ServiceC
                 bearer_token: bearer,
             })
         }
-        other => Err(format!("unknown credential type: {other}")),
+        other => Err(ClientError::CredentialParse(format!(
+            "unknown credential type: {other}"
+        ))),
     }
 }
 
@@ -83,15 +99,16 @@ pub fn build_add_credential_message(
     credential_type: String,
     fields: Vec<String>,
     unlock: bool,
-) -> Result<ClientMessage, String> {
+) -> Result<ClientMessage, ClientError> {
+    debug!("building add credential message for service: {service}, type: {credential_type}");
     let pub_key = read_public_key_bytes()?;
     let credential = parse_credential(&credential_type, &fields)?;
 
     let plaintext = bincode::serde::encode_to_vec(&credential, bincode::config::standard())
-        .map_err(|e| format!("serialize failed: {e}"))?;
+        .map_err(|e| ClientError::Bincode(e.to_string()))?;
 
     let encrypted_payload = tai_keystore::crypto::encrypt_with_public_key(&pub_key, &plaintext)
-        .map_err(|e| format!("encryption failed: {e}"))?;
+        .map_err(|e| ClientError::Encryption(e.to_string()))?;
 
     let unlock_key = if unlock {
         tai_keystore::paths::private_key_path()

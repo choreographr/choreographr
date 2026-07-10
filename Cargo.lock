@@ -7999,6 +7999,7 @@ dependencies = [
  "tai-keystore",
  "tai-proto",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

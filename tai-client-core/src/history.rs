@@ -2,6 +2,7 @@ use crate::error::ClientError;
 use crate::{FileDiff, ImageAssembler};
 use std::collections::HashMap;
 use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
+use tracing::{debug, info, trace};
 
 pub const MAX_HISTORY_ITEMS: usize = 500;
 
@@ -72,6 +73,7 @@ impl<TImage> ClientHistory<TImage> {
     }
 
     pub fn push_history_item(&mut self, item: HistoryItem<TImage>) {
+        debug!("pushing history item");
         self.history.push(item);
         self.trim_history();
     }
@@ -96,6 +98,7 @@ impl<TImage> ClientHistory<TImage> {
     }
 
     pub fn begin_stream(&mut self, request_id: u32) {
+        trace!("begin stream for request {request_id}");
         if self.in_progress.contains_key(&request_id) {
             return;
         }
@@ -107,6 +110,7 @@ impl<TImage> ClientHistory<TImage> {
     }
 
     pub fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
+        trace!("append stream for request {request_id}: {stream:?}");
         if !self.in_progress.contains_key(&request_id) {
             self.begin_stream(request_id);
         }
@@ -118,6 +122,7 @@ impl<TImage> ClientHistory<TImage> {
     }
 
     pub fn finalize_stream(&mut self, request_id: u32) {
+        trace!("finalize stream for request {request_id}");
         self.in_progress.remove(&request_id);
         self.pending_images.drop_request(request_id);
     }
@@ -156,6 +161,10 @@ impl<TImage> ClientHistory<TImage> {
             return;
         }
         let excess = self.history.len() - MAX_HISTORY_ITEMS;
+        info!(
+            "trimming history by {excess} items (current size: {})",
+            self.history.len()
+        );
         self.history.drain(0..excess);
         for index in self.in_progress.values_mut() {
             *index = index.saturating_sub(excess);

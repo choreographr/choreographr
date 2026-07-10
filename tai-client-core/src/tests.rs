@@ -1,5 +1,5 @@
 use super::*;
-use tai_proto::{ClientMessage, ImageMetadata, OutputStream};
+use tai_proto::{ClientMessage, ImageMetadata, OutputStream, ThinkingEffort};
 
 #[test]
 fn parses_empty_line() {
@@ -470,4 +470,120 @@ fn image_assembler_tracks_lifecycle() {
 
     assert_eq!(actual_metadata, metadata);
     assert_eq!(data, vec![1, 2, 3, 4]);
+}
+
+// ── Account sub-commands ──────────────────────────────────────────────────
+
+#[test]
+fn account_list() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/account list", &mut next, None),
+        ShellCommand::Send(ClientMessage::ListAccounts)
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn account_bare_lists_accounts() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/account", &mut next, None),
+        ShellCommand::Send(ClientMessage::ListAccounts)
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn account_remove() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/account remove my-provider", &mut next, None),
+        ShellCommand::Send(ClientMessage::RemoveAccount {
+            name: "my-provider".to_string()
+        })
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn account_remove_missing_name() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/account remove", &mut next, None),
+        ShellCommand::UnknownCommand("usage: /account remove <name>".to_string())
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn account_set_valid_name() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/account my-account", &mut next, None),
+        ShellCommand::Send(ClientMessage::SetSessionAccount {
+            name: "my-account".to_string()
+        })
+    );
+    assert_eq!(next, 3);
+}
+
+// ── Reasoning effort ──────────────────────────────────────────────────────
+
+#[test]
+fn reasoning_get() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/reasoning", &mut next, None),
+        ShellCommand::Send(ClientMessage::get_reasoning_effort())
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn reasoning_set_off() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/reasoning off", &mut next, None),
+        ShellCommand::Send(ClientMessage::set_reasoning_effort(ThinkingEffort::Off))
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn reasoning_set_low() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/reasoning low", &mut next, None),
+        ShellCommand::Send(ClientMessage::set_reasoning_effort(ThinkingEffort::Low))
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn reasoning_set_medium() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/reasoning medium", &mut next, None),
+        ShellCommand::Send(ClientMessage::set_reasoning_effort(ThinkingEffort::Medium))
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn reasoning_set_high() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/reasoning high", &mut next, None),
+        ShellCommand::Send(ClientMessage::set_reasoning_effort(ThinkingEffort::High))
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn reasoning_invalid_effort() {
+    let mut next = 3;
+    let result = parse_input_line("/reasoning turbo", &mut next, None);
+    assert!(matches!(result, ShellCommand::UnknownCommand(ref msg) if msg.contains("turbo")));
+    assert_eq!(next, 3);
 }

@@ -1,5 +1,6 @@
 use crate::error::ClientError;
-use tai_proto::{ClientMessage, DaemonMessage, ImageMetadata, OutputStream, SessionMessage};
+use tai_proto::{DaemonMessage, ImageMetadata, OutputStream, SessionMessage};
+use tracing::debug;
 
 pub trait DaemonMessageHandler {
     fn push_text(&mut self, text: String);
@@ -33,17 +34,19 @@ pub trait DaemonMessageHandler {
     fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError>;
 }
 
-pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
+// ── Session lifecycle ─────────────────────────────────────────
+
+fn dispatch_session<H: DaemonMessageHandler>(
     handler: &mut H,
-    message: DaemonMessage,
-) -> Result<Option<ClientMessage>, ClientError> {
-    match message {
+    msg: DaemonMessage,
+) -> Result<(), ClientError> {
+    match msg {
         DaemonMessage::SessionCreated {
             session_id, title, ..
         } => {
             let label = title.unwrap_or_else(|| "untitled".to_string());
             handler.push_text(format!("[daemon] created session {session_id}: {label}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::Sessions { sessions } => {
             if sessions.is_empty() {
@@ -59,13 +62,13 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
                     ));
                 }
             }
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::SessionAttached { session_id } => {
             handler.push_text(format!("[daemon] attached session: {session_id}"));
-            Ok(None)
+            Ok(())
         }
-        DaemonMessage::SessionStatusChanged { .. } => Ok(None),
+        DaemonMessage::SessionStatusChanged { .. } => Ok(()),
         DaemonMessage::SessionState {
             session_id,
             title,
@@ -93,25 +96,44 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             }
             handler.push_text(format!("[daemon]   {} messages", messages.len()));
             for message in messages {
-                // SystemText messages carry the system prompt and agent
-                // instructions intended for the LLM, not for display.
                 if !matches!(message, SessionMessage::SystemText { .. }) {
                     handler.push_session_message(message);
                 }
             }
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::SessionFailed { operation, error } => {
             handler.push_text(format!("[daemon] {operation} failed: {error}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::SessionMessageAppended { message } => {
             handler.push_session_message(message);
-            Ok(None)
+            Ok(())
         }
+        DaemonMessage::SessionDeleted { .. } => {
+            // Handled upstream by the TUI before dispatch; this crate-level
+            // handler just acknowledges it so the match is exhaustive.
+            Ok(())
+        }
+        DaemonMessage::SessionDeleteFailed { .. } => {
+            // Handled upstream by the TUI before dispatch; this crate-level
+            // handler just acknowledges it so the match is exhaustive.
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+// ── Stream lifecycle (start/end/tool calls) ────────────────────
+
+fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
+    handler: &mut H,
+    msg: DaemonMessage,
+) -> Result<(), ClientError> {
+    match msg {
         DaemonMessage::Started { request_id } => {
             handler.begin_stream(request_id);
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::ToolCallStarted {
             request_id,
@@ -123,7 +145,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
                 request_id,
                 format!("[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"),
             );
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::ToolCallFinished {
             request_id,
@@ -140,7 +162,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
                     is_error: false,
                 },
             );
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::ToolCallFailed {
             request_id,
@@ -152,7 +174,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
                 request_id,
                 format!("[{request_id}] tool {tool_name}#{call_id} failed: {error}"),
             );
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::ToolCallOutput {
             request_id,
@@ -164,38 +186,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
                 request_id,
                 format!("[{request_id}] tool #{call_id} output: {text}"),
             );
-            Ok(None)
-        }
-        DaemonMessage::OutputChunk {
-            request_id,
-            stream,
-            data,
-        } => {
-            let text = String::from_utf8(data)?;
-            handler.append_stream(request_id, stream, &text);
-            Ok(None)
-        }
-        DaemonMessage::ImageStart {
-            request_id,
-            metadata,
-        } => {
-            handler.handle_image_start(request_id, metadata)?;
-            Ok(None)
-        }
-        DaemonMessage::ImageChunk {
-            request_id,
-            image_id,
-            data,
-        } => {
-            handler.handle_image_chunk(request_id, image_id, &data)?;
-            Ok(None)
-        }
-        DaemonMessage::ImageEnd {
-            request_id,
-            image_id,
-        } => {
-            handler.handle_image_end(request_id, image_id)?;
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::Done {
             request_id,
@@ -203,22 +194,62 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
         } => {
             handler.push_text(format!("[{request_id}] done"));
             handler.drop_request(request_id);
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::Failed { request_id, error } => {
             handler.push_text(format!("[{request_id}] failed: {error}"));
             handler.drop_request(request_id);
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::Cancelled { request_id } => {
             handler.push_text(format!("[{request_id}] cancelled"));
             handler.drop_request(request_id);
-            Ok(None)
+            Ok(())
         }
-        DaemonMessage::Pong => {
-            handler.push_text("[daemon] pong".to_string());
-            Ok(None)
+        _ => Ok(()),
+    }
+}
+
+// ── Image assembly ────────────────────────────────────────────
+
+fn dispatch_image<H: DaemonMessageHandler>(
+    handler: &mut H,
+    msg: DaemonMessage,
+) -> Result<(), ClientError> {
+    match msg {
+        DaemonMessage::ImageStart {
+            request_id,
+            metadata,
+        } => {
+            handler.handle_image_start(request_id, metadata)?;
+            Ok(())
         }
+        DaemonMessage::ImageChunk {
+            request_id,
+            image_id,
+            data,
+        } => {
+            handler.handle_image_chunk(request_id, image_id, &data)?;
+            Ok(())
+        }
+        DaemonMessage::ImageEnd {
+            request_id,
+            image_id,
+        } => {
+            handler.handle_image_end(request_id, image_id)?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+// ── Model management ──────────────────────────────────────────
+
+fn dispatch_model<H: DaemonMessageHandler>(
+    handler: &mut H,
+    msg: DaemonMessage,
+) -> Result<(), ClientError> {
+    match msg {
         DaemonMessage::Models {
             models,
             selected_model,
@@ -236,92 +267,101 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
                     handler.push_text(format!("{prefix} {model}"));
                 }
             }
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::ModelsFailed { error } => {
             handler.push_text(format!("[daemon] models failed: {error}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::ModelSelected { model } => {
             handler.push_text(format!("[daemon] selected model: {model}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::ModelSelectionFailed { model, error } => {
             handler.push_text(format!("[daemon] failed to select model {model}: {error}"));
-            Ok(None)
+            Ok(())
         }
-        DaemonMessage::ReasoningEffortSet { effort } => {
-            handler.push_text(format!("[daemon] reasoning effort: {}", effort.as_label(),));
-            Ok(None)
-        }
-        DaemonMessage::ReasoningEffortSetFailed { effort, error } => {
-            handler.push_text(format!(
-                "[daemon] failed to set reasoning effort {effort}: {error}",
-            ));
-            Ok(None)
-        }
+        _ => Ok(()),
+    }
+}
+
+// ── Keystore state ────────────────────────────────────────────
+
+fn dispatch_keystore<H: DaemonMessageHandler>(
+    handler: &mut H,
+    msg: DaemonMessage,
+) -> Result<(), ClientError> {
+    match msg {
         DaemonMessage::Unlocked => {
             handler.push_text("[daemon] keystore unlocked, credentials available".to_string());
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::Locked => {
             handler.push_text("[daemon] keystore locked, credentials cleared".to_string());
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::LockedError { error } => {
             handler.push_text(format!("[daemon] locked: {error}"));
-            Ok(None)
+            Ok(())
         }
+        _ => Ok(()),
+    }
+}
+
+// ── Credential CRUD ───────────────────────────────────────────
+
+fn dispatch_credential<H: DaemonMessageHandler>(
+    handler: &mut H,
+    msg: DaemonMessage,
+) -> Result<(), ClientError> {
+    match msg {
         DaemonMessage::CredentialAdded { service } => {
             handler.push_text(format!("[daemon] credential added: {service}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::CredentialAddFailed { service, error } => {
             handler.push_text(format!(
                 "[daemon] credential add failed ({service}): {error}"
             ));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::CredentialRemoved { service } => {
             handler.push_text(format!("[daemon] credential removed: {service}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::CredentialRemoveFailed { service, error } => {
             handler.push_text(format!(
                 "[daemon] credential remove failed ({service}): {error}"
             ));
-            Ok(None)
+            Ok(())
         }
-        DaemonMessage::Credential { .. } => Ok(None),
-        DaemonMessage::SessionDeleted { .. } => {
-            // Handled upstream by the TUI before dispatch; this crate-level
-            // handler just acknowledges it so the match is exhaustive.
-            Ok(None)
-        }
-        DaemonMessage::SessionDeleteFailed { .. } => {
-            // Handled upstream by the TUI before dispatch; this crate-level
-            // handler just acknowledges it so the match is exhaustive.
-            Ok(None)
-        }
-        DaemonMessage::ShuttingDown => {
-            handler.push_text("[daemon] shutting down".to_string());
-            Ok(None)
-        }
+        DaemonMessage::Credential { .. } => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+// ── Account management ────────────────────────────────────────
+
+fn dispatch_account<H: DaemonMessageHandler>(
+    handler: &mut H,
+    msg: DaemonMessage,
+) -> Result<(), ClientError> {
+    match msg {
         DaemonMessage::AccountAdded { name } => {
             handler.push_text(format!("[daemon] account added: {name}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::AccountAddFailed { name, error } => {
             handler.push_text(format!("[daemon] failed to add account {name}: {error}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::AccountRemoved { name } => {
             handler.push_text(format!("[daemon] account removed: {name}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::AccountRemoveFailed { name, error } => {
             handler.push_text(format!("[daemon] failed to remove account {name}: {error}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::Accounts { accounts } => {
             if accounts.is_empty() {
@@ -332,18 +372,143 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
                     handler.push_text(format!("  {}: {}", a.name, a.provider));
                 }
             }
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::AccountListFailed { error } => {
             handler.push_text(format!("[daemon] failed to list accounts: {error}"));
-            Ok(None)
+            Ok(())
         }
         DaemonMessage::SessionAccountSet { account } => {
             handler.push_text(format!("[daemon] session account set: {account}"));
-            Ok(None)
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+// ── Reasoning effort ──────────────────────────────────────────
+
+fn dispatch_reasoning<H: DaemonMessageHandler>(
+    handler: &mut H,
+    msg: DaemonMessage,
+) -> Result<(), ClientError> {
+    match msg {
+        DaemonMessage::ReasoningEffortSet { effort } => {
+            handler.push_text(format!("[daemon] reasoning effort: {}", effort.as_label()));
+            Ok(())
+        }
+        DaemonMessage::ReasoningEffortSetFailed { effort, error } => {
+            handler.push_text(format!(
+                "[daemon] failed to set reasoning effort {effort}: {error}",
+            ));
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+// ── Miscellaneous one-off messages ────────────────────────────
+
+fn dispatch_misc<H: DaemonMessageHandler>(
+    handler: &mut H,
+    msg: DaemonMessage,
+) -> Result<(), ClientError> {
+    match msg {
+        DaemonMessage::ShuttingDown => {
+            handler.push_text("[daemon] shutting down".to_string());
+            Ok(())
+        }
+        DaemonMessage::Pong => {
+            handler.push_text("[daemon] pong".to_string());
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+// ── Main dispatcher ───────────────────────────────────────────
+
+pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
+    handler: &mut H,
+    message: DaemonMessage,
+) -> Result<(), ClientError> {
+    debug!("dispatching daemon message: {message:?}");
+    match message {
+        // Session lifecycle
+        m @ (DaemonMessage::SessionCreated { .. }
+        | DaemonMessage::Sessions { .. }
+        | DaemonMessage::SessionAttached { .. }
+        | DaemonMessage::SessionStatusChanged { .. }
+        | DaemonMessage::SessionState { .. }
+        | DaemonMessage::SessionFailed { .. }
+        | DaemonMessage::SessionMessageAppended { .. }
+        | DaemonMessage::SessionDeleted { .. }
+        | DaemonMessage::SessionDeleteFailed { .. }) => dispatch_session(handler, m),
+
+        // Stream lifecycle (start, finish, tool calls)
+        m @ (DaemonMessage::Started { .. }
+        | DaemonMessage::ToolCallStarted { .. }
+        | DaemonMessage::ToolCallFinished { .. }
+        | DaemonMessage::ToolCallFailed { .. }
+        | DaemonMessage::ToolCallOutput { .. }
+        | DaemonMessage::Done { .. }
+        | DaemonMessage::Failed { .. }
+        | DaemonMessage::Cancelled { .. }) => dispatch_stream_lifecycle(handler, m),
+
+        // Output chunks (the only variant with its own data flow)
+        DaemonMessage::OutputChunk {
+            request_id,
+            stream,
+            data,
+        } => {
+            let text = String::from_utf8(data)?;
+            handler.append_stream(request_id, stream, &text);
+            Ok(())
         }
 
-        _ => Ok(None),
+        // Image assembly
+        m @ (DaemonMessage::ImageStart { .. }
+        | DaemonMessage::ImageChunk { .. }
+        | DaemonMessage::ImageEnd { .. }) => dispatch_image(handler, m),
+
+        // Model management
+        m @ (DaemonMessage::Models { .. }
+        | DaemonMessage::ModelsFailed { .. }
+        | DaemonMessage::ModelSelected { .. }
+        | DaemonMessage::ModelSelectionFailed { .. }) => dispatch_model(handler, m),
+
+        // Keystore state
+        m @ (DaemonMessage::Unlocked
+        | DaemonMessage::Locked
+        | DaemonMessage::LockedError { .. }) => dispatch_keystore(handler, m),
+
+        // Credential CRUD
+        m @ (DaemonMessage::CredentialAdded { .. }
+        | DaemonMessage::CredentialAddFailed { .. }
+        | DaemonMessage::CredentialRemoved { .. }
+        | DaemonMessage::CredentialRemoveFailed { .. }
+        | DaemonMessage::Credential { .. }) => dispatch_credential(handler, m),
+
+        // Account management
+        m @ (DaemonMessage::AccountAdded { .. }
+        | DaemonMessage::AccountAddFailed { .. }
+        | DaemonMessage::AccountRemoved { .. }
+        | DaemonMessage::AccountRemoveFailed { .. }
+        | DaemonMessage::Accounts { .. }
+        | DaemonMessage::AccountListFailed { .. }
+        | DaemonMessage::SessionAccountSet { .. }) => dispatch_account(handler, m),
+
+        // Reasoning effort
+        m @ (DaemonMessage::ReasoningEffortSet { .. }
+        | DaemonMessage::ReasoningEffortSetFailed { .. }) => dispatch_reasoning(handler, m),
+
+        // One-off messages
+        m @ (DaemonMessage::Pong | DaemonMessage::ShuttingDown) => dispatch_misc(handler, m),
+
+        _ => {
+            debug!("unhandled daemon message variant");
+            Ok(())
+        }
     }
 }
 
@@ -1417,8 +1582,8 @@ mod tests {
     // ── Return value tests ───────────────────────────────────────────────
 
     #[test]
-    fn all_variants_return_none() {
-        // Spot-check a few variants — they should all return Ok(None).
+    fn all_variants_succeed() {
+        // Spot-check a few variants — they should all return Ok(()).
         let variants: Vec<DaemonMessage> = vec![
             DaemonMessage::Pong,
             DaemonMessage::Unlocked,
@@ -1441,8 +1606,8 @@ mod tests {
         let mut h = TestHandler::new();
         for variant in variants {
             let result = dispatch_daemon_message(&mut h, variant);
-            assert!(result.is_ok(), "expected Ok(None), got {result:?}");
-            assert!(result.unwrap().is_none(), "expected None reply");
+            assert!(result.is_ok(), "expected Ok(()), got {result:?}");
+            result.unwrap();
         }
     }
 

@@ -1,6 +1,7 @@
 use crate::error::ClientError;
 use std::collections::HashMap;
 use tai_proto::ImageMetadata;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct PendingImage {
@@ -55,8 +56,16 @@ impl ImageAssembler {
     }
 
     pub fn start(&mut self, request_id: u32, metadata: ImageMetadata) -> Result<(), ClientError> {
+        debug!(
+            "image start: request={request_id}, image_id={}, byte_len={}",
+            metadata.image_id, metadata.byte_len
+        );
         let key = (request_id, metadata.image_id);
         if self.pending.contains_key(&key) {
+            warn!(
+                "duplicate image {} for request {request_id}",
+                metadata.image_id
+            );
             return Err(ClientError::DuplicateImage {
                 image_id: metadata.image_id,
                 request_id,
@@ -72,13 +81,20 @@ impl ImageAssembler {
         image_id: u32,
         data: &[u8],
     ) -> Result<(), ClientError> {
-        let pending =
-            self.pending
-                .get_mut(&(request_id, image_id))
-                .ok_or(ClientError::UnknownImage {
+        debug!(
+            "image chunk: request={request_id}, image_id={image_id}, len={}",
+            data.len()
+        );
+        let pending = self
+            .pending
+            .get_mut(&(request_id, image_id))
+            .ok_or_else(|| {
+                warn!("unknown image {image_id} for request {request_id}");
+                ClientError::UnknownImage {
                     image_id,
                     request_id,
-                })?;
+                }
+            })?;
         pending.push_chunk(data)
     }
 
@@ -87,13 +103,17 @@ impl ImageAssembler {
         request_id: u32,
         image_id: u32,
     ) -> Result<(ImageMetadata, Vec<u8>), ClientError> {
-        let pending =
-            self.pending
-                .remove(&(request_id, image_id))
-                .ok_or(ClientError::UnknownImage {
+        debug!("image finish: request={request_id}, image_id={image_id}");
+        let pending = self
+            .pending
+            .remove(&(request_id, image_id))
+            .ok_or_else(|| {
+                warn!("unknown image {image_id} for request {request_id} at finish");
+                ClientError::UnknownImage {
                     image_id,
                     request_id,
-                })?;
+                }
+            })?;
         let (metadata, data) = pending.into_parts();
         let actual_len = u64::try_from(data.len()).map_err(|_| ClientError::ImageTooLarge)?;
         if actual_len != metadata.byte_len {
@@ -108,6 +128,7 @@ impl ImageAssembler {
     }
 
     pub fn drop_request(&mut self, request_id: u32) {
+        debug!("dropping pending images for request {request_id}");
         self.pending
             .retain(|(pending_request_id, _), _| *pending_request_id != request_id);
     }

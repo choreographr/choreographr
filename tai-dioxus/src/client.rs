@@ -181,12 +181,6 @@ pub(crate) fn apply_daemon_message(
         return Ok(());
     }
 
-    let response = dispatch_daemon_message(state, message)?;
-    if let Some(msg) = response
-        && let Some(sender) = daemon_tx
-        && let Err(e) = sender.send(msg)
-    {
-        tracing::error!("failed to send daemon response: {e}");
-    }
+    dispatch_daemon_message(state, message)?;
     Ok(())
 }

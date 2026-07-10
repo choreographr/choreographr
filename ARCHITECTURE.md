@@ -33,7 +33,8 @@ Seven crates in a single Cargo workspace (resolver = "3"):
 tai (workspace)
 ├── tai-proto           Wire protocol (shared types + framing)
 ├── tai-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
-├── tai-client-core     Shared client logic (parsing, markdown, images, history)
+├── tai-client-core     Shared client logic (parsing, images, history, credentials)
+├── tai-markdown        Markdown parser and HTML renderer (pulldown-cmark + ammonia)
 ├── tai-daemon          Unix socket server — the core engine
 ├── tai-tui              Terminal UI client (ratatui + crossterm)
 ├── tai-dioxus          Desktop GUI client (Dioxus)
@@ -171,12 +172,11 @@ Used by both `tai-tui` and `tai-dioxus`.
 |---|---|---|
 | `shell.rs` | Parses terminal input into `ShellCommand`: `/ping`, `/models`, `/model` (alias), `/cancel`, `/unlock`, `/lock`, `/image`, `/add-key`, `/add-x`, `/remove-key`, or `RunInput(prompt)`. All commands use `/` prefix exclusively; `parse_command()` is the single dispatch point. |
 | `credentials.rs` | Shared helpers: `resolve_private_key()` (read or decrypt the identity key), `build_add_credential_message()` (encrypt and package a credential for the daemon), `read_public_key_bytes()`. Eliminates duplicated logic across `tai-tui`, `tai-dioxus`, and `tai-im`. |
-| `markdown.rs` | Parses markdown into structured `MarkdownDocument` (paragraphs, headings, code blocks, lists, tables) via `pulldown-cmark`; `render_markdown_html()` sanitizes via `ammonia` |
 | `image.rs` | `ImageAssembler` reconstructs images from chunked stream protocol (`ImageStart` → `ImageChunk`* → `ImageEnd`), validating byte count |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text, structured diffs) |
 | `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
 
-`DaemonMessageHandler` trait uses `ClientError` (thiserror enum) — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`.
+`DaemonMessageHandler` trait uses `ClientError` (thiserror enum) — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `PrivateKeyEncRead`, `PrivateKeyDecrypt`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Bincode`, `Encryption`.
 
 
 ### `tai-daemon` — Core server

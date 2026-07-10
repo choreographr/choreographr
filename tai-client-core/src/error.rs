@@ -27,6 +27,24 @@ pub enum ClientError {
         expected: u64,
         actual: u64,
     },
+    #[error("failed to read private key: {0}")]
+    PrivateKeyRead(String),
+    #[error("invalid private key file: expected 32 bytes")]
+    PrivateKeyInvalid,
+    #[error("failed to read encrypted private key: {0}")]
+    PrivateKeyEncRead(String),
+    #[error("failed to decrypt private key: {0}")]
+    PrivateKeyDecrypt(String),
+    #[error("failed to read public key: {0}")]
+    PublicKeyRead(String),
+    #[error("invalid public key file")]
+    PublicKeyInvalid,
+    #[error("{0}")]
+    CredentialParse(String),
+    #[error("bincode serialization failed: {0}")]
+    Bincode(String),
+    #[error("encryption failed: {0}")]
+    Encryption(String),
 }
 
 /// Convert an mpsc send error (or any displayable error) into a
@@ -47,9 +65,16 @@ impl From<ClientError> for io::Error {
             | ClientError::ImageExceedsSize { .. }
             | ClientError::DuplicateImage { .. }
             | ClientError::UnknownImage { .. }
-            | ClientError::ImageSizeMismatch { .. } => {
-                io::Error::new(io::ErrorKind::InvalidData, error)
-            }
+            | ClientError::ImageSizeMismatch { .. }
+            | ClientError::PrivateKeyRead(_)
+            | ClientError::PrivateKeyInvalid
+            | ClientError::PrivateKeyEncRead(_)
+            | ClientError::PrivateKeyDecrypt(_)
+            | ClientError::PublicKeyRead(_)
+            | ClientError::PublicKeyInvalid
+            | ClientError::CredentialParse(_)
+            | ClientError::Bincode(_)
+            | ClientError::Encryption(_) => io::Error::new(io::ErrorKind::InvalidData, error),
         }
     }
 }

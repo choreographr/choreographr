@@ -926,9 +926,6 @@ pub(crate) fn handle_daemon_message(
         _ => {}
     }
 
-    let response = dispatch_daemon_message(app, message)?;
-    if let Some(msg) = response {
-        client_tx.send(msg).map_err(broken_pipe)?;
-    }
+    dispatch_daemon_message(app, message)?;
     Ok(())
 }
