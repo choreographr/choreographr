@@ -769,7 +769,6 @@ fn handle_ai_providers_new_form_key(
                         .send(ClientMessage::add_account(
                             &name,
                             provider_str,
-                            None, // no model
                             None, // no base_url
                             None, // streaming
                             None, // retry_max_attempts

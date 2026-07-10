@@ -96,6 +96,7 @@ pub(crate) enum AIProvidersView {
 pub(crate) enum ProviderOption {
     OpenCodeZen,
     OpenCodeGo,
+    Anthropic,
 }
 
 impl ProviderOption {
@@ -103,6 +104,7 @@ impl ProviderOption {
         match self {
             ProviderOption::OpenCodeZen => "opencode zen",
             ProviderOption::OpenCodeGo => "opencode go",
+            ProviderOption::Anthropic => "anthropic",
         }
     }
 
@@ -111,12 +113,16 @@ impl ProviderOption {
         match self {
             ProviderOption::OpenCodeZen => "opencode",
             ProviderOption::OpenCodeGo => "opencode-go",
+            ProviderOption::Anthropic => "anthropic",
         }
     }
 }
 
-pub(crate) const PROVIDER_OPTIONS: &[ProviderOption] =
-    &[ProviderOption::OpenCodeZen, ProviderOption::OpenCodeGo];
+pub(crate) const PROVIDER_OPTIONS: &[ProviderOption] = &[
+    ProviderOption::OpenCodeZen,
+    ProviderOption::OpenCodeGo,
+    ProviderOption::Anthropic,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NewAccountField {

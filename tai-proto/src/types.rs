@@ -64,7 +64,6 @@ impl From<InferenceError> for std::io::Error {
 pub struct AccountInfo {
     pub name: String,
     pub provider: String,
-    pub model: Option<String>,
     pub has_credential: bool,
 }
 
@@ -197,7 +196,6 @@ pub enum ClientMessage {
     AddAccount {
         name: String,
         provider: String,
-        model: Option<String>,
         base_url: Option<String>,
         streaming: Option<bool>,
         retry_max_attempts: Option<u32>,
@@ -769,7 +767,6 @@ impl ClientMessage {
     pub fn add_account(
         name: impl Into<String>,
         provider: impl Into<String>,
-        model: Option<String>,
         base_url: Option<String>,
         streaming: Option<bool>,
         retry_max_attempts: Option<u32>,
@@ -779,7 +776,6 @@ impl ClientMessage {
         Self::AddAccount {
             name: name.into(),
             provider: provider.into(),
-            model,
             base_url,
             streaming,
             retry_max_attempts,

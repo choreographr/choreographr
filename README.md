@@ -1,6 +1,6 @@
 # tai
 
-A local AI terminal interface in Rust. Connects to an OpenAI-compatible API, runs tools, and streams responses over a Unix socket.
+A local AI terminal interface in Rust. Connects to OpenAI-compatible and Anthropic APIs, runs tools, and streams responses over a Unix socket.
 
 ## Crates
 
@@ -82,6 +82,10 @@ cargo run -p tai-dioxus  # desktop app
 cargo run -p tai-im      # IM bridge
 ```
 
+Available provider options in the TUI's "AI Provider Accounts" page: `opencode zen`,
+`opencode go`, and `anthropic`. Use `n` to add a new account, select provider in the form,
+enter an API key, and press Enter to save.
+
 In `tai-tui`, `Ctrl+C` exits the local client and disconnects from the daemon without
 requesting daemon shutdown.
 
@@ -143,9 +147,21 @@ In `tai-tui`:
 - any other input — sent as a prompt
 
 Account names must be lowercase alphanumeric with hyphens or underscores (`[a-z0-9_-]`).
+Supported providers: `openai`, `openai_compatible`, `opencode`, `opencode-go`, `anthropic`.
 Each session may have its own account, set via `/account <name>`. There is no global default
 account. Sessions can be created and browsed while the daemon is locked — credentials are
 only required when running prompts.
+
+Accounts are configured via `~/.config/tai-daemon/accounts.toml`:
+```toml
+[[account]]
+name = "main"
+provider = "openai"
+
+[[account]]
+name = "claude"
+provider = "anthropic"
+```
 
 ## Monitoring
 

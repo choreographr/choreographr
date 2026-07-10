@@ -10,7 +10,6 @@ use tai_proto::AccountInfo;
 pub struct AccountConfig {
     pub name: String,
     pub provider: String,
-    pub model: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -47,7 +46,6 @@ impl AccountConfig {
         AccountInfo {
             name: self.name.clone(),
             provider: self.provider.clone(),
-            model: self.model.clone(),
             has_credential,
         }
     }
@@ -184,7 +182,6 @@ mod tests {
         AccountConfig {
             name: name.to_string(),
             provider: "openai".to_string(),
-            model: None,
             base_url: None,
             streaming: None,
             retry_max_attempts: None,
@@ -364,7 +361,6 @@ model = "claude-4"
         let cfg = AccountConfig {
             name: "test".to_string(),
             provider: "openai".to_string(),
-            model: Some("gpt-4".to_string()),
             base_url: None,
             streaming: None,
             retry_max_attempts: None,
@@ -374,7 +370,6 @@ model = "claude-4"
         let info = cfg.to_info(true);
         assert_eq!(info.name, "test");
         assert_eq!(info.provider, "openai");
-        assert_eq!(info.model, Some("gpt-4".to_string()));
         assert!(info.has_credential);
     }
 
@@ -384,7 +379,6 @@ model = "claude-4"
         let cfg = AccountConfig {
             name: "ovr".to_string(),
             provider: "openai".to_string(),
-            model: None,
             base_url: Some("https://custom.api.com/v1".to_string()),
             streaming: Some(false),
             retry_max_attempts: Some(5),

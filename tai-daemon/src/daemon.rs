@@ -106,7 +106,6 @@ pub enum DaemonCommand {
     AddAccountCmd {
         name: String,
         provider: String,
-        model: Option<String>,
         base_url: Option<String>,
         streaming: Option<bool>,
         retry_max_attempts: Option<u32>,
@@ -425,7 +424,6 @@ impl DaemonState {
             DaemonCommand::AddAccountCmd {
                 name,
                 provider,
-                model,
                 base_url,
                 streaming,
                 retry_max_attempts,
@@ -436,7 +434,6 @@ impl DaemonState {
                 let config = AccountConfig {
                     name: name.clone(),
                     provider: provider.clone(),
-                    model,
                     base_url,
                     streaming,
                     retry_max_attempts,
@@ -645,7 +642,6 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> Result<
         let default_config = AccountConfig {
             name: "default".to_string(),
             provider: "openai".to_string(),
-            model: None,
             base_url: None,
             streaming: None,
             retry_max_attempts: None,

@@ -1,0 +1,529 @@
+mod requests;
+#[cfg(test)]
+mod tests;
+
+use std::io;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use crate::openai::{
+    ChatAssistantToolUse, ChatRequestMessage, ChatToolCall, ChatToolDefinition, ChatTurnResult,
+    CompletionChunkKind, FinalTextResult,
+};
+
+const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+const DEFAULT_API_VERSION: &str = "2023-06-01";
+const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+/// Configuration for the Anthropic Messages API client.
+#[derive(Debug, Clone)]
+pub struct AnthropicConfig {
+    pub base_url: String,
+    pub api_version: String,
+    pub max_tokens: u32,
+    pub streaming: bool,
+    pub retry_max_attempts: u32,
+    pub retry_initial_backoff_ms: u64,
+    pub retry_max_backoff_ms: u64,
+    pub connect_timeout_secs: u64,
+    pub request_timeout_secs: u64,
+}
+
+impl Default for AnthropicConfig {
+    fn default() -> Self {
+        Self {
+            base_url: DEFAULT_BASE_URL.to_string(),
+            api_version: DEFAULT_API_VERSION.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            streaming: true,
+            retry_max_attempts: 5,
+            retry_initial_backoff_ms: 1000,
+            retry_max_backoff_ms: 30000,
+            connect_timeout_secs: 30,
+            request_timeout_secs: 120,
+        }
+    }
+}
+
+impl AnthropicConfig {
+    /// Apply account-level overrides onto this config.
+    pub fn apply_overrides(&mut self, cfg: &crate::accounts::AccountConfig) {
+        if let Some(base_url) = &cfg.base_url {
+            self.base_url = base_url.clone();
+        }
+        if let Some(streaming) = cfg.streaming {
+            self.streaming = streaming;
+        }
+        if let Some(retry) = cfg.retry_max_attempts {
+            self.retry_max_attempts = retry;
+        }
+        if let Some(connect) = cfg.connect_timeout_secs {
+            self.connect_timeout_secs = connect;
+        }
+        if let Some(request) = cfg.request_timeout_secs {
+            self.request_timeout_secs = request;
+        }
+    }
+}
+
+/// Errors from the Anthropic Messages API.
+#[derive(Debug, thiserror::Error)]
+pub enum AnthropicError {
+    #[error("unauthorized ({status}): {detail}")]
+    Unauthorized { status: u16, detail: String },
+    #[error("rate limited: {detail}")]
+    RateLimited {
+        retry_after_secs: Option<u64>,
+        detail: String,
+    },
+    #[error("server error ({status}): {detail}")]
+    ServerError { status: u16, detail: String },
+    #[error("client error ({status}): {detail}")]
+    ClientError { status: u16, detail: String },
+    #[error("provider returned an empty response")]
+    EmptyResponse,
+    #[error("request cancelled during retry backoff")]
+    Cancelled,
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<crate::retry::ProviderHttpError> for AnthropicError {
+    fn from(err: crate::retry::ProviderHttpError) -> Self {
+        match err {
+            crate::retry::ProviderHttpError::Unauthorized { status, detail } => {
+                AnthropicError::Unauthorized { status, detail }
+            }
+            crate::retry::ProviderHttpError::RateLimited {
+                retry_after_secs,
+                detail,
+            } => AnthropicError::RateLimited {
+                retry_after_secs,
+                detail,
+            },
+            crate::retry::ProviderHttpError::ServerError { status, detail } => {
+                AnthropicError::ServerError { status, detail }
+            }
+            crate::retry::ProviderHttpError::ClientError { status, detail } => {
+                AnthropicError::ClientError { status, detail }
+            }
+            crate::retry::ProviderHttpError::EmptyResponse => AnthropicError::EmptyResponse,
+            crate::retry::ProviderHttpError::Cancelled => AnthropicError::Cancelled,
+            crate::retry::ProviderHttpError::Io(e) => AnthropicError::Io(e),
+        }
+    }
+}
+
+/// Map an Anthropic error to a stable label for metrics.
+pub(crate) fn error_type_label(e: &AnthropicError) -> &'static str {
+    match e {
+        AnthropicError::Unauthorized { .. } => "unauthorized",
+        AnthropicError::RateLimited { .. } => "rate_limited",
+        AnthropicError::ServerError { .. } => "server_error",
+        AnthropicError::ClientError { .. } => "client_error",
+        AnthropicError::EmptyResponse => "empty_response",
+        AnthropicError::Cancelled => "cancelled",
+        AnthropicError::Io(_) => "other",
+    }
+}
+
+/// The Anthropic Messages API client.
+#[derive(Clone, Debug)]
+pub struct AnthropicClient {
+    config: AnthropicConfig,
+    api_key: String,
+    http: reqwest::blocking::Client,
+}
+
+impl AnthropicClient {
+    pub fn new(config: AnthropicConfig, api_key: String) -> io::Result<Self> {
+        let http = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .timeout(Duration::from_secs(config.request_timeout_secs))
+            .build()
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            config,
+            api_key,
+            http,
+        })
+    }
+
+    pub fn config(&self) -> &AnthropicConfig {
+        &self.config
+    }
+
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    /// List available models. Since the Anthropic models endpoint may not be
+    /// accessible to all API keys, we use a curated static list.
+    pub fn validate_and_list_models(&self) -> Result<Vec<String>, AnthropicError> {
+        Ok(KNOWN_CLAUDE_MODELS.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// Non-streaming chat completion turn via the Messages API.
+    pub fn chat_completion_turn(
+        &self,
+        model: &str,
+        messages: &[ChatRequestMessage],
+        tools: &[ChatToolDefinition],
+        on_retry: &mut Option<crate::retry::RetryCallback>,
+        cancel_rx: Option<&mpsc::Receiver<()>>,
+    ) -> Result<ChatTurnResult, AnthropicError> {
+        requests::messages_request(
+            &self.http,
+            &self.config,
+            &self.api_key,
+            model,
+            messages,
+            tools,
+            false,
+            on_retry,
+            cancel_rx,
+        )
+    }
+
+    /// Streaming chat completion turn via the Messages API.
+    pub fn chat_completion_turn_streaming<F>(
+        &self,
+        model: &str,
+        messages: &[ChatRequestMessage],
+        tools: &[ChatToolDefinition],
+        on_retry: &mut Option<crate::retry::RetryCallback>,
+        cancel_rx: Option<&mpsc::Receiver<()>>,
+        on_chunk: F,
+    ) -> Result<ChatTurnResult, AnthropicError>
+    where
+        F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    {
+        let api_start = std::time::Instant::now();
+        let result: Result<ChatTurnResult, AnthropicError> = (|| {
+            if !self.config.streaming {
+                let mut on_chunk = on_chunk;
+                let result =
+                    self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx)?;
+                match &result {
+                    ChatTurnResult::FinalText(final_text) => {
+                        if !final_text.content.is_empty() {
+                            on_chunk(CompletionChunkKind::Answer, final_text.content.clone())?;
+                        }
+                        if let Some(reasoning) =
+                            final_text.reasoning.as_ref().filter(|r| !r.is_empty())
+                        {
+                            on_chunk(CompletionChunkKind::Reasoning, reasoning.clone())?;
+                        }
+                    }
+                    ChatTurnResult::ToolUse(tool_use) => {
+                        if let Some(ref content) = tool_use.content
+                            && !content.is_empty()
+                        {
+                            on_chunk(CompletionChunkKind::Answer, content.clone())?;
+                        }
+                        if let Some(reasoning) =
+                            tool_use.reasoning.as_ref().filter(|r| !r.is_empty())
+                        {
+                            on_chunk(CompletionChunkKind::Reasoning, reasoning.clone())?;
+                        }
+                    }
+                }
+                return Ok(result);
+            }
+
+            requests::messages_request_streaming(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                model,
+                messages,
+                tools,
+                on_retry,
+                cancel_rx,
+                on_chunk,
+            )
+        })();
+
+        let elapsed = api_start.elapsed().as_secs_f64();
+        match &result {
+            Ok(_) => {
+                crate::metrics::record_api_call(model, "anthropic/messages", elapsed);
+            }
+            Err(e) => {
+                crate::metrics::record_api_call(model, "anthropic/messages", elapsed);
+                crate::metrics::record_api_error(model, error_type_label(e));
+            }
+        }
+        result
+    }
+}
+
+// ── API types ──────────────────────────────────────────────────────────
+
+/// Known Claude models (curated static list).
+const KNOWN_CLAUDE_MODELS: &[&str] = &[
+    "claude-sonnet-4-20250514",
+    "claude-sonnet-4",
+    "claude-haiku-3-5-20241022",
+    "claude-haiku-3-5",
+    "claude-opus-4-20250514",
+    "claude-opus-4",
+    "claude-sonnet-3-5-20241022",
+    "claude-sonnet-3-5",
+    "claude-3-haiku-20240307",
+    "claude-3-opus-20240229",
+];
+
+/// Request body for POST /v1/messages.
+#[derive(Debug, Serialize)]
+struct MessagesRequest<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<&'a str>,
+    messages: Vec<MessagePayload<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolPayload<'a>>>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MessagePayload<'a> {
+    role: &'a str,
+    content: Vec<ContentBlockPayload<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum ContentBlockPayload<'a> {
+    Text {
+        r#type: &'a str,
+        text: &'a str,
+    },
+    ToolUse {
+        r#type: &'a str,
+        id: &'a str,
+        name: &'a str,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        r#type: &'a str,
+        tool_use_id: &'a str,
+        content: &'a str,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct ToolPayload<'a> {
+    name: &'a str,
+    description: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_schema: Option<serde_json::Value>,
+}
+
+/// Response body from POST /v1/messages.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct MessagesResponse {
+    id: String,
+    r#type: String,
+    role: String,
+    content: Vec<ContentBlock>,
+    #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
+    stop_sequence: Option<String>,
+    model: String,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum ContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String },
+    #[serde(rename = "redacted_thinking")]
+    #[allow(dead_code)]
+    RedactedThinking { data: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct UsageInfo {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+}
+
+/// Convert the content blocks from a Messages API response into a
+/// [`ChatTurnResult`].
+fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult, AnthropicError> {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_uses: Vec<ChatToolCall> = Vec::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
+
+    for block in response.content {
+        match block {
+            ContentBlock::Text { text } => {
+                text_parts.push(text);
+            }
+            ContentBlock::ToolUse { id, name, input } => {
+                tool_uses.push(ChatToolCall {
+                    id,
+                    name,
+                    arguments_json: input.to_string(),
+                });
+            }
+            ContentBlock::Thinking { thinking } => {
+                reasoning_parts.push(thinking);
+            }
+            ContentBlock::RedactedThinking { .. } => {
+                // Redacted thinking blocks are skipped — they contain no usable text.
+            }
+        }
+    }
+
+    let reasoning = if reasoning_parts.is_empty() {
+        None
+    } else {
+        Some(reasoning_parts.join("\n"))
+    };
+
+    if !tool_uses.is_empty() {
+        let content = if text_parts.is_empty() {
+            None
+        } else {
+            Some(text_parts.join(""))
+        };
+        return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
+            content,
+            tool_calls: tool_uses,
+            reasoning,
+        }));
+    }
+
+    let content = text_parts.join("");
+    if content.is_empty() {
+        return Err(AnthropicError::EmptyResponse);
+    }
+
+    Ok(ChatTurnResult::FinalText(FinalTextResult {
+        content,
+        reasoning,
+    }))
+}
+
+/// Convert a list of messages + tools into the format expected by the
+/// Anthropic Messages API.
+fn build_message_payloads<'a>(
+    messages: &'a [ChatRequestMessage],
+    _tools: &'a [ChatToolDefinition],
+) -> (Vec<MessagePayload<'a>>, Option<String>) {
+    let mut system: Option<String> = None;
+    let mut payloads: Vec<MessagePayload> = Vec::new();
+
+    for msg in messages {
+        match msg.role {
+            "system" => {
+                // Collect system messages — Anthropic uses a top-level "system"
+                // field instead of a system message in the messages array.
+                if let Some(ref content) = msg.content {
+                    let text = system.get_or_insert_with(String::new);
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(content);
+                }
+            }
+            "tool" => {
+                // Tool results in Anthropic format: role: "user", content: [{type: "tool_result", ...}]
+                let text = msg.content.as_deref().unwrap_or("");
+                payloads.push(MessagePayload {
+                    role: "user",
+                    content: vec![ContentBlockPayload::ToolResult {
+                        r#type: "tool_result",
+                        tool_use_id: msg.tool_call_id.as_deref().unwrap_or(""),
+                        content: text,
+                    }],
+                });
+            }
+            "assistant" => {
+                // Assistant messages may contain text + tool_use content blocks.
+                let mut blocks: Vec<ContentBlockPayload<'a>> = Vec::new();
+                // Add text content if present.
+                if let Some(text) = msg.content.as_deref().filter(|t| !t.is_empty()) {
+                    blocks.push(ContentBlockPayload::Text {
+                        r#type: "text",
+                        text,
+                    });
+                }
+                // Add tool_use blocks for each tool call.
+                if let Some(ref calls) = msg.tool_calls {
+                    for tc in calls {
+                        blocks.push(ContentBlockPayload::ToolUse {
+                            r#type: "tool_use",
+                            id: &tc.id,
+                            name: &tc.function.name,
+                            input: serde_json::from_str(&tc.function.arguments)
+                                .unwrap_or(serde_json::Value::Null),
+                        });
+                    }
+                }
+                payloads.push(MessagePayload {
+                    role: "assistant",
+                    content: blocks,
+                });
+            }
+            role => {
+                // User or other roles: wrap content as text blocks.
+                let content = msg.content.as_deref().unwrap_or("");
+                payloads.push(MessagePayload {
+                    role,
+                    content: vec![ContentBlockPayload::Text {
+                        r#type: "text",
+                        text: content,
+                    }],
+                });
+            }
+        }
+    }
+
+    // Remove the last message if it's empty (sometimes happens with
+    // user messages that contain only tool results).
+    if let Some(last) = payloads.last()
+        && last.content.is_empty()
+    {
+        payloads.pop();
+    }
+
+    (payloads, system)
+}
+
+/// Map tool definitions to Anthropic tool format.
+fn build_tool_payloads(tools: &[ChatToolDefinition]) -> Vec<ToolPayload<'_>> {
+    tools
+        .iter()
+        .map(|t| {
+            // Each ChatToolDefinition has a single "function" entry.
+            ToolPayload {
+                name: t.function.name,
+                description: t.function.description,
+                input_schema: Some(t.function.parameters.clone()),
+            }
+        })
+        .collect()
+}

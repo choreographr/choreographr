@@ -1340,7 +1340,6 @@ mod tests {
         let accounts = vec![AccountInfo {
             name: "my-acc".into(),
             provider: "opencode".into(),
-            model: None,
             has_credential: true,
         }];
         dispatch_daemon_message(&mut h, DaemonMessage::Accounts { accounts }).unwrap();

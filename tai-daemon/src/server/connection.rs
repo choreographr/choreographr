@@ -202,7 +202,6 @@ pub(crate) fn client_thread(
                     ClientMessage::AddAccount {
                         name,
                         provider,
-                        model,
                         base_url,
                         streaming,
                         retry_max_attempts,
@@ -213,7 +212,6 @@ pub(crate) fn client_thread(
                         let _ = daemon_tx.send(DaemonCommand::AddAccountCmd {
                             name: name.clone(),
                             provider,
-                            model,
                             base_url,
                             streaming,
                             retry_max_attempts,

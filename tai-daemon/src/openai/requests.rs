@@ -17,7 +17,7 @@ impl OpenAiClient {
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, super::OpenAiError> {
         info!("listing models from {}", self.config.base_url);
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
-        let retry = retry::RetryConfig::from_service_config(&self.config);
+        let retry = retry::retry_config_from_config(&self.config);
         let response = retry::retry_send_get_simple(&self.http, &url, &self.api_key, &retry)?;
         let payload: ModelListResponse = response
             .json()
@@ -185,7 +185,7 @@ fn responses_request(
     prompt: &str,
 ) -> Result<String, super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
-    let retry = retry::RetryConfig::from_service_config(config);
+    let retry = retry::retry_config_from_config(config);
     let body = serde_json::to_value(&ResponsesRequest {
         model,
         input: prompt,
@@ -227,7 +227,7 @@ fn chat_completions_request(
             retry::MaxTokensField::MaxTokens => (max_tokens, None),
             retry::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
-    let retry = retry::RetryConfig::from_service_config(config);
+    let retry = retry::retry_config_from_config(config);
     let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
@@ -279,7 +279,7 @@ fn chat_completions_request_with_tools(
             retry::MaxTokensField::MaxTokens => (max_tokens, None),
             retry::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
-    let retry = retry::RetryConfig::from_service_config(config);
+    let retry = retry::retry_config_from_config(config);
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
         messages,
@@ -363,7 +363,7 @@ where
             retry::MaxTokensField::MaxTokens => (max_tokens, None),
             retry::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
-    let retry = retry::RetryConfig::from_service_config(config);
+    let retry = retry::retry_config_from_config(config);
     let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
@@ -426,7 +426,7 @@ where
     F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
 {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
-    let retry = retry::RetryConfig::from_service_config(config);
+    let retry = retry::retry_config_from_config(config);
     let body = serde_json::to_value(&ResponsesRequest {
         model,
         input: prompt,
@@ -522,7 +522,7 @@ where
             retry::MaxTokensField::MaxTokens => (max_tokens, None),
             retry::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
         };
-    let retry = retry::RetryConfig::from_service_config(config);
+    let retry = retry::retry_config_from_config(config);
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
         messages,
@@ -617,7 +617,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::retry;
     use super::*;
     use crate::openai::StreamToolCallFunctionDelta;
     use std::time::Duration;
@@ -628,15 +627,15 @@ mod tests {
     fn sleep_or_cancel_signal_returns_cancelled() {
         let (tx, rx) = mpsc::channel::<()>();
         tx.send(()).unwrap();
-        let result = retry::sleep_or_cancel(Duration::from_secs(10), Some(&rx));
-        assert!(matches!(result, Err(crate::openai::OpenAiError::Cancelled)));
+        let result = crate::retry::sleep_or_cancel(Duration::from_secs(10), Some(&rx));
+        assert!(result.is_err());
     }
 
     #[test]
     fn sleep_or_cancel_disconnected_returns_ok() {
         let (tx, rx) = mpsc::channel::<()>();
         drop(tx);
-        let result = retry::sleep_or_cancel(Duration::from_millis(1), Some(&rx));
+        let result = crate::retry::sleep_or_cancel(Duration::from_millis(1), Some(&rx));
         assert!(result.is_ok());
     }
 

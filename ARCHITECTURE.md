@@ -8,10 +8,10 @@ desktop, and IM platforms) connect to the daemon over a Unix domain socket using
 custom length-prefixed binary protocol.
 
 ```
-┌──────────────┐    Unix socket     ┌──────────────┐    HTTP/SSE     ┌───────────────┐
-│   tai-tui     │◄──────────────────►│              │◄──────────────►│  OpenAI API   │
-│  (terminal)  │                    │              │                │               │
-├──────────────┤                    │  tai-daemon  │                └───────────────┘
+┌──────────────┐    Unix socket     ┌──────────────┐    HTTP/SSE     ┌───────────────────┐
+│   tai-tui     │◄──────────────────►│              │◄──────────────►│  OpenAI API       │
+│  (terminal)  │                    │              │               │  Anthropic API    │
+├──────────────┤                    │  tai-daemon  │                └───────────────────┘
 │ tai-dioxus   │◄──────────────────►│              │
 │  (desktop)   │    Unix socket     │              │
 ├──────────────┤                    │              │
@@ -188,7 +188,9 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. |
-| `providers/` | `InferenceProvider` enum wrapping provider-specific clients (OpenAI, future Anthropic). Provides a uniform interface for chat completion, streaming, and model listing. |
+| `providers/` | `InferenceProvider` enum wrapping provider-specific clients (OpenAI, Anthropic). Provides a uniform interface for chat completion, streaming, and model listing. |
+| `anthropic/` | Anthropic Messages API client. Implements `AnthropicClient`, request/response types for the Messages API (`/v1/messages`), content block handling (text, tool_use, thinking), and Anthropic SSE streaming (event-type-aware parser). Auth via `x-api-key` header with `anthropic-version`. Model list is a curated static set. |
+| `retry/` | Shared HTTP retry logic extracted from the OpenAI module. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. Both `openai` and `anthropic` modules use this via their own error type conversions. |
 | `sessions.rs` | `SessionState` management: CRUD, subscriptions, broadcasting, persistence. Each session has a control thread; request work runs on separate worker threads. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
@@ -592,6 +594,7 @@ and exits cleanly when the daemon shuts down.
 | `requests.rs` — `run_agent_loop` turn | `record_turn` | turn count per model |
 | `requests.rs` — `execute_tool_with_timeout` | `record_tool_execution` | tool duration + status |
 | `openai/requests.rs` — `chat_completion_turn_streaming` | `record_api_call`, `record_api_error` | API latency + errors |
+| `anthropic/mod.rs` — `chat_completion_turn_streaming` | `record_api_call`, `record_api_error` | API latency + errors |
 
 ---
 
@@ -700,8 +703,10 @@ User presses Enter on a session in the session manager
 8. **Session subscription model** — multiple clients can subscribe to the same session. Events
    are broadcast to all subscribers except the originator, enabling shared session viewing.
 
-9. **SSE streaming** — a custom `SseReader` (not a library) handles `data:` lines and `[DONE]`,
-   giving full control over parsing and buffering behavior.
+9. **SSE streaming** — a custom `SseReader` (not a library) handles `data:` lines and `[DONE]`
+   for OpenAI SSE, giving full control over parsing and buffering behavior. The Anthropic
+   module has its own `AnthropicSseReader` that handles both `event:` and `data:` lines
+   (required by the Anthropic Messages streaming format) and yields `(event_type, data)` pairs.
 
 10. **Markdown as the intermediate format** — all text (tool output, assistant text, error
     messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
@@ -711,7 +716,14 @@ User presses Enter on a session in the session manager
     endpoints, selectable per-model. This lets users route different models to their best-supported
     endpoint.
 
-12. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
+12. **Pluggable providers via `InferenceProvider`** — the provider enum now supports both
+    OpenAI-compatible and Anthropic APIs. Each provider implements the same interface
+    (`chat_completion_turn`, `chat_completion_turn_streaming`, `list_models`) and is constructed
+    from an `AccountConfig` + credential. Accounts are defined in `accounts.toml` with a
+    `provider` field (`"openai"`, `"opencode"`, `"anthropic"`, etc.). The TUI new-account form
+    offers all registered provider options via a shared `PROVIDER_OPTIONS` array.
+
+13. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
     where third-party libraries (alloy) require it. A global `OnceLock<tokio::runtime::Runtime>`
     serves as a sidecar for those async calls via `block_on()`. This simplifies the mental model
     (each thread owns its data, no `Send` bounds on shared state, no `Pin<Box<dyn Future>>`),
@@ -921,6 +933,7 @@ Sandboxing (shared across all shell/exec tools via `shell_util.rs`):
 | Client core | Shell parsing, markdown→HTML, image assembly, history | `tai-client-core/src/tests.rs` |
 | Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `tai-daemon/src/tests.rs`, `tai-daemon/tests/integration.rs` |
 | Daemon OpenAI | SSE parsing, HTTP request construction, config loading | `tai-daemon/src/openai/tests.rs` |
+| Daemon Anthropic | Content block deserialisation, response→turn result conversion, message payload building, config overrides | `tai-daemon/src/anthropic/tests.rs` |
 | tai-tui | SVG rasterization, Unicode width, app state | `tai-tui/src/app_tests.rs`, `tai-tui/src/lib_tests.rs` |
 | tai-dioxus | App state, render helpers | `tai-dioxus/src/app_tests.rs` |
 

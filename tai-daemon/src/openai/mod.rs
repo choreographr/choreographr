@@ -13,11 +13,11 @@ pub use config::{
 pub(crate) use sse::build_sse_event;
 pub(crate) use sse::{SseReader, extract_responses_text_delta};
 
-pub use retry::RetryCallback;
 #[cfg(test)]
-pub(crate) use retry::{
+pub(crate) use crate::retry::{
     RetryConfig, backoff_duration, is_retryable_status, parse_retry_after_secs,
 };
+pub use retry::RetryCallback;
 
 use serde::{Deserialize, Serialize};
 use std::{io, time::Duration};
@@ -126,14 +126,14 @@ struct Usage {
 pub struct ChatToolDefinition {
     #[serde(rename = "type")]
     kind: &'static str,
-    function: ChatToolFunction,
+    pub(crate) function: ChatToolFunction,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ChatToolFunction {
-    name: &'static str,
-    description: &'static str,
-    parameters: serde_json::Value,
+pub(crate) struct ChatToolFunction {
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) parameters: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
