@@ -40,9 +40,11 @@ Never use `expect()`, `unwrap()`, or `panic!()` in production code. These create
 4. **Mutex poisoning** — use `.lock().unwrap_or_else(|e| e.into_inner())` to recover from poisoned mutexes instead of panicking.
 5. **`unwrap()`/`expect()`/`panic!()` are permitted only in `#[cfg(test)]` modules and `tests/` integration test files.**
 
-## TUI Logging
+## Logging
 
-In the `tai-tui` crate, do not use `eprintln!` for diagnostics. Use `tracing::info!`, `tracing::warn!`, or `tracing::error!` instead — output goes to `/tmp/tai-tui.log`.
+All crates in the workspace (`tai-daemon`, `tai-client-core`, `tai-keystore`, `tai-im`, `tai-dioxus`, `tai-markdown`, `tai-proto`, `tai-tui`) must log extensively using the `tracing` crate. Every module should emit `tracing` events (`info!`, `warn!`, `error!`, `debug!`, `trace!`) at appropriate levels to provide observability into key operations, state transitions, and error conditions.
+
+In the `tai-tui` crate specifically, do not use `eprintln!` for diagnostics — output goes to `/tmp/tai-tui.log`.
 
 ## Thread Communication
 
