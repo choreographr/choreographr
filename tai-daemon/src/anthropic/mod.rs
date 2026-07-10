@@ -3,7 +3,6 @@ mod requests;
 mod tests;
 
 use std::io;
-use std::sync::mpsc;
 use tracing::{debug, warn};
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +11,7 @@ use crate::openai::{
     ChatAssistantToolUse, ChatRequestMessage, ChatToolCall, ChatToolDefinition, ChatTurnResult,
     CompletionChunkKind, FinalTextResult,
 };
+use crate::providers::ChatTurnRequest;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_API_VERSION: &str = "2023-06-01";
@@ -91,39 +91,22 @@ impl ProviderClient for AnthropicClient {
 
     fn chat_completion_turn(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<crate::retry::RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result =
-            self.chat_completion_turn(model, messages, tools, thinking_effort, on_retry, cancel_rx);
+        let model = params.model;
+        let result = self.chat_completion_turn(params);
         crate::providers::shared::timed_result(api_start, model, "anthropic", result)
     }
 
     fn chat_completion_turn_streaming(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<crate::retry::RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
         on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result = self.chat_completion_turn_streaming(
-            model,
-            messages,
-            tools,
-            thinking_effort,
-            on_retry,
-            cancel_rx,
-            on_chunk,
-        );
+        let model = params.model;
+        let result = self.chat_completion_turn_streaming(params, on_chunk);
         crate::providers::shared::timed_result(api_start, model, "anthropic", result)
     }
 
@@ -167,56 +150,39 @@ impl AnthropicClient {
     /// Non-streaming chat completion turn via the Messages API.
     pub fn chat_completion_turn(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<crate::retry::RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, AnthropicError> {
         debug!(
-            effort = %thinking_effort.as_label(),
+            effort = %params.thinking_effort.as_label(),
             "Anthropic chat completion turn"
         );
         requests::messages_request(
             &self.http,
             &self.config,
             &self.api_key,
-            model,
-            messages,
-            tools,
-            thinking_effort,
+            params.model,
+            params.messages,
+            params.tools,
+            params.thinking_effort,
             false,
-            on_retry,
-            cancel_rx,
+            params.on_retry,
+            params.cancel_rx,
         )
     }
 
     /// Streaming chat completion turn via the Messages API.
     pub fn chat_completion_turn_streaming<F>(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<crate::retry::RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
         on_chunk: F,
     ) -> Result<ChatTurnResult, AnthropicError>
     where
         F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
     {
-        debug!(?thinking_effort, "anthropic chat_completion_turn_streaming");
+        debug!(?params.thinking_effort, "anthropic chat_completion_turn_streaming");
         if !self.config.streaming {
             let mut on_chunk = on_chunk;
-            let result = self.chat_completion_turn(
-                model,
-                messages,
-                tools,
-                thinking_effort,
-                on_retry,
-                cancel_rx,
-            )?;
+            let result = self.chat_completion_turn(params)?;
             match &result {
                 ChatTurnResult::FinalText(final_text) => {
                     if !final_text.content.is_empty() {
@@ -245,12 +211,12 @@ impl AnthropicClient {
             &self.http,
             &self.config,
             &self.api_key,
-            model,
-            messages,
-            tools,
-            thinking_effort,
-            on_retry,
-            cancel_rx,
+            params.model,
+            params.messages,
+            params.tools,
+            params.thinking_effort,
+            params.on_retry,
+            params.cancel_rx,
             on_chunk,
         )
     }

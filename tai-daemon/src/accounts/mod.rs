@@ -69,6 +69,15 @@ pub struct AccountManager {
 }
 
 impl AccountManager {
+    /// Create an empty account manager with the default config path.
+    /// Used as a fallback when the accounts file cannot be loaded.
+    pub fn empty() -> Self {
+        Self {
+            config_path: PathBuf::new(),
+            accounts: HashMap::new(),
+        }
+    }
+
     /// Load accounts from a TOML file. If the file doesn't exist, returns an
     /// empty manager (no error).
     pub fn load(path: &Path) -> io::Result<Self> {

@@ -100,14 +100,15 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Load accounts (may be empty — unlock will reload them)
+    // If the config path or file is unavailable, start with an empty manager.
     let accounts = match accounts_config_path() {
         Ok(path) => AccountManager::load(&path).unwrap_or_else(|e| {
             warn!("failed to load accounts: {e}");
-            AccountManager::load(std::path::Path::new("/dev/null")).unwrap()
+            AccountManager::empty()
         }),
         Err(e) => {
             warn!("no accounts config path: {e}");
-            AccountManager::load(std::path::Path::new("/dev/null")).unwrap()
+            AccountManager::empty()
         }
     };
 

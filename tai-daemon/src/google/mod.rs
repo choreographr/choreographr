@@ -3,7 +3,6 @@ mod requests;
 mod tests;
 
 use std::io;
-use std::sync::mpsc;
 use tracing::debug;
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +11,7 @@ use crate::openai::{
     ChatAssistantToolUse, ChatRequestMessage, ChatToolCall, ChatToolDefinition, ChatTurnResult,
     CompletionChunkKind, FinalTextResult,
 };
+use crate::providers::ChatTurnRequest;
 
 /// Default base URL for the Gemini API.
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -106,56 +106,37 @@ impl GoogleClient {
     }
 
     /// Non-streaming chat completion turn via the Gemini generateContent API.
-    #[allow(clippy::too_many_arguments)]
     pub fn chat_completion_turn(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<crate::retry::RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, GoogleError> {
-        debug!(effort = %thinking_effort.as_label(), "Google chat completion turn");
+        debug!(effort = %params.thinking_effort.as_label(), "Google chat completion turn");
         requests::generate_content_request(
             &self.http,
             &self.config,
             &self.api_key,
-            model,
-            messages,
-            tools,
-            thinking_effort,
-            on_retry,
-            cancel_rx,
+            params.model,
+            params.messages,
+            params.tools,
+            params.thinking_effort,
+            params.on_retry,
+            params.cancel_rx,
         )
     }
 
     /// Streaming chat completion turn via the Gemini streamGenerateContent API.
-    #[allow(clippy::too_many_arguments)]
     pub fn chat_completion_turn_streaming<F>(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<crate::retry::RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
         on_chunk: F,
     ) -> Result<ChatTurnResult, GoogleError>
     where
         F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
     {
-        debug!(?thinking_effort, "google chat_completion_turn_streaming");
+        debug!(?params.thinking_effort, "google chat_completion_turn_streaming");
         if !self.config.streaming {
             let mut on_chunk = on_chunk;
-            let result = self.chat_completion_turn(
-                model,
-                messages,
-                tools,
-                thinking_effort,
-                on_retry,
-                cancel_rx,
-            )?;
+            let result = self.chat_completion_turn(params)?;
             match &result {
                 ChatTurnResult::FinalText(final_text) => {
                     if !final_text.content.is_empty() {
@@ -184,12 +165,12 @@ impl GoogleClient {
             &self.http,
             &self.config,
             &self.api_key,
-            model,
-            messages,
-            tools,
-            thinking_effort,
-            on_retry,
-            cancel_rx,
+            params.model,
+            params.messages,
+            params.tools,
+            params.thinking_effort,
+            params.on_retry,
+            params.cancel_rx,
             on_chunk,
         )
     }
@@ -207,39 +188,22 @@ impl ProviderClient for GoogleClient {
 
     fn chat_completion_turn(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<crate::retry::RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result =
-            self.chat_completion_turn(model, messages, tools, thinking_effort, on_retry, cancel_rx);
+        let model = params.model;
+        let result = self.chat_completion_turn(params);
         crate::providers::shared::timed_result(api_start, model, "google", result)
     }
 
     fn chat_completion_turn_streaming(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<crate::retry::RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
         on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result = self.chat_completion_turn_streaming(
-            model,
-            messages,
-            tools,
-            thinking_effort,
-            on_retry,
-            cancel_rx,
-            on_chunk,
-        );
+        let model = params.model;
+        let result = self.chat_completion_turn_streaming(params, on_chunk);
         crate::providers::shared::timed_result(api_start, model, "google", result)
     }
 

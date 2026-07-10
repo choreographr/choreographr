@@ -5,7 +5,8 @@ use crate::openai::{
     ChatToolCall, ChatTurnResult, CompletionChunkKind,
 };
 use crate::providers::{
-    InferenceProvider, ReasoningSupport, effective_reasoning_support, lookup_provider,
+    ChatTurnRequest, InferenceProvider, ReasoningSupport, effective_reasoning_support,
+    lookup_provider,
 };
 use crate::sessions::{SessionCommand, SessionMetadata, SessionState};
 use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
@@ -180,12 +181,14 @@ pub(crate) fn run_agent_loop(
         }));
 
         match client.chat_completion_turn_streaming(
-            model,
-            &messages,
-            &tools,
-            thinking_effort,
-            &mut retry_cb,
-            Some(cancel_rx),
+            ChatTurnRequest {
+                model,
+                messages: &messages,
+                tools: &tools,
+                thinking_effort,
+                on_retry: &mut retry_cb,
+                cancel_rx: Some(cancel_rx),
+            },
             &mut |kind, text| {
                 let stream = match kind {
                     CompletionChunkKind::Answer => OutputStream::Answer,

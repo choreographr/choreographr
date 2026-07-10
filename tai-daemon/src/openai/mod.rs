@@ -21,7 +21,6 @@ pub use retry::RetryCallback;
 
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::sync::mpsc;
 
 /// Re-export the shared provider error type so all OpenAI code continues to
 /// use `super::OpenAiError` without structural changes.
@@ -321,7 +320,7 @@ pub(crate) fn reasoning_effort_api_value(effort: ThinkingEffort) -> Option<&'sta
 
 // ── ProviderClient trait impl ───────────────────────────────────────────
 
-use crate::providers::ProviderClient;
+use crate::providers::{ChatTurnRequest, ProviderClient};
 use tai_proto::{InferenceError, ThinkingEffort};
 
 impl ProviderClient for OpenAiClient {
@@ -331,39 +330,22 @@ impl ProviderClient for OpenAiClient {
 
     fn chat_completion_turn(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result =
-            self.chat_completion_turn(model, messages, tools, thinking_effort, on_retry, cancel_rx);
+        let model = params.model;
+        let result = self.chat_completion_turn(params);
         crate::providers::shared::timed_result(api_start, model, "openai", result)
     }
 
     fn chat_completion_turn_streaming(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
         on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result = self.chat_completion_turn_streaming(
-            model,
-            messages,
-            tools,
-            thinking_effort,
-            on_retry,
-            cancel_rx,
-            on_chunk,
-        );
+        let model = params.model;
+        let result = self.chat_completion_turn_streaming(params, on_chunk);
         crate::providers::shared::timed_result(api_start, model, "openai", result)
     }
 

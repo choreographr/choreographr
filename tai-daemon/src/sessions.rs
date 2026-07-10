@@ -497,7 +497,14 @@ fn process_command(
                 match rx.recv() {
                     Ok(Some(provider)) => {
                         state.provider = Some(provider);
-                        state.provider.as_ref().unwrap()
+                        let Some(p) = state.provider.as_ref() else {
+                            return fail_request(
+                                &state.subscribers,
+                                request_id,
+                                "internal error: provider not set after resolution".to_string(),
+                            );
+                        };
+                        p
                     }
                     _ => {
                         return fail_request(

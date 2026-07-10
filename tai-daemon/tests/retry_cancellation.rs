@@ -8,6 +8,7 @@ use std::time::Duration;
 use tai_daemon::openai::{
     ChatRequestMessage, ChatTurnResult, OpenAiClient, OpenAiError, RetryCallback, ServiceConfig,
 };
+use tai_daemon::providers::ChatTurnRequest;
 use tai_proto::ThinkingEffort;
 
 // ── Helpers ───────────────────────────────────────────────────────
@@ -92,14 +93,14 @@ fn retry_succeeds_with_callback() {
     let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
     let messages = [ChatRequestMessage::simple("user", "hello".into())];
 
-    let result = client.chat_completion_turn(
-        "retry-model",
-        &messages,
-        &[], // no tools
-        ThinkingEffort::Off,
-        &mut cb,
-        Some(&cancel_rx),
-    );
+    let result = client.chat_completion_turn(ChatTurnRequest {
+        model: "retry-model",
+        messages: &messages,
+        tools: &[], // no tools
+        thinking_effort: ThinkingEffort::Off,
+        on_retry: &mut cb,
+        cancel_rx: Some(&cancel_rx),
+    });
 
     match result {
         Ok(ChatTurnResult::FinalText(final_text)) => {
@@ -154,14 +155,14 @@ fn retry_cancelled_during_backoff() {
     });
 
     let mut cb: Option<RetryCallback> = None;
-    let result = client.chat_completion_turn(
-        "retry-model",
-        &messages,
-        &[],
-        ThinkingEffort::Off,
-        &mut cb,
-        Some(&cancel_rx),
-    );
+    let result = client.chat_completion_turn(ChatTurnRequest {
+        model: "retry-model",
+        messages: &messages,
+        tools: &[], // no tools
+        thinking_effort: ThinkingEffort::Off,
+        on_retry: &mut cb,
+        cancel_rx: Some(&cancel_rx),
+    });
 
     assert!(
         matches!(result, Err(OpenAiError::Cancelled)),

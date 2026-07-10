@@ -1,14 +1,10 @@
 use std::io;
 use std::sync::Arc;
-use std::sync::mpsc;
 
 use crate::anthropic::AnthropicClient;
 use crate::mistral::MistralClient;
-use crate::openai::{
-    ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind, OpenAiClient,
-    RetryCallback,
-};
-use tai_proto::{InferenceError, ThinkingEffort};
+use crate::openai::{ChatTurnResult, CompletionChunkKind, OpenAiClient};
+use tai_proto::InferenceError;
 
 mod catalog;
 pub(crate) mod shared;
@@ -18,7 +14,7 @@ pub use catalog::{
     PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, ReasoningSupport, all_display_names,
     all_slugs, effective_reasoning_support, lookup_provider,
 };
-pub use traits::ProviderClient;
+pub use traits::{ChatTurnRequest, ProviderClient};
 
 #[derive(Clone, Debug)]
 pub struct InferenceProvider {
@@ -121,42 +117,17 @@ impl InferenceProvider {
 
     pub fn chat_completion_turn(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        self.client.chat_completion_turn(
-            model,
-            messages,
-            tools,
-            thinking_effort,
-            on_retry,
-            cancel_rx,
-        )
+        self.client.chat_completion_turn(params)
     }
 
     pub fn chat_completion_turn_streaming(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
         on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        self.client.chat_completion_turn_streaming(
-            model,
-            messages,
-            tools,
-            thinking_effort,
-            on_retry,
-            cancel_rx,
-            on_chunk,
-        )
+        self.client.chat_completion_turn_streaming(params, on_chunk)
     }
 
     /// Return the provider slug (e.g. "openai", "anthropic").

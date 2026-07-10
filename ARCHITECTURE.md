@@ -213,14 +213,26 @@ The provider system has three layers:
 
 **1. `ProviderClient` trait (`providers/traits.rs`):**
 ```rust
+/// Holds the common parameters for a chat completion turn.
+pub struct ChatTurnRequest<'a> {
+    pub model: &'a str,
+    pub messages: &'a [ChatRequestMessage],
+    pub tools: &'a [ChatToolDefinition],
+    pub thinking_effort: ThinkingEffort,
+    pub on_retry: &'a mut Option<RetryCallback>,
+    pub cancel_rx: Option<&'a mpsc::Receiver<()>>,
+}
+
 pub trait ProviderClient: Debug + Send + Sync {
     fn provider_slug(&self) -> &'static str;
-    fn chat_completion_turn(&self, ..., thinking_effort: ThinkingEffort, ...) -> Result<ChatTurnResult, InferenceError>;
-    fn chat_completion_turn_streaming(&self, ..., thinking_effort: ThinkingEffort, ...) -> Result<ChatTurnResult, InferenceError>;
+    fn chat_completion_turn(&self, params: ChatTurnRequest<'_>) -> Result<ChatTurnResult, InferenceError>;
+    fn chat_completion_turn_streaming(&self, params: ChatTurnRequest<'_>, on_chunk: &mut dyn FnMut(...)) -> Result<ChatTurnResult, InferenceError>;
     fn list_models(&self) -> Result<Vec<String>, InferenceError>;
 }
 ```
 
+`ChatTurnRequest` consolidates the six per-turn parameters into a single struct
+to eliminate repetitive argument passing across all provider implementations.
 Uses `&mut dyn FnMut` for the streaming callback to keep the trait object-safe.
 Each client implementation maps `ThinkingEffort` to its wire format:
 - **OpenAI**: `reasoning_effort` field (`"low"`, `"medium"`, `"high"`)

@@ -1,4 +1,3 @@
-use tai_proto::ThinkingEffort;
 use tracing::{debug, info};
 
 use super::ServiceConfig;
@@ -10,6 +9,7 @@ use super::{
     OpenAiClient, RequestFormat, ResponsesRequest, ResponsesResponse, SseReader,
     StreamToolCallDelta, endpoint_url, extract_responses_text_delta, reasoning_effort_api_value,
 };
+use crate::providers::ChatTurnRequest;
 use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc;
@@ -79,44 +79,34 @@ impl OpenAiClient {
 
     pub fn chat_completion_turn(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<retry::RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, super::OpenAiError> {
-        let reasoning_effort = reasoning_effort_api_value(thinking_effort);
-        debug!(?thinking_effort, ?reasoning_effort, "chat_completion_turn");
+        let reasoning_effort = reasoning_effort_api_value(params.thinking_effort);
+        debug!(?params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
         chat_completions_request_with_tools(
             &self.http,
             &self.config,
             &self.api_key,
-            model,
-            messages,
-            tools,
+            params.model,
+            params.messages,
+            params.tools,
             reasoning_effort,
-            on_retry,
-            cancel_rx,
+            params.on_retry,
+            params.cancel_rx,
         )
     }
 
     pub fn chat_completion_turn_streaming<F>(
         &self,
-        model: &str,
-        messages: &[ChatRequestMessage],
-        tools: &[ChatToolDefinition],
-        thinking_effort: ThinkingEffort,
-        on_retry: &mut Option<retry::RetryCallback>,
-        cancel_rx: Option<&mpsc::Receiver<()>>,
+        params: ChatTurnRequest<'_>,
         on_chunk: F,
     ) -> Result<ChatTurnResult, super::OpenAiError>
     where
         F: FnMut(super::CompletionChunkKind, String) -> io::Result<()>,
     {
-        let reasoning_effort = reasoning_effort_api_value(thinking_effort);
+        let reasoning_effort = reasoning_effort_api_value(params.thinking_effort);
         debug!(
-            ?thinking_effort,
+            ?params.thinking_effort,
             ?reasoning_effort,
             "chat_completion_turn_streaming"
         );
@@ -125,14 +115,7 @@ impl OpenAiClient {
             // chunk through the callback so the caller's broadcasting path
             // stays uniform regardless of the streaming setting.
             let mut on_chunk = on_chunk;
-            let result = self.chat_completion_turn(
-                model,
-                messages,
-                tools,
-                thinking_effort,
-                on_retry,
-                cancel_rx,
-            )?;
+            let result = self.chat_completion_turn(params)?;
             match &result {
                 ChatTurnResult::FinalText(final_text) => {
                     if !final_text.content.is_empty() {
@@ -165,12 +148,12 @@ impl OpenAiClient {
             &self.http,
             &self.config,
             &self.api_key,
-            model,
-            messages,
-            tools,
+            params.model,
+            params.messages,
+            params.tools,
             reasoning_effort,
-            on_retry,
-            cancel_rx,
+            params.on_retry,
+            params.cancel_rx,
             on_chunk,
         )
     }
@@ -626,6 +609,7 @@ mod tests {
     use super::*;
     use crate::openai::StreamToolCallFunctionDelta;
     use std::time::Duration;
+    use tai_proto::ThinkingEffort;
 
     // -- sleep_or_cancel tests -------------------------------------------
 

@@ -1,4 +1,5 @@
 use prometheus::{Encoder, HistogramVec, IntCounter, IntCounterVec, IntGauge};
+use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -94,11 +95,16 @@ pub fn init() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|_| error!("metrics already initialized — this is a bug"));
 
     // Pre-parse the content-type header so serve_metrics doesn't need to
-    // parse it on every request. The string is hardcoded, so this is
-    // guaranteed to succeed.
-    let content_type: tiny_http::Header = "Content-Type: text/plain; version=0.0.4; charset=utf-8"
-        .parse()
-        .expect("hardcoded content-type header is valid");
+    // parse it on every request. The string is hardcoded and known-valid,
+    // so this only fails if the runtime environment is fundamentally broken.
+    let content_type =
+        tiny_http::Header::from_bytes("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+    let Ok(content_type) = content_type else {
+        return Err(io::Error::other(
+            "failed to parse hardcoded Content-Type header (this is a bug)",
+        )
+        .into());
+    };
     METRICS_CONTENT_TYPE
         .set(content_type)
         .unwrap_or_else(|_| error!("metrics content-type header already set — this is a bug"));

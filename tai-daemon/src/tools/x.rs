@@ -1,6 +1,5 @@
 use crate::tools::{ToolExecutionOutput, tool_err, tool_ok, truncate_tool_output};
 use reqwest::blocking::Client;
-use sha1::Sha1;
 use tai_keystore::{ServiceCredential, XCredentialView};
 
 fn get_x_credentials(x_credentials: Option<&ServiceCredential>) -> Option<XCredentialView<'_>> {
@@ -26,7 +25,16 @@ fn urlencode(s: &str) -> String {
 
 fn hmac_sha1(key: &[u8], data: &str) -> String {
     use hmac::{Hmac, KeyInit, Mac};
-    let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC can take key of any size");
+    use sha1::Sha1;
+    // Pad or truncate to HMAC-SHA1 block size (64 bytes).
+    // new_from_slice would reject empty keys, so we always
+    // provide a fixed-size key buffer.
+    let mut key_buf = [0u8; 64];
+    if !key.is_empty() {
+        let len = key.len().min(64);
+        key_buf[..len].copy_from_slice(&key[..len]);
+    }
+    let mut mac = Hmac::<Sha1>::new((&key_buf).into());
     mac.update(data.as_bytes());
     let result = mac.finalize();
     base64::Engine::encode(
