@@ -1,4 +1,4 @@
-use crate::tools::{ToolError, ToolResult, tool_ok, truncate_tool_output};
+use crate::tools::{ToolError, truncate_tool_output};
 use gix::ObjectId;
 use serde::Deserialize;
 use std::io;
@@ -6,24 +6,16 @@ use std::io;
 use super::{collect_cached_diff_lines, load_mutable_index, open_repo, path_from_bytes};
 
 #[derive(Debug, Deserialize)]
-struct GitCommitArgs {
-    repo_path: Option<String>,
-    message: String,
-    allow_empty: Option<bool>,
+pub struct GitCommitArgs {
+    pub repo_path: Option<String>,
+    pub message: String,
+    pub allow_empty: Option<bool>,
 }
 
-pub fn execute_git_commit_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_git_commit_inner(arguments_json, cwd) {
-        Ok(content) => tool_ok(content),
-        Err(error) => error.into(),
-    }
-}
-
-fn execute_git_commit_inner(
-    arguments_json: &str,
+pub fn execute_git_commit_tool(
+    args: &GitCommitArgs,
     cwd: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let args: GitCommitArgs = serde_json::from_str(arguments_json)?;
     let output = git_commit_impl(
         args.repo_path.as_deref(),
         &args.message,
@@ -114,10 +106,14 @@ fn current_head_parents(repo: &gix::Repository) -> Result<Vec<ObjectId>, ToolErr
     }
 }
 
+pub(crate) struct GitCommit;
+
 define_tool!(
     GitCommit,
     "git_commit",
     "Create a Git commit from the current index.",
+    GitCommitArgs,
+    String,
     execute_git_commit_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"message":{"type":"string","description":"Commit message"}},"required":["message"],"additionalProperties":false}),
     "git"

@@ -1,31 +1,25 @@
-use super::{ToolError, ToolExecutionOutput, ToolResult, tool_ok, truncate_tool_output};
+use super::{ToolError, truncate_tool_output};
 use reqwest::{
     Method, StatusCode, Url,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use serde::Deserialize;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::Path, time::Duration};
 
 #[derive(Debug, Deserialize)]
-struct HttpRequestArgs {
-    method: String,
-    url: String,
+pub struct HttpRequestArgs {
+    pub method: String,
+    pub url: String,
     #[serde(default)]
-    headers: HashMap<String, String>,
-    body: Option<String>,
-    timeout_secs: Option<u64>,
+    pub headers: HashMap<String, String>,
+    pub body: Option<String>,
+    pub timeout_secs: Option<u64>,
 }
 
-pub(crate) fn execute_http_request_tool(arguments_json: &str) -> ToolResult {
-    match execute_http_request_tool_inner(arguments_json) {
-        Ok(content) => tool_ok(content),
-        Err(error) => error.into(),
-    }
-}
-
-fn execute_http_request_tool_inner(arguments_json: &str) -> Result<String, ToolError> {
-    let args: HttpRequestArgs = serde_json::from_str(arguments_json)?;
-
+pub(crate) fn execute_http_request_tool(
+    args: &HttpRequestArgs,
+    _cwd: Option<&Path>,
+) -> Result<String, ToolError> {
     let method = match args.method.as_str() {
         "GET" => Method::GET,
         "POST" => Method::POST,
@@ -45,14 +39,14 @@ fn execute_http_request_tool_inner(arguments_json: &str) -> Result<String, ToolE
         .build()
         .map_err(|e| ToolError::Other(format!("failed to build http client: {e}")))?;
 
-    let headers = build_http_request_headers(args.headers)?;
+    let headers = build_http_request_headers(args.headers.clone())?;
 
     let mut request = client.request(method.clone(), url).headers(headers);
     if method != Method::GET
         && method != Method::HEAD
-        && let Some(body) = args.body
+        && let Some(body) = &args.body
     {
-        request = request.body(body);
+        request = request.body(body.clone());
     }
 
     let response = request
@@ -147,63 +141,44 @@ fn format_http_response(status: StatusCode, headers: &HeaderMap, body: &str) -> 
 
 pub(crate) struct HttpRequest;
 
-impl super::Tool for HttpRequest {
-    fn name(&self) -> &'static str {
-        "http_request"
-    }
-
-    fn group(&self) -> &'static str {
-        "core"
-    }
-
-    fn description(&self) -> &'static str {
-        "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests."
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "method": {
-                    "type": "string",
-                    "enum": ["GET", "POST", "HEAD"]
-                },
-                "url": {
-                    "type": "string",
-                    "description": "Absolute http or https URL"
-                },
-                "headers": {
-                    "type": "object",
-                    "description": "Optional request headers, including Range",
-                    "additionalProperties": {
-                        "type": "string"
-                    }
-                },
-                "body": {
-                    "type": "string",
-                    "description": "Optional UTF-8 request body"
-                },
-                "timeout_secs": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 30,
-                    "default": 10
+crate::define_tool!(
+    HttpRequest,
+    "http_request",
+    "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests.",
+    HttpRequestArgs,
+    String,
+    execute_http_request_tool,
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "method": {
+                "type": "string",
+                "enum": ["GET", "POST", "HEAD"]
+            },
+            "url": {
+                "type": "string",
+                "description": "Absolute http or https URL"
+            },
+            "headers": {
+                "type": "object",
+                "description": "Optional request headers, including Range",
+                "additionalProperties": {
+                    "type": "string"
                 }
             },
-            "required": ["method", "url"],
-            "additionalProperties": false
-        })
-    }
-
-    fn execute(
-        &self,
-        args: &str,
-        _x_credentials: Option<&tai_keystore::ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
-    ) -> ToolExecutionOutput {
-        ToolExecutionOutput {
-            result: execute_http_request_tool(args),
-            image: None,
-        }
-    }
-}
+            "body": {
+                "type": "string",
+                "description": "Optional UTF-8 request body"
+            },
+            "timeout_secs": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 30,
+                "default": 10
+            }
+        },
+        "required": ["method", "url"],
+        "additionalProperties": false
+    }),
+    "core"
+);

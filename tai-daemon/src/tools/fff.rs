@@ -1,6 +1,9 @@
-use super::{ToolError, tool_ok, truncate_tool_output};
-use crate::tools::ToolExecutionOutput;
-use fff_search::*;
+use super::{ToolError, context::ToolContext, truncate_tool_output};
+use fff_search::{
+    AiGrepConfig, FFFMode, FilePicker, FilePickerOptions, FileSearchConfig, FrecencyTracker,
+    FuzzySearchOptions, GrepMode, GrepSearchOptions, PaginationArgs, QueryParser, SharedFilePicker,
+    SharedFrecency,
+};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -15,12 +18,12 @@ const FFF_DEFAULT_MAX_RESULTS: usize = 50;
 const FFF_MAX_RESULTS_CAP: usize = 100;
 
 #[derive(Debug, Deserialize)]
-struct FffArgs {
-    query: String,
-    path: Option<String>,
-    mode: Option<String>,
-    pattern_type: Option<String>,
-    max_results: Option<usize>,
+pub struct FffArgs {
+    pub query: String,
+    pub path: Option<String>,
+    pub mode: Option<String>,
+    pub pattern_type: Option<String>,
+    pub max_results: Option<usize>,
 }
 
 pub(crate) struct FffState {
@@ -128,14 +131,67 @@ impl Fff {
     pub(crate) fn new(cache: Arc<FffStateCache>) -> Self {
         Self { cache }
     }
+}
 
-    fn execute_inner(
+impl super::Tool for Fff {
+    type Args = FffArgs;
+    type Return = String;
+
+    fn name(&self) -> &'static str {
+        "fff"
+    }
+
+    fn group(&self) -> &'static str {
+        "core"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes."
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query. Supports advanced syntax like 'ext:rs my_function' or 'path:src/**'. For file name search, this is a fuzzy pattern."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["grep", "files"],
+                    "description": "Search mode: 'grep' for content search (default), 'files' for file name fuzzy search",
+                    "default": "grep"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Root path for the search (default: current directory)"
+                },
+                "pattern_type": {
+                    "type": "string",
+                    "enum": ["plain", "regex", "fuzzy"],
+                    "description": "Pattern matching mode for grep: 'plain' (default), 'regex', or 'fuzzy'",
+                    "default": "plain"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 50
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+    }
+
+    fn execute(
         &self,
-        arguments_json: &str,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
         cwd: Option<&Path>,
-    ) -> std::result::Result<String, ToolError> {
-        let args: FffArgs = serde_json::from_str(arguments_json)?;
-
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
         let path = args.path.as_deref().unwrap_or(".");
         let resolved = super::resolve_path(path, cwd);
         let state = self.cache.get_or_init(&resolved.display().to_string())?;
@@ -223,74 +279,6 @@ impl Fff {
 
                 Ok(truncate_tool_output(&lines.join("\n")))
             }
-        }
-    }
-}
-
-impl super::Tool for Fff {
-    fn name(&self) -> &'static str {
-        "fff"
-    }
-
-    fn group(&self) -> &'static str {
-        "core"
-    }
-
-    fn description(&self) -> &'static str {
-        "Search file contents or file names using fff. Supports grep (content search) and files (file name search) modes."
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query. Supports advanced syntax like 'ext:rs my_function' or 'path:src/**'. For file name search, this is a fuzzy pattern."
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["grep", "files"],
-                    "description": "Search mode: 'grep' for content search (default), 'files' for file name fuzzy search",
-                    "default": "grep"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Root path for the search (default: current directory)"
-                },
-                "pattern_type": {
-                    "type": "string",
-                    "enum": ["plain", "regex", "fuzzy"],
-                    "description": "Pattern matching mode for grep: 'plain' (default), 'regex', or 'fuzzy'",
-                    "default": "plain"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 100,
-                    "default": 50
-                }
-            },
-            "required": ["query"],
-            "additionalProperties": false
-        })
-    }
-
-    fn execute(
-        &self,
-        arguments_json: &str,
-        _x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&Path>,
-    ) -> ToolExecutionOutput {
-        match self.execute_inner(arguments_json, cwd) {
-            Ok(content) => ToolExecutionOutput {
-                result: tool_ok(content),
-                image: None,
-            },
-            Err(error) => ToolExecutionOutput {
-                result: error.into(),
-                image: None,
-            },
         }
     }
 }

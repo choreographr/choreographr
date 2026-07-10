@@ -44,6 +44,7 @@ prometheus = { version = "0.14", features = ["process"] }
 tiny_http = "0.12"
 ckb-vm = { version = "0.24.14", features = ["asm", "detect-asm"] }
 tempfile = "3"
+postcard.workspace = true
 
 [dev-dependencies]
 filetime = "0.2"

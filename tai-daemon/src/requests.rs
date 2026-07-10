@@ -1072,7 +1072,8 @@ pub const REQUEST_IMAGE_HEIGHT: u32 = 640;
 mod tests {
     use super::*;
     use crate::daemon::DaemonCommand;
-    use crate::tools::{Tool, ToolRegistry};
+    use crate::tools::context::ToolContext;
+    use crate::tools::{Tool, ToolError, ToolRegistry};
     use std::sync::mpsc;
     use tai_proto::SessionSummary;
 
@@ -1408,6 +1409,9 @@ mod tests {
     struct FastTestTool;
 
     impl Tool for FastTestTool {
+        type Args = serde_json::Value;
+        type Return = String;
+
         fn name(&self) -> &'static str {
             "_test_fast"
         }
@@ -1422,17 +1426,12 @@ mod tests {
         }
         fn execute(
             &self,
-            _args: &str,
+            _args: Self::Args,
             _xc: Option<&ServiceCredential>,
             _cwd: Option<&Path>,
-        ) -> ToolExecutionOutput {
-            ToolExecutionOutput {
-                result: ToolResult {
-                    content: "fast result".into(),
-                    is_error: false,
-                },
-                image: None,
-            }
+            _ctx: Option<&ToolContext>,
+        ) -> Result<String, ToolError> {
+            Ok("fast result".into())
         }
     }
 
@@ -1443,6 +1442,9 @@ mod tests {
     }
 
     impl Tool for BlockingTestTool {
+        type Args = serde_json::Value;
+        type Return = String;
+
         fn name(&self) -> &'static str {
             "_test_blocking"
         }
@@ -1457,37 +1459,27 @@ mod tests {
         }
         fn execute(
             &self,
-            _args: &str,
+            _args: Self::Args,
             _xc: Option<&ServiceCredential>,
             _cwd: Option<&Path>,
-        ) -> ToolExecutionOutput {
-            ToolExecutionOutput {
-                result: ToolResult {
-                    content: "ignored".into(),
-                    is_error: false,
-                },
-                image: None,
-            }
+            _ctx: Option<&ToolContext>,
+        ) -> Result<String, ToolError> {
+            Ok("ignored".into())
         }
         fn execute_streaming(
             &self,
-            _args: &str,
+            _args: Self::Args,
             _xc: Option<&ServiceCredential>,
             _cwd: Option<&Path>,
             _output_tx: mpsc::Sender<Vec<u8>>,
-        ) -> ToolExecutionOutput {
+            _ctx: Option<&ToolContext>,
+        ) -> Result<String, ToolError> {
             // Block until the proceed signal arrives or the sender is
             // dropped (which unblocks on test teardown).
             if let Some(rx) = self.proceed.lock().unwrap().take() {
                 let _ = rx.recv();
             }
-            ToolExecutionOutput {
-                result: ToolResult {
-                    content: "blocked tool done".into(),
-                    is_error: false,
-                },
-                image: None,
-            }
+            Ok("blocked tool done".into())
         }
     }
 
@@ -1662,6 +1654,9 @@ mod tests {
     struct StreamingTestTool;
 
     impl Tool for StreamingTestTool {
+        type Args = serde_json::Value;
+        type Return = String;
+
         fn name(&self) -> &'static str {
             "_test_streaming"
         }
@@ -1676,35 +1671,25 @@ mod tests {
         }
         fn execute(
             &self,
-            _args: &str,
+            _args: Self::Args,
             _xc: Option<&ServiceCredential>,
             _cwd: Option<&Path>,
-        ) -> ToolExecutionOutput {
-            ToolExecutionOutput {
-                result: ToolResult {
-                    content: "exec result".into(),
-                    is_error: false,
-                },
-                image: None,
-            }
+            _ctx: Option<&ToolContext>,
+        ) -> Result<String, ToolError> {
+            Ok("exec result".into())
         }
         fn execute_streaming(
             &self,
-            _args: &str,
+            _args: Self::Args,
             _xc: Option<&ServiceCredential>,
             _cwd: Option<&Path>,
             output_tx: mpsc::Sender<Vec<u8>>,
-        ) -> ToolExecutionOutput {
+            _ctx: Option<&ToolContext>,
+        ) -> Result<String, ToolError> {
             // Send some output before returning so the forwarding thread
             // has data to forward.
             let _ = output_tx.send(b"streamed payload".to_vec());
-            ToolExecutionOutput {
-                result: ToolResult {
-                    content: "streaming done".into(),
-                    is_error: false,
-                },
-                image: None,
-            }
+            Ok("streaming done".into())
         }
     }
 

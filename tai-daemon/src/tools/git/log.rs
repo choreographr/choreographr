@@ -1,4 +1,4 @@
-use crate::tools::{ToolError, ToolResult, tool_ok, truncate_tool_output};
+use crate::tools::{ToolError, truncate_tool_output};
 use gix::bstr::ByteSlice;
 use serde::Deserialize;
 use std::{fmt::Write as _, io};
@@ -6,23 +6,15 @@ use std::{fmt::Write as _, io};
 use super::{describe_head, open_repo, repo_work_dir_display};
 
 #[derive(Debug, Deserialize)]
-struct GitLogArgs {
-    repo_path: Option<String>,
-    limit: Option<usize>,
+pub struct GitLogArgs {
+    pub repo_path: Option<String>,
+    pub limit: Option<usize>,
 }
 
-pub fn execute_git_log_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_git_log_inner(arguments_json, cwd) {
-        Ok(content) => tool_ok(content),
-        Err(error) => error.into(),
-    }
-}
-
-fn execute_git_log_inner(
-    arguments_json: &str,
+pub fn execute_git_log_tool(
+    args: &GitLogArgs,
     cwd: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let args: GitLogArgs = serde_json::from_str(arguments_json)?;
     let output = git_log_impl(
         args.repo_path.as_deref(),
         args.limit.unwrap_or(10).clamp(1, 100),
@@ -80,10 +72,14 @@ pub(crate) fn git_log_impl(
     Ok(out.trim_end().to_string())
 }
 
+pub(crate) struct GitLog;
+
 define_tool!(
     GitLog,
     "git_log",
     "Show recent Git commits for the repository containing the given path.",
+    GitLogArgs,
+    String,
     execute_git_log_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"max_count":{"type":"integer","minimum":1,"maximum":100,"default":10}},"additionalProperties":false}),
     "git"

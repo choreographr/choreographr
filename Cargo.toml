@@ -42,3 +42,4 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.11"
 hkdf = "0.13"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }

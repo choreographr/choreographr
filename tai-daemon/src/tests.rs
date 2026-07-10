@@ -1,4 +1,9 @@
 use super::*;
+use crate::tools::fs::{
+    EditFileArgs, LineCountArgs, ListFilesArgs, ReadFileArgs, ReadFileRangeArgs, TextEditArgs,
+    WriteFileArgs,
+};
+use crate::tools::http::HttpRequestArgs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
@@ -115,19 +120,18 @@ fn read_file_range_tool_reads_numbered_line_chunks() {
     std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\n").expect("seed file");
 
     let result = execute_read_file_range_tool(
-        &serde_json::json!({
-            "path": path,
-            "start_line": 2,
-            "max_lines": 2
-        })
-        .to_string(),
+        &ReadFileRangeArgs {
+            path: path.display().to_string(),
+            start_line: 2,
+            max_lines: 2,
+        },
         None,
     );
 
-    assert!(!result.is_error, "{}", result.content);
-    assert!(result.content.contains("lines: 2-3 of 4"));
-    assert!(result.content.contains("2 | beta"));
-    assert!(result.content.contains("3 | gamma"));
+    let content = result.unwrap_or_default();
+    assert!(content.contains("lines: 2-3 of 4"), "{}", content);
+    assert!(content.contains("2 | beta"), "{}", content);
+    assert!(content.contains("3 | gamma"), "{}", content);
 
     let _ = std::fs::remove_file(&path);
 }
@@ -138,19 +142,18 @@ fn read_file_range_tool_clamps_to_eof() {
     std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("seed file");
 
     let result = execute_read_file_range_tool(
-        &serde_json::json!({
-            "path": path,
-            "start_line": 2,
-            "max_lines": 10
-        })
-        .to_string(),
+        &ReadFileRangeArgs {
+            path: path.display().to_string(),
+            start_line: 2,
+            max_lines: 10,
+        },
         None,
     );
 
-    assert!(!result.is_error, "{}", result.content);
-    assert!(result.content.contains("lines: 2-3 of 3"));
-    assert!(result.content.contains("2 | beta"));
-    assert!(result.content.contains("3 | gamma"));
+    let content = result.unwrap_or_default();
+    assert!(content.contains("lines: 2-3 of 3"), "{}", content);
+    assert!(content.contains("2 | beta"), "{}", content);
+    assert!(content.contains("3 | gamma"), "{}", content);
 
     let _ = std::fs::remove_file(&path);
 }
@@ -161,17 +164,17 @@ fn read_file_range_tool_rejects_start_line_past_eof() {
     std::fs::write(&path, "alpha\nbeta\n").expect("seed file");
 
     let result = execute_read_file_range_tool(
-        &serde_json::json!({
-            "path": path,
-            "start_line": 5,
-            "max_lines": 1
-        })
-        .to_string(),
+        &ReadFileRangeArgs {
+            path: path.display().to_string(),
+            start_line: 5,
+            max_lines: 1,
+        },
         None,
     );
 
-    assert!(result.is_error, "{}", result.content);
-    assert!(result.content.contains("past end of file"));
+    assert!(result.is_err(), "{}", result.unwrap_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("past end of file"), "{}", err);
 
     let _ = std::fs::remove_file(&path);
 }
@@ -182,17 +185,17 @@ fn read_file_range_tool_rejects_excessive_max_lines() {
     std::fs::write(&path, "alpha\n").expect("seed file");
 
     let result = execute_read_file_range_tool(
-        &serde_json::json!({
-            "path": path,
-            "start_line": 1,
-            "max_lines": 201
-        })
-        .to_string(),
+        &ReadFileRangeArgs {
+            path: path.display().to_string(),
+            start_line: 1,
+            max_lines: 201,
+        },
         None,
     );
 
-    assert!(result.is_error, "{}", result.content);
-    assert!(result.content.contains("max_lines must be <= 200"));
+    assert!(result.is_err(), "{}", result.unwrap_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("max_lines must be <= 200"), "{}", err);
 
     let _ = std::fs::remove_file(&path);
 }
@@ -201,16 +204,17 @@ fn read_file_range_tool_rejects_excessive_max_lines() {
 fn write_file_tool_writes_new_file() {
     let path = test_temp_path("tai-write-tool");
 
-    let result = execute_write_file_tool(
-        &serde_json::json!({
-            "path": path,
-            "content": "hello from write tool\n"
-        })
-        .to_string(),
+    execute_write_file_tool(
+        &WriteFileArgs {
+            path: path.display().to_string(),
+            content: "hello from write tool\n".into(),
+            overwrite: Some(true),
+            create_parents: Some(true),
+        },
         None,
-    );
+    )
+    .unwrap();
 
-    assert!(!result.is_error, "{}", result.content);
     assert_eq!(
         std::fs::read_to_string(&path).expect("read file"),
         "hello from write tool\n"
@@ -225,20 +229,21 @@ fn write_file_tool_refuses_overwrite_when_disabled() {
     std::fs::write(&path, "original\n").expect("seed file");
 
     let result = execute_write_file_tool(
-        &serde_json::json!({
-            "path": path,
-            "content": "replacement\n",
-            "overwrite": false
-        })
-        .to_string(),
+        &WriteFileArgs {
+            path: path.display().to_string(),
+            content: "replacement\n".into(),
+            overwrite: Some(false),
+            create_parents: Some(true),
+        },
         None,
     );
 
-    assert!(result.is_error, "{}", result.content);
+    assert!(result.is_err(), "{}", result.unwrap_err());
+    let err = result.unwrap_err().to_string();
     assert!(
-        result
-            .content
-            .contains("refusing to overwrite existing file")
+        err.contains("refusing to overwrite existing file"),
+        "{}",
+        err
     );
     assert_eq!(
         std::fs::read_to_string(&path).expect("read file"),
@@ -253,17 +258,17 @@ fn write_file_tool_creates_parent_directories() {
     let dir = test_temp_path("tai-write-tool-dir").with_extension("");
     let path = dir.join("nested/output.txt");
 
-    let result = execute_write_file_tool(
-        &serde_json::json!({
-            "path": path,
-            "content": "nested hello\n",
-            "create_parents": true
-        })
-        .to_string(),
+    execute_write_file_tool(
+        &WriteFileArgs {
+            path: path.display().to_string(),
+            content: "nested hello\n".into(),
+            overwrite: Some(true),
+            create_parents: Some(true),
+        },
         None,
-    );
+    )
+    .unwrap();
 
-    assert!(!result.is_error, "{}", result.content);
     assert_eq!(
         std::fs::read_to_string(&path).expect("read file"),
         "nested hello\n"
@@ -278,21 +283,21 @@ fn edit_file_tool_replaces_single_unique_match() {
     std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("seed file");
 
     let result = execute_edit_file_tool(
-        &serde_json::json!({
-            "path": path,
-            "edits": [
-                {
-                    "old_text": "beta",
-                    "new_text": "delta"
-                }
-            ]
-        })
-        .to_string(),
+        &EditFileArgs {
+            path: path.display().to_string(),
+            edits: vec![TextEditArgs {
+                old_text: "beta".into(),
+                new_text: "delta".into(),
+                replace_all: None,
+            }],
+            expected_sha256: None,
+            dry_run: None,
+        },
         None,
     );
 
-    assert!(!result.is_error, "{}", result.content);
-    assert!(result.content.contains("edited file:"));
+    let content = result.unwrap_or_default();
+    assert!(content.contains("edited file:"), "{}", content);
     assert_eq!(
         std::fs::read_to_string(&path).expect("read file"),
         "alpha\ndelta\ngamma\n"
@@ -307,21 +312,22 @@ fn edit_file_tool_fails_when_old_text_is_missing() {
     std::fs::write(&path, "hello\nworld\n").expect("seed file");
 
     let result = execute_edit_file_tool(
-        &serde_json::json!({
-            "path": path,
-            "edits": [
-                {
-                    "old_text": "absent",
-                    "new_text": "present"
-                }
-            ]
-        })
-        .to_string(),
+        &EditFileArgs {
+            path: path.display().to_string(),
+            edits: vec![TextEditArgs {
+                old_text: "absent".into(),
+                new_text: "present".into(),
+                replace_all: None,
+            }],
+            expected_sha256: None,
+            dry_run: None,
+        },
         None,
     );
 
-    assert!(result.is_error, "{}", result.content);
-    assert!(result.content.contains("old_text not found"));
+    assert!(result.is_err(), "{}", result.unwrap_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("old_text not found"), "{}", err);
     assert_eq!(
         std::fs::read_to_string(&path).expect("read file"),
         "hello\nworld\n"
@@ -336,21 +342,22 @@ fn edit_file_tool_fails_on_ambiguous_non_replace_all_edit() {
     std::fs::write(&path, "repeat\nrepeat\n").expect("seed file");
 
     let result = execute_edit_file_tool(
-        &serde_json::json!({
-            "path": path,
-            "edits": [
-                {
-                    "old_text": "repeat",
-                    "new_text": "done"
-                }
-            ]
-        })
-        .to_string(),
+        &EditFileArgs {
+            path: path.display().to_string(),
+            edits: vec![TextEditArgs {
+                old_text: "repeat".into(),
+                new_text: "done".into(),
+                replace_all: None,
+            }],
+            expected_sha256: None,
+            dry_run: None,
+        },
         None,
     );
 
-    assert!(result.is_error, "{}", result.content);
-    assert!(result.content.contains("matched 2 locations"));
+    assert!(result.is_err(), "{}", result.unwrap_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("matched 2 locations"), "{}", err);
     assert_eq!(
         std::fs::read_to_string(&path).expect("read file"),
         "repeat\nrepeat\n"
@@ -365,24 +372,22 @@ fn edit_file_tool_supports_replace_all_and_dry_run() {
     std::fs::write(&path, "foo\nfoo\n").expect("seed file");
 
     let result = execute_edit_file_tool(
-        &serde_json::json!({
-            "path": path,
-            "dry_run": true,
-            "edits": [
-                {
-                    "old_text": "foo",
-                    "new_text": "bar",
-                    "replace_all": true
-                }
-            ]
-        })
-        .to_string(),
+        &EditFileArgs {
+            path: path.display().to_string(),
+            edits: vec![TextEditArgs {
+                old_text: "foo".into(),
+                new_text: "bar".into(),
+                replace_all: Some(true),
+            }],
+            expected_sha256: None,
+            dry_run: Some(true),
+        },
         None,
     );
 
-    assert!(!result.is_error, "{}", result.content);
-    assert!(result.content.contains("would edit file:"));
-    assert!(result.content.contains("2 replacements"));
+    let content = result.unwrap_or_default();
+    assert!(content.contains("would edit file:"), "{}", content);
+    assert!(content.contains("2 replacements"), "{}", content);
     assert_eq!(
         std::fs::read_to_string(&path).expect("read file"),
         "foo\nfoo\n"
@@ -399,41 +404,40 @@ fn edit_file_tool_validates_expected_sha256() {
     let expected_sha256 = sha256_hex(original);
 
     let success = execute_edit_file_tool(
-        &serde_json::json!({
-            "path": path,
-            "expected_sha256": expected_sha256,
-            "edits": [
-                {
-                    "old_text": "blue",
-                    "new_text": "green"
-                }
-            ]
-        })
-        .to_string(),
+        &EditFileArgs {
+            path: path.display().to_string(),
+            edits: vec![TextEditArgs {
+                old_text: "blue".into(),
+                new_text: "green".into(),
+                replace_all: None,
+            }],
+            expected_sha256: Some(expected_sha256.clone()),
+            dry_run: None,
+        },
         None,
     );
-    assert!(!success.is_error, "{}", success.content);
+    assert!(success.is_ok(), "{}", success.unwrap_err());
     assert_eq!(
         std::fs::read_to_string(&path).expect("read file"),
         "red\ngreen\n"
     );
 
     let failure = execute_edit_file_tool(
-        &serde_json::json!({
-            "path": path,
-            "expected_sha256": expected_sha256,
-            "edits": [
-                {
-                    "old_text": "green",
-                    "new_text": "purple"
-                }
-            ]
-        })
-        .to_string(),
+        &EditFileArgs {
+            path: path.display().to_string(),
+            edits: vec![TextEditArgs {
+                old_text: "green".into(),
+                new_text: "purple".into(),
+                replace_all: None,
+            }],
+            expected_sha256: Some(expected_sha256),
+            dry_run: None,
+        },
         None,
     );
-    assert!(failure.is_error, "{}", failure.content);
-    assert!(failure.content.contains("expected_sha256 mismatch"));
+    assert!(failure.is_err(), "{}", failure.unwrap_err());
+    let err = failure.unwrap_err().to_string();
+    assert!(err.contains("expected_sha256 mismatch"), "{}", err);
     assert_eq!(
         std::fs::read_to_string(&path).expect("read file"),
         "red\ngreen\n"
@@ -446,20 +450,28 @@ fn edit_file_tool_validates_expected_sha256() {
 fn http_request_tool_supports_range_header() {
     let (base_url, server) = spawn_http_tool_server();
     let result = execute_http_request_tool(
-        &serde_json::json!({
-            "method": "GET",
-            "url": format!("{base_url}/range"),
-            "headers": {
-                "Range": "bytes=0-9"
-            }
-        })
-        .to_string(),
+        &HttpRequestArgs {
+            method: "GET".into(),
+            url: format!("{base_url}/range"),
+            headers: [("Range".into(), "bytes=0-9".into())].into(),
+            body: None,
+            timeout_secs: None,
+        },
+        None,
     );
 
-    assert!(!result.is_error, "{}", result.content);
-    assert!(result.content.contains("status: 206 Partial Content"));
-    assert!(result.content.contains("content-range: bytes 0-9/100"));
-    assert!(result.content.ends_with("abcdefghij"));
+    let content = result.unwrap_or_default();
+    assert!(
+        content.contains("status: 206 Partial Content"),
+        "{}",
+        content
+    );
+    assert!(
+        content.contains("content-range: bytes 0-9/100"),
+        "{}",
+        content
+    );
+    assert!(content.ends_with("abcdefghij"), "{}", content);
 
     drop(server);
 }
@@ -468,17 +480,20 @@ fn http_request_tool_supports_range_header() {
 fn http_request_tool_supports_head_requests() {
     let (base_url, server) = spawn_http_tool_server();
     let result = execute_http_request_tool(
-        &serde_json::json!({
-            "method": "HEAD",
-            "url": format!("{base_url}/meta")
-        })
-        .to_string(),
+        &HttpRequestArgs {
+            method: "HEAD".into(),
+            url: format!("{base_url}/meta"),
+            headers: Default::default(),
+            body: None,
+            timeout_secs: None,
+        },
+        None,
     );
 
-    assert!(!result.is_error, "{}", result.content);
-    assert!(result.content.contains("status: 200 OK"));
-    assert!(result.content.contains("accept-ranges: bytes"));
-    assert!(result.content.ends_with("\n\n"));
+    let content = result.unwrap_or_default();
+    assert!(content.contains("status: 200 OK"), "{}", content);
+    assert!(content.contains("accept-ranges: bytes"), "{}", content);
+    assert!(content.ends_with("\n\n"), "{}", content);
 
     drop(server);
 }
@@ -487,20 +502,27 @@ fn http_request_tool_supports_head_requests() {
 fn http_request_tool_summarizes_non_text_responses() {
     let (base_url, server) = spawn_http_tool_server();
     let result = execute_http_request_tool(
-        &serde_json::json!({
-            "method": "GET",
-            "url": format!("{base_url}/binary")
-        })
-        .to_string(),
+        &HttpRequestArgs {
+            method: "GET".into(),
+            url: format!("{base_url}/binary"),
+            headers: Default::default(),
+            body: None,
+            timeout_secs: None,
+        },
+        None,
     );
 
-    assert!(!result.is_error, "{}", result.content);
+    let content = result.unwrap_or_default();
     assert!(
-        result
-            .content
-            .contains("content-type: application/octet-stream")
+        content.contains("content-type: application/octet-stream"),
+        "{}",
+        content
     );
-    assert!(result.content.ends_with("body omitted: non-text response"));
+    assert!(
+        content.ends_with("body omitted: non-text response"),
+        "{}",
+        content
+    );
 
     drop(server);
 }
@@ -509,15 +531,18 @@ fn http_request_tool_summarizes_non_text_responses() {
 fn http_request_tool_truncates_large_text_responses() {
     let (base_url, server) = spawn_http_tool_server();
     let result = execute_http_request_tool(
-        &serde_json::json!({
-            "method": "GET",
-            "url": format!("{base_url}/long")
-        })
-        .to_string(),
+        &HttpRequestArgs {
+            method: "GET".into(),
+            url: format!("{base_url}/long"),
+            headers: Default::default(),
+            body: None,
+            timeout_secs: None,
+        },
+        None,
     );
 
-    assert!(!result.is_error, "{}", result.content);
-    assert!(result.content.contains("...[truncated]"));
+    let content = result.unwrap_or_default();
+    assert!(content.contains("...[truncated]"), "{}", content);
 
     drop(server);
 }
@@ -526,16 +551,18 @@ fn http_request_tool_truncates_large_text_responses() {
 fn http_request_tool_supports_post_body() {
     let (base_url, server) = spawn_http_tool_server();
     let result = execute_http_request_tool(
-        &serde_json::json!({
-            "method": "POST",
-            "url": format!("{base_url}/echo"),
-            "body": "hello"
-        })
-        .to_string(),
+        &HttpRequestArgs {
+            method: "POST".into(),
+            url: format!("{base_url}/echo"),
+            headers: Default::default(),
+            body: Some("hello".into()),
+            timeout_secs: None,
+        },
+        None,
     );
 
-    assert!(!result.is_error, "{}", result.content);
-    assert!(result.content.ends_with("echo:hello"));
+    let content = result.unwrap_or_default();
+    assert!(content.ends_with("echo:hello"), "{}", content);
 
     drop(server);
 }

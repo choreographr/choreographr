@@ -488,37 +488,129 @@ startup                    /unlock [passphrase]
 
 ## Tool system
 
-### Tool trait
+### Generic `Tool` trait
+
+The tool trait is generic over argument and return types. Each tool declares its own
+`type Args` (must implement `DeserializeOwned`) and `type Return` (must implement `Serialize`).
 
 ```rust
-trait Tool: Send + Sync {
-    fn name(&self) -> &str;
-    fn description(&self) -> &str;
+pub trait Tool: Send + Sync {
+    type Args: DeserializeOwned + 'static;
+    type Return: Serialize + 'static;
+
+    fn name(&self) -> &'static str;
+    fn group(&self) -> &'static str { "core" }
+    fn description(&self) -> &'static str;
     fn schema(&self) -> serde_json::Value;
-    fn execute(&self, arguments_json: &str, x_credentials: Option<&ServiceCredential>, cwd: Option<&Path>) -> ToolExecutionOutput;
 
-    fn execute_streaming(&self, arguments_json: &str, x_credentials: Option<&ServiceCredential>, cwd: Option<&Path>, output_tx: mpsc::Sender<Vec<u8>>) -> ToolExecutionOutput {
-        self.execute(arguments_json, x_credentials, cwd)
+    fn execute(
+        &self,
+        args: Self::Args,
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&Path>,
+        ctx: Option<&ToolContext>,
+    ) -> Result<Self::Return, ToolError>;
+
+    fn execute_streaming(
+        &self,
+        args: Self::Args,
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        ctx: Option<&ToolContext>,
+    ) -> Result<Self::Return, ToolError> {
+        let ret = self.execute(args, x_credentials, cwd, ctx)?;
+        let bytes = postcard::to_allocvec(&ret).map_err(ToolError::Postcard)?;
+        let _ = output_tx.send(bytes);
+        Ok(ret)
     }
 
-    fn execute_with_context(&self, arguments_json: &str, x_credentials: Option<&ServiceCredential>, cwd: Option<&Path>, ctx: Option<&ToolContext>) -> ToolExecutionOutput {
-        self.execute(arguments_json, x_credentials, cwd)
-    }
-
-    fn execute_streaming_with_context(&self, arguments_json: &str, x_credentials: Option<&ServiceCredential>, cwd: Option<&Path>, output_tx: mpsc::Sender<Vec<u8>>, ctx: Option<&ToolContext>) -> ToolExecutionOutput {
-        self.execute_streaming(arguments_json, x_credentials, cwd, output_tx)
-    }
+    fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> { None }
 }
 ```
 
+Tools that produce images (e.g. `display_image`) override `extract_image()` to return a
+`PreparedImage` from the typed return value. The conversion layer (see `ToolDyn` below)
+calls this to attach the image to the JSON response.
+
+### `ToolDyn` — type-erased dispatch trait
+
+The `ToolDyn` trait erases the generic parameters so tools can be stored in a `HashMap`:
+
+```rust
+pub trait ToolDyn: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn group(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    fn schema(&self) -> serde_json::Value;
+
+    fn execute_json(&self, args_json: &str, ...) -> ToolExecutionOutput;
+    fn execute_binary(&self, args_bytes: &[u8], ...) -> Vec<u8>;
+    fn execute_streaming_json(&self, args_json: &str, ...) -> ToolExecutionOutput;
+    fn execute_streaming_binary(&self, args_bytes: &[u8], ...) -> Vec<u8>;
+}
+```
+
+A blanket impl `impl<T: Tool> ToolDyn for T` provides all four dispatch paths:
+
+| Path | Input | Output | Used by |
+|---|---|---|---|
+| `execute_json` | `&str` (JSON) | `ToolExecutionOutput` | LLM tool calls (OpenAI/Anthropic etc.) |
+| `execute_binary` | `&[u8]` (postcard) | `Vec<u8>` (postcard) | RISC-V VM tool calls |
+| `execute_streaming_json` | `&str` (JSON) | `ToolExecutionOutput` | Streaming shell/VM tools via LLM |
+| `execute_streaming_binary` | `&[u8]` (postcard) | `Vec<u8>` (postcard) | Streaming VM tool calls |
+
+The JSON path deserializes arguments with `serde_json`, calls `Tool::execute()`, then
+serializes the return value back to JSON. The binary path uses `postcard` for both
+deserialization and serialization, enabling compact cross-VM communication.
+
+### `define_tool!` macro
+
+The macro reduces boilerplate for tools that don't need session context:
+
+```rust
+define_tool!(
+    MyTool,              // struct name (must be declared separately)
+    "my_tool",           // tool name for the LLM
+    "Description...",    // description
+    MyToolArgs,          // argument type (Deserialize)
+    String,              // return type (Serialize)
+    execute_my_tool,     // implementation function: fn(&Args, Option<&Path>) -> Result<Return, ToolError>
+    serde_json::json!({...}),  // JSON Schema for arguments
+    "core"               // tool group
+);
+```
+
+The macro implements `Tool` for the struct, wiring `execute()` to call the implementation
+function with the deserialized args.
+
 ### Registry
 
-Tools are registered in a `ToolRegistry` owned by `DaemonStateInner`, constructed once
-at daemon startup. The agent loop extracts an `Arc<ToolRegistry>` from the daemon state to
-list available tool definitions and dispatch tool execution.
+Tools are registered in a `ToolRegistry` stored as `Box<dyn ToolDyn>`. The registry is
+owned by `DaemonStateInner`, constructed once at daemon startup. The agent loop extracts
+an `Arc<ToolRegistry>` from the daemon state to list available tool definitions and
+dispatch tool execution.
+
+The registry provides `execute_dyn()` for the binary dispatch path (used by the VM):
+
+```rust
+pub fn execute_dyn(&self, name: &str, args_bytes: &[u8], ...) -> Vec<u8> {
+    // finds the tool by name, calls ToolDyn::execute_binary()
+}
+```
 
 Each tool receives an optional `cwd: Option<&Path>` parameter that represents the session's
 working directory. Filesystem and Git tools resolve relative paths against this CWD.
+
+### Postcard binary encoding
+
+Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protocol:
+
+- **Arguments:** Encoded as `postcard::to_allocvec(&args)` where `args: Self::Args`
+- **Return value:** Encoded as `postcard::to_allocvec(&Result::<Self::Return, String>::Ok(ret))`
+  — a postcard `Result` where `Ok(bytes)` carries the serialized return value and
+  `Err(String)` carries the error message
+- **Tool call frame (VM → host):** `[tool_name: postcard String][args: postcard-encoded Args]`
 
 ### Available tools (up to 34 total, some dependent on installed binaries)
 
@@ -1012,9 +1104,9 @@ inside a sandboxed virtual machine powered by `ckb-vm`. It is registered manuall
    directory.
 3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory.
 4. Registers a `TaiSyscall` handler that intercepts three guest syscalls:
-   - **Syscall #0 (TOOL_CALL)** — reads a JSON `ChatToolCall` from guest memory, dispatches it
-     via the `ToolRegistry` (initialized into a process-level `OnceLock` by `ToolRegistry::build()`),
-     and writes the result to the guest's output buffer.
+   - **Syscall #0 (TOOL_CALL)** — reads a postcard-encoded frame `[tool_name: String][args: bytes]`
+     from guest memory, dispatches it via the `ToolRegistry::execute_dyn()`, and writes the
+     postcard-encoded `Result<Return, String>` result to the guest's output buffer.
    - **Syscall #1 (WRITE)** — copies guest data into an accumulator buffer that becomes the tool's
      output upon VM exit.
    - **Syscall #2 (EXIT)** — stops the VM.
@@ -1145,6 +1237,7 @@ cargo run -p tai-im -- telegram
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `x25519-dalek` + `hkdf` + `sha2` | keystore | X25519 ECDH key agreement, HKDF key derivation |
 | `ckb-vm` | daemon | RISC-V VM interpreter for sandboxed code execution |
+| `postcard` | daemon | Compact binary serialization for VM↔host tool communication |
 | `thiserror` | proto, keystore, client-core, daemon | Structured library error types |
 | `anyhow` | daemon, tui, dioxus, im, keystore | Application error context & propagation |
 
@@ -1180,8 +1273,13 @@ warning logs when a subscriber is disconnected.
 ### Tool errors
 
 The `ToolError` enum (thiserror) covers common tool failure modes: invalid arguments, I/O
-errors, network failures, etc. Tools return `Result<String, ToolError>` and convert to
-`ToolResult` at the `Tool::execute()` boundary via `From<ToolError> for ToolResult`.
+errors, network failures, postcard encoding errors, etc. Tools return `Result<Self::Return, ToolError>`
+from their `execute()` method. The `ToolDyn::execute_json()` conversion layer transforms errors
+into `ToolExecutionOutput { is_error: true }` for the LLM path, and the binary path encodes
+them as `Result::<Return, String>::Err(e.to_string())` via postcard.
+
+The legacy `ToolResult { content, is_error }` and `ToolExecutionOutput` types remain for
+backward compatibility in the VM's internal `run_riscv_impl` and the `ToolDyn` conversion layer.
 | `gix` | daemon | Git operations |
 | `teloxide` | tai-im | Telegram Bot API client |
 | `prometheus` | daemon | OpenMetrics instrumentation, process metrics |

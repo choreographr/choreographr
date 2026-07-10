@@ -1,13 +1,16 @@
-use super::{PreparedImage, ToolExecutionOutput, tool_err, tool_ok};
+use super::{PreparedImage, ToolError, context::ToolContext, truncate_tool_output};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::GenericImageView;
 use reqwest::{Url, header::CONTENT_TYPE};
 use resvg::usvg;
 use serde::Deserialize;
+use std::path::Path;
+use std::sync::Mutex;
 use std::{io, time::Duration};
+use tai_keystore::ServiceCredential;
 
 #[derive(Debug, Deserialize)]
-struct DisplayImageArgs {
+pub struct DisplayImageArgs {
     mime_type: String,
     path: Option<String>,
     url: Option<String>,
@@ -20,34 +23,7 @@ const MAX_DISPLAY_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const SUPPORTED_IMAGE_MIME_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/svg+xml"];
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
 
-pub(crate) fn execute_display_image_tool(arguments_json: &str) -> ToolExecutionOutput {
-    match prepare_image_result(arguments_json) {
-        Ok(image) => {
-            let mime_type = image.mime_type.clone();
-            let width = image.width;
-            let height = image.height;
-            let byte_len = image.data.len();
-            ToolExecutionOutput {
-                result: tool_ok(format!(
-                    "displayed image ({mime_type}, {width}x{height}, {byte_len} bytes)"
-                )),
-                image: Some(image),
-            }
-        }
-        Err(error) => ToolExecutionOutput {
-            result: tool_err(error),
-            image: None,
-        },
-    }
-}
-
-fn prepare_image_result(arguments_json: &str) -> Result<PreparedImage, String> {
-    let args: DisplayImageArgs =
-        serde_json::from_str(arguments_json).map_err(|e| format!("invalid arguments: {e}"))?;
-    prepare_image(args).map_err(|e| e.to_string())
-}
-
-fn prepare_image(args: DisplayImageArgs) -> io::Result<PreparedImage> {
+fn prepare_image(args: &DisplayImageArgs) -> io::Result<PreparedImage> {
     let mime_type = normalize_image_mime_type(&args.mime_type)?;
     let selected_sources = [
         args.path.as_ref().map(|_| "path"),
@@ -65,19 +41,19 @@ fn prepare_image(args: DisplayImageArgs) -> io::Result<PreparedImage> {
         ));
     }
 
-    let data = if let Some(path) = args.path {
+    let data = if let Some(path) = &args.path {
         std::fs::read(path.trim())?
-    } else if let Some(url) = args.url {
+    } else if let Some(url) = &args.url {
         fetch_image_bytes(url.trim(), mime_type)?
-    } else if let Some(base64_data) = args.base64_data {
+    } else if let Some(base64_data) = &args.base64_data {
         BASE64.decode(base64_data.trim()).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("invalid base64_data: {error}"),
             )
         })?
-    } else if let Some(svg_text) = args.svg_text {
-        svg_text.into_bytes()
+    } else if let Some(svg_text) = &args.svg_text {
+        svg_text.as_bytes().to_vec()
     } else {
         unreachable!("source count validated")
     };
@@ -98,7 +74,7 @@ fn prepare_image(args: DisplayImageArgs) -> io::Result<PreparedImage> {
         data,
         width,
         height,
-        alt: args.alt.filter(|alt| !alt.trim().is_empty()),
+        alt: args.alt.clone().filter(|alt| !alt.trim().is_empty()),
     })
 }
 
@@ -172,9 +148,22 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
     }
 }
 
-pub(crate) struct DisplayImage;
+pub(crate) struct DisplayImage {
+    last_image: Mutex<Option<PreparedImage>>,
+}
+
+impl DisplayImage {
+    pub(crate) fn new() -> Self {
+        DisplayImage {
+            last_image: Mutex::new(None),
+        }
+    }
+}
 
 impl super::Tool for DisplayImage {
+    type Args = DisplayImageArgs;
+    type Return = String;
+
     fn name(&self) -> &'static str {
         "display_image"
     }
@@ -216,10 +205,26 @@ impl super::Tool for DisplayImage {
     }
     fn execute(
         &self,
-        arguments_json: &str,
-        _x_credentials: Option<&tai_keystore::ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
-    ) -> ToolExecutionOutput {
-        execute_display_image_tool(arguments_json)
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        _cwd: Option<&Path>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        let image = prepare_image(&args).map_err(|e| ToolError::Other(e.to_string()))?;
+        let mime_type = image.mime_type.clone();
+        let width = image.width;
+        let height = image.height;
+        let byte_len = image.data.len();
+        *self.last_image.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
+        Ok(truncate_tool_output(&format!(
+            "displayed image ({mime_type}, {width}x{height}, {byte_len} bytes)"
+        )))
+    }
+
+    fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> {
+        self.last_image
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 }

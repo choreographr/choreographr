@@ -1,5 +1,6 @@
-use crate::openai::ChatToolCall;
-use crate::tools::{Tool, ToolExecutionOutput, ToolRegistry, ToolResult, tool_err, tool_ok};
+use crate::tools::{
+    Tool, ToolError, ToolExecutionOutput, ToolRegistry, context::ToolContext, tool_err, tool_ok,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ckb_vm::Bytes;
 use ckb_vm::machine::VERSION2;
@@ -8,7 +9,7 @@ use ckb_vm::{
     FlatMemory, ISA_A, ISA_B, ISA_IMC, ISA_MOP, SupportMachine, Syscalls, TraceMachine,
     memory::Memory, registers,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -178,6 +179,165 @@ pub extern "C" fn _start() {
 }
 "#;
 
+const BOILERPLATE_TAIL_ENCODING: &str = r#"
+    // ── Postcard-format encoding helpers ──────────────────────────────
+
+    /// Encode a u64 as a postcard varint.
+    pub fn enc_varint(mut v: u64, buf: &mut Vec<u8>) {
+        loop {
+            if v < 0x80 {
+                buf.push(v as u8);
+                break;
+            }
+            buf.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+    }
+
+    /// Encode a string as postcard: varint(len) + UTF-8 bytes.
+    pub fn enc_str(s: &str, buf: &mut Vec<u8>) {
+        enc_varint(s.len() as u64, buf);
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// Encode bytes as postcard: varint(len) + raw bytes.
+    pub fn enc_bytes(b: &[u8], buf: &mut Vec<u8>) {
+        enc_varint(b.len() as u64, buf);
+        buf.extend_from_slice(b);
+    }
+
+    /// Encode a u64 as 8-byte BE (for non-varint integer fields).
+    pub fn enc_u64(v: u64, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Encode a bool as 1 byte.
+    pub fn enc_bool(v: bool, buf: &mut Vec<u8>) {
+        buf.push(v as u8);
+    }
+
+    /// Decode a postcard varint from the front of a byte slice.
+    /// Returns (value, bytes_consumed).
+    pub fn dec_varint(buf: &[u8]) -> Result<(u64, usize), &'static str> {
+        let mut value: u64 = 0;
+        let mut shift: u64 = 0;
+        let mut consumed: usize = 0;
+        for &byte in buf {
+            value |= ((byte & 0x7F) as u64) << shift;
+            consumed += 1;
+            if byte & 0x80 == 0 {
+                return Ok((value, consumed));
+            }
+            shift += 7;
+            if shift > 63 {
+                return Err("varint too large");
+            }
+        }
+        Err("unterminated varint")
+    }
+
+    /// Decode a postcard string from the front of a byte slice.
+    pub fn dec_str<'a>(buf: &'a [u8]) -> Result<(&'a str, usize), &'static str> {
+        let (len, consumed) = dec_varint(buf)?;
+        let start = consumed;
+        let end = start + len as usize;
+        if end > buf.len() {
+            return Err("string too short");
+        }
+        let s = core::str::from_utf8(&buf[start..end])
+            .map_err(|_| "invalid utf-8")?;
+        Ok((s, end))
+    }
+
+    /// Decode a postcard `Result<Vec<u8>, String>` from a byte slice.
+    /// Returns Ok(bytes) or Err(error_string).
+    pub fn dec_result(resp: &[u8]) -> Result<&[u8], &str> {
+        if resp.is_empty() { return Err("empty response"); }
+        let status = resp[0];
+        let rest = &resp[1..];
+        let (payload_len, consumed) = dec_varint(rest)?;
+        let start = consumed;
+        let end = start + payload_len as usize;
+        if end > rest.len() {
+            return Err("truncated payload");
+        }
+        let payload = &rest[start..end];
+        match status {
+            0 => Ok(payload),       // Ok
+            1 => Err(core::str::from_utf8(payload).unwrap_or("decode error")), // Err
+            _ => Err("unknown result status"),
+        }
+    }
+
+    // ── Tool call helpers ─────────────────────────────────────────────
+
+    /// Make a raw tool call. Encodes tool name + args as postcard frame,
+    /// does ecall, returns the raw result bytes.
+    pub fn call(name: &str, args: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        enc_str(name, &mut buf);
+        buf.extend_from_slice(args);
+        let mut output = vec![0u8; 65536];
+        let n = unsafe { tool_call(&buf, &mut output) };
+        output[..n].to_vec()
+    }
+
+    // ── Per-tool wrappers ─────────────────────────────────────────────
+
+    /// db_get(key: &str) -> raw value bytes. Empty vec = not found or error.
+    pub fn db_get(key: &str) -> Vec<u8> {
+        let mut args = Vec::new();
+        enc_str(key, &mut args);
+        let resp = call("db_get", &args);
+        dec_result(&resp).unwrap_or(&[]).to_vec()
+    }
+
+    /// db_set(key: &str, value: &[u8]).
+    pub fn db_set(key: &str, value: &[u8]) {
+        let mut args = Vec::new();
+        enc_str(key, &mut args);
+        enc_bytes(value, &mut args);
+        let _resp = call("db_set", &args);
+    }
+
+    /// db_delete(key: &str) -> bool (true if deleted).
+    pub fn db_delete(key: &str) -> bool {
+        let mut args = Vec::new();
+        enc_str(key, &mut args);
+        let resp = call("db_delete", &args);
+        dec_result(&resp).is_ok()
+    }
+
+    /// read_file(path: &str) -> file content as String.
+    pub fn read_file(path: &str) -> String {
+        let mut args = Vec::new();
+        enc_str(path, &mut args);
+        let resp = call("read_file", &args);
+        match dec_result(&resp) {
+            Ok(b) => String::from_utf8_lossy(b).to_string(),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// write_file(path: &str, content: &str, overwrite: bool).
+    pub fn write_file(path: &str, content: &str, overwrite: bool) {
+        let mut args = Vec::new();
+        enc_str(path, &mut args);
+        enc_str(content, &mut args);
+        enc_bool(overwrite, &mut args);
+        let _resp = call("write_file", &args);
+    }
+
+    /// git_status() -> status string.
+    pub fn git_status() -> String {
+        let resp = call("git_status", &[]);
+        match dec_result(&resp) {
+            Ok(b) => String::from_utf8_lossy(b).to_string(),
+            Err(_) => String::new(),
+        }
+    }
+"#;
+
 fn build_boilerplate(enable_allocator: bool) -> String {
     let mut s = String::from(BOILERPLATE_HEAD);
     if enable_allocator {
@@ -186,6 +346,7 @@ fn build_boilerplate(enable_allocator: bool) -> String {
     s.push_str(BOILERPLATE_TAIL_BASE);
     if enable_allocator {
         s.push_str(BOILERPLATE_TAIL_ALLOC);
+        s.push_str(BOILERPLATE_TAIL_ENCODING);
     }
     s.push_str(BOILERPLATE_TAIL_CLOSE);
     s
@@ -231,14 +392,14 @@ fn format_rust_source(source: &str) -> String {
     }
 }
 
-#[derive(Deserialize)]
-struct RunRiscVInput {
-    source: Option<String>,
-    program: Option<String>,
-    args: Option<Vec<String>>,
-    max_cycles: Option<u64>,
-    memory_size: Option<usize>,
-    allocator: Option<bool>,
+#[derive(Default, Deserialize, Serialize)]
+pub struct RunRiscVInput {
+    pub source: Option<String>,
+    pub program: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub max_cycles: Option<u64>,
+    pub memory_size: Option<usize>,
+    pub allocator: Option<bool>,
 }
 
 struct TaiSyscall {
@@ -272,41 +433,26 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
 
                 let request_bytes = machine.memory_mut().load_bytes(req_ptr, req_len)?;
 
-                let v: serde_json::Value = serde_json::from_slice(&request_bytes)
-                    .map_err(|_| VmError::Unexpected("invalid tool call JSON".into()))?;
+                // Decode postcard frame: [tool_name: postcard String][args: postcard-encoded Args]
+                // Use postcard::take_from_bytes to split into tool name + args bytes
+                let (tool_name, rest): (String, &[u8]) = postcard::take_from_bytes(&request_bytes)
+                    .map_err(|_| VmError::Unexpected("invalid postcard frame: tool name".into()))?;
 
-                let name = v["name"]
-                    .as_str()
-                    .ok_or(VmError::Unexpected("missing 'name' in tool call".into()))?
-                    .to_string();
-                let arguments_json = v["arguments_json"].as_str().unwrap_or("{}").to_string();
-
-                let tool_call = ChatToolCall {
-                    id: "vm-0".to_string(),
-                    name,
-                    arguments_json,
-                };
-
-                let exec_output = self.registry.execute(
-                    &tool_call,
+                let result_bytes = self.registry.execute_dyn(
+                    &tool_name,
+                    rest,
                     self.x_credentials.as_ref(),
                     self.cwd.as_deref(),
                     self.ctx.as_ref(),
                 );
 
-                let content = exec_output.result.content.as_bytes();
-                let to_write = content.len().min(out_size as usize);
+                let to_write = result_bytes.len().min(out_size as usize);
                 if to_write > 0 {
                     machine
                         .memory_mut()
-                        .store_bytes(out_ptr, &content[..to_write])?;
+                        .store_bytes(out_ptr, &result_bytes[..to_write])?;
                 }
-                let result_len = if exec_output.result.is_error {
-                    0usize
-                } else {
-                    to_write
-                };
-                machine.set_register(registers::A0, result_len as u64);
+                machine.set_register(registers::A0, to_write as u64);
 
                 Ok(true)
             }
@@ -405,23 +551,13 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
 }
 
 fn run_riscv_impl(
-    args: &str,
+    input: &RunRiscVInput,
     x_credentials: Option<&ServiceCredential>,
     cwd: Option<&Path>,
     write_tx: Option<mpsc::Sender<Vec<u8>>>,
     registry: Arc<ToolRegistry>,
     ctx: Option<crate::tools::context::ToolContext>,
 ) -> ToolExecutionOutput {
-    let input: RunRiscVInput = match serde_json::from_str(args) {
-        Ok(i) => i,
-        Err(e) => {
-            return ToolExecutionOutput {
-                result: tool_err(format!("invalid arguments: {e}")),
-                image: None,
-            };
-        }
-    };
-
     let enable_allocator = input.allocator.unwrap_or(true);
 
     // Format the user's Rust source with rustfmt before compiling.
@@ -509,6 +645,7 @@ fn run_riscv_impl(
 
     let args_list: Vec<Bytes> = input
         .args
+        .clone()
         .unwrap_or_default()
         .into_iter()
         .map(Bytes::from)
@@ -586,6 +723,9 @@ impl RunRiscV {
 }
 
 impl Tool for RunRiscV {
+    type Args = RunRiscVInput;
+    type Return = String;
+
     fn name(&self) -> &'static str {
         "run_riscv"
     }
@@ -629,69 +769,62 @@ impl Tool for RunRiscV {
 
     fn execute(
         &self,
-        args: &str,
+        args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&Path>,
-    ) -> ToolExecutionOutput {
-        self.execute_with_context(args, x_credentials, cwd, None)
+        ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| ToolError::Other("ToolRegistry no longer available".to_string()))?;
+        let output = run_riscv_impl(&args, x_credentials, cwd, None, registry, ctx.cloned());
+        if output.result.is_error {
+            Err(ToolError::Other(output.result.content))
+        } else {
+            Ok(output.result.content)
+        }
     }
 
     fn execute_streaming(
         &self,
-        args: &str,
+        args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
-    ) -> ToolExecutionOutput {
-        self.execute_streaming_with_context(args, x_credentials, cwd, output_tx, None)
-    }
-
-    fn execute_with_context(
-        &self,
-        args: &str,
-        x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&Path>,
-        ctx: Option<&crate::tools::context::ToolContext>,
-    ) -> ToolExecutionOutput {
-        match self.registry.upgrade() {
-            Some(registry) => {
-                run_riscv_impl(args, x_credentials, cwd, None, registry, ctx.cloned())
-            }
-            None => ToolExecutionOutput {
-                result: tool_err("ToolRegistry no longer available"),
-                image: None,
-            },
-        }
-    }
-
-    fn execute_streaming_with_context(
-        &self,
-        args: &str,
-        x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
-        ctx: Option<&crate::tools::context::ToolContext>,
-    ) -> ToolExecutionOutput {
-        match self.registry.upgrade() {
-            Some(registry) => run_riscv_impl(
-                args,
-                x_credentials,
-                cwd,
-                Some(output_tx),
-                registry,
-                ctx.cloned(),
-            ),
-            None => ToolExecutionOutput {
-                result: tool_err("ToolRegistry no longer available"),
-                image: None,
-            },
+        ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| ToolError::Other("ToolRegistry no longer available".to_string()))?;
+        let output = run_riscv_impl(
+            &args,
+            x_credentials,
+            cwd,
+            Some(output_tx),
+            registry,
+            ctx.cloned(),
+        );
+        if output.result.is_error {
+            Err(ToolError::Other(output.result.content))
+        } else {
+            Ok(output.result.content)
         }
     }
 }
 
-pub fn execute_run_riscv_tool(args: &str, cwd: Option<&Path>) -> ToolResult {
+pub fn execute_run_riscv_tool(
+    input: &RunRiscVInput,
+    cwd: Option<&Path>,
+) -> Result<String, ToolError> {
     let registry = Arc::new(ToolRegistry::new());
-    run_riscv_impl(args, None, cwd, None, registry, None).result
+    let output = run_riscv_impl(input, None, cwd, None, registry, None);
+    if output.result.is_error {
+        Err(ToolError::Other(output.result.content))
+    } else {
+        Ok(output.result.content)
+    }
 }
 
 #[cfg(test)]
@@ -796,23 +929,15 @@ mod tests {
     }
 
     #[test]
-    fn run_riscv_rejects_invalid_json() {
-        let result = run_riscv_impl(r#"not json"#, None, None, None, dummy_registry(), None);
-        assert!(
-            result.result.is_error,
-            "expected error: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("invalid arguments"),
-            "{}",
-            result.result.content
-        );
-    }
-
-    #[test]
     fn run_riscv_requires_source_or_program() {
-        let result = run_riscv_impl(r#"{}"#, None, None, None, dummy_registry(), None);
+        let result = run_riscv_impl(
+            &RunRiscVInput::default(),
+            None,
+            None,
+            None,
+            dummy_registry(),
+            None,
+        );
         assert!(
             result.result.is_error,
             "expected error: {}",
@@ -828,7 +953,11 @@ mod tests {
     #[test]
     fn run_riscv_rejects_both_source_and_program() {
         let result = run_riscv_impl(
-            r#"{"source": "fn main() {}", "program": "AAAA"}"#,
+            &RunRiscVInput {
+                source: Some("fn main() {}".to_string()),
+                program: Some("AAAA".to_string()),
+                ..Default::default()
+            },
             None,
             None,
             None,
@@ -850,7 +979,10 @@ mod tests {
     #[test]
     fn run_riscv_rejects_invalid_base64() {
         let result = run_riscv_impl(
-            r#"{"program": "!!!not-base64!!!"}"#,
+            &RunRiscVInput {
+                program: Some("!!!not-base64!!!".to_string()),
+                ..Default::default()
+            },
             None,
             None,
             None,
@@ -872,7 +1004,11 @@ mod tests {
     #[test]
     fn run_riscv_rejects_non_aligned_memory() {
         let result = run_riscv_impl(
-            r#"{"program": "AAAA", "memory_size": 100}"#,
+            &RunRiscVInput {
+                program: Some("AAAA".to_string()),
+                memory_size: Some(100),
+                ..Default::default()
+            },
             None,
             None,
             None,
@@ -894,7 +1030,11 @@ mod tests {
     #[test]
     fn run_riscv_rejects_memory_over_4mb() {
         let result = run_riscv_impl(
-            r#"{"program": "AAAA", "memory_size": 4198400}"#,
+            &RunRiscVInput {
+                program: Some("AAAA".to_string()),
+                memory_size: Some(4198400),
+                ..Default::default()
+            },
             None,
             None,
             None,
@@ -919,7 +1059,11 @@ mod tests {
         // not during input validation. This test verifies that valid base64 + aligned memory
         // passes input validation (the error will be about ELF loading, not input).
         let result = run_riscv_impl(
-            r#"{"program": "AAAA", "memory_size": 4096}"#,
+            &RunRiscVInput {
+                program: Some("AAAA".to_string()),
+                memory_size: Some(4096),
+                ..Default::default()
+            },
             None,
             None,
             None,

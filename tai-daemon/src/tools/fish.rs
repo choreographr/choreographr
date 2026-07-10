@@ -1,22 +1,25 @@
 use super::{
-    ToolError, ToolResult,
+    ToolError,
     shell_util::{format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
-    tool_ok,
 };
 use serde::Deserialize;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
-struct FishArgs {
-    command: String,
-    workdir: Option<String>,
-    timeout: Option<u64>,
+pub struct FishArgs {
+    pub command: String,
+    pub workdir: Option<String>,
+    pub timeout: Option<u64>,
 }
+
+pub(crate) struct FishShell;
 
 define_tool!(
     FishShell,
     "fish",
     "Execute a fish shell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang.",
+    FishArgs,
+    String,
     execute_fish_tool,
     serde_json::json!({
         "type": "object",
@@ -41,23 +44,14 @@ define_tool!(
     "shell"
 );
 
-pub fn execute_fish_tool(arguments_json: &str, cwd: Option<&Path>) -> ToolResult {
-    match execute_fish_inner(arguments_json, cwd) {
-        Ok(content) => tool_ok(content),
-        Err(error) => error.into(),
-    }
-}
-
-fn execute_fish_inner(arguments_json: &str, cwd: Option<&Path>) -> Result<String, ToolError> {
-    let args: FishArgs = serde_json::from_str(arguments_json)?;
-
-    let command = args.command;
+pub fn execute_fish_tool(args: &FishArgs, cwd: Option<&Path>) -> Result<String, ToolError> {
+    let command = &args.command;
     let timeout_ms = args.timeout.unwrap_or(30000).min(300000);
 
     let resolved = resolve_and_confine(args.workdir.as_deref(), cwd)?;
 
     let mut cmd = std::process::Command::new("fish");
-    cmd.args(["-c", &command])
+    cmd.args(["-c", command])
         .current_dir(&resolved)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -67,7 +61,7 @@ fn execute_fish_inner(arguments_json: &str, cwd: Option<&Path>) -> Result<String
     let (output, was_killed) = spawn_with_watchdog(&mut cmd, timeout_ms)?;
 
     Ok(format_shell_output(
-        &command, &output, timeout_ms, was_killed,
+        command, &output, timeout_ms, was_killed,
     ))
 }
 

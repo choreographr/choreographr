@@ -1,4 +1,4 @@
-use crate::tools::{ToolError, ToolResult, tool_ok, truncate_tool_output};
+use crate::tools::{ToolError, truncate_tool_output};
 use serde::Deserialize;
 use std::fmt::Write as _;
 
@@ -8,27 +8,19 @@ use super::{
 };
 
 #[derive(Debug, Deserialize)]
-struct GitPushArgs {
-    repo_path: Option<String>,
-    remote: String,
-    branch: Option<String>,
-    set_upstream: Option<bool>,
-    force_with_lease: Option<bool>,
-    dry_run: Option<bool>,
+pub struct GitPushArgs {
+    pub repo_path: Option<String>,
+    pub remote: String,
+    pub branch: Option<String>,
+    pub set_upstream: Option<bool>,
+    pub force_with_lease: Option<bool>,
+    pub dry_run: Option<bool>,
 }
 
-pub fn execute_git_push_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_git_push_inner(arguments_json, cwd) {
-        Ok(content) => tool_ok(content),
-        Err(error) => error.into(),
-    }
-}
-
-fn execute_git_push_inner(
-    arguments_json: &str,
+pub fn execute_git_push_tool(
+    args: &GitPushArgs,
     cwd: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let args: GitPushArgs = serde_json::from_str(arguments_json)?;
     let output = git_push_impl(
         args.repo_path.as_deref(),
         &args.remote,
@@ -112,10 +104,14 @@ fn git_push_impl(
     Ok(out.trim_end().to_string())
 }
 
+pub(crate) struct GitPush;
+
 define_tool!(
     GitPush,
     "git_push",
     "Push to a Git remote branch.",
+    GitPushArgs,
+    String,
     execute_git_push_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"remote":{"type":"string","description":"Remote name","default":"origin"},"branch":{"type":"string","description":"Remote branch name"},"set_upstream":{"type":"boolean","description":"Set upstream tracking reference","default":false},"force_with_lease":{"type":"boolean","description":"Force push with lease (safe force push)","default":false},"dry_run":{"type":"boolean","description":"Simulate push without sending data","default":false}},"required":[],"additionalProperties":false}),
     "git"

@@ -18,17 +18,17 @@ mod stage;
 mod status;
 
 pub(crate) use commit::GitCommit;
-pub use commit::execute_git_commit_tool;
+pub use commit::{GitCommitArgs, execute_git_commit_tool};
 pub(crate) use diff::GitDiff;
-pub use diff::execute_git_diff_tool;
+pub use diff::{GitDiffArgs, execute_git_diff_tool};
 pub(crate) use log::GitLog;
-pub use log::execute_git_log_tool;
+pub use log::{GitLogArgs, execute_git_log_tool};
 pub(crate) use push::GitPush;
-pub use push::execute_git_push_tool;
+pub use push::{GitPushArgs, execute_git_push_tool};
 pub(crate) use stage::GitAdd;
-pub use stage::execute_git_add_tool;
+pub use stage::{GitAddArgs, execute_git_add_tool};
 pub(crate) use status::GitStatus;
-pub use status::execute_git_status_tool;
+pub use status::{GitRepoArgs, execute_git_status_tool};
 
 pub(crate) fn open_repo(
     repo_path: Option<&str>,

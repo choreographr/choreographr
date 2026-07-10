@@ -1,4 +1,4 @@
-use crate::tools::{ToolError, ToolResult, tool_ok, truncate_tool_output};
+use crate::tools::{ToolError, truncate_tool_output};
 use gix::status::UntrackedFiles;
 use serde::Deserialize;
 use std::{fmt::Write as _, io, ops::Deref};
@@ -9,30 +9,23 @@ use super::{
 };
 
 #[derive(Debug, Deserialize)]
-struct GitDiffArgs {
-    repo_path: Option<String>,
-    cached: Option<bool>,
-    pathspec: Option<Vec<String>>,
-    full: Option<bool>,
+pub struct GitDiffArgs {
+    pub repo_path: Option<String>,
+    pub cached: Option<bool>,
+    pub pathspec: Option<Vec<String>>,
+    pub full: Option<bool>,
 }
 
-pub fn execute_git_diff_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_git_diff_inner(arguments_json, cwd) {
-        Ok(content) => tool_ok(content),
-        Err(error) => error.into(),
-    }
-}
-
-fn execute_git_diff_inner(
-    arguments_json: &str,
+pub fn execute_git_diff_tool(
+    args: &GitDiffArgs,
     cwd: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let args: GitDiffArgs = serde_json::from_str(arguments_json)?;
+    let pathspec = args.pathspec.clone().unwrap_or_default();
     if args.full.unwrap_or(false) {
         let output = git_full_diff_impl(
             args.repo_path.as_deref(),
             args.cached.unwrap_or(false),
-            args.pathspec.unwrap_or_default(),
+            pathspec,
             cwd,
         )?;
         Ok(truncate_tool_output(&output))
@@ -40,7 +33,7 @@ fn execute_git_diff_inner(
         let output = git_diff_impl(
             args.repo_path.as_deref(),
             args.cached.unwrap_or(false),
-            args.pathspec.unwrap_or_default(),
+            pathspec,
             cwd,
         )?;
         Ok(truncate_tool_output(&output))
@@ -276,10 +269,14 @@ fn collect_worktree_diff_lines(
     Ok(lines)
 }
 
+pub(crate) struct GitDiff;
+
 define_tool!(
     GitDiff,
     "git_diff",
     "Show the diff for a file or repository. When `full` is true, returns line-by-line unified diff instead of file status summary.",
+    GitDiffArgs,
+    String,
     execute_git_diff_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"cached":{"type":"boolean","description":"Show staged (cached) changes instead of worktree changes","default":false},"pathspec":{"type":"array","items":{"type":"string"},"description":"Optional pathspecs to filter"},"full":{"type":"boolean","description":"Return full unified diff instead of file status summary","default":false}},"additionalProperties":false}),
     "git"

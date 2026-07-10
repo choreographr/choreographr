@@ -1,15 +1,28 @@
 use crate::openai::{ChatToolCall, ChatToolDefinition};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc;
 use tai_keystore::ServiceCredential;
 
+/// Helper: encode Result<R, impl ToString> as postcard-encoded Result<R, String>.
+fn encode_result<R: Serialize>(result: Result<R, impl ToString>) -> Vec<u8> {
+    let wrapped: Result<R, String> = result.map_err(|e| e.to_string());
+    postcard::to_allocvec(&wrapped).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to postcard-encode tool result");
+        Vec::new()
+    })
+}
+
 #[macro_export]
 macro_rules! define_tool {
-    ($struct:ident, $name:literal, $desc:literal, $exec_fn:path, $schema:expr, $tool_group:literal) => {
-        pub(crate) struct $struct;
+    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty, $return_ty:ty,
+     $exec_fn:path, $schema:expr, $tool_group:literal) => {
         impl $crate::tools::Tool for $struct {
+            type Args = $args_ty;
+            type Return = $return_ty;
             fn name(&self) -> &'static str {
                 $name
             }
@@ -24,14 +37,12 @@ macro_rules! define_tool {
             }
             fn execute(
                 &self,
-                args: &str,
-                _x_credentials: Option<&tai_keystore::ServiceCredential>,
+                args: Self::Args,
+                _x_credentials: Option<&$crate::tools::ServiceCredential>,
                 cwd: Option<&std::path::Path>,
-            ) -> $crate::tools::ToolExecutionOutput {
-                $crate::tools::ToolExecutionOutput {
-                    result: $exec_fn(args, cwd),
-                    image: None,
-                }
+                _ctx: Option<&$crate::tools::context::ToolContext>,
+            ) -> Result<Self::Return, $crate::tools::ToolError> {
+                $exec_fn(&args, cwd)
             }
         }
     };
@@ -72,7 +83,7 @@ pub struct ToolExecutionOutput {
 }
 
 #[derive(Debug)]
-pub(crate) struct PreparedImage {
+pub struct PreparedImage {
     pub(crate) mime_type: String,
     pub(crate) data: Vec<u8>,
     pub(crate) width: u32,
@@ -86,60 +97,226 @@ pub struct ToolGroup {
     pub description: &'static str,
 }
 
+/// Typed tool trait. Each tool declares its Args and Return types.
+/// Both must be serde-compatible (JSON path uses serde_json, binary path uses postcard).
 pub trait Tool: Send + Sync {
+    /// Argument type — must be deserializable from both JSON and postcard.
+    type Args: DeserializeOwned + 'static;
+    /// Return type — must be serializable to both JSON and postcard.
+    type Return: Serialize + 'static;
+
     fn name(&self) -> &'static str;
     fn group(&self) -> &'static str {
         "core"
     }
     fn description(&self) -> &'static str;
     fn schema(&self) -> serde_json::Value;
+
+    /// Execute the tool with typed arguments.
     fn execute(
         &self,
-        arguments_json: &str,
+        args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
-    ) -> ToolExecutionOutput;
+        ctx: Option<&context::ToolContext>,
+    ) -> Result<Self::Return, ToolError>;
 
+    /// Execute with streaming output.
+    ///
+    /// The default implementation calls execute() and sends the serialized
+    /// return value as one chunk through output_tx. Tools that produce
+    /// incremental output (shell commands, VM execution) override this.
     fn execute_streaming(
         &self,
-        arguments_json: &str,
-        x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&std::path::Path>,
-        _output_tx: mpsc::Sender<Vec<u8>>,
-    ) -> ToolExecutionOutput {
-        self.execute(arguments_json, x_credentials, cwd)
-    }
-
-    /// Execute a tool with optional session context.
-    ///
-    /// The default implementation delegates to `execute()` for backward
-    /// compatibility. Tools that need session context (e.g. DB tools)
-    /// override this method instead.
-    fn execute_with_context(
-        &self,
-        arguments_json: &str,
-        x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&std::path::Path>,
-        _ctx: Option<&context::ToolContext>,
-    ) -> ToolExecutionOutput {
-        self.execute(arguments_json, x_credentials, cwd)
-    }
-
-    /// Execute a tool with streaming output and optional session context.
-    ///
-    /// The default implementation delegates to `execute_streaming()` for
-    /// backward compatibility with tools that override the old method.
-    /// Tools that need both streaming and session context (e.g. RISC-V)
-    /// override this method directly.
-    fn execute_streaming_with_context(
-        &self,
-        arguments_json: &str,
+        args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
-        _ctx: Option<&context::ToolContext>,
+        ctx: Option<&context::ToolContext>,
+    ) -> Result<Self::Return, ToolError> {
+        let ret = self.execute(args, x_credentials, cwd, ctx)?;
+        let bytes = postcard::to_allocvec(&ret).map_err(ToolError::Postcard)?;
+        let _ = output_tx.send(bytes);
+        Ok(ret)
+    }
+
+    /// Optional: extract a PreparedImage from the return value.
+    /// Only display_image overrides this.
+    fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> {
+        None
+    }
+}
+
+/// Type-erased dispatch trait stored in ToolRegistry.
+/// Converts between JSON/binary and the typed Tool::execute().
+pub trait ToolDyn: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn group(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    fn schema(&self) -> serde_json::Value;
+
+    /// JSON path (LLM tool calls) — returns ToolExecutionOutput for session.
+    fn execute_json(
+        &self,
+        args_json: &str,
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        ctx: Option<&context::ToolContext>,
+    ) -> ToolExecutionOutput;
+
+    /// Binary path (VM ecall) — returns raw postcard-encoded Result<Return, String>.
+    fn execute_binary(
+        &self,
+        args_bytes: &[u8],
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        ctx: Option<&context::ToolContext>,
+    ) -> Vec<u8>;
+
+    /// Streaming JSON path.
+    fn execute_streaming_json(
+        &self,
+        args_json: &str,
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        ctx: Option<&context::ToolContext>,
+    ) -> ToolExecutionOutput;
+
+    /// Streaming binary path.
+    fn execute_streaming_binary(
+        &self,
+        args_bytes: &[u8],
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        ctx: Option<&context::ToolContext>,
+    ) -> Vec<u8>;
+}
+
+/// Blanket impl: every TypedTool is also a ToolDyn.
+impl<T: Tool + 'static> ToolDyn for T {
+    fn name(&self) -> &'static str {
+        Tool::name(self)
+    }
+    fn group(&self) -> &'static str {
+        Tool::group(self)
+    }
+    fn description(&self) -> &'static str {
+        Tool::description(self)
+    }
+    fn schema(&self) -> serde_json::Value {
+        Tool::schema(self)
+    }
+
+    fn execute_json(
+        &self,
+        args_json: &str,
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        ctx: Option<&context::ToolContext>,
     ) -> ToolExecutionOutput {
-        self.execute_streaming(arguments_json, x_credentials, cwd, output_tx)
+        let args = match serde_json::from_str::<T::Args>(args_json) {
+            Ok(a) => a,
+            Err(e) => {
+                return ToolExecutionOutput {
+                    result: ToolResult {
+                        content: format!("invalid arguments: {e}"),
+                        is_error: true,
+                    },
+                    image: None,
+                };
+            }
+        };
+        match self.execute(args, x_credentials, cwd, ctx) {
+            Ok(ret) => {
+                let image = self.extract_image(&ret);
+                ToolExecutionOutput {
+                    result: ToolResult {
+                        content: serde_json::to_string(&ret).unwrap_or_default(),
+                        is_error: false,
+                    },
+                    image,
+                }
+            }
+            Err(e) => ToolExecutionOutput {
+                result: ToolResult {
+                    content: e.to_string(),
+                    is_error: true,
+                },
+                image: None,
+            },
+        }
+    }
+
+    fn execute_binary(
+        &self,
+        args_bytes: &[u8],
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        ctx: Option<&context::ToolContext>,
+    ) -> Vec<u8> {
+        let args = match postcard::from_bytes::<T::Args>(args_bytes) {
+            Ok(a) => a,
+            Err(e) => return encode_result::<T::Return>(Err::<T::Return, _>(e)),
+        };
+        encode_result(self.execute(args, x_credentials, cwd, ctx))
+    }
+
+    fn execute_streaming_json(
+        &self,
+        args_json: &str,
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        ctx: Option<&context::ToolContext>,
+    ) -> ToolExecutionOutput {
+        let args = match serde_json::from_str::<T::Args>(args_json) {
+            Ok(a) => a,
+            Err(e) => {
+                return ToolExecutionOutput {
+                    result: ToolResult {
+                        content: format!("invalid arguments: {e}"),
+                        is_error: true,
+                    },
+                    image: None,
+                };
+            }
+        };
+        match self.execute_streaming(args, x_credentials, cwd, output_tx, ctx) {
+            Ok(ret) => {
+                let image = self.extract_image(&ret);
+                ToolExecutionOutput {
+                    result: ToolResult {
+                        content: serde_json::to_string(&ret).unwrap_or_default(),
+                        is_error: false,
+                    },
+                    image,
+                }
+            }
+            Err(e) => ToolExecutionOutput {
+                result: ToolResult {
+                    content: e.to_string(),
+                    is_error: true,
+                },
+                image: None,
+            },
+        }
+    }
+
+    fn execute_streaming_binary(
+        &self,
+        args_bytes: &[u8],
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        ctx: Option<&context::ToolContext>,
+    ) -> Vec<u8> {
+        let args = match postcard::from_bytes::<T::Args>(args_bytes) {
+            Ok(a) => a,
+            Err(e) => return encode_result::<T::Return>(Err::<T::Return, _>(e)),
+        };
+        encode_result(self.execute_streaming(args, x_credentials, cwd, output_tx, ctx))
     }
 }
 
@@ -171,7 +348,7 @@ pub const GROUPS: &[ToolGroup] = &[
 ];
 
 pub struct ToolRegistry {
-    tools: HashMap<&'static str, Box<dyn Tool>>,
+    tools: HashMap<&'static str, Box<dyn ToolDyn>>,
     fff_cache: Arc<fff::FffStateCache>,
 }
 
@@ -194,7 +371,7 @@ impl ToolRegistry {
         reg.register(http::HttpRequest);
         reg.register(fs::WriteFile);
         reg.register(fs::EditFile);
-        reg.register(image::DisplayImage);
+        reg.register(image::DisplayImage::new());
         reg.register(git::GitStatus);
         reg.register(git::GitDiff);
         reg.register(git::GitLog);
@@ -254,9 +431,7 @@ impl ToolRegistry {
         ctx: Option<&context::ToolContext>,
     ) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
-            Some(tool) => {
-                tool.execute_with_context(&tool_call.arguments_json, x_credentials, cwd, ctx)
-            }
+            Some(tool) => tool.execute_json(&tool_call.arguments_json, x_credentials, cwd, ctx),
             None => ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("unknown tool: {}", tool_call.name),
@@ -276,7 +451,7 @@ impl ToolRegistry {
         ctx: Option<&context::ToolContext>,
     ) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
-            Some(tool) => tool.execute_streaming_with_context(
+            Some(tool) => tool.execute_streaming_json(
                 &tool_call.arguments_json,
                 x_credentials,
                 cwd,
@@ -290,6 +465,27 @@ impl ToolRegistry {
                 },
                 image: None,
             },
+        }
+    }
+
+    /// Execute a tool via postcard binary dispatch (VM path).
+    pub fn execute_dyn(
+        &self,
+        name: &str,
+        args_bytes: &[u8],
+        x_credentials: Option<&ServiceCredential>,
+        cwd: Option<&std::path::Path>,
+        ctx: Option<&context::ToolContext>,
+    ) -> Vec<u8> {
+        match self.tools.get(name) {
+            Some(tool) => tool.execute_binary(args_bytes, x_credentials, cwd, ctx),
+            None => {
+                let err: Result<(), String> = Err(format!("unknown tool: {name}"));
+                postcard::to_allocvec(&err).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, tool = %name, "failed to postcard-encode unknown-tool error");
+                    Vec::new()
+                })
+            }
         }
     }
 

@@ -23,17 +23,18 @@ pub use crate::server::run_server;
 pub use crate::sessions::{
     ActiveSessionEntry, RequestContext, SessionCommand, SessionMetadata, SessionState, session_main,
 };
-pub use crate::tools::exec::execute_exec_tool;
-pub use crate::tools::fish::execute_fish_tool;
+pub use crate::tools::exec::{ExecArgs, execute_exec_tool};
+pub use crate::tools::fish::{FishArgs, execute_fish_tool};
 pub use crate::tools::git::{
+    GitAddArgs, GitCommitArgs, GitDiffArgs, GitLogArgs, GitPushArgs, GitRepoArgs,
     execute_git_add_tool, execute_git_commit_tool, execute_git_diff_tool, execute_git_log_tool,
     execute_git_push_tool, execute_git_status_tool,
 };
-pub use crate::tools::nu::execute_nu_tool;
-pub use crate::tools::sh::execute_sh_tool;
+pub use crate::tools::nu::{NuArgs, execute_nu_tool};
+pub use crate::tools::sh::{ShArgs, execute_sh_tool};
 #[cfg(test)]
 pub(crate) use crate::tools::sha256_hex;
-pub use crate::tools::vm::execute_run_riscv_tool;
+pub use crate::tools::vm::{RunRiscVInput, execute_run_riscv_tool};
 
 #[cfg(test)]
 pub(crate) use crate::tools::fs::{

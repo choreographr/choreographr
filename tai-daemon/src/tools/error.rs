@@ -2,7 +2,7 @@ use super::ToolResult;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub(crate) enum ToolError {
+pub enum ToolError {
     #[error("invalid arguments: {0}")]
     InvalidArguments(#[from] serde_json::Error),
     #[error("unsupported method: {0}")]
@@ -17,6 +17,8 @@ pub(crate) enum ToolError {
     RequestFailed(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("postcard error: {0}")]
+    Postcard(#[from] postcard::Error),
     #[error("{0}")]
     Other(String),
 }

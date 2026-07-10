@@ -1,6 +1,24 @@
-use crate::tools::{ToolExecutionOutput, tool_err, tool_ok, truncate_tool_output};
+use crate::tools::{ToolError, context::ToolContext, truncate_tool_output};
 use reqwest::blocking::Client;
+use serde::Deserialize;
+use std::path::Path;
 use tai_keystore::{ServiceCredential, XCredentialView};
+
+#[derive(Debug, Deserialize)]
+pub struct XPostArgs {
+    pub text: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct XSearchRecentArgs {
+    pub query: String,
+    pub max_results: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct XUserLookupArgs {
+    pub username: String,
+}
 
 fn get_x_credentials(x_credentials: Option<&ServiceCredential>) -> Option<XCredentialView<'_>> {
     x_credentials.and_then(ServiceCredential::as_x)
@@ -26,9 +44,6 @@ fn urlencode(s: &str) -> String {
 fn hmac_sha1(key: &[u8], data: &str) -> String {
     use hmac::{Hmac, KeyInit, Mac};
     use sha1::Sha1;
-    // Pad or truncate to HMAC-SHA1 block size (64 bytes).
-    // new_from_slice would reject empty keys, so we always
-    // provide a fixed-size key buffer.
     let mut key_buf = [0u8; 64];
     if !key.is_empty() {
         let len = key.len().min(64);
@@ -188,9 +203,93 @@ fn x_api_post(
     Ok(body)
 }
 
+fn format_x_api_response(response: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(response) {
+        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| response.to_string()),
+        Err(_) => response.to_string(),
+    }
+}
+
+fn execute_x_post_tool(
+    args: &XPostArgs,
+    x_credentials: Option<&ServiceCredential>,
+) -> Result<String, ToolError> {
+    let text = args.text.trim();
+    if text.is_empty() {
+        return Err(ToolError::Other("text must not be empty".to_string()));
+    }
+
+    let body = serde_json::json!({ "text": text }).to_string();
+
+    x_api_post("/2/tweets", &body, x_credentials)
+        .map(|response| {
+            truncate_tool_output(&format!(
+                "tweet posted successfully:\n{}",
+                format_x_api_response(&response)
+            ))
+        })
+        .map_err(|e| ToolError::Other(truncate_tool_output(&e)))
+}
+
+fn execute_x_search_recent_tool(
+    args: &XSearchRecentArgs,
+    x_credentials: Option<&ServiceCredential>,
+) -> Result<String, ToolError> {
+    let query = args.query.trim();
+    if query.is_empty() {
+        return Err(ToolError::Other("query must not be empty".to_string()));
+    }
+
+    let max_results = args.max_results.unwrap_or(10).clamp(10, 100);
+    let max_results_str = max_results.to_string();
+
+    let params = vec![
+        ("query", query),
+        ("max_results", &max_results_str),
+        ("tweet.fields", "created_at,author_id,public_metrics"),
+    ];
+
+    x_api_get("/2/tweets/search/recent", &params, x_credentials)
+        .map(|response| {
+            truncate_tool_output(&format!(
+                "search results for '{query}':\n{}",
+                format_x_api_response(&response)
+            ))
+        })
+        .map_err(|e| ToolError::Other(truncate_tool_output(&e)))
+}
+
+fn execute_x_user_lookup_tool(
+    args: &XUserLookupArgs,
+    x_credentials: Option<&ServiceCredential>,
+) -> Result<String, ToolError> {
+    let username = args.username.trim();
+    if username.is_empty() {
+        return Err(ToolError::Other("username must not be empty".to_string()));
+    }
+
+    let params = vec![("user.fields", "description,public_metrics,created_at")];
+
+    x_api_get(
+        &format!("/2/users/by/username/{username}"),
+        &params,
+        x_credentials,
+    )
+    .map(|response| {
+        truncate_tool_output(&format!(
+            "user lookup for @{username}:\n{}",
+            format_x_api_response(&response)
+        ))
+    })
+    .map_err(|e| ToolError::Other(truncate_tool_output(&e)))
+}
+
 pub(crate) struct XPost;
 
 impl super::Tool for XPost {
+    type Args = XPostArgs;
+    type Return = String;
+
     fn name(&self) -> &'static str {
         "x_post"
     }
@@ -218,54 +317,21 @@ impl super::Tool for XPost {
 
     fn execute(
         &self,
-        arguments_json: &str,
+        args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
-    ) -> ToolExecutionOutput {
-        let args: serde_json::Value = match serde_json::from_str(arguments_json) {
-            Ok(v) => v,
-            Err(e) => {
-                return ToolExecutionOutput {
-                    result: tool_err(format!("invalid arguments: {e}")),
-                    image: None,
-                };
-            }
-        };
-
-        let text = args["text"].as_str().unwrap_or_default();
-        if text.is_empty() {
-            return ToolExecutionOutput {
-                result: tool_err("text must not be empty"),
-                image: None,
-            };
-        }
-
-        let body = serde_json::json!({ "text": text }).to_string();
-
-        match x_api_post("/2/tweets", &body, x_credentials) {
-            Ok(response) => {
-                let formatted = match serde_json::from_str::<serde_json::Value>(&response) {
-                    Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(response),
-                    Err(_) => response,
-                };
-                ToolExecutionOutput {
-                    result: tool_ok(truncate_tool_output(&format!(
-                        "tweet posted successfully:\n{formatted}"
-                    ))),
-                    image: None,
-                }
-            }
-            Err(e) => ToolExecutionOutput {
-                result: tool_err(truncate_tool_output(&e)),
-                image: None,
-            },
-        }
+        _cwd: Option<&Path>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        execute_x_post_tool(&args, x_credentials)
     }
 }
 
 pub(crate) struct XSearchRecent;
 
 impl super::Tool for XSearchRecent {
+    type Args = XSearchRecentArgs;
+    type Return = String;
+
     fn name(&self) -> &'static str {
         "x_search_recent"
     }
@@ -297,61 +363,21 @@ impl super::Tool for XSearchRecent {
 
     fn execute(
         &self,
-        arguments_json: &str,
+        args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
-    ) -> ToolExecutionOutput {
-        let args: serde_json::Value = match serde_json::from_str(arguments_json) {
-            Ok(v) => v,
-            Err(e) => {
-                return ToolExecutionOutput {
-                    result: tool_err(format!("invalid arguments: {e}")),
-                    image: None,
-                };
-            }
-        };
-
-        let query = args["query"].as_str().unwrap_or_default();
-        if query.is_empty() {
-            return ToolExecutionOutput {
-                result: tool_err("query must not be empty"),
-                image: None,
-            };
-        }
-
-        let max_results = args["max_results"].as_u64().unwrap_or(10).clamp(10, 100);
-        let max_results_str = max_results.to_string();
-
-        let params = vec![
-            ("query", query),
-            ("max_results", &max_results_str),
-            ("tweet.fields", "created_at,author_id,public_metrics"),
-        ];
-
-        match x_api_get("/2/tweets/search/recent", &params, x_credentials) {
-            Ok(response) => {
-                let formatted = match serde_json::from_str::<serde_json::Value>(&response) {
-                    Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(response),
-                    Err(_) => response,
-                };
-                ToolExecutionOutput {
-                    result: tool_ok(truncate_tool_output(&format!(
-                        "search results for '{query}':\n{formatted}"
-                    ))),
-                    image: None,
-                }
-            }
-            Err(e) => ToolExecutionOutput {
-                result: tool_err(truncate_tool_output(&e)),
-                image: None,
-            },
-        }
+        _cwd: Option<&Path>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        execute_x_search_recent_tool(&args, x_credentials)
     }
 }
 
 pub(crate) struct XUserLookup;
 
 impl super::Tool for XUserLookup {
+    type Args = XUserLookupArgs;
+    type Return = String;
+
     fn name(&self) -> &'static str {
         "x_user_lookup"
     }
@@ -379,52 +405,12 @@ impl super::Tool for XUserLookup {
 
     fn execute(
         &self,
-        arguments_json: &str,
+        args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
-    ) -> ToolExecutionOutput {
-        let args: serde_json::Value = match serde_json::from_str(arguments_json) {
-            Ok(v) => v,
-            Err(e) => {
-                return ToolExecutionOutput {
-                    result: tool_err(format!("invalid arguments: {e}")),
-                    image: None,
-                };
-            }
-        };
-
-        let username = args["username"].as_str().unwrap_or_default();
-        if username.is_empty() {
-            return ToolExecutionOutput {
-                result: tool_err("username must not be empty"),
-                image: None,
-            };
-        }
-
-        let params = vec![("user.fields", "description,public_metrics,created_at")];
-
-        match x_api_get(
-            &format!("/2/users/by/username/{username}"),
-            &params,
-            x_credentials,
-        ) {
-            Ok(response) => {
-                let formatted = match serde_json::from_str::<serde_json::Value>(&response) {
-                    Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(response),
-                    Err(_) => response,
-                };
-                ToolExecutionOutput {
-                    result: tool_ok(truncate_tool_output(&format!(
-                        "user lookup for @{username}:\n{formatted}"
-                    ))),
-                    image: None,
-                }
-            }
-            Err(e) => ToolExecutionOutput {
-                result: tool_err(truncate_tool_output(&e)),
-                image: None,
-            },
-        }
+        _cwd: Option<&Path>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        execute_x_user_lookup_tool(&args, x_credentials)
     }
 }
 

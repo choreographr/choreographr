@@ -1,4 +1,4 @@
-use crate::tools::{ToolError, ToolResult, tool_ok, truncate_tool_output};
+use crate::tools::{ToolError, truncate_tool_output};
 use gix::{
     ObjectId,
     bstr::{BStr, BString, ByteSlice},
@@ -11,24 +11,16 @@ use super::{
 };
 
 #[derive(Debug, Deserialize)]
-struct GitAddArgs {
-    repo_path: Option<String>,
-    pathspec: Vec<String>,
+pub struct GitAddArgs {
+    pub repo_path: Option<String>,
+    pub pathspec: Vec<String>,
 }
 
-pub fn execute_git_add_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_git_add_inner(arguments_json, cwd) {
-        Ok(content) => tool_ok(content),
-        Err(error) => error.into(),
-    }
-}
-
-pub(super) fn execute_git_add_inner(
-    arguments_json: &str,
+pub fn execute_git_add_tool(
+    args: &GitAddArgs,
     cwd: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let args: GitAddArgs = serde_json::from_str(arguments_json)?;
-    let pathspec = normalize_pathspecs(args.pathspec)?;
+    let pathspec = normalize_pathspecs(args.pathspec.clone())?;
     let output = git_add_impl(args.repo_path.as_deref(), pathspec, cwd)?;
     Ok(truncate_tool_output(&output))
 }
@@ -259,10 +251,14 @@ impl IndexEntrySnapshot {
     }
 }
 
+pub(crate) struct GitAdd;
+
 define_tool!(
     GitAdd,
     "git_add",
     "Stage a file or pathspec in Git.",
+    GitAddArgs,
+    String,
     execute_git_add_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"pathspec":{"type":"array","items":{"type":"string"},"description":"Files or pathspecs to stage"}},"required":["pathspec"],"additionalProperties":false}),
     "git"

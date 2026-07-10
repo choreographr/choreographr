@@ -1,4 +1,4 @@
-use crate::tools::{ToolError, ToolResult, tool_ok, truncate_tool_output};
+use crate::tools::{ToolError, truncate_tool_output};
 use gix::{
     bstr::BString,
     status::{Item as StatusItem, UntrackedFiles},
@@ -12,22 +12,14 @@ use super::{
 };
 
 #[derive(Debug, Deserialize)]
-struct GitRepoArgs {
-    repo_path: Option<String>,
+pub struct GitRepoArgs {
+    pub repo_path: Option<String>,
 }
 
-pub fn execute_git_status_tool(arguments_json: &str, cwd: Option<&std::path::Path>) -> ToolResult {
-    match execute_git_status_inner(arguments_json, cwd) {
-        Ok(content) => tool_ok(content),
-        Err(error) => error.into(),
-    }
-}
-
-fn execute_git_status_inner(
-    arguments_json: &str,
+pub fn execute_git_status_tool(
+    args: &GitRepoArgs,
     cwd: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let args: GitRepoArgs = serde_json::from_str(arguments_json)?;
     let output = git_status_impl(args.repo_path.as_deref(), cwd)?;
     Ok(truncate_tool_output(&output))
 }
@@ -79,10 +71,14 @@ fn git_status_impl(
     Ok(out.trim_end().to_string())
 }
 
+pub(crate) struct GitStatus;
+
 define_tool!(
     GitStatus,
     "git_status",
     "Show the status of the Git repository containing the given path.",
+    GitRepoArgs,
+    String,
     execute_git_status_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."}},"additionalProperties":false}),
     "git"
