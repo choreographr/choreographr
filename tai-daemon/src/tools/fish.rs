@@ -34,7 +34,7 @@ define_tool!(
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in milliseconds (default 30000, max 300000)",
+                "description": "Timeout in milliseconds (default 30000; capped by outer tool deadline)",
                 "default": 30000
             }
         },
@@ -46,7 +46,7 @@ define_tool!(
 
 pub fn execute_fish_tool(args: &FishArgs, cwd: Option<&Path>) -> Result<String, ToolError> {
     let command = &args.command;
-    let timeout_ms = args.timeout.unwrap_or(30000).min(300000);
+    let timeout_ms = args.timeout.unwrap_or(30000);
 
     let resolved = resolve_and_confine(args.workdir.as_deref(), cwd)?;
 

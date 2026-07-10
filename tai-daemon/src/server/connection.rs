@@ -336,6 +336,7 @@ fn handle_client_create_session(
         parent_session_id,
         cwd: cwd.map(std::path::PathBuf::from),
         max_turns,
+        reasoning_effort: None,
         context_config,
         account_name,
         active_tool_groups: Vec::new(),

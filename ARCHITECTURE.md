@@ -205,8 +205,8 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
-| `tools/` | `Tool` trait, `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 27 registered tools. |
-| `tools/context.rs` | `ToolContext` — session-scoped context (session ID + `Arc<Database>`) passed to tools that need DB access. |
+| `tools/` | `Tool` trait, `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 30 registered tools (including `list_sessions`, `get_session`, `load_skill` via `admin.rs`). |
+| `tools/context.rs` | `ToolContext` — session-scoped context (session ID + `Arc<Database>` + `mpsc::Sender<DaemonCommand>`) passed to tools that need DB or daemon access. |
 | `tools/db.rs` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
 
@@ -527,11 +527,18 @@ pub trait Tool: Send + Sync {
 
     fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> { None }
 }
+
+Tool implementations can declare which parameters they need via flags on the
+`define_tool!` invocation (see below). The `ctx` parameter provides `ToolContext`
+with session ID, database handle, and a daemon command channel — used by admin
+tools (`list_sessions`, `get_session`).
 ```
 
 Tools that produce images (e.g. `display_image`) override `extract_image()` to return a
 `PreparedImage` from the typed return value. The conversion layer (see `ToolDyn` below)
-calls this to attach the image to the JSON response.
+sends the image through an out-of-band `image_tx: Option<mpsc::Sender<PreparedImage>>`
+channel rather than embedding it in the response struct. The agent loop drains this
+channel after execution to persist and broadcast the image.
 
 ### `ToolDyn` — type-erased dispatch trait
 
@@ -544,9 +551,9 @@ pub trait ToolDyn: Send + Sync {
     fn description(&self) -> &'static str;
     fn schema(&self) -> serde_json::Value;
 
-    fn execute_json(&self, args_json: &str, ...) -> ToolExecutionOutput;
+    fn execute_json(&self, args_json: &str, ..., image_tx: Option<mpsc::Sender<PreparedImage>>) -> ToolExecutionOutput;
     fn execute_binary(&self, args_bytes: &[u8], ...) -> Vec<u8>;
-    fn execute_streaming_json(&self, args_json: &str, ...) -> ToolExecutionOutput;
+    fn execute_streaming_json(&self, args_json: &str, ..., image_tx: Option<mpsc::Sender<PreparedImage>>) -> ToolExecutionOutput;
     fn execute_streaming_binary(&self, args_bytes: &[u8], ...) -> Vec<u8>;
 }
 ```
@@ -566,23 +573,32 @@ deserialization and serialization, enabling compact cross-VM communication.
 
 ### `define_tool!` macro
 
-The macro reduces boilerplate for tools that don't need session context:
+The macro reduces boilerplate for tools that don't need session context. Four variants
+control which parameters the `execute()` implementation receives:
 
+**Default (no flags):** The implementation function receives `(&Args, Option<&Path>)`:
 ```rust
-define_tool!(
-    MyTool,              // struct name (must be declared separately)
-    "my_tool",           // tool name for the LLM
-    "Description...",    // description
-    MyToolArgs,          // argument type (Deserialize)
-    String,              // return type (Serialize)
-    execute_my_tool,     // implementation function: fn(&Args, Option<&Path>) -> Result<Return, ToolError>
-    serde_json::json!({...}),  // JSON Schema for arguments
-    "core"               // tool group
-);
+define_tool!(MyTool, "my_tool", "Description...", MyToolArgs, String,
+    execute_my_tool, schema!(), "core");
+```
+
+**`use_context`:** The implementation receives `(&Args, Option<&Path>, Option<&ToolContext>)`:
+```rust
+define_tool!(MyTool, ..., "core", use_context);
+```
+
+**`use_credentials`:** The implementation receives `(&Args, Option<&ServiceCredential>, Option<&Path>)`:
+```rust
+define_tool!(MyTool, ..., "core", use_credentials);
+```
+
+**`use_credentials, use_context`:** The implementation receives all four parameters:
+```rust
+define_tool!(MyTool, ..., "core", use_credentials, use_context);
 ```
 
 The macro implements `Tool` for the struct, wiring `execute()` to call the implementation
-function with the deserialized args.
+function with the deserialized args and automatically ignoring unused parameters via `_`.
 
 ### Registry
 
@@ -616,7 +632,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 
 | Group | Tools |
 |---|---|
-| **Filesystem** | `read_file`, `read_file_range`, `write_file`, `edit_file`, `list_files`, `line_count` |
+| **Core** | `list_sessions`, `get_session`, `load_skill`, `read_file`, `read_file_range`, `write_file`, `edit_file`, `list_files`, `line_count` |
 | **HTTP** | `http_request` (GET/POST/HEAD with headers, body, timeout) |
 | **Image** | `display_image` (from path, URL, base64, or SVG text) |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push` |
@@ -628,7 +644,6 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
 | **DB** | `db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count` |
 | **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
-| **Skills** | `load_skill` (loads the full instructions for a skill by name, following the Agent Skills standard) |
 
 ### Tool groups
 
@@ -652,9 +667,14 @@ mechanism, not access control. The RISC-V VM (`run_riscv`) always has access to 
 tools regardless of group state.
 
 Implementation details:
-- `ToolRegistry::available_definitions(active)` filters by `active: &HashSet<String>`
+- `ToolRegistry::available_definitions(active)` returns definitions for registry tools in the
+  active set, plus always-available meta-tools (`load_tools`, `unload_tools`, `spawn_subsession`)
+  that require mutable session state or deep coupling with the agent loop
 - `load_tools`/`unload_tools` are intercepted in `execute_tool_with_timeout()` (same pattern as
-  `spawn_subsession` and `load_skill`)
+  `spawn_subsession`) — they are not in the registry because they modify `session.config.active_tool_groups`
+- `list_sessions`, `get_session`, and `load_skill` were formerly intercepted like `spawn_subsession`
+  but are now proper `Tool` trait implementations registered in the default registry via `ToolRegistry::build()`,
+  using `ToolContext.daemon_tx` to communicate with the daemon command loop
 - Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell}`)
 - `ToolGroup` struct and `GROUPS` constant live in `tai-daemon/src/tools/mod.rs`
 - Handler functions live in `tai-daemon/src/tools/groups.rs`
@@ -884,16 +904,20 @@ and exits cleanly when the daemon shuts down.
 
 ### Image flow (tool-triggered)
 
+Images are delivered out-of-band via a one-shot `mpsc` channel rather than embedded in
+`ToolExecutionOutput`:
+
 ```
 Model calls display_image tool
-  → daemon executes tool
-  → ToolExecutionOutput with PreparedImage
-  ├── Persistence path (new):
-  │     → clone image data
+  → daemon creates (image_tx, image_rx) channel
+  → passes image_tx to ToolDyn::execute_json → execute_streaming_json
+  → tool extracts PreparedImage from typed return → sends via image_tx
+  → agent loop drains image_rx after tool completion
+  ├── Persistence path:
   │     → SessionMessage::DisplayedImage(DisplayedImageRecord)
   │     → push to session messages + write to DB via write_message_retry
   │     → replayed on session re-attach via DaemonMessage::SessionState
-  └── Live broadcast path (unchanged):
+  └── Live broadcast path:
         → DaemonMessage::ImageStart { request_id, metadata }
         → DaemonMessage::ImageChunk { request_id, data (≤64 KiB) } × N
         → DaemonMessage::ImageEnd { request_id }

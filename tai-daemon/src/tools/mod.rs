@@ -18,6 +18,94 @@ fn encode_result<R: Serialize>(result: Result<R, impl ToString>) -> Vec<u8> {
 
 #[macro_export]
 macro_rules! define_tool {
+    // With both use_credentials and use_context
+    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty, $return_ty:ty,
+     $exec_fn:path, $schema:expr, $tool_group:literal, use_credentials, use_context) => {
+        impl $crate::tools::Tool for $struct {
+            type Args = $args_ty;
+            type Return = $return_ty;
+            fn name(&self) -> &'static str {
+                $name
+            }
+            fn group(&self) -> &'static str {
+                $tool_group
+            }
+            fn description(&self) -> &'static str {
+                $desc
+            }
+            fn schema(&self) -> serde_json::Value {
+                $schema
+            }
+            fn execute(
+                &self,
+                args: Self::Args,
+                x_credentials: Option<&$crate::tools::ServiceCredential>,
+                cwd: Option<&std::path::Path>,
+                ctx: Option<&$crate::tools::context::ToolContext>,
+            ) -> Result<Self::Return, $crate::tools::ToolError> {
+                $exec_fn(&args, x_credentials, cwd, ctx)
+            }
+        }
+    };
+    // With use_credentials
+    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty, $return_ty:ty,
+     $exec_fn:path, $schema:expr, $tool_group:literal, use_credentials) => {
+        impl $crate::tools::Tool for $struct {
+            type Args = $args_ty;
+            type Return = $return_ty;
+            fn name(&self) -> &'static str {
+                $name
+            }
+            fn group(&self) -> &'static str {
+                $tool_group
+            }
+            fn description(&self) -> &'static str {
+                $desc
+            }
+            fn schema(&self) -> serde_json::Value {
+                $schema
+            }
+            fn execute(
+                &self,
+                args: Self::Args,
+                x_credentials: Option<&$crate::tools::ServiceCredential>,
+                cwd: Option<&std::path::Path>,
+                _ctx: Option<&$crate::tools::context::ToolContext>,
+            ) -> Result<Self::Return, $crate::tools::ToolError> {
+                $exec_fn(&args, x_credentials, cwd)
+            }
+        }
+    };
+    // With use_context
+    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty, $return_ty:ty,
+     $exec_fn:path, $schema:expr, $tool_group:literal, use_context) => {
+        impl $crate::tools::Tool for $struct {
+            type Args = $args_ty;
+            type Return = $return_ty;
+            fn name(&self) -> &'static str {
+                $name
+            }
+            fn group(&self) -> &'static str {
+                $tool_group
+            }
+            fn description(&self) -> &'static str {
+                $desc
+            }
+            fn schema(&self) -> serde_json::Value {
+                $schema
+            }
+            fn execute(
+                &self,
+                args: Self::Args,
+                _x_credentials: Option<&$crate::tools::ServiceCredential>,
+                cwd: Option<&std::path::Path>,
+                ctx: Option<&$crate::tools::context::ToolContext>,
+            ) -> Result<Self::Return, $crate::tools::ToolError> {
+                $exec_fn(&args, cwd, ctx)
+            }
+        }
+    };
+    // Default (no flags) — original behavior
     ($struct:ident, $name:literal, $desc:literal, $args_ty:ty, $return_ty:ty,
      $exec_fn:path, $schema:expr, $tool_group:literal) => {
         impl $crate::tools::Tool for $struct {
@@ -48,6 +136,7 @@ macro_rules! define_tool {
     };
 }
 
+pub(crate) mod admin;
 mod error;
 pub(crate) use error::{ToolError, tool_err, tool_ok};
 
@@ -63,10 +152,8 @@ pub(crate) mod http;
 mod image;
 pub(crate) mod nu;
 pub(crate) mod random;
-pub(crate) mod sessions;
 pub(crate) mod sh;
 pub(crate) mod shell_util;
-pub(crate) mod skill;
 pub(crate) mod subsession;
 pub(crate) mod vm;
 pub(crate) mod x;
@@ -80,7 +167,6 @@ pub struct ToolResult {
 #[derive(Debug)]
 pub struct ToolExecutionOutput {
     pub(crate) result: ToolResult,
-    pub(crate) image: Option<PreparedImage>,
 }
 
 #[derive(Debug)]
@@ -163,6 +249,7 @@ pub trait ToolDyn: Send + Sync {
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
+        image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> ToolExecutionOutput;
 
     /// Binary path (VM ecall) — returns raw postcard-encoded Result<Return, String>.
@@ -182,6 +269,7 @@ pub trait ToolDyn: Send + Sync {
         cwd: Option<&std::path::Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
+        image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> ToolExecutionOutput;
 
     /// Streaming binary path.
@@ -216,6 +304,7 @@ impl<T: Tool + 'static> ToolDyn for T {
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
+        image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> ToolExecutionOutput {
         let args = match serde_json::from_str::<T::Args>(args_json) {
             Ok(a) => a,
@@ -225,19 +314,21 @@ impl<T: Tool + 'static> ToolDyn for T {
                         content: format!("invalid arguments: {e}"),
                         is_error: true,
                     },
-                    image: None,
                 };
             }
         };
         match self.execute(args, x_credentials, cwd, ctx) {
             Ok(ret) => {
-                let image = self.extract_image(&ret);
+                if let Some(tx) = image_tx
+                    && let Some(image) = self.extract_image(&ret)
+                {
+                    let _ = tx.send(image);
+                }
                 ToolExecutionOutput {
                     result: ToolResult {
                         content: serde_json::to_string(&ret).unwrap_or_default(),
                         is_error: false,
                     },
-                    image,
                 }
             }
             Err(e) => ToolExecutionOutput {
@@ -245,7 +336,6 @@ impl<T: Tool + 'static> ToolDyn for T {
                     content: e.to_string(),
                     is_error: true,
                 },
-                image: None,
             },
         }
     }
@@ -271,6 +361,7 @@ impl<T: Tool + 'static> ToolDyn for T {
         cwd: Option<&std::path::Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
+        image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> ToolExecutionOutput {
         let args = match serde_json::from_str::<T::Args>(args_json) {
             Ok(a) => a,
@@ -280,19 +371,21 @@ impl<T: Tool + 'static> ToolDyn for T {
                         content: format!("invalid arguments: {e}"),
                         is_error: true,
                     },
-                    image: None,
                 };
             }
         };
         match self.execute_streaming(args, x_credentials, cwd, output_tx, ctx) {
             Ok(ret) => {
-                let image = self.extract_image(&ret);
+                if let Some(tx) = image_tx
+                    && let Some(image) = self.extract_image(&ret)
+                {
+                    let _ = tx.send(image);
+                }
                 ToolExecutionOutput {
                     result: ToolResult {
                         content: serde_json::to_string(&ret).unwrap_or_default(),
                         is_error: false,
                     },
-                    image,
                 }
             }
             Err(e) => ToolExecutionOutput {
@@ -300,7 +393,6 @@ impl<T: Tool + 'static> ToolDyn for T {
                     content: e.to_string(),
                     is_error: true,
                 },
-                image: None,
             },
         }
     }
@@ -405,6 +497,9 @@ impl ToolRegistry {
         reg.register(db::DbGetRange);
         reg.register(db::DbList);
         reg.register(db::DbCount);
+        reg.register(admin::ListSessions);
+        reg.register(admin::GetSession);
+        reg.register(admin::LoadSkill);
         reg
     }
 
@@ -431,15 +526,17 @@ impl ToolRegistry {
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
+        image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
-            Some(tool) => tool.execute_json(&tool_call.arguments_json, x_credentials, cwd, ctx),
+            Some(tool) => {
+                tool.execute_json(&tool_call.arguments_json, x_credentials, cwd, ctx, image_tx)
+            }
             None => ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("unknown tool: {}", tool_call.name),
                     is_error: true,
                 },
-                image: None,
             },
         }
     }
@@ -451,6 +548,7 @@ impl ToolRegistry {
         x_credentials: Option<&ServiceCredential>,
         cwd: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
+        image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> ToolExecutionOutput {
         match self.tools.get(tool_call.name.as_str()) {
             Some(tool) => tool.execute_streaming_json(
@@ -459,13 +557,13 @@ impl ToolRegistry {
                 cwd,
                 output_tx,
                 ctx,
+                image_tx,
             ),
             None => ToolExecutionOutput {
                 result: ToolResult {
                     content: format!("unknown tool: {}", tool_call.name),
                     is_error: true,
                 },
-                image: None,
             },
         }
     }
@@ -514,13 +612,12 @@ impl ToolRegistry {
             .filter(|t| active.contains(t.group()))
             .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
             .collect();
-        // Always-available meta-tools
+        // Always-available meta-tools (not in the registry because they
+        // need mutable access to session state or deep coupling with the
+        // agent loop — spawn_subsession, load_tools, unload_tools).
         defs.push(groups::load_tools_definition(self));
         defs.push(groups::unload_tools_definition(self));
         defs.push(subsession::spawn_subsession_definition());
-        defs.push(sessions::list_sessions_definition());
-        defs.push(sessions::get_session_definition());
-        defs.push(skill::load_skill_definition());
         defs
     }
 }

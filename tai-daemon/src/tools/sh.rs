@@ -41,7 +41,7 @@ fn sh_schema() -> serde_json::Value {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in milliseconds (default 30000, max 300000)",
+                "description": "Timeout in milliseconds (default 30000; capped by outer tool deadline)",
                 "default": 30000
             }
         },
@@ -66,7 +66,10 @@ define_tool!(
 pub fn execute_sh_tool(args: &ShArgs, cwd: Option<&Path>) -> Result<String, ToolError> {
     let shell = &args.shell;
     let command = &args.command;
-    let timeout_ms = args.timeout.unwrap_or(30000).min(300000);
+    // The per-tool timeout (default 30s) governs shell execution.
+    // The outer deadline in execute_tool_with_timeout (300s) is the
+    // absolute safety net — no independent cap needed here.
+    let timeout_ms = args.timeout.unwrap_or(30000);
 
     let resolved = resolve_and_confine(args.workdir.as_deref(), cwd)?;
 

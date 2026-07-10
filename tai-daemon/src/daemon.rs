@@ -14,7 +14,8 @@ use std::thread;
 use std::time::Instant;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
-    AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary, TokenUsage,
+    AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary, ThinkingEffort,
+    TokenUsage,
 };
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
@@ -47,6 +48,7 @@ pub enum DaemonCommand {
         parent_session_id: Option<u64>,
         cwd: Option<PathBuf>,
         max_turns: Option<u32>,
+        reasoning_effort: Option<ThinkingEffort>,
         context_config: Option<ContextConfig>,
         account_name: Option<String>,
         active_tool_groups: Vec<String>,
@@ -142,6 +144,7 @@ impl DaemonState {
                 parent_session_id,
                 cwd,
                 max_turns,
+                reasoning_effort,
                 context_config,
                 account_name,
                 active_tool_groups,
@@ -151,6 +154,7 @@ impl DaemonState {
                 parent_session_id,
                 cwd,
                 max_turns,
+                reasoning_effort,
                 context_config,
                 account_name,
                 active_tool_groups,
@@ -312,6 +316,7 @@ impl DaemonState {
         parent_session_id: Option<u64>,
         cwd: Option<PathBuf>,
         max_turns: Option<u32>,
+        reasoning_effort: Option<ThinkingEffort>,
         context_config: Option<ContextConfig>,
         account_name: Option<String>,
         active_tool_groups: Vec<String>,
@@ -335,7 +340,7 @@ impl DaemonState {
         let record = SessionRecord {
             title: title.clone(),
             selected_model: None,
-            reasoning_effort: None,
+            reasoning_effort,
             parent_session_id,
             cwd: cwd_str.clone(),
             max_turns,
@@ -357,7 +362,7 @@ impl DaemonState {
         let metadata = SessionMetadata {
             title: title.clone(),
             selected_model: None,
-            reasoning_effort: None,
+            reasoning_effort,
             parent_session_id,
             cwd: cwd_str.clone(),
             created_at: record.created_at,
@@ -1115,6 +1120,7 @@ mod tests {
             parent_session_id: None,
             cwd: None,
             max_turns: None,
+            reasoning_effort: None,
             context_config: None,
             account_name: None,
             active_tool_groups: Vec::new(),

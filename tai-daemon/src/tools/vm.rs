@@ -681,7 +681,6 @@ fn run_riscv_impl(
             Err(e) => {
                 return ToolExecutionOutput {
                     result: tool_err(e),
-                    image: None,
                 };
             }
         },
@@ -690,20 +689,17 @@ fn run_riscv_impl(
             Err(e) => {
                 return ToolExecutionOutput {
                     result: tool_err(format!("base64 decode error: {e}")),
-                    image: None,
                 };
             }
         },
         (None, None) => {
             return ToolExecutionOutput {
                 result: tool_err("either 'source' or 'program' is required"),
-                image: None,
             };
         }
         (Some(_), Some(_)) => {
             return ToolExecutionOutput {
                 result: tool_err("provide only one of 'source' or 'program'"),
-                image: None,
             };
         }
     };
@@ -712,13 +708,11 @@ fn run_riscv_impl(
     if !memory_size.is_multiple_of(4096) {
         return ToolExecutionOutput {
             result: tool_err("memory_size must be a multiple of 4096"),
-            image: None,
         };
     }
     if memory_size > 4 * 1024 * 1024 {
         return ToolExecutionOutput {
             result: tool_err("memory_size cannot exceed 4MB"),
-            image: None,
         };
     }
 
@@ -757,7 +751,6 @@ fn run_riscv_impl(
     if let Err(e) = trace.load_program(&Bytes::from(elf), args_list.iter().map(|b| Ok(b.clone()))) {
         return ToolExecutionOutput {
             result: tool_err(format!("failed to load program: {e}")),
-            image: None,
         };
     }
 
@@ -802,7 +795,6 @@ fn run_riscv_impl(
 
             ToolExecutionOutput {
                 result: tool_ok(result_content),
-                image: None,
             }
         }
         Err(e) => {
@@ -822,7 +814,6 @@ fn run_riscv_impl(
             };
             ToolExecutionOutput {
                 result: tool_err(msg),
-                image: None,
             }
         }
     }
