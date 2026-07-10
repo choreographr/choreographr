@@ -7,7 +7,7 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
-use tai_proto::{ContextConfig, SessionMessage};
+use tai_proto::{ContextConfig, SessionMessage, ThinkingEffort};
 use tracing::{debug, error, info, warn};
 
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
@@ -35,6 +35,8 @@ pub struct SessionRecord {
     pub context_config: ContextConfig,
     #[serde(default)]
     pub account_name: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<ThinkingEffort>,
 }
 
 pub fn db_path() -> io::Result<PathBuf> {
@@ -410,6 +412,7 @@ mod tests {
         let record = SessionRecord {
             title: Some("test session".into()),
             selected_model: Some("gpt-4".into()),
+            reasoning_effort: None,
             parent_session_id: None,
             cwd: Some("/tmp".into()),
             max_turns: None,

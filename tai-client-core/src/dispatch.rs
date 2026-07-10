@@ -246,6 +246,16 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             handler.push_text(format!("[daemon] failed to select model {model}: {error}"));
             Ok(None)
         }
+        DaemonMessage::ReasoningEffortSet { effort } => {
+            handler.push_text(format!("[daemon] reasoning effort: {}", effort.as_label(),));
+            Ok(None)
+        }
+        DaemonMessage::ReasoningEffortSetFailed { effort, error } => {
+            handler.push_text(format!(
+                "[daemon] failed to set reasoning effort {effort}: {error}",
+            ));
+            Ok(None)
+        }
         DaemonMessage::Unlocked => {
             handler.push_text("[daemon] keystore unlocked, credentials available".to_string());
             Ok(None)
@@ -640,6 +650,7 @@ mod tests {
             session_id: 1,
             title: Some("first".into()),
             selected_model: Some("gpt-4".into()),
+            reasoning_effort: None,
             parent_session_id: None,
             cwd: None,
             created_at: 0,

@@ -18,6 +18,7 @@ use ratatui_image::{Resize, StatefulImage};
 use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
 use tai_proto::SessionMessage;
 use tai_proto::SessionStatus;
+use tai_proto::ThinkingEffort;
 use tai_tui::RenderedImage;
 
 pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
@@ -592,6 +593,14 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             let att = if is_attached { "*" } else { " " };
             let title = session.title.as_deref().unwrap_or("untitled");
             let model = session.selected_model.as_deref().unwrap_or("-");
+            let model_display = if let Some(effort) = session
+                .reasoning_effort
+                .filter(|e| *e != ThinkingEffort::Off)
+            {
+                format!("({model}, {})", effort.as_label())
+            } else {
+                format!("({model})")
+            };
             let status_str = match &session.status {
                 SessionStatus::Sleeping => "sleep",
                 SessionStatus::Inactive => "idle",
@@ -609,7 +618,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
                 _ => Color::White,
             };
             let row = format!(
-                "{sel}{att} {:>4}  \"{title}\"  ({model})  — {} messages  [",
+                "{sel}{att} {:>4}  \"{title}\"  {model_display}  — {} messages  [",
                 session.session_id, session.message_count,
             );
 
@@ -658,6 +667,14 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
             Line::from(format!("Session ID:    {}", detail.session_id)),
             Line::from(format!("Title:         {}", detail.title)),
             Line::from(format!("Model:         {}", detail.selected_model)),
+            Line::from(format!(
+                "Reasoning:     {}",
+                detail
+                    .reasoning_effort
+                    .filter(|e| *e != ThinkingEffort::Off)
+                    .map(|e| e.as_label().to_string())
+                    .unwrap_or_else(|| "off".to_string())
+            )),
             Line::from(format!(
                 "Parent:        {}",
                 detail

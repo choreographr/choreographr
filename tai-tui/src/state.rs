@@ -7,7 +7,7 @@ use tai_client_core::{
 };
 use tai_proto::{
     AccountInfo, ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionStatus,
-    SessionSummary,
+    SessionSummary, ThinkingEffort,
 };
 use tai_tui::{ImageAssembler, RenderedImage, StreamingText, build_rendered_image};
 use unicode_segmentation::UnicodeSegmentation;
@@ -378,6 +378,7 @@ pub(crate) struct SessionDetailData {
     pub(crate) session_id: u64,
     pub(crate) title: String,
     pub(crate) selected_model: String,
+    pub(crate) reasoning_effort: Option<ThinkingEffort>,
     pub(crate) parent_session_id: Option<u64>,
     pub(crate) cwd: String,
     pub(crate) created_at: i64,
@@ -702,6 +703,7 @@ impl SessionManagerState {
                 session_id,
                 title,
                 selected_model,
+                reasoning_effort: s.reasoning_effort,
                 parent_session_id,
                 cwd,
                 created_at,
@@ -1628,6 +1630,7 @@ mod tests {
             session_id: id,
             title: Some(title.into()),
             selected_model: None,
+            reasoning_effort: None,
             parent_session_id: None,
             cwd: None,
             created_at: 1000,
@@ -1644,6 +1647,7 @@ mod tests {
             session_id,
             title: String::new(),
             selected_model: String::new(),
+            reasoning_effort: None,
             parent_session_id: None,
             cwd: String::new(),
             created_at: 0,

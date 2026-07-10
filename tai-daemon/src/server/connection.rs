@@ -3,7 +3,9 @@ use crate::sessions::SessionCommand;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
-use tai_proto::{ClientMessage, DaemonMessage, ProtoError, read_message_sync, write_message_sync};
+use tai_proto::{
+    ClientMessage, DaemonMessage, ProtoError, ThinkingEffort, read_message_sync, write_message_sync,
+};
 use tracing::{debug, error, info, warn};
 
 pub(crate) fn client_thread(
@@ -164,6 +166,34 @@ pub(crate) fn client_thread(
                                 model,
                                 error: "no session attached".to_string(),
                             });
+                        }
+                    }
+                    ClientMessage::SetReasoningEffort { effort } => {
+                        info!(
+                            "client {}: SetReasoningEffort effort={:?} attached={}",
+                            client_id,
+                            effort,
+                            attached_session_tx.is_some()
+                        );
+                        if let Some(ref tx) = attached_session_tx {
+                            let _ = tx.send(SessionCommand::SetReasoningEffort { effort });
+                        } else {
+                            let _ = writer_tx.send(DaemonMessage::reasoning_effort_set_failed(
+                                effort.as_label(),
+                                "no session attached",
+                            ));
+                        }
+                    }
+                    ClientMessage::GetReasoningEffort => {
+                        if let Some(ref tx) = attached_session_tx {
+                            let (reply, rx) = mpsc::channel();
+                            let _ = tx.send(SessionCommand::GetReasoningEffort { reply });
+                            if let Ok(effort) = rx.recv() {
+                                let _ = writer_tx.send(DaemonMessage::reasoning_effort_set(effort));
+                            }
+                        } else {
+                            let _ = writer_tx
+                                .send(DaemonMessage::reasoning_effort_set(ThinkingEffort::Off));
                         }
                     }
                     ClientMessage::Unlock { private_key } => {

@@ -532,6 +532,48 @@ fn response_part_function_call_deserialises() {
     }
 }
 
+// ── Thinking config tests ─────────────────────────────────────────────
+
+#[test]
+fn test_thinking_config_off() {
+    assert!(super::thinking_config_payload(tai_proto::ThinkingEffort::Off).is_none());
+}
+
+#[test]
+fn test_thinking_config_on() {
+    let payload = super::thinking_config_payload(tai_proto::ThinkingEffort::Medium);
+    assert!(payload.is_some());
+    assert!(payload.unwrap().include_thoughts);
+}
+
+#[test]
+fn test_response_part_thinking_deserialization() {
+    let json = r#"{"thinking":"Let me think about this...","signature":"abc123"}"#;
+    let part: super::ResponsePart = serde_json::from_str(json).unwrap();
+    match part {
+        super::ResponsePart::Thinking { thinking, .. } => {
+            assert_eq!(thinking, "Let me think about this...");
+        }
+        _ => panic!("expected Thinking variant"),
+    }
+}
+
+#[test]
+fn test_response_part_thinking_deserialization_no_signature() {
+    let json = r#"{"thinking":"Simple thought"}"#;
+    let part: super::ResponsePart = serde_json::from_str(json).unwrap();
+    match part {
+        super::ResponsePart::Thinking {
+            thinking,
+            signature,
+        } => {
+            assert_eq!(thinking, "Simple thought");
+            assert!(signature.is_none());
+        }
+        _ => panic!("expected Thinking variant"),
+    }
+}
+
 #[test]
 fn response_part_function_call_no_args() {
     let part: ResponsePart = serde_json::from_value(json!({

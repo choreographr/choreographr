@@ -109,6 +109,8 @@ where
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -344,22 +346,39 @@ impl OpenAiClient {
     }
 }
 
+/// Map ThinkingEffort to the OpenAI `reasoning_effort` API string value.
+/// Returns None for Off (parameter should be omitted).
+pub(crate) fn reasoning_effort_api_value(effort: ThinkingEffort) -> Option<&'static str> {
+    match effort {
+        ThinkingEffort::Off => None,
+        ThinkingEffort::Low => Some("low"),
+        ThinkingEffort::Medium => Some("medium"),
+        ThinkingEffort::High => Some("high"),
+    }
+}
+
 // ── ProviderClient trait impl ───────────────────────────────────────────
 
 use crate::providers::ProviderClient;
-use tai_proto::InferenceError;
+use tai_proto::{InferenceError, ThinkingEffort};
 
 impl ProviderClient for OpenAiClient {
+    fn provider_slug(&self) -> &'static str {
+        "openai"
+    }
+
     fn chat_completion_turn(
         &self,
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result = self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx);
+        let result =
+            self.chat_completion_turn(model, messages, tools, thinking_effort, on_retry, cancel_rx);
         crate::providers::timed_result(
             api_start,
             model,
@@ -375,13 +394,21 @@ impl ProviderClient for OpenAiClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
         on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result = self
-            .chat_completion_turn_streaming(model, messages, tools, on_retry, cancel_rx, on_chunk);
+        let result = self.chat_completion_turn_streaming(
+            model,
+            messages,
+            tools,
+            thinking_effort,
+            on_retry,
+            cancel_rx,
+            on_chunk,
+        );
         crate::providers::timed_result(
             api_start,
             model,

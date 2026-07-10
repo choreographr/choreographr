@@ -161,6 +161,7 @@ impl DaemonState {
                 let record = SessionRecord {
                     title: title.clone(),
                     selected_model: None,
+                    reasoning_effort: None,
                     parent_session_id,
                     cwd: cwd_str.clone(),
                     max_turns,
@@ -181,6 +182,7 @@ impl DaemonState {
                 let metadata = SessionMetadata {
                     title: title.clone(),
                     selected_model: None,
+                    reasoning_effort: None,
                     parent_session_id,
                     cwd: cwd_str.clone(),
                     created_at: record.created_at,
@@ -245,6 +247,7 @@ impl DaemonState {
                         session_id: *id,
                         title: meta.title.clone(),
                         selected_model: meta.selected_model.clone(),
+                        reasoning_effort: meta.reasoning_effort,
                         parent_session_id: meta.parent_session_id,
                         cwd: meta.cwd.clone(),
                         created_at: meta.created_at,
@@ -267,6 +270,7 @@ impl DaemonState {
                         session_id,
                         title: meta.title.clone(),
                         selected_model: meta.selected_model.clone(),
+                        reasoning_effort: meta.reasoning_effort,
                         parent_session_id: meta.parent_session_id,
                         cwd: meta.cwd.clone(),
                         created_at: meta.created_at,
@@ -789,6 +793,7 @@ mod tests {
             SessionMetadata {
                 title: Some("test".into()),
                 selected_model: None,
+                reasoning_effort: None,
                 parent_session_id: None,
                 cwd: None,
                 created_at: 1000,
@@ -827,6 +832,7 @@ mod tests {
             SessionMetadata {
                 title: Some("original".into()),
                 selected_model: None,
+                reasoning_effort: None,
                 parent_session_id: None,
                 cwd: None,
                 created_at: 1000,
@@ -840,6 +846,7 @@ mod tests {
         let new_meta = SessionMetadata {
             title: Some("updated".into()),
             selected_model: Some("gpt-4".into()),
+            reasoning_effort: None,
             parent_session_id: None,
             cwd: None,
             created_at: 2000,

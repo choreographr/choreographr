@@ -141,6 +141,8 @@ In `tai-tui`:
 - `/remove-key <service>` — remove a credential
 - `/account list` — list configured AI provider accounts
 - `/account remove <name>` — remove an AI provider account
+- `/reasoning` — show current reasoning effort
+- `/reasoning off|low|medium|high` — set reasoning/thinking effort for the session
 - `/account <name>` — set the session's AI provider account
 - any other input — sent as a prompt
 

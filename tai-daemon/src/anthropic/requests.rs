@@ -3,6 +3,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use tai_proto::ThinkingEffort;
+use tracing::debug;
 
 use crate::openai::{
     ChatAssistantToolUse, ChatRequestMessage, ChatToolCall, ChatToolDefinition, ChatTurnResult,
@@ -12,7 +14,7 @@ use crate::retry;
 
 use super::{
     AnthropicConfig, AnthropicError, MessagesRequest, MessagesResponse, build_message_payloads,
-    build_tool_payloads, response_to_turn_result,
+    build_tool_payloads, response_to_turn_result, thinking_payload,
 };
 
 /// Endpoint path for the Messages API.
@@ -38,6 +40,7 @@ pub(super) fn messages_request(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
+    thinking_effort: ThinkingEffort,
     stream: bool,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
@@ -56,12 +59,21 @@ pub(super) fn messages_request(
         Some(build_tool_payloads(tools))
     };
 
+    let thinking = thinking_payload(thinking_effort, config.max_tokens);
+    if thinking.is_some() {
+        debug!(
+            budget_tokens = ?thinking.as_ref().map(|t| t.budget_tokens),
+            "Anthropic thinking enabled"
+        );
+    }
+
     let body = serde_json::to_value(&MessagesRequest {
         model,
         max_tokens: config.max_tokens,
         system: system.as_deref(),
         messages: payloads,
         tools: tool_payloads,
+        thinking,
         stream,
     })
     .map_err(io::Error::other)?;
@@ -97,6 +109,7 @@ pub(super) fn messages_request_streaming<F>(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
+    thinking_effort: ThinkingEffort,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
     mut on_chunk: F,
@@ -118,12 +131,21 @@ where
         Some(build_tool_payloads(tools))
     };
 
+    let thinking = thinking_payload(thinking_effort, config.max_tokens);
+    if thinking.is_some() {
+        debug!(
+            budget_tokens = ?thinking.as_ref().map(|t| t.budget_tokens),
+            "Anthropic thinking enabled"
+        );
+    }
+
     let body = serde_json::to_value(&MessagesRequest {
         model,
         max_tokens: config.max_tokens,
         system: system.as_deref(),
         messages: payloads,
         tools: tool_payloads,
+        thinking,
         stream: true,
     })
     .map_err(io::Error::other)?;

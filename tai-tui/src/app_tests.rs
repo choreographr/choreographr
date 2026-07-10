@@ -989,6 +989,7 @@ fn make_session(id: u64, title: &str, model: &str, count: u32) -> tai_proto::Ses
         session_id: id,
         title: Some(title.to_string()),
         selected_model: Some(model.to_string()),
+        reasoning_effort: None,
         parent_session_id: None,
         cwd: None,
         created_at: 1705314000,

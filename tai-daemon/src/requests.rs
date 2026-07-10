@@ -4,7 +4,9 @@ use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatAssistantToolUse, ChatRequestMessage,
     ChatToolCall, ChatTurnResult, CompletionChunkKind,
 };
-use crate::providers::InferenceProvider;
+use crate::providers::{
+    InferenceProvider, ReasoningSupport, effective_reasoning_support, lookup_provider,
+};
 use crate::sessions::{SessionCommand, SessionMetadata, SessionState};
 use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
 use std::io;
@@ -15,9 +17,9 @@ use std::time::Duration;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata,
-    MAX_IMAGE_CHUNK_SIZE, OutputStream, SessionMessage, SessionStatus,
+    MAX_IMAGE_CHUNK_SIZE, OutputStream, SessionMessage, SessionStatus, ThinkingEffort,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Route an image-sync broadcast through the session command channel so the
 /// main session thread dispatches it to its live subscriber map.
@@ -115,7 +117,34 @@ pub(crate) fn run_agent_loop(
     let max_turns = session.max_turns.unwrap_or(max_turns_default);
 
     for turn in 0..max_turns {
+        let mut thinking_effort = session.reasoning_effort.unwrap_or(ThinkingEffort::Off);
         debug!(session_id, turn, "agent loop turn");
+        if thinking_effort != ThinkingEffort::Off {
+            // Validate that the current model actually supports the requested
+            // reasoning effort at inference time.  The set-time check in
+            // sessions.rs accepts the effort when no model is selected yet,
+            // so we must re-validate here with the concrete model.
+            let slug = client.provider_slug();
+            let catalog_entry = lookup_provider(slug);
+            let reasoning_support = catalog_entry
+                .map(|e| e.reasoning)
+                .unwrap_or(ReasoningSupport::None);
+            let effective = effective_reasoning_support(model, reasoning_support);
+            if effective == ReasoningSupport::None {
+                warn!(
+                    session_id, turn, model,
+                    effort = %thinking_effort.as_label(),
+                    "model does not support reasoning effort, disabling",
+                );
+                thinking_effort = ThinkingEffort::Off;
+            } else {
+                debug!(
+                    session_id, turn,
+                    effort = %thinking_effort.as_label(),
+                    "reasoning effort active in agent loop",
+                );
+            }
+        }
         crate::metrics::record_turn(model);
         let tools = tool_registry.available_definitions(&session.active_tool_groups);
         if is_cancelled(cancel_rx, &mut false) {
@@ -154,6 +183,7 @@ pub(crate) fn run_agent_loop(
             model,
             &messages,
             &tools,
+            thinking_effort,
             &mut retry_cb,
             Some(cancel_rx),
             &mut |kind, text| {
@@ -702,6 +732,20 @@ fn execute_spawn_subsession_sync(
     _max_turns_default: u32,
     cancel_rx: &mpsc::Receiver<()>,
 ) -> ToolExecutionOutput {
+    // Note: The child session does not inherit the parent's `reasoning_effort`
+    // because the `CreateSession` daemon command has no field for it. The child
+    // will get the default (Off) and can independently set its own effort via
+    // the `/reasoning` command. Properly threading this through requires adding
+    // a `reasoning_effort` field to `DaemonCommand::CreateSession` and plumbing
+    // it through `session_main()`.
+    if parent_session.reasoning_effort != Some(ThinkingEffort::Off) {
+        debug!(
+            parent_session_id,
+            effort = ?parent_session.reasoning_effort,
+            "spawn_subsession: parent has non-default reasoning effort; child will use default",
+        );
+    }
+
     let args: serde_json::Value = match serde_json::from_str(&tool_call.arguments_json) {
         Ok(a) => a,
         Err(e) => {
@@ -1129,6 +1173,7 @@ mod tests {
                     session_id: 1,
                     title: Some("Test".into()),
                     selected_model: Some("gpt-4".into()),
+                    reasoning_effort: None,
                     parent_session_id: None,
                     cwd: Some("/tmp".into()),
                     created_at: 1000,
@@ -1189,6 +1234,7 @@ mod tests {
                     session_id: 1,
                     title: Some("Test".into()),
                     selected_model: Some("gpt-4".into()),
+                    reasoning_effort: None,
                     parent_session_id: None,
                     cwd: Some("/tmp".into()),
                     created_at: 1000,

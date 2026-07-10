@@ -2,12 +2,16 @@ use std::io::{self, BufReader, Read};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use tai_proto::ThinkingEffort;
+use tracing::debug;
+
 use crate::openai::{ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind};
 use crate::retry;
 
 use super::{
     GenerateContentRequest, GenerateContentResponse, GoogleConfig, GoogleError,
     build_message_payloads, build_tool_payloads, model_url, response_to_turn_result,
+    thinking_config_payload,
 };
 
 /// Endpoint action for non-streaming content generation.
@@ -25,6 +29,7 @@ pub(super) fn generate_content_request(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
+    thinking_effort: ThinkingEffort,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<ChatTurnResult, GoogleError> {
@@ -44,10 +49,17 @@ pub(super) fn generate_content_request(
 
     let system_value = system_instruction.map(|s| serde_json::json!({"parts": [{"text": s}]}));
 
+    let thinking_config = thinking_config_payload(thinking_effort);
+    debug!(
+        "Google non-streaming request body built (thinking: {})",
+        thinking_config.is_some()
+    );
+
     let body = serde_json::to_value(&GenerateContentRequest {
         contents: payloads,
         system_instruction: system_value,
         tools: tool_payloads,
+        thinking_config,
     })
     .map_err(io::Error::other)?;
 
@@ -88,6 +100,7 @@ pub(super) fn generate_content_request_streaming<F>(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
+    thinking_effort: ThinkingEffort,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
     mut on_chunk: F,
@@ -111,10 +124,17 @@ where
 
     let system_value = system_instruction.map(|s| serde_json::json!({"parts": [{"text": s}]}));
 
+    let thinking_config = thinking_config_payload(thinking_effort);
+    debug!(
+        "Google streaming request body built (thinking: {})",
+        thinking_config.is_some()
+    );
+
     let body = serde_json::to_value(&GenerateContentRequest {
         contents: payloads,
         system_instruction: system_value,
         tools: tool_payloads,
+        thinking_config,
     })
     .map_err(io::Error::other)?;
 
@@ -140,8 +160,9 @@ where
     }
 
     let mut reader = GeminiSseReader::from_reader(response);
-    let mut saw_text = false;
+    let mut has_content = false;
     let mut full_text = String::new();
+    let mut full_reasoning = String::new();
     let mut pending_tool_calls: Vec<super::ChatToolCall> = Vec::new();
 
     while let Some(data) = reader.next_event()? {
@@ -160,13 +181,13 @@ where
             match part {
                 super::ResponsePart::Text { text } => {
                     if !text.is_empty() {
-                        saw_text = true;
+                        has_content = true;
                         full_text.push_str(&text);
                         on_chunk(CompletionChunkKind::Answer, text)?;
                     }
                 }
                 super::ResponsePart::FunctionCall { function_call } => {
-                    saw_text = true;
+                    has_content = true;
                     let id = format!("fc_{}", function_call.name);
                     let args_json = function_call.args.to_string();
                     pending_tool_calls.push(super::ChatToolCall {
@@ -175,11 +196,18 @@ where
                         arguments_json: args_json,
                     });
                 }
+                super::ResponsePart::Thinking { thinking, .. } => {
+                    if !thinking.is_empty() {
+                        has_content = true;
+                        full_reasoning.push_str(&thinking);
+                        on_chunk(CompletionChunkKind::Reasoning, thinking)?;
+                    }
+                }
             }
         }
     }
 
-    if !saw_text {
+    if !has_content {
         return Err(GoogleError::EmptyResponse);
     }
 
@@ -192,18 +220,26 @@ where
                     Some(full_text)
                 },
                 tool_calls: pending_tool_calls,
-                reasoning: None,
+                reasoning: if full_reasoning.is_empty() {
+                    None
+                } else {
+                    Some(full_reasoning)
+                },
             },
         ));
     }
 
-    if full_text.is_empty() {
+    if full_text.is_empty() && full_reasoning.is_empty() {
         return Err(GoogleError::EmptyResponse);
     }
 
     Ok(super::ChatTurnResult::FinalText(super::FinalTextResult {
         content: full_text,
-        reasoning: None,
+        reasoning: if full_reasoning.is_empty() {
+            None
+        } else {
+            Some(full_reasoning)
+        },
     }))
 }
 

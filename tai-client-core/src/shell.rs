@@ -1,4 +1,4 @@
-use tai_proto::ClientMessage;
+use tai_proto::{ClientMessage, ThinkingEffort};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnlockMethod {
@@ -267,6 +267,28 @@ fn parse_command(
         return ShellCommand::Send(ClientMessage::ListModels);
     }
 
+    // /reasoning [off|low|medium|high] — set reasoning effort
+    if let Some(effort_s) = rest.strip_prefix("reasoning ") {
+        let effort_s = effort_s.trim();
+        let effort = match effort_s {
+            "off" => ThinkingEffort::Off,
+            "low" => ThinkingEffort::Low,
+            "medium" => ThinkingEffort::Medium,
+            "high" => ThinkingEffort::High,
+            _ => {
+                return ShellCommand::UnknownCommand(format!(
+                    "unknown reasoning effort '{effort_s}'. Usage: /reasoning off | low | medium | high"
+                ));
+            }
+        };
+        return ShellCommand::Send(ClientMessage::set_reasoning_effort(effort));
+    }
+
+    // /reasoning — show current effort
+    if rest == "reasoning" {
+        return ShellCommand::Send(ClientMessage::get_reasoning_effort());
+    }
+
     if let Some(args) = rest.strip_prefix("account ") {
         let args = args.trim();
         if args.is_empty() {
@@ -330,6 +352,10 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
             }
             ClientMessage::TestImage { .. } => Some("> /image".to_string()),
             ClientMessage::SetModel { model } => Some(format!("> set model: {model}")),
+            ClientMessage::SetReasoningEffort { effort } => {
+                Some(format!("> set reasoning effort: {}", effort.as_label()))
+            }
+            ClientMessage::GetReasoningEffort => Some("> get reasoning effort".to_string()),
             _ => None,
         },
         // Non-Send shell commands: echo the raw line so the user can see

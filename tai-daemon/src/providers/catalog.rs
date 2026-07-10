@@ -1,10 +1,26 @@
 use std::fmt;
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {
     OpenAiCompatible,
     AnthropicMessages,
     GoogleGenerativeAi,
+}
+
+/// Declares which reasoning parameter protocol a provider speaks.
+/// This is the wire-format level — model-level gating is done separately
+/// via `effective_reasoning_support()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningSupport {
+    /// No reasoning parameter is supported by this provider.
+    None,
+    /// OpenAI-style `reasoning_effort` field in chat completions.
+    ReasoningEffort,
+    /// Anthropic-style `thinking` block with `budget_tokens`.
+    AnthropicThinking,
+    /// Google-style `thinkingConfig` with `includeThoughts`.
+    GoogleThinkingConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -14,6 +30,7 @@ pub struct ProviderEntry {
     pub protocol: ProviderProtocol,
     pub default_base_url: &'static str,
     pub default_model: &'static str,
+    pub reasoning: ReasoningSupport,
 }
 
 /// Static catalog of all known providers.
@@ -24,6 +41,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.openai.com/v1",
         default_model: "gpt-4.1",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "openai_compatible",
@@ -31,6 +49,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.openai.com/v1",
         default_model: "custom-model",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "opencode",
@@ -38,6 +57,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://opencode.ai/zen/v1",
         default_model: "deepseek-v4-flash",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "opencode-go",
@@ -45,6 +65,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://opencode.ai/zen/go/v1",
         default_model: "deepseek-v4-pro",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "deepseek",
@@ -52,6 +73,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.deepseek.com",
         default_model: "deepseek-chat",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "xai",
@@ -59,6 +81,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.x.ai/v1",
         default_model: "grok-4",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "groq",
@@ -66,6 +89,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.groq.com/openai/v1",
         default_model: "llama-3.3-70b-versatile",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "together",
@@ -73,6 +97,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.together.xyz/v1",
         default_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "mistral",
@@ -80,6 +105,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.mistral.ai/v1",
         default_model: "mistral-large-latest",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "ollama",
@@ -87,6 +113,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "http://localhost:11434/v1",
         default_model: "llama3.1",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "ollama-cloud",
@@ -94,6 +121,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://ollama.com/v1",
         default_model: "qwen3-coder:480b",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "openrouter",
@@ -101,6 +129,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://openrouter.ai/api/v1",
         default_model: "openai/gpt-4.1",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "huggingface",
@@ -108,6 +137,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://router.huggingface.co/v1",
         default_model: "meta-llama/Llama-3.3-70B-Instruct",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "github",
@@ -115,6 +145,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://models.inference.ai.azure.com",
         default_model: "openai/gpt-4.1",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "nvidia",
@@ -122,6 +153,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://integrate.api.nvidia.com/v1",
         default_model: "nvidia/llama-3.1-nemotron-70b-instruct",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "cerebras",
@@ -129,6 +161,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.cerebras.ai/v1",
         default_model: "cerebras",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "fireworks",
@@ -136,6 +169,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.fireworks.ai/inference/v1",
         default_model: "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "xiaomi-mimo",
@@ -143,6 +177,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.mimo.xiaomi.com/openai/v1",
         default_model: "mimo-vl",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "dashscope",
@@ -150,6 +185,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         default_model: "qwen-plus",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "moonshot",
@@ -157,6 +193,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.moonshot.ai/v1",
         default_model: "kimi-k2",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "perplexity",
@@ -164,6 +201,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.perplexity.ai",
         default_model: "sonar-pro",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "zai",
@@ -171,6 +209,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.z.ai/api/paas/v4",
         default_model: "glm-4.5",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "venice",
@@ -178,6 +217,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.venice.ai/api/v1",
         default_model: "qwen-2.5-qwq-32b",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "novita",
@@ -185,6 +225,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.novita.ai/v3/openai",
         default_model: "deepseek-v3",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "lmstudio",
@@ -192,6 +233,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "http://localhost:1234/v1",
         default_model: "local-model",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "custom-openai",
@@ -199,6 +241,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::OpenAiCompatible,
         default_base_url: "https://api.openai.com/v1",
         default_model: "custom-model",
+        reasoning: ReasoningSupport::ReasoningEffort,
     },
     ProviderEntry {
         slug: "anthropic",
@@ -206,6 +249,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::AnthropicMessages,
         default_base_url: "https://api.anthropic.com",
         default_model: "claude-sonnet-4-20250514",
+        reasoning: ReasoningSupport::AnthropicThinking,
     },
     ProviderEntry {
         slug: "minimax",
@@ -213,6 +257,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::AnthropicMessages,
         default_base_url: "https://api.minimax.io/anthropic",
         default_model: "MiniMax-M3",
+        reasoning: ReasoningSupport::AnthropicThinking,
     },
     ProviderEntry {
         slug: "custom-anthropic",
@@ -220,6 +265,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::AnthropicMessages,
         default_base_url: "https://api.anthropic.com",
         default_model: "custom-model",
+        reasoning: ReasoningSupport::AnthropicThinking,
     },
     ProviderEntry {
         slug: "google",
@@ -227,6 +273,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         protocol: ProviderProtocol::GoogleGenerativeAi,
         default_base_url: "https://generativelanguage.googleapis.com/v1beta",
         default_model: "gemini-2.5-pro",
+        reasoning: ReasoningSupport::GoogleThinkingConfig,
     },
 ];
 
@@ -243,6 +290,60 @@ impl fmt::Display for ProviderProtocol {
 /// Look up a provider entry by slug. Returns `None` if not found.
 pub fn lookup_provider(slug: &str) -> Option<&'static ProviderEntry> {
     PROVIDER_CATALOG.iter().find(|e| e.slug == slug)
+}
+
+/// Determine whether a specific model actually supports reasoning on a given
+/// provider. Uses model-name heuristics because the static catalog can't
+/// enumerate every model variant dynamically.
+///
+/// Returns `ReasoningSupport::None` when the model doesn't support reasoning,
+/// even if the provider protocol would allow it.
+pub fn effective_reasoning_support(model: &str, provider: ReasoningSupport) -> ReasoningSupport {
+    let lower = model.to_lowercase();
+    let result = match provider {
+        ReasoningSupport::ReasoningEffort => {
+            // OpenAI reasoning models: o-series (o1, o3, o4-mini, etc.)
+            // GPT-5 series
+            // DeepSeek reasoner
+            // xAI Grok reasoning models
+            if lower.starts_with("o")
+                || lower.starts_with("gpt-5")
+                || lower.contains("deepseek-reasoner")
+                || lower.contains("grok") && lower.contains("reasoning")
+            {
+                ReasoningSupport::ReasoningEffort
+            } else {
+                ReasoningSupport::None
+            }
+        }
+        ReasoningSupport::AnthropicThinking => {
+            // Claude Sonnet/Opus 4+ support extended thinking
+            if lower.contains("sonnet-4")
+                || lower.contains("opus-4")
+                || lower.contains("sonnet-3-5")
+            {
+                ReasoningSupport::AnthropicThinking
+            } else {
+                ReasoningSupport::None
+            }
+        }
+        ReasoningSupport::GoogleThinkingConfig => {
+            // Gemini 2.5 series supports thinking
+            if lower.contains("gemini-2.5") {
+                ReasoningSupport::GoogleThinkingConfig
+            } else {
+                ReasoningSupport::None
+            }
+        }
+        ReasoningSupport::None => ReasoningSupport::None,
+    };
+    debug!(
+        model = %model,
+        ?provider,
+        ?result,
+        "effective_reasoning_support"
+    );
+    result
 }
 
 /// Return all provider slugs.
@@ -313,6 +414,122 @@ mod tests {
                 entry.slug
             );
         }
+    }
+
+    #[test]
+    fn catalog_entries_have_reasoning_support() {
+        for entry in PROVIDER_CATALOG {
+            assert!(
+                matches!(
+                    entry.reasoning,
+                    ReasoningSupport::None
+                        | ReasoningSupport::ReasoningEffort
+                        | ReasoningSupport::AnthropicThinking
+                        | ReasoningSupport::GoogleThinkingConfig
+                ),
+                "missing reasoning for {}",
+                entry.slug
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_support_effort_models() {
+        // OpenAI reasoning models
+        assert_eq!(
+            effective_reasoning_support("o1", ReasoningSupport::ReasoningEffort),
+            ReasoningSupport::ReasoningEffort
+        );
+        assert_eq!(
+            effective_reasoning_support("o3-mini", ReasoningSupport::ReasoningEffort),
+            ReasoningSupport::ReasoningEffort
+        );
+        assert_eq!(
+            effective_reasoning_support("o4-mini-2025-07-18", ReasoningSupport::ReasoningEffort),
+            ReasoningSupport::ReasoningEffort
+        );
+        assert_eq!(
+            effective_reasoning_support("gpt-5.4", ReasoningSupport::ReasoningEffort),
+            ReasoningSupport::ReasoningEffort
+        );
+
+        // Non-reasoning models
+        assert_eq!(
+            effective_reasoning_support("gpt-4.1", ReasoningSupport::ReasoningEffort),
+            ReasoningSupport::None
+        );
+        assert_eq!(
+            effective_reasoning_support("gpt-4o", ReasoningSupport::ReasoningEffort),
+            ReasoningSupport::None
+        );
+        assert_eq!(
+            effective_reasoning_support("llama-3.3-70b", ReasoningSupport::ReasoningEffort),
+            ReasoningSupport::None
+        );
+    }
+
+    #[test]
+    fn reasoning_support_anthropic_models() {
+        assert_eq!(
+            effective_reasoning_support(
+                "claude-sonnet-4-20250514",
+                ReasoningSupport::AnthropicThinking
+            ),
+            ReasoningSupport::AnthropicThinking
+        );
+        assert_eq!(
+            effective_reasoning_support(
+                "claude-opus-4-20250514",
+                ReasoningSupport::AnthropicThinking
+            ),
+            ReasoningSupport::AnthropicThinking
+        );
+
+        // Non-reasoning Claude
+        assert_eq!(
+            effective_reasoning_support(
+                "claude-haiku-3-5-20241022",
+                ReasoningSupport::AnthropicThinking
+            ),
+            ReasoningSupport::None
+        );
+        assert_eq!(
+            effective_reasoning_support(
+                "claude-3-haiku-20240307",
+                ReasoningSupport::AnthropicThinking
+            ),
+            ReasoningSupport::None
+        );
+    }
+
+    #[test]
+    fn reasoning_support_google_models() {
+        assert_eq!(
+            effective_reasoning_support("gemini-2.5-pro", ReasoningSupport::GoogleThinkingConfig),
+            ReasoningSupport::GoogleThinkingConfig
+        );
+        assert_eq!(
+            effective_reasoning_support("gemini-2.5-flash", ReasoningSupport::GoogleThinkingConfig),
+            ReasoningSupport::GoogleThinkingConfig
+        );
+
+        // Non-reasoning Gemini
+        assert_eq!(
+            effective_reasoning_support("gemini-1.5-pro", ReasoningSupport::GoogleThinkingConfig),
+            ReasoningSupport::None
+        );
+        assert_eq!(
+            effective_reasoning_support("gemma-3-27b-it", ReasoningSupport::GoogleThinkingConfig),
+            ReasoningSupport::None
+        );
+    }
+
+    #[test]
+    fn reasoning_support_none_always_none() {
+        assert_eq!(
+            effective_reasoning_support("anything", ReasoningSupport::None),
+            ReasoningSupport::None
+        );
     }
 
     #[test]

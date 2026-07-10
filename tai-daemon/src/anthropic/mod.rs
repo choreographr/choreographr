@@ -5,6 +5,7 @@ mod tests;
 use std::io;
 use std::sync::mpsc;
 use std::time::Duration;
+use tracing::{debug, warn};
 
 use serde::{Deserialize, Serialize};
 
@@ -140,19 +141,25 @@ pub struct AnthropicClient {
 // ── ProviderClient trait impl ───────────────────────────────────────────
 
 use crate::providers::ProviderClient;
-use tai_proto::InferenceError;
+use tai_proto::{InferenceError, ThinkingEffort};
 
 impl ProviderClient for AnthropicClient {
+    fn provider_slug(&self) -> &'static str {
+        "anthropic"
+    }
+
     fn chat_completion_turn(
         &self,
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<crate::retry::RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result = self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx);
+        let result =
+            self.chat_completion_turn(model, messages, tools, thinking_effort, on_retry, cancel_rx);
         crate::providers::timed_result(
             api_start,
             model,
@@ -168,13 +175,21 @@ impl ProviderClient for AnthropicClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<crate::retry::RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
         on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result = self
-            .chat_completion_turn_streaming(model, messages, tools, on_retry, cancel_rx, on_chunk);
+        let result = self.chat_completion_turn_streaming(
+            model,
+            messages,
+            tools,
+            thinking_effort,
+            on_retry,
+            cancel_rx,
+            on_chunk,
+        );
         crate::providers::timed_result(
             api_start,
             model,
@@ -249,9 +264,14 @@ impl AnthropicClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<crate::retry::RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
     ) -> Result<ChatTurnResult, AnthropicError> {
+        debug!(
+            effort = %thinking_effort.as_label(),
+            "Anthropic chat completion turn"
+        );
         requests::messages_request(
             &self.http,
             &self.config,
@@ -259,6 +279,7 @@ impl AnthropicClient {
             model,
             messages,
             tools,
+            thinking_effort,
             false,
             on_retry,
             cancel_rx,
@@ -271,6 +292,7 @@ impl AnthropicClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<crate::retry::RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
         on_chunk: F,
@@ -278,9 +300,17 @@ impl AnthropicClient {
     where
         F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
     {
+        debug!(?thinking_effort, "anthropic chat_completion_turn_streaming");
         if !self.config.streaming {
             let mut on_chunk = on_chunk;
-            let result = self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx)?;
+            let result = self.chat_completion_turn(
+                model,
+                messages,
+                tools,
+                thinking_effort,
+                on_retry,
+                cancel_rx,
+            )?;
             match &result {
                 ChatTurnResult::FinalText(final_text) => {
                     if !final_text.content.is_empty() {
@@ -312,6 +342,7 @@ impl AnthropicClient {
             model,
             messages,
             tools,
+            thinking_effort,
             on_retry,
             cancel_rx,
             on_chunk,
@@ -347,6 +378,8 @@ struct MessagesRequest<'a> {
     tools: Option<Vec<ToolPayload<'a>>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingPayload>,
 }
 
 #[derive(Debug, Serialize)]
@@ -382,6 +415,14 @@ struct ToolPayload<'a> {
     description: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_schema: Option<serde_json::Value>,
+}
+
+/// Thinking payload for Anthropic's extended thinking API.
+#[derive(Debug, Serialize)]
+pub(super) struct ThinkingPayload {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    budget_tokens: u32,
 }
 
 /// Response body from POST /v1/messages.
@@ -584,4 +625,36 @@ fn build_tool_payloads(tools: &[ChatToolDefinition]) -> Vec<ToolPayload<'_>> {
             }
         })
         .collect()
+}
+
+/// Map ThinkingEffort to Anthropic thinking budget tokens.
+/// Off → None (no thinking block sent).
+/// Low → 2048, Medium → 4096, High → 16384.
+/// Clamps budget_tokens so that max_tokens >= budget_tokens + 1024.
+pub(super) fn thinking_payload(effort: ThinkingEffort, max_tokens: u32) -> Option<ThinkingPayload> {
+    match effort {
+        ThinkingEffort::Off => None,
+        _ => {
+            let desired = match effort {
+                ThinkingEffort::Off => unreachable!(),
+                ThinkingEffort::Low => 2048,
+                ThinkingEffort::Medium => 4096,
+                ThinkingEffort::High => 16384,
+            };
+            let max_possible = max_tokens.saturating_sub(1024);
+            let budget = desired.min(max_possible);
+            if budget < desired {
+                warn!(
+                    desired,
+                    budget,
+                    max_tokens,
+                    "clamped Anthropic thinking budget_tokens to fit within max_tokens"
+                );
+            }
+            Some(ThinkingPayload {
+                kind: "enabled",
+                budget_tokens: budget,
+            })
+        }
+    }
 }

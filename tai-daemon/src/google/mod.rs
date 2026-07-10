@@ -5,6 +5,7 @@ mod tests;
 use std::io;
 use std::sync::mpsc;
 use std::time::Duration;
+use tracing::debug;
 
 use serde::{Deserialize, Serialize};
 
@@ -166,9 +167,11 @@ impl GoogleClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<crate::retry::RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
     ) -> Result<ChatTurnResult, GoogleError> {
+        debug!(effort = %thinking_effort.as_label(), "Google chat completion turn");
         requests::generate_content_request(
             &self.http,
             &self.config,
@@ -176,6 +179,7 @@ impl GoogleClient {
             model,
             messages,
             tools,
+            thinking_effort,
             on_retry,
             cancel_rx,
         )
@@ -188,6 +192,7 @@ impl GoogleClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<crate::retry::RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
         on_chunk: F,
@@ -195,9 +200,17 @@ impl GoogleClient {
     where
         F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
     {
+        debug!(?thinking_effort, "google chat_completion_turn_streaming");
         if !self.config.streaming {
             let mut on_chunk = on_chunk;
-            let result = self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx)?;
+            let result = self.chat_completion_turn(
+                model,
+                messages,
+                tools,
+                thinking_effort,
+                on_retry,
+                cancel_rx,
+            )?;
             match &result {
                 ChatTurnResult::FinalText(final_text) => {
                     if !final_text.content.is_empty() {
@@ -229,6 +242,7 @@ impl GoogleClient {
             model,
             messages,
             tools,
+            thinking_effort,
             on_retry,
             cancel_rx,
             on_chunk,
@@ -239,19 +253,25 @@ impl GoogleClient {
 // ── ProviderClient trait impl ───────────────────────────────────────────
 
 use crate::providers::ProviderClient;
-use tai_proto::InferenceError;
+use tai_proto::{InferenceError, ThinkingEffort};
 
 impl ProviderClient for GoogleClient {
+    fn provider_slug(&self) -> &'static str {
+        "google"
+    }
+
     fn chat_completion_turn(
         &self,
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<crate::retry::RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result = self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx);
+        let result =
+            self.chat_completion_turn(model, messages, tools, thinking_effort, on_retry, cancel_rx);
         crate::providers::timed_result(
             api_start,
             model,
@@ -267,13 +287,21 @@ impl ProviderClient for GoogleClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<crate::retry::RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
         on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
-        let result = self
-            .chat_completion_turn_streaming(model, messages, tools, on_retry, cancel_rx, on_chunk);
+        let result = self.chat_completion_turn_streaming(
+            model,
+            messages,
+            tools,
+            thinking_effort,
+            on_retry,
+            cancel_rx,
+            on_chunk,
+        );
         crate::providers::timed_result(
             api_start,
             model,
@@ -350,6 +378,14 @@ struct GenerateContentRequest<'a> {
     system_instruction: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
+    thinking_config: Option<ThinkingConfigPayload>,
+}
+
+#[derive(Debug, Serialize)]
+struct ThinkingConfigPayload {
+    #[serde(rename = "includeThoughts")]
+    include_thoughts: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -418,6 +454,12 @@ enum ResponsePart {
     FunctionCall {
         #[serde(rename = "functionCall")]
         function_call: FunctionCallResponse,
+    },
+    Thinking {
+        thinking: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        signature: Option<String>,
     },
 }
 
@@ -551,6 +593,23 @@ fn build_tool_payloads(tools: &[ChatToolDefinition]) -> serde_json::Value {
     serde_json::json!([{"functionDeclarations": declarations}])
 }
 
+/// Map ThinkingEffort to Google's thinkingConfig.
+/// Off → None (omitted from body). Anything else → includeThoughts: true.
+fn thinking_config_payload(effort: ThinkingEffort) -> Option<ThinkingConfigPayload> {
+    match effort {
+        ThinkingEffort::Off => {
+            debug!("Google thinking: Off, omitting thinkingConfig");
+            None
+        }
+        _ => {
+            debug!("Google thinking enabled with effort={}", effort.as_label());
+            Some(ThinkingConfigPayload {
+                include_thoughts: true,
+            })
+        }
+    }
+}
+
 /// Convert a non-streaming Gemini response into a ChatTurnResult.
 fn response_to_turn_result(
     response: GenerateContentResponse,
@@ -565,6 +624,7 @@ fn response_to_turn_result(
 
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ChatToolCall> = Vec::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
 
     for part in content.parts {
         match part {
@@ -580,8 +640,17 @@ fn response_to_turn_result(
                     arguments_json: args_json,
                 });
             }
+            ResponsePart::Thinking { thinking, .. } => {
+                reasoning_parts.push(thinking);
+            }
         }
     }
+
+    let reasoning = if reasoning_parts.is_empty() {
+        None
+    } else {
+        Some(reasoning_parts.join("\n"))
+    };
 
     if !tool_calls.is_empty() {
         let content = if text_parts.is_empty() {
@@ -592,7 +661,7 @@ fn response_to_turn_result(
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
             content,
             tool_calls,
-            reasoning: None,
+            reasoning,
         }));
     }
 
@@ -603,6 +672,6 @@ fn response_to_turn_result(
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
-        reasoning: None,
+        reasoning,
     }))
 }

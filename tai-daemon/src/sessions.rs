@@ -1,7 +1,9 @@
 use crate::context;
 use crate::daemon::DaemonCommand;
 use crate::db::{self, SessionRecord, write_message_retry, write_session_retry};
-use crate::providers::InferenceProvider;
+use crate::providers::{
+    InferenceProvider, ReasoningSupport, effective_reasoning_support, lookup_provider,
+};
 use crate::requests::run_agent_loop;
 use crate::tools::ToolRegistry;
 use std::collections::{HashMap, HashSet};
@@ -9,7 +11,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tai_proto::{ContextConfig, DaemonMessage, SessionMessage, SessionStatus, SessionSummary};
+use tai_proto::{
+    ContextConfig, DaemonMessage, SessionMessage, SessionStatus, SessionSummary, ThinkingEffort,
+};
 use tracing::{debug, error, info, warn};
 
 pub enum SessionCommand {
@@ -53,6 +57,12 @@ pub enum SessionCommand {
     SetAccount {
         name: String,
     },
+    SetReasoningEffort {
+        effort: ThinkingEffort,
+    },
+    GetReasoningEffort {
+        reply: mpsc::Sender<ThinkingEffort>,
+    },
     Shutdown,
 }
 
@@ -65,6 +75,7 @@ pub struct ChildResult {
 pub struct SessionMetadata {
     pub title: Option<String>,
     pub selected_model: Option<String>,
+    pub reasoning_effort: Option<ThinkingEffort>,
     pub parent_session_id: Option<u64>,
     pub cwd: Option<String>,
     pub created_at: i64,
@@ -83,6 +94,7 @@ impl From<SessionRecord> for SessionMetadata {
         SessionMetadata {
             title: record.title,
             selected_model: record.selected_model,
+            reasoning_effort: record.reasoning_effort,
             parent_session_id: record.parent_session_id,
             cwd: record.cwd,
             created_at: record.created_at,
@@ -101,6 +113,7 @@ impl From<SessionMetadata> for SessionRecord {
         SessionRecord {
             title: meta.title,
             selected_model: meta.selected_model,
+            reasoning_effort: meta.reasoning_effort,
             parent_session_id: meta.parent_session_id,
             cwd: meta.cwd,
             max_turns: meta.max_turns,
@@ -124,6 +137,7 @@ impl From<&SessionState> for SessionMetadata {
         SessionMetadata {
             title: state.title.clone(),
             selected_model: state.selected_model.clone(),
+            reasoning_effort: state.reasoning_effort,
             parent_session_id: state.parent_session_id,
             cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
             created_at: state.created_at,
@@ -153,6 +167,7 @@ impl From<&SessionState> for SessionRecord {
 pub struct SessionSnapshot {
     pub title: Option<String>,
     pub selected_model: Option<String>,
+    pub reasoning_effort: Option<ThinkingEffort>,
     pub parent_session_id: Option<u64>,
     pub cwd: Option<PathBuf>,
     pub max_turns: Option<u32>,
@@ -179,6 +194,7 @@ pub struct ActiveSessionEntry {
 pub struct SessionState {
     pub title: Option<String>,
     pub selected_model: Option<String>,
+    pub reasoning_effort: Option<ThinkingEffort>,
     pub parent_session_id: Option<u64>,
     pub cwd: Option<PathBuf>,
     pub max_turns: Option<u32>,
@@ -201,6 +217,7 @@ impl SessionState {
         SessionSnapshot {
             title: self.title.clone(),
             selected_model: self.selected_model.clone(),
+            reasoning_effort: self.reasoning_effort,
             parent_session_id: self.parent_session_id,
             cwd: self.cwd.clone(),
             max_turns: self.max_turns,
@@ -223,6 +240,7 @@ impl SessionState {
         Self {
             title: snapshot.title,
             selected_model: snapshot.selected_model,
+            reasoning_effort: snapshot.reasoning_effort,
             parent_session_id: snapshot.parent_session_id,
             cwd: snapshot.cwd,
             max_turns: snapshot.max_turns,
@@ -244,6 +262,7 @@ impl SessionState {
     fn apply_snapshot(&mut self, snapshot: SessionSnapshot) {
         self.title = snapshot.title;
         self.selected_model = snapshot.selected_model;
+        self.reasoning_effort = snapshot.reasoning_effort;
         self.parent_session_id = snapshot.parent_session_id;
         self.cwd = snapshot.cwd;
         self.max_turns = snapshot.max_turns;
@@ -285,6 +304,7 @@ impl SessionState {
         Self {
             title: None,
             selected_model: None,
+            reasoning_effort: None,
             parent_session_id: None,
             cwd: None,
             max_turns: None,
@@ -347,6 +367,7 @@ pub fn session_main(
     let mut state = SessionState {
         title: init_record.as_ref().and_then(|r| r.title.clone()),
         selected_model: init_record.as_ref().and_then(|r| r.selected_model.clone()),
+        reasoning_effort: init_record.as_ref().and_then(|r| r.reasoning_effort),
         parent_session_id: init_record.as_ref().and_then(|r| r.parent_session_id),
         cwd: init_record
             .as_ref()
@@ -680,6 +701,7 @@ fn process_command(
                 session_id,
                 title: state.title.clone(),
                 selected_model: state.selected_model.clone(),
+                reasoning_effort: state.reasoning_effort,
                 parent_session_id: state.parent_session_id,
                 cwd: state.cwd.as_ref().map(|p| p.display().to_string()),
                 created_at: state.created_at,
@@ -753,6 +775,62 @@ fn process_command(
                 session_id,
                 metadata: SessionMetadata::from(&*state),
             });
+            false
+        }
+        SessionCommand::SetReasoningEffort { effort } => {
+            info!(
+                session_id,
+                effort = %effort.as_label(),
+                "setting reasoning effort"
+            );
+
+            // Check if the current model supports reasoning
+            let supported = if let (Some(model), Some(provider)) =
+                (state.selected_model.as_ref(), state.provider.as_ref())
+            {
+                // Get the provider slug
+                let slug = provider.provider_slug();
+                let catalog_entry = lookup_provider(slug);
+                let reasoning_support = catalog_entry
+                    .map(|e| e.reasoning)
+                    .unwrap_or(ReasoningSupport::None);
+                let effective = effective_reasoning_support(model, reasoning_support);
+                effective != ReasoningSupport::None
+            } else {
+                // If no model or provider is set yet, accept the preference
+                // (it will be validated when inference actually runs)
+                true
+            };
+
+            if supported || effort == ThinkingEffort::Off {
+                state.reasoning_effort = Some(effort);
+                debug!(
+                    session_id,
+                    effort = %effort.as_label(),
+                    "reasoning effort stored"
+                );
+                broadcast(
+                    &state.subscribers,
+                    DaemonMessage::reasoning_effort_set(effort),
+                );
+            } else {
+                let model = state.selected_model.as_deref().unwrap_or("(none)");
+                let msg = format!(
+                    "model '{}' does not support reasoning effort '{}'",
+                    model,
+                    effort.as_label(),
+                );
+                warn!(session_id, error = %msg, "reasoning effort rejected");
+                broadcast(
+                    &state.subscribers,
+                    DaemonMessage::reasoning_effort_set_failed(effort.as_label(), msg),
+                );
+            }
+            false
+        }
+        SessionCommand::GetReasoningEffort { reply } => {
+            let current = state.reasoning_effort.unwrap_or(ThinkingEffort::Off);
+            let _ = reply.send(current);
             false
         }
         SessionCommand::Shutdown => {
@@ -911,6 +989,7 @@ mod tests {
         SessionRecord {
             title: Some("test session".into()),
             selected_model: Some("gpt-4".into()),
+            reasoning_effort: None,
             parent_session_id: None,
             cwd: Some("/tmp".into()),
             max_turns: Some(10),
@@ -926,6 +1005,7 @@ mod tests {
         SessionState {
             title: Some("test session".into()),
             selected_model: Some("gpt-4".into()),
+            reasoning_effort: None,
             parent_session_id: None,
             cwd: Some(std::path::PathBuf::from("/tmp")),
             max_turns: Some(10),
@@ -973,6 +1053,7 @@ mod tests {
         let meta = SessionMetadata {
             title: Some("meta title".into()),
             selected_model: Some("claude-3".into()),
+            reasoning_effort: None,
             parent_session_id: Some(42),
             cwd: Some("/home".into()),
             created_at: 2000,

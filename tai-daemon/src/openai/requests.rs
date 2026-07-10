@@ -1,3 +1,4 @@
+use tai_proto::ThinkingEffort;
 use tracing::{debug, info};
 
 use super::ServiceConfig;
@@ -7,7 +8,7 @@ use super::{
     ChatCompletionsStreamOptions, ChatCompletionsStreamResponse, ChatRequestMessage, ChatToolCall,
     ChatToolDefinition, ChatTurnResult, CompletionChunkKind, FinalTextResult, ModelListResponse,
     OpenAiClient, RequestFormat, ResponsesRequest, ResponsesResponse, SseReader,
-    StreamToolCallDelta, endpoint_url, extract_responses_text_delta,
+    StreamToolCallDelta, endpoint_url, extract_responses_text_delta, reasoning_effort_api_value,
 };
 use std::collections::HashMap;
 use std::io;
@@ -70,6 +71,7 @@ impl OpenAiClient {
                 &self.api_key,
                 model,
                 prompt,
+                None, // No reasoning_effort for simple completion
                 &mut on_chunk,
             ),
         }
@@ -80,9 +82,12 @@ impl OpenAiClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<retry::RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
     ) -> Result<ChatTurnResult, super::OpenAiError> {
+        let reasoning_effort = reasoning_effort_api_value(thinking_effort);
+        debug!(?thinking_effort, ?reasoning_effort, "chat_completion_turn");
         chat_completions_request_with_tools(
             &self.http,
             &self.config,
@@ -90,6 +95,7 @@ impl OpenAiClient {
             model,
             messages,
             tools,
+            reasoning_effort,
             on_retry,
             cancel_rx,
         )
@@ -100,6 +106,7 @@ impl OpenAiClient {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<retry::RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
         on_chunk: F,
@@ -107,12 +114,25 @@ impl OpenAiClient {
     where
         F: FnMut(super::CompletionChunkKind, String) -> io::Result<()>,
     {
+        let reasoning_effort = reasoning_effort_api_value(thinking_effort);
+        debug!(
+            ?thinking_effort,
+            ?reasoning_effort,
+            "chat_completion_turn_streaming"
+        );
         if !self.config.streaming {
             // Fall back to non-streaming, deliver the full response as a single
             // chunk through the callback so the caller's broadcasting path
             // stays uniform regardless of the streaming setting.
             let mut on_chunk = on_chunk;
-            let result = self.chat_completion_turn(model, messages, tools, on_retry, cancel_rx)?;
+            let result = self.chat_completion_turn(
+                model,
+                messages,
+                tools,
+                thinking_effort,
+                on_retry,
+                cancel_rx,
+            )?;
             match &result {
                 ChatTurnResult::FinalText(final_text) => {
                     if !final_text.content.is_empty() {
@@ -148,6 +168,7 @@ impl OpenAiClient {
             model,
             messages,
             tools,
+            reasoning_effort,
             on_retry,
             cancel_rx,
             on_chunk,
@@ -215,6 +236,7 @@ fn chat_completions_request(
         stream_options: None,
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
+        reasoning_effort: None,
     })
     .map_err(io::Error::other)?;
     let response = retry::retry_send_simple(client, &url, api_key, &body, &retry)?;
@@ -246,6 +268,7 @@ fn chat_completions_request_with_tools(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
+    reasoning_effort: Option<&'static str>,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
@@ -266,6 +289,7 @@ fn chat_completions_request_with_tools(
         stream_options: None,
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
+        reasoning_effort,
     })
     .map_err(io::Error::other)?;
     let response = retry::retry_send(client, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
@@ -329,6 +353,7 @@ fn chat_completions_request_streaming<F>(
     api_key: &str,
     model: &str,
     prompt: &str,
+    reasoning_effort: Option<&'static str>,
     on_chunk: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
@@ -353,6 +378,7 @@ where
         }),
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
+        reasoning_effort,
     })
     .map_err(io::Error::other)?;
     let response = retry::retry_send_simple(client, &url, api_key, &body, &retry)?;
@@ -486,6 +512,7 @@ fn chat_completions_request_streaming_with_tools<F>(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
+    reasoning_effort: Option<&'static str>,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
     mut on_chunk: F,
@@ -511,6 +538,7 @@ where
         }),
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
+        reasoning_effort,
     })
     .map_err(io::Error::other)?;
     let response = retry::retry_send(client, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
@@ -841,5 +869,69 @@ mod tests {
             }
             _ => panic!("expected ToolUse"),
         }
+    }
+
+    // -- reasoning_effort serialization tests ---------------------------
+
+    #[test]
+    fn reasoning_effort_serialization() {
+        // Off → None (omitted from body)
+        assert_eq!(
+            crate::openai::reasoning_effort_api_value(ThinkingEffort::Off),
+            None
+        );
+
+        // Low → "low"
+        assert_eq!(
+            crate::openai::reasoning_effort_api_value(ThinkingEffort::Low),
+            Some("low")
+        );
+
+        // Medium → "medium"
+        assert_eq!(
+            crate::openai::reasoning_effort_api_value(ThinkingEffort::Medium),
+            Some("medium")
+        );
+
+        // High → "high"
+        assert_eq!(
+            crate::openai::reasoning_effort_api_value(ThinkingEffort::High),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn chat_completions_request_omits_reasoning_effort_when_none() {
+        let body = serde_json::to_value(&ChatCompletionsRequest {
+            model: "gpt-4.1",
+            messages: &[ChatRequestMessage::simple("user", "hello".into())],
+            tools: None,
+            stream: false,
+            stream_options: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: None,
+        })
+        .unwrap();
+        assert!(body.get("reasoning_effort").is_none(), "should be omitted");
+    }
+
+    #[test]
+    fn chat_completions_request_includes_reasoning_effort_when_set() {
+        let body = serde_json::to_value(&ChatCompletionsRequest {
+            model: "o3-mini",
+            messages: &[ChatRequestMessage::simple("user", "hello".into())],
+            tools: None,
+            stream: false,
+            stream_options: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: Some("low"),
+        })
+        .unwrap();
+        assert_eq!(
+            body.get("reasoning_effort"),
+            Some(&serde_json::Value::String("low".into()))
+        );
     }
 }

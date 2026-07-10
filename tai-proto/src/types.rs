@@ -2,6 +2,28 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_IMAGE_CHUNK_SIZE: usize = 64 * 1024;
 
+/// ThinkingEffort — controls how much reasoning/thinking the model performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingEffort {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl ThinkingEffort {
+    /// Human-readable label.
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            ThinkingEffort::Off => "off",
+            ThinkingEffort::Low => "low",
+            ThinkingEffort::Medium => "medium",
+            ThinkingEffort::High => "high",
+        }
+    }
+}
+
 /// ContextConfig — controls file discovery for session context.
 /// Moved here from tai-daemon so proto messages can carry it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +151,7 @@ pub struct SessionSummary {
     pub session_id: u64,
     pub title: Option<String>,
     pub selected_model: Option<String>,
+    pub reasoning_effort: Option<ThinkingEffort>,
     pub parent_session_id: Option<u64>,
     pub cwd: Option<String>,
     pub created_at: i64,
@@ -209,6 +232,10 @@ pub enum ClientMessage {
     SetSessionAccount {
         name: String,
     },
+    SetReasoningEffort {
+        effort: ThinkingEffort,
+    },
+    GetReasoningEffort,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -388,6 +415,13 @@ pub enum DaemonMessage {
     },
     SessionAccountSet {
         account: String,
+    },
+    ReasoningEffortSet {
+        effort: ThinkingEffort,
+    },
+    ReasoningEffortSetFailed {
+        effort: String,
+        error: String,
     },
     ShuttingDown,
 }
@@ -660,6 +694,20 @@ impl DaemonMessage {
             account: account.into(),
         }
     }
+
+    pub fn reasoning_effort_set(effort: ThinkingEffort) -> Self {
+        Self::ReasoningEffortSet { effort }
+    }
+
+    pub fn reasoning_effort_set_failed(
+        effort: impl Into<String>,
+        error: impl Into<String>,
+    ) -> Self {
+        Self::ReasoningEffortSetFailed {
+            effort: effort.into(),
+            error: error.into(),
+        }
+    }
 }
 
 impl ClientMessage {
@@ -794,5 +842,34 @@ impl ClientMessage {
 
     pub fn set_session_account(name: impl Into<String>) -> Self {
         Self::SetSessionAccount { name: name.into() }
+    }
+
+    pub fn set_reasoning_effort(effort: ThinkingEffort) -> Self {
+        Self::SetReasoningEffort { effort }
+    }
+
+    pub fn get_reasoning_effort() -> Self {
+        Self::GetReasoningEffort
+    }
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::*;
+
+    #[test]
+    fn thinking_effort_labels() {
+        assert_eq!(ThinkingEffort::Off.as_label(), "off");
+        assert_eq!(ThinkingEffort::Low.as_label(), "low");
+        assert_eq!(ThinkingEffort::Medium.as_label(), "medium");
+        assert_eq!(ThinkingEffort::High.as_label(), "high");
+    }
+
+    #[test]
+    fn thinking_effort_serialization() {
+        let json = serde_json::to_string(&ThinkingEffort::Medium).unwrap();
+        assert_eq!(json, "\"medium\"");
+        let deserialized: ThinkingEffort = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, ThinkingEffort::Medium);
     }
 }

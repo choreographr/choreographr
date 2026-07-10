@@ -83,12 +83,13 @@ Defines all shared message types and framing. No dependencies on other workspace
 | `SessionMessage` | A single turn in a conversation. Variants: `SystemText`, `UserText`, `AssistantText`, `AssistantToolUse`, `ToolResult`, `DisplayedImage` (persisted image replay) |
 | `ImageMetadata` | Mime type, dimensions, byte length for streamed images |
 | `DisplayedImageRecord` | Binary image data + `ImageMetadata` for persisted image replay (carried inside `SessionMessage::DisplayedImage`) |
+| `ThinkingEffort` | Enum controlling how much reasoning/thinking the model performs: `Off`, `Low`, `Medium`, `High`. Stored per-session and passed through to each provider's wire format. |
 
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
 `TestImage`, `Cancel`, `Ping`, `GetCredential`, `ListModels`, `SetModel`, `Unlock`,
 `Lock`, `AddCredential`, `RemoveCredential`, `AddAccount`, `RemoveAccount`,
-`ListAccounts`, `SetSessionAccount`
+`ListAccounts`, `SetSessionAccount`, `SetReasoningEffort`, `GetReasoningEffort`
 - `CreateSession` now carries optional `context_config` and `account_name` fields
 
 `DaemonMessage` variants:
@@ -100,6 +101,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 - Locking: `Unlocked`, `Locked`, `LockedError`
 - Credential management: `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`
 - Account management: `AccountAdded`, `AccountAddFailed`, `AccountRemoved`, `AccountRemoveFailed`, `Accounts`, `AccountListFailed`, `SessionAccountSet`
+- Reasoning effort: `ReasoningEffortSet`, `ReasoningEffortSetFailed`
 - Misc: `Pong`, `ShuttingDown`
 
 **Wire format:**
@@ -207,13 +209,18 @@ The provider system has three layers:
 **1. `ProviderClient` trait (`providers/traits.rs`):**
 ```rust
 pub trait ProviderClient: Debug + Send + Sync {
-    fn chat_completion_turn(...) -> Result<ChatTurnResult, InferenceError>;
-    fn chat_completion_turn_streaming(&self, ..., on_chunk: &mut dyn FnMut(...)) -> Result<ChatTurnResult, InferenceError>;
+    fn provider_slug(&self) -> &'static str;
+    fn chat_completion_turn(&self, ..., thinking_effort: ThinkingEffort, ...) -> Result<ChatTurnResult, InferenceError>;
+    fn chat_completion_turn_streaming(&self, ..., thinking_effort: ThinkingEffort, ...) -> Result<ChatTurnResult, InferenceError>;
     fn list_models(&self) -> Result<Vec<String>, InferenceError>;
 }
 ```
 
 Uses `&mut dyn FnMut` for the streaming callback to keep the trait object-safe.
+Each client implementation maps `ThinkingEffort` to its wire format:
+- **OpenAI**: `reasoning_effort` field (`"low"`, `"medium"`, `"high"`)
+- **Anthropic**: `thinking` block with `budget_tokens` (clamped to `max_tokens - 1024`)
+- **Google**: `thinkingConfig` with `includeThoughts: true`
 
 **2. `InferenceProvider` struct (`providers/mod.rs`):**
 ```rust
@@ -237,6 +244,9 @@ A static `PROVIDER_CATALOG: &[ProviderEntry]` maps each provider slug to:
 - `protocol` — which wire protocol to use
 - `default_base_url` — well-known API endpoint
 - `default_model` — sensible default model name
+- `reasoning` — `ReasoningSupport` variant declaring which reasoning parameter protocol the provider speaks
+
+`ReasoningSupport` enum: `None`, `ReasoningEffort` (OpenAI-style), `AnthropicThinking` (thinking budget block), `GoogleThinkingConfig` (thinkingConfig field). Model-level gating is handled by `effective_reasoning_support()`, which uses name heuristics since the static catalog cannot enumerate every model variant dynamically.
 
 Currently supports ~30 providers. Adding a new OpenAI-compatible provider requires only a catalog entry — zero client code.
 

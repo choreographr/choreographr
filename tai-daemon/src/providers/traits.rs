@@ -4,16 +4,20 @@ use std::sync::mpsc;
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind};
 use crate::retry::RetryCallback;
-use tai_proto::InferenceError;
+use tai_proto::{InferenceError, ThinkingEffort};
 
 /// Trait that every provider client must implement.
 /// Uses `&mut dyn FnMut` for the streaming callback to keep the trait object-safe.
 pub trait ProviderClient: Debug + Send + Sync {
+    /// Return the provider slug for catalog lookups.
+    fn provider_slug(&self) -> &'static str;
+
     fn chat_completion_turn(
         &self,
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
     ) -> Result<ChatTurnResult, InferenceError>;
@@ -23,6 +27,7 @@ pub trait ProviderClient: Debug + Send + Sync {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
         on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,

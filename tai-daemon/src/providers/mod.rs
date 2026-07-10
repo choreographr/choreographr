@@ -7,14 +7,14 @@ use crate::openai::{
     ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind, OpenAiClient,
     RetryCallback,
 };
-use tai_proto::InferenceError;
+use tai_proto::{InferenceError, ThinkingEffort};
 
 mod catalog;
 mod traits;
 
 pub use catalog::{
-    PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, all_display_names, all_slugs,
-    lookup_provider,
+    PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, ReasoningSupport, all_display_names,
+    all_slugs, effective_reasoning_support, lookup_provider,
 };
 pub use traits::ProviderClient;
 
@@ -102,11 +102,18 @@ impl InferenceProvider {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        self.client
-            .chat_completion_turn(model, messages, tools, on_retry, cancel_rx)
+        self.client.chat_completion_turn(
+            model,
+            messages,
+            tools,
+            thinking_effort,
+            on_retry,
+            cancel_rx,
+        )
     }
 
     pub fn chat_completion_turn_streaming(
@@ -114,12 +121,25 @@ impl InferenceProvider {
         model: &str,
         messages: &[ChatRequestMessage],
         tools: &[ChatToolDefinition],
+        thinking_effort: ThinkingEffort,
         on_retry: &mut Option<RetryCallback>,
         cancel_rx: Option<&mpsc::Receiver<()>>,
         on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        self.client
-            .chat_completion_turn_streaming(model, messages, tools, on_retry, cancel_rx, on_chunk)
+        self.client.chat_completion_turn_streaming(
+            model,
+            messages,
+            tools,
+            thinking_effort,
+            on_retry,
+            cancel_rx,
+            on_chunk,
+        )
+    }
+
+    /// Return the provider slug (e.g. "openai", "anthropic").
+    pub fn provider_slug(&self) -> &'static str {
+        self.client.provider_slug()
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, InferenceError> {
