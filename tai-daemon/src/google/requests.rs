@@ -9,7 +9,7 @@ use crate::openai::{ChatRequestMessage, ChatToolDefinition, ChatTurnResult, Comp
 use crate::retry;
 
 use super::{
-    GenerateContentRequest, GenerateContentResponse, GoogleConfig, GoogleError,
+    GenerateContentRequest, GenerateContentResponse, GoogleConfig, GoogleError, ModelListResponse,
     build_message_payloads, build_tool_payloads, model_url, response_to_turn_result,
     thinking_config_payload,
 };
@@ -19,6 +19,51 @@ const GENERATE_CONTENT: &str = "generateContent";
 
 /// Endpoint action for streaming content generation with SSE.
 const STREAM_GENERATE_CONTENT: &str = "streamGenerateContent?alt=sse";
+
+/// Fetch the list of available models from the Google Gemini API.
+pub(super) fn list_models_request(
+    client: &reqwest::blocking::Client,
+    config: &GoogleConfig,
+    api_key: &str,
+) -> Result<Vec<String>, GoogleError> {
+    let base = config.base_url.trim_end_matches('/');
+    let url = format!("{}/models", base);
+    let retry_cfg = retry::RetryConfig {
+        max_attempts: config.retry_max_attempts,
+        initial_backoff_ms: config.retry_initial_backoff_ms,
+        max_backoff_ms: config.retry_max_backoff_ms,
+    };
+
+    let response = retry::retry_loop(
+        || {
+            client
+                .get(&url)
+                .header("x-goog-api-key", api_key.trim())
+                .send()
+        },
+        &retry_cfg,
+        &mut None,
+        None,
+    )?;
+
+    let payload: ModelListResponse = response
+        .json()
+        .map_err(|e| GoogleError::Io(std::io::Error::other(e)))?;
+
+    // Google returns model names as "models/gemini-2.5-pro" — strip the prefix.
+    let models: Vec<String> = payload
+        .models
+        .into_iter()
+        .map(|m| {
+            m.name
+                .strip_prefix("models/")
+                .unwrap_or(&m.name)
+                .to_string()
+        })
+        .collect();
+
+    Ok(models)
+}
 
 /// Send a POST /v1beta/models/{model}:generateContent request with retry.
 #[allow(clippy::too_many_arguments)]

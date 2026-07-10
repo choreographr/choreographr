@@ -13,12 +13,49 @@ use crate::openai::{
 use crate::retry;
 
 use super::{
-    AnthropicConfig, AnthropicError, MessagesRequest, MessagesResponse, build_message_payloads,
-    build_tool_payloads, response_to_turn_result, thinking_payload,
+    AnthropicConfig, AnthropicError, MessagesRequest, MessagesResponse, ModelListResponse,
+    build_message_payloads, build_tool_payloads, response_to_turn_result, thinking_payload,
 };
 
 /// Endpoint path for the Messages API.
 const MESSAGES_PATH: &str = "/v1/messages";
+
+/// Endpoint path for listing models.
+const MODELS_PATH: &str = "/v1/models";
+
+/// Fetch the list of available models from the Anthropic API.
+pub(super) fn list_models_request(
+    client: &reqwest::blocking::Client,
+    config: &AnthropicConfig,
+    api_key: &str,
+) -> Result<Vec<String>, AnthropicError> {
+    let url = endpoint_url(&config.base_url, MODELS_PATH)?;
+    let retry_cfg = retry::RetryConfig {
+        max_attempts: config.retry_max_attempts,
+        initial_backoff_ms: config.retry_initial_backoff_ms,
+        max_backoff_ms: config.retry_max_backoff_ms,
+    };
+
+    let response = retry::retry_loop(
+        || {
+            client
+                .get(&url)
+                .header("x-api-key", api_key.trim())
+                .header("anthropic-version", &config.api_version)
+                .send()
+        },
+        &retry_cfg,
+        &mut None,
+        None,
+    )?;
+
+    let payload: ModelListResponse = response
+        .json()
+        .map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
+
+    let models: Vec<String> = payload.data.into_iter().map(|m| m.id).collect();
+    Ok(models)
+}
 
 /// Build the full URL for a given path.
 fn endpoint_url(base_url: &str, path: &str) -> io::Result<String> {

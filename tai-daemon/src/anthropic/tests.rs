@@ -2,6 +2,20 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn model_list_response_deserialises() {
+    let json = json!({
+        "data": [
+            {"id": "claude-sonnet-4-20250514", "type": "model"},
+            {"id": "claude-opus-4-20250514", "type": "model"}
+        ]
+    });
+    let resp: ModelListResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(resp.data.len(), 2);
+    assert_eq!(resp.data[0].id, "claude-sonnet-4-20250514");
+    assert_eq!(resp.data[1].id, "claude-opus-4-20250514");
+}
+
+#[test]
 fn content_block_text_deserialises() {
     let block: ContentBlock = serde_json::from_value(json!({
         "type": "text",

@@ -252,10 +252,14 @@ impl AnthropicClient {
         &self.api_key
     }
 
-    /// List available models. Since the Anthropic models endpoint may not be
-    /// accessible to all API keys, we use a curated static list.
+    /// List available models from the API, falling back to the curated static list
+    /// if the endpoint is unreachable or the API key lacks permission.
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, AnthropicError> {
-        Ok(KNOWN_CLAUDE_MODELS.iter().map(|s| s.to_string()).collect())
+        crate::providers::list_models_with_fallback(
+            || requests::list_models_request(&self.http, &self.config, &self.api_key),
+            KNOWN_CLAUDE_MODELS,
+            "Anthropic",
+        )
     }
 
     /// Non-streaming chat completion turn via the Messages API.
@@ -351,6 +355,17 @@ impl AnthropicClient {
 }
 
 // ── API types ──────────────────────────────────────────────────────────
+
+/// Response from GET /v1/models.
+#[derive(Debug, Deserialize)]
+pub(super) struct ModelListResponse {
+    data: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ModelInfo {
+    id: String,
+}
 
 /// Known Claude models (curated static list).
 const KNOWN_CLAUDE_MODELS: &[&str] = &[

@@ -155,9 +155,14 @@ impl GoogleClient {
         &self.api_key
     }
 
-    /// List available models from the known Gemini models list.
+    /// List available models from the API, falling back to the curated static list
+    /// if the endpoint is unreachable or the API key lacks permission.
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, GoogleError> {
-        Ok(KNOWN_GEMINI_MODELS.iter().map(|s| s.to_string()).collect())
+        crate::providers::list_models_with_fallback(
+            || requests::list_models_request(&self.http, &self.config, &self.api_key),
+            KNOWN_GEMINI_MODELS,
+            "Google",
+        )
     }
 
     /// Non-streaming chat completion turn via the Gemini generateContent API.
@@ -340,6 +345,17 @@ fn google_error_to_inference(e: GoogleError) -> InferenceError {
         GoogleError::Cancelled => InferenceError::Cancelled,
         GoogleError::Io(e) => InferenceError::Io(e.to_string()),
     }
+}
+
+/// Response from GET /v1beta/models.
+#[derive(Debug, Deserialize)]
+pub(super) struct ModelListResponse {
+    models: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ModelInfo {
+    name: String,
 }
 
 /// Known Gemini models (curated static list).

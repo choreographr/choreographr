@@ -169,6 +169,32 @@ pub(crate) fn timed_result<T, E>(
     result.map_err(error_convert)
 }
 
+/// Try to list models via the API; fall back to the static known list on any
+/// error.  Used by provider implementations to gracefully degrade when the
+/// models endpoint is unreachable or the API key lacks permission.
+pub(crate) fn list_models_with_fallback<F, E>(
+    fetch: F,
+    static_list: &[&str],
+    provider_name: &str,
+) -> Result<Vec<String>, E>
+where
+    F: FnOnce() -> Result<Vec<String>, E>,
+    E: std::fmt::Display,
+{
+    match fetch() {
+        Ok(models) => {
+            tracing::info!("{provider_name} models returned: {}", models.len());
+            Ok(models)
+        }
+        Err(e) => {
+            tracing::warn!(
+                "failed to list models from {provider_name} API, using static list: {e}"
+            );
+            Ok(static_list.iter().map(|s| s.to_string()).collect())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

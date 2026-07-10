@@ -3,6 +3,20 @@ use crate::google::requests::extract_error_detail;
 use crate::openai::{AssistantToolCall, AssistantToolFunction};
 use serde_json::json;
 
+#[test]
+fn model_list_response_deserialises() {
+    let json = json!({
+        "models": [
+            {"name": "models/gemini-2.5-pro", "displayName": "Gemini 2.5 Pro"},
+            {"name": "models/gemini-2.5-flash", "displayName": "Gemini 2.5 Flash"}
+        ]
+    });
+    let resp: ModelListResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(resp.models.len(), 2);
+    assert_eq!(resp.models[0].name, "models/gemini-2.5-pro");
+    assert_eq!(resp.models[1].name, "models/gemini-2.5-flash");
+}
+
 // ── build_message_payloads tests ──────────────────────────────────────
 
 #[test]
