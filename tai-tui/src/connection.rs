@@ -805,18 +805,18 @@ fn handle_ai_providers_new_form_key(
             }
         }
         // j/k navigate when on provider field; otherwise pass through
-        KeyCode::Char('j') | KeyCode::Down => {
-            if app.ai_providers.new_field == NewAccountField::Provider {
-                let max = PROVIDER_OPTIONS.len().saturating_sub(1);
-                if app.ai_providers.new_provider_idx < max {
-                    app.ai_providers.new_provider_idx += 1;
-                }
+        KeyCode::Char('j') | KeyCode::Down
+            if app.ai_providers.new_field == NewAccountField::Provider =>
+        {
+            let max = PROVIDER_OPTIONS.len().saturating_sub(1);
+            if app.ai_providers.new_provider_idx < max {
+                app.ai_providers.new_provider_idx += 1;
             }
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if app.ai_providers.new_field == NewAccountField::Provider
-                && app.ai_providers.new_provider_idx > 0
-            {
+        KeyCode::Char('k') | KeyCode::Up
+            if app.ai_providers.new_field == NewAccountField::Provider =>
+        {
+            if app.ai_providers.new_provider_idx > 0 {
                 app.ai_providers.new_provider_idx -= 1;
             }
         }

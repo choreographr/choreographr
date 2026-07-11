@@ -845,6 +845,20 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 /// Render the credential-input overlay for setting an API key on an account.
+/// Position the terminal cursor at the insertion point of a text field
+/// rendered inside a Paragraph at `area[line]`.
+fn set_input_cursor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    line: u16,
+    prefix_width: u16,
+    text_before_cursor: &str,
+) {
+    let x = area.x + prefix_width + display_width(text_before_cursor) as u16;
+    let y = area.y + line;
+    frame.set_cursor_position((x, y));
+}
+
 fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default()
@@ -876,22 +890,23 @@ fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
     )));
     lines.push(Line::from(Span::styled(String::new(), Style::default())));
 
-    let text = app.ai_providers.credential_input.text.clone();
+    let text = &app.ai_providers.credential_input.text;
+    let cursor = app.ai_providers.credential_input.cursor;
     // Mask the key: show first 4 + last 4 if long enough
-    let masked = if text.len() > 12 {
-        format!("{}...{}", &text[..4], &text[text.len().saturating_sub(4)..])
-    } else if text.is_empty() {
+    let masked = if text.is_empty() {
         String::new()
+    } else if text.len() > 12 {
+        format!("{}...{}", &text[..4], &text[text.len().saturating_sub(4)..])
     } else {
         "••••••••".to_string()
     };
-    let caret = if text.is_empty() { "█" } else { "" };
     let display = if text.is_empty() {
-        format!("> {caret}")
+        "> ".to_string()
     } else {
         format!("> {masked}")
     };
     lines.push(Line::from(Span::styled(display, input_style)));
+    let input_line = lines.len() as u16 - 1;
     lines.push(Line::from(Span::styled(String::new(), Style::default())));
 
     if let Some(ref err) = app.ai_providers.add_error {
@@ -903,6 +918,18 @@ fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
+
+    // Set cursor position for the masked credential input
+    let masked_before = if text.is_empty() {
+        ""
+    } else if cursor >= text.len() {
+        &masked
+    } else {
+        let pos = (cursor as f64 / text.len() as f64 * masked.len() as f64).round() as usize;
+        let pos = pos.min(masked.len());
+        &masked[..pos]
+    };
+    set_input_cursor(frame, inner, input_line, 2, masked_before);
 
     let status = Paragraph::new(Line::from(" <Enter save>  <Esc cancel>"));
     frame.render_widget(status, chunks[1]);
@@ -943,14 +970,10 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
     let label_style = if is_name_active { bright } else { dim };
     lines.push(Line::from(Span::styled("  Name:", label_style)));
     let prefix = if is_name_active { "> " } else { "  " };
-    let text = app.ai_providers.new_name.text.clone();
-    let caret = if is_name_active && text.is_empty() {
-        "█"
-    } else {
-        ""
-    };
+    let text = &app.ai_providers.new_name.text;
+    let cursor = app.ai_providers.new_name.cursor;
     let display = if text.is_empty() {
-        format!("{prefix}{caret}")
+        prefix.to_string()
     } else {
         format!("{prefix}{text}")
     };
@@ -958,6 +981,7 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
         display,
         if is_name_active { input_style } else { dim },
     )));
+    let name_input_line = lines.len() as u16 - 1;
     lines.push(Line::from(Span::styled(String::new(), Style::default())));
 
     // ── Provider dropdown ─────────────────────────────────────
@@ -986,26 +1010,21 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
     let label_style = if is_key_active { bright } else { dim };
     lines.push(Line::from(Span::styled("  API Key:", label_style)));
     let prefix = if is_key_active { "> " } else { "  " };
-    let key_text = app.ai_providers.new_api_key.text.clone();
-    // Mask the key when displayed; show first 4 + last 4 if long enough
-    let masked = if key_text.len() > 12 {
+    let key_text = &app.ai_providers.new_api_key.text;
+    let key_cursor = app.ai_providers.new_api_key.cursor;
+    let masked = if key_text.is_empty() {
+        String::new()
+    } else if key_text.len() > 12 {
         format!(
             "{}...{}",
             &key_text[..4],
             &key_text[key_text.len().saturating_sub(4)..]
         )
-    } else if key_text.is_empty() {
-        String::new()
     } else {
         "••••••••".to_string()
     };
-    let caret = if is_key_active && key_text.is_empty() {
-        "█"
-    } else {
-        ""
-    };
     let display = if key_text.is_empty() {
-        format!("{prefix}{caret}")
+        prefix.to_string()
     } else {
         format!("{prefix}{masked}")
     };
@@ -1013,6 +1032,7 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
         display,
         if is_key_active { input_style } else { dim },
     )));
+    let key_input_line = lines.len() as u16 - 1;
     lines.push(Line::from(Span::styled(String::new(), Style::default())));
 
     // ── Done / Cancel instruction ─────────────────────────────
@@ -1031,6 +1051,29 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
+
+    // Set terminal cursor at the active text field's insertion point
+    if is_name_active {
+        set_input_cursor(
+            frame,
+            inner,
+            name_input_line,
+            2,
+            app.ai_providers.new_name.text.get(..cursor).unwrap_or(""),
+        );
+    } else if is_key_active {
+        let masked_before = if key_text.is_empty() {
+            ""
+        } else if key_cursor >= key_text.len() {
+            &masked
+        } else {
+            let pos =
+                (key_cursor as f64 / key_text.len() as f64 * masked.len() as f64).round() as usize;
+            let pos = pos.min(masked.len());
+            &masked[..pos]
+        };
+        set_input_cursor(frame, inner, key_input_line, 2, masked_before);
+    }
 
     // Footer
     let status = Paragraph::new(Line::from(" <Enter next>  <j/k provider>  <Esc cancel>"));
