@@ -8,12 +8,48 @@ use crate::client::apply_daemon_message;
 use crate::components::{Composer, HistoryList, Toolbar};
 use crate::hooks::use_daemon_connection;
 use crate::state::{AppState, UiEvent};
+use clap::Parser;
 use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
 use futures_util::StreamExt as _;
+use std::sync::OnceLock;
+use tai_client_core::{ConnectionMode, read_server_pk};
 use tai_proto::socket_path;
 
+/// Global connection mode, set once at startup from CLI args.
+static CONNECTION_MODE: OnceLock<ConnectionMode> = OnceLock::new();
+
+#[derive(Parser)]
+#[command(name = "tai-dioxus", about = "Tai AI desktop GUI")]
+struct Cli {
+    /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
+    #[arg(long = "tcp-addr")]
+    tcp_addr: Option<String>,
+
+    /// Path to the server's Noise IK public key (defaults to ~/.config/tai-daemon/transport.pub)
+    #[arg(long = "server-pk")]
+    server_pk: Option<String>,
+}
+
 fn main() {
+    let cli = Cli::parse();
+
+    let mode = if let Some(addr) = cli.tcp_addr {
+        let server_pk = match read_server_pk(cli.server_pk.as_deref()) {
+            Ok(pk) => pk,
+            Err(e) => {
+                eprintln!("failed to read server public key: {e}");
+                std::process::exit(1);
+            }
+        };
+        ConnectionMode::Tcp { addr, server_pk }
+    } else {
+        ConnectionMode::UnixSocket(socket_path())
+    };
+
+    // Store mode globally so the App component can read it.
+    let _ = CONNECTION_MODE.set(mode);
+
     dioxus::LaunchBuilder::desktop()
         .with_cfg(Config::new().with_window(WindowBuilder::new().with_title("tai-dioxus")))
         .launch(App);
@@ -22,7 +58,14 @@ fn main() {
 #[component]
 fn App() -> Element {
     let (daemon_tx, mut events_rx) = use_daemon_connection();
-    let mut state = use_signal(|| AppState::new(socket_path()));
+    let mut state = use_signal(|| {
+        let display_path = match CONNECTION_MODE.get() {
+            Some(ConnectionMode::UnixSocket(path)) => path.clone(),
+            Some(ConnectionMode::Tcp { addr, .. }) => addr.clone(),
+            None => socket_path(),
+        };
+        AppState::new(display_path)
+    });
 
     let tx = daemon_tx.read().clone();
 

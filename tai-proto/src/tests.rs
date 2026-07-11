@@ -23,11 +23,8 @@ fn decode_rejects_trailing_bytes() {
 
 #[test]
 fn decode_rejects_wrong_version() {
-    let payload = bincode::serde::encode_to_vec(
-        (PROTOCOL_VERSION + 1, ClientMessage::Ping),
-        bincode::config::standard(),
-    )
-    .expect("encode");
+    let payload =
+        postcard::to_allocvec(&(PROTOCOL_VERSION + 1, ClientMessage::Ping)).expect("encode");
     let err = decode_frame::<ClientMessage>(&payload).expect_err("should fail");
     assert!(matches!(err, ProtoError::UnsupportedVersion { .. }));
 }

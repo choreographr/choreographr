@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
-clap = { version = "4.6.1", features = ["derive"] }
+clap.workspace = true
 base64.workspace = true
 dirs.workspace = true
 fff-search = "0.9"
@@ -29,9 +29,9 @@ sha2.workspace = true
 x25519-dalek.workspace = true
 hkdf.workspace = true
 zeroize.workspace = true
-url = "2"
 tai-keystore.workspace = true
 tai-proto.workspace = true
+tai-transport.workspace = true
 signal-hook.workspace = true
 toml = "1.1"
 tracing.workspace = true

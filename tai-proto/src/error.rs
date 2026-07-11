@@ -3,8 +3,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum ProtoError {
-    #[error("bincode error: {0}")]
-    Bincode(String),
+    #[error("postcard error: {0}")]
+    Postcard(String),
     #[error("frame too large")]
     FrameTooLarge,
     #[error("trailing bytes in frame")]
@@ -19,7 +19,7 @@ impl From<ProtoError> for io::Error {
     fn from(error: ProtoError) -> Self {
         match error {
             ProtoError::Io(io) => io,
-            ProtoError::Bincode(_)
+            ProtoError::Postcard(_)
             | ProtoError::FrameTooLarge
             | ProtoError::TrailingBytes
             | ProtoError::UnsupportedVersion { .. } => {

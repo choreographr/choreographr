@@ -1,3 +1,4 @@
+pub mod acl;
 pub(crate) mod connection;
 pub(crate) mod lifecycle;
 

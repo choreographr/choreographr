@@ -8,6 +8,7 @@ use tai_daemon::daemon::DaemonState;
 use tai_daemon::db::read_all_sessions;
 use tai_daemon::openai::load_daemon_config;
 use tai_proto::socket_path;
+use tai_transport::key::ensure_transport_keypair;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -26,6 +27,11 @@ struct Cli {
     /// (e.g. 127.0.0.1:9464).  When absent no metrics server is started.
     #[arg(long = "metrics-addr")]
     metrics_addr: Option<String>,
+
+    /// Enable TCP Noise IK listener on this socket address
+    /// (e.g. 0.0.0.0:9443).  When absent no TCP listener is started.
+    #[arg(long = "tcp-addr")]
+    tcp_addr: Option<String>,
 }
 
 const DEFAULT_MAX_TURNS: u32 = 25;
@@ -139,6 +145,23 @@ fn main() -> anyhow::Result<()> {
         model_cache: HashMap::new(),
     };
 
+    // Load or generate the transport keypair for Noise IK.
+    let (transport_sk, _transport_pk) =
+        ensure_transport_keypair().context("failed to load/generate transport keypair")?;
+
+    // Load the ACL of authorized client public keys.
+    let acl_path = tai_keystore::paths::authorized_clients_path()
+        .context("failed to resolve authorized_clients path")?;
+    let acl = std::sync::Arc::new(tai_daemon::server::acl::Acl::load(&acl_path));
+
     let socket_path = socket_path();
-    tai_daemon::run_server(&socket_path, state, cli.metrics_addr).context("failed to run server")
+    tai_daemon::run_server(
+        &socket_path,
+        state,
+        cli.metrics_addr,
+        cli.tcp_addr,
+        transport_sk,
+        acl,
+    )
+    .context("failed to run server")
 }

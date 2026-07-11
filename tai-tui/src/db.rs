@@ -106,8 +106,8 @@ pub fn save_command(db: &redb::Database, entry: &CommandEntry) -> io::Result<u64
 
     // Insert the entry.
     {
-        let payload = bincode::serde::encode_to_vec(entry, bincode::config::standard())
-            .map_err(|e| io::Error::other(format!("bincode encode entry: {e}")))?;
+        let payload = postcard::to_allocvec(entry)
+            .map_err(|e| io::Error::other(format!("postcard encode entry: {e}")))?;
         let mut table = write_txn
             .open_table(COMMAND_HISTORY)
             .map_err(|e| io::Error::other(format!("redb open command_history: {e}")))?;
@@ -177,11 +177,8 @@ pub fn load_recent_commands(db: &redb::Database, limit: usize) -> io::Result<Vec
         .map_err(|e| io::Error::other(format!("redb iter: {e}")))?
     {
         let (key, value) = result.map_err(|e| io::Error::other(format!("redb iter item: {e}")))?;
-        match bincode::serde::decode_from_slice::<CommandEntry, _>(
-            value.value(),
-            bincode::config::standard(),
-        ) {
-            Ok((entry, _)) => entries.push((key.value(), entry)),
+        match postcard::from_bytes::<CommandEntry>(value.value()) {
+            Ok(entry) => entries.push((key.value(), entry)),
             Err(e) => {
                 tracing::warn!(
                     "[tai-tui] skipping corrupt history entry {}: {e}",

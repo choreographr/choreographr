@@ -41,8 +41,8 @@ pub enum ClientError {
     PublicKeyInvalid,
     #[error("{0}")]
     CredentialParse(String),
-    #[error("bincode serialization failed: {0}")]
-    Bincode(String),
+    #[error("postcard serialization failed: {0}")]
+    Postcard(String),
     #[error("encryption failed: {0}")]
     Encryption(String),
 }
@@ -73,7 +73,7 @@ impl From<ClientError> for io::Error {
             | ClientError::PublicKeyRead(_)
             | ClientError::PublicKeyInvalid
             | ClientError::CredentialParse(_)
-            | ClientError::Bincode(_)
+            | ClientError::Postcard(_)
             | ClientError::Encryption(_) => io::Error::new(io::ErrorKind::InvalidData, error),
         }
     }

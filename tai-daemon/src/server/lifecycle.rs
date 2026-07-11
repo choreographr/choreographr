@@ -2,7 +2,7 @@ use crate::daemon::{DaemonCommand, DaemonState};
 use crate::sessions::SessionCommand;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use std::io::{self, BufWriter};
-use std::net::{Shutdown, SocketAddr};
+use std::net::{Shutdown, SocketAddr, TcpListener};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -11,12 +11,16 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tai_proto::DaemonMessage;
+use tai_transport::key::TransportSecretKey;
 use tracing::{error, info};
 
 pub fn run_server(
     socket_path: &str,
     mut state: DaemonState,
     metrics_addr: Option<String>,
+    tcp_addr: Option<String>,
+    transport_sk: TransportSecretKey,
+    acl: std::sync::Arc<crate::server::acl::Acl>,
 ) -> io::Result<()> {
     if Path::new(socket_path).exists() {
         std::fs::remove_file(socket_path)?;
@@ -90,6 +94,71 @@ pub fn run_server(
         });
     }
 
+    // TCP listener for Noise IK clients.
+    let tcp_shutdown = Arc::clone(&shutdown);
+    if let Some(ref tcp_addr_str) = tcp_addr {
+        let addr: SocketAddr = tcp_addr_str.parse().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid --tcp-addr: {e}"),
+            )
+        })?;
+        let listener = TcpListener::bind(addr)
+            .map_err(|e| io::Error::other(format!("failed to bind TCP listener on {addr}: {e}")))?;
+        info!("TCP (Noise IK) listening on {addr}");
+
+        let daemon_tx = daemon_tx.clone();
+        let acl = Arc::clone(&acl);
+        thread::spawn(move || {
+            loop {
+                if tcp_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((tcp, _)) => {
+                        let tx = daemon_tx.clone();
+                        let sk_bytes = *transport_sk.as_bytes();
+                        let acl = Arc::clone(&acl);
+                        thread::spawn(move || {
+                            let noise = match tai_transport::noise::handshake_responder(
+                                tcp,
+                                &sk_bytes,
+                                |pk| acl.contains(pk),
+                            ) {
+                                Ok(ns) => ns,
+                                Err(e) => {
+                                    error!(error = %e, "Noise IK handshake rejected");
+                                    return;
+                                }
+                            };
+                            if let Err(e) = crate::server::connection::tcp_client_thread(noise, tx)
+                            {
+                                error!(error = %e, "TCP client error");
+                            }
+                        });
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                        // Blocking accept was interrupted by a signal.
+                        // Retry immediately.
+                        continue;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                        // The connection was aborted before accept completed.
+                        // No FD was consumed, retry immediately.
+                        continue;
+                    }
+                    Err(e) => {
+                        // Transient or resource-exhaustion errors
+                        // (EMFILE, ENFILE, etc.) — log and retry with
+                        // backoff so other threads can close FDs.
+                        error!(error = %e, "TCP accept error, retrying");
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        });
+    }
+
     // Main thread accept loop — blocking accept() is event-driven
     // (the kernel deschedules us until a connection arrives).
     let mut client_streams: Vec<UnixStream> = Vec::new();
@@ -119,16 +188,18 @@ pub fn run_server(
                 // (signal_hook does not use SA_RESTART).  Retry.
                 continue;
             }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                // The connection was aborted before accept completed.
+                // No FD was consumed, retry immediately.
+                continue;
+            }
             Err(e) => {
-                if shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
                 // Transient or resource-exhaustion errors
                 // (ECONNABORTED, EMFILE, ENFILE, etc.) — log
-                // and retry with backoff.
+                // and retry with backoff so other threads can
+                // close file descriptors.
                 error!(error = %e, "accept error, retrying");
                 thread::sleep(Duration::from_millis(100));
-                continue;
             }
         }
     }

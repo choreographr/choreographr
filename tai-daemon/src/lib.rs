@@ -11,7 +11,7 @@ pub mod openai;
 pub mod providers;
 mod requests;
 pub mod retry;
-mod server;
+pub mod server;
 mod sessions;
 pub mod tools;
 

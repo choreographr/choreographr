@@ -104,8 +104,8 @@ pub fn build_add_credential_message(
     let pub_key = read_public_key_bytes()?;
     let credential = parse_credential(&credential_type, &fields)?;
 
-    let plaintext = bincode::serde::encode_to_vec(&credential, bincode::config::standard())
-        .map_err(|e| ClientError::Bincode(e.to_string()))?;
+    let plaintext =
+        postcard::to_allocvec(&credential).map_err(|e| ClientError::Postcard(e.to_string()))?;
 
     let encrypted_payload = tai_keystore::crypto::encrypt_with_public_key(&pub_key, &plaintext)
         .map_err(|e| ClientError::Encryption(e.to_string()))?;

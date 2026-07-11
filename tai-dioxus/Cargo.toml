@@ -5,12 +5,12 @@ edition = "2024"
 
 [dependencies]
 base64.workspace = true
+clap.workspace = true
 dioxus = { version = "0.7", features = ["desktop"] }
 futures-channel.workspace = true
 futures-util.workspace = true
 tai-client-core.workspace = true
 tai-keystore.workspace = true
-bincode.workspace = true
 tai-markdown.workspace = true
 tai-proto.workspace = true
 tracing.workspace = true

@@ -7,7 +7,11 @@ pub mod history;
 pub mod image;
 pub mod shell;
 
-pub use connection::{run_daemon_connection, run_daemon_reader};
+pub use connection::{
+    ConnectionMode, run_daemon_connection, run_daemon_connection_with_mode, run_daemon_reader,
+    run_daemon_tcp_connection,
+};
+pub use tai_transport::key::read_server_pk;
 pub use credentials::{build_add_credential_message, read_public_key_bytes, resolve_private_key};
 pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 pub use dispatch::{DaemonMessageHandler, dispatch_daemon_message};

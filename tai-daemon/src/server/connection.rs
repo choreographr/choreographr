@@ -9,6 +9,260 @@ use tai_proto::{
 };
 use tracing::{debug, error, info, warn};
 
+/// Shared per-client context passed through the dispatch and handler functions.
+/// Bundles the channels and mutable per-connection state into one struct so
+/// the call sites don't pass 5–6 individual arguments to every function.
+struct ClientCtx<'a> {
+    writer_tx: &'a mpsc::Sender<DaemonMessage>,
+    daemon_tx: &'a mpsc::Sender<DaemonCommand>,
+    attached_session_id: &'a mut Option<u64>,
+    attached_session_tx: &'a mut Option<mpsc::Sender<SessionCommand>>,
+    client_id: u64,
+}
+
+/// Clean up a client connection: detach from session, unregister the summary
+/// subscriber, wait for the writer thread to drain, and record the disconnect
+/// metric.  Owns the writer_tx sender and writer handle so both are consumed.
+fn cleanup_client(
+    attached_session_tx: Option<mpsc::Sender<SessionCommand>>,
+    client_id: u64,
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
+    writer_tx: mpsc::Sender<DaemonMessage>,
+    writer_handle: std::thread::JoinHandle<()>,
+) {
+    if let Some(ref tx) = attached_session_tx {
+        let _ = tx.send(SessionCommand::Detach { client_id });
+    }
+    let _ = daemon_tx.send(DaemonCommand::UnregisterSummarySubscriber { client_id });
+    drop(writer_tx);
+    let _ = writer_handle.join();
+    crate::metrics::record_client_disconnected();
+}
+
+/// Dispatch a decoded ClientMessage through the shared handler functions.
+/// Returns an error only when the daemon has disconnected (caller should
+/// terminate the client connection).
+fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Result<()> {
+    match msg {
+        ClientMessage::CreateSession {
+            title,
+            parent_session_id,
+            cwd,
+            max_turns,
+            context_config,
+            account_name,
+        } => {
+            if !handle_client_create_session(
+                title,
+                parent_session_id,
+                cwd,
+                max_turns,
+                context_config,
+                account_name,
+                ctx,
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "daemon disconnected",
+                ));
+            }
+        }
+        ClientMessage::AttachSession { session_id } => {
+            if !handle_client_attach_session(session_id, ctx) {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "daemon disconnected",
+                ));
+            }
+        }
+        ClientMessage::ListSessions => {
+            debug!("client {}: ListSessions", ctx.client_id);
+            let (reply, rx) = mpsc::channel();
+            let _ = ctx.daemon_tx.send(DaemonCommand::ListSessions { reply });
+            if let Ok(sessions) = rx.recv() {
+                let _ = ctx.writer_tx.send(DaemonMessage::Sessions { sessions });
+            }
+        }
+        ClientMessage::SubscribeSessionsSummary => {
+            let _ = ctx.daemon_tx.send(DaemonCommand::RegisterSummarySubscriber {
+                client_id: ctx.client_id,
+                writer: ctx.writer_tx.clone(),
+            });
+        }
+        ClientMessage::UnsubscribeSessionsSummary => {
+            let _ = ctx
+                .daemon_tx
+                .send(DaemonCommand::UnregisterSummarySubscriber {
+                    client_id: ctx.client_id,
+                });
+        }
+        ClientMessage::RunInput { request_id, input } => {
+            debug!("client {}: RunInput id={}", ctx.client_id, request_id);
+            if let Some(tx) = ctx.attached_session_tx {
+                let _ = tx.send(SessionCommand::RunInput { request_id, input });
+            } else {
+                let _ = ctx.writer_tx.send(DaemonMessage::Failed {
+                    request_id,
+                    error: "no session attached".to_string(),
+                });
+            }
+        }
+        ClientMessage::Cancel { request_id } => {
+            debug!("client {}: Cancel id={}", ctx.client_id, request_id);
+            if let Some(tx) = ctx.attached_session_tx {
+                let _ = tx.send(SessionCommand::Cancel { request_id });
+            }
+        }
+        ClientMessage::Ping => {
+            debug!("client {}: Ping", ctx.client_id);
+            let _ = ctx.writer_tx.send(DaemonMessage::Pong);
+        }
+        ClientMessage::SetModel { model } => {
+            info!(
+                "client {}: SetModel model={} attached={}",
+                ctx.client_id,
+                model,
+                ctx.attached_session_tx.is_some()
+            );
+            if let Some(tx) = ctx.attached_session_tx {
+                let _ = tx.send(SessionCommand::SetModel { model });
+            } else {
+                let _ = ctx.writer_tx.send(DaemonMessage::ModelSelectionFailed {
+                    model,
+                    error: "no session attached".to_string(),
+                });
+            }
+        }
+        ClientMessage::SetReasoningEffort { effort } => {
+            info!(
+                "client {}: SetReasoningEffort effort={:?} attached={}",
+                ctx.client_id,
+                effort,
+                ctx.attached_session_tx.is_some()
+            );
+            if let Some(tx) = ctx.attached_session_tx {
+                let _ = tx.send(SessionCommand::SetReasoningEffort { effort });
+            } else {
+                let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSetFailed {
+                    effort: effort.as_label().to_string(),
+                    error: "no session attached".to_string(),
+                });
+            }
+        }
+        ClientMessage::GetReasoningEffort => {
+            if let Some(tx) = ctx.attached_session_tx {
+                let (reply, rx) = mpsc::channel();
+                let _ = tx.send(SessionCommand::GetReasoningEffort { reply });
+                if let Ok(effort) = rx.recv() {
+                    let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSet { effort });
+                }
+            } else {
+                let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSet {
+                    effort: ThinkingEffort::Off,
+                });
+            }
+        }
+        ClientMessage::Unlock { private_key } => {
+            info!("client {}: Unlock", ctx.client_id);
+            handle_unlock_sync(ctx, private_key);
+        }
+        ClientMessage::AddCredential {
+            service,
+            encrypted_payload,
+            unlock_key,
+        } => {
+            info!("client {}: AddCredential service={}", ctx.client_id, service);
+            handle_add_credential_sync(ctx, service, encrypted_payload, unlock_key);
+        }
+        ClientMessage::RemoveCredential { service } => {
+            info!("client {}: RemoveCredential service={}", ctx.client_id, service);
+            handle_remove_credential_sync(ctx, service);
+        }
+        ClientMessage::ListModels => {
+            debug!("client {}: ListModels", ctx.client_id);
+            handle_list_models_sync(ctx, *ctx.attached_session_id);
+        }
+        ClientMessage::DeleteSession { session_id } => {
+            info!("client {}: DeleteSession id={}", ctx.client_id, session_id);
+            handle_delete_session_sync(ctx, session_id);
+        }
+        ClientMessage::GetCredential { service } => {
+            handle_get_credential_sync(ctx, service);
+        }
+        ClientMessage::AddAccount {
+            name,
+            provider,
+            base_url,
+            streaming,
+            retry_max_attempts,
+            connect_timeout_secs,
+            request_timeout_secs,
+        } => {
+            let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::AddAccountCmd {
+                name: name.clone(),
+                provider,
+                base_url,
+                streaming,
+                retry_max_attempts,
+                connect_timeout_secs,
+                request_timeout_secs,
+                reply,
+            });
+            match result {
+                Ok(Ok(())) => {
+                    let _ = ctx.writer_tx.send(DaemonMessage::AccountAdded { name });
+                }
+                Ok(Err(e)) => {
+                    let _ = ctx
+                        .writer_tx
+                        .send(DaemonMessage::AccountAddFailed { name, error: e });
+                }
+                Err(_) => warn!("daemon disconnected while handling add account"),
+            }
+        }
+        ClientMessage::RemoveAccount { name } => {
+            let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::RemoveAccountCmd {
+                name: name.clone(),
+                reply,
+            });
+            match result {
+                Ok(Ok(())) => {
+                    let _ = ctx.writer_tx.send(DaemonMessage::AccountRemoved { name });
+                }
+                Ok(Err(e)) => {
+                    let _ = ctx
+                        .writer_tx
+                        .send(DaemonMessage::AccountRemoveFailed { name, error: e });
+                }
+                Err(_) => warn!("daemon disconnected while handling remove account"),
+            }
+        }
+        ClientMessage::ListAccounts => {
+            let result =
+                request_daemon(ctx.daemon_tx, |reply| DaemonCommand::ListAccountsCmd { reply });
+            match result {
+                Ok(Ok(accounts)) => {
+                    let _ = ctx.writer_tx.send(DaemonMessage::Accounts { accounts });
+                }
+                Ok(Err(e)) => {
+                    let _ = ctx.writer_tx.send(DaemonMessage::AccountListFailed { error: e });
+                }
+                Err(_) => warn!("daemon disconnected while handling list accounts"),
+            }
+        }
+        ClientMessage::SetSessionAccount { name } => {
+            handle_client_set_session_account(name, ctx);
+        }
+        _ => {
+            warn!(
+                "unhandled client message: {:?}",
+                std::mem::discriminant(&msg)
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn client_thread(
     stream: UnixStream,
     daemon_tx: mpsc::Sender<DaemonCommand>,
@@ -35,234 +289,19 @@ pub(crate) fn client_thread(
     let mut reader = reader;
     loop {
         match read_message::<_, ClientMessage>(&mut reader) {
-            Ok(msg) => match msg {
-                ClientMessage::CreateSession {
-                    title,
-                    parent_session_id,
-                    cwd,
-                    max_turns,
-                    context_config,
-                    account_name,
-                } => {
-                    if !handle_client_create_session(
-                        title,
-                        parent_session_id,
-                        cwd,
-                        max_turns,
-                        context_config,
-                        account_name,
-                        client_id,
-                        &daemon_tx,
-                        &writer_tx,
-                    ) {
-                        return Ok(());
-                    }
+            Ok(msg) => {
+                let mut ctx = ClientCtx {
+                    writer_tx: &writer_tx,
+                    daemon_tx: &daemon_tx,
+                    attached_session_id: &mut attached_session_id,
+                    attached_session_tx: &mut attached_session_tx,
+                    client_id,
+                };
+                if let Err(e) = dispatch_client_message(msg, &mut ctx) {
+                    debug!("daemon disconnected: {e}");
+                    break;
                 }
-                ClientMessage::AttachSession { session_id } => {
-                    if !handle_client_attach_session(
-                        session_id,
-                        client_id,
-                        &daemon_tx,
-                        &writer_tx,
-                        &mut attached_session_id,
-                        &mut attached_session_tx,
-                    ) {
-                        return Ok(());
-                    }
-                }
-                ClientMessage::ListSessions => {
-                    debug!("client {}: ListSessions", client_id);
-                    let (reply, rx) = mpsc::channel();
-                    let _ = daemon_tx.send(DaemonCommand::ListSessions { reply });
-                    if let Ok(sessions) = rx.recv() {
-                        let _ = writer_tx.send(DaemonMessage::Sessions { sessions });
-                    }
-                }
-                ClientMessage::SubscribeSessionsSummary => {
-                    let _ = daemon_tx.send(DaemonCommand::RegisterSummarySubscriber {
-                        client_id,
-                        writer: writer_tx.clone(),
-                    });
-                }
-                ClientMessage::UnsubscribeSessionsSummary => {
-                    let _ =
-                        daemon_tx.send(DaemonCommand::UnregisterSummarySubscriber { client_id });
-                }
-                ClientMessage::RunInput { request_id, input } => {
-                    debug!("client {}: RunInput id={}", client_id, request_id);
-                    if let Some(ref tx) = attached_session_tx {
-                        let _ = tx.send(SessionCommand::RunInput { request_id, input });
-                    } else {
-                        let _ = writer_tx.send(DaemonMessage::Failed {
-                            request_id,
-                            error: "no session attached".to_string(),
-                        });
-                    }
-                }
-                ClientMessage::Cancel { request_id } => {
-                    debug!("client {}: Cancel id={}", client_id, request_id);
-                    if let Some(ref tx) = attached_session_tx {
-                        let _ = tx.send(SessionCommand::Cancel { request_id });
-                    }
-                }
-                ClientMessage::Ping => {
-                    debug!("client {}: Ping", client_id);
-                    let _ = writer_tx.send(DaemonMessage::Pong);
-                }
-                ClientMessage::SetModel { model } => {
-                    info!(
-                        "client {}: SetModel model={} attached={}",
-                        client_id,
-                        model,
-                        attached_session_tx.is_some()
-                    );
-                    if let Some(ref tx) = attached_session_tx {
-                        let _ = tx.send(SessionCommand::SetModel { model });
-                    } else {
-                        let _ = writer_tx.send(DaemonMessage::ModelSelectionFailed {
-                            model,
-                            error: "no session attached".to_string(),
-                        });
-                    }
-                }
-                ClientMessage::SetReasoningEffort { effort } => {
-                    info!(
-                        "client {}: SetReasoningEffort effort={:?} attached={}",
-                        client_id,
-                        effort,
-                        attached_session_tx.is_some()
-                    );
-                    if let Some(ref tx) = attached_session_tx {
-                        let _ = tx.send(SessionCommand::SetReasoningEffort { effort });
-                    } else {
-                        let _ = writer_tx.send(DaemonMessage::ReasoningEffortSetFailed {
-                            effort: effort.as_label().to_string(),
-                            error: "no session attached".to_string(),
-                        });
-                    }
-                }
-                ClientMessage::GetReasoningEffort => {
-                    if let Some(ref tx) = attached_session_tx {
-                        let (reply, rx) = mpsc::channel();
-                        let _ = tx.send(SessionCommand::GetReasoningEffort { reply });
-                        if let Ok(effort) = rx.recv() {
-                            let _ = writer_tx.send(DaemonMessage::ReasoningEffortSet { effort });
-                        }
-                    } else {
-                        let _ = writer_tx.send(DaemonMessage::ReasoningEffortSet {
-                            effort: ThinkingEffort::Off,
-                        });
-                    }
-                }
-                ClientMessage::Unlock { private_key } => {
-                    info!("client {}: Unlock", client_id);
-                    handle_unlock_sync(&daemon_tx, &writer_tx, private_key);
-                }
-                ClientMessage::AddCredential {
-                    service,
-                    encrypted_payload,
-                    unlock_key,
-                } => {
-                    info!("client {}: AddCredential service={}", client_id, service);
-                    handle_add_credential_sync(
-                        &daemon_tx,
-                        &writer_tx,
-                        service,
-                        encrypted_payload,
-                        unlock_key,
-                    );
-                }
-                ClientMessage::RemoveCredential { service } => {
-                    info!("client {}: RemoveCredential service={}", client_id, service);
-                    handle_remove_credential_sync(&daemon_tx, &writer_tx, service);
-                }
-                ClientMessage::ListModels => {
-                    debug!("client {}: ListModels", client_id);
-                    handle_list_models_sync(&daemon_tx, &writer_tx, attached_session_id);
-                }
-                ClientMessage::DeleteSession { session_id } => {
-                    info!("client {}: DeleteSession id={}", client_id, session_id);
-                    handle_delete_session_sync(&daemon_tx, &writer_tx, session_id);
-                }
-                ClientMessage::GetCredential { service } => {
-                    handle_get_credential_sync(&daemon_tx, &writer_tx, service);
-                }
-                ClientMessage::AddAccount {
-                    name,
-                    provider,
-                    base_url,
-                    streaming,
-                    retry_max_attempts,
-                    connect_timeout_secs,
-                    request_timeout_secs,
-                } => {
-                    let result = request_daemon(&daemon_tx, |reply| DaemonCommand::AddAccountCmd {
-                        name: name.clone(),
-                        provider,
-                        base_url,
-                        streaming,
-                        retry_max_attempts,
-                        connect_timeout_secs,
-                        request_timeout_secs,
-                        reply,
-                    });
-                    match result {
-                        Ok(Ok(())) => {
-                            let _ = writer_tx.send(DaemonMessage::AccountAdded { name });
-                        }
-                        Ok(Err(e)) => {
-                            let _ =
-                                writer_tx.send(DaemonMessage::AccountAddFailed { name, error: e });
-                        }
-                        Err(_) => warn!("daemon disconnected while handling add account"),
-                    }
-                }
-                ClientMessage::RemoveAccount { name } => {
-                    let result =
-                        request_daemon(&daemon_tx, |reply| DaemonCommand::RemoveAccountCmd {
-                            name: name.clone(),
-                            reply,
-                        });
-                    match result {
-                        Ok(Ok(())) => {
-                            let _ = writer_tx.send(DaemonMessage::AccountRemoved { name });
-                        }
-                        Ok(Err(e)) => {
-                            let _ = writer_tx
-                                .send(DaemonMessage::AccountRemoveFailed { name, error: e });
-                        }
-                        Err(_) => warn!("daemon disconnected while handling remove account"),
-                    }
-                }
-                ClientMessage::ListAccounts => {
-                    let result = request_daemon(&daemon_tx, |reply| {
-                        DaemonCommand::ListAccountsCmd { reply }
-                    });
-                    match result {
-                        Ok(Ok(accounts)) => {
-                            let _ = writer_tx.send(DaemonMessage::Accounts { accounts });
-                        }
-                        Ok(Err(e)) => {
-                            let _ = writer_tx.send(DaemonMessage::AccountListFailed { error: e });
-                        }
-                        Err(_) => warn!("daemon disconnected while handling list accounts"),
-                    }
-                }
-                ClientMessage::SetSessionAccount { name } => {
-                    handle_client_set_session_account(
-                        name,
-                        &daemon_tx,
-                        &writer_tx,
-                        &attached_session_tx,
-                    );
-                }
-                _ => {
-                    warn!(
-                        "unhandled client message: {:?}",
-                        std::mem::discriminant(&msg)
-                    );
-                }
-            },
+            }
             Err(ProtoError::Io(e))
                 if matches!(
                     e.kind(),
@@ -279,13 +318,68 @@ pub(crate) fn client_thread(
         }
     }
 
-    if let Some(ref tx) = attached_session_tx {
-        let _ = tx.send(SessionCommand::Detach { client_id });
+    cleanup_client(attached_session_tx, client_id, &daemon_tx, writer_tx, writer_handle);
+    Ok(())
+}
+
+pub(crate) fn tcp_client_thread(
+    noise: tai_transport::noise::NoiseStream,
+    daemon_tx: mpsc::Sender<DaemonCommand>,
+) -> io::Result<()> {
+    let (writer_tx, writer_rx) = mpsc::channel::<DaemonMessage>();
+
+    // Writer thread: blocks on writer_rx, sends via NoiseStream encryption.
+    let mut writer = noise.try_clone()?;
+    let writer_handle = std::thread::spawn(move || {
+        for msg in writer_rx {
+            if let Err(e) = writer.send_daemon_message(&msg) {
+                warn!("tcp writer thread error: {e}");
+                break;
+            }
+        }
+    });
+
+    let mut attached_session_tx: Option<mpsc::Sender<SessionCommand>> = None;
+    let mut attached_session_id: Option<u64> = None;
+    let client_id = rand::random::<u64>();
+    let mut reader = noise;
+    info!("TCP client connected: id={}", client_id);
+    crate::metrics::record_client_connected();
+
+    // Register the summary subscriber so daemon push notifications
+    // go through the writer thread (writer_tx channel).
+    let _ = daemon_tx.send(DaemonCommand::RegisterSummarySubscriber {
+        client_id,
+        writer: writer_tx.clone(),
+    });
+
+    loop {
+        match reader.recv_client_message() {
+            Ok(msg) => {
+                let mut ctx = ClientCtx {
+                    writer_tx: &writer_tx,
+                    daemon_tx: &daemon_tx,
+                    attached_session_id: &mut attached_session_id,
+                    attached_session_tx: &mut attached_session_tx,
+                    client_id,
+                };
+                if let Err(e) = dispatch_client_message(msg, &mut ctx) {
+                    debug!("daemon disconnected: {e}");
+                    break;
+                }
+            }
+            Err(tai_transport::error::TransportError::ConnectionClosed) => {
+                info!("TCP client closed connection");
+                break;
+            }
+            Err(e) => {
+                error!(error = %e, "failed to read client message");
+                break;
+            }
+        }
     }
-    let _ = daemon_tx.send(DaemonCommand::UnregisterSummarySubscriber { client_id });
-    drop(writer_tx);
-    let _ = writer_handle.join();
-    crate::metrics::record_client_disconnected();
+
+    cleanup_client(attached_session_tx, client_id, &daemon_tx, writer_tx, writer_handle);
     Ok(())
 }
 
@@ -295,23 +389,22 @@ pub(crate) fn client_thread(
 fn switch_attached_session(
     new_session_id: u64,
     session_tx: mpsc::Sender<SessionCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
-    attached_session_id: &mut Option<u64>,
-    attached_session_tx: &mut Option<mpsc::Sender<SessionCommand>>,
-    client_id: u64,
+    ctx: &mut ClientCtx,
 ) {
     // Don't detach when re-attaching to the same session.
-    if Some(new_session_id) != *attached_session_id
-        && let Some(old_tx) = attached_session_tx.as_ref()
+    if Some(new_session_id) != *ctx.attached_session_id
+        && let Some(old_tx) = ctx.attached_session_tx.as_ref()
     {
-        let _ = old_tx.send(SessionCommand::Detach { client_id });
+        let _ = old_tx.send(SessionCommand::Detach {
+            client_id: ctx.client_id,
+        });
     }
     let _ = session_tx.send(SessionCommand::Attach {
-        client_id,
-        tx: writer_tx.clone(),
+        client_id: ctx.client_id,
+        tx: ctx.writer_tx.clone(),
     });
-    *attached_session_tx = Some(session_tx);
-    *attached_session_id = Some(new_session_id);
+    *ctx.attached_session_tx = Some(session_tx);
+    *ctx.attached_session_id = Some(new_session_id);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -324,14 +417,12 @@ fn handle_client_create_session(
     max_turns: Option<u32>,
     context_config: Option<ContextConfig>,
     account_name: Option<String>,
-    client_id: u64,
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
+    ctx: &mut ClientCtx,
 ) -> bool {
-    info!("client {}: CreateSession", client_id);
+    info!("client {}: CreateSession", ctx.client_id);
     let cwd_str = cwd.clone();
     let (reply, rx) = mpsc::channel();
-    let _ = daemon_tx.send(DaemonCommand::CreateSession {
+    let _ = ctx.daemon_tx.send(DaemonCommand::CreateSession {
         title: title.clone(),
         parent_session_id,
         cwd: cwd.map(std::path::PathBuf::from),
@@ -355,7 +446,7 @@ fn handle_client_create_session(
             // the user presses Enter on a session.
             // This keeps the old session alive when
             // creating from the session manager page.
-            let _ = writer_tx.send(DaemonMessage::SessionCreated {
+            let _ = ctx.writer_tx.send(DaemonMessage::SessionCreated {
                 session_id: sid,
                 title,
                 parent_session_id,
@@ -364,7 +455,7 @@ fn handle_client_create_session(
             });
         }
         Ok(Err(e)) => {
-            let _ = writer_tx.send(DaemonMessage::SessionFailed {
+            let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
                 operation: "create_session".into(),
                 error: e.to_string(),
             });
@@ -376,31 +467,19 @@ fn handle_client_create_session(
 
 /// Handle an AttachSession client message. Returns false if the daemon
 /// disconnected, signaling client_thread to return.
-fn handle_client_attach_session(
-    session_id: u64,
-    client_id: u64,
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
-    attached_session_id: &mut Option<u64>,
-    attached_session_tx: &mut Option<mpsc::Sender<SessionCommand>>,
-) -> bool {
-    info!("client {}: AttachSession id={}", client_id, session_id);
+fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
+    info!("client {}: AttachSession id={}", ctx.client_id, session_id);
     let (reply, rx) = mpsc::channel();
-    let _ = daemon_tx.send(DaemonCommand::AttachSession { session_id, reply });
+    let _ = ctx
+        .daemon_tx
+        .send(DaemonCommand::AttachSession { session_id, reply });
     match rx.recv() {
         Ok(Ok(session_tx)) => {
-            switch_attached_session(
-                session_id,
-                session_tx,
-                writer_tx,
-                attached_session_id,
-                attached_session_tx,
-                client_id,
-            );
-            let _ = writer_tx.send(DaemonMessage::SessionAttached { session_id });
+            switch_attached_session(session_id, session_tx, ctx);
+            let _ = ctx.writer_tx.send(DaemonMessage::SessionAttached { session_id });
         }
         Ok(Err(e)) => {
-            let _ = writer_tx.send(DaemonMessage::SessionFailed {
+            let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
                 operation: "attach_session".into(),
                 error: e.to_string(),
             });
@@ -412,16 +491,11 @@ fn handle_client_attach_session(
 
 /// Handle a SetSessionAccount client message: verify the account exists
 /// via the daemon, then set it on the attached session.
-fn handle_client_set_session_account(
-    name: String,
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
-    attached_session_tx: &Option<mpsc::Sender<SessionCommand>>,
-) {
-    if let Some(tx) = attached_session_tx {
+fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
+    if let Some(tx) = ctx.attached_session_tx.as_ref() {
         // Verify the account exists before setting it.
         let (reply, rx) = mpsc::channel();
-        let _ = daemon_tx.send(DaemonCommand::AccountExists {
+        let _ = ctx.daemon_tx.send(DaemonCommand::AccountExists {
             name: name.clone(),
             reply,
         });
@@ -430,14 +504,14 @@ fn handle_client_set_session_account(
                 let _ = tx.send(SessionCommand::SetAccount { name });
             }
             _ => {
-                let _ = writer_tx.send(DaemonMessage::SessionFailed {
+                let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
                     operation: "set_account".into(),
                     error: format!("account '{name}' not found"),
                 });
             }
         }
     } else {
-        let _ = writer_tx.send(DaemonMessage::SessionFailed {
+        let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
             operation: "set_account".into(),
             error: "no session attached".to_string(),
         });
@@ -457,78 +531,62 @@ fn request_daemon<R>(
     rx.recv()
 }
 
-fn handle_unlock_sync(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
-    private_key: Vec<u8>,
-) {
-    let result = request_daemon(daemon_tx, |reply| DaemonCommand::Unlock {
+fn handle_unlock_sync(ctx: &mut ClientCtx, private_key: Vec<u8>) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::Unlock {
         private_key,
         reply,
     });
     match result {
         Ok(Ok(())) => {
-            let _ = writer_tx.send(DaemonMessage::Unlocked);
+            let _ = ctx.writer_tx.send(DaemonMessage::Unlocked);
         }
         Ok(Err(e)) => {
-            let _ = writer_tx.send(DaemonMessage::LockedError { error: e });
+            let _ = ctx.writer_tx.send(DaemonMessage::LockedError { error: e });
         }
         Err(_) => warn!("daemon disconnected while handling unlock"),
     }
 }
 
-fn handle_list_models_sync(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
-    attached_session_id: Option<u64>,
-) {
-    let result = request_daemon(daemon_tx, |reply| DaemonCommand::ListModels {
+fn handle_list_models_sync(ctx: &mut ClientCtx, attached_session_id: Option<u64>) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::ListModels {
         session_id: attached_session_id,
         reply,
     });
     match result {
         Ok(Ok((models, selected_model))) => {
-            let _ = writer_tx.send(DaemonMessage::Models {
+            let _ = ctx.writer_tx.send(DaemonMessage::Models {
                 models,
                 selected_model,
             });
         }
         Ok(Err(e)) => {
-            let _ = writer_tx.send(DaemonMessage::ModelsFailed { error: e });
+            let _ = ctx.writer_tx.send(DaemonMessage::ModelsFailed { error: e });
         }
         Err(_) => warn!("daemon disconnected while handling list models"),
     }
 }
 
-fn handle_get_credential_sync(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
-    service: String,
-) {
-    let result = request_daemon(daemon_tx, |reply| DaemonCommand::GetCredential {
+fn handle_get_credential_sync(ctx: &mut ClientCtx, service: String) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::GetCredential {
         service: service.clone(),
         reply,
     });
     match result {
         Ok(Some(key)) => {
-            let _ = writer_tx.send(DaemonMessage::Credential {
+            let _ = ctx.writer_tx.send(DaemonMessage::Credential {
                 service,
                 key: Some(key),
             });
         }
         Ok(None) => {
-            let _ = writer_tx.send(DaemonMessage::Credential { service, key: None });
+            let _ = ctx.writer_tx.send(DaemonMessage::Credential { service, key: None });
         }
         Err(_) => warn!("daemon disconnected while handling get credential"),
     }
 }
 
-fn handle_delete_session_sync(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
-    session_id: u64,
-) {
-    let result = request_daemon(daemon_tx, |reply| DaemonCommand::DeleteSession {
+fn handle_delete_session_sync(ctx: &mut ClientCtx, session_id: u64) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::DeleteSession {
         session_id,
         reply,
     });
@@ -539,7 +597,7 @@ fn handle_delete_session_sync(
             // the session list), so we don't duplicate it here.
         }
         Ok(Err(e)) => {
-            let _ = writer_tx.send(DaemonMessage::SessionDeleteFailed {
+            let _ = ctx.writer_tx.send(DaemonMessage::SessionDeleteFailed {
                 session_id,
                 error: e.to_string(),
             });
@@ -549,13 +607,12 @@ fn handle_delete_session_sync(
 }
 
 fn handle_add_credential_sync(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
+    ctx: &mut ClientCtx,
     service: String,
     encrypted_payload: Vec<u8>,
     unlock_key: Option<Vec<u8>>,
 ) {
-    let result = request_daemon(daemon_tx, |reply| DaemonCommand::SaveCredential {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::SaveCredential {
         service: service.clone(),
         encrypted_blob: encrypted_payload,
         unlock_key,
@@ -563,30 +620,30 @@ fn handle_add_credential_sync(
     });
     match result {
         Ok(Ok(())) => {
-            let _ = writer_tx.send(DaemonMessage::CredentialAdded { service });
+            let _ = ctx.writer_tx.send(DaemonMessage::CredentialAdded { service });
         }
         Ok(Err(e)) => {
-            let _ = writer_tx.send(DaemonMessage::CredentialAddFailed { service, error: e });
+            let _ = ctx
+                .writer_tx
+                .send(DaemonMessage::CredentialAddFailed { service, error: e });
         }
         Err(_) => warn!("daemon disconnected while handling add credential"),
     }
 }
 
-fn handle_remove_credential_sync(
-    daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: &mpsc::Sender<DaemonMessage>,
-    service: String,
-) {
-    let result = request_daemon(daemon_tx, |reply| DaemonCommand::RemoveCredentialCmd {
+fn handle_remove_credential_sync(ctx: &mut ClientCtx, service: String) {
+    let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::RemoveCredentialCmd {
         service: service.clone(),
         reply,
     });
     match result {
         Ok(Ok(())) => {
-            let _ = writer_tx.send(DaemonMessage::CredentialRemoved { service });
+            let _ = ctx.writer_tx.send(DaemonMessage::CredentialRemoved { service });
         }
         Ok(Err(e)) => {
-            let _ = writer_tx.send(DaemonMessage::CredentialRemoveFailed { service, error: e });
+            let _ = ctx
+                .writer_tx
+                .send(DaemonMessage::CredentialRemoveFailed { service, error: e });
         }
         Err(_) => warn!("daemon disconnected while handling remove credential"),
     }
@@ -600,12 +657,21 @@ mod tests {
     fn handle_unlock_sync_ok() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         let (writer_tx, writer_rx) = mpsc::channel();
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::Unlock { reply, .. }) = daemon_rx.recv() {
                 let _ = reply.send(Ok(()));
             }
         });
-        handle_unlock_sync(&daemon_tx, &writer_tx, vec![0u8; 32]);
+        handle_unlock_sync(&mut ctx, vec![0u8; 32]);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg, DaemonMessage::Unlocked));
     }
@@ -614,12 +680,21 @@ mod tests {
     fn handle_unlock_sync_err() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         let (writer_tx, writer_rx) = mpsc::channel();
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::Unlock { reply, .. }) = daemon_rx.recv() {
                 let _ = reply.send(Err("wrong password".into()));
             }
         });
-        handle_unlock_sync(&daemon_tx, &writer_tx, vec![0u8; 32]);
+        handle_unlock_sync(&mut ctx, vec![0u8; 32]);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg, DaemonMessage::LockedError { .. }));
         if let DaemonMessage::LockedError { error } = &msg {
@@ -631,8 +706,17 @@ mod tests {
     fn handle_unlock_sync_disconnected() {
         let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
         let (writer_tx, writer_rx) = mpsc::channel();
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
         drop(daemon_rx);
-        handle_unlock_sync(&daemon_tx, &writer_tx, vec![0u8; 32]);
+        handle_unlock_sync(&mut ctx, vec![0u8; 32]);
         assert!(writer_rx.try_recv().is_err());
     }
 
@@ -640,6 +724,15 @@ mod tests {
     fn handle_list_models_sync_ok() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         let (writer_tx, writer_rx) = mpsc::channel();
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::ListModels { reply, .. }) = daemon_rx.recv() {
                 let _ = reply.send(Ok((
@@ -648,7 +741,7 @@ mod tests {
                 )));
             }
         });
-        handle_list_models_sync(&daemon_tx, &writer_tx, None);
+        handle_list_models_sync(&mut ctx, None);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg, DaemonMessage::Models { .. }));
     }
@@ -657,12 +750,21 @@ mod tests {
     fn handle_list_models_sync_err() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         let (writer_tx, writer_rx) = mpsc::channel();
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::ListModels { reply, .. }) = daemon_rx.recv() {
                 let _ = reply.send(Err("daemon is locked".into()));
             }
         });
-        handle_list_models_sync(&daemon_tx, &writer_tx, None);
+        handle_list_models_sync(&mut ctx, None);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg, DaemonMessage::ModelsFailed { .. }));
         if let DaemonMessage::ModelsFailed { error } = &msg {
@@ -674,13 +776,22 @@ mod tests {
     fn handle_get_credential_sync_some() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         let (writer_tx, writer_rx) = mpsc::channel();
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::GetCredential { service, reply }) = daemon_rx.recv() {
                 assert_eq!(service, "openai");
                 let _ = reply.send(Some("sk-123".into()));
             }
         });
-        handle_get_credential_sync(&daemon_tx, &writer_tx, "openai".into());
+        handle_get_credential_sync(&mut ctx, "openai".into());
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg, DaemonMessage::Credential { .. }));
         if let DaemonMessage::Credential { service, key } = &msg {
@@ -693,13 +804,22 @@ mod tests {
     fn handle_get_credential_sync_none() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         let (writer_tx, writer_rx) = mpsc::channel();
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::GetCredential { service, reply }) = daemon_rx.recv() {
                 assert_eq!(service, "openai");
                 let _ = reply.send(None);
             }
         });
-        handle_get_credential_sync(&daemon_tx, &writer_tx, "openai".into());
+        handle_get_credential_sync(&mut ctx, "openai".into());
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg, DaemonMessage::Credential { .. }));
         if let DaemonMessage::Credential { service, key } = &msg {
@@ -713,17 +833,18 @@ mod tests {
         let (old_tx, old_rx) = mpsc::channel();
         let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
         let (writer_tx, _writer_rx) = mpsc::channel::<DaemonMessage>();
+        let (daemon_tx, _daemon_rx) = mpsc::channel();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(old_tx);
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut attached_id,
+            attached_session_tx: &mut attached_tx,
+            client_id: 42,
+        };
 
-        switch_attached_session(
-            2,
-            new_tx,
-            &writer_tx,
-            &mut attached_id,
-            &mut attached_tx,
-            42,
-        );
+        switch_attached_session(2, new_tx, &mut ctx);
 
         // Detach sent to old session
         assert!(matches!(
@@ -744,17 +865,18 @@ mod tests {
         let (old_tx, old_rx) = mpsc::channel();
         let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
         let (writer_tx, _writer_rx) = mpsc::channel::<DaemonMessage>();
+        let (daemon_tx, _daemon_rx) = mpsc::channel();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(old_tx);
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut attached_id,
+            attached_session_tx: &mut attached_tx,
+            client_id: 42,
+        };
 
-        switch_attached_session(
-            1,
-            new_tx,
-            &writer_tx,
-            &mut attached_id,
-            &mut attached_tx,
-            42,
-        );
+        switch_attached_session(1, new_tx, &mut ctx);
 
         // No Detach sent — same session id
         assert!(old_rx.try_recv().is_err());
@@ -771,12 +893,21 @@ mod tests {
     fn handle_delete_session_sync_success_no_message_sent() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         let (writer_tx, writer_rx) = mpsc::channel();
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::DeleteSession { reply, .. }) = daemon_rx.recv() {
                 let _ = reply.send(Ok(()));
             }
         });
-        handle_delete_session_sync(&daemon_tx, &writer_tx, 42);
+        handle_delete_session_sync(&mut ctx, 42);
         // On success, no message is sent to writer (broadcast handles it)
         assert!(writer_rx.try_recv().is_err());
     }
@@ -785,12 +916,21 @@ mod tests {
     fn handle_delete_session_sync_error() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
         let (writer_tx, writer_rx) = mpsc::channel();
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::DeleteSession { reply, .. }) = daemon_rx.recv() {
                 let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "db error")));
             }
         });
-        handle_delete_session_sync(&daemon_tx, &writer_tx, 42);
+        handle_delete_session_sync(&mut ctx, 42);
         let msg = writer_rx.recv().unwrap();
         assert!(matches!(msg, DaemonMessage::SessionDeleteFailed { .. }));
         if let DaemonMessage::SessionDeleteFailed { session_id, error } = &msg {
@@ -803,8 +943,17 @@ mod tests {
     fn handle_delete_session_sync_disconnected() {
         let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
         let (writer_tx, writer_rx) = mpsc::channel();
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
         drop(daemon_rx);
-        handle_delete_session_sync(&daemon_tx, &writer_tx, 42);
+        handle_delete_session_sync(&mut ctx, 42);
         assert!(writer_rx.try_recv().is_err());
     }
 
@@ -812,17 +961,18 @@ mod tests {
     fn switch_session_from_none_no_detach() {
         let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
         let (writer_tx, _writer_rx) = mpsc::channel::<DaemonMessage>();
+        let (daemon_tx, _daemon_rx) = mpsc::channel();
         let mut attached_id: Option<u64> = None;
         let mut attached_tx: Option<mpsc::Sender<SessionCommand>> = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut attached_id,
+            attached_session_tx: &mut attached_tx,
+            client_id: 42,
+        };
 
-        switch_attached_session(
-            1,
-            new_tx,
-            &writer_tx,
-            &mut attached_id,
-            &mut attached_tx,
-            42,
-        );
+        switch_attached_session(1, new_tx, &mut ctx);
 
         assert_eq!(attached_id, Some(1));
         assert!(matches!(

@@ -16,10 +16,23 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// overflow the frame when the client re-attaches to a session.
 pub const MAX_FRAME_SIZE: usize = 32 * 1024 * 1024;
 
+/// Encode a message without the 4-byte length prefix.
+///
+/// This is used when the transport layer already provides its own
+/// framing (e.g. NoiseStream), so only the raw postcard payload is needed.
+pub fn encode_payload<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
+    let payload = postcard::to_allocvec(&(PROTOCOL_VERSION, message))
+        .map_err(|e| ProtoError::Postcard(e.to_string()))?;
+
+    if payload.len() > MAX_FRAME_SIZE {
+        return Err(ProtoError::FrameTooLarge);
+    }
+    Ok(payload)
+}
+
 pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, ProtoError> {
-    let payload =
-        bincode::serde::encode_to_vec((PROTOCOL_VERSION, message), bincode::config::standard())
-            .map_err(|e| ProtoError::Bincode(e.to_string()))?;
+    let payload = postcard::to_allocvec(&(PROTOCOL_VERSION, message))
+        .map_err(|e| ProtoError::Postcard(e.to_string()))?;
 
     if payload.len() > MAX_FRAME_SIZE {
         return Err(ProtoError::FrameTooLarge);
@@ -35,11 +48,10 @@ pub fn decode_frame<T>(payload: &[u8]) -> Result<T, ProtoError>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let ((version, message), consumed): ((u8, T), usize) =
-        bincode::serde::decode_from_slice(payload, bincode::config::standard())
-            .map_err(|e| ProtoError::Bincode(e.to_string()))?;
+    let ((version, message), remainder): ((u8, T), &[u8]) =
+        postcard::take_from_bytes(payload).map_err(|e| ProtoError::Postcard(e.to_string()))?;
 
-    if consumed != payload.len() {
+    if !remainder.is_empty() {
         return Err(ProtoError::TrailingBytes);
     }
 

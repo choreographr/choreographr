@@ -1,20 +1,20 @@
 use crate::state::{AppState, UiEvent};
 use dioxus::prelude::*;
 use futures_channel::mpsc::UnboundedSender;
-use std::io;
 use tai_client_core::{
-    ClientError, ShellCommand, build_add_credential_message, dispatch_daemon_message,
-    parse_input_line, resolve_private_key, run_daemon_connection, shell_command_echo,
+    ClientError, ConnectionMode, ShellCommand, build_add_credential_message,
+    dispatch_daemon_message, parse_input_line, resolve_private_key,
+    run_daemon_connection_with_mode, shell_command_echo,
 };
 use tai_proto::{ClientMessage, DaemonMessage};
 
 pub(crate) fn run_client(
-    socket_path: String,
+    mode: ConnectionMode,
     client_rx: std::sync::mpsc::Receiver<ClientMessage>,
     ui_tx: UnboundedSender<UiEvent>,
-) -> io::Result<()> {
-    let result = run_daemon_connection(
-        &socket_path,
+) -> Result<(), ClientError> {
+    let result = run_daemon_connection_with_mode(
+        mode,
         |message| {
             if let Err(e) = ui_tx.unbounded_send(UiEvent::Daemon(message)) {
                 tracing::error!("failed to send Daemon UI event: {e}");
@@ -28,7 +28,7 @@ pub(crate) fn run_client(
     {
         tracing::warn!("failed to send ReaderClosed UI event: {e}");
     }
-    result.map_err(io::Error::from)
+    result
 }
 
 pub(crate) fn submit_input(

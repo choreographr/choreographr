@@ -47,9 +47,15 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
 
     let state = test_daemon_state();
 
+    // Dummy transport key and empty ACL (no TCP listener needed for this test).
+    let transport_sk = tai_transport::key::TransportSecretKey::new([0u8; 32]);
+    let acl = Arc::new(tai_daemon::server::acl::Acl::load(std::path::Path::new(
+        "/nonexistent",
+    )));
+
     // Run the server in a background thread.
     let handle = thread::spawn(move || {
-        run_server(&socket_str, state, None).expect("run_server");
+        run_server(&socket_str, state, None, None, transport_sk, acl).expect("run_server");
     });
 
     // Wait for the socket to appear (server is ready).

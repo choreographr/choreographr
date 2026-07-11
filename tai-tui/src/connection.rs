@@ -16,18 +16,19 @@ use std::sync::{
 };
 use std::{io, time::Duration};
 use tai_client_core::{
-    ClientError, broken_pipe, build_add_credential_message, dispatch_daemon_message,
-    is_valid_account_name, resolve_private_key, run_daemon_connection, shell_command_echo,
+    ClientError, ConnectionMode, broken_pipe, build_add_credential_message,
+    dispatch_daemon_message, is_valid_account_name, resolve_private_key,
+    run_daemon_connection_with_mode, shell_command_echo,
 };
 use tai_keystore::ensure_keypair;
-use tai_proto::{ClientMessage, DaemonMessage, socket_path};
+use tai_proto::{ClientMessage, DaemonMessage};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
 use tui_prompts::State;
 
 const UI_EVENT_CHANNEL_SIZE: usize = 4096;
 const UI_FRAME_POLL_MS: u64 = 16;
 
-pub(crate) fn run_app() -> io::Result<()> {
+pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     tracing::info!("[tai-tui] run_app starting");
     // Ensure the keystore keypair exists before we try to connect to the
     // daemon.  If no keypair has been generated yet, this creates one on the
@@ -37,8 +38,10 @@ pub(crate) fn run_app() -> io::Result<()> {
         tracing::error!("[tai-tui] failed to ensure keystore keypair: {e}");
     }
 
-    let socket_path = socket_path();
-    let app_socket_path = socket_path.clone();
+    let app_socket_path = match &mode {
+        ConnectionMode::UnixSocket(path) => path.clone(),
+        ConnectionMode::Tcp { addr, .. } => addr.clone(),
+    };
     let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
     let (ui_tx, mut ui_rx) = mpsc::sync_channel::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
@@ -48,8 +51,8 @@ pub(crate) fn run_app() -> io::Result<()> {
 
     let connection_ui_tx = ui_tx.clone();
     let connection_task = std::thread::spawn(move || {
-        let result = run_daemon_connection(
-            &socket_path,
+        let result = run_daemon_connection_with_mode(
+            mode,
             |message| {
                 let _ = connection_ui_tx.send(UiEvent::Daemon(message));
             },

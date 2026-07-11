@@ -65,6 +65,11 @@ pub fn public_key_path() -> Result<PathBuf, KeystoreError> {
     Ok(config_dir()?.join("public.pk"))
 }
 
+/// Path to the authorized clients ACL file (~/.config/tai-daemon/authorized_clients.toml)
+pub fn authorized_clients_path() -> Result<PathBuf, KeystoreError> {
+    Ok(config_dir()?.join("authorized_clients.toml"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

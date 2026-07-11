@@ -5,7 +5,7 @@
 `tai` is a local-first AI assistant built as a Rust workspace. A **daemon** process
 communicates with multiple LLM providers through a pluggable trait-based provider
 system, while **clients** (terminal, desktop, and IM platforms) connect to the daemon
-over a Unix domain socket using a custom length-prefixed binary protocol.
+over a Unix domain socket (or Noise IK encrypted TCP for remote connections) using a custom length-prefixed binary protocol.
 
 ```
 ┌──────────────┐    Unix socket     ┌──────────────┐    HTTP/SSE     ┌──────────────────────┐
@@ -27,12 +27,13 @@ over a Unix domain socket using a custom length-prefixed binary protocol.
 
 ## Workspace topology
 
-Seven crates in a single Cargo workspace (resolver = "3"):
+Nine crates in a single Cargo workspace (resolver = "3"):
 
 ```
 tai (workspace)
 ├── tai-proto           Wire protocol (shared types + framing)
 ├── tai-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
+├── tai-transport       Noise IK encrypted TCP transport abstraction
 ├── tai-client-core     Shared client logic (parsing, images, history, credentials)
 ├── tai-markdown        Markdown parser and HTML renderer (pulldown-cmark + ammonia)
 ├── tai-daemon          Unix socket server — the core engine
@@ -52,22 +53,19 @@ tai (workspace)
                     │  tai-keystore   │ (no workspace deps)
                     └────────┬────────┘
                              │
-              ┌──────────────┼──────────────┐
-              │              │              │
-     ┌────────▼────────┐     │     ┌────────▼────────┐
-     │ tai-client-core │     │     │    tai-daemon   │
-     └────────┬────────┘     │     └─────────────────┘
-              │              │
-     ┌────────┼────────┬─────┘
-     │        │        │
-┌────▼───┐ ┌──▼───┐ ┌──▼───┐
-│tai-tui  │ │tai-  │ │tai-  │
-│        │ │dioxus│ │im    │
-└────────┘ └──────┘ └──────┘
-                        │
-                  ┌─────▼─────┐
-                  │  tai-proto │
-                  └───────────┘
+              ┌──────────────┼──────────────────────┐
+              │              │                      │
+      ┌────────▼────────┐   │       ┌───────────────▼──────────┐
+      │ tai-client-core │   │       │        tai-daemon        │
+      └────┬───────┬────┘   │       └───────────────┬──────────┘
+           │       │        │                       │
+           │  ┌────▼────────▼────┐                  │
+           │  │  tai-transport   │◄─────────────────┘
+           │  └────────┬────────┘
+           │           │
+      ┌────▼───┐ ┌────▼────┐ ┌────▼───┐
+      │tai-tui  │ │tai-dioxus│ │tai-im  │
+      └────────┘ └─────────┘ └────────┘
 ```
 
 ---
@@ -113,15 +111,15 @@ Defines all shared message types and framing. No dependencies on other workspace
 
 ```
 ┌──────────────────┬────────────────────────────────────────┐
-│ 4 bytes (BE u32) │ bincode((protocol_version: u32, msg)) │
+│ 4 bytes (BE u32) │ postcard((protocol_version: u8, msg)) │
 │   payload len    │                                        │
 └──────────────────┴────────────────────────────────────────┘
 ```
 
 - Protocol version: `1`
-- Max frame size: 1 MiB
+- Max frame size: 32 MiB
 - Framing functions: `encode_frame`, `decode_frame`, `read_message`, `write_message`
-- **Error type**: `ProtoError` (thiserror enum) — `Bincode`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io`
+- **Error type**: `ProtoError` (thiserror enum) — `Postcard`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io`
 
 
 ### `tai-keystore` — Identity keypair & credential crypto
@@ -164,9 +162,24 @@ in the `redb` database alongside sessions.
 **Error type:** `KeystoreError` (thiserror enum) — `Io`, `TooShort`, `InvalidKeyLength`, `EncryptionFailed`, `DecryptionFailed`, `ConfigDirNotFound`
 
 
+### `tai-transport` — Noise IK encrypted transport
+
+A small crate providing Noise IK handshake and encrypted message I/O over
+TCP.  Used by both `tai-client-core` (client side) and `tai-daemon` (server side).
+
+| Module | Purpose |
+|---|---|
+| `noise.rs` | `NoiseStream` — wraps `TcpStream` + `snow::TransportState` with length-prefixed AES-256-GCM framing. `handshake_initiator()` (client) and `handshake_responder()` (server) implement the Noise IK handshake with X25519 key agreement. |
+| `error.rs` | `TransportError` enum — `Io`, `Noise`, `Protocol`, `AuthFailed`, `ConnectionClosed`. |
+
+The server-side TCP/Noise handler lives in `tai-daemon/src/server/connection.rs`
+(`tcp_client_thread`), where the Noise IK handshake is performed and the
+encrypted stream enters the same dispatch loop as Unix socket clients.
+
+
 ### `tai-client-core` — Shared client logic
 
-Used by both `tai-tui` and `tai-dioxus`.
+Used by `tai-tui`, `tai-dioxus`, and `tai-im`.
 
 | Module | Purpose |
 |---|---|---|
@@ -175,8 +188,9 @@ Used by both `tai-tui` and `tai-dioxus`.
 | `image.rs` | `ImageAssembler` reconstructs images from chunked stream protocol (`ImageStart` → `ImageChunk`* → `ImageEnd`), validating byte count |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text, structured diffs) |
 | `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
+| `connection.rs` | Daemon connection helpers: `run_daemon_connection()` (Unix socket), `run_daemon_tcp_connection()` (Noise IK), `run_daemon_connection_with_mode()` (dispatch), `run_daemon_reader()` (blocking reader). `ConnectionMode` enum (`UnixSocket` | `Tcp`) selects the transport. |
 
-`DaemonMessageHandler` trait uses `ClientError` (thiserror enum) — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `PrivateKeyEncRead`, `PrivateKeyDecrypt`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Bincode`, `Encryption`.
+`DaemonMessageHandler` trait uses `ClientError` (thiserror enum) — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `PrivateKeyEncRead`, `PrivateKeyDecrypt`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Postcard`, `Encryption`.
 
 
 ### `tai-daemon` — Core server
@@ -405,8 +419,9 @@ main()
 
 Entry point: `src/main.rs`
 
-Same Unix socket transport, but rendered via Dioxus components. Uses hooks to spawn
-async reader/writer tasks inside the Dioxus runtime.
+Unix socket or Noise IK encrypted TCP transport (selected via `--tcp-addr` / `--server-pk` CLI flags),
+rendered via Dioxus components. Uses hooks to spawn async reader/writer tasks inside
+the Dioxus runtime.
 
 **Module breakdown:**
 
@@ -938,7 +953,7 @@ User presses Enter on a session in the session manager
 1. **Unix sockets, not HTTP for client↔daemon** — keeps everything local, avoids port conflicts,
    leverages OS-level access control.
 
-2. **Binary protocol (bincode), not JSON** — compact, typed, versioned. Length-prefixed framing
+2. **Binary protocol (postcard), not JSON** — compact, typed, versioned. Length-prefixed framing
    avoids parsing ambiguities. Version field allows protocol evolution.
 
 3. **Lock/Unlock security** — the daemon starts without credentials in memory. The private key is
@@ -1246,8 +1261,8 @@ cargo run -p tai-im -- telegram
 | Crate | Used by | Purpose |
 |---|---|---|
 | `tokio` | tui, dioxus, im | Async runtime |
-| `serde` + `bincode` | proto, clients | Wire protocol framing |
-| `serde` + `postcard` | daemon | Internal storage serialization (redb tables, credentials) |
+| `serde` + `postcard` | proto, clients, daemon | Wire protocol framing and internal storage |
+| `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
 | `reqwest` (rustls) | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
 | `ratatui` + `crossterm` | tai-tui | Terminal UI |
@@ -1272,7 +1287,7 @@ Each library crate defines a structured error enum:
 
 | Crate | Error type | Key variants |
 |---|---|---|
-| `tai-proto` | `ProtoError` | `Bincode`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io` |
+| `tai-proto` | `ProtoError` | `Postcard`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io` |
 | `tai-keystore` | `KeystoreError` | `Io`, `TooShort`, `DecryptionFailed`, `InvalidKeyLength`, `EncryptionFailed`, `ConfigDirNotFound` |
 | `tai-client-core` | `ClientError` | `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch` |
 
