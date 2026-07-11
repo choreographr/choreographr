@@ -225,6 +225,7 @@ fn config_apply_overrides() {
         provider: "anthropic".into(),
         base_url: Some("https://custom.anthropic.com".into()),
         streaming: Some(false),
+        stream_options: None,
         retry_max_attempts: Some(3),
         connect_timeout_secs: Some(10),
         request_timeout_secs: Some(60),

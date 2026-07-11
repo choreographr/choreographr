@@ -139,7 +139,7 @@ The private key can be stored encrypted at rest:
 
 **Credential encryption pipeline (client-side):**
 ```
-credential ──► bincode serialize ──► ECDH (ephemeral + recipient pubkey)
+credential ──► postcard serialize ──► ECDH (ephemeral + recipient pubkey)
   ──► HKDF ──► AES-256-GCM encrypt ──► encrypted payload
 ```
 
@@ -705,8 +705,8 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 
 | Table | Key | Value |
 |---|---|---|
-| `sessions` | `u64` session ID | bincode(`SessionRecord`) |
-| `session_messages` | `(u64, u32)` (session ID, index) | bincode(`SessionMessage`) |
+| `sessions` | `u64` session ID | postcard(`SessionRecord`) |
+| `session_messages` | `(u64, u32)` (session ID, index) | postcard(`SessionMessage`) |
 | `credentials` | `&str` service name | encrypted blob |
 | `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
 | `meta` | `&str` | `u64` counter |
@@ -1254,7 +1254,8 @@ cargo run -p tai-im -- telegram
 | Crate | Used by | Purpose |
 |---|---|---|
 | `tokio` | tui, dioxus, im | Async runtime |
-| `serde` + `bincode` | proto, daemon, clients | Serialization |
+| `serde` + `bincode` | proto, clients | Wire protocol framing |
+| `serde` + `postcard` | daemon | Internal storage serialization (redb tables, credentials) |
 | `reqwest` (rustls) | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
 | `ratatui` + `crossterm` | tai-tui | Terminal UI |
@@ -1264,7 +1265,7 @@ cargo run -p tai-im -- telegram
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `x25519-dalek` + `hkdf` + `sha2` | keystore | X25519 ECDH key agreement, HKDF key derivation |
 | `ckb-vm` | daemon | RISC-V VM interpreter for sandboxed code execution |
-| `postcard` | daemon | Compact binary serialization for VM↔host tool communication |
+| `postcard` | daemon | Compact binary serialization (internal storage, VM↔host tool communication) |
 | `thiserror` | proto, keystore, client-core, daemon | Structured library error types |
 | `anyhow` | daemon, tui, dioxus, im, keystore | Application error context & propagation |
 

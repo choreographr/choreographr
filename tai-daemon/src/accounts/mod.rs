@@ -15,6 +15,8 @@ pub struct AccountConfig {
     #[serde(default)]
     pub streaming: Option<bool>,
     #[serde(default)]
+    pub stream_options: Option<bool>,
+    #[serde(default)]
     pub retry_max_attempts: Option<u32>,
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
@@ -30,6 +32,9 @@ impl AccountConfig {
         }
         if let Some(streaming) = self.streaming {
             config.streaming = streaming;
+        }
+        if let Some(stream_options) = self.stream_options {
+            config.stream_options = stream_options;
         }
         if let Some(retry) = self.retry_max_attempts {
             config.retry_max_attempts = retry;
@@ -193,6 +198,7 @@ mod tests {
             provider: "openai".to_string(),
             base_url: None,
             streaming: None,
+            stream_options: None,
             retry_max_attempts: None,
             connect_timeout_secs: None,
             request_timeout_secs: None,
@@ -372,6 +378,7 @@ model = "claude-4"
             provider: "openai".to_string(),
             base_url: None,
             streaming: None,
+            stream_options: None,
             retry_max_attempts: None,
             connect_timeout_secs: None,
             request_timeout_secs: None,
@@ -390,6 +397,7 @@ model = "claude-4"
             provider: "openai".to_string(),
             base_url: Some("https://custom.api.com/v1".to_string()),
             streaming: Some(false),
+            stream_options: None,
             retry_max_attempts: Some(5),
             connect_timeout_secs: Some(30),
             request_timeout_secs: Some(120),

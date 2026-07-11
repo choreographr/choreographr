@@ -543,10 +543,7 @@ impl DaemonState {
             uk.zeroize();
             if let Ok(plaintext) =
                 tai_keystore::crypto::decrypt_with_private_key(&key, &encrypted_blob)
-                && let Ok((cred, _)) = bincode::serde::decode_from_slice::<ServiceCredential, _>(
-                    &plaintext,
-                    bincode::config::standard(),
-                )
+                && let Ok(cred) = postcard::from_bytes::<ServiceCredential>(&plaintext)
             {
                 // Update in-memory state
                 if matches!(&cred, ServiceCredential::X { .. }) && service == "twitter" {
@@ -679,6 +676,7 @@ impl DaemonState {
             provider: provider.clone(),
             base_url,
             streaming,
+            stream_options: None,
             retry_max_attempts,
             connect_timeout_secs,
             request_timeout_secs,
@@ -775,20 +773,15 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
     let mut decrypt_failures = 0usize;
     for (service, blob) in &blobs {
         match tai_keystore::crypto::decrypt_with_private_key(&key, blob) {
-            Ok(plaintext) => {
-                match bincode::serde::decode_from_slice::<ServiceCredential, _>(
-                    &plaintext,
-                    bincode::config::standard(),
-                ) {
-                    Ok((cred, _)) => {
-                        credentials.insert(service.clone(), cred);
-                    }
-                    Err(e) => {
-                        warn!("Unlock: failed to decode credential '{}': {e}", service);
-                        decrypt_failures += 1;
-                    }
+            Ok(plaintext) => match postcard::from_bytes::<ServiceCredential>(&plaintext) {
+                Ok(cred) => {
+                    credentials.insert(service.clone(), cred);
                 }
-            }
+                Err(e) => {
+                    warn!("Unlock: failed to decode credential '{}': {e}", service);
+                    decrypt_failures += 1;
+                }
+            },
             Err(e) => {
                 warn!("Unlock: failed to decrypt credential '{}': {e}", service);
                 decrypt_failures += 1;
@@ -831,6 +824,7 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
             provider: "openai".to_string(),
             base_url: None,
             streaming: None,
+            stream_options: None,
             retry_max_attempts: None,
             connect_timeout_secs: None,
             request_timeout_secs: None,

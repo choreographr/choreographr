@@ -32,6 +32,8 @@ pub struct ServiceConfig {
     pub model_max_tokens_fields: HashMap<String, MaxTokensField>,
     #[serde(default = "default_streaming")]
     pub streaming: bool,
+    #[serde(default = "default_stream_options")]
+    pub stream_options: bool,
     #[serde(default)]
     pub max_turns: Option<u32>,
     #[serde(default = "default_retry_max_attempts")]
@@ -62,6 +64,7 @@ impl Default for ServiceConfig {
             chat_completions_max_tokens_field: default_max_tokens_field(),
             model_max_tokens_fields: HashMap::new(),
             streaming: default_streaming(),
+            stream_options: default_stream_options(),
             max_turns: None,
             retry_max_attempts: default_retry_max_attempts(),
             retry_initial_backoff_ms: default_retry_initial_backoff_ms(),
@@ -98,6 +101,10 @@ fn default_max_tokens_field() -> MaxTokensField {
 }
 
 fn default_streaming() -> bool {
+    true
+}
+
+fn default_stream_options() -> bool {
     true
 }
 

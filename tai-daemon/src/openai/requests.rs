@@ -526,9 +526,16 @@ where
         messages,
         tools: Some(tools),
         stream: true,
-        stream_options: Some(ChatCompletionsStreamOptions {
-            include_usage: true,
-        }),
+        // Configurable stream_options — some OpenAI-compatible providers
+        // reject the `stream_options` field entirely, so users can disable
+        // it per-account to maintain compatibility.
+        stream_options: if config.stream_options {
+            Some(ChatCompletionsStreamOptions {
+                include_usage: true,
+            })
+        } else {
+            None
+        },
         max_tokens: max_tokens_field,
         max_completion_tokens: max_completion_tokens_field,
         reasoning_effort,
@@ -984,5 +991,42 @@ mod tests {
             body.get("reasoning_effort"),
             Some(&serde_json::Value::String("low".into()))
         );
+    }
+
+    #[test]
+    fn stream_options_included_when_enabled() {
+        let body = serde_json::to_value(&ChatCompletionsRequest {
+            model: "gpt-4",
+            messages: &[ChatRequestMessage::simple("user", "hello".into())],
+            tools: None,
+            stream: true,
+            stream_options: Some(ChatCompletionsStreamOptions {
+                include_usage: true,
+            }),
+            max_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: None,
+        })
+        .unwrap();
+        assert_eq!(
+            body.get("stream_options"),
+            Some(&serde_json::json!({"include_usage": true}))
+        );
+    }
+
+    #[test]
+    fn stream_options_omitted_when_disabled() {
+        let body = serde_json::to_value(&ChatCompletionsRequest {
+            model: "gpt-4",
+            messages: &[ChatRequestMessage::simple("user", "hello".into())],
+            tools: None,
+            stream: true,
+            stream_options: None,
+            max_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: None,
+        })
+        .unwrap();
+        assert!(body.get("stream_options").is_none());
     }
 }

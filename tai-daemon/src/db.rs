@@ -96,8 +96,8 @@ pub fn write_session(
     session_id: u64,
     record: &SessionRecord,
 ) -> io::Result<()> {
-    let payload = bincode::serde::encode_to_vec(record, bincode::config::standard())
-        .map_err(|e| db_err(format!("bincode encode session: {e}")))?;
+    let payload = postcard::to_allocvec(record)
+        .map_err(|e| db_err(format!("postcard encode session: {e}")))?;
     let write_txn = db
         .begin_write()
         .map_err(|e| db_err(format!("redb write txn: {e}")))?;
@@ -129,10 +129,8 @@ pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<S
         .map_err(|e| db_err(format!("redb get session: {e}")))?
     {
         Some(guard) => {
-            let record: SessionRecord =
-                bincode::serde::decode_from_slice(guard.value(), bincode::config::standard())
-                    .map_err(|e| db_err(format!("bincode decode session: {e}")))?
-                    .0;
+            let record: SessionRecord = postcard::from_bytes(guard.value())
+                .map_err(|e| db_err(format!("postcard decode session: {e}")))?;
             Ok(Some(record))
         }
         None => Ok(None),
@@ -170,11 +168,8 @@ pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRec
                 continue;
             }
         };
-        match bincode::serde::decode_from_slice::<SessionRecord, _>(
-            value.value(),
-            bincode::config::standard(),
-        ) {
-            Ok((record, _)) => {
+        match postcard::from_bytes::<SessionRecord>(value.value()) {
+            Ok(record) => {
                 sessions.push((key.value(), record));
             }
             Err(e) => {
@@ -255,8 +250,8 @@ pub fn write_message(
     index: u32,
     message: &SessionMessage,
 ) -> io::Result<()> {
-    let payload = bincode::serde::encode_to_vec(message, bincode::config::standard())
-        .map_err(|e| db_err(format!("bincode encode message: {e}")))?;
+    let payload = postcard::to_allocvec(message)
+        .map_err(|e| db_err(format!("postcard encode message: {e}")))?;
     let write_txn = db
         .begin_write()
         .map_err(|e| db_err(format!("redb write txn: {e}")))?;
@@ -289,22 +284,26 @@ pub fn read_messages(db: &redb::Database, session_id: u64) -> io::Result<Vec<Ses
         let (key, value) = result.map_err(|e| db_err(format!("redb iter item: {e}")))?;
         let (sid, idx) = key.value();
         if sid == session_id {
-            match bincode::serde::decode_from_slice::<SessionMessage, _>(
-                value.value(),
-                bincode::config::standard(),
-            ) {
-                Ok((message, _)) => {
+            match postcard::from_bytes::<SessionMessage>(value.value()) {
+                Ok(message) => {
                     messages.push((idx, message));
                 }
                 Err(e) => {
-                    // Schema may have evolved — skip messages that fail to
-                    // decode (e.g. old format missing a newly-added field)
+                    // Schema may have evolved — insert a placeholder to
+                    // preserve message sequence integrity (otherwise orphaned
+                    // tool results can cause 400 errors from the API).
                     warn!(
                         session_id,
                         message_idx = idx,
                         error = %e,
-                        "skipping undecodable message",
+                        "undecodable message, inserting placeholder",
                     );
+                    messages.push((
+                        idx,
+                        SessionMessage::UserText {
+                            content: String::new(),
+                        },
+                    ));
                 }
             }
         }
@@ -760,13 +759,13 @@ mod tests {
         };
         write_message(&db, id, 0, &valid_msg).unwrap();
 
-        // Manually insert a corrupt blob at index 1 (not valid bincode)
+        // Manually insert a corrupt blob at index 1 (not valid postcard)
         {
             let write_txn = db.begin_write().unwrap();
             {
                 let mut table = write_txn.open_table(SESSION_MESSAGES).unwrap();
                 table
-                    .insert((id, 1u32), b"not valid bincode data".as_slice())
+                    .insert((id, 1u32), b"not valid postcard data".as_slice())
                     .unwrap();
             }
             write_txn.commit().unwrap();
@@ -778,10 +777,21 @@ mod tests {
         };
         write_message(&db, id, 2, &valid_msg2).unwrap();
 
-        // read_messages should skip the corrupt entry and return the valid ones
+        // read_messages should insert a placeholder for the corrupt entry
         let messages = read_messages(&db, id).unwrap();
-        assert_eq!(messages.len(), 2, "corrupt message should be skipped");
+        assert_eq!(
+            messages.len(),
+            3,
+            "corrupt message should be replaced with placeholder"
+        );
         assert_eq!(messages[0], valid_msg);
-        assert_eq!(messages[1], valid_msg2);
+        assert_eq!(
+            messages[1],
+            SessionMessage::UserText {
+                content: String::new(),
+            },
+            "corrupt entry should be replaced with empty UserText placeholder"
+        );
+        assert_eq!(messages[2], valid_msg2);
     }
 }

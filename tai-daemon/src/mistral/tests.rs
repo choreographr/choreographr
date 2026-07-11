@@ -98,6 +98,7 @@ fn test_mistral_config_apply_overrides() {
         provider: "mistral".into(),
         base_url: Some("https://custom.mistral.ai/v1".into()),
         streaming: Some(false),
+        stream_options: None,
         retry_max_attempts: Some(3),
         connect_timeout_secs: Some(15),
         request_timeout_secs: Some(60),
