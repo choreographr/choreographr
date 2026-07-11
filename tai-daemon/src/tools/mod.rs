@@ -155,6 +155,7 @@ pub(crate) mod random;
 pub(crate) mod sh;
 pub(crate) mod shell_util;
 pub(crate) mod subsession;
+pub(crate) mod time;
 pub(crate) mod vm;
 pub(crate) mod x;
 
@@ -416,7 +417,7 @@ impl<T: Tool + 'static> ToolDyn for T {
 pub const GROUPS: &[ToolGroup] = &[
     ToolGroup {
         name: "core",
-        description: "File system operations, HTTP requests, image display, and file search",
+        description: "File system operations, HTTP requests, image display, file search, random values, and time queries",
     },
     ToolGroup {
         name: "db",
@@ -487,6 +488,7 @@ impl ToolRegistry {
         reg.register(exec::Exec);
         reg.register(fff::Fff::new(Arc::clone(&reg.fff_cache)));
         reg.register(random::Random);
+        reg.register(time::GetCurrentTime);
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);
         reg.register(x::XUserLookup);

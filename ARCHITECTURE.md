@@ -632,14 +632,13 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 
 | Group | Tools |
 |---|---|
-| **Core** | `list_sessions`, `get_session`, `load_skill`, `read_file`, `read_file_range`, `write_file`, `edit_file`, `list_files`, `line_count` |
+| **Core** | `list_sessions`, `get_session`, `load_skill`, `read_file`, `read_file_range`, `write_file`, `edit_file`, `list_files`, `line_count`, `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed), `get_current_time` (Unix millisecond timestamp) |
 | **HTTP** | `http_request` (GET/POST/HEAD with headers, body, timeout) |
 | **Image** | `display_image` (from path, URL, base64, or SVG text) |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push` |
 | **EVM** | `evm_chain`, `evm_balance`, `evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`, `evm_logs`, `evm_nonce`, `evm_resolve` |
 | **File search** | `fff` (file finding) |
 | **RISC-V VM** | `run_riscv` (compile & run Rust code in a sandboxed RISC-V VM with access to all registered tools) |
-| **Random** | `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed for reproducibility) |
 | **Shell** | `exec` (direct program execution), `sh` (bash/dash/zsh — detected at startup), `nushell` (if `nu` is installed), `fish` (if `fish` is installed) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
 | **DB** | `db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count` |
@@ -652,7 +651,7 @@ via `fn group() -> &'static str` on the `Tool` trait. Groups are:
 
 | Group | Default | Description |
 |---|---|---|
-| `core` | always on | File system, HTTP, images, file search |
+| `core` | always on | File system, HTTP, images, file search, random values, and time queries |
 | `db` | off | Session-scoped key-value database |
 | `git` | on | Local Git operations |
 | `shell` | on | Shell and exec |
