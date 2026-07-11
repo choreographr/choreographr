@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use tai_daemon::accounts::{AccountManager, accounts_config_path};
 use tai_daemon::daemon::DaemonState;
 use tai_daemon::db::read_all_sessions;
-use tai_daemon::openai::load_service_config;
+use tai_daemon::openai::load_daemon_config;
 use tai_proto::socket_path;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -37,7 +37,7 @@ fn resolve_max_turns() -> u32 {
     {
         return n;
     }
-    if let Ok(config) = load_service_config()
+    if let Ok(config) = load_daemon_config()
         && let Some(n) = config.max_turns
         && n > 0
     {

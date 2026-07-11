@@ -221,14 +221,14 @@ fn anthropic_config_defaults_are_sensible() {
 #[test]
 fn config_apply_overrides() {
     let account = crate::accounts::AccountConfig {
-        name: "test".into(),
-        provider: "anthropic".into(),
         base_url: Some("https://custom.anthropic.com".into()),
         streaming: Some(false),
-        stream_options: None,
         retry_max_attempts: Some(3),
         connect_timeout_secs: Some(10),
         request_timeout_secs: Some(60),
+        retry_initial_backoff_ms: Some(2000),
+        retry_max_backoff_ms: Some(40000),
+        ..crate::accounts::AccountConfig::simple("test", "anthropic")
     };
     let mut cfg = AnthropicConfig::default();
     cfg.apply_overrides(&account);
@@ -237,6 +237,8 @@ fn config_apply_overrides() {
     assert_eq!(cfg.retry_max_attempts, 3);
     assert_eq!(cfg.connect_timeout_secs, 10);
     assert_eq!(cfg.request_timeout_secs, 60);
+    assert_eq!(cfg.retry_initial_backoff_ms, 2000);
+    assert_eq!(cfg.retry_max_backoff_ms, 40000);
 }
 
 #[test]

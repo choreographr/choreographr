@@ -61,6 +61,12 @@ impl MistralConfig {
         if let Some(request) = cfg.request_timeout_secs {
             self.request_timeout_secs = request;
         }
+        if let Some(ms) = cfg.retry_initial_backoff_ms {
+            self.retry_initial_backoff_ms = ms;
+        }
+        if let Some(ms) = cfg.retry_max_backoff_ms {
+            self.retry_max_backoff_ms = ms;
+        }
     }
 }
 

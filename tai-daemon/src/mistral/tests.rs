@@ -94,14 +94,14 @@ fn test_mistral_config_default() {
 fn test_mistral_config_apply_overrides() {
     let mut cfg = MistralConfig::default();
     let account_cfg = crate::accounts::AccountConfig {
-        name: "test".into(),
-        provider: "mistral".into(),
         base_url: Some("https://custom.mistral.ai/v1".into()),
         streaming: Some(false),
-        stream_options: None,
         retry_max_attempts: Some(3),
         connect_timeout_secs: Some(15),
         request_timeout_secs: Some(60),
+        retry_initial_backoff_ms: Some(2000),
+        retry_max_backoff_ms: Some(40000),
+        ..crate::accounts::AccountConfig::simple("test", "mistral")
     };
     cfg.apply_overrides(&account_cfg);
     assert_eq!(cfg.base_url, "https://custom.mistral.ai/v1");
@@ -109,6 +109,8 @@ fn test_mistral_config_apply_overrides() {
     assert_eq!(cfg.retry_max_attempts, 3);
     assert_eq!(cfg.connect_timeout_secs, 15);
     assert_eq!(cfg.request_timeout_secs, 60);
+    assert_eq!(cfg.retry_initial_backoff_ms, 2000);
+    assert_eq!(cfg.retry_max_backoff_ms, 40000);
 }
 
 #[test]

@@ -52,14 +52,11 @@ impl InferenceProvider {
 
         match entry.protocol {
             ProviderProtocol::OpenAiCompatible => {
-                let mut svc_config = crate::openai::load_service_config().unwrap_or_default();
-                // If the account doesn't specify a base_url, use the catalog default.
-                // This is important for non-OpenAI providers (e.g. opencode) that
-                // have different default base URLs from the ServiceConfig default.
-                if config.base_url.is_none() {
-                    svc_config.base_url = entry.default_base_url.to_string();
-                }
-                svc_config.chat_completions_max_tokens_field = entry.max_tokens_field;
+                let mut svc_config = crate::openai::ServiceConfig {
+                    base_url: entry.default_base_url.to_string(),
+                    chat_completions_max_tokens_field: entry.max_tokens_field,
+                    ..Default::default()
+                };
                 config.apply_overrides(&mut svc_config);
                 let key = api_key
                     .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
@@ -193,80 +190,35 @@ mod tests {
 
     #[test]
     fn from_account_config_unknown_provider_errors() {
-        let cfg = AccountConfig {
-            name: "unknown".to_string(),
-            provider: "nonexistent".to_string(),
-            base_url: None,
-            streaming: None,
-            stream_options: None,
-            retry_max_attempts: None,
-            connect_timeout_secs: None,
-            request_timeout_secs: None,
-        };
+        let cfg = AccountConfig::simple("unknown", "nonexistent");
         let err = InferenceProvider::from_account_config(&cfg, Some("key".into())).unwrap_err();
         assert!(err.contains("unknown provider"), "{err}");
     }
 
     #[test]
     fn from_account_config_anthropic_requires_key() {
-        let cfg = AccountConfig {
-            name: "claude".to_string(),
-            provider: "anthropic".to_string(),
-            base_url: None,
-            streaming: None,
-            stream_options: None,
-            retry_max_attempts: None,
-            connect_timeout_secs: None,
-            request_timeout_secs: None,
-        };
+        let cfg = AccountConfig::simple("claude", "anthropic");
         let err = InferenceProvider::from_account_config(&cfg, None).unwrap_err();
         assert!(err.contains("no API key"), "{err}");
     }
 
     #[test]
     fn from_account_config_openai_missing_key_errors() {
-        let cfg = AccountConfig {
-            name: "openai".to_string(),
-            provider: "openai".to_string(),
-            base_url: None,
-            streaming: None,
-            stream_options: None,
-            retry_max_attempts: None,
-            connect_timeout_secs: None,
-            request_timeout_secs: None,
-        };
+        let cfg = AccountConfig::simple("openai", "openai");
         let err = InferenceProvider::from_account_config(&cfg, None).unwrap_err();
         assert!(err.contains("no API key"), "{err}");
     }
 
     #[test]
     fn from_account_config_openai_succeeds() {
-        let cfg = AccountConfig {
-            name: "openai".to_string(),
-            provider: "openai".to_string(),
-            base_url: None,
-            streaming: None,
-            stream_options: None,
-            retry_max_attempts: None,
-            connect_timeout_secs: None,
-            request_timeout_secs: None,
-        };
+        let cfg = AccountConfig::simple("openai", "openai");
         let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
         assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
     fn from_account_config_anthropic_succeeds() {
-        let cfg = AccountConfig {
-            name: "claude".to_string(),
-            provider: "anthropic".to_string(),
-            base_url: None,
-            streaming: None,
-            stream_options: None,
-            retry_max_attempts: None,
-            connect_timeout_secs: None,
-            request_timeout_secs: None,
-        };
+        let cfg = AccountConfig::simple("claude", "anthropic");
         let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
         assert!(result.is_ok(), "{:?}", result.err());
     }
@@ -290,32 +242,14 @@ mod tests {
 
     #[test]
     fn from_account_config_mistral_missing_key_errors() {
-        let cfg = AccountConfig {
-            name: "mistral".to_string(),
-            provider: "mistral".to_string(),
-            base_url: None,
-            streaming: None,
-            stream_options: None,
-            retry_max_attempts: None,
-            connect_timeout_secs: None,
-            request_timeout_secs: None,
-        };
+        let cfg = AccountConfig::simple("mistral", "mistral");
         let err = InferenceProvider::from_account_config(&cfg, None).unwrap_err();
         assert!(err.contains("no API key"), "{err}");
     }
 
     #[test]
     fn from_account_config_mistral_succeeds() {
-        let cfg = AccountConfig {
-            name: "mistral".to_string(),
-            provider: "mistral".to_string(),
-            base_url: None,
-            streaming: None,
-            stream_options: None,
-            retry_max_attempts: None,
-            connect_timeout_secs: None,
-            request_timeout_secs: None,
-        };
+        let cfg = AccountConfig::simple("mistral", "mistral");
         let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
         assert!(result.is_ok(), "{:?}", result.err());
     }

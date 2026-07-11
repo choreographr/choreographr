@@ -775,21 +775,14 @@ snapshot of the session state and use cooperative cancellation via an `AtomicBoo
 **Service config:** `~/.config/tai-daemon/config.toml`
 
 ```toml
-base_url = "https://api.openai.com/v1"
-model_list_path = "/models"
-responses_path = "/responses"
-chat_completions_path = "/chat/completions"
-default_request_format = "chat_completions"     # or "responses"
-chat_completions_max_tokens = 4096
-streaming = true
 max_turns = 25                                   # default tool loop iteration cap
 
-[model_request_formats]                          # per-model overrides
-gpt-5 = "responses"
-
-[model_max_tokens]                               # per-model token caps
-big-model = 4096
+[context]
+context_file_names = ["AGENTS.md", "CLAUDE.md"]
+context_file_max_bytes = 32768
 ```
+
+> **Note:** Provider-level settings (`base_url`, `streaming`, `retry_*`, timeouts, endpoint paths, request format) have moved to per-account overrides in `accounts.toml`. See `README.md` for the full list.
 
 **Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Identity keys reside in `~/.config/tai-daemon/identity.pk` (private), `~/.config/tai-daemon/public.pk` (public), and optionally `~/.config/tai-daemon/identity.pk.enc` (passphrase-encrypted private key).
 

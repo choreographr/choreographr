@@ -173,3 +173,47 @@ fn assistant_message_take_reasoning_falls_back_to_reasoning_text() {
     };
     assert_eq!(msg.take_reasoning(), Some("think 3".to_string()));
 }
+
+#[test]
+fn daemon_config_deserializes_max_turns() {
+    let raw = "max_turns = 42\n";
+    let config: crate::openai::DaemonConfig = toml::from_str(raw).unwrap();
+    assert_eq!(config.max_turns, Some(42));
+}
+
+#[test]
+fn daemon_config_deserializes_context() {
+    let raw = r#"
+[context]
+context_file_names = ["AGENTS.md"]
+context_file_max_bytes = 16384
+disable_claude_code_prompt = true
+"#;
+    let config: crate::openai::DaemonConfig = toml::from_str(raw).unwrap();
+    assert_eq!(config.context.context_file_names, vec!["AGENTS.md"]);
+    assert_eq!(config.context.context_file_max_bytes, 16384);
+    assert!(config.context.disable_claude_code_prompt);
+}
+
+#[test]
+fn daemon_config_ignores_unknown_fields() {
+    let raw = r#"
+max_turns = 10
+base_url = "https://example.com"
+streaming = false
+"#;
+    let config: crate::openai::DaemonConfig = toml::from_str(raw).unwrap();
+    assert_eq!(config.max_turns, Some(10));
+}
+
+#[test]
+fn daemon_config_defaults_when_empty() {
+    let config: crate::openai::DaemonConfig = toml::from_str("").unwrap();
+    assert_eq!(config.max_turns, None);
+}
+
+#[test]
+fn daemon_config_errors_on_invalid_toml() {
+    let result: Result<crate::openai::DaemonConfig, _> = toml::from_str("[[[");
+    assert!(result.is_err());
+}

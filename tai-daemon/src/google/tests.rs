@@ -214,14 +214,14 @@ fn google_config_defaults() {
 #[test]
 fn google_config_apply_overrides() {
     let account = crate::accounts::AccountConfig {
-        name: "test".into(),
-        provider: "google".into(),
         base_url: Some("https://custom.googleapis.com".into()),
         streaming: Some(false),
-        stream_options: None,
         retry_max_attempts: Some(3),
         connect_timeout_secs: Some(10),
         request_timeout_secs: Some(60),
+        retry_initial_backoff_ms: Some(2000),
+        retry_max_backoff_ms: Some(40000),
+        ..crate::accounts::AccountConfig::simple("test", "google")
     };
     let mut cfg = GoogleConfig::default();
     cfg.apply_overrides(&account);
@@ -230,6 +230,8 @@ fn google_config_apply_overrides() {
     assert_eq!(cfg.retry_max_attempts, 3);
     assert_eq!(cfg.connect_timeout_secs, 10);
     assert_eq!(cfg.request_timeout_secs, 60);
+    assert_eq!(cfg.retry_initial_backoff_ms, 2000);
+    assert_eq!(cfg.retry_max_backoff_ms, 40000);
 }
 
 // ── Client tests ──────────────────────────────────────────────────────
@@ -488,32 +490,14 @@ fn status_to_google_error_rate_limited() {
 
 #[test]
 fn from_account_config_routes_google() {
-    let cfg = crate::accounts::AccountConfig {
-        name: "gemini".to_string(),
-        provider: "google".to_string(),
-        base_url: None,
-        streaming: None,
-        stream_options: None,
-        retry_max_attempts: None,
-        connect_timeout_secs: None,
-        request_timeout_secs: None,
-    };
+    let cfg = crate::accounts::AccountConfig::simple("gemini", "google");
     let result = crate::providers::InferenceProvider::from_account_config(&cfg, Some("key".into()));
     assert!(result.is_ok(), "{:?}", result.err());
 }
 
 #[test]
 fn from_account_config_google_missing_key_errors() {
-    let cfg = crate::accounts::AccountConfig {
-        name: "gemini".to_string(),
-        provider: "google".to_string(),
-        base_url: None,
-        streaming: None,
-        stream_options: None,
-        retry_max_attempts: None,
-        connect_timeout_secs: None,
-        request_timeout_secs: None,
-    };
+    let cfg = crate::accounts::AccountConfig::simple("gemini", "google");
     let result = crate::providers::InferenceProvider::from_account_config(&cfg, None);
     assert!(result.is_err());
     let err = result.unwrap_err();

@@ -92,31 +92,15 @@ requesting daemon shutdown.
 The daemon reads config from `~/.config/tai-daemon/config.toml` (all fields optional):
 
 ```toml
-base_url = "https://api.openai.com/v1"
-model_list_path = "/models"
-responses_path = "/responses"
-chat_completions_path = "/chat/completions"
-default_request_format = "chat_completions"   # or "responses"
-chat_completions_max_tokens = 4096
-streaming = true
 max_turns = 25
-retry_max_attempts = 5
-retry_initial_backoff_ms = 1000
-retry_max_backoff_ms = 30000
-connect_timeout_secs = 30
-request_timeout_secs = 120
-
-[model_request_formats]
-gpt-5 = "responses"
-
-[model_max_tokens]
-big-pickle = 4096
 
 [context]
 context_file_names = ["AGENTS.md", "CLAUDE.md"]
 context_file_max_bytes = 32768
 disable_claude_code_prompt = false
 ```
+
+> **Note:** Provider-level settings (`base_url`, `streaming`, `retry_*`, timeouts, endpoint paths, request format, etc.) have moved to per-account overrides in `accounts.toml`. They are no longer read from `config.toml`.
 
 Credentials are encrypted per-credential with the daemon's X25519 public key and stored in the `redb` database. Identity keys reside in `~/.config/tai-daemon/identity.pk` (private), `~/.config/tai-daemon/public.pk` (public), and optionally `~/.config/tai-daemon/identity.pk.enc` (passphrase-encrypted private key).
 
@@ -170,13 +154,35 @@ provider = "google"
 name = "local"
 provider = "ollama"
 base_url = "http://localhost:11434/v1"
+streaming = false
+retry_max_attempts = 3
 
 [[account]]
 name = "mistral"
 provider = "mistral"
 ```
 
-Each provider from the catalog is pre-configured with sensible defaults (base_url, default model). Override any field per-account.
+Each provider from the catalog is pre-configured with sensible defaults (base_url, default model). Override any field per-account. Available per-account overrides:
+
+| Field | Description |
+|-------|-------------|
+| `base_url` | API base URL |
+| `streaming` | Enable/disable streaming responses |
+| `stream_options` | Include usage in stream |
+| `retry_max_attempts` | Max retry count on transient errors |
+| `retry_initial_backoff_ms` | Initial backoff between retries (ms) |
+| `retry_max_backoff_ms` | Max backoff between retries (ms) |
+| `connect_timeout_secs` | TCP connect timeout |
+| `request_timeout_secs` | HTTP request timeout |
+| `model_list_path` | Custom models list endpoint path |
+| `responses_path` | Custom responses endpoint path |
+| `chat_completions_path` | Custom chat completions endpoint path |
+| `default_request_format` | Request format: `"chat_completions"` or `"responses"` |
+| `model_request_formats` | Per-model request format overrides |
+| `chat_completions_max_tokens` | Default max tokens for chat completions |
+| `model_max_tokens` | Per-model max token caps |
+| `chat_completions_max_tokens_field` | Token field: `"max_tokens"` or `"max_completion_tokens"` |
+| `model_max_tokens_fields` | Per-model token field overrides |
 
 ## Monitoring
 

@@ -8,124 +8,88 @@ const DEFAULT_MODEL_LIST_PATH: &str = "/models";
 const DEFAULT_RESPONSES_PATH: &str = "/responses";
 const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ServiceConfig {
-    #[serde(default = "default_base_url")]
-    pub base_url: String,
-    #[serde(default = "default_model_list_path")]
-    pub model_list_path: String,
-    #[serde(default = "default_responses_path")]
-    pub responses_path: String,
-    #[serde(default = "default_chat_completions_path")]
-    pub chat_completions_path: String,
-    #[serde(default = "default_request_format")]
-    pub default_request_format: RequestFormat,
-    #[serde(default)]
-    pub model_request_formats: HashMap<String, RequestFormat>,
-    #[serde(default)]
-    pub chat_completions_max_tokens: Option<u32>,
-    #[serde(default)]
-    pub model_max_tokens: HashMap<String, u32>,
-    #[serde(default = "default_max_tokens_field")]
-    pub chat_completions_max_tokens_field: MaxTokensField,
-    #[serde(default)]
-    pub model_max_tokens_fields: HashMap<String, MaxTokensField>,
-    #[serde(default = "default_streaming")]
-    pub streaming: bool,
-    #[serde(default = "default_stream_options")]
-    pub stream_options: bool,
+/// Deprecated provider-level fields that used to live in config.toml.
+/// They have been moved to accounts.toml — warn users who still have them.
+const DEPRECATED_PROVIDER_FIELDS: &[&str] = &[
+    "base_url",
+    "model_list_path",
+    "responses_path",
+    "chat_completions_path",
+    "default_request_format",
+    "model_request_formats",
+    "chat_completions_max_tokens",
+    "model_max_tokens",
+    "chat_completions_max_tokens_field",
+    "model_max_tokens_fields",
+    "streaming",
+    "stream_options",
+    "retry_max_attempts",
+    "retry_initial_backoff_ms",
+    "retry_max_backoff_ms",
+    "connect_timeout_secs",
+    "request_timeout_secs",
+];
+
+/// Daemon-level configuration from config.toml.
+///
+/// Only truly global settings belong here.  All provider-level
+/// configuration (endpoints, timeouts, retry, etc.) belongs in
+/// accounts.toml.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DaemonConfig {
     #[serde(default)]
     pub max_turns: Option<u32>,
-    #[serde(default = "default_retry_max_attempts")]
-    pub retry_max_attempts: u32,
-    #[serde(default = "default_retry_initial_backoff_ms")]
-    pub retry_initial_backoff_ms: u64,
-    #[serde(default = "default_retry_max_backoff_ms")]
-    pub retry_max_backoff_ms: u64,
-    #[serde(default = "default_connect_timeout_secs")]
-    pub connect_timeout_secs: u64,
-    #[serde(default = "default_request_timeout_secs")]
-    pub request_timeout_secs: u64,
     #[serde(default)]
+    pub context: ContextConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    pub base_url: String,
+    pub model_list_path: String,
+    pub responses_path: String,
+    pub chat_completions_path: String,
+    pub default_request_format: RequestFormat,
+    pub model_request_formats: HashMap<String, RequestFormat>,
+    pub chat_completions_max_tokens: Option<u32>,
+    pub model_max_tokens: HashMap<String, u32>,
+    pub chat_completions_max_tokens_field: MaxTokensField,
+    pub model_max_tokens_fields: HashMap<String, MaxTokensField>,
+    pub streaming: bool,
+    pub stream_options: bool,
+    pub max_turns: Option<u32>,
+    pub retry_max_attempts: u32,
+    pub retry_initial_backoff_ms: u64,
+    pub retry_max_backoff_ms: u64,
+    pub connect_timeout_secs: u64,
+    pub request_timeout_secs: u64,
     pub context: ContextConfig,
 }
 
 impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
-            base_url: default_base_url(),
-            model_list_path: default_model_list_path(),
-            responses_path: default_responses_path(),
-            chat_completions_path: default_chat_completions_path(),
-            default_request_format: default_request_format(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            model_list_path: DEFAULT_MODEL_LIST_PATH.to_string(),
+            responses_path: DEFAULT_RESPONSES_PATH.to_string(),
+            chat_completions_path: DEFAULT_CHAT_COMPLETIONS_PATH.to_string(),
+            default_request_format: RequestFormat::ChatCompletions,
             model_request_formats: HashMap::new(),
             chat_completions_max_tokens: None,
             model_max_tokens: HashMap::new(),
-            chat_completions_max_tokens_field: default_max_tokens_field(),
+            chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
             model_max_tokens_fields: HashMap::new(),
-            streaming: default_streaming(),
-            stream_options: default_stream_options(),
+            streaming: true,
+            stream_options: true,
             max_turns: None,
-            retry_max_attempts: default_retry_max_attempts(),
-            retry_initial_backoff_ms: default_retry_initial_backoff_ms(),
-            retry_max_backoff_ms: default_retry_max_backoff_ms(),
-            connect_timeout_secs: default_connect_timeout_secs(),
-            request_timeout_secs: default_request_timeout_secs(),
+            retry_max_attempts: 5,
+            retry_initial_backoff_ms: 1000,
+            retry_max_backoff_ms: 30000,
+            connect_timeout_secs: 30,
+            request_timeout_secs: 120,
             context: ContextConfig::default(),
         }
     }
-}
-
-fn default_base_url() -> String {
-    DEFAULT_BASE_URL.to_string()
-}
-
-fn default_model_list_path() -> String {
-    DEFAULT_MODEL_LIST_PATH.to_string()
-}
-
-fn default_responses_path() -> String {
-    DEFAULT_RESPONSES_PATH.to_string()
-}
-
-fn default_chat_completions_path() -> String {
-    DEFAULT_CHAT_COMPLETIONS_PATH.to_string()
-}
-
-fn default_request_format() -> RequestFormat {
-    RequestFormat::ChatCompletions
-}
-
-fn default_max_tokens_field() -> MaxTokensField {
-    MaxTokensField::MaxCompletionTokens
-}
-
-fn default_streaming() -> bool {
-    true
-}
-
-fn default_stream_options() -> bool {
-    true
-}
-
-fn default_retry_max_attempts() -> u32 {
-    5
-}
-
-fn default_retry_initial_backoff_ms() -> u64 {
-    1000
-}
-
-fn default_retry_max_backoff_ms() -> u64 {
-    30000
-}
-
-fn default_connect_timeout_secs() -> u64 {
-    30
-}
-
-fn default_request_timeout_secs() -> u64 {
-    120
 }
 
 pub fn config_path() -> io::Result<PathBuf> {
@@ -138,10 +102,14 @@ pub fn config_path() -> io::Result<PathBuf> {
     Ok(config_dir.join("tai-daemon").join("config.toml"))
 }
 
-pub fn load_service_config() -> io::Result<ServiceConfig> {
+/// Load daemon-level configuration from config.toml.
+///
+/// Emits `tracing::warn!` for any provider-level fields that are still
+/// present in config.toml (they should be in accounts.toml instead).
+pub fn load_daemon_config() -> io::Result<DaemonConfig> {
     let path = config_path()?;
     if !path.exists() {
-        return Ok(ServiceConfig::default());
+        return Ok(DaemonConfig::default());
     }
     let raw = fs::read_to_string(&path).map_err(|error| {
         io::Error::new(
@@ -149,13 +117,49 @@ pub fn load_service_config() -> io::Result<ServiceConfig> {
             format!("failed to read config at {}: {error}", path.display()),
         )
     })?;
-    let config: ServiceConfig = toml::from_str(&raw).map_err(|error| {
+    // First pass: check for deprecated provider-level fields.
+    if let Ok(value) = toml::from_str::<toml::Value>(&raw)
+        && let toml::Value::Table(table) = &value
+    {
+        for key in table.keys() {
+            if DEPRECATED_PROVIDER_FIELDS.contains(&key.as_str()) {
+                tracing::warn!(
+                    "config.toml contains deprecated provider-level field '{key}'. \
+                     This field is no longer read from config.toml; \
+                     move it to accounts.toml instead."
+                );
+            }
+        }
+    }
+    // Second pass: parse only the daemon-level fields (unknown fields are
+    // silently ignored thanks to #[serde(default)]).
+    let config: DaemonConfig = toml::from_str(&raw).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("failed to parse config at {}: {error}", path.display()),
         )
     })?;
     Ok(config)
+}
+
+/// Deprecated.  Use [`load_daemon_config`] instead.
+///
+/// Provider-level fields in config.toml are no longer read.  This function
+/// returns default provider settings; configure those in accounts.toml.
+#[deprecated(
+    since = "0.1.0",
+    note = "provider-level config has moved to accounts.toml; use load_daemon_config() for daemon settings"
+)]
+pub fn load_service_config() -> io::Result<ServiceConfig> {
+    tracing::warn!(
+        "load_service_config() is deprecated.  Provider-level config is no longer read from \
+         config.toml; configure providers in accounts.toml instead."
+    );
+    // Also surface deprecation warnings for any stale fields.
+    if let Err(e) = load_daemon_config() {
+        tracing::warn!("error reading config.toml while checking for deprecated fields: {e}");
+    }
+    Ok(ServiceConfig::default())
 }
 
 pub(crate) fn endpoint_url(base_url: &str, path: &str) -> io::Result<String> {

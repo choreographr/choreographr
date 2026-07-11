@@ -5,6 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use tai_proto::AccountInfo;
 
+use crate::openai::{MaxTokensField, RequestFormat};
+
 /// Configuration for a single inference account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountConfig {
@@ -22,9 +24,61 @@ pub struct AccountConfig {
     pub connect_timeout_secs: Option<u64>,
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
+    // Endpoint path overrides (OpenAI-compatible only)
+    #[serde(default)]
+    pub model_list_path: Option<String>,
+    #[serde(default)]
+    pub responses_path: Option<String>,
+    #[serde(default)]
+    pub chat_completions_path: Option<String>,
+    // Request format overrides (OpenAI-compatible only)
+    #[serde(default)]
+    pub default_request_format: Option<RequestFormat>,
+    #[serde(default)]
+    pub model_request_formats: Option<HashMap<String, RequestFormat>>,
+    // Token limit overrides (OpenAI-compatible only)
+    #[serde(default)]
+    pub chat_completions_max_tokens: Option<u32>,
+    #[serde(default)]
+    pub model_max_tokens: Option<HashMap<String, u32>>,
+    #[serde(default)]
+    pub chat_completions_max_tokens_field: Option<MaxTokensField>,
+    #[serde(default)]
+    pub model_max_tokens_fields: Option<HashMap<String, MaxTokensField>>,
+    // Retry timing (all providers)
+    #[serde(default)]
+    pub retry_initial_backoff_ms: Option<u64>,
+    #[serde(default)]
+    pub retry_max_backoff_ms: Option<u64>,
 }
 
 impl AccountConfig {
+    /// Create an AccountConfig with just a name and provider; all other
+    /// fields are `None` (meaning "use the provider default").
+    pub fn simple(name: &str, provider: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            provider: provider.to_string(),
+            base_url: None,
+            streaming: None,
+            stream_options: None,
+            retry_max_attempts: None,
+            connect_timeout_secs: None,
+            request_timeout_secs: None,
+            model_list_path: None,
+            responses_path: None,
+            chat_completions_path: None,
+            default_request_format: None,
+            model_request_formats: None,
+            chat_completions_max_tokens: None,
+            model_max_tokens: None,
+            chat_completions_max_tokens_field: None,
+            model_max_tokens_fields: None,
+            retry_initial_backoff_ms: None,
+            retry_max_backoff_ms: None,
+        }
+    }
+
     /// Apply this account's config overrides to a ServiceConfig.
     pub fn apply_overrides(&self, config: &mut crate::openai::ServiceConfig) {
         if let Some(base_url) = &self.base_url {
@@ -44,6 +98,39 @@ impl AccountConfig {
         }
         if let Some(request) = self.request_timeout_secs {
             config.request_timeout_secs = request;
+        }
+        if let Some(path) = &self.model_list_path {
+            config.model_list_path = path.clone();
+        }
+        if let Some(path) = &self.responses_path {
+            config.responses_path = path.clone();
+        }
+        if let Some(path) = &self.chat_completions_path {
+            config.chat_completions_path = path.clone();
+        }
+        if let Some(fmt) = self.default_request_format {
+            config.default_request_format = fmt;
+        }
+        if let Some(ref map) = self.model_request_formats {
+            config.model_request_formats = map.clone();
+        }
+        if let Some(n) = self.chat_completions_max_tokens {
+            config.chat_completions_max_tokens = Some(n);
+        }
+        if let Some(ref map) = self.model_max_tokens {
+            config.model_max_tokens = map.clone();
+        }
+        if let Some(field) = self.chat_completions_max_tokens_field {
+            config.chat_completions_max_tokens_field = field;
+        }
+        if let Some(ref map) = self.model_max_tokens_fields {
+            config.model_max_tokens_fields = map.clone();
+        }
+        if let Some(ms) = self.retry_initial_backoff_ms {
+            config.retry_initial_backoff_ms = ms;
+        }
+        if let Some(ms) = self.retry_max_backoff_ms {
+            config.retry_max_backoff_ms = ms;
         }
     }
 
@@ -192,19 +279,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn config(name: &str) -> AccountConfig {
-        AccountConfig {
-            name: name.to_string(),
-            provider: "openai".to_string(),
-            base_url: None,
-            streaming: None,
-            stream_options: None,
-            retry_max_attempts: None,
-            connect_timeout_secs: None,
-            request_timeout_secs: None,
-        }
-    }
-
     fn manager(path: &std::path::Path) -> AccountManager {
         AccountManager::load(path).unwrap()
     }
@@ -258,7 +332,7 @@ model = "claude-4"
         let path = dir.path().join("accounts.toml");
         let mut mgr = manager(&path);
 
-        mgr.add(config("prod")).unwrap();
+        mgr.add(AccountConfig::simple("prod", "openai")).unwrap();
         assert!(mgr.contains("prod"));
         assert_eq!(mgr.get("prod").unwrap().provider, "openai");
     }
@@ -269,8 +343,8 @@ model = "claude-4"
         let path = dir.path().join("accounts.toml");
         let mut mgr = manager(&path);
 
-        mgr.add(config("dup")).unwrap();
-        let err = mgr.add(config("dup")).unwrap_err();
+        mgr.add(AccountConfig::simple("dup", "openai")).unwrap();
+        let err = mgr.add(AccountConfig::simple("dup", "openai")).unwrap_err();
         assert!(err.contains("already exists"), "{err}");
     }
 
@@ -280,7 +354,7 @@ model = "claude-4"
         let path = dir.path().join("accounts.toml");
         let mut mgr = manager(&path);
 
-        mgr.add(config("temp")).unwrap();
+        mgr.add(AccountConfig::simple("temp", "openai")).unwrap();
         assert!(mgr.contains("temp"));
         mgr.remove("temp").unwrap();
         assert!(!mgr.contains("temp"));
@@ -302,9 +376,9 @@ model = "claude-4"
         let path = dir.path().join("accounts.toml");
         let mut mgr = manager(&path);
 
-        mgr.add(config("zebra")).unwrap();
-        mgr.add(config("alpha")).unwrap();
-        mgr.add(config("omega")).unwrap();
+        mgr.add(AccountConfig::simple("zebra", "openai")).unwrap();
+        mgr.add(AccountConfig::simple("alpha", "openai")).unwrap();
+        mgr.add(AccountConfig::simple("omega", "openai")).unwrap();
 
         let first = mgr.first().unwrap();
         assert_eq!(first.name, "alpha");
@@ -316,8 +390,8 @@ model = "claude-4"
         let path = dir.path().join("accounts.toml");
         let mut mgr = manager(&path);
 
-        mgr.add(config("z")).unwrap();
-        mgr.add(config("a")).unwrap();
+        mgr.add(AccountConfig::simple("z", "openai")).unwrap();
+        mgr.add(AccountConfig::simple("a", "openai")).unwrap();
         let list = mgr.list(&std::collections::HashSet::new());
         assert_eq!(list[0].name, "a");
         assert_eq!(list[1].name, "z");
@@ -329,8 +403,8 @@ model = "claude-4"
         let path = dir.path().join("accounts.toml");
         let mut mgr = manager(&path);
 
-        mgr.add(config("has_it")).unwrap();
-        mgr.add(config("missing")).unwrap();
+        mgr.add(AccountConfig::simple("has_it", "openai")).unwrap();
+        mgr.add(AccountConfig::simple("missing", "openai")).unwrap();
 
         let mut credentialed = std::collections::HashSet::new();
         credentialed.insert("has_it".to_string());
@@ -352,8 +426,8 @@ model = "claude-4"
         let path = dir.path().join("accounts.toml");
         let mut mgr = manager(&path);
 
-        mgr.add(config("b")).unwrap();
-        mgr.add(config("a")).unwrap();
+        mgr.add(AccountConfig::simple("b", "openai")).unwrap();
+        mgr.add(AccountConfig::simple("a", "openai")).unwrap();
         let configs = mgr.all_configs();
         assert_eq!(configs[0].name, "a");
         assert_eq!(configs[1].name, "b");
@@ -365,7 +439,7 @@ model = "claude-4"
         let path = dir.path().join("accounts.toml");
         {
             let mut mgr = manager(&path);
-            mgr.add(config("persist")).unwrap();
+            mgr.add(AccountConfig::simple("persist", "openai")).unwrap();
         }
         let mgr = manager(&path);
         assert!(mgr.contains("persist"));
@@ -373,16 +447,7 @@ model = "claude-4"
 
     #[test]
     fn to_info_roundtrip() {
-        let cfg = AccountConfig {
-            name: "test".to_string(),
-            provider: "openai".to_string(),
-            base_url: None,
-            streaming: None,
-            stream_options: None,
-            retry_max_attempts: None,
-            connect_timeout_secs: None,
-            request_timeout_secs: None,
-        };
+        let cfg = AccountConfig::simple("test", "openai");
         let info = cfg.to_info(true);
         assert_eq!(info.name, "test");
         assert_eq!(info.provider, "openai");
@@ -393,14 +458,20 @@ model = "claude-4"
     fn apply_overrides() {
         let mut svc_config = crate::openai::ServiceConfig::default();
         let cfg = AccountConfig {
-            name: "ovr".to_string(),
-            provider: "openai".to_string(),
             base_url: Some("https://custom.api.com/v1".to_string()),
             streaming: Some(false),
-            stream_options: None,
             retry_max_attempts: Some(5),
             connect_timeout_secs: Some(30),
             request_timeout_secs: Some(120),
+            model_list_path: Some("/v2/models".to_string()),
+            responses_path: Some("/v2/responses".to_string()),
+            chat_completions_path: Some("/v2/chat".to_string()),
+            default_request_format: Some(crate::openai::RequestFormat::Responses),
+            chat_completions_max_tokens: Some(2048),
+            chat_completions_max_tokens_field: Some(crate::openai::MaxTokensField::MaxTokens),
+            retry_initial_backoff_ms: Some(500),
+            retry_max_backoff_ms: Some(60000),
+            ..AccountConfig::simple("ovr", "openai")
         };
         cfg.apply_overrides(&mut svc_config);
         assert_eq!(svc_config.base_url, "https://custom.api.com/v1");
@@ -408,5 +479,19 @@ model = "claude-4"
         assert_eq!(svc_config.retry_max_attempts, 5);
         assert_eq!(svc_config.connect_timeout_secs, 30);
         assert_eq!(svc_config.request_timeout_secs, 120);
+        assert_eq!(svc_config.model_list_path, "/v2/models");
+        assert_eq!(svc_config.responses_path, "/v2/responses");
+        assert_eq!(svc_config.chat_completions_path, "/v2/chat");
+        assert_eq!(
+            svc_config.default_request_format,
+            crate::openai::RequestFormat::Responses
+        );
+        assert_eq!(svc_config.chat_completions_max_tokens, Some(2048));
+        assert_eq!(
+            svc_config.chat_completions_max_tokens_field,
+            crate::openai::MaxTokensField::MaxTokens
+        );
+        assert_eq!(svc_config.retry_initial_backoff_ms, 500);
+        assert_eq!(svc_config.retry_max_backoff_ms, 60000);
     }
 }

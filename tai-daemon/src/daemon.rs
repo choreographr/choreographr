@@ -672,14 +672,12 @@ impl DaemonState {
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     ) {
         let config = AccountConfig {
-            name: name.clone(),
-            provider: provider.clone(),
             base_url,
             streaming,
-            stream_options: None,
             retry_max_attempts,
             connect_timeout_secs,
             request_timeout_secs,
+            ..AccountConfig::simple(&name, &provider)
         };
         let result = self.accounts.add(config);
         match &result {
@@ -819,17 +817,10 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
     // If no accounts configured but an "openai" credential exists, create a
     // default account automatically so the user doesn't have to set one up.
     if state.accounts.is_empty() && state.credentials.contains_key("openai") {
-        let default_config = AccountConfig {
-            name: "default".to_string(),
-            provider: "openai".to_string(),
-            base_url: None,
-            streaming: None,
-            stream_options: None,
-            retry_max_attempts: None,
-            connect_timeout_secs: None,
-            request_timeout_secs: None,
-        };
-        let _ = state.accounts.add(default_config);
+        let default_config = AccountConfig::simple("default", "openai");
+        if let Err(e) = state.accounts.add(default_config) {
+            tracing::warn!("failed to create default account: {e}");
+        }
     }
 
     let account_names: Vec<String> = state
