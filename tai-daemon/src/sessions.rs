@@ -683,8 +683,24 @@ fn handle_cancel(request_id: u32, state: &mut SessionState, ctx: &RequestContext
 }
 
 /// Set the model for this session and broadcast the change.
+/// Rejects invalid model names by broadcasting `ModelSelectionFailed`
+/// instead of mutating state.
 fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
     info!("session {}: SetModel model={}", ctx.session_id, model);
+
+    // Validate the model against the provider's model list before accepting it.
+    if let Err(msg) = validate_model_via_daemon(&model, ctx) {
+        warn!(
+            "session {}: model '{model}' rejected: {msg}",
+            ctx.session_id
+        );
+        broadcast(
+            &state.subscribers,
+            DaemonMessage::ModelSelectionFailed { model, error: msg },
+        );
+        return false;
+    }
+
     state.config.selected_model = Some(model.clone());
     debug!(
         "session {}: broadcasting ModelSelected model={}",
@@ -701,6 +717,42 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         metadata: SessionMetadata::from(&*state),
     });
     false
+}
+
+/// Ask the daemon whether `model` is valid for this session's account.
+/// Returns `Ok(())` if valid, `Err(reason)` if invalid.
+/// If the daemon is unreachable or the model list is unavailable the
+/// model is allowed through (`Ok(())`).
+fn validate_model_via_daemon(model: &str, ctx: &RequestContext) -> Result<(), String> {
+    let (reply, rx) = mpsc::channel();
+    if ctx
+        .daemon_tx
+        .send(DaemonCommand::ValidateModel {
+            session_id: ctx.session_id,
+            model: model.to_string(),
+            reply,
+        })
+        .is_err()
+    {
+        warn!(
+            "session {}: daemon disconnected during model validation for '{model}'",
+            ctx.session_id
+        );
+        return Ok(());
+    }
+
+    match rx.recv() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(msg)) => Err(msg),
+        Err(_) => {
+            warn!(
+                "session {}: daemon disconnected while waiting for model validation \
+                 of '{model}', allowing through",
+                ctx.session_id
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Update the session status and broadcast to subscribers and daemon.
@@ -1636,5 +1688,108 @@ mod tests {
             }
             other => panic!("expected SessionState, got {other:?}"),
         }
+    }
+
+    // -- SetModel validation tests ----------------------------------------
+
+    /// Spawn a daemon handler that replies to ValidateModel with either
+    /// Ok(()) or an error, then drains the rest of the channel.
+    fn spawn_daemon_handler(
+        daemon_rx: mpsc::Receiver<DaemonCommand>,
+        accept: bool,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            if let Ok(DaemonCommand::ValidateModel { reply, .. }) = daemon_rx.recv() {
+                if accept {
+                    let _ = reply.send(Ok(()));
+                } else {
+                    let _ = reply.send(Err("not available".into()));
+                }
+            }
+            // Drain remaining commands so the sender doesn't get
+            // disconnected errors (UpdateMetadata etc.).
+            while daemon_rx.recv().is_ok() {}
+        })
+    }
+
+    #[test]
+    fn handle_set_model_rejected_by_daemon_broadcasts_failure() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let tool_registry = ToolRegistry::new().build();
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+        let daemon = spawn_daemon_handler(daemon_rx, false);
+
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db,
+            tool_registry,
+            daemon_tx,
+            max_turns_default: 25,
+        };
+
+        let (sub_tx, sub_rx) = mpsc::channel();
+        let mut state = test_state();
+        state.subscribers.insert(10, sub_tx);
+
+        handle_set_model("invalid-model".into(), &mut state, &ctx);
+
+        // Should broadcast ModelSelectionFailed
+        let msg = sub_rx.recv().unwrap();
+        match msg {
+            DaemonMessage::ModelSelectionFailed { model, error } => {
+                assert_eq!(model, "invalid-model");
+                assert_eq!(error, "not available");
+            }
+            other => panic!("expected ModelSelectionFailed, got {other:?}"),
+        }
+
+        // Model should NOT be changed from original
+        assert_eq!(state.config.selected_model.as_deref(), Some("gpt-4"));
+
+        drop(ctx);
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn handle_set_model_accepted_by_daemon_updates_model() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let tool_registry = ToolRegistry::new().build();
+        let (daemon_tx, daemon_rx) = mpsc::channel();
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+        let daemon = spawn_daemon_handler(daemon_rx, true);
+
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db,
+            tool_registry,
+            daemon_tx,
+            max_turns_default: 25,
+        };
+
+        let (sub_tx, sub_rx) = mpsc::channel();
+        let mut state = test_state();
+        state.subscribers.insert(10, sub_tx);
+
+        handle_set_model("gpt-5".into(), &mut state, &ctx);
+
+        // Should broadcast ModelSelected
+        let msg = sub_rx.recv().unwrap();
+        match msg {
+            DaemonMessage::ModelSelected { model } => {
+                assert_eq!(model, "gpt-5");
+            }
+            other => panic!("expected ModelSelected, got {other:?}"),
+        }
+
+        // Model should be updated
+        assert_eq!(state.config.selected_model.as_deref(), Some("gpt-5"));
+
+        drop(ctx);
+        daemon.join().unwrap();
     }
 }

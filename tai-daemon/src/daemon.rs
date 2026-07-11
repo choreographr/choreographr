@@ -134,6 +134,11 @@ pub enum DaemonCommand {
         name: String,
         reply: std::sync::mpsc::Sender<bool>,
     },
+    ValidateModel {
+        session_id: u64,
+        model: String,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
 }
 
 impl DaemonState {
@@ -227,6 +232,11 @@ impl DaemonState {
                 self.handle_resolve_provider(account, reply)
             }
             DaemonCommand::AccountExists { name, reply } => self.handle_account_exists(name, reply),
+            DaemonCommand::ValidateModel {
+                session_id,
+                model,
+                reply,
+            } => self.handle_validate_model(session_id, model, reply),
             DaemonCommand::Shutdown => {
                 warn!("unexpected Shutdown command in handle_command; handled at loop level");
             }
@@ -293,11 +303,18 @@ impl DaemonState {
 
     /// Try to resolve an `InferenceProvider` for the given account name using
     /// the stored credential.  Silently ignores missing credentials or config.
-    fn resolve_account_provider(&mut self, name: &str, api_key: Option<String>) {
+    /// Resolve the provider for `name` and pre-fetch the model list so
+    /// SetModel doesn't wait on an HTTP round-trip through the event loop.
+    /// Returns `true` if a provider was successfully created and cached.
+    fn resolve_account_provider(&mut self, name: &str, api_key: Option<String>) -> bool {
         if let Some(config) = self.accounts.get(name)
             && let Ok(provider) = InferenceProvider::from_account_config(config, api_key)
         {
+            fetch_and_cache_models(self, name, &provider);
             self.providers.insert(name.to_string(), provider);
+            true
+        } else {
+            false
         }
     }
 
@@ -550,13 +567,10 @@ impl DaemonState {
                     self.x_credentials = Some(cred.clone());
                 }
                 self.credentials.insert(service.clone(), cred.clone());
-                // Resolve provider for any account matching this service name
-                if let ServiceCredential::ApiKey { key: api_key } = &cred
-                    && let Some(config) = self.accounts.get(&service)
-                    && let Ok(provider) =
-                        InferenceProvider::from_account_config(config, Some(api_key.clone()))
-                {
-                    self.providers.insert(service.clone(), provider);
+                // Resolve provider (and pre-fetch models) for any account
+                // matching this service name.
+                if let ServiceCredential::ApiKey { key: api_key } = &cred {
+                    self.resolve_account_provider(&service, Some(api_key.clone()));
                 }
             }
         }
@@ -588,6 +602,67 @@ impl DaemonState {
         debug!("ListModels: session_id={:?}", session_id);
         let result = handle_list_models_inner(self, session_id);
         let _ = reply.send(result);
+    }
+
+    /// Validate that a model exists in the provider's model list for this
+    /// session's account.  The model list is pre-populated by
+    /// `fetch_and_cache_models` at provider-resolution time (unlock, credential
+    /// save, account add).  If no cached data exists (fetch failed or provider
+    /// was just resolved without a successful fetch) the model is allowed
+    /// through — we'd rather fail at inference time than reject a potentially
+    /// valid model we couldn't verify.
+    fn handle_validate_model(
+        &mut self,
+        session_id: u64,
+        model: String,
+        reply: mpsc::Sender<Result<(), String>>,
+    ) {
+        debug!("ValidateModel: session_id={}, model={}", session_id, model);
+
+        let Some(account_name) = self
+            .session_metadata
+            .get(&session_id)
+            .and_then(|m| m.account_name.clone())
+        else {
+            debug!(
+                "ValidateModel: no session or no account attached, \
+                 allowing model '{model}' through"
+            );
+            let _ = reply.send(Ok(()));
+            return;
+        };
+
+        // No provider for this account → cannot validate, allow through.
+        if !self.providers.contains_key(&account_name) {
+            debug!(
+                "ValidateModel: no provider for account '{account_name}', \
+                 allowing model '{model}' through"
+            );
+            let _ = reply.send(Ok(()));
+            return;
+        }
+
+        // Check the cache.  If missing (fetch failed earlier) or empty,
+        // allow through rather than reject a potentially valid model.
+        match self.model_cache.get(&account_name) {
+            Some((cached_models, _cached_at)) if !cached_models.is_empty() => {
+                if cached_models.contains(&model) {
+                    let _ = reply.send(Ok(()));
+                } else {
+                    let available = cached_models.join(", ");
+                    let _ = reply.send(Err(format!(
+                        "model '{model}' not found. Available: {available}"
+                    )));
+                }
+            }
+            _ => {
+                debug!(
+                    "ValidateModel: no cached models for account '{account_name}', \
+                     allowing model '{model}' through"
+                );
+                let _ = reply.send(Ok(()));
+            }
+        }
     }
 
     /// Get the API key for a stored credential (returns None if not found).
@@ -694,7 +769,7 @@ impl DaemonState {
             ),
         }
         // If account was added and there's a matching credential,
-        // resolve the provider immediately.
+        // resolve the provider immediately (which also pre-fetches models).
         if result.is_ok()
             && let Some(ServiceCredential::ApiKey { key }) = self.credentials.get(&name)
         {
@@ -844,8 +919,7 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
             api_key.is_some(),
             state.credentials.contains_key(&config.name)
         );
-        if let Ok(provider) = InferenceProvider::from_account_config(&config, api_key) {
-            state.providers.insert(config.name.clone(), provider);
+        if state.resolve_account_provider(&config.name, api_key) {
             info!("Unlock: provider resolved for account '{}'", config.name);
         } else {
             info!(
@@ -861,6 +935,35 @@ fn handle_unlock_inner(state: &mut DaemonState, private_key: Vec<u8>) -> io::Res
 
     key.zeroize();
     Ok(())
+}
+
+/// Eagerly fetch the model list for `provider` and cache it under
+/// `account_name`.  If the fetch fails (network, API error, etc.) we
+/// simply log a warning — callers will fall through to their allow-on-error
+/// path or attempt an on-demand fetch (see `handle_list_models_inner`).
+fn fetch_and_cache_models(
+    state: &mut DaemonState,
+    account_name: &str,
+    provider: &InferenceProvider,
+) {
+    match provider.list_models() {
+        Ok(models) => {
+            debug!(
+                "cached {} models for account '{}'",
+                models.len(),
+                account_name
+            );
+            state
+                .model_cache
+                .insert(account_name.to_string(), (models, Instant::now()));
+        }
+        Err(e) => {
+            warn!(
+                "failed to fetch model list for account '{}': {e}",
+                account_name
+            );
+        }
+    }
 }
 
 fn handle_list_models_inner(
@@ -1162,5 +1265,48 @@ mod tests {
         state.broadcast(DaemonMessage::SessionDeleted { session_id: 42 });
         // Dead subscriber should be removed
         assert!(!state.summary_subscribers.contains_key(&1));
+    }
+
+    #[test]
+    fn handle_validate_model_allows_through_when_no_session() {
+        let (mut state, _rx) = make_daemon_state();
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::ValidateModel {
+            session_id: 999,
+            model: "gpt-4".into(),
+            reply,
+        });
+        let result = rx.recv().unwrap();
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn handle_validate_model_allows_through_when_no_provider() {
+        let (mut state, _rx) = make_daemon_state();
+        state.session_metadata.insert(
+            1,
+            SessionMetadata {
+                title: None,
+                selected_model: None,
+                reasoning_effort: None,
+                parent_session_id: None,
+                cwd: None,
+                created_at: 1000,
+                message_count: 0,
+                max_turns: None,
+                status: SessionStatus::Sleeping,
+                active_tool_groups: vec![],
+                account_name: Some("nonexistent".into()),
+                accumulated_usage: TokenUsage::default(),
+            },
+        );
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::ValidateModel {
+            session_id: 1,
+            model: "gpt-4".into(),
+            reply,
+        });
+        let result = rx.recv().unwrap();
+        assert_eq!(result, Ok(()));
     }
 }
