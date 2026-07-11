@@ -1,10 +1,12 @@
 use crate::render::{mouse_in_history_box, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    AIProvidersView, App, HOME_MENU_ITEMS, HomeMenuItem, InputBuffer, NewAccountField,
-    PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent,
+    AIProvidersView, App, HOME_MENU_ITEMS, HomeMenuItem, InputBuffer, PAGE_SCROLL_LINES, Page,
+    SessionManagerView, UiEvent,
 };
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use signal_hook::consts::SIGINT;
 use std::sync::{
@@ -20,6 +22,7 @@ use tai_client_core::{
 use tai_keystore::ensure_keypair;
 use tai_proto::{ClientMessage, DaemonMessage, socket_path};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
+use tui_prompts::State;
 
 const UI_EVENT_CHANNEL_SIZE: usize = 4096;
 const UI_FRAME_POLL_MS: u64 = 16;
@@ -720,121 +723,125 @@ fn handle_ai_providers_new_form_key(
         return Ok(());
     }
 
-    match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
-        // Enter advances to next field, and on Done submits
-        KeyCode::Enter => {
-            match app.ai_providers.new_field {
-                NewAccountField::Name => {
-                    app.ai_providers.new_field = NewAccountField::Provider;
-                }
-                NewAccountField::Provider => {
-                    app.ai_providers.new_field = NewAccountField::ApiKey;
-                }
-                NewAccountField::ApiKey => {
-                    app.ai_providers.new_field = NewAccountField::Done;
-                }
-                NewAccountField::Done => {
-                    // Submit the new account
-                    let name = app.ai_providers.new_name.text.trim().to_string();
-
-                    if name.is_empty() {
-                        app.ai_providers.add_error = Some("Account name is required".to_string());
-                        app.ai_providers.new_field = NewAccountField::Name;
-                        return Ok(());
-                    }
-
-                    if !is_valid_account_name(&name) {
-                        app.ai_providers.add_error = Some(
-                            "account name must be lowercase alphanumeric, hyphens, or underscores"
-                                .to_string(),
-                        );
-                        app.ai_providers.new_field = NewAccountField::Name;
-                        return Ok(());
-                    }
-
-                    // Get the selected provider string
-                    let provider_idx = app.ai_providers.new_provider_idx;
-                    let provider_str = PROVIDER_OPTIONS[provider_idx].slug;
-
-                    // Collect the API key
-                    let api_key = app.ai_providers.new_api_key.text.trim().to_string();
-
-                    app.ai_providers.add_error = None;
-
-                    // Send AddAccount
-                    client_tx
-                        .send(ClientMessage::AddAccount {
-                            name: name.clone(),
-                            provider: provider_str.to_string(),
-                            base_url: None,
-                            streaming: None,
-                            retry_max_attempts: None,
-                            connect_timeout_secs: None,
-                            request_timeout_secs: None,
-                        })
-                        .map_err(broken_pipe)?;
-
-                    // If an API key was provided, send AddCredential too.
-                    // The credential is encrypted client-side and sent to
-                    // the daemon, keyed by the account name.
-                    if !api_key.is_empty() {
-                        // Use the shared helper from tai-client-core to
-                        // build and encrypt the credential message.
-                        match tai_client_core::build_add_credential_message(
-                            name.clone(),
-                            "api_key".to_string(),
-                            vec![api_key],
-                            false, // don't also unlock — just store
-                        ) {
-                            Ok(msg) => {
-                                let _ = client_tx.send(msg);
-                            }
-                            Err(e) => {
-                                app.push_text(format!("[warning] failed to encrypt API key: {e}"));
-                            }
-                        }
-                    }
-
-                    // Go back to list — the AccountAdded message will
-                    // refresh the list.
-                    app.ai_providers.leave_new_form();
-                }
-            }
-        }
-        // j/k navigate when on provider field; otherwise pass through
-        KeyCode::Char('j') | KeyCode::Down
-            if app.ai_providers.new_field == NewAccountField::Provider =>
-        {
-            let max = PROVIDER_OPTIONS.len().saturating_sub(1);
-            if app.ai_providers.new_provider_idx < max {
-                app.ai_providers.new_provider_idx += 1;
-            }
-        }
-        KeyCode::Char('k') | KeyCode::Up
-            if app.ai_providers.new_field == NewAccountField::Provider =>
-        {
-            if app.ai_providers.new_provider_idx > 0 {
-                app.ai_providers.new_provider_idx -= 1;
-            }
-        }
-        // Esc cancels back to list
-        KeyCode::Esc => {
-            app.ai_providers.leave_new_form();
-        }
-        // All other keys go to the active text field
-        _ => match app.ai_providers.new_field {
-            NewAccountField::Name => {
-                app.ai_providers.new_name.handle_key(key);
-            }
-            NewAccountField::ApiKey => {
-                app.ai_providers.new_api_key.handle_key(key);
-            }
-            _ => {}
-        },
+    // Ctrl+C -> quit (overrides everything)
+    if matches!(
+        key.code,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL)
+    ) {
+        app.should_quit = true;
+        return Ok(());
     }
+
+    // Esc -> cancel form back to list
+    if key.code == KeyCode::Esc {
+        app.ai_providers.leave_new_form();
+        return Ok(());
+    }
+
+    // Enter -> validate, advance to next field, or submit
+    if key.code == KeyCode::Enter {
+        if app.ai_providers.new_name_state.is_focused() {
+            let name = app.ai_providers.new_name_state.value().trim().to_string();
+            if name.is_empty() {
+                app.ai_providers.add_error = Some("Account name is required".to_string());
+                return Ok(());
+            }
+            if !is_valid_account_name(&name) {
+                app.ai_providers.add_error = Some(
+                    "account name must be lowercase alphanumeric, hyphens, or underscores"
+                        .to_string(),
+                );
+                return Ok(());
+            }
+            app.ai_providers.add_error = None;
+            app.ai_providers.new_name_state.blur();
+            app.ai_providers.new_provider_state.focus();
+        } else if app.ai_providers.new_provider_state.is_focused() {
+            app.ai_providers.new_provider_state.blur();
+            app.ai_providers.new_api_key_state.focus();
+        } else if app.ai_providers.new_api_key_state.is_focused() {
+            submit_new_account(app, client_tx)?;
+        }
+        return Ok(());
+    }
+
+    // Remap j/k to Up/Down when the provider field is focused, so users
+    // can navigate the SelectPrompt with the same keys as before.
+    let key = match key.code {
+        KeyCode::Char('j') if app.ai_providers.new_provider_state.is_focused() => KeyEvent {
+            code: KeyCode::Down,
+            ..key
+        },
+        KeyCode::Char('k') if app.ai_providers.new_provider_state.is_focused() => KeyEvent {
+            code: KeyCode::Up,
+            ..key
+        },
+        _ => key,
+    };
+
+    // Dispatch all other keys to the focused field's state
+    if app.ai_providers.new_name_state.is_focused() {
+        app.ai_providers.new_name_state.handle_key_event(key);
+    } else if app.ai_providers.new_provider_state.is_focused() {
+        app.ai_providers.new_provider_state.handle_key_event(key);
+    } else if app.ai_providers.new_api_key_state.is_focused() {
+        app.ai_providers.new_api_key_state.handle_key_event(key);
+    }
+
+    Ok(())
+}
+
+/// Validate the form, send AddAccount and (optionally) AddCredential
+/// messages, then return to the provider list view.
+fn submit_new_account(
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let name = app.ai_providers.new_name_state.value().trim().to_string();
+
+    let provider_idx = app.ai_providers.new_provider_state.focused_index();
+    let provider_str = PROVIDER_OPTIONS[provider_idx].slug;
+
+    let api_key = app
+        .ai_providers
+        .new_api_key_state
+        .value()
+        .trim()
+        .to_string();
+
+    app.ai_providers.add_error = None;
+
+    // Send AddAccount
+    client_tx
+        .send(ClientMessage::AddAccount {
+            name: name.clone(),
+            provider: provider_str.to_string(),
+            base_url: None,
+            streaming: None,
+            retry_max_attempts: None,
+            connect_timeout_secs: None,
+            request_timeout_secs: None,
+        })
+        .map_err(broken_pipe)?;
+
+    // If an API key was provided, encrypt and send the credential.
+    if !api_key.is_empty() {
+        match build_add_credential_message(
+            name.clone(),
+            "api_key".to_string(),
+            vec![api_key],
+            false,
+        ) {
+            Ok(msg) => {
+                let _ = client_tx.send(msg);
+            }
+            Err(e) => {
+                app.push_text(format!("[warning] failed to encrypt API key: {e}"));
+            }
+        }
+    }
+
+    app.ai_providers.leave_new_form();
     Ok(())
 }
 

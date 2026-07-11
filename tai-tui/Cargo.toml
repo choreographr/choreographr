@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 lru.workspace = true
 signal-hook.workspace = true
 chrono.workspace = true
+tui-prompts = "0.6"
 
 [dev-dependencies]
 tempfile.workspace = true

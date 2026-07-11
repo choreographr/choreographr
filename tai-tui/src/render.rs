@@ -4,8 +4,8 @@ use crate::markdown_render::{
 };
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT, NewAccountField, Page,
-    RenderedCache, SessionManagerView, history_text_height,
+    AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache,
+    SessionManagerView, history_text_height,
 };
 use ratatui::{
     Frame,
@@ -20,6 +20,9 @@ use tai_proto::SessionMessage;
 use tai_proto::SessionStatus;
 use tai_proto::ThinkingEffort;
 use tai_tui::RenderedImage;
+use tui_prompts::{
+    Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
+};
 
 pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
     let Ok((width, height)) = crossterm::terminal::size() else {
@@ -948,135 +951,55 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
     let inner = block.inner(chunks[0]);
     frame.render_widget(block, chunks[0]);
 
-    // Calculate vertical centering for the form fields
-    let form_field_count = 3; // Name, Provider (with dropdown), instruction
-    let form_height = form_field_count * 2 + PROVIDER_OPTIONS.len() + 3;
-    let top_pad = (inner.height as usize).saturating_sub(form_height) / 2;
+    // ── Form layout ──────────────────────────────────────────
+    // Each bordered TextPrompt needs 3 lines. SelectPrompt takes
+    // the remaining space so it can scroll if the terminal is
+    // too short for all provider options.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Name field
+            Constraint::Min(3),    // Provider dropdown
+            Constraint::Length(3), // API Key field
+            Constraint::Length(1), // Error line
+        ])
+        .split(inner);
 
-    let mut lines: Vec<Line> = Vec::new();
+    let border_style = Style::default().fg(Color::Cyan);
 
-    // Top padding
-    for _ in 0..top_pad {
-        lines.push(Line::from(Span::styled(String::new(), Style::default())));
-    }
+    // ── Name field ───────────────────────────────────────────
+    let name_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("Name:"))
+        .with_block(Block::bordered().border_style(border_style));
+    (&name_prompt).draw(frame, rows[0], &mut app.ai_providers.new_name_state);
 
-    let bright = Style::default().fg(Color::White).bold();
-    let dim = Style::default().fg(Color::DarkGray);
-    let input_style = Style::default().fg(Color::Cyan);
-    let selected_bg = Style::default().bg(Color::Blue).fg(Color::White);
+    // ── Provider dropdown ────────────────────────────────────
+    let options: SelectOptionList = PROVIDER_OPTIONS
+        .iter()
+        .map(|p| SelectOption::new(p.display_name))
+        .collect::<Vec<_>>()
+        .into();
+    let provider_prompt = SelectPrompt::new(std::borrow::Cow::Borrowed("Provider:"), options);
+    provider_prompt.draw(frame, rows[1], &mut app.ai_providers.new_provider_state);
 
-    // ── Name field ────────────────────────────────────────────
-    let is_name_active = app.ai_providers.new_field == NewAccountField::Name;
-    let label_style = if is_name_active { bright } else { dim };
-    lines.push(Line::from(Span::styled("  Name:", label_style)));
-    let prefix = if is_name_active { "> " } else { "  " };
-    let text = &app.ai_providers.new_name.text;
-    let cursor = app.ai_providers.new_name.cursor;
-    let display = if text.is_empty() {
-        prefix.to_string()
-    } else {
-        format!("{prefix}{text}")
-    };
-    lines.push(Line::from(Span::styled(
-        display,
-        if is_name_active { input_style } else { dim },
-    )));
-    let name_input_line = lines.len() as u16 - 1;
-    lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    // ── API Key field ────────────────────────────────────────
+    let key_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("API Key:"))
+        .with_block(Block::bordered().border_style(border_style))
+        .with_render_style(TextRenderStyle::Password);
+    (&key_prompt).draw(frame, rows[2], &mut app.ai_providers.new_api_key_state);
 
-    // ── Provider dropdown ─────────────────────────────────────
-    let is_provider_active = app.ai_providers.new_field == NewAccountField::Provider;
-    let label_style = if is_provider_active { bright } else { dim };
-    lines.push(Line::from(Span::styled("  Provider:", label_style)));
-    for (i, option) in PROVIDER_OPTIONS.iter().enumerate() {
-        let is_selected = i == app.ai_providers.new_provider_idx;
-        let bullet = if is_selected { "◉" } else { "○" };
-        let row_style = if is_provider_active && is_selected {
-            selected_bg
-        } else if is_provider_active {
-            dim
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        lines.push(Line::from(Span::styled(
-            format!("    {bullet} {}", option.display_name),
-            row_style,
-        )));
-    }
-    lines.push(Line::from(Span::styled(String::new(), Style::default())));
-
-    // ── API Key field ─────────────────────────────────────────
-    let is_key_active = app.ai_providers.new_field == NewAccountField::ApiKey;
-    let label_style = if is_key_active { bright } else { dim };
-    lines.push(Line::from(Span::styled("  API Key:", label_style)));
-    let prefix = if is_key_active { "> " } else { "  " };
-    let key_text = &app.ai_providers.new_api_key.text;
-    let key_cursor = app.ai_providers.new_api_key.cursor;
-    let masked = if key_text.is_empty() {
-        String::new()
-    } else if key_text.len() > 12 {
-        format!(
-            "{}...{}",
-            &key_text[..4],
-            &key_text[key_text.len().saturating_sub(4)..]
-        )
-    } else {
-        "••••••••".to_string()
-    };
-    let display = if key_text.is_empty() {
-        prefix.to_string()
-    } else {
-        format!("{prefix}{masked}")
-    };
-    lines.push(Line::from(Span::styled(
-        display,
-        if is_key_active { input_style } else { dim },
-    )));
-    let key_input_line = lines.len() as u16 - 1;
-    lines.push(Line::from(Span::styled(String::new(), Style::default())));
-
-    // ── Done / Cancel instruction ─────────────────────────────
-    lines.push(Line::from(Span::styled(
-        "  Press Enter to advance, j/k to change provider, Esc to cancel",
-        dim,
-    )));
-
-    // ── Error message ─────────────────────────────────────────
+    // ── Error message ────────────────────────────────────────
     if let Some(ref err) = app.ai_providers.add_error {
-        lines.push(Line::from(Span::styled(
-            format!("  Error: {err}"),
-            Style::default().fg(Color::Red),
-        )));
-    }
-
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, inner);
-
-    // Set terminal cursor at the active text field's insertion point
-    if is_name_active {
-        set_input_cursor(
-            frame,
-            inner,
-            name_input_line,
-            2,
-            app.ai_providers.new_name.text.get(..cursor).unwrap_or(""),
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  Error: {err}"),
+                Style::default().fg(Color::Red),
+            ))),
+            rows[3],
         );
-    } else if is_key_active {
-        let masked_before = if key_text.is_empty() {
-            ""
-        } else if key_cursor >= key_text.len() {
-            &masked
-        } else {
-            let pos =
-                (key_cursor as f64 / key_text.len() as f64 * masked.len() as f64).round() as usize;
-            let pos = pos.min(masked.len());
-            &masked[..pos]
-        };
-        set_input_cursor(frame, inner, key_input_line, 2, masked_before);
     }
 
     // Footer
-    let status = Paragraph::new(Line::from(" <Enter next>  <j/k provider>  <Esc cancel>"));
+    let status = Paragraph::new(Line::from(" <Enter next>  <Esc cancel>"));
     frame.render_widget(status, chunks[1]);
 }
 

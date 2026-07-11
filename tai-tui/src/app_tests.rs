@@ -7,6 +7,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Mouse
 use ratatui::text::Line;
 use tai_client_core::DaemonMessageHandler;
 use tai_proto::{ClientMessage, OutputStream};
+use tui_prompts::State;
 
 #[test]
 fn app_push_text_trims_history_to_limit() {
@@ -1743,4 +1744,355 @@ fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
         app.scroll_accumulator, 0,
         "accumulator must remain unchanged"
     );
+}
+
+// ── AI Providers new-account form (tui-prompts) ────────────
+
+fn setup_providers_new_form(app: &mut App) {
+    app.page = Page::AIProviders;
+    app.ai_providers.enter_new_form();
+}
+
+#[test]
+fn ai_providers_new_form_entering_focuses_name() {
+    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    setup_providers_new_form(&mut app);
+    assert!(app.ai_providers.new_name_state.is_focused());
+    assert!(!app.ai_providers.new_provider_state.is_focused());
+    assert!(!app.ai_providers.new_api_key_state.is_focused());
+}
+
+#[test]
+fn ai_providers_new_form_enter_advances_name_to_provider() {
+    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_form(&mut app);
+
+    // Type a valid name
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("char m");
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("char y");
+
+    // Enter to advance
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter");
+
+    assert!(!app.ai_providers.new_name_state.is_focused());
+    assert!(app.ai_providers.new_provider_state.is_focused());
+    assert!(!app.ai_providers.new_api_key_state.is_focused());
+    assert!(app.ai_providers.add_error.is_none());
+}
+
+#[test]
+fn ai_providers_new_form_enter_advances_provider_to_apikey() {
+    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_form(&mut app);
+
+    // Type name and advance
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("char a");
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter advance name");
+
+    assert!(app.ai_providers.new_provider_state.is_focused());
+
+    // Enter on provider advances to API key
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter advance provider");
+
+    assert!(!app.ai_providers.new_provider_state.is_focused());
+    assert!(app.ai_providers.new_api_key_state.is_focused());
+}
+
+#[test]
+fn ai_providers_new_form_name_validation_empty() {
+    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_form(&mut app);
+
+    // Enter on empty name should show error and stay on name
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter empty name");
+
+    assert!(
+        app.ai_providers.new_name_state.is_focused(),
+        "should stay on name field when name is empty"
+    );
+    assert_eq!(
+        app.ai_providers.add_error.as_deref(),
+        Some("Account name is required"),
+    );
+}
+
+#[test]
+fn ai_providers_new_form_name_validation_invalid() {
+    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_form(&mut app);
+
+    // Type uppercase (invalid - must be lowercase)
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("char uppercase");
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter invalid name");
+
+    assert!(
+        app.ai_providers.new_name_state.is_focused(),
+        "should stay on name field when name is invalid"
+    );
+    assert!(app.ai_providers.add_error.is_some());
+}
+
+#[test]
+fn ai_providers_new_form_esc_cancels() {
+    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_form(&mut app);
+
+    assert_eq!(app.ai_providers.view, AIProvidersView::NewForm);
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("esc cancel");
+
+    assert_eq!(app.ai_providers.view, AIProvidersView::List);
+}
+
+#[test]
+fn ai_providers_new_form_enter_on_apikey_submits() {
+    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let (tx, rx) = std::sync::mpsc::channel();
+    setup_providers_new_form(&mut app);
+
+    // Type a valid name
+    for c in "my-account".chars() {
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            &mut app,
+            &tx,
+        )
+        .expect("char");
+    }
+    // Advance to provider
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter to provider");
+    // Advance to API key
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter to apikey");
+
+    // Submit
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter submit");
+
+    // Should be back in list view
+    assert_eq!(app.ai_providers.view, AIProvidersView::List);
+    // Should have sent AddAccount
+    let msg = rx.recv().expect("AddAccount message");
+    assert_eq!(
+        msg,
+        ClientMessage::AddAccount {
+            name: "my-account".to_string(),
+            provider: "openai".to_string(),
+            base_url: None,
+            streaming: None,
+            retry_max_attempts: None,
+            connect_timeout_secs: None,
+            request_timeout_secs: None,
+        }
+    );
+}
+
+#[test]
+fn ai_providers_new_form_keys_go_to_correct_field() {
+    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_form(&mut app);
+
+    // Name is focused by default, typing 'x' goes to name
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("char x on name");
+    assert_eq!(app.ai_providers.new_name_state.value(), "x");
+    assert_eq!(app.ai_providers.new_api_key_state.value(), "");
+
+    // Advance to provider (Enter is handled by our code, not SelectState)
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter to provider");
+    assert!(app.ai_providers.new_provider_state.is_focused());
+
+    // Advance to API key
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter to apikey");
+    assert!(app.ai_providers.new_api_key_state.is_focused());
+
+    // Type in API key — goes to the API key field, not name
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("char s on apikey");
+    assert_eq!(app.ai_providers.new_api_key_state.value(), "s");
+    // The name field should not receive this character (still has "x")
+    assert_eq!(app.ai_providers.new_name_state.value(), "x");
+}
+
+#[test]
+fn ai_providers_new_form_jk_remapped_to_up_down_on_provider() {
+    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_form(&mut app);
+
+    // Type name and advance to provider
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("char a");
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter to provider");
+
+    assert_eq!(app.ai_providers.new_provider_state.focused_index(), 0);
+
+    // j/j should be remapped to Down by the event handler.
+    // SelectState needs options rendered to navigate; test that the
+    // event handler reaches the state (no panic, focus unchanged
+    // because option_count is 0 before rendering).
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("j on provider");
+    // j did NOT leak through as a character into any text field
+    assert_eq!(app.ai_providers.new_name_state.value(), "a");
+    assert_eq!(app.ai_providers.new_api_key_state.value(), "");
+
+    // On the name field, 'k' should type normally (not remapped)
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("esc cancel");
+    setup_providers_new_form(&mut app);
+    // Now on name field, type 'k' — should go into the name buffer
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("k on name");
+    assert_eq!(
+        app.ai_providers.new_name_state.value(),
+        "k",
+        "k should type into name field when not on provider"
+    );
+}
+
+#[test]
+fn ai_providers_new_form_down_up_navigates_provider() {
+    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_form(&mut app);
+
+    // Type name and advance to provider
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("char a");
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("enter to provider");
+
+    // Up/Down navigation reaches SelectState (index stays 0 because
+    // option_count is 0 before rendering, but no crash).
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("down on provider");
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("up on provider");
+    // No assertion on index — option_count is 0 before render.
+    // This test validates that Down/Up don't trigger other side effects.
 }

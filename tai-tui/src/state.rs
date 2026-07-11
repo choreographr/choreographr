@@ -18,6 +18,7 @@ use crate::markdown_render::{lines_height, session_message_lines, streaming_text
 use ratatui::text::Line;
 use ratatui_image::Resize;
 use tai_client_core::FileDiff;
+use tui_prompts::{SelectState, State, TextState};
 
 /// If the text looks like a unified diff and can be parsed successfully,
 /// return the structured diffs. Otherwise return `None`.
@@ -229,14 +230,6 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
     },
 ];
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NewAccountField {
-    Name,
-    Provider,
-    ApiKey,
-    Done,
-}
-
 /// State for the AI Provider Accounts page.
 pub(crate) struct AIProvidersState {
     pub(crate) accounts: Vec<AccountInfo>,
@@ -244,14 +237,12 @@ pub(crate) struct AIProvidersState {
     pub(crate) selection: Option<usize>,
     pub(crate) scroll: usize,
     pub(crate) confirm_remove: Option<String>,
-    /// The name being typed in the new-account form.
-    pub(crate) new_name: InputBuffer,
-    /// Index into PROVIDER_OPTIONS for the selected provider.
-    pub(crate) new_provider_idx: usize,
-    /// The API key being typed in the new-account form.
-    pub(crate) new_api_key: InputBuffer,
-    /// Which field the cursor is on.
-    pub(crate) new_field: NewAccountField,
+    /// State for the account name text prompt.
+    pub(crate) new_name_state: TextState<'static>,
+    /// State for the provider select prompt.
+    pub(crate) new_provider_state: SelectState,
+    /// State for the API key password prompt.
+    pub(crate) new_api_key_state: TextState<'static>,
     /// When set, the user is typing a credential (API key) for this account name.
     pub(crate) credential_target: Option<String>,
     /// Input buffer for typing a credential value.
@@ -269,12 +260,11 @@ impl AIProvidersState {
             selection: None,
             scroll: 0,
             confirm_remove: None,
-            new_name: InputBuffer::new(),
-            new_provider_idx: 0,
-            new_api_key: InputBuffer::new(),
+            new_name_state: TextState::default(),
+            new_provider_state: SelectState::default(),
+            new_api_key_state: TextState::default(),
             credential_target: None,
             credential_input: InputBuffer::new(),
-            new_field: NewAccountField::Name,
             add_error: None,
         }
     }
@@ -342,11 +332,12 @@ impl AIProvidersState {
     /// Enter the new-account form and reset all form fields.
     pub(crate) fn enter_new_form(&mut self) {
         self.view = AIProvidersView::NewForm;
-        self.new_name = InputBuffer::new();
-        self.new_provider_idx = 0;
-        self.new_api_key = InputBuffer::new();
-        self.new_field = NewAccountField::Name;
+        self.new_name_state = TextState::default();
+        self.new_provider_state = SelectState::default();
+        self.new_api_key_state = TextState::default();
         self.add_error = None;
+        // Focus the name field so key events are routed there.
+        self.new_name_state.focus();
     }
 
     /// Enter credential-input mode for a specific account.
@@ -366,10 +357,9 @@ impl AIProvidersState {
     /// Leave the new-account form back to the list view.
     pub(crate) fn leave_new_form(&mut self) {
         self.view = AIProvidersView::List;
-        self.new_name = InputBuffer::new();
-        self.new_provider_idx = 0;
-        self.new_api_key = InputBuffer::new();
-        self.new_field = NewAccountField::Name;
+        self.new_name_state = TextState::default();
+        self.new_provider_state = SelectState::default();
+        self.new_api_key_state = TextState::default();
         self.add_error = None;
     }
 }
