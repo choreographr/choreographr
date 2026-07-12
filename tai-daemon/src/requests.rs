@@ -9,12 +9,17 @@ use crate::providers::{
     lookup_provider,
 };
 use crate::sessions::{RequestContext, SessionCommand, SessionMetadata, SessionState};
-use crate::tools::{PreparedImage, ToolExecutionOutput, ToolResult};
+use crate::tools::context::ToolContext;
+use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata,
@@ -28,17 +33,17 @@ fn emit_prepared_image_sync(
     cmd_tx: &mpsc::Sender<SessionCommand>,
     request_id: u32,
     image_id: u32,
-    image: PreparedImage,
+    image: &PreparedImage,
 ) {
     // Safety: image.data.len() fits in u64 on all supported platforms.
     let byte_len = image.data.len() as u64;
     let metadata = ImageMetadata {
         image_id,
-        mime_type: image.mime_type,
+        mime_type: image.mime_type.clone(),
         width: image.width,
         height: image.height,
         byte_len,
-        alt: image.alt,
+        alt: image.alt.clone(),
     };
     let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::ImageStart {
         request_id,
@@ -55,6 +60,76 @@ fn emit_prepared_image_sync(
         request_id,
         image_id,
     }));
+}
+
+/// Emit a `PreparedImage` to subscribers and persist it to the database as a
+/// `DisplayedImage` message.  Used by both the serial and concurrent tool paths.
+fn emit_and_persist_image(
+    cmd_tx: &mpsc::Sender<SessionCommand>,
+    request_id: u32,
+    next_image_id: &mut u32,
+    image: PreparedImage,
+    session: &mut SessionState,
+    ctx: &RequestContext,
+) {
+    emit_prepared_image_sync(cmd_tx, request_id, *next_image_id, &image);
+    *next_image_id = next_image_id.wrapping_add(1);
+
+    let persisted = SessionMessage::DisplayedImage(DisplayedImageRecord {
+        metadata: ImageMetadata {
+            image_id: 0,
+            mime_type: image.mime_type,
+            width: image.width,
+            height: image.height,
+            byte_len: image.data.len() as u64,
+            alt: image.alt,
+        },
+        data: image.data,
+    });
+    let img_idx = session.messages().len() as u32;
+    if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, img_idx, &persisted) {
+        tracing::warn!(
+            session_id = ctx.session_id, error = %e,
+            "failed to persist displayed image",
+        );
+    }
+    session.push_message(persisted);
+}
+
+/// Spawn a forwarding thread that relays streaming output chunks to session
+/// subscribers in real time.  Exits when the output channel is disconnected
+/// (tool finished) or a kill signal is received (caller stopped waiting).
+fn spawn_forwarding_thread(
+    cmd_tx: mpsc::Sender<SessionCommand>,
+    request_id: u32,
+    call_id: String,
+    output_rx: mpsc::Receiver<Vec<u8>>,
+    kill_rx: mpsc::Receiver<()>,
+) {
+    let check_interval = Duration::from_millis(200);
+    thread::spawn(move || {
+        loop {
+            match output_rx.recv_timeout(check_interval) {
+                Ok(data) => {
+                    if cmd_tx
+                        .send(SessionCommand::Broadcast(DaemonMessage::ToolCallOutput {
+                            request_id,
+                            call_id: call_id.clone(),
+                            data,
+                        }))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => match kill_rx.try_recv() {
+                    Ok(()) | Err(TryRecvError::Disconnected) => break,
+                    Err(TryRecvError::Empty) => {}
+                },
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
 }
 
 /// Check whether a cancellation signal has been received.
@@ -89,21 +164,6 @@ fn accumulate_token_usage(
     }
 }
 
-/// Check cancellation with a cached flag for use in polling loops.
-///
-/// On the first call that detects cancellation, `was_cancelled` is set to `true`.
-/// Subsequent calls return `true` without re-checking the (now-empty) channel,
-/// since the `Receiver` only delivers the signal once.
-///
-/// Initialize `was_cancelled` to `false` before the loop and pass the same
-/// `&mut bool` on every iteration.
-pub(crate) fn is_cancelled_cached(rx: &mpsc::Receiver<()>, was_cancelled: &mut bool) -> bool {
-    if !*was_cancelled {
-        *was_cancelled = rx.try_recv().is_ok();
-    }
-    *was_cancelled
-}
-
 fn refresh_session_context(
     session: &mut SessionState,
     cwd: &Path,
@@ -126,6 +186,160 @@ fn refresh_session_context(
         session.config.context_file_paths =
             new_bundle.files.iter().map(|f| f.path.clone()).collect();
     }
+}
+
+/// Resolve the execution timeout for a tool by name.
+///
+/// Returns `None` for sub-sessions (run indefinitely) and `Some(duration)`
+/// for all other tools so that hanging tools are eventually killed.
+fn determine_tool_timeout(name: &str) -> Option<Duration> {
+    if name == "spawn_subsession" {
+        // Sub-sessions run their own agent loop which may need many
+        // turns across multiple LLM calls — no wall-clock timeout.
+        None
+    } else if matches!(name, "sh" | "nushell" | "fish" | "exec") {
+        // Shell commands may involve compilation, tests, or long-running
+        // processes that need more time than the default.
+        Some(Duration::from_secs(300))
+    } else {
+        Some(Duration::from_secs(60))
+    }
+}
+
+/// Aggregated result of a single concurrent tool execution, including any
+/// image the tool emitted through its streaming channel.
+struct ToolHandle {
+    tool_call: ChatToolCall,
+    output: ToolExecutionOutput,
+    image: Option<PreparedImage>,
+}
+
+/// Parameters for spawning a single concurrent tool call.
+struct SpawnToolArgs {
+    tool_call: ChatToolCall,
+    timeout: Option<Duration>,
+    request_id: u32,
+    registry: Arc<ToolRegistry>,
+    cmd_tx: mpsc::Sender<SessionCommand>,
+    x_credentials: Option<ServiceCredential>,
+    cwd: Option<PathBuf>,
+    ctx: ToolContext,
+}
+
+/// Spawn a single tool call on a dedicated thread with its own forwarding
+/// channel, timeout guard, and image drain.
+///
+/// The returned `JoinHandle` lets the caller collect results in whatever
+/// order they choose — the spawned thread handles all channel wiring,
+/// timeouts, and error recording internally.
+fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
+    let SpawnToolArgs {
+        tool_call,
+        timeout,
+        request_id,
+        registry,
+        cmd_tx,
+        x_credentials,
+        cwd,
+        ctx,
+    } = args;
+    // Channel for the execution thread to deliver its final result.
+    let (result_tx, result_rx) = mpsc::channel::<ToolExecutionOutput>();
+
+    // Channel for streaming output forwarded to subscribers in real time.
+    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+
+    // Kill signal for the forwarding thread — sent when we're done waiting.
+    let (kill_tx, kill_rx) = mpsc::channel::<()>();
+
+    // Image channel — the tool may emit one image during execution.
+    let (image_tx, image_rx) = mpsc::channel::<PreparedImage>();
+
+    // ── Forwarding thread ──────────────────────────────────────────
+    //
+    // Forwards streaming output chunks to subscribers as they arrive.
+    // Exits when the output channel is disconnected (tool finished) or
+    // a kill signal is received (we stopped waiting).
+    spawn_forwarding_thread(cmd_tx, request_id, tool_call.id.clone(), output_rx, kill_rx);
+
+    // ── Execution thread ───────────────────────────────────────────
+    let tc = tool_call.clone();
+    let tr = registry;
+    let xc = x_credentials;
+    let c = cwd;
+    let tool_ctx = ctx;
+    thread::spawn(move || {
+        let result = tr.execute_streaming(
+            &tc,
+            output_tx,
+            xc.as_ref(),
+            c.as_deref(),
+            Some(&tool_ctx),
+            Some(image_tx),
+        );
+        let _ = result_tx.send(result);
+    });
+
+    // ── Wait loop ──────────────────────────────────────────────────
+    //
+    // Two modes:
+    //   Some(dur) — bounded wait with deadline; returns error on timeout.
+    //   None      — unbounded wait; blocks until the tool completes.
+    let deadline = timeout.map(|d| Instant::now() + d);
+    let check_interval = Duration::from_millis(200);
+    thread::spawn(move || {
+        let output = loop {
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break ToolExecutionOutput {
+                        result: ToolResult {
+                            content: format!("tool '{}' timed out", tool_call.name,),
+                            is_error: true,
+                        },
+                    };
+                }
+                match result_rx.recv_timeout(remaining.min(check_interval)) {
+                    Ok(output) => break output,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        break ToolExecutionOutput {
+                            result: ToolResult {
+                                content: "tool execution thread panicked".to_string(),
+                                is_error: true,
+                            },
+                        };
+                    }
+                }
+            } else {
+                // No timeout — block indefinitely until the tool finishes.
+                match result_rx.recv() {
+                    Ok(output) => break output,
+                    Err(_) => {
+                        break ToolExecutionOutput {
+                            result: ToolResult {
+                                content: "tool execution thread panicked".to_string(),
+                                is_error: true,
+                            },
+                        };
+                    }
+                }
+            }
+        };
+
+        // Drain any image that was emitted during execution.
+        let image = image_rx.try_recv().ok();
+
+        // Signal the forwarding thread to stop — we have our result and
+        // won't be streaming any more output from this tool call.
+        let _ = kill_tx.send(());
+
+        ToolHandle {
+            tool_call,
+            output,
+            image,
+        }
+    })
 }
 
 pub(crate) fn run_agent_loop(
@@ -258,7 +472,21 @@ pub(crate) fn run_agent_loop(
                 let token_usage = tool_use.usage.clone();
                 accumulate_token_usage(session, &token_usage, turn, ctx);
                 persist_assistant_tool_use_sync(session, &tool_use, token_usage, ctx);
-                for tool_call in tool_use.tool_calls {
+
+                // Partition tool calls into two groups:
+                //   mutators  — tools that need &mut SessionState or deep
+                //               coupling with the agent loop (load_tools,
+                //               unload_tools).
+                //   concurrent — everything else (run_riscv, shell,
+                //               filesystem, etc.) that can run on
+                //               independent OS threads.
+                let (mutators, concurrent): (Vec<_>, Vec<_>) = tool_use
+                    .tool_calls
+                    .into_iter()
+                    .partition(|tc| matches!(tc.name.as_str(), "load_tools" | "unload_tools"));
+
+                // ── Phase 1: Session-mutating tools (serial) ────────
+                for tool_call in mutators {
                     if is_cancelled_once(cancel_rx) {
                         return Ok(true);
                     }
@@ -272,17 +500,9 @@ pub(crate) fn run_agent_loop(
                         },
                     ));
 
-                    let tool_timeout = if tool_call.name == "spawn_subsession" {
-                        Duration::from_secs(120)
-                    } else if tool_call.name == "sh"
-                        || tool_call.name == "nushell"
-                        || tool_call.name == "fish"
-                        || tool_call.name == "exec"
-                    {
-                        Duration::from_secs(300)
-                    } else {
-                        Duration::from_secs(60)
-                    };
+                    // Meta-tools always have a timeout (load/unload are fast).
+                    let tool_timeout =
+                        determine_tool_timeout(&tool_call.name).unwrap_or(Duration::from_secs(60));
 
                     if ctx
                         .cmd_tx
@@ -300,10 +520,9 @@ pub(crate) fn run_agent_loop(
                         tool_name = %tool_call.name,
                         tool_call_id = %tool_call.id,
                         args_preview = %(&tool_call.arguments_json[..tool_call.arguments_json.len().min(200)]),
-                        "executing tool",
+                        "executing tool (serial)",
                     );
 
-                    let tool_start = std::time::Instant::now();
                     let (image_tx, image_rx) = mpsc::channel::<PreparedImage>();
                     let mut output = execute_tool_with_timeout(
                         &tool_call,
@@ -311,69 +530,172 @@ pub(crate) fn run_agent_loop(
                         cwd,
                         tool_timeout,
                         request_id,
-                        client,
                         session,
-                        model,
                         cancel_rx,
                         ctx,
                         Some(image_tx),
                     );
 
-                    let elapsed = tool_start.elapsed();
-                    debug!(
-                        session_id = ctx.session_id,
-                        turn,
-                        tool_name = %tool_call.name,
-                        tool_call_id = %tool_call.id,
-                        elapsed_ms = elapsed.as_millis(),
-                        result_len = output.result.content.len(),
-                        is_error = output.result.is_error,
-                        "tool finished",
-                    );
-
-                    // Drain any image emitted by the tool through the channel.
+                    // Drain any image emitted by the tool.
                     if let Ok(image) = image_rx.try_recv() {
-                        emit_prepared_image_sync(
+                        emit_and_persist_image(
                             &ctx.cmd_tx,
                             request_id,
-                            next_image_id,
-                            PreparedImage {
-                                mime_type: image.mime_type.clone(),
-                                data: image.data.clone(),
-                                width: image.width,
-                                height: image.height,
-                                alt: image.alt.clone(),
-                            },
+                            &mut next_image_id,
+                            image,
+                            session,
+                            ctx,
                         );
-                        next_image_id = next_image_id.wrapping_add(1);
-
-                        let persisted = SessionMessage::DisplayedImage(DisplayedImageRecord {
-                            metadata: ImageMetadata {
-                                image_id: 0,
-                                mime_type: image.mime_type,
-                                width: image.width,
-                                height: image.height,
-                                byte_len: image.data.len() as u64,
-                                alt: image.alt,
-                            },
-                            data: image.data,
-                        });
-                        let img_idx = session.messages().len() as u32;
-                        if let Err(e) = write_message_retry(
-                            ctx.db.as_ref(),
-                            ctx.session_id,
-                            img_idx,
-                            &persisted,
-                        ) {
-                            tracing::warn!(
-                                session_id = ctx.session_id, error = %e,
-                                "failed to persist displayed image",
-                            );
-                        }
-                        session.push_message(persisted);
                     }
 
                     finish_tool_call(request_id, session, &tool_call, &mut output, ctx);
+                }
+
+                // ── Phase 2: All remaining tools (concurrent) ───────
+                if !concurrent.is_empty() {
+                    // Broadcast all ToolCallStarted events before any tool
+                    // begins execution so subscribers see the full batch.
+                    for tc in &concurrent {
+                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                            DaemonMessage::ToolCallStarted {
+                                request_id,
+                                call_id: tc.id.clone(),
+                                tool_name: tc.name.clone(),
+                                arguments_json: tc.arguments_json.clone(),
+                            },
+                        ));
+                    }
+
+                    if ctx
+                        .cmd_tx
+                        .send(SessionCommand::StatusChanged(SessionStatus::ToolCall(
+                            "(parallel)".into(),
+                        )))
+                        .is_err()
+                    {
+                        return Ok(false);
+                    }
+
+                    debug!(
+                        session_id = ctx.session_id,
+                        turn,
+                        count = concurrent.len(),
+                        "dispatching {} tools concurrently",
+                        concurrent.len(),
+                    );
+
+                    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+                    let tool_ctx = ToolContext {
+                        session_id: ctx.session_id,
+                        db: Arc::clone(&ctx.db),
+                        daemon_tx: ctx.daemon_tx.clone(),
+                        active_tool_groups: session.config.active_tool_groups.clone(),
+                        reasoning_effort: session.config.reasoning_effort,
+                        cwd: cwd.map(|p| p.to_path_buf()),
+                        cancelled: Arc::clone(&cancel_flag),
+                    };
+
+                    let cmd_tx = ctx.cmd_tx.clone();
+                    let reg = Arc::clone(&ctx.tool_registry);
+
+                    // Pair each tool's identifying info with its thread handle
+                    // so we can reconstruct a meaningful error if the thread
+                    // panics (avoiding expect() in production code per AGENTS.md).
+                    let handles: Vec<_> = concurrent
+                        .into_iter()
+                        .map(|tool_call| {
+                            let timeout = determine_tool_timeout(&tool_call.name);
+                            let call_info = (
+                                tool_call.id.clone(),
+                                tool_call.name.clone(),
+                                tool_call.arguments_json.clone(),
+                                Instant::now(),
+                            );
+                            let handle = spawn_single_tool(SpawnToolArgs {
+                                tool_call,
+                                timeout,
+                                request_id,
+                                registry: Arc::clone(&reg),
+                                cmd_tx: cmd_tx.clone(),
+                                x_credentials: None,
+                                cwd: cwd.map(|p| p.to_path_buf()),
+                                ctx: tool_ctx.clone(),
+                            });
+                            (call_info, handle)
+                        })
+                        .collect();
+
+                    // Collect results in source-call order so the LLM sees
+                    // a deterministic conversation history.
+                    //
+                    // Between each join we check the parent cancellation
+                    // channel.  If cancelled we propagate to all in-flight
+                    // tools via the shared AtomicBool — the flag is cheap
+                    // and requires no lock.  We do NOT return early because
+                    // the remaining JoinHandles must be drained to avoid
+                    // leaking threads.
+                    if is_cancelled_once(cancel_rx) {
+                        cancel_flag.store(true, Ordering::Relaxed);
+                    }
+                    for ((call_id, tool_name, arguments_json, tool_start), handle) in handles {
+                        // Re-check cancellation before each join so the
+                        // flag is set as early as possible for tools that
+                        // haven't finished yet.
+                        if is_cancelled_once(cancel_rx) {
+                            cancel_flag.store(true, Ordering::Relaxed);
+                        }
+
+                        let ToolHandle {
+                            tool_call,
+                            mut output,
+                            image,
+                        } = handle.join().unwrap_or_else(|_| {
+                            // Thread panicked — create a fallback result
+                            // so the agent loop can continue with the other
+                            // concurrent tool outputs.
+                            ToolHandle {
+                                tool_call: ChatToolCall {
+                                    id: call_id,
+                                    name: tool_name.clone(),
+                                    arguments_json,
+                                },
+                                output: ToolExecutionOutput {
+                                    result: ToolResult {
+                                        content: "tool thread panicked".to_string(),
+                                        is_error: true,
+                                    },
+                                },
+                                image: None,
+                            }
+                        });
+
+                        let elapsed = tool_start.elapsed();
+
+                        debug!(
+                            session_id = ctx.session_id,
+                            turn,
+                            tool_name = %tool_call.name,
+                            elapsed_ms = elapsed.as_millis(),
+                            result_len = output.result.content.len(),
+                            is_error = output.result.is_error,
+                            "tool finished (concurrent)",
+                        );
+
+                        // Emit and persist any image the tool produced.
+                        if let Some(image) = image {
+                            emit_and_persist_image(
+                                &ctx.cmd_tx,
+                                request_id,
+                                &mut next_image_id,
+                                image,
+                                session,
+                                ctx,
+                            );
+                        }
+
+                        finish_tool_call(request_id, session, &tool_call, &mut output, ctx);
+                    }
                 }
             }
             Err(tai_proto::InferenceError::Cancelled) => {
@@ -446,25 +768,17 @@ fn execute_tool_with_timeout(
     cwd: Option<&Path>,
     timeout_dur: Duration,
     request_id: u32,
-    client: &InferenceProvider,
     session: &mut SessionState,
-    model: &str,
     cancel_rx: &mpsc::Receiver<()>,
     ctx: &RequestContext,
     image_tx: Option<mpsc::Sender<PreparedImage>>,
 ) -> ToolExecutionOutput {
     // Capture start time for tool execution metrics.
-    // Non-registry tools (spawn_subsession, load_tools, unload_tools) that
-    // need mutable session state or deep coupling with the agent loop return
-    // early and are not timed — only the registry-executed path below records
-    // metrics.
+    // Meta-tools (load_tools, unload_tools) that need mutable session state
+    // return early and are not timed — only the registry-executed path below
+    // records metrics.
     let exec_start = std::time::Instant::now();
     match tool_call.name.as_str() {
-        "spawn_subsession" => {
-            return execute_spawn_subsession_sync(
-                client, session, model, tool_call, None, cwd, cancel_rx, ctx,
-            );
-        }
         "load_tools" => {
             let result = crate::tools::groups::execute_load_tools(
                 &mut session.config.active_tool_groups,
@@ -508,39 +822,16 @@ fn execute_tool_with_timeout(
     let (output_tx, output_rx) = std::sync::mpsc::channel();
     let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
 
-    // Forward streaming output to subscribers as it arrives (event-driven,
-    // blocks on the channel — no polling).  Exits when output_rx is
-    // disconnected (tool thread finished) or a kill signal arrives.
-    let fwd_cmd_tx = ctx.cmd_tx.clone();
-    let fwd_request_id = request_id;
-    let fwd_call_id = tool_call.id.clone();
-    let fwd_check_interval = Duration::from_millis(200);
-    std::thread::spawn(move || {
-        loop {
-            match output_rx.recv_timeout(fwd_check_interval) {
-                Ok(data) => {
-                    if fwd_cmd_tx
-                        .send(SessionCommand::Broadcast(DaemonMessage::ToolCallOutput {
-                            request_id: fwd_request_id,
-                            call_id: fwd_call_id.clone(),
-                            data,
-                        }))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // Check whether a kill signal was sent (main loop exited).
-                    match kill_rx.try_recv() {
-                        Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    }
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-    });
+    // Forward streaming output to subscribers as it arrives, exiting when
+    // the output channel is disconnected (tool finished) or a kill signal
+    // arrives (main loop exited).
+    spawn_forwarding_thread(
+        ctx.cmd_tx.clone(),
+        request_id,
+        tool_call.id.clone(),
+        output_rx,
+        kill_rx,
+    );
 
     // Drop guard: when the main loop exits (for any reason), signal the
     // forwarder to stop so it doesn't orphan waiting on output_rx.
@@ -557,11 +848,15 @@ fn execute_tool_with_timeout(
     let tr = Arc::clone(&ctx.tool_registry);
     let xc = x_credentials.cloned();
     let c = cwd.map(|p| p.to_path_buf());
-    let tool_ctx = crate::tools::context::ToolContext::new(
-        ctx.session_id,
-        Arc::clone(&ctx.db),
-        ctx.daemon_tx.clone(),
-    );
+    let tool_ctx = crate::tools::context::ToolContext {
+        session_id: ctx.session_id,
+        db: Arc::clone(&ctx.db),
+        daemon_tx: ctx.daemon_tx.clone(),
+        active_tool_groups: session.config.active_tool_groups.clone(),
+        reasoning_effort: session.config.reasoning_effort,
+        cwd: cwd.map(|p| p.to_path_buf()),
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
     std::thread::spawn(move || {
         let result = tr.execute_streaming(
             &tc,
@@ -579,12 +874,11 @@ fn execute_tool_with_timeout(
     // caller has cancelled the request or the tool has finished.
     let deadline = std::time::Instant::now() + timeout_dur;
     let check_interval = Duration::from_millis(200);
-    let mut was_cancelled = false;
     loop {
         // Check cancellation before each blocking wait so that a cancel
         // sent between tool start and our first recv_timeout is honoured
         // immediately rather than waiting up to check_interval.
-        if is_cancelled_cached(cancel_rx, &mut was_cancelled) {
+        if is_cancelled_once(cancel_rx) {
             crate::metrics::record_tool_execution(
                 &tool_call.name,
                 exec_start.elapsed().as_secs_f64(),
@@ -641,161 +935,6 @@ fn execute_tool_with_timeout(
                 };
             }
         }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_spawn_subsession_sync(
-    _client: &InferenceProvider,
-    parent_session: &SessionState,
-    _model: &str,
-    tool_call: &crate::openai::ChatToolCall,
-    _x_credentials: Option<&ServiceCredential>,
-    cwd: Option<&Path>,
-    cancel_rx: &mpsc::Receiver<()>,
-    ctx: &RequestContext,
-) -> ToolExecutionOutput {
-    if parent_session.config.reasoning_effort != Some(ThinkingEffort::Off) {
-        debug!(
-            parent_session_id = ctx.session_id,
-            effort = ?parent_session.config.reasoning_effort,
-            "spawn_subsession: parent has non-default reasoning effort; child will use default",
-        );
-    }
-
-    let args: serde_json::Value = match serde_json::from_str(&tool_call.arguments_json) {
-        Ok(a) => a,
-        Err(e) => {
-            return ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!("invalid arguments: {e}"),
-                    is_error: true,
-                },
-            };
-        }
-    };
-    let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
-        Some(p) => p.to_string(),
-        None => {
-            return ToolExecutionOutput {
-                result: ToolResult {
-                    content: "missing required argument: prompt".to_string(),
-                    is_error: true,
-                },
-            };
-        }
-    };
-    let title = args
-        .get("title")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let max_turns = args
-        .get("max_turns")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let child_cwd = cwd.map(|p| p.to_path_buf());
-
-    // Inherit categories from parent, or use explicit list if provided.
-    let categories = args
-        .get("categories")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            parent_session
-                .config
-                .active_tool_groups
-                .iter()
-                .cloned()
-                .collect()
-        });
-
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    let _ = ctx
-        .daemon_tx
-        .send(crate::daemon::DaemonCommand::CreateSession {
-            title,
-            parent_session_id: Some(ctx.session_id),
-            cwd: child_cwd.clone(),
-            max_turns,
-            reasoning_effort: parent_session.config.reasoning_effort,
-            context_config: None,
-            account_name: None,
-            active_tool_groups: categories,
-            reply: reply_tx,
-        });
-
-    match reply_rx.recv() {
-        Ok(Ok((child_id, child_tx))) => {
-            let _ = child_tx.send(crate::sessions::SessionCommand::AppendMessage {
-                message: SessionMessage::SystemText { content: prompt },
-            });
-
-            let (result_tx, result_rx) = std::sync::mpsc::channel();
-            let _ = child_tx.send(crate::sessions::SessionCommand::RunChildInput {
-                request_id: 1,
-                reply: result_tx,
-            });
-            let mut was_cancelled = false;
-            loop {
-                if is_cancelled_cached(cancel_rx, &mut was_cancelled) {
-                    let _ =
-                        child_tx.send(crate::sessions::SessionCommand::Cancel { request_id: 1 });
-                    return ToolExecutionOutput {
-                        result: ToolResult {
-                            content: format!("sub-session {child_id} cancelled"),
-                            is_error: true,
-                        },
-                    };
-                }
-
-                match result_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(Ok(child_result)) => {
-                        return ToolExecutionOutput {
-                            result: ToolResult {
-                                content: format!(
-                                    "sub-session {child_id} result:\n{}",
-                                    child_result.output
-                                ),
-                                is_error: child_result.is_error,
-                            },
-                        };
-                    }
-                    Ok(Err(e)) => {
-                        return ToolExecutionOutput {
-                            result: ToolResult {
-                                content: format!("child session error: {e}"),
-                                is_error: true,
-                            },
-                        };
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        return ToolExecutionOutput {
-                            result: ToolResult {
-                                content: format!("sub-session {child_id} exited unexpectedly"),
-                                is_error: true,
-                            },
-                        };
-                    }
-                }
-            }
-        }
-        Ok(Err(e)) => ToolExecutionOutput {
-            result: ToolResult {
-                content: format!("failed to create sub-session: {e}"),
-                is_error: true,
-            },
-        },
-        Err(_) => ToolExecutionOutput {
-            result: ToolResult {
-                content: "daemon communication failed".to_string(),
-                is_error: true,
-            },
-        },
     }
 }
 
@@ -1030,43 +1169,6 @@ mod tests {
         assert!(is_cancelled_once(&rx));
     }
 
-    #[test]
-    fn is_cancelled_cached_persists_after_message_consumed() {
-        let (tx, rx) = mpsc::channel::<()>();
-        tx.send(()).unwrap();
-        let mut flag = false;
-
-        // First call consumes the message and sets the cached flag.
-        assert!(is_cancelled_cached(&rx, &mut flag));
-
-        // Second call should still return true using the cached flag,
-        // even though the channel is now empty.
-        assert!(is_cancelled_cached(&rx, &mut flag));
-        assert!(flag);
-    }
-
-    #[test]
-    fn is_cancelled_cached_disconnected_no_signal() {
-        let (tx, rx) = mpsc::channel::<()>();
-        drop(tx); // disconnected without sending
-        let mut flag = false;
-        assert!(!is_cancelled_cached(&rx, &mut flag));
-        assert!(!flag);
-    }
-
-    #[test]
-    fn is_cancelled_cached_disconnected_after_signal_still_true() {
-        let (tx, rx) = mpsc::channel::<()>();
-        tx.send(()).unwrap();
-        drop(tx); // disconnect after sending
-
-        let mut flag = false;
-        assert!(is_cancelled_cached(&rx, &mut flag)); // consumes the message
-        assert!(flag);
-        // Channel is now empty *and* disconnected, but cache keeps it true.
-        assert!(is_cancelled_cached(&rx, &mut flag));
-    }
-
     // -- execute_tool_with_timeout tests -----------------------------------
     //
     // These exercise the streaming execution path with cancellation and
@@ -1164,11 +1266,6 @@ mod tests {
         let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
 
-        let config = crate::openai::ServiceConfig::default();
-        let openai_client =
-            crate::openai::OpenAiClient::new(config, "test-key".into()).expect("OpenAiClient");
-        let client = InferenceProvider::from_openai(openai_client);
-
         let dir = tempfile::tempdir().expect("tempdir");
         let db = redb::Database::create(dir.path().join("test.redb")).expect("Database");
 
@@ -1198,9 +1295,7 @@ mod tests {
             None, // cwd
             timeout_dur,
             1, // request_id
-            &client,
             &mut session,
-            "test-model",
             &cancel_rx,
             &ctx,
             None, // image_tx
@@ -1392,6 +1487,211 @@ mod tests {
             }
             Ok(_other) => panic!("expected ToolCallOutput, got unexpected SessionCommand"),
             Err(e) => panic!("channel disconnected while waiting for streaming output: {e}"),
+        }
+    }
+
+    // -- determine_tool_timeout tests ----------------------------------
+
+    #[test]
+    fn determine_tool_timeout_subsession_none() {
+        assert!(determine_tool_timeout("spawn_subsession").is_none());
+    }
+
+    #[test]
+    fn determine_tool_timeout_shell_300() {
+        for name in &["sh", "nushell", "fish", "exec"] {
+            assert_eq!(
+                determine_tool_timeout(name),
+                Some(Duration::from_secs(300)),
+                "tool {name} should have 300s timeout",
+            );
+        }
+    }
+
+    #[test]
+    fn determine_tool_timeout_default_60() {
+        for name in &[
+            "read_file",
+            "write_file",
+            "run_riscv",
+            "grep",
+            "http_request",
+        ] {
+            assert_eq!(
+                determine_tool_timeout(name),
+                Some(Duration::from_secs(60)),
+                "tool {name} should have 60s timeout",
+            );
+        }
+    }
+
+    // -- spawn_single_tool tests ---------------------------------------
+
+    /// Helper: create a ToolRegistry with a test tool and spawn a single tool call.
+    fn run_spawn_single_tool(
+        tool: impl Tool + 'static,
+        tool_name: &str,
+        tool_args: &str,
+        timeout: Option<Duration>,
+    ) -> ToolHandle {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+        let (_daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).expect("Database"));
+
+        let mut registry = ToolRegistry::new();
+        registry.register(tool);
+        let registry = registry.build();
+
+        let tool_call = ChatToolCall {
+            id: "call_test".into(),
+            name: tool_name.into(),
+            arguments_json: tool_args.into(),
+        };
+
+        let tool_ctx = ToolContext {
+            session_id: 1,
+            db,
+            daemon_tx: _daemon_tx,
+            active_tool_groups: std::collections::HashSet::new(),
+            reasoning_effort: None,
+            cwd: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+
+        let handle = spawn_single_tool(SpawnToolArgs {
+            tool_call,
+            timeout,
+            request_id: 1,
+            registry,
+            cmd_tx,
+            x_credentials: None,
+            cwd: None,
+            ctx: tool_ctx,
+        });
+
+        handle.join().expect("tool thread panicked")
+    }
+
+    #[test]
+    fn spawn_single_tool_fast_returns_result() {
+        let handle = run_spawn_single_tool(
+            FastTestTool,
+            "_test_fast",
+            "{}",
+            Some(Duration::from_secs(60)),
+        );
+        assert!(
+            !handle.output.result.is_error,
+            "expected success: {}",
+            handle.output.result.content
+        );
+        assert!(
+            handle.output.result.content.contains("fast result"),
+            "{}",
+            handle.output.result.content
+        );
+        assert!(handle.image.is_none(), "expected no image from fast tool",);
+    }
+
+    #[test]
+    fn spawn_single_tool_no_timeout_still_completes() {
+        // Even with None timeout, a fast tool should complete successfully.
+        let handle = run_spawn_single_tool(FastTestTool, "_test_fast", "{}", None);
+        assert!(
+            !handle.output.result.is_error,
+            "expected success: {}",
+            handle.output.result.content
+        );
+        assert!(
+            handle.output.result.content.contains("fast result"),
+            "{}",
+            handle.output.result.content
+        );
+    }
+
+    // -- emit_and_persist_image tests -----------------------------------
+
+    #[test]
+    fn emit_and_persist_image_broadcasts_and_persists() {
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = redb::Database::create(dir.path().join("test.redb")).expect("Database");
+        let registry = ToolRegistry::new().build();
+
+        let mut session = SessionState::empty();
+        let mut next_image_id = 1u32;
+
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 42,
+            db: Arc::new(db),
+            tool_registry: registry,
+            daemon_tx,
+            max_turns_default: 25,
+        };
+
+        let image = PreparedImage {
+            mime_type: "image/png".into(),
+            data: b"fakedata".to_vec(),
+            width: 100,
+            height: 200,
+            alt: Some("test image".into()),
+        };
+
+        emit_and_persist_image(
+            &ctx.cmd_tx,
+            7, // request_id
+            &mut next_image_id,
+            image,
+            &mut session,
+            &ctx,
+        );
+
+        // Image ID should have been incremented.
+        assert_eq!(next_image_id, 2);
+
+        // Session should have one message: a DisplayedImage.
+        assert_eq!(session.messages().len(), 1);
+        match &session.messages()[0] {
+            SessionMessage::DisplayedImage(record) => {
+                assert_eq!(record.metadata.mime_type, "image/png");
+                assert_eq!(record.metadata.width, 100);
+                assert_eq!(record.metadata.height, 200);
+                assert_eq!(record.data, b"fakedata");
+                assert_eq!(record.metadata.alt.as_deref(), Some("test image"));
+            }
+            other => panic!("expected DisplayedImage, got {other:?}"),
+        }
+
+        // Should have received an ImageStart broadcast.
+        match cmd_rx.recv() {
+            Ok(SessionCommand::Broadcast(DaemonMessage::ImageStart {
+                request_id,
+                metadata,
+            })) => {
+                assert_eq!(request_id, 7);
+                assert_eq!(metadata.mime_type, "image/png");
+            }
+            Ok(_) => panic!("expected DaemonMessage::ImageStart"),
+            Err(e) => panic!("channel error: {e}"),
+        }
+
+        // Then ImageChunk with the data.
+        match cmd_rx.recv() {
+            Ok(SessionCommand::Broadcast(DaemonMessage::ImageChunk { data, .. })) => {
+                assert_eq!(data, b"fakedata");
+            }
+            Ok(_) => panic!("expected DaemonMessage::ImageChunk"),
+            Err(e) => panic!("channel error: {e}"),
+        }
+
+        // Then ImageEnd.
+        match cmd_rx.recv() {
+            Ok(SessionCommand::Broadcast(DaemonMessage::ImageEnd { .. })) => {}
+            Ok(_) => panic!("expected DaemonMessage::ImageEnd"),
+            Err(e) => panic!("channel error: {e}"),
         }
     }
 }

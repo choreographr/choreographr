@@ -98,6 +98,7 @@ pub mod tai {
     pub const TOOL_CALL: u64 = 0;
     pub const WRITE: u64 = 1;
     pub const EXIT: u64 = 2;
+    pub const BATCH_TOOL_CALL: u64 = 3;
 
     pub unsafe fn tool_call(request: &[u8], output: &mut [u8]) -> usize {
         let result: usize;
@@ -135,6 +136,25 @@ pub mod tai {
                 options(nostack, noreturn)
             );
         }
+    }
+
+    /// Submit multiple tool calls for concurrent execution on the host.
+    /// Request format is a postcard frame: [count: varint][name: str][args: bytes]*.
+    /// Response format is: [count: varint][result]*
+    /// where each result is a postcard-encoded `Result<Vec<u8>, String>`.
+    pub unsafe fn batch_tool_call(request: &[u8], output: &mut [u8]) -> usize {
+        let result: usize;
+        core::arch::asm!(
+            "ecall",
+            in("a0") request.as_ptr(),
+            in("a1") request.len(),
+            in("a2") output.as_mut_ptr(),
+            in("a3") output.len(),
+            in("a7") BATCH_TOOL_CALL,
+            lateout("a0") result,
+            options(nostack)
+        );
+        result
     }
 "#;
 
@@ -306,6 +326,24 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         }
     }
 
+    /// Like `dec_result` but also returns the total number of bytes consumed
+    /// so callers can advance a cursor across a sequence of results.
+    pub fn dec_result_raw(data: &[u8]) -> Result<(&[u8], usize), &str> {
+        if data.is_empty() { return Err("empty"); }
+        let status = data[0];
+        let (payload_len, mut consumed) = dec_varint(&data[1..])?;
+        consumed += 1; // account for the status byte
+        let payload_start = consumed;
+        let payload_end = payload_start + payload_len as usize;
+        if payload_end > data.len() { return Err("truncated payload"); }
+        let payload = &data[payload_start..payload_end];
+        match status {
+            0 => Ok((payload, payload_end)),
+            1 => Err(core::str::from_utf8(payload).map_err(|_| "invalid utf-8")?),
+            _ => Err("unknown result status"),
+        }
+    }
+
     // ── Tool call helpers ─────────────────────────────────────────────
 
     /// Make a raw tool call. Encodes tool name + args as postcard frame,
@@ -318,6 +356,46 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         output.resize(65536, 0u8);
         let n = unsafe { tool_call(&buf, &mut output) };
         output[..n].to_vec()
+    }
+
+    /// Submit multiple tool calls for concurrent execution on the host.
+    ///
+    /// Encodes all requests into a single batch frame, issues one ecall,
+    /// and returns results in submission order. Each result is independent —
+    /// one tool may fail without affecting the others.
+    pub fn call_multi(requests: &[(&str, &[u8])]) -> Vec<Result<Vec<u8>, &str>> {
+        let mut buf = Vec::new();
+        enc_varint(requests.len() as u64, &mut buf);
+        for (name, args) in requests {
+            enc_str(name, &mut buf);
+            enc_bytes(args, &mut buf);
+        }
+        let mut output = Vec::new();
+        output.resize(65536, 0u8);
+        let n = unsafe { batch_tool_call(&buf, &mut output) };
+        let data = &output[..n];
+        let (count, mut pos) = match dec_varint(data) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let mut results = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            if pos >= data.len() { break; }
+            match dec_result_raw(&data[pos..]) {
+                Ok((payload, end)) => {
+                    results.push(Ok(payload.to_vec()));
+                    pos = end;
+                }
+                Err(e) => {
+                    // Decoding failed mid-stream; return partial results and stop.
+                    // The host always produces well-formed responses, so hitting
+                    // this path indicates a fundamental protocol mismatch.
+                    results.push(Err(e));
+                    break;
+                }
+            }
+        }
+        results
     }
 
     // ── Per-tool wrappers ─────────────────────────────────────────────
@@ -590,6 +668,73 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
             }
             2 => {
                 machine.set_running(false);
+                Ok(true)
+            }
+            3 => {
+                let req_ptr = machine.registers()[registers::A0];
+                let req_len = machine.registers()[registers::A1];
+                let out_ptr = machine.registers()[registers::A2];
+                let out_size = machine.registers()[registers::A3];
+
+                let request_bytes = machine.memory_mut().load_bytes(req_ptr, req_len)?;
+
+                // Decode batch frame: [count: varint][name: String][args: &[u8]]*
+                let (count, mut rest): (u32, &[u8]) = postcard::take_from_bytes(&request_bytes)
+                    .map_err(|_| VmError::Unexpected("invalid batch frame: count".into()))?;
+
+                let mut requests: Vec<(String, Vec<u8>)> = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let (name, r): (String, &[u8]) = postcard::take_from_bytes(rest)
+                        .map_err(|_| VmError::Unexpected("invalid batch frame: name".into()))?;
+                    let (args, r): (&[u8], &[u8]) = postcard::take_from_bytes(r)
+                        .map_err(|_| VmError::Unexpected("invalid batch frame: args".into()))?;
+                    requests.push((name, args.to_vec()));
+                    rest = r;
+                }
+
+                // Dispatch all tool calls concurrently using std::thread::scope,
+                // which ensures every spawned thread completes before we return.
+                let registry = &self.registry;
+                let xc = self.x_credentials.as_ref();
+                let cw = self.cwd.as_deref();
+                let ctx = self.ctx.as_ref();
+                let results: Vec<Vec<u8>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = requests
+                        .into_iter()
+                        .map(|(name, args)| {
+                            scope.spawn(move || registry.execute_dyn(&name, &args, xc, cw, ctx))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                // Thread panicked — encode an error result.
+                                let err: Result<(), String> =
+                                    Err("tool thread panicked".to_string());
+                                postcard::to_allocvec(&err).unwrap_or_default()
+                            })
+                        })
+                        .collect()
+                });
+
+                // Encode response: [count: varint][result: postcard Result]*.
+                // Each result from execute_dyn is already a postcard-encoded
+                // Result<Vec<u8>, String>, so we just concatenate them.
+                let count_encoded: Vec<u8> = postcard::to_allocvec(&(results.len() as u32))
+                    .map_err(|_| VmError::Unexpected("batch encode count failed".into()))?;
+                let mut response = count_encoded;
+                for r in &results {
+                    response.extend_from_slice(r);
+                }
+
+                let to_write = response.len().min(out_size as usize);
+                if to_write > 0 {
+                    machine
+                        .memory_mut()
+                        .store_bytes(out_ptr, &response[..to_write])?;
+                }
+                machine.set_register(registers::A0, to_write as u64);
                 Ok(true)
             }
             _ => Ok(false),
@@ -1283,5 +1428,138 @@ mod tests {
             out.extend_from_slice(&chunk);
         }
         assert_eq!(out, b"abc");
+    }
+
+    // ── Batch ecall tests ─────────────────────────────────────────
+
+    /// A minimal tool that returns a constant string — used to verify
+    /// concurrent dispatch of multiple tool calls. Uses `()` as args so
+    /// postcard always decodes cleanly (single-byte unit).
+    struct EchoTestTool {
+        name: &'static str,
+        response: &'static str,
+    }
+
+    impl Tool for EchoTestTool {
+        type Args = ();
+        type Return = String;
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        fn group(&self) -> &'static str {
+            "test"
+        }
+        fn description(&self) -> &'static str {
+            "test tool for concurrent dispatch"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn execute(
+            &self,
+            _args: Self::Args,
+            _xc: Option<&ServiceCredential>,
+            _cwd: Option<&Path>,
+            _ctx: Option<&ToolContext>,
+        ) -> Result<String, ToolError> {
+            Ok(self.response.to_string())
+        }
+    }
+
+    #[test]
+    fn echo_test_tool_works_with_execute_dyn() {
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTestTool {
+            name: "_echo_solo",
+            response: "hello",
+        });
+        let registry = registry.build();
+
+        // Postcard-encoded () unit — EchoTestTool takes no args.
+        let unit_args: Vec<u8> = postcard::to_allocvec(&()).unwrap();
+        let result = registry.execute_dyn("_echo_solo", &unit_args, None, None, None);
+
+        assert!(!result.is_empty(), "should have a result");
+        if result[0] == 0 {
+            // Decode the Ok payload.
+            let (payload, _rest): (Vec<u8>, &[u8]) =
+                postcard::take_from_bytes(&result[1..]).unwrap();
+            assert_eq!(payload, b"hello", "payload mismatch");
+        } else {
+            // Decode the error message for debugging.
+            let (err_msg, _rest): (String, &[u8]) =
+                postcard::take_from_bytes(&result[1..]).unwrap();
+            panic!("execute_dyn returned Err: {err_msg}");
+        }
+    }
+
+    #[test]
+    fn concurrent_tool_dispatch_via_thread_scope() {
+        // Register two tools with different names, then dispatch both
+        // concurrently via thread::scope — the same pattern used in
+        // the batch ecall (ecall 3). Verify both results come back.
+        let mut registry = ToolRegistry::new();
+        registry.register(EchoTestTool {
+            name: "_echo_a",
+            response: "result_a",
+        });
+        registry.register(EchoTestTool {
+            name: "_echo_b",
+            response: "result_b",
+        });
+        let registry = registry.build();
+
+        // Postcard-encoded () unit — EchoTestTool takes no args.
+        let unit_args: Vec<u8> = postcard::to_allocvec(&()).unwrap();
+        let requests = vec![
+            ("_echo_a".to_string(), unit_args.clone()),
+            ("_echo_b".to_string(), unit_args),
+        ];
+
+        let results: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = requests
+                .into_iter()
+                .map(|(name, args)| {
+                    let reg = Arc::clone(&registry);
+                    scope.spawn(move || reg.execute_dyn(&name, &args, None, None, None))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+
+        assert_eq!(results.len(), 2, "should have 2 results");
+
+        // Each result is a postcard-encoded Result<Vec<u8>, String>.
+        // For Ok values, the encoding is: 0x00 (Ok tag) + postcard(Vec<u8>).
+        for (i, result) in results.iter().enumerate() {
+            assert!(
+                !result.is_empty() && result[0] == 0,
+                "result {} should be Ok, got tag {:?}",
+                i,
+                result.first(),
+            );
+        }
+
+        // Decode payloads to verify they match expected responses.
+        fn decode_ok_payload(data: &[u8]) -> Vec<u8> {
+            assert_eq!(data[0], 0, "expected Ok tag byte");
+            let (payload, _rest): (Vec<u8>, &[u8]) = postcard::take_from_bytes(&data[1..]).unwrap();
+            payload
+        }
+
+        assert_eq!(
+            decode_ok_payload(&results[0]),
+            b"result_a",
+            "first result content mismatch",
+        );
+        assert_eq!(
+            decode_ok_payload(&results[1]),
+            b"result_b",
+            "second result content mismatch",
+        );
     }
 }

@@ -141,7 +141,7 @@ mod error;
 pub use error::ToolError;
 pub(crate) use error::{tool_err, tool_ok};
 
-pub(crate) mod context;
+pub mod context;
 pub(crate) mod db;
 pub(crate) mod exec;
 pub(crate) mod find;
@@ -156,7 +156,7 @@ pub(crate) mod nu;
 pub(crate) mod random;
 pub(crate) mod sh;
 pub(crate) mod shell_util;
-pub(crate) mod subsession;
+pub mod subsession;
 pub(crate) mod time;
 pub(crate) mod vm;
 pub(crate) mod x;
@@ -503,6 +503,7 @@ impl ToolRegistry {
         reg.register(admin::ListSessions);
         reg.register(admin::GetSession);
         reg.register(admin::LoadSkill);
+        reg.register(subsession::SpawnSubsession);
         reg
     }
 
@@ -607,7 +608,7 @@ impl ToolRegistry {
     }
 
     /// Return tool definitions for groups in the active set, plus always-available
-    /// meta-tools (load_tools, unload_tools, load_skill, spawn_subsession, etc.).
+    /// meta-tools (load_tools, unload_tools, etc.).
     pub fn available_definitions(&self, active: &HashSet<String>) -> Vec<ChatToolDefinition> {
         let mut defs: Vec<_> = self
             .tools
@@ -616,11 +617,9 @@ impl ToolRegistry {
             .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
             .collect();
         // Always-available meta-tools (not in the registry because they
-        // need mutable access to session state or deep coupling with the
-        // agent loop — spawn_subsession, load_tools, unload_tools).
+        // need mutable access to session state — load_tools, unload_tools).
         defs.push(groups::load_tools_definition(self));
         defs.push(groups::unload_tools_definition(self));
-        defs.push(subsession::spawn_subsession_definition());
         defs
     }
 }

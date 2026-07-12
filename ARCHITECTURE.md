@@ -220,7 +220,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
 | `tools/` | `Tool` trait, `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 30 registered tools (including `list_sessions`, `get_session`, `load_skill` via `admin.rs`). |
-| `tools/context.rs` | `ToolContext` — session-scoped context (session ID + `Arc<Database>` + `mpsc::Sender<DaemonCommand>`) passed to tools that need DB or daemon access. |
+| `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, CWD) passed to tools that need DB or daemon access or parent config for sub-sessions. |
 | `tools/db.rs` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
 
@@ -681,31 +681,64 @@ mechanism, not access control. The RISC-V VM (`run_riscv`) always has access to 
 tools regardless of group state.
 
 Implementation details:
-- `ToolRegistry::available_definitions(active)` returns definitions for registry tools in the
-  active set, plus always-available meta-tools (`load_tools`, `unload_tools`, `spawn_subsession`)
-  that require mutable session state or deep coupling with the agent loop
-- `load_tools`/`unload_tools` are intercepted in `execute_tool_with_timeout()` (same pattern as
-  `spawn_subsession`) — they are not in the registry because they modify `session.config.active_tool_groups`
-- `list_sessions`, `get_session`, and `load_skill` were formerly intercepted like `spawn_subsession`
-  but are now proper `Tool` trait implementations registered in the default registry via `ToolRegistry::build()`,
-  using `ToolContext.daemon_tx` to communicate with the daemon command loop
+- `ToolRegistry::available_definitions(active)` returns definitions for all registry tools
+  in the active set, plus always-available meta-tools (`load_tools`, `unload_tools`)
+  that require mutable session state
+- `load_tools`/`unload_tools` are intercepted in `execute_tool_with_timeout()` — they are
+  not in the registry because they modify `session.config.active_tool_groups`
+- `list_sessions`, `get_session`, `load_skill`, and `spawn_subsession` were formerly
+  intercepted like `load_tools`/`unload_tools` but are now proper `Tool` trait implementations
+  registered in the default registry via `ToolRegistry::build()`, using `ToolContext.daemon_tx`
+  to communicate with the daemon command loop
 - Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell}`)
 - `ToolGroup` struct and `GROUPS` constant live in `tai-daemon/src/tools/mod.rs`
 - Handler functions live in `tai-daemon/src/tools/groups.rs`
 - Group metadata is appended to the system prompt in `context::build_base_prompt()`
 
+### Concurrent tool dispatch
+
+`run_agent_loop` in `requests.rs` partitions tool calls into two groups before execution:
+
+- **Mutators** — `load_tools`, `unload_tools` — tools that require `&mut SessionState`.
+  These execute serially on the agent loop's thread via `execute_tool_with_timeout()`.
+- **Concurrent** — all remaining tools (shell, filesystem, VM, HTTP, Git,
+  `spawn_subsession`, etc.) — tools whose execution is independent of session state.
+  These are dispatched across multiple OS threads in parallel using `spawn_single_tool()`.
+
+For concurrent tools, each call gets:
+1. A dedicated **execution thread** that runs the tool via `ToolDyn::execute_streaming_json()`.
+2. A **forwarding thread** that relays streaming output chunks to session subscribers in
+   real time through the session command channel.
+3. A **wait-loop thread** that enforces the per-tool timeout (300s for shell tools, 60s for
+   others, no limit for sub-sessions).
+4. A dedicated **image channel** — the tool emits any produced image through this channel,
+   which the wait-loop drains after execution completes.
+
+**Thread count:** Because each concurrent tool spawns three threads (execution, forwarding,
+wait-loop), dispatching N tools simultaneously creates up to 3N + 1 additional threads
+(the +1 is the agent loop's main thread). The kernel scheduler handles these efficiently
+for typical N (< 10), but callers should be aware of the resource footprint.
+
+Results are collected in source-call order (the order the LLM issued them) so the
+conversation history remains deterministic regardless of which thread finishes first.
+If a tool thread panics, the error is caught and reported as a `ToolResult` with
+`is_error: true` instead of crashing the daemon.
+
 ### spawn_subsession
 
-`spawn_subsession` is a special tool: it does not implement the `Tool` trait. Instead, it is
-intercepted in `run_agent_loop()` and handled with full access to `DaemonState` and the
-`OpenAiClient`. When invoked:
+`spawn_subsession` is a core-group `Tool` trait implementation registered in `ToolRegistry`.
+It runs in the concurrent dispatch path alongside other tools. When invoked:
 
-1. A child session is created via `create_session_internal()` with the parent as
-   `parent_session_id` and inheriting the parent's CWD.
+1. A child session is created via `DaemonCommand::CreateSession` with the parent as
+   `parent_session_id` and inheriting the parent's CWD and tool groups.
 2. The prompt argument is pushed as a `SystemText` message into the child session.
 3. The child session runs its own `run_agent_loop()` (model → tools → model, up to 8 iterations).
 4. The child's assistant text output is collected and returned to the parent as the tool result.
 5. The child session persists in the database and is listable/attachable like any other session.
+
+The child session runs to completion regardless of parent cancellation — it uses `ToolContext`
+(`active_tool_groups`, `reasoning_effort`, `cwd`, `daemon_tx`) to inherit parent config and
+communicate with the daemon command loop.
 
 
 ---
