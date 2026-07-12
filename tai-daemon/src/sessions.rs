@@ -597,7 +597,6 @@ fn handle_run_input(
         .active_requests
         .insert(request_id, ActiveRequest { cancel_tx });
 
-    let working_dir = state.config.working_dir.clone();
     // Workers don't need their own subscriber map — all broadcasts
     // are routed through SessionCommand::Broadcast to this main
     // session thread which holds the live subscriber set.
@@ -610,7 +609,6 @@ fn handle_run_input(
             provider,
             &mut worker_session,
             model,
-            working_dir,
             cancel_rx,
             ctx,
             None,
@@ -648,7 +646,6 @@ fn handle_run_child_input(
         return false;
     }
     broadcast(&state.subscribers, DaemonMessage::Started { request_id });
-    let working_dir = state.config.working_dir.clone();
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     state
         .active_requests
@@ -662,7 +659,6 @@ fn handle_run_child_input(
             provider,
             &mut worker_session,
             model,
-            working_dir,
             cancel_rx,
             ctx,
             Some(reply),
@@ -1015,7 +1011,6 @@ fn run_request_worker(
     client: InferenceProvider,
     session: &mut SessionState,
     model: String,
-    working_dir: Option<PathBuf>,
     cancel_rx: mpsc::Receiver<()>,
     ctx: RequestContext,
     child_reply: Option<mpsc::Sender<io::Result<ChildResult>>>,
@@ -1023,15 +1018,7 @@ fn run_request_worker(
     let request_start = std::time::Instant::now();
     let initial_snapshot = session.snapshot();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_agent_loop(
-            &client,
-            session,
-            &model,
-            request_id,
-            working_dir.as_deref(),
-            &cancel_rx,
-            &ctx,
-        )
+        run_agent_loop(&client, session, &model, request_id, &cancel_rx, &ctx)
     }));
 
     let (outcome, snapshot) = match result {

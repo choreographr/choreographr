@@ -82,6 +82,27 @@ pub(crate) fn execute_load_tools(
     }
 }
 
+/// Tool definition for `set_working_dir`: changes the session's working directory.
+pub(crate) fn set_working_dir_definition() -> ChatToolDefinition {
+    ChatToolDefinition::function(
+        "set_working_dir",
+        "Change the working directory for this session. All subsequent file operations, \
+         shell commands, and context discovery (AGENTS.md, CLAUDE.md, skills) will \
+         resolve relative to this new directory. The change takes effect on the next turn.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path or path relative to the current session working directory"
+                }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 /// Execute `unload_tools` by removing groups from the session's active set.
 /// The "core" group is protected and cannot be removed.
 pub(crate) fn execute_unload_tools(
@@ -126,6 +147,36 @@ pub(crate) fn execute_unload_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolRegistry;
+
+    #[test]
+    fn set_working_dir_schema_has_required_path() {
+        let _registry = ToolRegistry::new().build();
+        let def = set_working_dir_definition();
+        assert_eq!(def.function.name, "set_working_dir");
+        let params = def
+            .function
+            .parameters
+            .as_object()
+            .expect("params should be an object");
+        let required = params
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("should have required array");
+        assert!(
+            required.iter().any(|v| v == "path"),
+            "path should be in required: {required:?}",
+        );
+        let props = params
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("schema should have properties");
+        assert!(props.contains_key("path"), "path should be in properties",);
+        assert!(
+            props["path"]["type"] == "string",
+            "path should be string type",
+        );
+    }
 
     #[test]
     fn test_execute_load_tools_adds_new_groups() {

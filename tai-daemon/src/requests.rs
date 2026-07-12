@@ -1,5 +1,5 @@
 use crate::context;
-use crate::db::write_message_retry;
+use crate::db::{SessionRecord, write_message_retry, write_session_retry};
 use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatAssistantToolUse, ChatRequestMessage,
     ChatToolCall, ChatTurnResult, CompletionChunkKind,
@@ -10,7 +10,7 @@ use crate::providers::{
 };
 use crate::sessions::{RequestContext, SessionCommand, SessionMetadata, SessionState};
 use crate::tools::context::ToolContext;
-use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult};
+use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult, resolve_path};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata,
     MAX_IMAGE_CHUNK_SIZE, OutputStream, SessionMessage, SessionStatus, ThinkingEffort, TokenUsage,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Route an image-sync broadcast through the session command channel so the
 /// main session thread dispatches it to its live subscriber map.
@@ -347,7 +347,6 @@ pub(crate) fn run_agent_loop(
     session: &mut SessionState,
     model: &str,
     request_id: u32,
-    working_dir: Option<&Path>,
     cancel_rx: &mpsc::Receiver<()>,
     ctx: &RequestContext,
 ) -> io::Result<bool> {
@@ -491,10 +490,13 @@ pub(crate) fn run_agent_loop(
                 //   concurrent — everything else (run_riscv, shell,
                 //               filesystem, etc.) that can run on
                 //               independent OS threads.
-                let (mutators, concurrent): (Vec<_>, Vec<_>) = tool_use
-                    .tool_calls
-                    .into_iter()
-                    .partition(|tc| matches!(tc.name.as_str(), "load_tools" | "unload_tools"));
+                let (mutators, concurrent): (Vec<_>, Vec<_>) =
+                    tool_use.tool_calls.into_iter().partition(|tc| {
+                        matches!(
+                            tc.name.as_str(),
+                            "load_tools" | "unload_tools" | "set_working_dir"
+                        )
+                    });
 
                 // ── Phase 1: Session-mutating tools (serial) ────────
                 for tool_call in mutators {
@@ -535,10 +537,11 @@ pub(crate) fn run_agent_loop(
                     );
 
                     let (image_tx, image_rx) = mpsc::channel::<PreparedImage>();
+                    let turn_working_dir = session.config.working_dir.clone();
                     let mut output = execute_tool_with_timeout(
                         &tool_call,
                         None,
-                        working_dir,
+                        turn_working_dir.as_deref(),
                         tool_timeout,
                         request_id,
                         session,
@@ -608,7 +611,7 @@ pub(crate) fn run_agent_loop(
                         daemon_tx: ctx.daemon_tx.clone(),
                         active_tool_groups: session.config.active_tool_groups.clone(),
                         reasoning_effort: session.config.reasoning_effort,
-                        working_dir: working_dir.map(|p| p.to_path_buf()),
+                        working_dir: session.config.working_dir.clone(),
                         cancelled: Arc::clone(&cancel_flag),
                     };
 
@@ -635,7 +638,7 @@ pub(crate) fn run_agent_loop(
                                 registry: Arc::clone(&reg),
                                 cmd_tx: cmd_tx.clone(),
                                 x_credentials: None,
-                                working_dir: working_dir.map(|p| p.to_path_buf()),
+                                working_dir: session.config.working_dir.clone(),
                                 ctx: tool_ctx.clone(),
                             });
                             (call_info, handle)
@@ -833,6 +836,95 @@ fn execute_tool_with_timeout(
             return ToolExecutionOutput {
                 result: ToolResult {
                     content: result,
+                    is_error: false,
+                },
+            };
+        }
+        "set_working_dir" => {
+            // Meta-tools receive raw JSON rather than typed Args because they
+            // are not registered as `Tool` impls — they run inline here with
+            // direct `&mut SessionState` access, avoiding the indirection of
+            // the ToolRegistry dispatch path.
+            let args: serde_json::Value = match serde_json::from_str(&tool_call.arguments_json) {
+                Ok(a) => a,
+                Err(e) => {
+                    return ToolExecutionOutput {
+                        result: ToolResult {
+                            content: format!("invalid arguments: {e}"),
+                            is_error: true,
+                        },
+                    };
+                }
+            };
+            let path_str = match args.get("path").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => {
+                    return ToolExecutionOutput {
+                        result: ToolResult {
+                            content: "missing required argument: path".to_string(),
+                            is_error: true,
+                        },
+                    };
+                }
+            };
+            // Resolve relative to the current session working directory
+            // (or process cwd if none is set yet).
+            let resolved = resolve_path(path_str, working_dir);
+            // canonicalize() resolves symlinks and normalizes the path.
+            // This serves two purposes:
+            //   1. Prevents symlink-escape attacks that would let a model
+            //      redirect subsequent file ops outside the intended tree.
+            //   2. Ensures the path actually exists so subsequent tools
+            //      (find, grep, read_file) don't silently operate on
+            //      a directory that was mistyped or never created.
+            // The downside is that `set_working_dir` cannot target a path
+            // that doesn't exist yet — this is an intentional tradeoff.
+            let canonical = match resolved.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    return ToolExecutionOutput {
+                        result: ToolResult {
+                            content: format!(
+                                "path '{}' does not exist or cannot be resolved: {e}",
+                                resolved.display()
+                            ),
+                            is_error: true,
+                        },
+                    };
+                }
+            };
+
+            info!(
+                session_id = ctx.session_id,
+                path = %canonical.display(),
+                "set_working_dir: changing session working directory",
+            );
+
+            session.config.working_dir = Some(canonical.clone());
+
+            // Notify the daemon so the TUI/inspector can reflect the change
+            // immediately without waiting for the next persist cycle.
+            let _ = ctx
+                .daemon_tx
+                .send(crate::daemon::DaemonCommand::UpdateMetadata {
+                    session_id: ctx.session_id,
+                    metadata: SessionMetadata::from(&*session),
+                });
+
+            // Persist the updated working_dir so it survives a daemon restart.
+            // This is the same pattern used by load_tools/unload_tools.
+            let record: SessionRecord = (&*session).into();
+            if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
+                warn!(
+                    session_id = ctx.session_id,
+                    error = %e,
+                    "set_working_dir: failed to persist session",
+                );
+            }
+
+            return ToolExecutionOutput {
+                result: ToolResult {
+                    content: format!("Working directory changed to '{}'", canonical.display()),
                     is_error: false,
                 },
             };
@@ -1717,5 +1809,179 @@ mod tests {
             Ok(_) => panic!("expected DaemonMessage::ImageEnd"),
             Err(e) => panic!("channel error: {e}"),
         }
+    }
+
+    // -- set_working_dir meta-tool tests ------------------------------------
+
+    #[test]
+    fn set_working_dir_valid_path_updates_session_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let db = redb::Database::create(db_dir.path().join("test.redb")).expect("Database");
+        let registry = ToolRegistry::new().build();
+
+        let mut session = SessionState::empty();
+
+        let tool_call = crate::openai::ChatToolCall {
+            id: "call_set_wd".into(),
+            name: "set_working_dir".into(),
+            arguments_json: serde_json::json!({"path": dir.path().display().to_string()})
+                .to_string(),
+            caller: None,
+        };
+
+        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db: Arc::new(db),
+            tool_registry: registry,
+            daemon_tx,
+            max_turns_default: 25,
+        };
+
+        let result = execute_tool_with_timeout(
+            &tool_call,
+            None,
+            None, // working_dir (not needed for absolute path)
+            Duration::from_secs(10),
+            1,
+            &mut session,
+            &cancel_rx,
+            &ctx,
+            None,
+        );
+
+        assert!(
+            !result.result.is_error,
+            "unexpected error: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("Working directory changed"),
+            "result: {}",
+            result.result.content
+        );
+        assert_eq!(
+            session
+                .config
+                .working_dir
+                .map(|p| p.to_string_lossy().to_string()),
+            Some(dir.path().to_string_lossy().to_string()),
+        );
+    }
+
+    #[test]
+    fn set_working_dir_nonexistent_path_returns_error() {
+        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let db = redb::Database::create(db_dir.path().join("test.redb")).expect("Database");
+        let registry = ToolRegistry::new().build();
+
+        let mut session = SessionState::empty();
+
+        let tool_call = crate::openai::ChatToolCall {
+            id: "call_set_wd_bad".into(),
+            name: "set_working_dir".into(),
+            arguments_json: r#"{"path": "/nonexistent_path_abcxyz_12345"}"#.to_string(),
+            caller: None,
+        };
+
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db: Arc::new(db),
+            tool_registry: registry,
+            daemon_tx,
+            max_turns_default: 25,
+        };
+
+        let result = execute_tool_with_timeout(
+            &tool_call,
+            None,
+            None,
+            Duration::from_secs(10),
+            1,
+            &mut session,
+            &cancel_rx,
+            &ctx,
+            None,
+        );
+
+        assert!(
+            result.result.is_error,
+            "expected error, got: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("does not exist"),
+            "result: {}",
+            result.result.content
+        );
+    }
+
+    #[test]
+    fn set_working_dir_relative_path_resolves_against_current_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).expect("create subdir");
+
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+        let db_dir = tempfile::tempdir().expect("tempdir");
+        let db = redb::Database::create(db_dir.path().join("test.redb")).expect("Database");
+        let registry = ToolRegistry::new().build();
+
+        let mut session = SessionState::empty();
+
+        let tool_call = crate::openai::ChatToolCall {
+            id: "call_set_wd_rel".into(),
+            name: "set_working_dir".into(),
+            arguments_json: r#"{"path": "subdir"}"#.to_string(),
+            caller: None,
+        };
+
+        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        let ctx = RequestContext {
+            cmd_tx,
+            session_id: 1,
+            db: Arc::new(db),
+            tool_registry: registry,
+            daemon_tx,
+            max_turns_default: 25,
+        };
+
+        let result = execute_tool_with_timeout(
+            &tool_call,
+            None,
+            Some(dir.path()), // current working_dir for relative resolution
+            Duration::from_secs(10),
+            1,
+            &mut session,
+            &cancel_rx,
+            &ctx,
+            None,
+        );
+
+        assert!(
+            !result.result.is_error,
+            "unexpected error: {}",
+            result.result.content
+        );
+        assert!(
+            result.result.content.contains("Working directory changed"),
+            "result: {}",
+            result.result.content
+        );
+        let new_wd = session.config.working_dir.unwrap();
+        assert!(
+            new_wd.ends_with("subdir"),
+            "expected endswith subdir, got: {}",
+            new_wd.display()
+        );
     }
 }

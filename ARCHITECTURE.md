@@ -696,10 +696,11 @@ tools regardless of group state.
 
 Implementation details:
 - `ToolRegistry::available_definitions(active)` returns definitions for all registry tools
-  in the active set, plus always-available meta-tools (`load_tools`, `unload_tools`)
-  that require mutable session state
-- `load_tools`/`unload_tools` are intercepted in `execute_tool_with_timeout()` — they are
-  not in the registry because they modify `session.config.active_tool_groups`
+  in the active set, plus always-available meta-tools (`load_tools`, `unload_tools`,
+  `set_working_dir`) that require mutable session state
+- `load_tools`/`unload_tools`/`set_working_dir` are intercepted in
+  `execute_tool_with_timeout()` — they are not in the registry because they modify
+  `session.config.active_tool_groups` or `session.config.working_dir`
 - `list_sessions`, `get_session`, `load_skill`, and `spawn_subsession` were formerly
   intercepted like `load_tools`/`unload_tools` but are now proper `Tool` trait implementations
   registered in the default registry via `ToolRegistry::build()`, using `ToolContext.daemon_tx`

@@ -603,6 +603,7 @@ impl ToolRegistry {
         // need mutable access to session state — load_tools, unload_tools).
         defs.push(groups::load_tools_definition(self));
         defs.push(groups::unload_tools_definition(self));
+        defs.push(groups::set_working_dir_definition());
         defs
     }
 }
