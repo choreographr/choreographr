@@ -102,10 +102,7 @@ pub enum ConnectionMode {
     UnixSocket(String),
     /// Connect via TCP/Noise IK at the given address with the server's
     /// 32-byte X25519 public key (resolved before constructing this variant).
-    Tcp {
-        addr: String,
-        server_pk: [u8; 32],
-    },
+    Tcp { addr: String, server_pk: [u8; 32] },
 }
 
 impl Default for ConnectionMode {

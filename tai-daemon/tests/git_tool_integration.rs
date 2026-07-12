@@ -31,21 +31,6 @@ fn git(repo: &Path, args: &[&str]) {
     assert!(status.success(), "git {:?} failed with {status}", args);
 }
 
-fn git_output(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
 fn init_repo() -> std::path::PathBuf {
     let dir = unique_repo_dir("repo");
     std::fs::create_dir_all(&dir).expect("create repo dir");

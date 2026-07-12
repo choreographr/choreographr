@@ -84,22 +84,14 @@ pub fn backoff_duration(retry_number: u32, config: &RetryConfig) -> Duration {
     Duration::from_millis((capped as f64 * jitter) as u64)
 }
 
-pub fn is_retryable_status(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status,
-        reqwest::StatusCode::TOO_MANY_REQUESTS
-            | reqwest::StatusCode::INTERNAL_SERVER_ERROR
-            | reqwest::StatusCode::BAD_GATEWAY
-            | reqwest::StatusCode::SERVICE_UNAVAILABLE
-            | reqwest::StatusCode::GATEWAY_TIMEOUT
-    )
+pub fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
-pub fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    headers
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
+/// Extract the retry-after header value as seconds from an optional string
+/// value (e.g. `response.header("retry-after")`).
+pub fn parse_retry_after_secs(value: Option<&str>) -> Option<u64> {
+    value.and_then(|v| v.parse::<u64>().ok())
 }
 
 /// Block for `delay`, returning `Cancelled` early if a signal arrives on
@@ -135,109 +127,109 @@ pub fn wait_before_retry(
     sleep_or_cancel(delay, cancel_rx)
 }
 
-fn status_to_error(
-    status: reqwest::StatusCode,
-    detail: &str,
-    headers: &reqwest::header::HeaderMap,
-) -> ProviderHttpError {
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return ProviderHttpError::Unauthorized {
-            status: status.as_u16(),
+fn status_to_error(status: u16, detail: &str, retry_after_secs: Option<u64>) -> ProviderHttpError {
+    match status {
+        401 | 403 => ProviderHttpError::Unauthorized {
+            status,
             detail: detail.to_string(),
-        };
-    }
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return ProviderHttpError::RateLimited {
-            retry_after_secs: parse_retry_after_secs(headers),
+        },
+        429 => ProviderHttpError::RateLimited {
+            retry_after_secs,
             detail: detail.to_string(),
-        };
-    }
-    if status.is_server_error() {
-        return ProviderHttpError::ServerError {
-            status: status.as_u16(),
+        },
+        _ if (500..600).contains(&status) => ProviderHttpError::ServerError {
+            status,
             detail: detail.to_string(),
-        };
-    }
-    if status.is_client_error() {
-        return ProviderHttpError::ClientError {
-            status: status.as_u16(),
+        },
+        _ if (400..500).contains(&status) => ProviderHttpError::ClientError {
+            status,
             detail: detail.to_string(),
-        };
+        },
+        _ => ProviderHttpError::Io(io::Error::other(detail.to_string())),
     }
-    ProviderHttpError::Io(io::Error::other(detail.to_string()))
 }
 
 /// Core retry loop: calls `send_request`, inspects the HTTP status, and retries
 /// on retryable errors up to `retry.max_attempts` times.
+///
+/// The agent must be created with `http_status_as_error(false)` so that 4xx/5xx
+/// arrive as `Ok(response)` rather than `Err`.  Only transport errors
+/// (connection refused, timeout, etc.) produce `Err`.
 pub fn retry_loop<F>(
     send_request: F,
     retry: &RetryConfig,
     on_retry: &mut Option<RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
-) -> Result<reqwest::blocking::Response, ProviderHttpError>
+) -> Result<ureq::http::Response<ureq::Body>, ProviderHttpError>
 where
-    F: Fn() -> Result<reqwest::blocking::Response, reqwest::Error>,
+    F: Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
 
-        let result = send_request();
-
-        match result {
-            Ok(response) => {
-                let status = response.status();
-                let headers = response.headers().clone();
-                if status.is_success() {
-                    return Ok(response);
-                }
-
-                if is_retryable_status(status) && attempt < retry.max_attempts {
-                    let retry_after = parse_retry_after_secs(response.headers());
-                    let body_text = response.text().unwrap_or_default();
-                    let delay = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        retry_after
-                            .map(Duration::from_secs)
-                            .unwrap_or_else(|| backoff_duration(attempt, retry))
-                    } else {
-                        backoff_duration(attempt, retry)
-                    };
-                    tracing::warn!(
-                        attempt,
-                        max_attempts = retry.max_attempts,
-                        ?status,
-                        %body_text,
-                        delay_ms = delay.as_millis(),
-                        "retrying request"
-                    );
-                    wait_before_retry(attempt, retry.max_attempts, delay, on_retry, cancel_rx)?;
-                    continue;
-                }
-
-                let body_text = response.text().unwrap_or_default();
-                let trimmed_body = body_text.trim();
-                let detail = if trimmed_body.is_empty() {
-                    format!("request failed with status {status}")
-                } else {
-                    format!("request failed with status {status}: {trimmed_body}")
-                };
-                return Err(status_to_error(status, &detail, &headers));
-            }
-            Err(error) => {
-                if (error.is_connect() || error.is_timeout()) && attempt < retry.max_attempts {
+        // With http_status_as_error(false), all HTTP responses (even 4xx/5xx)
+        // arrive as Ok; only transport errors are Err.
+        let response = match send_request() {
+            Ok(resp) => resp,
+            Err(err) => {
+                if attempt < retry.max_attempts {
                     let delay = backoff_duration(attempt, retry);
                     tracing::warn!(
                         attempt,
                         max_attempts = retry.max_attempts,
-                        ?error,
+                        ?err,
                         delay_ms = delay.as_millis(),
-                        "retrying request after connection/timeout error"
+                        "retrying request after transport error"
                     );
                     wait_before_retry(attempt, retry.max_attempts, delay, on_retry, cancel_rx)?;
                     continue;
                 }
-                return Err(ProviderHttpError::Io(io::Error::other(error)));
+                return Err(ProviderHttpError::Io(io::Error::other(format!("{err}"))));
             }
+        };
+
+        let status: u16 = response.status().as_u16();
+        if (200..300).contains(&status) {
+            return Ok(response);
         }
+
+        // Parse retry-after once, used in both the retry and terminal-error paths.
+        let retry_after_secs = parse_retry_after_secs(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+        );
+
+        if is_retryable_status(status) && attempt < retry.max_attempts {
+            let delay = if status == 429 {
+                retry_after_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| backoff_duration(attempt, retry))
+            } else {
+                backoff_duration(attempt, retry)
+            };
+            let body_text = response.into_body().read_to_string().unwrap_or_default();
+            tracing::warn!(
+                attempt,
+                max_attempts = retry.max_attempts,
+                status,
+                %body_text,
+                delay_ms = delay.as_millis(),
+                "retrying request"
+            );
+            wait_before_retry(attempt, retry.max_attempts, delay, on_retry, cancel_rx)?;
+            continue;
+        }
+
+        let body_text = response.into_body().read_to_string().unwrap_or_default();
+        let trimmed_body = body_text.trim();
+        let detail = if trimmed_body.is_empty() {
+            format!("request failed with status {status}")
+        } else {
+            format!("request failed with status {status}: {trimmed_body}")
+        };
+        return Err(status_to_error(status, &detail, retry_after_secs));
     }
 }

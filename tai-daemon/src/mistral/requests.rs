@@ -44,7 +44,7 @@ fn endpoint_url(base_url: &str, path: &str) -> io::Result<String> {
 
 /// Fetch the list of available models from the Mistral API.
 pub(super) fn list_models_request(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &MistralConfig,
     api_key: &str,
 ) -> Result<Vec<String>, MistralError> {
@@ -57,10 +57,10 @@ pub(super) fn list_models_request(
 
     let response = retry::retry_loop(
         || {
-            client
+            agent
                 .get(&url)
-                .header("Authorization", format!("Bearer {}", api_key.trim()))
-                .send()
+                .header("Authorization", &format!("Bearer {}", api_key.trim()))
+                .call()
         },
         &retry_cfg,
         &mut None,
@@ -68,7 +68,8 @@ pub(super) fn list_models_request(
     )?;
 
     let payload: ModelListResponse = response
-        .json()
+        .into_body()
+        .read_json()
         .map_err(|e| MistralError::Io(io::Error::other(e)))?;
 
     let models: Vec<String> = payload.data.into_iter().map(|m| m.id).collect();
@@ -78,7 +79,7 @@ pub(super) fn list_models_request(
 /// Send a POST /v1/chat/completions request with retry.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat_completion_request(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &MistralConfig,
     api_key: &str,
     model: &str,
@@ -104,29 +105,28 @@ pub(super) fn chat_completion_request(
 
     let reasoning = thinking_payload(thinking_effort);
 
-    let body = ChatCompletionRequest {
+    let body = serde_json::to_value(&ChatCompletionRequest {
         model,
         messages: payloads,
         tools: tool_payloads,
         stream: false,
         max_tokens: Some(config.max_tokens),
         reasoning_effort: reasoning,
-    };
+    })
+    .map_err(io::Error::other)?;
 
     debug!(
-        "Mistral chat completion request: {} messages, model={}, tools={}",
-        body.messages.len(),
-        body.model,
-        body.tools.as_ref().map_or(0, |t| t.len()),
+        "Mistral chat completion request: {} messages, model={}",
+        body["messages"].as_array().map_or(0, |a| a.len()),
+        body["model"].as_str().unwrap_or("?"),
     );
 
     let response = retry::retry_loop(
         || {
-            client
+            agent
                 .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key.trim()))
-                .json(&body)
-                .send()
+                .header("Authorization", &format!("Bearer {}", api_key.trim()))
+                .send_json(body.clone())
         },
         &retry_cfg,
         on_retry,
@@ -134,7 +134,8 @@ pub(super) fn chat_completion_request(
     )?;
 
     let payload: ChatCompletionResponse = response
-        .json()
+        .into_body()
+        .read_json()
         .map_err(|e| MistralError::Io(io::Error::other(e)))?;
 
     response_to_turn_result(payload)
@@ -143,7 +144,7 @@ pub(super) fn chat_completion_request(
 /// Send a streaming POST /v1/chat/completions request with retry.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat_completion_request_streaming<F>(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &MistralConfig,
     api_key: &str,
     model: &str,
@@ -173,42 +174,40 @@ where
 
     let reasoning = thinking_payload(thinking_effort);
 
-    let body = ChatCompletionRequest {
+    let body = serde_json::to_value(&ChatCompletionRequest {
         model,
         messages: payloads,
         tools: tool_payloads,
         stream: true,
         max_tokens: Some(config.max_tokens),
         reasoning_effort: reasoning,
-    };
+    })
+    .map_err(io::Error::other)?;
 
-    debug!(
-        "Mistral streaming chat completion request: model={}",
-        body.model
-    );
+    debug!("Mistral streaming chat completion request: model={}", model,);
 
     let response = retry::retry_loop(
         || {
-            client
+            agent
                 .post(&url)
-                .header("Authorization", format!("Bearer {}", api_key.trim()))
-                .json(&body)
-                .send()
+                .header("Authorization", &format!("Bearer {}", api_key.trim()))
+                .send_json(body.clone())
         },
         &retry_cfg,
         on_retry,
         cancel_rx,
     )?;
 
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
+    let status: u16 = response.status().as_u16();
+    if !(200..300).contains(&status) {
         let detail = response
-            .text()
+            .into_body()
+            .read_to_string()
             .unwrap_or_else(|_| "unknown error".to_string());
         return Err(map_http_status(status, detail));
     }
 
-    let reader = BufReader::new(response);
+    let reader = BufReader::new(response.into_body().into_reader());
     let mut text_accumulated = String::new();
 
     // Accumulate tool call deltas by index across SSE chunks.

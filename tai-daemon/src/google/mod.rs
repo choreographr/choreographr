@@ -77,15 +77,15 @@ pub use crate::providers::shared::ProviderError as GoogleError;
 pub struct GoogleClient {
     config: GoogleConfig,
     api_key: String,
-    http: reqwest::blocking::Client,
+    http: ureq::Agent,
 }
 
 impl GoogleClient {
     pub fn new(config: GoogleConfig, api_key: String) -> io::Result<Self> {
-        let http = crate::providers::shared::build_http_client(
+        let http = crate::providers::shared::build_agent(
             config.connect_timeout_secs,
             config.request_timeout_secs,
-        )?;
+        );
         Ok(Self {
             config,
             api_key,

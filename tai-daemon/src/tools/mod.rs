@@ -138,7 +138,8 @@ macro_rules! define_tool {
 
 pub(crate) mod admin;
 mod error;
-pub(crate) use error::{ToolError, tool_err, tool_ok};
+pub use error::ToolError;
+pub(crate) use error::{tool_err, tool_ok};
 
 pub(crate) mod context;
 pub(crate) mod db;
@@ -148,7 +149,7 @@ pub(crate) mod fish;
 pub(crate) mod fs;
 pub(crate) mod git;
 pub(crate) mod groups;
-pub(crate) mod http;
+pub mod http;
 mod image;
 pub(crate) mod nu;
 pub(crate) mod random;

@@ -14,21 +14,21 @@ pub(crate) fn retry_config_from_config(config: &ServiceConfig) -> RetryConfig {
 }
 
 pub(crate) fn retry_send(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     url: &str,
     api_key: &str,
     body: &serde_json::Value,
     retry_cfg: &RetryConfig,
     on_retry: &mut Option<RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
-) -> Result<reqwest::blocking::Response, OpenAiError> {
+) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
+    let auth_header = format!("Bearer {}", api_key.trim());
     retry::retry_loop(
         || {
-            client
+            agent
                 .post(url)
-                .bearer_auth(api_key.trim())
-                .json(body)
-                .send()
+                .header("Authorization", &auth_header)
+                .send_json(body.clone())
         },
         retry_cfg,
         on_retry,
@@ -38,15 +38,16 @@ pub(crate) fn retry_send(
 }
 
 pub(crate) fn retry_send_get(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     url: &str,
     api_key: &str,
     retry_cfg: &RetryConfig,
     on_retry: &mut Option<RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
-) -> Result<reqwest::blocking::Response, OpenAiError> {
+) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
+    let auth_header = format!("Bearer {}", api_key.trim());
     retry::retry_loop(
-        || client.get(url).bearer_auth(api_key.trim()).send(),
+        || agent.get(url).header("Authorization", &auth_header).call(),
         retry_cfg,
         on_retry,
         cancel_rx,
@@ -57,22 +58,22 @@ pub(crate) fn retry_send_get(
 /// Thin wrapper around [`retry_send`] that skips retry callbacks and
 /// cancellation.
 pub(crate) fn retry_send_simple(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     url: &str,
     api_key: &str,
     body: &serde_json::Value,
     retry_cfg: &RetryConfig,
-) -> Result<reqwest::blocking::Response, OpenAiError> {
-    retry_send(client, url, api_key, body, retry_cfg, &mut None, None)
+) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
+    retry_send(agent, url, api_key, body, retry_cfg, &mut None, None)
 }
 
 /// Thin wrapper around [`retry_send_get`] that skips retry callbacks and
 /// cancellation.
 pub(crate) fn retry_send_get_simple(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     url: &str,
     api_key: &str,
     retry_cfg: &RetryConfig,
-) -> Result<reqwest::blocking::Response, OpenAiError> {
-    retry_send_get(client, url, api_key, retry_cfg, &mut None, None)
+) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
+    retry_send_get(agent, url, api_key, retry_cfg, &mut None, None)
 }

@@ -1,5 +1,4 @@
 use crate::connection::handle_terminal_event;
-use crate::db;
 use crate::markdown_render::*;
 use crate::state::*;
 use crate::test_util::test_app;

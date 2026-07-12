@@ -1,5 +1,4 @@
 use crate::tools::{ToolError, context::ToolContext, truncate_tool_output};
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use std::path::Path;
 use tai_keystore::{ServiceCredential, XCredentialView};
@@ -154,19 +153,24 @@ fn x_api_get(
     let url = format!("{X_API_BASE}{path}");
     let auth_header = build_oauth1_header("GET", &url, &creds, params);
 
-    let client = Client::new();
-    let response = client
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let response = agent
         .get(&url)
         .header("Authorization", &auth_header)
-        .send()
+        .call()
         .map_err(|e| format!("X API request failed: {e}"))?;
 
-    let status = response.status();
+    let status = response.status().as_u16();
     let body = response
-        .text()
+        .into_body()
+        .read_to_string()
         .map_err(|e| format!("failed to read response: {e}"))?;
 
-    if !status.is_success() {
+    if !(200..300).contains(&status) {
         return Err(format!("X API error (status {status}): {body}"));
     }
 
@@ -182,21 +186,25 @@ fn x_api_post(
     let url = format!("{X_API_BASE}{path}");
     let auth_header = build_oauth1_header("POST", &url, &creds, &[]);
 
-    let client = Client::new();
-    let response = client
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let response = agent
         .post(&url)
         .header("Authorization", &auth_header)
         .header("Content-Type", "application/json")
-        .body(body_json.to_string())
-        .send()
+        .send(body_json)
         .map_err(|e| format!("X API request failed: {e}"))?;
 
-    let status = response.status();
+    let status = response.status().as_u16();
     let body = response
-        .text()
+        .into_body()
+        .read_to_string()
         .map_err(|e| format!("failed to read response: {e}"))?;
 
-    if !status.is_success() {
+    if !(200..300).contains(&status) {
         return Err(format!("X API error (status {status}): {body}"));
     }
 

@@ -42,7 +42,4 @@ pub(crate) use crate::tools::fs::{
 };
 
 #[cfg(test)]
-pub(crate) use crate::tools::http::execute_http_request_tool;
-
-#[cfg(test)]
 mod tests;

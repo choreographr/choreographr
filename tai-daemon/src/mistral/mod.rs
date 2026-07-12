@@ -77,7 +77,7 @@ pub use crate::providers::shared::ProviderError as MistralError;
 pub struct MistralClient {
     config: MistralConfig,
     api_key: String,
-    http: reqwest::blocking::Client,
+    http: ureq::Agent,
 }
 
 // ── ProviderClient trait impl ───────────────────────────────────────────
@@ -119,10 +119,10 @@ impl ProviderClient for MistralClient {
 
 impl MistralClient {
     pub fn new(config: MistralConfig, api_key: String) -> io::Result<Self> {
-        let http = crate::providers::shared::build_http_client(
+        let http = crate::providers::shared::build_agent(
             config.connect_timeout_secs,
             config.request_timeout_secs,
-        )?;
+        );
         Ok(Self {
             config,
             api_key,

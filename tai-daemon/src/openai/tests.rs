@@ -55,17 +55,16 @@ fn chat_completions_stream_delta_keeps_reasoning_separate() {
 
 #[test]
 fn retryable_statuses() {
-    use reqwest::StatusCode;
-    assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
-    assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
-    assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
-    assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
-    assert!(is_retryable_status(StatusCode::GATEWAY_TIMEOUT));
-    assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
-    assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
-    assert!(!is_retryable_status(StatusCode::FORBIDDEN));
-    assert!(!is_retryable_status(StatusCode::NOT_FOUND));
-    assert!(!is_retryable_status(StatusCode::OK));
+    assert!(is_retryable_status(429)); // TOO_MANY_REQUESTS
+    assert!(is_retryable_status(500)); // INTERNAL_SERVER_ERROR
+    assert!(is_retryable_status(502)); // BAD_GATEWAY
+    assert!(is_retryable_status(503)); // SERVICE_UNAVAILABLE
+    assert!(is_retryable_status(504)); // GATEWAY_TIMEOUT
+    assert!(!is_retryable_status(400)); // BAD_REQUEST
+    assert!(!is_retryable_status(401)); // UNAUTHORIZED
+    assert!(!is_retryable_status(403)); // FORBIDDEN
+    assert!(!is_retryable_status(404)); // NOT_FOUND
+    assert!(!is_retryable_status(200)); // OK
 }
 
 #[test]
@@ -103,22 +102,17 @@ fn backoff_respects_max_cap() {
 
 #[test]
 fn parse_retry_after_seconds() {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::RETRY_AFTER, "42".parse().unwrap());
-    assert_eq!(parse_retry_after_secs(&headers), Some(42));
+    assert_eq!(parse_retry_after_secs(Some("42")), Some(42));
 }
 
 #[test]
 fn parse_retry_after_missing_header() {
-    let headers = reqwest::header::HeaderMap::new();
-    assert_eq!(parse_retry_after_secs(&headers), None);
+    assert_eq!(parse_retry_after_secs(None), None);
 }
 
 #[test]
 fn parse_retry_after_non_integer() {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(reqwest::header::RETRY_AFTER, "abc".parse().unwrap());
-    assert_eq!(parse_retry_after_secs(&headers), None);
+    assert_eq!(parse_retry_after_secs(Some("abc")), None);
 }
 
 #[test]

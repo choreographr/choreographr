@@ -25,7 +25,7 @@ const MODELS_PATH: &str = "/v1/models";
 
 /// Fetch the list of available models from the Anthropic API.
 pub(super) fn list_models_request(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &AnthropicConfig,
     api_key: &str,
 ) -> Result<Vec<String>, AnthropicError> {
@@ -38,11 +38,11 @@ pub(super) fn list_models_request(
 
     let response = retry::retry_loop(
         || {
-            client
+            agent
                 .get(&url)
                 .header("x-api-key", api_key.trim())
                 .header("anthropic-version", &config.api_version)
-                .send()
+                .call()
         },
         &retry_cfg,
         &mut None,
@@ -50,7 +50,8 @@ pub(super) fn list_models_request(
     )?;
 
     let payload: ModelListResponse = response
-        .json()
+        .into_body()
+        .read_json()
         .map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
 
     let models: Vec<String> = payload.data.into_iter().map(|m| m.id).collect();
@@ -71,7 +72,7 @@ fn endpoint_url(base_url: &str, path: &str) -> io::Result<String> {
 /// Send a POST /v1/messages request with retry.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn messages_request(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &AnthropicConfig,
     api_key: &str,
     model: &str,
@@ -117,12 +118,11 @@ pub(super) fn messages_request(
 
     let response = retry::retry_loop(
         || {
-            client
+            agent
                 .post(&url)
                 .header("x-api-key", api_key.trim())
                 .header("anthropic-version", &config.api_version)
-                .json(&body)
-                .send()
+                .send_json(body.clone())
         },
         &retry_cfg,
         on_retry,
@@ -131,7 +131,8 @@ pub(super) fn messages_request(
     .map_err(AnthropicError::from)?;
 
     let payload: MessagesResponse = response
-        .json()
+        .into_body()
+        .read_json()
         .map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
 
     response_to_turn_result(payload)
@@ -140,7 +141,7 @@ pub(super) fn messages_request(
 /// Streaming POST /v1/messages request via SSE with retry.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn messages_request_streaming<F>(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &AnthropicConfig,
     api_key: &str,
     model: &str,
@@ -189,12 +190,11 @@ where
 
     let response = retry::retry_loop(
         || {
-            client
+            agent
                 .post(&url)
                 .header("x-api-key", api_key.trim())
                 .header("anthropic-version", &config.api_version)
-                .json(&body)
-                .send()
+                .send_json(body.clone())
         },
         &retry_cfg,
         on_retry,
@@ -203,7 +203,7 @@ where
     .map_err(AnthropicError::from)?;
 
     // Parse the SSE stream using an Anthropic-specific reader.
-    let mut reader = AnthropicSseReader::from_reader(response);
+    let mut reader = AnthropicSseReader::from_reader(response.into_body().into_reader());
     let mut saw_text = false;
     let mut full_text = String::new();
     let mut full_reasoning = String::new();

@@ -11,6 +11,8 @@ tai-client-core.workspace = true
 tai-markdown.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-frankenstein = { version = "0.50", features = ["client-ureq"] }
+thiserror.workspace = true
+ureq.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 ammonia.workspace = true
-tempfile.workspace = true

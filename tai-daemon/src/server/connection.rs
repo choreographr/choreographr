@@ -84,10 +84,12 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             }
         }
         ClientMessage::SubscribeSessionsSummary => {
-            let _ = ctx.daemon_tx.send(DaemonCommand::RegisterSummarySubscriber {
-                client_id: ctx.client_id,
-                writer: ctx.writer_tx.clone(),
-            });
+            let _ = ctx
+                .daemon_tx
+                .send(DaemonCommand::RegisterSummarySubscriber {
+                    client_id: ctx.client_id,
+                    writer: ctx.writer_tx.clone(),
+                });
         }
         ClientMessage::UnsubscribeSessionsSummary => {
             let _ = ctx
@@ -154,7 +156,9 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let (reply, rx) = mpsc::channel();
                 let _ = tx.send(SessionCommand::GetReasoningEffort { reply });
                 if let Ok(effort) = rx.recv() {
-                    let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSet { effort });
+                    let _ = ctx
+                        .writer_tx
+                        .send(DaemonMessage::ReasoningEffortSet { effort });
                 }
             } else {
                 let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSet {
@@ -171,11 +175,17 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             encrypted_payload,
             unlock_key,
         } => {
-            info!("client {}: AddCredential service={}", ctx.client_id, service);
+            info!(
+                "client {}: AddCredential service={}",
+                ctx.client_id, service
+            );
             handle_add_credential_sync(ctx, service, encrypted_payload, unlock_key);
         }
         ClientMessage::RemoveCredential { service } => {
-            info!("client {}: RemoveCredential service={}", ctx.client_id, service);
+            info!(
+                "client {}: RemoveCredential service={}",
+                ctx.client_id, service
+            );
             handle_remove_credential_sync(ctx, service);
         }
         ClientMessage::ListModels => {
@@ -238,14 +248,17 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             }
         }
         ClientMessage::ListAccounts => {
-            let result =
-                request_daemon(ctx.daemon_tx, |reply| DaemonCommand::ListAccountsCmd { reply });
+            let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::ListAccountsCmd {
+                reply,
+            });
             match result {
                 Ok(Ok(accounts)) => {
                     let _ = ctx.writer_tx.send(DaemonMessage::Accounts { accounts });
                 }
                 Ok(Err(e)) => {
-                    let _ = ctx.writer_tx.send(DaemonMessage::AccountListFailed { error: e });
+                    let _ = ctx
+                        .writer_tx
+                        .send(DaemonMessage::AccountListFailed { error: e });
                 }
                 Err(_) => warn!("daemon disconnected while handling list accounts"),
             }
@@ -318,7 +331,13 @@ pub(crate) fn client_thread(
         }
     }
 
-    cleanup_client(attached_session_tx, client_id, &daemon_tx, writer_tx, writer_handle);
+    cleanup_client(
+        attached_session_tx,
+        client_id,
+        &daemon_tx,
+        writer_tx,
+        writer_handle,
+    );
     Ok(())
 }
 
@@ -379,7 +398,13 @@ pub(crate) fn tcp_client_thread(
         }
     }
 
-    cleanup_client(attached_session_tx, client_id, &daemon_tx, writer_tx, writer_handle);
+    cleanup_client(
+        attached_session_tx,
+        client_id,
+        &daemon_tx,
+        writer_tx,
+        writer_handle,
+    );
     Ok(())
 }
 
@@ -476,7 +501,9 @@ fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
     match rx.recv() {
         Ok(Ok(session_tx)) => {
             switch_attached_session(session_id, session_tx, ctx);
-            let _ = ctx.writer_tx.send(DaemonMessage::SessionAttached { session_id });
+            let _ = ctx
+                .writer_tx
+                .send(DaemonMessage::SessionAttached { session_id });
         }
         Ok(Err(e)) => {
             let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
@@ -579,7 +606,9 @@ fn handle_get_credential_sync(ctx: &mut ClientCtx, service: String) {
             });
         }
         Ok(None) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::Credential { service, key: None });
+            let _ = ctx
+                .writer_tx
+                .send(DaemonMessage::Credential { service, key: None });
         }
         Err(_) => warn!("daemon disconnected while handling get credential"),
     }
@@ -620,7 +649,9 @@ fn handle_add_credential_sync(
     });
     match result {
         Ok(Ok(())) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::CredentialAdded { service });
+            let _ = ctx
+                .writer_tx
+                .send(DaemonMessage::CredentialAdded { service });
         }
         Ok(Err(e)) => {
             let _ = ctx
@@ -638,7 +669,9 @@ fn handle_remove_credential_sync(ctx: &mut ClientCtx, service: String) {
     });
     match result {
         Ok(Ok(())) => {
-            let _ = ctx.writer_tx.send(DaemonMessage::CredentialRemoved { service });
+            let _ = ctx
+                .writer_tx
+                .send(DaemonMessage::CredentialRemoved { service });
         }
         Ok(Err(e)) => {
             let _ = ctx

@@ -24,6 +24,7 @@ tai-proto = { path = "tai-proto" }
 tai-im = { path = "tai-im" }
 tai-markdown = { path = "tai-markdown" }
 tai-transport = { path = "tai-transport" }
+ureq = { version = "3", features = ["json"] }
 ammonia = "4"
 base64 = "0.22"
 dirs = "6"
@@ -47,3 +48,4 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 tempfile = "3"
 clap = { version = "4.6.1", features = ["derive"] }
 snow = "0.10"
+url = "2"

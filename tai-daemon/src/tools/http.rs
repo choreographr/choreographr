@@ -1,8 +1,4 @@
 use super::{ToolError, truncate_tool_output};
-use reqwest::{
-    Method, StatusCode, Url,
-    header::{HeaderMap, HeaderName, HeaderValue},
-};
 use serde::Deserialize;
 use std::{collections::HashMap, path::Path, time::Duration};
 
@@ -16,54 +12,87 @@ pub struct HttpRequestArgs {
     pub timeout_secs: Option<u64>,
 }
 
-pub(crate) fn execute_http_request_tool(
+pub fn execute_http_request_tool(
     args: &HttpRequestArgs,
     _cwd: Option<&Path>,
 ) -> Result<String, ToolError> {
-    let method = match args.method.as_str() {
-        "GET" => Method::GET,
-        "POST" => Method::POST,
-        "HEAD" => Method::HEAD,
+    match args.method.as_str() {
+        "GET" | "POST" | "HEAD" => {}
         other => return Err(ToolError::UnsupportedMethod(other.to_string())),
-    };
+    }
 
-    let url = Url::parse(&args.url).map_err(|e| ToolError::InvalidUrl(e.to_string()))?;
-    match url.scheme() {
+    let parsed_url =
+        url::Url::parse(&args.url).map_err(|e| ToolError::InvalidUrl(e.to_string()))?;
+    match parsed_url.scheme() {
         "http" | "https" => {}
         other => return Err(ToolError::UnsupportedUrlScheme(other.to_string())),
     }
 
     let timeout_secs = args.timeout_secs.unwrap_or(10).clamp(1, 30);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .build()
-        .map_err(|e| ToolError::Other(format!("failed to build http client: {e}")))?;
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(timeout_secs)))
+            .http_status_as_error(false)
+            .build(),
+    );
 
-    let headers = build_http_request_headers(args.headers.clone())?;
-
-    let mut request = client.request(method.clone(), url).headers(headers);
-    if method != Method::GET
-        && method != Method::HEAD
-        && let Some(body) = &args.body
-    {
-        request = request.body(body.clone());
+    let response = match args.method.as_str() {
+        "GET" => {
+            let mut req = agent.get(&args.url);
+            req = req.header("User-Agent", "tai-daemon/0.1");
+            for (name, value) in &args.headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+            req.call()
+        }
+        "POST" => {
+            let mut req = agent.post(&args.url);
+            req = req.header("User-Agent", "tai-daemon/0.1");
+            for (name, value) in &args.headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+            if let Some(body) = &args.body {
+                req.send(body.as_str())
+            } else {
+                req.send_empty()
+            }
+        }
+        "HEAD" => {
+            let mut req = agent.head(&args.url);
+            req = req.header("User-Agent", "tai-daemon/0.1");
+            for (name, value) in &args.headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+            req.call()
+        }
+        other => return Err(ToolError::UnsupportedMethod(other.to_string())),
     }
-
-    let response = request
-        .send()
-        .map_err(|e| ToolError::RequestFailed(e.to_string()))?;
+    .map_err(|e| ToolError::RequestFailed(e.to_string()))?;
 
     let status = response.status();
-    let headers = response.headers().clone();
-    let content_type = headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
         .to_string();
-    let body = if method == Method::HEAD {
+
+    // Collect headers before consuming the body with into_body()
+    let headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                value.to_str().unwrap_or("<non-utf8>").to_string(),
+            )
+        })
+        .collect();
+
+    let body = if args.method == "HEAD" {
         String::new()
     } else if is_text_content_type(&content_type) {
-        match response.text() {
+        match response.into_body().read_to_string() {
             Ok(text) => truncate_tool_output(&text),
             Err(error) => format!("body omitted: failed to decode response text: {error}"),
         }
@@ -72,24 +101,6 @@ pub(crate) fn execute_http_request_tool(
     };
 
     Ok(format_http_response(status, &headers, &body))
-}
-
-fn build_http_request_headers(headers: HashMap<String, String>) -> Result<HeaderMap, ToolError> {
-    let mut request_headers = HeaderMap::new();
-    for (name, value) in headers {
-        let header_name =
-            HeaderName::try_from(name.as_str()).map_err(|error| ToolError::InvalidHeader {
-                name: name.clone(),
-                error: error.to_string(),
-            })?;
-        let header_value =
-            HeaderValue::from_str(&value).map_err(|error| ToolError::InvalidHeader {
-                name: name.clone(),
-                error: error.to_string(),
-            })?;
-        request_headers.insert(header_name, header_value);
-    }
-    Ok(request_headers)
 }
 
 fn is_text_content_type(content_type: &str) -> bool {
@@ -113,25 +124,21 @@ fn is_text_content_type(content_type: &str) -> bool {
         || mime.ends_with("+xml")
 }
 
-fn format_http_response(status: StatusCode, headers: &HeaderMap, body: &str) -> String {
-    let mut output = format!("status: {}", status);
+fn format_http_response(
+    status: ureq::http::StatusCode,
+    headers: &[(String, String)],
+    body: &str,
+) -> String {
+    let mut output = format!("status: {status}");
 
-    let mut entries = headers
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_ascii_lowercase(),
-                value.to_str().unwrap_or("<non-utf8>").to_string(),
-            )
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut sorted = headers.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for (name, value) in entries {
+    for (name, value) in &sorted {
         output.push('\n');
-        output.push_str(&name);
+        output.push_str(name);
         output.push_str(": ");
-        output.push_str(&value);
+        output.push_str(value);
     }
 
     output.push_str("\n\n");

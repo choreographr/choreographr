@@ -292,15 +292,15 @@ impl ChatToolDefinition {
 pub struct OpenAiClient {
     config: ServiceConfig,
     api_key: String,
-    http: reqwest::blocking::Client,
+    http: ureq::Agent,
 }
 
 impl OpenAiClient {
     pub fn new(config: ServiceConfig, api_key: String) -> io::Result<Self> {
-        let http = crate::providers::shared::build_http_client(
+        let http = crate::providers::shared::build_agent(
             config.connect_timeout_secs,
             config.request_timeout_secs,
-        )?;
+        );
         Ok(Self {
             config,
             api_key,

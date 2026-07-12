@@ -22,7 +22,7 @@ const STREAM_GENERATE_CONTENT: &str = "streamGenerateContent?alt=sse";
 
 /// Fetch the list of available models from the Google Gemini API.
 pub(super) fn list_models_request(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &GoogleConfig,
     api_key: &str,
 ) -> Result<Vec<String>, GoogleError> {
@@ -36,10 +36,10 @@ pub(super) fn list_models_request(
 
     let response = retry::retry_loop(
         || {
-            client
+            agent
                 .get(&url)
                 .header("x-goog-api-key", api_key.trim())
-                .send()
+                .call()
         },
         &retry_cfg,
         &mut None,
@@ -47,7 +47,8 @@ pub(super) fn list_models_request(
     )?;
 
     let payload: ModelListResponse = response
-        .json()
+        .into_body()
+        .read_json()
         .map_err(|e| GoogleError::Io(std::io::Error::other(e)))?;
 
     // Google returns model names as "models/gemini-2.5-pro" — strip the prefix.
@@ -68,7 +69,7 @@ pub(super) fn list_models_request(
 /// Send a POST /v1beta/models/{model}:generateContent request with retry.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn generate_content_request(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &GoogleConfig,
     api_key: &str,
     model: &str,
@@ -110,11 +111,10 @@ pub(super) fn generate_content_request(
 
     let response = retry::retry_loop(
         || {
-            client
+            agent
                 .post(&url)
                 .header("x-goog-api-key", api_key.trim())
-                .json(&body)
-                .send()
+                .send_json(body.clone())
         },
         &retry_cfg,
         on_retry,
@@ -124,13 +124,14 @@ pub(super) fn generate_content_request(
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().unwrap_or_default();
+        let body_text = response.into_body().read_to_string().unwrap_or_default();
         let detail = extract_error_detail(&body_text);
         return Err(status_to_google_error(status.as_u16(), &detail));
     }
 
     let payload: GenerateContentResponse = response
-        .json()
+        .into_body()
+        .read_json()
         .map_err(|e| GoogleError::Io(io::Error::other(e)))?;
 
     response_to_turn_result(payload)
@@ -139,7 +140,7 @@ pub(super) fn generate_content_request(
 /// Streaming POST /v1beta/models/{model}:streamGenerateContent?alt=sse via SSE with retry.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn generate_content_request_streaming<F>(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &GoogleConfig,
     api_key: &str,
     model: &str,
@@ -185,11 +186,10 @@ where
 
     let response = retry::retry_loop(
         || {
-            client
+            agent
                 .post(&url)
                 .header("x-goog-api-key", api_key.trim())
-                .json(&body)
-                .send()
+                .send_json(body.clone())
         },
         &retry_cfg,
         on_retry,
@@ -199,12 +199,12 @@ where
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().unwrap_or_default();
+        let body_text = response.into_body().read_to_string().unwrap_or_default();
         let detail = extract_error_detail(&body_text);
         return Err(status_to_google_error(status.as_u16(), &detail));
     }
 
-    let mut reader = GeminiSseReader::from_reader(response);
+    let mut reader = GeminiSseReader::from_reader(response.into_body().into_reader());
     let mut has_content = false;
     let mut full_text = String::new();
     let mut full_reasoning = String::new();

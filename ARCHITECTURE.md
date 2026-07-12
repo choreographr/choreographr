@@ -209,7 +209,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. |
 | `providers/` | `ProviderClient` trait + `ProviderCatalog` system. `InferenceProvider` struct wraps `Arc<dyn ProviderClient>`. Static `PROVIDER_CATALOG` maps ~31 slugs to protocol type, default base URL, and default model. Dispatches to the correct client based on protocol. |
-| `providers/shared.rs` | Shared provider infrastructure: `ProviderError` (unified error type used by all providers), `build_http_client()`, `error_type_label()`, `provider_error_to_inference()`, `timed_result()` (metrics instrumentation wrapper). Eliminates duplicated error types, `From<ProviderHttpError>` impls, and error conversion functions across provider implementations. |
+| `providers/shared.rs` | Shared provider infrastructure: `ProviderError` (unified error type used by all providers), `build_agent()` (ureq Agent construction with timeouts), `error_type_label()`, `provider_error_to_inference()`, `timed_result()` (metrics instrumentation wrapper). Eliminates duplicated error types, `From<ProviderHttpError>` impls, and error conversion functions across provider implementations. |
 | `anthropic/` | Anthropic Messages API client (`AnthropicClient`). Implements `ProviderClient`. |
 | `google/` | Google Gemini API client (`GoogleClient`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
 | `mistral/` | Mistral API client (`MistralClient`). Implements `ProviderClient`. Uses OpenAI-compatible SSE reader for streaming. |
@@ -1263,7 +1263,7 @@ cargo run -p tai-im -- telegram
 | `tokio` | tui, dioxus, im | Async runtime |
 | `serde` + `postcard` | proto, clients, daemon | Wire protocol framing and internal storage |
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
-| `reqwest` (rustls) | daemon | HTTP client |
+| `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
 | `ratatui` + `crossterm` | tai-tui | Terminal UI |
 | `dioxus` | tai-dioxus | Desktop UI |

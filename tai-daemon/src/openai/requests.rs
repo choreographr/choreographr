@@ -22,7 +22,8 @@ impl OpenAiClient {
         let retry = retry::retry_config_from_config(&self.config);
         let response = retry::retry_send_get_simple(&self.http, &url, &self.api_key, &retry)?;
         let payload: ModelListResponse = response
-            .json()
+            .into_body()
+            .read_json()
             .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
         let models: Vec<String> = payload.data.into_iter().map(|model| model.id).collect();
         info!("models returned: {}", models.len());
@@ -161,7 +162,7 @@ impl OpenAiClient {
 }
 
 fn responses_request(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -175,9 +176,10 @@ fn responses_request(
         stream: false,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send_simple(client, &url, api_key, &body, &retry)?;
+    let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
     let payload: ResponsesResponse = response
-        .json()
+        .into_body()
+        .read_json()
         .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
     let content = payload
@@ -197,7 +199,7 @@ fn responses_request(
 }
 
 fn chat_completions_request(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -223,9 +225,10 @@ fn chat_completions_request(
         reasoning_effort: None,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send_simple(client, &url, api_key, &body, &retry)?;
+    let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
     let payload: ChatCompletionsResponse = response
-        .json()
+        .into_body()
+        .read_json()
         .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
     let content = payload
@@ -246,7 +249,7 @@ fn chat_completions_request(
 
 #[allow(clippy::too_many_arguments)]
 fn chat_completions_request_with_tools(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -276,9 +279,10 @@ fn chat_completions_request_with_tools(
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send(client, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
     let payload: ChatCompletionsResponse = response
-        .json()
+        .into_body()
+        .read_json()
         .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
     let elapsed = start.elapsed();
@@ -341,7 +345,7 @@ fn chat_completions_request_with_tools(
 }
 
 fn chat_completions_request_streaming<F>(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -374,8 +378,8 @@ where
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send_simple(client, &url, api_key, &body, &retry)?;
-    let mut reader = SseReader::from_reader(response);
+    let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
+    let mut reader = SseReader::from_reader(response.into_body().into_reader());
     let mut saw_text = false;
     while let Some(data) = reader.next_event()? {
         let payload: ChatCompletionsStreamResponse =
@@ -412,7 +416,7 @@ where
 }
 
 fn responses_request_streaming<F>(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -430,8 +434,8 @@ where
         stream: true,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send_simple(client, &url, api_key, &body, &retry)?;
-    let mut reader = SseReader::from_reader(response);
+    let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
+    let mut reader = SseReader::from_reader(response.into_body().into_reader());
     let mut saw_text = false;
     while let Some(data) = reader.next_event()? {
         if let Some(delta) = extract_responses_text_delta(&data)?
@@ -499,7 +503,7 @@ fn accumulate_tool_calls_from_deltas(
 /// chunks and returned as `ChatTurnResult::ToolUse` when the stream ends.
 #[allow(clippy::too_many_arguments)]
 fn chat_completions_request_streaming_with_tools<F>(
-    client: &reqwest::blocking::Client,
+    agent: &ureq::Agent,
     config: &ServiceConfig,
     api_key: &str,
     model: &str,
@@ -541,7 +545,7 @@ where
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send(client, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
     let mut saw_text = false;
     let mut full_content = String::new();
     let mut full_reasoning = String::new();
@@ -549,7 +553,7 @@ where
     // shared accumulator once the stream is fully consumed.
     let mut raw_tool_call_deltas: Vec<StreamToolCallDelta> = Vec::new();
 
-    let mut reader = SseReader::from_reader(response);
+    let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // Track usage from the final SSE chunk (OpenAI sends a usage chunk with
     // choices: [] when stream_options.include_usage is true).
     let mut last_usage: Option<TokenUsage> = None;

@@ -1,8 +1,4 @@
 use ammonia::Builder as HtmlSanitizer;
-use frankenstein::client_ureq::Bot;
-use frankenstein::methods::{GetUpdatesParams, SendMessageParams, SendPhotoParams};
-use frankenstein::types::ChatType;
-use frankenstein::{ParseMode, TelegramApi};
 use std::cell::Cell;
 use std::sync::mpsc;
 use tai_client_core::{
@@ -13,6 +9,7 @@ use tai_proto::ClientMessage;
 use tracing::{debug, error, info, warn};
 
 use crate::bridge::BridgeEvent;
+use crate::tg_api::Bot;
 
 pub fn run(
     bot_token: String,
@@ -54,16 +51,12 @@ pub fn run(
 
     let mut update_id: u32 = 0;
     loop {
-        let params = GetUpdatesParams::builder()
-            .offset(update_id as i64 + 1)
-            .timeout(10)
-            .build();
-        match bot.get_updates(&params) {
-            Ok(response) => {
-                for update in response.result {
-                    if let frankenstein::updates::UpdateContent::Message(msg) = update.content {
+        match bot.get_updates(update_id + 1, 10) {
+            Ok(updates) => {
+                for update in updates {
+                    if let Some(msg) = update.message {
                         update_id = update.update_id;
-                        handle_message(&bot, &state, *msg);
+                        handle_message(&bot, &state, msg);
                     } else {
                         update_id = update.update_id;
                     }
@@ -84,17 +77,17 @@ struct TelegramState {
     chat_id_tx: mpsc::Sender<i64>,
 }
 
-fn is_chat_private(msg: &frankenstein::types::Message) -> bool {
-    msg.chat.type_field == ChatType::Private
+fn is_chat_private(msg: &crate::tg_api::Message) -> bool {
+    msg.chat.type_field == "private"
 }
 
-fn is_admin(msg: &frankenstein::types::Message, admin_ids: &[i64]) -> bool {
+fn is_admin(msg: &crate::tg_api::Message, admin_ids: &[i64]) -> bool {
     msg.from
         .as_ref()
-        .is_some_and(|user| admin_ids.contains(&(user.id as i64)))
+        .is_some_and(|user| admin_ids.contains(&user.id))
 }
 
-fn handle_message(bot: &Bot, state: &TelegramState, msg: frankenstein::types::Message) {
+fn handle_message(bot: &Bot, state: &TelegramState, msg: crate::tg_api::Message) {
     let text = match msg.text.as_ref() {
         Some(t) => t.clone(),
         None => return,
@@ -119,11 +112,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: frankenstein::types::Me
         ShellCommand::Send(client_msg) => {
             if let ClientMessage::RunInput { input, .. } = &client_msg {
                 let echo = format!("> {}", String::from_utf8_lossy(input));
-                let params = SendMessageParams::builder()
-                    .chat_id(chat_id_val)
-                    .text(echo)
-                    .build();
-                if let Err(e) = bot.send_message(&params) {
+                if let Err(e) = bot.send_message(chat_id_val, &echo, None) {
                     warn!("failed to send echo to telegram: {e}");
                 }
             }
@@ -134,11 +123,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: frankenstein::types::Me
         }
         ShellCommand::UnknownCommand(err) => {
             warn!(%err, "unknown command from user");
-            let params = SendMessageParams::builder()
-                .chat_id(chat_id_val)
-                .text(err)
-                .build();
-            if let Err(e) = bot.send_message(&params) {
+            if let Err(e) = bot.send_message(chat_id_val, &err, None) {
                 warn!("failed to send error message to telegram: {e}");
             }
         }
@@ -149,11 +134,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: frankenstein::types::Me
                 }
             }
             Err(e) => {
-                let params = SendMessageParams::builder()
-                    .chat_id(chat_id_val)
-                    .text(format!("[error] {e}"))
-                    .build();
-                let _ = bot.send_message(&params);
+                let _ = bot.send_message(chat_id_val, &format!("[error] {e}"), None);
             }
         },
         ShellCommand::AddCredential {
@@ -168,11 +149,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: frankenstein::types::Me
                 }
             }
             Err(e) => {
-                let params = SendMessageParams::builder()
-                    .chat_id(chat_id_val)
-                    .text(format!("[error] {e}"))
-                    .build();
-                let _ = bot.send_message(&params);
+                let _ = bot.send_message(chat_id_val, &format!("[error] {e}"), None);
             }
         },
         ShellCommand::RemoveCredential { service } => {
@@ -192,37 +169,28 @@ fn send_daemon_event(bot: &Bot, chat_id: i64, event: BridgeEvent) {
         BridgeEvent::Text(text) => {
             let html = render_markdown_html(&text);
             let tg_html = to_telegram_html(&html);
-            if !tg_html.is_empty() {
-                let params = SendMessageParams::builder()
-                    .chat_id(chat_id)
-                    .text(tg_html)
-                    .parse_mode(ParseMode::Html)
-                    .build();
-                if let Err(e) = bot.send_message(&params) {
-                    error!(%e, "failed to send text message to telegram");
-                }
+            if !tg_html.is_empty()
+                && let Err(e) = bot.send_message(chat_id, &tg_html, Some("HTML"))
+            {
+                error!(%e, "failed to send text message to telegram");
             }
         }
         BridgeEvent::ToolCallStarted {
             name,
             arguments_json,
         } => {
-            let params = SendMessageParams::builder()
-                .chat_id(chat_id)
-                .text(format!("<i>Running {name} {arguments_json}</i>"))
-                .parse_mode(ParseMode::Html)
-                .build();
-            if let Err(e) = bot.send_message(&params) {
+            if let Err(e) = bot.send_message(
+                chat_id,
+                &format!("<i>Running {name} {arguments_json}</i>"),
+                Some("HTML"),
+            ) {
                 warn!("failed to send tool call started message: {e}");
             }
         }
         BridgeEvent::ToolCallFinished { name, output } => {
-            let params = SendMessageParams::builder()
-                .chat_id(chat_id)
-                .text(format!("<b>{name}</b>: {output}"))
-                .parse_mode(ParseMode::Html)
-                .build();
-            if let Err(e) = bot.send_message(&params) {
+            if let Err(e) =
+                bot.send_message(chat_id, &format!("<b>{name}</b>: {output}"), Some("HTML"))
+            {
                 warn!("failed to send tool call finished message: {e}");
             }
         }
@@ -231,12 +199,11 @@ fn send_daemon_event(bot: &Bot, chat_id: i64, event: BridgeEvent) {
             error: error_msg,
         } => {
             error!(%name, %error_msg, "tool call failed");
-            let params = SendMessageParams::builder()
-                .chat_id(chat_id)
-                .text(format!("<b>{name}</b> failed: {error_msg}"))
-                .parse_mode(ParseMode::Html)
-                .build();
-            if let Err(e) = bot.send_message(&params) {
+            if let Err(e) = bot.send_message(
+                chat_id,
+                &format!("<b>{name}</b> failed: {error_msg}"),
+                Some("HTML"),
+            ) {
                 warn!("failed to send tool call failed message: {e}");
             }
         }
@@ -248,11 +215,7 @@ fn send_daemon_event(bot: &Bot, chat_id: i64, event: BridgeEvent) {
         }
         BridgeEvent::Error(msg) => {
             error!(%msg, "sending error to telegram");
-            let params = SendMessageParams::builder()
-                .chat_id(chat_id)
-                .text(msg)
-                .build();
-            if let Err(e) = bot.send_message(&params) {
+            if let Err(e) = bot.send_message(chat_id, &msg, None) {
                 warn!("failed to send error event to telegram: {e}");
             }
         }
@@ -266,66 +229,39 @@ fn send_daemon_event(bot: &Bot, chat_id: i64, event: BridgeEvent) {
                 };
                 text.push_str(&format!("  {marker} {model}\n"));
             }
-            let params = SendMessageParams::builder()
-                .chat_id(chat_id)
-                .text(text)
-                .build();
-            if let Err(e) = bot.send_message(&params) {
+            if let Err(e) = bot.send_message(chat_id, &text, None) {
                 warn!("failed to send models list to telegram: {e}");
             }
         }
         BridgeEvent::ModelSelected(model) => {
-            let params = SendMessageParams::builder()
-                .chat_id(chat_id)
-                .text(format!("Model: {model}"))
-                .build();
-            if let Err(e) = bot.send_message(&params) {
+            if let Err(e) = bot.send_message(chat_id, &format!("Model: {model}"), None) {
                 warn!("failed to send model selected to telegram: {e}");
             }
         }
         BridgeEvent::Unlocked => {
-            let params = SendMessageParams::builder()
-                .chat_id(chat_id)
-                .text("Unlocked")
-                .build();
-            if let Err(e) = bot.send_message(&params) {
+            if let Err(e) = bot.send_message(chat_id, "Unlocked", None) {
                 warn!("failed to send unlocked message to telegram: {e}");
             }
         }
         BridgeEvent::Locked => {
-            let params = SendMessageParams::builder()
-                .chat_id(chat_id)
-                .text("Locked")
-                .build();
-            if let Err(e) = bot.send_message(&params) {
+            if let Err(e) = bot.send_message(chat_id, "Locked", None) {
                 warn!("failed to send locked message to telegram: {e}");
             }
         }
         BridgeEvent::Pong => {
-            let params = SendMessageParams::builder()
-                .chat_id(chat_id)
-                .text("pong")
-                .build();
-            if let Err(e) = bot.send_message(&params) {
+            if let Err(e) = bot.send_message(chat_id, "pong", None) {
                 warn!("failed to send pong to telegram: {e}");
             }
         }
     }
 }
 
-fn send_photo_from_memory(bot: &Bot, chat_id: i64, data: &[u8]) -> Result<(), frankenstein::Error> {
-    use std::io::Write;
-    // Write image data to a temp file that is automatically cleaned up on drop.
-    let mut tmp = tempfile::NamedTempFile::new().map_err(frankenstein::Error::ReadFile)?;
-    tmp.write_all(data).map_err(frankenstein::Error::ReadFile)?;
-    tmp.flush().map_err(frankenstein::Error::ReadFile)?;
-    let path = tmp.path().to_path_buf();
-    let params = SendPhotoParams::builder()
-        .chat_id(chat_id)
-        .photo(path)
-        .build();
-    bot.send_photo(&params).map(|_| ())
-    // NamedTempFile is dropped here, removing the temp file automatically.
+fn send_photo_from_memory(
+    bot: &Bot,
+    chat_id: i64,
+    data: &[u8],
+) -> Result<(), crate::tg_api::TelegramError> {
+    bot.send_photo(chat_id, data)
 }
 
 fn to_telegram_html(html: &str) -> String {

@@ -2,12 +2,12 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-/// Thread-local override for test database path.
-///
-/// Each test thread sets its own temp directory so parallel tests don't
-/// collide on the same database file and don't read/write the real one.
 #[cfg(test)]
 thread_local! {
+    // Thread-local override for test database path.
+    // Each test thread sets its own temp directory so parallel tests don't
+    // collide on the same database file and don't read/write the real one.
+
     static TEST_DB_PATH: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 

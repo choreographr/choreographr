@@ -1,13 +1,13 @@
 use super::{PreparedImage, ToolError, context::ToolContext, truncate_tool_output};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::GenericImageView;
-use reqwest::{Url, header::CONTENT_TYPE};
 use resvg::usvg;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::Mutex;
 use std::{io, time::Duration};
 use tai_keystore::ServiceCredential;
+use url::Url;
 
 #[derive(Debug, Deserialize)]
 pub struct DisplayImageArgs {
@@ -90,9 +90,9 @@ fn normalize_image_mime_type(mime_type: &str) -> io::Result<&str> {
     }
 }
 
-fn fetch_image_bytes(url: &str, expected_mime_type: &str) -> io::Result<Vec<u8>> {
+fn fetch_image_bytes(url_str: &str, expected_mime_type: &str) -> io::Result<Vec<u8>> {
     let url =
-        Url::parse(url).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        Url::parse(url_str).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     match url.scheme() {
         "http" | "https" => {}
         _ => {
@@ -103,18 +103,20 @@ fn fetch_image_bytes(url: &str, expected_mime_type: &str) -> io::Result<Vec<u8>>
         }
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(IMAGE_FETCH_TIMEOUT_SECS))
-        .build()
-        .map_err(io::Error::other)?;
-    let response = client.get(url).send().map_err(io::Error::other)?;
-    let status = response.status();
-    if !status.is_success() {
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(IMAGE_FETCH_TIMEOUT_SECS)))
+            .http_status_as_error(false)
+            .build(),
+    );
+    let response = agent.get(url.as_str()).call().map_err(io::Error::other)?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
         return Err(io::Error::other(format!(
             "image request failed with status {status}"
         )));
     }
-    if let Some(content_type) = response.headers().get(CONTENT_TYPE)
+    if let Some(content_type) = response.headers().get("content-type")
         && let Ok(content_type) = content_type.to_str()
         && !content_type.starts_with(expected_mime_type)
     {
@@ -125,8 +127,11 @@ fn fetch_image_bytes(url: &str, expected_mime_type: &str) -> io::Result<Vec<u8>>
             ),
         ));
     }
-    let bytes = response.bytes().map_err(io::Error::other)?;
-    Ok(bytes.to_vec())
+    let bytes = response
+        .into_body()
+        .read_to_vec()
+        .map_err(io::Error::other)?;
+    Ok(bytes)
 }
 
 fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u32)> {

@@ -1,5 +1,4 @@
 use std::io;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tai_proto::InferenceError;
@@ -109,16 +108,15 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
     }
 }
 
-/// Build a reqwest blocking client with connect and request timeouts.
-pub(crate) fn build_http_client(
-    connect_timeout_secs: u64,
-    request_timeout_secs: u64,
-) -> io::Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(connect_timeout_secs))
-        .timeout(Duration::from_secs(request_timeout_secs))
-        .build()
-        .map_err(io::Error::other)
+/// Build a ureq agent with connect and request timeouts.
+pub(crate) fn build_agent(connect_timeout_secs: u64, request_timeout_secs: u64) -> ureq::Agent {
+    ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(connect_timeout_secs)))
+            .timeout_global(Some(std::time::Duration::from_secs(request_timeout_secs)))
+            .http_status_as_error(false)
+            .build(),
+    )
 }
 
 /// Wrap the result of a provider API call with timing instrumentation and error
