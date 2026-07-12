@@ -15,7 +15,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use ratatui_image::{Resize, StatefulImage};
+use ratatui_image::{Resize, StatefulImage, picker::Picker};
 use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
 use tai_proto::SessionMessage;
 use tai_proto::SessionStatus;
@@ -73,7 +73,7 @@ pub(crate) fn render_fullscreen_only(frame: &mut Frame<'_>, app: &mut App) -> bo
             && matches!(&app.client.history[idx], HistoryItem::Image(_))
             && let Some(HistoryItem::Image(rendered)) = app.client.history.get_mut(idx)
         {
-            render_fullscreen_image(frame, rendered);
+            render_fullscreen_image(frame, rendered, app.picker.as_ref());
             return true;
         }
         // History mutated (trimmed from front); index no longer valid.
@@ -96,9 +96,25 @@ fn render_fullscreen_placeholder(frame: &mut Frame<'_>) {
 /// Lanczos3 quality.  The protocol's built-in cache avoids re-encoding on
 /// subsequent frames (the first frame encodes, all later frames hit the
 /// cache).  The cursor is hidden so it doesn't distract.
-fn render_fullscreen_image(frame: &mut Frame<'_>, rendered: &mut Box<RenderedImage>) {
+///
+/// If the image is an SVG that hasn't been re-rasterized yet, this is the
+/// moment we rasterize the vector graphics directly at the terminal's pixel
+/// resolution (using `picker` to map terminal cells to pixels) so that the
+/// fullscreen display is crisp rather than upscaled from the SVG's native
+/// viewport size.
+fn render_fullscreen_image(
+    frame: &mut Frame<'_>,
+    rendered: &mut Box<RenderedImage>,
+    picker: Option<&Picker>,
+) {
     let area = frame.area();
     let full = Size::new(area.width, area.height);
+
+    // Ensure the SVG is rasterized at the full terminal pixel resolution.
+    // Non-SVG images and cache hits are no-ops internally.
+    if let Some(picker) = picker {
+        let _ = rendered.ensure_display_resolution(picker, full);
+    }
 
     // Compute the aspect-ratio-correct cell size at terminal dimensions.
     let target = rendered
@@ -269,6 +285,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
+                    app.picker.as_ref(),
                 );
             }
             HistoryItem::Diff(diffs) => {
@@ -558,6 +575,11 @@ fn render_item_streaming(
 /// Render a `HistoryItem::Image`, clipped to the visible scroll area.
 /// The underlying image protocol is only rendered when the item is fully
 /// visible to avoid rescaling during scrolling.
+///
+/// If the image is an SVG that hasn't been re-rasterized yet, we rasterize
+/// the vector graphics directly at the inline pixel resolution so that the
+/// image is crisp rather than upscaled from the SVG's native viewport size
+/// by ratatui-image's Lanczos3 filter.
 fn render_item_image(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -565,11 +587,19 @@ fn render_item_image(
     rows_remaining: &mut usize,
     y: &mut u16,
     rows_to_skip: &mut usize,
+    picker: Option<&Picker>,
 ) {
-    let rendered = image.protocol.size_for(
-        Resize::Scale(Some(FilterType::Lanczos3)),
-        ratatui::layout::Size::new(area.width, (area.height / 2).max(1)),
-    );
+    let inline_size = ratatui::layout::Size::new(area.width, (area.height / 2).max(1));
+
+    // Ensure the SVG is rasterized at the inline display resolution.
+    // Non-SVG images and cache hits are no-ops internally.
+    if let Some(picker) = picker {
+        let _ = image.ensure_display_resolution(picker, inline_size);
+    }
+
+    let rendered = image
+        .protocol
+        .size_for(Resize::Scale(Some(FilterType::Lanczos3)), inline_size);
     let full_height = rendered.height.max(1) as usize;
 
     // Use the shared clipped_area helper just like the text/diff renderers.
