@@ -374,9 +374,12 @@ fn extract_tool_path(tool_name: &str, arguments_json: &str) -> Option<String> {
             .or_else(|| v.get("directory"))
             .and_then(|p| p.as_str())
             .map(|s| s.to_string()),
-        "fff" => v
-            .get("root")
-            .or_else(|| v.get("path"))
+        "grep" => v
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string()),
+        "find" => v
+            .get("path")
             .and_then(|p| p.as_str())
             .map(|s| s.to_string()),
         _ => None,

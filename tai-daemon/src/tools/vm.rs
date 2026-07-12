@@ -242,6 +242,17 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         buf.push(v as u8);
     }
 
+    /// Encode an Option<bool>: 0x00 for None, 0x01 + 1 byte for Some.
+    pub fn enc_option_bool(v: Option<bool>, buf: &mut Vec<u8>) {
+        match v {
+            Some(b) => {
+                buf.push(0x01);
+                buf.push(b as u8);
+            }
+            None => buf.push(0x00),
+        }
+    }
+
     /// Decode a postcard varint from the front of a byte slice.
     /// Returns (value, bytes_consumed).
     pub fn dec_varint(buf: &[u8]) -> Result<(u64, usize), &'static str> {
@@ -364,15 +375,29 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         }
     }
 
-    /// fff(query: &str) -> file search results as string.
-    pub fn fff(query: &str) -> String {
+    /// grep(pattern: &str) -> file content search results as string.
+    pub fn grep(pattern: &str) -> String {
         let mut args = Vec::new();
-        enc_str(query, &mut args);
-        enc_option_str(None, &mut args); // path
-        enc_option_str(None, &mut args); // mode
-        enc_option_str(None, &mut args); // pattern_type
-        enc_option_u64(None, &mut args); // max_results
-        let resp = call("fff", &args);
+        enc_str(pattern, &mut args);
+        enc_bool(false, &mut args);       // regex (default: literal)
+        enc_option_str(None, &mut args);  // include
+        enc_option_str(None, &mut args);  // path
+        enc_option_u64(None, &mut args);  // max_results
+        let resp = call("grep", &args);
+        match dec_result(&resp) {
+            Ok(b) => String::from_utf8_lossy(b).to_string(),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// find(pattern: &str) -> file name search results as string.
+    pub fn find(pattern: &str) -> String {
+        let mut args = Vec::new();
+        enc_str(pattern, &mut args);
+        enc_bool(false, &mut args);       // glob (default: substring)
+        enc_option_str(None, &mut args);  // path
+        enc_option_u64(None, &mut args);  // max_results
+        let resp = call("find", &args);
         match dec_result(&resp) {
             Ok(b) => String::from_utf8_lossy(b).to_string(),
             Err(_) => String::new(),
@@ -842,7 +867,7 @@ impl Tool for RunRiscV {
     }
 
     fn description(&self) -> &'static str {
-        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `tai` module. Use per-tool convenience wrappers (tai::read_file, tai::write_file, tai::db_get, tai::db_set, tai::sh, tai::exec, tai::fff, tai::http_request) for tool calls — they handle the postcard encoding automatically. Use tai::write(b\"...\") for VM output and tai::exit(code) to finish. Do NOT use raw ecall with Linux syscall numbers (64, 93) — they are not supported."
+        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `tai` module. Use per-tool convenience wrappers (tai::read_file, tai::write_file, tai::db_get, tai::db_set, tai::sh, tai::exec, tai::grep, tai::find, tai::http_request) for tool calls — they handle the postcard encoding automatically. Use tai::write(b\"...\") for VM output and tai::exit(code) to finish. Do NOT use raw ecall with Linux syscall numbers (64, 93) — they are not supported."
     }
 
     fn schema(&self) -> serde_json::Value {
@@ -851,7 +876,7 @@ impl Tool for RunRiscV {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `tai` module — these are auto-generated. Do NOT use raw ecall with Linux syscall numbers (64 for write, 93 for exit). Use the provided wrappers: tai::write(b\"...\"), tai::exit(code), and per-tool wrappers like tai::read_file(path), tai::write_file(path, content, overwrite), tai::db_get(key), tai::db_set(key, value), tai::sh(command, shell, ...), tai::exec(command, args, ...), tai::fff(query), tai::http_request(method, url, headers, body, timeout). The wrappers handle postcard encoding automatically — no need to call tai::tool_call or tai::call directly. Example: `fn main() { let content = tai::read_file(\"Cargo.toml\"); tai::write(content.as_bytes()); }`. When allocator:true (default), alloc types are pre-imported: Vec, String, Box, format!, .to_string()."
+                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `tai` module — these are auto-generated. Do NOT use raw ecall with Linux syscall numbers (64 for write, 93 for exit). Use the provided wrappers: tai::write(b\"...\"), tai::exit(code), and per-tool wrappers like tai::read_file(path), tai::write_file(path, content, overwrite), tai::db_get(key), tai::db_set(key, value), tai::sh(command, shell, ...), tai::exec(command, args, ...), tai::grep(pattern), tai::find(pattern), tai::http_request(method, url, headers, body, timeout). The wrappers handle postcard encoding automatically — no need to call tai::tool_call or tai::call directly. Example: `fn main() { let content = tai::read_file(\"Cargo.toml\"); tai::write(content.as_bytes()); }`. When allocator:true (default), alloc types are pre-imported: Vec, String, Box, format!, .to_string()."
                 },
                 "program": {
                     "type": "string",

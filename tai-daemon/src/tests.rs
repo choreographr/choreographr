@@ -1,7 +1,5 @@
 use super::*;
-use crate::tools::fs::{
-    EditFileArgs, ReadFileRangeArgs, TextEditArgs, WriteFileArgs,
-};
+use crate::tools::fs::{EditFileArgs, ReadFileRangeArgs, TextEditArgs, WriteFileArgs};
 
 fn test_temp_path(prefix: &str) -> std::path::PathBuf {
     let unique = std::time::SystemTime::now()

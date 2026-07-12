@@ -24,12 +24,14 @@ pub use crate::sessions::{
     ActiveSessionEntry, RequestContext, SessionCommand, SessionMetadata, SessionState, session_main,
 };
 pub use crate::tools::exec::{ExecArgs, execute_exec_tool};
+pub use crate::tools::find::{FindArgs, execute_find_tool};
 pub use crate::tools::fish::{FishArgs, execute_fish_tool};
 pub use crate::tools::git::{
     GitAddArgs, GitCommitArgs, GitDiffArgs, GitLogArgs, GitPushArgs, GitRepoArgs,
     execute_git_add_tool, execute_git_commit_tool, execute_git_diff_tool, execute_git_log_tool,
     execute_git_push_tool, execute_git_status_tool,
 };
+pub use crate::tools::grep::{GrepArgs, execute_grep_tool};
 pub use crate::tools::nu::{NuArgs, execute_nu_tool};
 pub use crate::tools::sh::{ShArgs, execute_sh_tool};
 #[cfg(test)]

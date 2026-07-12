@@ -8,7 +8,10 @@ anyhow.workspace = true
 clap.workspace = true
 base64.workspace = true
 dirs.workspace = true
-fff-search = "0.9"
+ignore = "0.4"
+globset = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 hex = "0.4"
 libc = "0.2"
 

@@ -144,10 +144,11 @@ pub(crate) use error::{tool_err, tool_ok};
 pub(crate) mod context;
 pub(crate) mod db;
 pub(crate) mod exec;
-mod fff;
+pub(crate) mod find;
 pub(crate) mod fish;
 pub(crate) mod fs;
 pub(crate) mod git;
+pub(crate) mod grep;
 pub(crate) mod groups;
 pub mod http;
 mod image;
@@ -444,7 +445,6 @@ pub const GROUPS: &[ToolGroup] = &[
 
 pub struct ToolRegistry {
     tools: HashMap<&'static str, Box<dyn ToolDyn>>,
-    fff_cache: Arc<fff::FffStateCache>,
 }
 
 impl Default for ToolRegistry {
@@ -457,7 +457,6 @@ impl ToolRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
             tools: HashMap::new(),
-            fff_cache: Arc::new(fff::FffStateCache::new()),
         };
         reg.register(fs::ReadFile);
         reg.register(fs::ReadFileRange);
@@ -487,7 +486,8 @@ impl ToolRegistry {
             reg.register(fish::FishShell);
         }
         reg.register(exec::Exec);
-        reg.register(fff::Fff::new(Arc::clone(&reg.fff_cache)));
+        reg.register(grep::Grep);
+        reg.register(find::Find);
         reg.register(random::Random);
         reg.register(time::GetCurrentTime);
         reg.register(x::XPost);

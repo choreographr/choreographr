@@ -652,7 +652,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 | **Image** | `display_image` (from path, URL, base64, or SVG text) |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push` |
 | **EVM** | `evm_chain`, `evm_balance`, `evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`, `evm_logs`, `evm_nonce`, `evm_resolve` |
-| **File search** | `fff` (file finding) |
+| **File search** | `grep` (file content search), `find` (file name search) |
 | **RISC-V VM** | `run_riscv` (compile & run Rust code in a sandboxed RISC-V VM with access to all registered tools) |
 | **Shell** | `exec` (direct program execution), `sh` (bash/dash/zsh — detected at startup), `nushell` (if `nu` is installed), `fish` (if `fish` is installed) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
@@ -1049,7 +1049,7 @@ messages[1] = volatile project context (AGENTS.md, CLAUDE.md, etc.)
 
 ### Subdirectory hints
 
-When filesystem tools (`read_file`, `list_files`, `fff`, etc.) access a file
+When filesystem tools (`read_file`, `list_files`, `grep`, `find`, etc.) access a file
 in a subdirectory below the session CWD, the daemon walks up from that file's
 parent toward CWD and checks for `AGENTS.md`/`CLAUDE.md` files not already in
 the main context. Any found hint content is appended to the tool result message
