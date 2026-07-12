@@ -153,6 +153,12 @@ impl Tool for DbGet {
         })
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        // Returns None because the output is raw binary (Vec<u8>), not a structured JSON type.
+        // Callers must handle the opaque byte sequence as-is.
+        None
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -353,6 +359,20 @@ impl Tool for DbGetRange {
         })
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value_b64": {"type": "string"}
+                },
+                "required": ["key", "value_b64"]
+            }
+        }))
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -435,6 +455,10 @@ impl Tool for DbList {
         })
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "array", "items": {"type": "string"}}))
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -504,6 +528,10 @@ impl Tool for DbCount {
                 }
             }
         })
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "integer"}))
     }
 
     fn execute(
@@ -838,5 +866,47 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "no session context");
+    }
+
+    // ── output_schema tests ──────────────────────────────────────────
+
+    #[test]
+    fn db_get_output_schema_is_none() {
+        assert!(
+            DbGet.output_schema().is_none(),
+            "DbGet returns raw bytes, no structured JSON schema"
+        );
+    }
+
+    #[test]
+    fn db_get_range_output_schema_is_array_of_objects() {
+        let schema = DbGetRange.output_schema().expect("schema");
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["items"]["type"], "object");
+        assert!(
+            schema["items"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::Value::String("key".into()))
+        );
+        assert!(
+            schema["items"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::Value::String("value_b64".into()))
+        );
+    }
+
+    #[test]
+    fn db_list_output_schema_is_array_of_strings() {
+        let schema = DbList.output_schema().expect("schema");
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["items"]["type"], "string");
+    }
+
+    #[test]
+    fn db_count_output_schema_is_integer() {
+        let schema = DbCount.output_schema().expect("schema");
+        assert_eq!(schema["type"], "integer");
     }
 }

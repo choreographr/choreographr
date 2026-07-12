@@ -19,7 +19,6 @@ define_tool!(
     "nushell",
     "Execute a nushell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang.",
     NuArgs,
-    String,
     execute_nu_tool,
     serde_json::json!({
         "type": "object",

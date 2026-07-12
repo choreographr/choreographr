@@ -21,7 +21,6 @@ define_tool!(
     "exec",
     "Execute a program directly without a shell. The command is not parsed by a shell — no pipes, redirects, glob expansion, or environment variable interpolation. Prefer this over `sh` when you only need to run a single program with arguments (lower risk of shell-injection issues).",
     ExecArgs,
-    String,
     execute_exec_tool,
     serde_json::json!({
         "type": "object",

@@ -376,6 +376,7 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
                     id,
                     name,
                     arguments_json: input.to_string(),
+                    caller: None,
                 });
             }
             ContentBlock::Thinking { thinking } => {

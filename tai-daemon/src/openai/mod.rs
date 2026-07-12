@@ -42,6 +42,20 @@ pub enum RequestFormat {
     ChatCompletions,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AllowedCaller {
+    Direct,
+    Programmatic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallerInfo {
+    #[serde(rename = "type")]
+    pub(crate) kind: String,
+    pub(crate) caller_id: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelListResponse {
     data: Vec<ModelInfo>,
@@ -63,6 +77,8 @@ pub(crate) enum ResponsesInputItem {
     FunctionCallOutput {
         call_id: String,
         output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerInfo>,
     },
 }
 
@@ -91,7 +107,14 @@ struct ResponsesRequest<'a> {
     parallel_tool_calls: Option<bool>,
 }
 
+/// Raw Responses API response envelope.
+///
+/// Fields like `id` come from the wire but aren't always read in the
+/// current code path — they're kept for deserialization completeness
+/// and future use (streaming contexts, resumption, etc.).
+/// Ref: https://developers.openai.com/api/reference/resources/responses/methods/create
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ResponsesResponse {
     #[serde(default)]
     id: Option<String>,
@@ -103,8 +126,18 @@ struct ResponsesResponse {
     usage: Option<Usage>,
 }
 
+/// Items in a Responses API response output array.
+///
+/// Variant fields marked `#[serde(default)]` are part of the wire spec
+/// but only read when the current code path needs them — keeping them
+/// allows forward-compatible deserialization without discarding data
+/// that may be needed for retries, resumption, or future features.
+/// `#[allow(dead_code)]` suppresses warnings on spec fields we don't
+/// actively read yet.
+/// Ref: https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
 enum ResponseOutputItem {
     Message {
         #[serde(default)]
@@ -121,6 +154,27 @@ enum ResponseOutputItem {
         call_id: String,
         name: String,
         arguments: String,
+        #[serde(default)]
+        caller: Option<CallerInfo>,
+    },
+    Program {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        fingerprint: Option<String>,
+    },
+    #[serde(rename = "program_output")]
+    ProgramOutput {
+        #[serde(default)]
+        id: Option<String>,
+        call_id: String,
+        #[serde(default)]
+        result: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
     },
 }
 
@@ -131,15 +185,29 @@ struct ResponseContentPart {
     text: Option<String>,
 }
 
+/// A tool definition in a Responses API request.
+///
+/// For regular function tools all fields are used; for the
+/// `programmatic_tool_calling` hosted tool only `type` is needed — the
+/// empty name/description/parameters are omitted via `skip_serializing_if`
+/// so the wire format matches the OpenAI spec (just `{"type":"programmatic_tool_calling"}`).
+/// See <https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>
 #[derive(Debug, Serialize)]
 pub(crate) struct ResponsesTool {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     description: String,
+    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
     parameters: serde_json::Value,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     strict: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_callers: Option<Vec<AllowedCaller>>,
 }
 
 impl From<&ChatToolDefinition> for ResponsesTool {
@@ -150,6 +218,8 @@ impl From<&ChatToolDefinition> for ResponsesTool {
             description: tool.function.description.to_string(),
             parameters: tool.function.parameters.clone(),
             strict: false,
+            output_schema: tool.function.output_schema.clone(),
+            allowed_callers: tool.function.allowed_callers.clone(),
         }
     }
 }
@@ -200,6 +270,10 @@ pub(crate) struct ChatToolFunction {
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
     pub(crate) parameters: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) output_schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) allowed_callers: Option<Vec<AllowedCaller>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -284,6 +358,7 @@ pub struct ChatToolCall {
     pub id: String,
     pub name: String,
     pub arguments_json: String,
+    pub caller: Option<CallerInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,6 +441,28 @@ impl ChatToolDefinition {
                 name,
                 description,
                 parameters,
+                output_schema: None,
+                allowed_callers: None,
+            },
+        }
+    }
+
+    /// Create a tool definition with output_schema and allowed_callers.
+    pub fn function_with_options(
+        name: &'static str,
+        description: &'static str,
+        parameters: serde_json::Value,
+        output_schema: Option<serde_json::Value>,
+        allowed_callers: Option<Vec<AllowedCaller>>,
+    ) -> Self {
+        Self {
+            kind: "function",
+            function: ChatToolFunction {
+                name,
+                description,
+                parameters,
+                output_schema,
+                allowed_callers,
             },
         }
     }
@@ -447,6 +544,7 @@ pub(crate) fn messages_to_responses_input(
                     items.push(ResponsesInputItem::FunctionCallOutput {
                         call_id: call_id.clone(),
                         output: content.clone(),
+                        caller: None,
                     });
                 }
             }
@@ -502,5 +600,9 @@ impl ProviderClient for OpenAiClient {
     fn list_models(&self) -> Result<Vec<String>, InferenceError> {
         let result = self.validate_and_list_models();
         result.map_err(crate::providers::shared::provider_error_to_inference)
+    }
+
+    fn supports_programmatic_tool_calling(&self, model: &str) -> bool {
+        self.config.programmatic_tool_calling_for_model(model)
     }
 }

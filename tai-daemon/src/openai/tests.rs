@@ -298,3 +298,119 @@ fn parse_responses_stream_event_unknown_type_returns_none() {
             .expect("parse");
     assert!(result.is_none());
 }
+
+// ── Programmatic tool calling SSE event tests ──────────────────────
+
+#[test]
+fn parse_responses_stream_event_program_code_delta() {
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.program.code.delta","delta":"console.log"}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ProgramCodeDelta(delta) => {
+            assert_eq!(delta, "console.log");
+        }
+        _ => panic!("expected ProgramCodeDelta"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_program_code_delta_missing_delta() {
+    // When delta is missing, the parser returns None for this event type.
+    let result =
+        parse_responses_stream_event(r#"{"type":"response.program.code.delta"}"#).expect("parse");
+    assert!(result.is_none(), "expected None when delta is missing");
+}
+
+#[test]
+fn parse_responses_stream_event_program_code_done() {
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.program.code.done","call_id":"prog_1","fingerprint":"fp_abc"}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ProgramCodeDone {
+            call_id,
+            fingerprint,
+        } => {
+            assert_eq!(call_id, "prog_1");
+            assert_eq!(fingerprint.as_deref(), Some("fp_abc"));
+        }
+        _ => panic!("expected ProgramCodeDone"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_program_code_done_no_fingerprint() {
+    let event =
+        parse_responses_stream_event(r#"{"type":"response.program.code.done","call_id":"prog_1"}"#)
+            .expect("parse")
+            .expect("event");
+    match event {
+        ResponsesStreamEvent::ProgramCodeDone {
+            call_id,
+            fingerprint,
+        } => {
+            assert_eq!(call_id, "prog_1");
+            assert!(fingerprint.is_none());
+        }
+        _ => panic!("expected ProgramCodeDone"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_program_code_done_missing_call_id() {
+    let result = parse_responses_stream_event(r#"{"type":"response.program.code.done"}"#);
+    assert!(result.is_err(), "missing call_id should be an error");
+}
+
+#[test]
+fn parse_responses_stream_event_program_output_done() {
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.program_output.done","call_id":"prog_1","result":"{\"status\":\"ok\"}","status":"completed"}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ProgramOutputDone {
+            call_id,
+            result,
+            status,
+        } => {
+            assert_eq!(call_id, "prog_1");
+            assert_eq!(result, r#"{"status":"ok"}"#);
+            assert_eq!(status, "completed");
+        }
+        _ => panic!("expected ProgramOutputDone"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_program_output_done_defaults() {
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.program_output.done","call_id":"prog_1"}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ProgramOutputDone {
+            call_id,
+            result,
+            status,
+        } => {
+            assert_eq!(call_id, "prog_1");
+            assert_eq!(result, "", "result defaults to empty string");
+            assert_eq!(status, "", "status defaults to empty string");
+        }
+        _ => panic!("expected ProgramOutputDone"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_program_output_done_missing_call_id() {
+    let result = parse_responses_stream_event(r#"{"type":"response.program_output.done"}"#);
+    assert!(result.is_err(), "missing call_id should be an error");
+}

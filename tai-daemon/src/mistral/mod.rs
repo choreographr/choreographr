@@ -500,6 +500,7 @@ fn response_to_turn_result(
             id: tc._id,
             name: tc.function.name,
             arguments_json: tc.function.arguments,
+            caller: None,
         })
         .collect();
 

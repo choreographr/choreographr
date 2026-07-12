@@ -239,6 +239,7 @@ where
                         id,
                         name: function_call.name,
                         arguments_json: args_json,
+                        caller: None,
                     });
                 }
                 super::ResponsePart::Thinking { thinking, .. } => {

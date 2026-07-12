@@ -148,12 +148,11 @@ fn format_http_response(
 
 pub(crate) struct HttpRequest;
 
-crate::define_tool!(
+define_tool!(
     HttpRequest,
     "http_request",
     "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests.",
     HttpRequestArgs,
-    String,
     execute_http_request_tool,
     serde_json::json!({
         "type": "object",

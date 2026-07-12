@@ -51,6 +51,8 @@ pub struct AccountConfig {
     #[serde(default)]
     pub responses_store: Option<bool>,
     #[serde(default)]
+    pub programmatic_tool_calling: Option<bool>,
+    #[serde(default)]
     pub model_max_tokens_fields: Option<HashMap<String, MaxTokensField>>,
     // Retry timing (all providers)
     #[serde(default)]
@@ -84,6 +86,7 @@ impl AccountConfig {
             responses_max_output_tokens: None,
             model_responses_max_output_tokens: None,
             responses_store: None,
+            programmatic_tool_calling: None,
             retry_initial_backoff_ms: None,
             retry_max_backoff_ms: None,
         }
@@ -144,6 +147,9 @@ impl AccountConfig {
         }
         if let Some(v) = self.responses_store {
             config.responses_store = v;
+        }
+        if let Some(v) = self.programmatic_tool_calling {
+            config.programmatic_tool_calling = v;
         }
         if let Some(ms) = self.retry_initial_backoff_ms {
             config.retry_initial_backoff_ms = ms;

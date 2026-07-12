@@ -208,6 +208,7 @@ impl super::Tool for DisplayImage {
             "additionalProperties": false
         })
     }
+
     fn execute(
         &self,
         args: Self::Args,

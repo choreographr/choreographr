@@ -288,6 +288,7 @@ where
                                                 id: id.clone(),
                                                 name: name.clone(),
                                                 arguments_json: args,
+                                                caller: None,
                                             })
                                         })
                                         .collect();
@@ -338,6 +339,7 @@ where
                     id: id.clone(),
                     name: name.clone(),
                     arguments_json: args,
+                    caller: None,
                 })
             })
             .collect();

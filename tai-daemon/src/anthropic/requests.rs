@@ -331,6 +331,7 @@ where
             id: tc.id,
             name: tc.name,
             arguments_json: tc.arguments,
+            caller: None,
         })
         .collect();
 

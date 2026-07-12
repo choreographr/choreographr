@@ -395,7 +395,6 @@ define_tool!(
     "read_file",
     "Read a UTF-8 text file from the local workspace.",
     ReadFileArgs,
-    String,
     execute_read_file_tool,
     serde_json::json!({
         "type": "object",
@@ -418,7 +417,6 @@ define_tool!(
     "read_file_range",
     "Read a line range from a UTF-8 text file in the local workspace.",
     ReadFileRangeArgs,
-    String,
     execute_read_file_range_tool,
     serde_json::json!({
         "type": "object",
@@ -452,7 +450,6 @@ define_tool!(
     "list_files",
     "List files in a local directory.",
     ListFilesArgs,
-    String,
     execute_list_files_tool,
     serde_json::json!({
         "type": "object",
@@ -475,7 +472,6 @@ define_tool!(
     "line_count",
     "Count the number of lines in a UTF-8 text file.",
     LineCountArgs,
-    String,
     execute_line_count_tool,
     serde_json::json!({
         "type": "object",
@@ -498,7 +494,6 @@ define_tool!(
     "write_file",
     "Write a UTF-8 text file to the local workspace.",
     WriteFileArgs,
-    String,
     execute_write_file_tool,
     serde_json::json!({
         "type": "object",
@@ -535,7 +530,6 @@ define_tool!(
     "edit_file",
     "Edit a UTF-8 text file by applying one or more exact text replacements. Each edit must match at least once; non-replace_all edits must match exactly once.",
     EditFileArgs,
-    String,
     execute_edit_file_tool,
     serde_json::json!({
         "type": "object",

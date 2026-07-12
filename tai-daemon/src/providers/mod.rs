@@ -136,6 +136,10 @@ impl InferenceProvider {
     pub fn list_models(&self) -> Result<Vec<String>, InferenceError> {
         self.client.list_models()
     }
+
+    pub fn supports_programmatic_tool_calling(&self, model: &str) -> bool {
+        self.client.supports_programmatic_tool_calling(model)
+    }
 }
 
 /// Try to list models via the API; fall back to the static known list on any

@@ -1,4 +1,6 @@
-use crate::openai::{ChatToolCall, ChatToolDefinition};
+pub(crate) use crate::openai::AllowedCaller;
+use crate::openai::ChatToolCall;
+use crate::openai::ChatToolDefinition;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -16,77 +18,22 @@ fn encode_result<R: Serialize>(result: Result<R, impl ToString>) -> Vec<u8> {
     })
 }
 
-#[macro_export]
+/// Simplified tool-definition macro.
+///
+/// Covers the common case (`Return = String`, no credentials/context).
+/// For tools that need custom `output_schema`, `allowed_callers`, non-`String`
+/// returns, or `use_credentials`, write `impl Tool` manually.
 macro_rules! define_tool {
-    // With both use_credentials and use_context
-    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty, $return_ty:ty,
-     $exec_fn:path, $schema:expr, $tool_group:literal, use_credentials, use_context) => {
+    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty,
+     $exec_fn:path, $schema:expr, $group:literal, use_context) => {
         impl $crate::tools::Tool for $struct {
             type Args = $args_ty;
-            type Return = $return_ty;
+            type Return = String;
             fn name(&self) -> &'static str {
                 $name
             }
             fn group(&self) -> &'static str {
-                $tool_group
-            }
-            fn description(&self) -> &'static str {
-                $desc
-            }
-            fn schema(&self) -> serde_json::Value {
-                $schema
-            }
-            fn execute(
-                &self,
-                args: Self::Args,
-                x_credentials: Option<&$crate::tools::ServiceCredential>,
-                working_dir: Option<&std::path::Path>,
-                ctx: Option<&$crate::tools::context::ToolContext>,
-            ) -> Result<Self::Return, $crate::tools::ToolError> {
-                $exec_fn(&args, x_credentials, working_dir, ctx)
-            }
-        }
-    };
-    // With use_credentials
-    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty, $return_ty:ty,
-     $exec_fn:path, $schema:expr, $tool_group:literal, use_credentials) => {
-        impl $crate::tools::Tool for $struct {
-            type Args = $args_ty;
-            type Return = $return_ty;
-            fn name(&self) -> &'static str {
-                $name
-            }
-            fn group(&self) -> &'static str {
-                $tool_group
-            }
-            fn description(&self) -> &'static str {
-                $desc
-            }
-            fn schema(&self) -> serde_json::Value {
-                $schema
-            }
-            fn execute(
-                &self,
-                args: Self::Args,
-                x_credentials: Option<&$crate::tools::ServiceCredential>,
-                working_dir: Option<&std::path::Path>,
-                _ctx: Option<&$crate::tools::context::ToolContext>,
-            ) -> Result<Self::Return, $crate::tools::ToolError> {
-                $exec_fn(&args, x_credentials, working_dir)
-            }
-        }
-    };
-    // With use_context
-    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty, $return_ty:ty,
-     $exec_fn:path, $schema:expr, $tool_group:literal, use_context) => {
-        impl $crate::tools::Tool for $struct {
-            type Args = $args_ty;
-            type Return = $return_ty;
-            fn name(&self) -> &'static str {
-                $name
-            }
-            fn group(&self) -> &'static str {
-                $tool_group
+                $group
             }
             fn description(&self) -> &'static str {
                 $desc
@@ -105,17 +52,16 @@ macro_rules! define_tool {
             }
         }
     };
-    // Default (no flags) — original behavior
-    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty, $return_ty:ty,
-     $exec_fn:path, $schema:expr, $tool_group:literal) => {
+    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty,
+     $exec_fn:path, $schema:expr, $group:literal) => {
         impl $crate::tools::Tool for $struct {
             type Args = $args_ty;
-            type Return = $return_ty;
+            type Return = String;
             fn name(&self) -> &'static str {
                 $name
             }
             fn group(&self) -> &'static str {
-                $tool_group
+                $group
             }
             fn description(&self) -> &'static str {
                 $desc
@@ -202,6 +148,23 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &'static str;
     fn schema(&self) -> serde_json::Value;
 
+    /// JSON Schema for the tool's return value (for Programmatic Tool Calling).
+    /// The default assumes the tool returns a string, which covers the vast
+    /// majority of tools. Override this for tools that return integers,
+    /// arrays, binary data, or unstructured output.
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "string"}))
+    }
+
+    /// Controls which callers can invoke this tool.
+    /// - `[AllowedCaller::Direct]` — model can call directly
+    /// - `[AllowedCaller::Direct, AllowedCaller::Programmatic]` — model or JS program (default)
+    ///
+    ///   Return the list of allowed caller types.
+    fn allowed_callers(&self) -> Vec<AllowedCaller> {
+        vec![AllowedCaller::Direct, AllowedCaller::Programmatic]
+    }
+
     /// Execute the tool with typed arguments.
     fn execute(
         &self,
@@ -244,6 +207,8 @@ pub trait ToolDyn: Send + Sync {
     fn group(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn schema(&self) -> serde_json::Value;
+    fn output_schema(&self) -> Option<serde_json::Value>;
+    fn allowed_callers(&self) -> Vec<AllowedCaller>;
 
     /// JSON path (LLM tool calls) — returns ToolExecutionOutput for session.
     fn execute_json(
@@ -299,6 +264,12 @@ impl<T: Tool + 'static> ToolDyn for T {
     }
     fn schema(&self) -> serde_json::Value {
         Tool::schema(self)
+    }
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Tool::output_schema(self)
+    }
+    fn allowed_callers(&self) -> Vec<AllowedCaller> {
+        Tool::allowed_callers(self)
     }
 
     fn execute_json(
@@ -618,7 +589,15 @@ impl ToolRegistry {
             .tools
             .values()
             .filter(|t| active.contains(t.group()))
-            .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
+            .map(|t| {
+                ChatToolDefinition::function_with_options(
+                    t.name(),
+                    t.description(),
+                    t.schema(),
+                    t.output_schema(),
+                    Some(t.allowed_callers()),
+                )
+            })
             .collect();
         // Always-available meta-tools (not in the registry because they
         // need mutable access to session state — load_tools, unload_tools).
@@ -813,5 +792,155 @@ mod tests {
         let path = Path::new("/tmp/__tai_test_nonexistent_dir_abcdefg/h/i/j/k/file.txt");
         let ancestor = resolve_existing_ancestor(path).unwrap();
         assert!(ancestor.exists());
+    }
+
+    // ── Tool trait default method tests ──────────────────────────────
+
+    /// A minimal tool that uses all defaults for the new methods.
+    struct DefaultTool;
+
+    impl Tool for DefaultTool {
+        type Args = ();
+        type Return = String;
+
+        fn name(&self) -> &'static str {
+            "default_tool"
+        }
+        fn group(&self) -> &'static str {
+            "test"
+        }
+        fn description(&self) -> &'static str {
+            "A tool with default settings"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn execute(
+            &self,
+            _args: Self::Args,
+            _x_credentials: Option<&ServiceCredential>,
+            _working_dir: Option<&std::path::Path>,
+            _ctx: Option<&crate::tools::context::ToolContext>,
+        ) -> Result<Self::Return, ToolError> {
+            Ok("ok".to_string())
+        }
+    }
+
+    #[test]
+    fn default_output_schema_is_string() {
+        let tool = DefaultTool;
+        assert_eq!(
+            Tool::output_schema(&tool),
+            Some(serde_json::json!({"type": "string"}))
+        );
+    }
+
+    #[test]
+    fn default_allowed_callers_includes_both() {
+        let tool = DefaultTool;
+        let callers = Tool::allowed_callers(&tool);
+        assert_eq!(callers.len(), 2);
+        assert!(callers.contains(&AllowedCaller::Direct));
+        assert!(callers.contains(&AllowedCaller::Programmatic));
+    }
+
+    #[test]
+    fn default_tool_name_description_schema() {
+        let tool = DefaultTool;
+        assert_eq!(Tool::name(&tool), "default_tool");
+        assert_eq!(Tool::group(&tool), "test");
+        assert_eq!(Tool::description(&tool), "A tool with default settings");
+    }
+
+    // ── ToolDyn delegation tests ─────────────────────────────────────
+
+    #[test]
+    fn tooldyn_delegates_output_schema() {
+        let tool: Box<dyn ToolDyn> = Box::new(DefaultTool);
+        assert_eq!(
+            tool.output_schema(),
+            Some(serde_json::json!({"type": "string"}))
+        );
+    }
+
+    #[test]
+    fn tooldyn_delegates_allowed_callers() {
+        let tool: Box<dyn ToolDyn> = Box::new(DefaultTool);
+        let callers = tool.allowed_callers();
+        assert!(callers.contains(&AllowedCaller::Direct));
+        assert!(callers.contains(&AllowedCaller::Programmatic));
+    }
+
+    #[test]
+    fn tooldyn_delegates_group() {
+        let tool: Box<dyn ToolDyn> = Box::new(DefaultTool);
+        assert_eq!(tool.group(), "test");
+    }
+
+    /// A tool that overrides output_schema and allowed_callers.
+    struct RestrictedTool;
+
+    impl Tool for RestrictedTool {
+        type Args = ();
+        type Return = u64;
+
+        fn name(&self) -> &'static str {
+            "restricted_tool"
+        }
+        fn group(&self) -> &'static str {
+            "test"
+        }
+        fn description(&self) -> &'static str {
+            "A tool with restricted callers"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn output_schema(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({"type": "integer"}))
+        }
+        fn allowed_callers(&self) -> Vec<AllowedCaller> {
+            vec![AllowedCaller::Direct]
+        }
+        fn execute(
+            &self,
+            _args: Self::Args,
+            _x_credentials: Option<&ServiceCredential>,
+            _working_dir: Option<&std::path::Path>,
+            _ctx: Option<&crate::tools::context::ToolContext>,
+        ) -> Result<Self::Return, ToolError> {
+            Ok(42)
+        }
+    }
+
+    #[test]
+    fn restricted_tool_uses_overridden_output_schema() {
+        let tool = RestrictedTool;
+        assert_eq!(
+            Tool::output_schema(&tool),
+            Some(serde_json::json!({"type": "integer"}))
+        );
+    }
+
+    #[test]
+    fn restricted_tool_uses_overridden_allowed_callers() {
+        let tool = RestrictedTool;
+        assert_eq!(Tool::allowed_callers(&tool), vec![AllowedCaller::Direct]);
+        assert!(!Tool::allowed_callers(&tool).contains(&AllowedCaller::Programmatic));
+    }
+
+    #[test]
+    fn tooldyn_delegates_restricted_output_schema() {
+        let tool: Box<dyn ToolDyn> = Box::new(RestrictedTool);
+        assert_eq!(
+            tool.output_schema(),
+            Some(serde_json::json!({"type": "integer"}))
+        );
+    }
+
+    #[test]
+    fn tooldyn_delegates_restricted_allowed_callers() {
+        let tool: Box<dyn ToolDyn> = Box::new(RestrictedTool);
+        assert_eq!(tool.allowed_callers(), vec![AllowedCaller::Direct]);
     }
 }

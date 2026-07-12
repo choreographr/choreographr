@@ -136,9 +136,26 @@ pub(crate) enum ResponsesStreamEvent {
     ResponseFailed(String),
     /// Response incomplete
     ResponseIncomplete,
+    /// Program code delta (streaming generated JavaScript)
+    ProgramCodeDelta(String),
+    /// Program code is complete
+    ProgramCodeDone {
+        call_id: String,
+        fingerprint: Option<String>,
+    },
+    /// Program output is complete
+    ProgramOutputDone {
+        call_id: String,
+        result: String,
+        status: String,
+    },
 }
 
 /// Parse a single Responses API SSE event data string into a typed event.
+///
+/// Fields that the spec guarantees (e.g. `call_id`) are required — missing
+/// them is an error rather than a silent default, because a missing
+/// identifier would cause confusing downstream failures.
 ///
 /// Returns `Ok(None)` for unknown event types that should be silently ignored.
 pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<ResponsesStreamEvent>> {
@@ -221,6 +238,60 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             Ok(Some(ResponsesStreamEvent::ResponseFailed(error)))
         }
         "response.incomplete" => Ok(Some(ResponsesStreamEvent::ResponseIncomplete)),
+        "response.program.code.delta" => {
+            let delta = payload
+                .get("delta")
+                .and_then(|value| value.as_str())
+                .map(|s| ResponsesStreamEvent::ProgramCodeDelta(s.to_string()));
+            Ok(delta)
+        }
+        "response.program.code.done" => {
+            let call_id = payload
+                .get("call_id")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing call_id in response.program.code.done",
+                    )
+                })?;
+            let fingerprint = payload
+                .get("fingerprint")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string());
+            Ok(Some(ResponsesStreamEvent::ProgramCodeDone {
+                call_id,
+                fingerprint,
+            }))
+        }
+        "response.program_output.done" => {
+            let call_id = payload
+                .get("call_id")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "missing call_id in response.program_output.done",
+                    )
+                })?;
+            let result = payload
+                .get("result")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let status = payload
+                .get("status")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            Ok(Some(ResponsesStreamEvent::ProgramOutputDone {
+                call_id,
+                result,
+                status,
+            }))
+        }
         _ => {
             // Unknown event types are silently ignored
             Ok(None)

@@ -102,6 +102,7 @@ fn retry_succeeds_with_callback() {
         cancel_rx: Some(&cancel_rx),
         previous_response_id: None,
         tool_results: &[],
+        programmatic_tool_calling: false,
     });
 
     match result {
@@ -166,6 +167,7 @@ fn retry_cancelled_during_backoff() {
         cancel_rx: Some(&cancel_rx),
         previous_response_id: None,
         tool_results: &[],
+        programmatic_tool_calling: false,
     });
 
     assert!(

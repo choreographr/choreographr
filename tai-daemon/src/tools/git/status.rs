@@ -78,7 +78,6 @@ define_tool!(
     "git_status",
     "Show the status of the Git repository containing the given path.",
     GitRepoArgs,
-    String,
     execute_git_status_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."}},"additionalProperties":false}),
     "git"

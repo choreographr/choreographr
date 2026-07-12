@@ -436,6 +436,7 @@ pub(crate) fn run_agent_loop(
                 cancel_rx: Some(cancel_rx),
                 previous_response_id: prev_resp_id.as_deref(),
                 tool_results: &tool_results,
+                programmatic_tool_calling: client.supports_programmatic_tool_calling(model),
             },
             &mut |kind, text| {
                 let stream = match kind {
@@ -562,6 +563,7 @@ pub(crate) fn run_agent_loop(
                     tool_results.push(ToolResultItem {
                         call_id: tool_call.id.clone(),
                         output: output.result.content.clone(),
+                        caller: tool_call.caller.clone(),
                     });
                 }
 
@@ -673,6 +675,7 @@ pub(crate) fn run_agent_loop(
                                     id: call_id,
                                     name: tool_name.clone(),
                                     arguments_json,
+                                    caller: None,
                                 },
                                 output: ToolExecutionOutput {
                                     result: ToolResult {
@@ -712,6 +715,7 @@ pub(crate) fn run_agent_loop(
                         tool_results.push(ToolResultItem {
                             call_id: tool_call.id.clone(),
                             output: output.result.content.clone(),
+                            caller: tool_call.caller.clone(),
                         });
                     }
                 }
@@ -1297,6 +1301,7 @@ mod tests {
             id: "call_test".into(),
             name: tool_name.into(),
             arguments_json: tool_args.into(),
+            caller: None,
         };
 
         let ctx = RequestContext {
@@ -1565,6 +1570,7 @@ mod tests {
             id: "call_test".into(),
             name: tool_name.into(),
             arguments_json: tool_args.into(),
+            caller: None,
         };
 
         let tool_ctx = ToolContext {

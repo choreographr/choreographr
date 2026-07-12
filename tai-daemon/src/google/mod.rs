@@ -526,6 +526,7 @@ fn response_to_turn_result(
                     id,
                     name: function_call.name,
                     arguments_json: args_json,
+                    caller: None,
                 });
             }
             ResponsePart::Thinking { thinking, .. } => {

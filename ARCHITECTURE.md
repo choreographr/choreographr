@@ -218,8 +218,8 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
-| `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
-| `tools/` | `Tool` trait, `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 30 registered tools (including `list_sessions`, `get_session`, `load_skill` via `admin.rs`). |
+| `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading, programmatic tool calling (Responses API). |
+| `tools/` | `Tool` trait (with `output_schema` for programmatic tool calling, `allowed_callers` for caller-level gating), `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 30+ registered tools (including `list_sessions`, `get_session`, `load_skill` via `admin.rs`). |
 | `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, working directory) passed to tools that need DB or daemon access or parent config for sub-sessions. |
 | `tools/db.rs` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
@@ -238,6 +238,9 @@ pub struct ChatTurnRequest<'a> {
     pub thinking_effort: ThinkingEffort,
     pub on_retry: &'a mut Option<RetryCallback>,
     pub cancel_rx: Option<&'a mpsc::Receiver<()>>,
+    pub previous_response_id: Option<&'a str>,
+    pub tool_results: &'a [ToolResultItem],
+    pub programmatic_tool_calling: bool,
 }
 
 pub trait ProviderClient: Debug + Send + Sync {
@@ -245,6 +248,7 @@ pub trait ProviderClient: Debug + Send + Sync {
     fn chat_completion_turn(&self, params: ChatTurnRequest<'_>) -> Result<ChatTurnResult, InferenceError>;
     fn chat_completion_turn_streaming(&self, params: ChatTurnRequest<'_>, on_chunk: &mut dyn FnMut(...)) -> Result<ChatTurnResult, InferenceError>;
     fn list_models(&self) -> Result<Vec<String>, InferenceError>;
+    fn supports_programmatic_tool_calling(&self, model: &str) -> bool;
 }
 ```
 
@@ -518,6 +522,18 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &'static str;
     fn schema(&self) -> serde_json::Value;
 
+    /// JSON Schema for the tool's return value (for Programmatic Tool Calling).
+    /// The default assumes the tool returns a string.
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "string"}))
+    }
+
+    /// Controls which callers can invoke this tool
+    /// (`Direct`, `Programmatic`, or both).
+    fn allowed_callers(&self) -> Vec<AllowedCaller> {
+        vec![AllowedCaller::Direct, AllowedCaller::Programmatic]
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -542,11 +558,14 @@ pub trait Tool: Send + Sync {
 
     fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> { None }
 }
+```
 
-Tool implementations can declare which parameters they need via flags on the
-`define_tool!` invocation (see below). The `ctx` parameter provides `ToolContext`
-with session ID, database handle, and a daemon command channel — used by admin
-tools (`list_sessions`, `get_session`).
+Tools that need session context (`ToolContext` — used by `list_sessions`, `get_session`)
+receive it in the `ctx` parameter. Tools that return structured data override
+`output_schema()` to describe their return JSON shape, enabling the model to call
+them programmatically (see [Programmatic Tool Calling](#114-programmatic-tool-calling-responses-api-gpt-56)).
+Tools can restrict callers via `allowed_callers()`, gating whether the model calls
+them directly, from generated JavaScript, or both.
 ```
 
 Tools that produce images (e.g. `display_image`) override `extract_image()` to return a
@@ -565,6 +584,8 @@ pub trait ToolDyn: Send + Sync {
     fn group(&self) -> &'static str;
     fn description(&self) -> &'static str;
     fn schema(&self) -> serde_json::Value;
+    fn output_schema(&self) -> Option<serde_json::Value>;
+    fn allowed_callers(&self) -> Vec<AllowedCaller>;
 
     fn execute_json(&self, args_json: &str, ..., image_tx: Option<mpsc::Sender<PreparedImage>>) -> ToolExecutionOutput;
     fn execute_binary(&self, args_bytes: &[u8], ...) -> Vec<u8>;
@@ -588,13 +609,14 @@ deserialization and serialization, enabling compact cross-VM communication.
 
 ### `define_tool!` macro
 
-The macro reduces boilerplate for tools that don't need session context. Four variants
-control which parameters the `execute()` implementation receives:
+The `define_tool!` macro reduces boilerplate for the common tool case
+(`Return = String`, no credentials needed). It lives in `tai-daemon/src/tools/mod.rs`
+and has two variants:
 
 **Default (no flags):** The implementation function receives `(&Args, Option<&Path>)`:
 ```rust
-define_tool!(MyTool, "my_tool", "Description...", MyToolArgs, String,
-    execute_my_tool, schema!(), "core");
+define_tool!(MyTool, "my_tool", "Description...", MyToolArgs,
+    execute_my_tool, serde_json::json!({...}), "core");
 ```
 
 **`use_context`:** The implementation receives `(&Args, Option<&Path>, Option<&ToolContext>)`:
@@ -602,18 +624,10 @@ define_tool!(MyTool, "my_tool", "Description...", MyToolArgs, String,
 define_tool!(MyTool, ..., "core", use_context);
 ```
 
-**`use_credentials`:** The implementation receives `(&Args, Option<&ServiceCredential>, Option<&Path>)`:
-```rust
-define_tool!(MyTool, ..., "core", use_credentials);
-```
-
-**`use_credentials, use_context`:** The implementation receives all four parameters:
-```rust
-define_tool!(MyTool, ..., "core", use_credentials, use_context);
-```
-
-The macro implements `Tool` for the struct, wiring `execute()` to call the implementation
-function with the deserialized args and automatically ignoring unused parameters via `_`.
+Tools that need custom `output_schema()`, `allowed_callers()`, non-`String` return types,
+or `use_credentials` are written as manual `impl Tool` blocks instead. Examples:
+`DbGet`/`DbGetRange`/`DbList`/`DbCount` (custom `output_schema`),
+`GetCurrentTime` (`Return = u64`), `DisplayImage` (overrides `extract_image`).
 
 ### Registry
 
@@ -1038,6 +1052,17 @@ User presses Enter on a session in the session manager
     `previous_response_id` to link turns together, while Chat Completions relies on the full
     message history.
 
+    **Programmatic tool calling (Responses API, gpt-5.6+):** When enabled, the Responses
+    request body includes a `programmatic_tool_calling` tool with `type: "programmatic_tool_calling"`.
+    The model responds with `response.program.code.delta` and `response.program.code.done` events
+    carrying generated JavaScript, plus `response.program_output.done` with execution results.
+    The daemon's `Tool` trait exposes `output_schema()` (JSON Schema describing each tool's
+    return value) and `allowed_callers()` (whether a tool is callable directly by the model,
+    programmatically, or both). These are plumbed through `ChatToolDefinition::function_with_options()`
+    and `ResponsesTool` into the wire format. Per-model auto-enablement is controlled by
+    `ServiceConfig::programmatic_tool_calling_for_model()`; account-level override via
+    `accounts.toml`'s `programmatic_tool_calling` field.
+
 12. **Pluggable providers via `InferenceProvider`** — the provider system supports OpenAI-compatible,
     Anthropic Messages, Google Gemini, and Mistral APIs. Each provider implements the same interface
     (`chat_completion_turn`, `chat_completion_turn_streaming`, `list_models`) and is constructed
@@ -1162,8 +1187,9 @@ The skill body is available to the model on all subsequent turns.
 ### `run_riscv` — RISC-V sandboxed code execution
 
 `run_riscv` is a tool that compiles Rust source code into a RISC-V ELF binary and executes it
-inside a sandboxed virtual machine powered by `ckb-vm`. It is registered manually (not via
-`define_tool!`) to pass `x_credentials` and `working_dir` through to the guest syscall handler.
+inside a sandboxed virtual machine powered by `ckb-vm`. It is registered as a manual
+`impl Tool` (not via `define_tool!`) to pass `x_credentials` and `working_dir` through
+to the guest syscall handler.
 
 **Execution flow:**
 

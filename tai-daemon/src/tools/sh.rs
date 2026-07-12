@@ -57,7 +57,6 @@ define_tool!(
     "sh",
     "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified.",
     ShArgs,
-    String,
     execute_sh_tool,
     sh_schema(),
     "shell"

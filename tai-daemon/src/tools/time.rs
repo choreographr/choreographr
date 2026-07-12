@@ -21,24 +21,49 @@ pub(crate) fn execute_get_current_time(
 
 pub(crate) struct GetCurrentTime;
 
-define_tool!(
-    GetCurrentTime,
-    "get_current_time",
-    "Get the current Unix timestamp in milliseconds since epoch",
-    (),
-    u64,
-    execute_get_current_time,
-    serde_json::json!({
-        "type": "object",
-        "properties": {},
-        "additionalProperties": false
-    }),
-    "core"
-);
+impl super::Tool for GetCurrentTime {
+    type Args = ();
+    type Return = u64;
+
+    fn name(&self) -> &'static str {
+        "get_current_time"
+    }
+
+    fn group(&self) -> &'static str {
+        "core"
+    }
+
+    fn description(&self) -> &'static str {
+        "Get the current Unix timestamp in milliseconds since epoch"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&crate::tools::ServiceCredential>,
+        working_dir: Option<&std::path::Path>,
+        _ctx: Option<&crate::tools::context::ToolContext>,
+    ) -> Result<Self::Return, ToolError> {
+        execute_get_current_time(&args, working_dir)
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({"type": "integer"}))
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::Tool;
 
     #[test]
     fn test_returns_reasonable_millis() {
@@ -52,5 +77,12 @@ mod tests {
             result < 2_000_000_000_000,
             "timestamp should be before year 2033, got {result}"
         );
+    }
+
+    #[test]
+    fn output_schema_is_integer() {
+        let tool = GetCurrentTime;
+        let schema = tool.output_schema().expect("output_schema");
+        assert_eq!(schema["type"], "integer");
     }
 }

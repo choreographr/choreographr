@@ -67,6 +67,7 @@ pub struct ServiceConfig {
     pub connect_timeout_secs: u64,
     pub request_timeout_secs: u64,
     pub context: ContextConfig,
+    pub programmatic_tool_calling: bool,
 }
 
 impl Default for ServiceConfig {
@@ -94,6 +95,7 @@ impl Default for ServiceConfig {
             connect_timeout_secs: 30,
             request_timeout_secs: 120,
             context: ContextConfig::default(),
+            programmatic_tool_calling: false,
         }
     }
 }
@@ -202,6 +204,23 @@ impl ServiceConfig {
 
     /// Resolve which JSON field to use for the token limit for a given model.
     /// Per-model overrides take precedence over the default.
+    /// Returns whether programmatic tool calling should be enabled for a given model.
+    ///
+    /// Auto-enables for gpt-5.6+ models when the default is Responses API.
+    /// The account-level `programmatic_tool_calling` override takes precedence.
+    pub fn programmatic_tool_calling_for_model(&self, model: &str) -> bool {
+        if self.programmatic_tool_calling {
+            return true;
+        }
+        // Auto-enable for gpt-5.6 models when using the Responses API
+        if self.request_format_for_model(model) == RequestFormat::Responses
+            && model.starts_with("gpt-5.6")
+        {
+            return true;
+        }
+        false
+    }
+
     pub fn max_tokens_field_for_model(&self, model: &str) -> MaxTokensField {
         let field = self
             .model_max_tokens_fields
@@ -230,4 +249,74 @@ pub fn completion(
 ) -> io::Result<String> {
     let client = OpenAiClient::new(config.clone(), api_key.to_string())?;
     Ok(client.completion(model, prompt)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn programmatic_tool_calling_default_is_false() {
+        let config = ServiceConfig::default();
+        assert!(!config.programmatic_tool_calling_for_model("gpt-4.1"));
+    }
+
+    #[test]
+    fn programmatic_tool_calling_account_override() {
+        let mut config = ServiceConfig::default();
+        config.programmatic_tool_calling = true;
+        // Override takes precedence regardless of model.
+        assert!(config.programmatic_tool_calling_for_model("gpt-4.1"));
+        assert!(config.programmatic_tool_calling_for_model("claude-3"));
+    }
+
+    #[test]
+    fn programmatic_tool_calling_auto_enables_for_gpt_5_6_responses() {
+        let mut config = ServiceConfig::default();
+        config.default_request_format = RequestFormat::Responses;
+        // gpt-5.6 models auto-enable with Responses API format.
+        assert!(config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
+        assert!(config.programmatic_tool_calling_for_model("gpt-5.6-chat"));
+    }
+
+    #[test]
+    fn programmatic_tool_calling_not_auto_enabled_for_gpt_5_6_chat_completions() {
+        let mut config = ServiceConfig::default();
+        config.default_request_format = RequestFormat::ChatCompletions;
+        // No auto-enable when using Chat Completions format.
+        assert!(!config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn programmatic_tool_calling_not_auto_enabled_for_other_models() {
+        let mut config = ServiceConfig::default();
+        config.default_request_format = RequestFormat::Responses;
+        assert!(!config.programmatic_tool_calling_for_model("gpt-4.1"));
+        assert!(!config.programmatic_tool_calling_for_model("gpt-5.5"));
+        assert!(!config.programmatic_tool_calling_for_model("claude-3-opus"));
+    }
+
+    #[test]
+    fn programmatic_tool_calling_auto_enable_respects_per_model_format() {
+        let mut config = ServiceConfig::default();
+        config.default_request_format = RequestFormat::Responses;
+        // Per-model override to ChatCompletions should disable auto-enable.
+        config
+            .model_request_formats
+            .insert("gpt-5.6-sol".to_string(), RequestFormat::ChatCompletions);
+        assert!(!config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
+        // Other gpt-5.6 models without override still auto-enable.
+        assert!(config.programmatic_tool_calling_for_model("gpt-5.6-chat"));
+    }
+
+    #[test]
+    fn programmatic_tool_calling_override_wins_over_auto_disable() {
+        let mut config = ServiceConfig::default();
+        config.default_request_format = RequestFormat::ChatCompletions;
+        config.programmatic_tool_calling = true;
+        // Account-level override takes precedence even when auto-enable
+        // would not trigger (ChatCompletions format).
+        assert!(config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
+        assert!(config.programmatic_tool_calling_for_model("gpt-4.1"));
+    }
 }

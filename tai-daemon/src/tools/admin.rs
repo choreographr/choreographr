@@ -59,12 +59,11 @@ fn execute_list_sessions(
 
 pub(crate) struct ListSessions;
 
-crate::define_tool!(
+define_tool!(
     ListSessions,
     "list_sessions",
     "List all sessions known to the daemon. Returns session ID, title, model, message count, parent session ID, and working directory for each session.",
     ListSessionsArgs,
-    String,
     execute_list_sessions,
     serde_json::json!({
         "type": "object",
@@ -109,12 +108,11 @@ fn execute_get_session(
 
 pub(crate) struct GetSession;
 
-crate::define_tool!(
+define_tool!(
     GetSession,
     "get_session",
     "Read the full message history of a session by its ID. Returns all messages (system, user, assistant, tool calls, tool results) with role labels.",
     GetSessionArgs,
-    String,
     execute_get_session,
     serde_json::json!({
         "type": "object",
@@ -152,12 +150,11 @@ fn execute_load_skill(
 
 pub(crate) struct LoadSkill;
 
-crate::define_tool!(
+define_tool!(
     LoadSkill,
     "load_skill",
     "Load the full instructions for a skill by name. Use this when a task matches one of the available skill descriptions.",
     LoadSkillArgs,
-    String,
     execute_load_skill,
     serde_json::json!({
         "type": "object",

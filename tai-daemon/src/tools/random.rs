@@ -117,7 +117,6 @@ define_tool!(
     "random",
     "Generate random values: integers, floats, booleans, bytes (base64), or UUID v4. Supports optional seed for reproducibility.",
     RandomArgs,
-    String,
     execute_random_tool,
     serde_json::json!({
         "type": "object",

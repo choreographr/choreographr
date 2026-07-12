@@ -259,7 +259,6 @@ define_tool!(
     "git_add",
     "Stage a file or pathspec in Git.",
     GitAddArgs,
-    String,
     execute_git_add_tool,
     serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"pathspec":{"type":"array","items":{"type":"string"},"description":"Files or pathspecs to stage"}},"required":["pathspec"],"additionalProperties":false}),
     "git"

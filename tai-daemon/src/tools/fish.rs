@@ -19,7 +19,6 @@ define_tool!(
     "fish",
     "Execute a fish shell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang.",
     FishArgs,
-    String,
     execute_fish_tool,
     serde_json::json!({
         "type": "object",

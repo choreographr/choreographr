@@ -2,7 +2,9 @@ use std::fmt::Debug;
 use std::io;
 use std::sync::mpsc;
 
-use crate::openai::{ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind};
+use crate::openai::{
+    CallerInfo, ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind,
+};
 use crate::retry::RetryCallback;
 use tai_proto::{InferenceError, ThinkingEffort};
 
@@ -11,6 +13,7 @@ use tai_proto::{InferenceError, ThinkingEffort};
 pub struct ToolResultItem {
     pub call_id: String,
     pub output: String,
+    pub caller: Option<CallerInfo>,
 }
 
 /// Holds the common parameters for a chat completion turn.
@@ -25,6 +28,8 @@ pub struct ChatTurnRequest<'a> {
     pub previous_response_id: Option<&'a str>,
     /// Tool results from previous turn (Responses API).
     pub tool_results: &'a [ToolResultItem],
+    /// Enable programmatic tool calling (Responses API, gpt-5.6+).
+    pub programmatic_tool_calling: bool,
 }
 
 /// Trait that every provider client must implement.
@@ -45,4 +50,10 @@ pub trait ProviderClient: Debug + Send + Sync {
     ) -> Result<ChatTurnResult, InferenceError>;
 
     fn list_models(&self) -> Result<Vec<String>, InferenceError>;
+
+    /// Returns whether programmatic tool calling should be enabled for the given model.
+    /// The default implementation returns false.
+    fn supports_programmatic_tool_calling(&self, _model: &str) -> bool {
+        false
+    }
 }
