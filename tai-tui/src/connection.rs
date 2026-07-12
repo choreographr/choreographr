@@ -1,11 +1,11 @@
-use crate::render::{mouse_in_history_box, render};
+use crate::render::{mouse_in_history_box, render, render_fullscreen_only};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    AIProvidersView, App, HOME_MENU_ITEMS, HomeMenuItem, InputBuffer, PAGE_SCROLL_LINES, Page,
-    SessionManagerView, UiEvent,
+    AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, HomeMenuItem, InputBuffer,
+    PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent, find_history_item_at_row,
 };
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use signal_hook::consts::SIGINT;
@@ -160,7 +160,30 @@ pub(crate) fn run_ui_loop(
         app.update_viewport_from_terminal_size();
         app.clamp_scroll_state();
 
+        // Hide the cursor while the fullscreen overlay is active so the
+        // blinking block/line doesn't distract.  Using the Terminal API
+        // rather than raw crossterm so that ratatui's internal cursor-
+        // visibility tracking stays in sync.
+        if app.fullscreen_image_idx.is_some() {
+            terminal.hide_cursor()?;
+        }
+
         terminal.draw(|frame| render(frame, app))?;
+
+        // If we just showed a loading placeholder, immediately render
+        // the actual fullscreen image on a second draw so the user sees
+        // instant feedback while the protocol encodes at full size.
+        if app.fullscreen_placeholder {
+            app.fullscreen_placeholder = false;
+            terminal.draw(|frame| {
+                render_fullscreen_only(frame, app);
+            })?;
+        }
+
+        // Re-show the cursor once the overlay is dismissed.
+        if app.fullscreen_image_idx.is_none() {
+            terminal.show_cursor()?;
+        }
 
         // Block for up to ~60 Hz to pace the frame rate without
         // busy-waiting.  Any event that arrives during this interval
@@ -178,6 +201,10 @@ pub(crate) fn handle_terminal_event(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // Fullscreen image overlay takes priority over page content.
+    if app.fullscreen_image_idx.is_some() {
+        return handle_fullscreen_event(event, app, client_tx);
+    }
     match app.page {
         Page::SessionManager => handle_session_manager_event(event, app, client_tx),
         Page::AIProviders => handle_ai_providers_event(event, app, client_tx),
@@ -268,6 +295,34 @@ fn handle_settings_event(
         // Esc returns to the home page
         KeyCode::Esc => {
             app.page = Page::Home;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Handle events while the fullscreen image overlay is active.
+///
+/// Only `Esc` (dismiss) and `Ctrl+C` (quit) are accepted; all other events
+/// are silently consumed.
+fn handle_fullscreen_event(
+    event: Event,
+    app: &mut App,
+    _client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Event::Key(key) = event else {
+        return Ok(());
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.fullscreen_image_idx = None;
+            app.fullscreen_placeholder = false;
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
         }
         _ => {}
     }
@@ -426,6 +481,17 @@ fn handle_chat_event(
                 }
                 MouseEventKind::ScrollDown => {
                     app.scroll_accumulator = app.scroll_accumulator.saturating_sub(1);
+                }
+                // Left-click on an image opens it fullscreen.  We render the
+                // existing `StatefulProtocol` directly by index (no re-decode
+                // of the raw image bytes).
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(idx) = find_history_item_at_row(app, mouse.row)
+                        && matches!(&app.client.history[idx], HistoryItem::Image(_))
+                    {
+                        app.fullscreen_image_idx = Some(idx);
+                        app.fullscreen_placeholder = true;
+                    }
                 }
                 _ => {}
             }

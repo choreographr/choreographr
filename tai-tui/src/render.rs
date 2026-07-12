@@ -10,7 +10,7 @@ use crate::state::{
 use image::imageops::FilterType;
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -40,6 +40,20 @@ pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
+    // When the user just clicked an image, show a loading placeholder on
+    // the very first frame.  `run_ui_loop` will follow up with a second
+    // draw that actually encodes the image at full size.
+    if app.fullscreen_placeholder {
+        render_fullscreen_placeholder(frame);
+        return;
+    }
+
+    // Fullscreen image overlay — rendered directly from the existing
+    // `StatefulProtocol` in history (no re-decode of raw bytes on click).
+    if render_fullscreen_only(frame, app) {
+        return;
+    }
+
     match app.page {
         Page::Chat => render_chat(frame, app),
         Page::SessionManager => render_session_manager(frame, app),
@@ -47,6 +61,63 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         Page::Settings => render_settings(frame, app),
         Page::Home => render_home(frame, app),
     }
+}
+
+/// Look up the fullscreen image by index and render it.  Returns `true` if
+/// a valid image was found and rendered, `false` if the index was stale.
+/// This is `pub(crate)` so `run_ui_loop` can call it directly for the
+/// follow-up draw after the loading placeholder.
+pub(crate) fn render_fullscreen_only(frame: &mut Frame<'_>, app: &mut App) -> bool {
+    if let Some(idx) = app.fullscreen_image_idx {
+        if idx < app.client.history.len()
+            && matches!(&app.client.history[idx], HistoryItem::Image(_))
+            && let Some(HistoryItem::Image(rendered)) = app.client.history.get_mut(idx)
+        {
+            render_fullscreen_image(frame, rendered);
+            return true;
+        }
+        // History mutated (trimmed from front); index no longer valid.
+        app.fullscreen_image_idx = None;
+    }
+    false
+}
+
+/// Draw a centered "Loading image …" placeholder that fills the terminal.
+/// Used as instant feedback before the protocol encodes at full size.
+fn render_fullscreen_placeholder(frame: &mut Frame<'_>) {
+    let area = frame.area();
+    let block = Block::bordered()
+        .title(" Loading image … ")
+        .title_alignment(Alignment::Center);
+    frame.render_widget(block, area);
+}
+
+/// Render the fullscreen image overlay at the full terminal size with
+/// Lanczos3 quality.  The protocol's built-in cache avoids re-encoding on
+/// subsequent frames (the first frame encodes, all later frames hit the
+/// cache).  The cursor is hidden so it doesn't distract.
+fn render_fullscreen_image(frame: &mut Frame<'_>, rendered: &mut Box<RenderedImage>) {
+    let area = frame.area();
+    let full = Size::new(area.width, area.height);
+
+    // Compute the aspect-ratio-correct cell size at terminal dimensions.
+    let target = rendered
+        .protocol
+        .size_for(Resize::Scale(Some(FilterType::Lanczos3)), full);
+
+    // Center the image within the terminal.
+    let centered = Rect {
+        x: area.x + (area.width.saturating_sub(target.width)) / 2,
+        y: area.y + (area.height.saturating_sub(target.height)) / 2,
+        width: target.width.min(area.width),
+        height: target.height.min(area.height),
+    };
+
+    frame.render_stateful_widget(
+        StatefulImage::new().resize(Resize::Scale(Some(FilterType::Lanczos3))),
+        centered,
+        &mut rendered.protocol,
+    );
 }
 
 fn render_settings(frame: &mut Frame<'_>, _app: &mut App) {

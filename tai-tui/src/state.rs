@@ -468,6 +468,17 @@ pub(crate) struct App {
     /// vector grows or shrinks — this is O(n) but only happens on mutation,
     /// never during scrolling.
     pub(crate) render_cache: Vec<Option<RenderedCache>>,
+
+    /// Index into `client.history` of the image currently displayed
+    /// fullscreen.  `None` means no fullscreen overlay is active.
+    /// The existing `StatefulProtocol` is rendered directly (no re-decode).
+    pub(crate) fullscreen_image_idx: Option<usize>,
+
+    /// When `true`, the very first fullscreen frame should show a loading
+    /// placeholder instead of the image (the protocol may take ~3 s to
+    /// encode at full terminal size).  Set in the click handler and consumed
+    /// by `run_ui_loop` which immediately follows up with a second draw.
+    pub(crate) fullscreen_placeholder: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1031,6 +1042,8 @@ impl App {
             history_index: None,
             saved_draft: String::new(),
             db,
+            fullscreen_image_idx: None,
+            fullscreen_placeholder: false,
         }
     }
 
@@ -1612,6 +1625,35 @@ impl DaemonMessageHandler for App {
 
 pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
     lines_height(&crate::markdown_render::plain_text_lines(text), width)
+}
+
+/// Walk the history bottom-up (same direction as `render_history`) and find
+/// the index of the item whose vertical span contains `screen_row` (0 = top
+/// of the history viewport), accounting for the current scroll offset.
+///
+/// Returns `None` when `screen_row` is out of bounds or the history is empty.
+pub(crate) fn find_history_item_at_row(app: &App, screen_row: u16) -> Option<usize> {
+    let vh = app.history_viewport.height;
+    if screen_row >= vh {
+        return None;
+    }
+
+    // Convert top-down screen row to 0-based distance from the bottom of
+    // the viewport, then add the scroll offset to get the logical position
+    // within the full history content.
+    let from_bottom: usize = (vh - 1 - screen_row).into();
+    let logical_row = from_bottom + app.effective_scroll();
+
+    // Walk items from last (bottom) to first (top), accumulating heights.
+    let mut accumulated: usize = 0;
+    for i in (0..app.client.history.len()).rev() {
+        let height = app.history_viewport.item_height(&app.client.history[i]);
+        if logical_row < accumulated + height {
+            return Some(i);
+        }
+        accumulated += height;
+    }
+    None
 }
 
 #[cfg(test)]
