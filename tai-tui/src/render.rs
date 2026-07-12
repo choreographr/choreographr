@@ -7,6 +7,7 @@ use crate::state::{
     AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache,
     SessionManagerView, history_text_height,
 };
+use image::imageops::FilterType;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -495,7 +496,7 @@ fn render_item_image(
     rows_to_skip: &mut usize,
 ) {
     let rendered = image.protocol.size_for(
-        Resize::Scale(None),
+        Resize::Scale(Some(FilterType::Lanczos3)),
         ratatui::layout::Size::new(area.width, (area.height / 2).max(1)),
     );
     let full_height = rendered.height.max(1) as usize;
@@ -533,7 +534,7 @@ fn render_item_image(
     // ratatui_image never rescales during scrolling.
     if visible_height == full_height {
         frame.render_stateful_widget(
-            StatefulImage::new().resize(Resize::Scale(None)),
+            StatefulImage::new().resize(Resize::Scale(Some(FilterType::Lanczos3))),
             inner,
             &mut image.protocol,
         );

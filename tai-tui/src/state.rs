@@ -15,6 +15,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use crate::db::{self, CommandEntry};
 use crate::diff_render::{diff_display_height, is_diff_text, parse_diff};
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
+use image::imageops::FilterType;
 use ratatui::text::Line;
 use ratatui_image::Resize;
 use tai_client_core::FileDiff;
@@ -524,7 +525,7 @@ impl HistoryViewport {
             }
             HistoryItem::Image(image) => {
                 let rendered = image.protocol.size_for(
-                    Resize::Scale(None),
+                    Resize::Scale(Some(FilterType::Lanczos3)),
                     Size::new(self.width, (self.height / 2).max(1)),
                 );
                 rendered.height.max(1) as usize

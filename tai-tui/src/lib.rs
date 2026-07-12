@@ -2,6 +2,7 @@ use image::{DynamicImage, RgbaImage, load_from_memory};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 use resvg::{tiny_skia, usvg};
 use std::io;
+use std::sync::Arc;
 pub use tai_client_core::{
     ClientError, ImageAssembler, ShellCommand, StreamingText, parse_input_line,
 };
@@ -35,7 +36,8 @@ fn decode_display_image(metadata: &ImageMetadata, data: &[u8]) -> io::Result<Dyn
 }
 
 fn rasterize_svg(data: &[u8]) -> io::Result<DynamicImage> {
-    let options = usvg::Options::default();
+    let mut options = usvg::Options::default();
+    Arc::make_mut(&mut options.fontdb).load_system_fonts();
     let tree = usvg::Tree::from_data(data, &options).map_err(io::Error::other)?;
     let size = tree.size().to_int_size();
     let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height()).ok_or_else(|| {
