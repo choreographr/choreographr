@@ -181,7 +181,7 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
             call_id,
             data,
         } => {
-            let text = String::from_utf8(data)?;
+            let text = String::from_utf8_lossy(&data).into_owned();
             handler.push_tool_text(
                 request_id,
                 format!("[{request_id}] tool #{call_id} output: {text}"),
@@ -461,7 +461,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             stream,
             data,
         } => {
-            let text = String::from_utf8(data)?;
+            let text = String::from_utf8_lossy(&data).into_owned();
             handler.append_stream(request_id, stream, &text);
             Ok(())
         }
