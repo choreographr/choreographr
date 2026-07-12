@@ -348,6 +348,7 @@ where
                 Some(full_reasoning)
             },
             usage,
+            response_id: None,
         }));
     }
 
@@ -363,6 +364,7 @@ where
             Some(full_reasoning)
         },
         usage,
+        response_id: None,
     }))
 }
 

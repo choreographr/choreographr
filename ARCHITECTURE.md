@@ -1026,9 +1026,17 @@ User presses Enter on a session in the session manager
     messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
     (tai-tui), providing a consistent rendering layer.
 
-11. **Flexible API format** — the daemon supports both OpenAI Chat Completions and Responses
-    endpoints, selectable per-model. This lets users route different models to their best-supported
-    endpoint.
+11. **Flexible API format** — both OpenAI Chat Completions and Responses are first-class
+    citizens, selectable per-model via a `RequestFormat` enum (`ChatCompletions` / `Responses`).
+    The dispatch mechanism lives in `ServiceConfig::request_format_for_model()`: it checks
+    per-model overrides (`model_request_formats`) and falls back to `default_request_format`.
+    Every entry point (`completion`, `completion_stream`, `chat_completion_turn`,
+    `chat_completion_turn_streaming`) matches on the resolved format and calls the appropriate
+    request builder. Input/output mapping differs between the two: system messages become the
+    Responses `instructions` field, tool results become `function_call_output` items, and the
+    `input` is an array of typed items rather than a flat messages list. Multi-turn chaining uses
+    `previous_response_id` to link turns together, while Chat Completions relies on the full
+    message history.
 
 12. **Pluggable providers via `InferenceProvider`** — the provider system supports OpenAI-compatible,
     Anthropic Messages, Google Gemini, and Mistral APIs. Each provider implements the same interface

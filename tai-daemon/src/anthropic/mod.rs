@@ -422,6 +422,7 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
             tool_calls: tool_uses,
             reasoning,
             usage,
+            response_id: None,
         }));
     }
 
@@ -434,6 +435,7 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
         content,
         reasoning,
         usage,
+        response_id: None,
     }))
 }
 

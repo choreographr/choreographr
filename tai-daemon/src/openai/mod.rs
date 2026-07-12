@@ -14,9 +14,12 @@ pub use config::{
     DaemonConfig, ServiceConfig, completion, config_path, load_daemon_config, load_service_config,
     validate_and_list_models,
 };
+pub(crate) use sse::SseReader;
 #[cfg(test)]
 pub(crate) use sse::build_sse_event;
-pub(crate) use sse::{SseReader, extract_responses_text_delta};
+#[cfg(test)]
+pub(crate) use sse::extract_responses_text_delta;
+pub(crate) use sse::{ResponsesStreamEvent, parse_responses_stream_event};
 
 #[cfg(test)]
 pub(crate) use crate::retry::{
@@ -50,27 +53,105 @@ struct ModelInfo {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ResponsesInputItem {
+    Message {
+        role: String,
+        content: String,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
 struct ResponsesRequest<'a> {
     model: &'a str,
-    input: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ResponsesTool>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include: Option<Vec<&'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResponsesResponse {
-    output: Vec<OutputItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OutputItem {
     #[serde(default)]
-    content: Vec<ContentItem>,
+    id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    output: Vec<ResponseOutputItem>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ContentItem {
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponseOutputItem {
+    Message {
+        #[serde(default)]
+        content: Vec<ResponseContentPart>,
+        #[serde(default)]
+        role: Option<String>,
+    },
+    Reasoning {
+        #[serde(default)]
+        summary: Vec<serde_json::Value>,
+    },
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseContentPart {
+    #[serde(rename = "type")]
+    kind: String,
     text: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ResponsesTool {
+    #[serde(rename = "type")]
+    kind: String,
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    strict: bool,
+}
+
+impl From<&ChatToolDefinition> for ResponsesTool {
+    fn from(tool: &ChatToolDefinition) -> Self {
+        Self {
+            kind: "function".to_string(),
+            name: tool.function.name.to_string(),
+            description: tool.function.description.to_string(),
+            parameters: tool.function.parameters.clone(),
+            strict: false,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -100,8 +181,8 @@ struct ChatCompletionsStreamOptions {
     include_usage: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct Usage {
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct Usage {
     prompt_tokens: u32,
     completion_tokens: u32,
     total_tokens: u32,
@@ -211,6 +292,7 @@ pub struct ChatAssistantToolUse {
     pub tool_calls: Vec<ChatToolCall>,
     pub reasoning: Option<String>,
     pub usage: Option<TokenUsage>,
+    pub response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +300,7 @@ pub struct FinalTextResult {
     pub content: String,
     pub reasoning: Option<String>,
     pub usage: Option<TokenUsage>,
+    pub response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -326,6 +409,63 @@ pub(crate) fn reasoning_effort_api_value(effort: ThinkingEffort) -> Option<&'sta
         ThinkingEffort::Medium => Some("medium"),
         ThinkingEffort::High => Some("high"),
     }
+}
+
+/// Convert ChatRequestMessage slice to Responses API input format.
+/// Returns (instructions, input_items) where instructions is the system prompt
+/// extracted from system-role messages.
+pub(crate) fn messages_to_responses_input(
+    messages: &[ChatRequestMessage],
+) -> (Option<String>, Vec<ResponsesInputItem>) {
+    let mut instructions = None;
+    let mut items = Vec::new();
+
+    for msg in messages {
+        match msg.role {
+            "system" => {
+                if let Some(ref content) = msg.content {
+                    tracing::debug!(
+                        "extracted instructions from system message (len={})",
+                        content.len()
+                    );
+                    instructions = Some(content.clone());
+                }
+            }
+            "user" | "assistant" => {
+                if let Some(ref content) = msg.content {
+                    items.push(ResponsesInputItem::Message {
+                        role: msg.role.to_string(),
+                        content: content.clone(),
+                    });
+                }
+            }
+            "tool" => {
+                // Tool results become function_call_output items
+                if let Some(ref call_id) = msg.tool_call_id
+                    && let Some(ref content) = msg.content
+                {
+                    items.push(ResponsesInputItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: content.clone(),
+                    });
+                }
+            }
+            _ => {
+                tracing::warn!(
+                    "unexpected message role in messages_to_responses_input: {}",
+                    msg.role
+                );
+            }
+        }
+    }
+
+    tracing::debug!(
+        "messages_to_responses_input: {} items, instructions={}",
+        items.len(),
+        instructions.is_some()
+    );
+
+    (instructions, items)
 }
 
 // ── ProviderClient trait impl ───────────────────────────────────────────

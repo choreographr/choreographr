@@ -6,10 +6,12 @@ use super::{
     ChatAssistantToolUse, ChatCompletionsRequest, ChatCompletionsResponse,
     ChatCompletionsStreamOptions, ChatCompletionsStreamResponse, ChatRequestMessage, ChatToolCall,
     ChatToolDefinition, ChatTurnResult, CompletionChunkKind, FinalTextResult, ModelListResponse,
-    OpenAiClient, RequestFormat, ResponsesRequest, ResponsesResponse, SseReader,
-    StreamToolCallDelta, endpoint_url, extract_responses_text_delta, reasoning_effort_api_value,
+    OpenAiClient, RequestFormat, ResponseOutputItem, ResponsesInputItem, ResponsesRequest,
+    ResponsesResponse, ResponsesStreamEvent, ResponsesTool, SseReader, StreamToolCallDelta,
+    endpoint_url, messages_to_responses_input, parse_responses_stream_event,
+    reasoning_effort_api_value,
 };
-use crate::providers::ChatTurnRequest;
+use crate::providers::{ChatTurnRequest, ToolResultItem};
 use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc;
@@ -85,17 +87,30 @@ impl OpenAiClient {
     ) -> Result<ChatTurnResult, super::OpenAiError> {
         let reasoning_effort = reasoning_effort_api_value(params.thinking_effort);
         debug!(?params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
-        chat_completions_request_with_tools(
-            &self.http,
-            &self.config,
-            &self.api_key,
-            params.model,
-            params.messages,
-            params.tools,
-            reasoning_effort,
-            params.on_retry,
-            params.cancel_rx,
-        )
+        match self.config.request_format_for_model(params.model) {
+            RequestFormat::Responses => responses_request_with_tools(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                params.model,
+                params.messages,
+                params.tools,
+                reasoning_effort,
+                params.previous_response_id,
+                params.tool_results,
+            ),
+            RequestFormat::ChatCompletions => chat_completions_request_with_tools(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                params.model,
+                params.messages,
+                params.tools,
+                reasoning_effort,
+                params.on_retry,
+                params.cancel_rx,
+            ),
+        }
     }
 
     pub fn chat_completion_turn_streaming<F>(
@@ -146,18 +161,34 @@ impl OpenAiClient {
             return Ok(result);
         }
 
-        chat_completions_request_streaming_with_tools(
-            &self.http,
-            &self.config,
-            &self.api_key,
-            params.model,
-            params.messages,
-            params.tools,
-            reasoning_effort,
-            params.on_retry,
-            params.cancel_rx,
-            on_chunk,
-        )
+        match self.config.request_format_for_model(params.model) {
+            RequestFormat::Responses => responses_request_streaming_with_tools(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                params.model,
+                params.messages,
+                params.tools,
+                reasoning_effort,
+                params.previous_response_id,
+                params.tool_results,
+                params.on_retry,
+                params.cancel_rx,
+                on_chunk,
+            ),
+            RequestFormat::ChatCompletions => chat_completions_request_streaming_with_tools(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                params.model,
+                params.messages,
+                params.tools,
+                reasoning_effort,
+                params.on_retry,
+                params.cancel_rx,
+                on_chunk,
+            ),
+        }
     }
 }
 
@@ -168,14 +199,8 @@ fn responses_request(
     model: &str,
     prompt: &str,
 ) -> Result<String, super::OpenAiError> {
-    let url = endpoint_url(&config.base_url, &config.responses_path)?;
+    let (url, body) = build_simple_responses_body(config, model, prompt, false)?;
     let retry = retry::retry_config_from_config(config);
-    let body = serde_json::to_value(&ResponsesRequest {
-        model,
-        input: prompt,
-        stream: false,
-    })
-    .map_err(io::Error::other)?;
     let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
     let payload: ResponsesResponse = response
         .into_body()
@@ -185,8 +210,15 @@ fn responses_request(
     let content = payload
         .output
         .into_iter()
-        .flat_map(|item| item.content.into_iter())
-        .filter_map(|item| item.text)
+        .filter_map(|item| {
+            if let ResponseOutputItem::Message { content, .. } = item {
+                Some(content)
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .filter_map(|part| part.text)
         .map(|text| text.trim().to_string())
         .find(|text| !text.is_empty())
         .unwrap_or_default();
@@ -324,6 +356,7 @@ fn chat_completions_request_with_tools(
                 .collect(),
             reasoning,
             usage: turn_usage,
+            response_id: None,
         }));
     }
 
@@ -341,6 +374,7 @@ fn chat_completions_request_with_tools(
         content,
         reasoning,
         usage: turn_usage,
+        response_id: None,
     }))
 }
 
@@ -426,31 +460,308 @@ fn responses_request_streaming<F>(
 where
     F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
 {
-    let url = endpoint_url(&config.base_url, &config.responses_path)?;
+    let (url, body) = build_simple_responses_body(config, model, prompt, true)?;
     let retry = retry::retry_config_from_config(config);
-    let body = serde_json::to_value(&ResponsesRequest {
-        model,
-        input: prompt,
-        stream: true,
-    })
-    .map_err(io::Error::other)?;
     let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
-    let mut saw_text = false;
+    let mut has_any_output = false;
     while let Some(data) = reader.next_event()? {
-        if let Some(delta) = extract_responses_text_delta(&data)?
-            && !delta.is_empty()
-        {
-            saw_text = true;
-            on_chunk(CompletionChunkKind::Answer, delta)?;
+        let event = parse_responses_stream_event(&data)?;
+        match event {
+            Some(ResponsesStreamEvent::TextDelta(text)) => {
+                has_any_output = true;
+                on_chunk(CompletionChunkKind::Answer, text)?;
+            }
+            Some(ResponsesStreamEvent::TextDone) => {
+                // Text output is complete; continue waiting for completion event.
+            }
+            Some(ResponsesStreamEvent::ResponseCompleted { .. }) => {
+                break;
+            }
+            Some(ResponsesStreamEvent::ResponseFailed(error)) => {
+                return Err(super::OpenAiError::Io(io::Error::other(error)));
+            }
+            Some(ResponsesStreamEvent::ResponseIncomplete) => {
+                return Err(super::OpenAiError::Io(io::Error::other(
+                    "response incomplete",
+                )));
+            }
+            _ => {}
         }
     }
 
-    if !saw_text {
+    if !has_any_output {
         return Err(super::OpenAiError::EmptyResponse);
     }
 
     Ok(())
+}
+
+/// Shared helper: build the `instructions` and `input` JSON value for a
+/// Responses API request, based on whether this is a follow-up turn carrying
+/// tool results or a first turn built from message history.
+fn build_responses_input(
+    tool_results: &[ToolResultItem],
+    messages: &[ChatRequestMessage],
+) -> (Option<String>, Option<serde_json::Value>) {
+    if tool_results.is_empty() {
+        // First call in a turn: convert messages to Responses input items.
+        // System message(s) become `instructions`; everything else goes into
+        // the `input` array.
+        let (instructions, items) = messages_to_responses_input(messages);
+        let input_value = if items.is_empty() {
+            serde_json::Value::String(String::new())
+        } else {
+            serde_json::to_value(&items).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to serialize responses input items");
+                serde_json::Value::String(String::new())
+            })
+        };
+        (instructions, Some(input_value))
+    } else {
+        // Returning tool results from a previous turn: build
+        // function_call_output items.  Both `instructions` and `messages`
+        // are omitted because the Responses API remembers the full
+        // conversation history from the original turn via
+        // `previous_response_id` — only the new tool results are needed.
+        let items: Vec<ResponsesInputItem> = tool_results
+            .iter()
+            .map(|tr| ResponsesInputItem::FunctionCallOutput {
+                call_id: tr.call_id.clone(),
+                output: tr.output.clone(),
+            })
+            .collect();
+        let input_value = serde_json::to_value(&items).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to serialize tool result items");
+            serde_json::Value::String(String::new())
+        });
+        (None, Some(input_value))
+    }
+}
+
+/// Shared helper: extract the reasoning text from a Responses API
+/// reasoning-summary array.  Each entry may be a plain string or an object
+/// with a `"text"` field.
+fn extract_reasoning_text(summary: &[serde_json::Value]) -> Option<String> {
+    let parts: Vec<String> = summary
+        .iter()
+        .filter_map(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("text").and_then(|t| t.as_str().map(String::from)))
+        })
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+/// Shared helper: build the URL and serialised request body for a
+/// Responses API request with tools (and optionally tool results from a
+/// previous turn).
+#[allow(clippy::too_many_arguments)]
+fn build_responses_request_body(
+    config: &ServiceConfig,
+    model: &str,
+    messages: &[ChatRequestMessage],
+    tools: &[ChatToolDefinition],
+    reasoning_effort: Option<&'static str>,
+    previous_response_id: Option<&str>,
+    tool_results: &[ToolResultItem],
+    stream: bool,
+) -> Result<(String, serde_json::Value), super::OpenAiError> {
+    let url = endpoint_url(&config.base_url, &config.responses_path)?;
+    let max_output_tokens = config.max_output_tokens_for_model(model);
+    let (instructions, input_value) = build_responses_input(tool_results, messages);
+
+    let responses_tools: Vec<ResponsesTool> = tools.iter().map(ResponsesTool::from).collect();
+    let tools_opt = if responses_tools.is_empty() {
+        None
+    } else {
+        Some(responses_tools)
+    };
+
+    // Always request reasoning summary — the server omits it for models
+    // that don't support reasoning.
+    let include = Some(vec!["reasoning.summary"]);
+
+    let body = serde_json::to_value(&ResponsesRequest {
+        model,
+        input: input_value,
+        instructions: instructions.as_deref(),
+        tools: tools_opt,
+        stream,
+        max_output_tokens,
+        reasoning_effort,
+        store: config.responses_store,
+        previous_response_id,
+        include,
+        parallel_tool_calls: None,
+    })
+    .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+
+    Ok((url, body))
+}
+
+/// Build the URL and serialised request body for a simple (no-tool) Responses API request.
+/// Unlike `build_responses_request_body`, this sends `input` as a plain string and
+/// omits instructions, tools, and chaining fields — appropriate for one-shot completions.
+fn build_simple_responses_body(
+    config: &ServiceConfig,
+    model: &str,
+    prompt: &str,
+    stream: bool,
+) -> Result<(String, serde_json::Value), super::OpenAiError> {
+    let url = endpoint_url(&config.base_url, &config.responses_path)?;
+    let body = serde_json::to_value(&ResponsesRequest {
+        model,
+        // Simple (non-turn) requests send input as a plain string rather than
+        // an items array.  The server expands it to a single user message.
+        input: Some(serde_json::Value::String(prompt.to_string())),
+        instructions: None,
+        tools: None,
+        stream,
+        max_output_tokens: None,
+        reasoning_effort: None,
+        // Simple requests are ephemeral — don't persist on the server side.
+        // Tool-using paths respect `config.responses_store` for multi-turn
+        // conversations that benefit from server-side history.
+        store: false,
+        previous_response_id: None,
+        include: None,
+        parallel_tool_calls: None,
+    })
+    .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+    Ok((url, body))
+}
+
+/// Non-streaming Responses API turn with tool definitions, reasoning effort,
+/// and optional tool results from a previous turn.
+#[allow(clippy::too_many_arguments)]
+fn responses_request_with_tools(
+    agent: &ureq::Agent,
+    config: &ServiceConfig,
+    api_key: &str,
+    model: &str,
+    messages: &[ChatRequestMessage],
+    tools: &[ChatToolDefinition],
+    reasoning_effort: Option<&'static str>,
+    previous_response_id: Option<&str>,
+    tool_results: &[ToolResultItem],
+) -> Result<ChatTurnResult, super::OpenAiError> {
+    let start = std::time::Instant::now();
+
+    let (url, body) = build_responses_request_body(
+        config,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        previous_response_id,
+        tool_results,
+        false,
+    )?;
+
+    let has_instructions = messages.iter().any(|m| m.role == "system");
+    info!(
+        model = %model,
+        tool_count = tools.len(),
+        tool_result_count = tool_results.len(),
+        has_instructions = has_instructions,
+        "responses request with tools",
+    );
+
+    let retry = retry::retry_config_from_config(config);
+    let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
+    let payload: ResponsesResponse = response
+        .into_body()
+        .read_json()
+        .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+
+    let elapsed = start.elapsed();
+    debug!(
+        model = %model,
+        elapsed_ms = elapsed.as_millis(),
+        prompt_tokens = payload.usage.as_ref().map(|u| u.prompt_tokens),
+        completion_tokens = payload.usage.as_ref().map(|u| u.completion_tokens),
+        total_tokens = payload.usage.as_ref().map(|u| u.total_tokens),
+        "responses turn",
+    );
+
+    let response_id = payload.id.clone();
+    let turn_usage = payload.usage.map(|u| TokenUsage {
+        input_tokens: u.prompt_tokens,
+        output_tokens: u.completion_tokens,
+        total_tokens: u.total_tokens,
+    });
+
+    // Parse output items: extract text, reasoning, and tool calls.
+    let mut full_text = String::new();
+    let mut full_reasoning = String::new();
+    let mut tool_calls: Vec<ChatToolCall> = Vec::new();
+
+    for item in payload.output {
+        match item {
+            ResponseOutputItem::Message { content, .. } => {
+                for part in content {
+                    if part.kind == "output_text"
+                        && let Some(ref t) = part.text
+                    {
+                        full_text.push_str(t);
+                    }
+                }
+            }
+            ResponseOutputItem::Reasoning { summary } => {
+                if let Some(text) = extract_reasoning_text(&summary) {
+                    full_reasoning.push_str(&text);
+                }
+            }
+            ResponseOutputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                tool_calls.push(ChatToolCall {
+                    id: call_id,
+                    name,
+                    arguments_json: arguments,
+                });
+            }
+        }
+    }
+
+    if !tool_calls.is_empty() {
+        Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
+            content: if full_text.is_empty() {
+                None
+            } else {
+                Some(full_text)
+            },
+            tool_calls,
+            reasoning: if full_reasoning.is_empty() {
+                None
+            } else {
+                Some(full_reasoning)
+            },
+            usage: turn_usage,
+            response_id,
+        }))
+    } else if full_text.is_empty() {
+        Err(super::OpenAiError::EmptyResponse)
+    } else {
+        Ok(ChatTurnResult::FinalText(FinalTextResult {
+            content: full_text,
+            reasoning: if full_reasoning.is_empty() {
+                None
+            } else {
+                Some(full_reasoning)
+            },
+            usage: turn_usage,
+            response_id,
+        }))
+    }
 }
 
 /// Accumulates tool call fields across streaming SSE chunks keyed by the
@@ -458,6 +769,14 @@ where
 #[derive(Debug, Default)]
 struct AccumulatingToolCall {
     id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+/// Accumulator for Responses API tool call arguments keyed by call_id.
+/// Used in `responses_request_streaming_with_tools` to merge delta chunks.
+#[derive(Debug, Default)]
+struct AccCall {
     name: Option<String>,
     arguments: String,
 }
@@ -546,7 +865,7 @@ where
     })
     .map_err(io::Error::other)?;
     let response = retry::retry_send(agent, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
-    let mut saw_text = false;
+    let mut has_any_output = false;
     let mut full_content = String::new();
     let mut full_reasoning = String::new();
     // Collect raw tool call deltas across all chunks, then delegate to the
@@ -584,7 +903,7 @@ where
 
             // Content chunks: answer text
             if let Some(content) = delta.content.filter(|c| !c.is_empty()) {
-                saw_text = true;
+                has_any_output = true;
                 full_content.push_str(&content);
                 on_chunk(CompletionChunkKind::Answer, content)?;
             }
@@ -599,7 +918,7 @@ where
             .flatten()
             .filter(|r| !r.is_empty())
             {
-                saw_text = true;
+                has_any_output = true;
                 full_reasoning.push_str(reasoning);
                 on_chunk(CompletionChunkKind::Reasoning, reasoning.clone())?;
             }
@@ -608,13 +927,13 @@ where
             // (accumulate_tool_calls_from_deltas) will merge them by index
             // and produce sorted ChatToolCall output after the stream ends.
             if let Some(ref tcs) = delta.tool_calls {
-                saw_text = true;
+                has_any_output = true;
                 raw_tool_call_deltas.extend(tcs.iter().cloned());
             }
         }
     }
 
-    if !saw_text {
+    if !has_any_output {
         return Err(super::OpenAiError::EmptyResponse);
     }
 
@@ -633,6 +952,7 @@ where
                 Some(full_reasoning)
             },
             usage: last_usage,
+            response_id: None,
         }));
     }
 
@@ -644,6 +964,178 @@ where
             Some(full_reasoning)
         },
         usage: last_usage,
+        response_id: None,
+    }))
+}
+
+/// Streaming Responses API turn with tool definitions, reasoning effort,
+/// tool results, retry support, and cancellation.
+///
+/// Sends `stream: true` with tool definitions, reads SSE chunks, and calls
+/// `on_chunk` for each content / reasoning delta so the caller can forward
+/// it to subscribers immediately.  Tool call deltas are accumulated across
+/// chunks and returned as `ChatTurnResult::ToolUse` when the stream ends.
+#[allow(clippy::too_many_arguments)]
+fn responses_request_streaming_with_tools<F>(
+    agent: &ureq::Agent,
+    config: &ServiceConfig,
+    api_key: &str,
+    model: &str,
+    messages: &[ChatRequestMessage],
+    tools: &[ChatToolDefinition],
+    reasoning_effort: Option<&'static str>,
+    previous_response_id: Option<&str>,
+    tool_results: &[ToolResultItem],
+    on_retry: &mut Option<retry::RetryCallback>,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
+    mut on_chunk: F,
+) -> Result<ChatTurnResult, super::OpenAiError>
+where
+    F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+{
+    let (url, body) = build_responses_request_body(
+        config,
+        model,
+        messages,
+        tools,
+        reasoning_effort,
+        previous_response_id,
+        tool_results,
+        true,
+    )?;
+
+    info!(
+        model = %model,
+        tool_count = tools.len(),
+        tool_result_count = tool_results.len(),
+        streaming = true,
+        "responses streaming request with tools",
+    );
+
+    let retry = retry::retry_config_from_config(config);
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
+
+    let mut has_any_output = false;
+    let mut full_content = String::new();
+    let mut full_reasoning = String::new();
+    let mut last_usage: Option<TokenUsage> = None;
+    let mut response_id: Option<String> = None;
+
+    let mut acc_calls: HashMap<String, AccCall> = HashMap::new();
+
+    let mut reader = SseReader::from_reader(response.into_body().into_reader());
+    while let Some(data) = reader.next_event()? {
+        let event = parse_responses_stream_event(&data)?;
+        match event {
+            Some(ResponsesStreamEvent::TextDelta(text)) => {
+                has_any_output = true;
+                full_content.push_str(&text);
+                on_chunk(CompletionChunkKind::Answer, text)?;
+            }
+            Some(ResponsesStreamEvent::TextDone) => {
+                // Text output is complete — continue listening for the
+                // completion / failure events and any remaining tool calls.
+            }
+            Some(ResponsesStreamEvent::ReasoningSummary(summary)) => {
+                if let Some(text) = extract_reasoning_text(&summary) {
+                    has_any_output = true;
+                    full_reasoning.push_str(&text);
+                    on_chunk(CompletionChunkKind::Reasoning, text)?;
+                }
+            }
+            Some(ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta }) => {
+                has_any_output = true;
+                let entry = acc_calls.entry(call_id).or_default();
+                entry.arguments.push_str(&delta);
+            }
+            Some(ResponsesStreamEvent::FunctionCallArgumentsDone {
+                call_id,
+                name,
+                arguments,
+            }) => {
+                has_any_output = true;
+                let entry = acc_calls.entry(call_id).or_default();
+                entry.name = Some(name);
+                // The done event carries the full arguments; replace any
+                // partial arguments accumulated from delta events.
+                entry.arguments = arguments;
+            }
+            Some(ResponsesStreamEvent::ResponseCompleted { id, usage }) => {
+                response_id = id;
+                if let Some(u) = usage {
+                    debug!(
+                        prompt_tokens = u.prompt_tokens,
+                        completion_tokens = u.completion_tokens,
+                        total_tokens = u.total_tokens,
+                        "responses streaming turn usage",
+                    );
+                    last_usage = Some(TokenUsage {
+                        input_tokens: u.prompt_tokens,
+                        output_tokens: u.completion_tokens,
+                        total_tokens: u.total_tokens,
+                    });
+                }
+                break;
+            }
+            Some(ResponsesStreamEvent::ResponseFailed(error)) => {
+                return Err(super::OpenAiError::Io(io::Error::other(error)));
+            }
+            Some(ResponsesStreamEvent::ResponseIncomplete) => {
+                return Err(super::OpenAiError::Io(io::Error::other(
+                    "response incomplete",
+                )));
+            }
+            _ => {
+                // Unknown event types are silently ignored.
+            }
+        }
+    }
+
+    if !has_any_output {
+        return Err(super::OpenAiError::EmptyResponse);
+    }
+
+    if !acc_calls.is_empty() {
+        let tool_calls: Vec<ChatToolCall> = acc_calls
+            .into_iter()
+            .map(|(call_id, acc)| ChatToolCall {
+                id: call_id,
+                name: acc.name.unwrap_or_default(),
+                arguments_json: acc.arguments,
+            })
+            .collect();
+        return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
+            content: if full_content.is_empty() {
+                None
+            } else {
+                Some(full_content)
+            },
+            tool_calls,
+            reasoning: if full_reasoning.is_empty() {
+                None
+            } else {
+                Some(full_reasoning)
+            },
+            usage: last_usage,
+            response_id,
+        }));
+    }
+
+    // If only reasoning events arrived without any answer text, treat it as
+    // empty — matching the non-streaming variant's behaviour.
+    if full_content.is_empty() {
+        return Err(super::OpenAiError::EmptyResponse);
+    }
+
+    Ok(ChatTurnResult::FinalText(FinalTextResult {
+        content: full_content,
+        reasoning: if full_reasoning.is_empty() {
+            None
+        } else {
+            Some(full_reasoning)
+        },
+        usage: last_usage,
+        response_id,
     }))
 }
 
@@ -889,6 +1381,7 @@ mod tests {
             tool_calls,
             reasoning: None,
             usage: None,
+            response_id: None,
         });
         match result {
             ChatTurnResult::ToolUse(use_) => {
@@ -1032,5 +1525,342 @@ mod tests {
         })
         .unwrap();
         assert!(body.get("stream_options").is_none());
+    }
+
+    // ── Responses API serialization / deserialization tests ──────────
+
+    #[test]
+    fn responses_request_serializes_with_all_fields() {
+        let req = ResponsesRequest {
+            model: "gpt-5.6-sol",
+            input: Some(serde_json::Value::String("hello".into())),
+            instructions: Some("be helpful"),
+            tools: None,
+            stream: true,
+            max_output_tokens: Some(1000),
+            reasoning_effort: Some("medium"),
+            store: true,
+            previous_response_id: Some("resp_abc"),
+            include: None,
+            parallel_tool_calls: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["model"], "gpt-5.6-sol");
+        assert_eq!(json["input"], "hello");
+        assert_eq!(json["instructions"], "be helpful");
+        assert_eq!(json["stream"], true);
+        assert_eq!(json["store"], true);
+        assert_eq!(json["max_output_tokens"], 1000);
+        assert_eq!(json["reasoning_effort"], "medium");
+        assert_eq!(json["previous_response_id"], "resp_abc");
+    }
+
+    #[test]
+    fn responses_request_serializes_with_input_items() {
+        let input_items = serde_json::json!([
+            {"type": "message", "role": "user", "content": "hello"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "result"}
+        ]);
+        let req = ResponsesRequest {
+            model: "gpt-5.6-sol",
+            input: Some(input_items),
+            instructions: None,
+            tools: None,
+            stream: false,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            store: false,
+            previous_response_id: None,
+            include: None,
+            parallel_tool_calls: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["input"][0]["type"], "message");
+        assert_eq!(json["input"][0]["content"], "hello");
+        assert_eq!(json["input"][1]["type"], "function_call_output");
+        assert_eq!(json["input"][1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn responses_request_omits_optional_fields_when_none() {
+        let req = ResponsesRequest {
+            model: "gpt-4.1",
+            input: Some(serde_json::Value::String("hi".into())),
+            instructions: None,
+            tools: None,
+            stream: false,
+            max_output_tokens: None,
+            reasoning_effort: None,
+            store: false,
+            previous_response_id: None,
+            include: None,
+            parallel_tool_calls: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("reasoning_effort").is_none());
+        assert!(json.get("max_output_tokens").is_none());
+        assert!(json.get("previous_response_id").is_none());
+        assert!(json.get("include").is_none());
+        assert!(json.get("tools").is_none());
+        assert!(json.get("parallel_tool_calls").is_none());
+        assert!(json.get("instructions").is_none());
+        assert!(json.get("stream").is_none());
+        assert!(json.get("store").is_none());
+    }
+
+    #[test]
+    fn responses_response_deserializes_message_item() {
+        let json = r#"{
+            "id": "resp_abc",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "Hello"}],
+                "role": "assistant"
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
+        }"#;
+        let resp: ResponsesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.id.as_deref(), Some("resp_abc"));
+        assert_eq!(resp.output.len(), 1);
+        let usage = resp.usage.unwrap();
+        assert_eq!(usage.total_tokens, 8);
+    }
+
+    #[test]
+    fn responses_response_deserializes_function_call_item() {
+        let json = r#"{
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"London\"}"
+            }]
+        }"#;
+        let resp: ResponsesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.output.len(), 1);
+    }
+
+    #[test]
+    fn responses_response_deserializes_reasoning_item() {
+        let json = r#"{
+            "output": [{
+                "type": "reasoning",
+                "summary": [{"text": "thinking step 1"}]
+            }]
+        }"#;
+        let resp: ResponsesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.output.len(), 1);
+    }
+
+    #[test]
+    fn messages_to_responses_input_extracts_instructions() {
+        let messages = vec![
+            ChatRequestMessage::simple("system", "You are helpful".into()),
+            ChatRequestMessage::simple("user", "Hello".into()),
+        ];
+        let (instructions, items) = messages_to_responses_input(&messages);
+        assert_eq!(instructions, Some("You are helpful".into()));
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            ResponsesInputItem::Message { role, content } => {
+                assert_eq!(role, "user");
+                assert_eq!(content, "Hello");
+            }
+            _ => panic!("expected Message item"),
+        }
+    }
+
+    #[test]
+    fn messages_to_responses_input_converts_tool_results() {
+        let messages = vec![ChatRequestMessage {
+            role: "tool",
+            content: Some("file content".into()),
+            tool_call_id: Some("call_1".into()),
+            tool_calls: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_text: None,
+        }];
+        let (instructions, items) = messages_to_responses_input(&messages);
+        assert!(instructions.is_none());
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            ResponsesInputItem::FunctionCallOutput { call_id, output } => {
+                assert_eq!(call_id, "call_1");
+                assert_eq!(output, "file content");
+            }
+            _ => panic!("expected FunctionCallOutput item"),
+        }
+    }
+
+    #[test]
+    fn responses_tool_converts_from_chat_tool_definition() {
+        let chat_tool = ChatToolDefinition::function(
+            "get_weather",
+            "Get the weather for a city",
+            serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+        );
+        let resp_tool = ResponsesTool::from(&chat_tool);
+        assert_eq!(resp_tool.kind, "function");
+        assert_eq!(resp_tool.name, "get_weather");
+        assert_eq!(resp_tool.description, "Get the weather for a city");
+        assert_eq!(resp_tool.parameters["properties"]["city"]["type"], "string");
+        assert!(!resp_tool.strict);
+    }
+
+    #[test]
+    fn chat_completion_turn_dispatches_to_responses_when_configured() {
+        let mut config = ServiceConfig::default();
+        config.default_request_format = RequestFormat::Responses;
+        assert_eq!(
+            config.request_format_for_model("gpt-4"),
+            RequestFormat::Responses
+        );
+        // Per-model override to ChatCompletions should take precedence.
+        config
+            .model_request_formats
+            .insert("gpt-4".to_string(), RequestFormat::ChatCompletions);
+        assert_eq!(
+            config.request_format_for_model("gpt-4"),
+            RequestFormat::ChatCompletions
+        );
+    }
+
+    // ── build_responses_input tests ──────────────────────────────────
+
+    #[test]
+    fn build_responses_input_first_turn_with_no_tool_results() {
+        let messages = vec![
+            ChatRequestMessage::simple("system", "be helpful".into()),
+            ChatRequestMessage::simple("user", "Hello".into()),
+        ];
+        let (instructions, input) = build_responses_input(&[], &messages);
+        assert_eq!(instructions, Some("be helpful".into()));
+        let input_value = input.expect("input should be Some");
+        assert_eq!(input_value[0]["role"], "user");
+        assert_eq!(input_value[0]["content"], "Hello");
+    }
+
+    #[test]
+    fn build_responses_input_first_turn_preserves_assistant_messages() {
+        let messages = vec![
+            ChatRequestMessage::simple("assistant", "Hi there".into()),
+            ChatRequestMessage::simple("user", "What is the weather?".into()),
+        ];
+        let (instructions, input) = build_responses_input(&[], &messages);
+        assert!(instructions.is_none());
+        let input_value = input.expect("input should be Some");
+        let arr = input_value.as_array().expect("expected array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["role"], "assistant");
+        assert_eq!(arr[0]["content"], "Hi there");
+        assert_eq!(arr[1]["role"], "user");
+        assert_eq!(arr[1]["content"], "What is the weather?");
+    }
+
+    #[test]
+    fn build_responses_input_tool_results_produces_function_call_output() {
+        let tool_results = vec![
+            ToolResultItem {
+                call_id: "call_1".into(),
+                output: "sunny".into(),
+            },
+            ToolResultItem {
+                call_id: "call_2".into(),
+                output: "error: timeout".into(),
+            },
+        ];
+        let (instructions, input) = build_responses_input(&tool_results, &[]);
+        assert!(instructions.is_none());
+        let input_value = input.expect("input should be Some");
+        assert_eq!(input_value.as_array().map(|a| a.len()), Some(2));
+        assert_eq!(input_value[0]["type"], "function_call_output");
+        assert_eq!(input_value[0]["call_id"], "call_1");
+        assert_eq!(input_value[0]["output"], "sunny");
+        assert_eq!(input_value[1]["call_id"], "call_2");
+        assert_eq!(input_value[1]["output"], "error: timeout");
+    }
+
+    #[test]
+    fn build_responses_input_tool_results_ignores_messages() {
+        let tool_results = vec![ToolResultItem {
+            call_id: "call_1".into(),
+            output: "42".into(),
+        }];
+        // Even with messages present, tool_results branch is taken
+        let messages = vec![ChatRequestMessage::simple("user", "Hello".into())];
+        let (instructions, input) = build_responses_input(&tool_results, &messages);
+        assert!(instructions.is_none());
+        let input_value = input.expect("input should be Some");
+        assert_eq!(input_value.as_array().map(|a| a.len()), Some(1));
+        assert_eq!(input_value[0]["type"], "function_call_output");
+    }
+
+    // ── extract_reasoning_text tests ──────────────────────────────────
+
+    #[test]
+    fn extract_reasoning_text_plain_strings() {
+        let summary = vec![
+            serde_json::Value::String("first".into()),
+            serde_json::Value::String("second".into()),
+        ];
+        assert_eq!(
+            extract_reasoning_text(&summary).as_deref(),
+            Some("first second")
+        );
+    }
+
+    #[test]
+    fn extract_reasoning_text_objects_with_text_field() {
+        let summary = vec![
+            serde_json::json!({"text": "thinking step 1"}),
+            serde_json::json!({"text": "step 2"}),
+        ];
+        assert_eq!(
+            extract_reasoning_text(&summary).as_deref(),
+            Some("thinking step 1 step 2")
+        );
+    }
+
+    #[test]
+    fn extract_reasoning_text_mixed_strings_and_objects() {
+        let summary = vec![
+            serde_json::Value::String("start".into()),
+            serde_json::json!({"text": "middle"}),
+            serde_json::Value::String("end".into()),
+        ];
+        assert_eq!(
+            extract_reasoning_text(&summary).as_deref(),
+            Some("start middle end")
+        );
+    }
+
+    #[test]
+    fn extract_reasoning_text_empty_array_returns_none() {
+        assert!(extract_reasoning_text(&[]).is_none());
+    }
+
+    #[test]
+    fn extract_reasoning_text_no_textual_content_returns_none() {
+        let summary = vec![
+            serde_json::json!({"other": "field"}),
+            serde_json::Value::Null,
+            serde_json::json!({"score": 42}),
+        ];
+        assert!(extract_reasoning_text(&summary).is_none());
+    }
+
+    #[test]
+    fn extract_reasoning_text_skips_non_text_entries_joins_rest() {
+        let summary = vec![
+            serde_json::json!({"text": "valid"}),
+            serde_json::json!({"score": 42}),
+            serde_json::Value::String("also valid".into()),
+        ];
+        assert_eq!(
+            extract_reasoning_text(&summary).as_deref(),
+            Some("valid also valid")
+        );
     }
 }

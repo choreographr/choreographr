@@ -43,6 +43,13 @@ pub struct AccountConfig {
     pub model_max_tokens: Option<HashMap<String, u32>>,
     #[serde(default)]
     pub chat_completions_max_tokens_field: Option<MaxTokensField>,
+    // Responses API overrides (OpenAI Responses API)
+    #[serde(default)]
+    pub responses_max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub model_responses_max_output_tokens: Option<HashMap<String, u32>>,
+    #[serde(default)]
+    pub responses_store: Option<bool>,
     #[serde(default)]
     pub model_max_tokens_fields: Option<HashMap<String, MaxTokensField>>,
     // Retry timing (all providers)
@@ -74,6 +81,9 @@ impl AccountConfig {
             model_max_tokens: None,
             chat_completions_max_tokens_field: None,
             model_max_tokens_fields: None,
+            responses_max_output_tokens: None,
+            model_responses_max_output_tokens: None,
+            responses_store: None,
             retry_initial_backoff_ms: None,
             retry_max_backoff_ms: None,
         }
@@ -125,6 +135,15 @@ impl AccountConfig {
         }
         if let Some(ref map) = self.model_max_tokens_fields {
             config.model_max_tokens_fields = map.clone();
+        }
+        if let Some(n) = self.responses_max_output_tokens {
+            config.responses_max_output_tokens = Some(n);
+        }
+        if let Some(ref map) = self.model_responses_max_output_tokens {
+            config.model_responses_max_output_tokens = map.clone();
+        }
+        if let Some(v) = self.responses_store {
+            config.responses_store = v;
         }
         if let Some(ms) = self.retry_initial_backoff_ms {
             config.retry_initial_backoff_ms = ms;
@@ -469,6 +488,9 @@ model = "claude-4"
             default_request_format: Some(crate::openai::RequestFormat::Responses),
             chat_completions_max_tokens: Some(2048),
             chat_completions_max_tokens_field: Some(crate::openai::MaxTokensField::MaxTokens),
+            responses_max_output_tokens: Some(4096),
+            model_responses_max_output_tokens: Some(HashMap::from([("gpt-4".to_string(), 8192)])),
+            responses_store: Some(false),
             retry_initial_backoff_ms: Some(500),
             retry_max_backoff_ms: Some(60000),
             ..AccountConfig::simple("ovr", "openai")
@@ -493,5 +515,11 @@ model = "claude-4"
         );
         assert_eq!(svc_config.retry_initial_backoff_ms, 500);
         assert_eq!(svc_config.retry_max_backoff_ms, 60000);
+        assert_eq!(svc_config.responses_max_output_tokens, Some(4096));
+        assert_eq!(
+            svc_config.model_responses_max_output_tokens.get("gpt-4"),
+            Some(&8192)
+        );
+        assert!(!svc_config.responses_store);
     }
 }

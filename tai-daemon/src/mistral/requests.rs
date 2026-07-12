@@ -302,6 +302,7 @@ where
                                             tool_calls: calls,
                                             reasoning: None,
                                             usage: None,
+                                            response_id: None,
                                         },
                                     ));
                                 }
@@ -351,6 +352,7 @@ where
                     tool_calls: calls,
                     reasoning: None,
                     usage: None,
+                    response_id: None,
                 },
             ));
         }
@@ -364,6 +366,7 @@ where
         content: text_accumulated,
         reasoning: None,
         usage: None,
+        response_id: None,
     }))
 }
 

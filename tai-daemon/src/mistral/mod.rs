@@ -530,6 +530,7 @@ fn response_to_turn_result(
             tool_calls,
             reasoning: None,
             usage,
+            response_id: None,
         }));
     }
 
@@ -541,6 +542,7 @@ fn response_to_turn_result(
         content,
         reasoning: None,
         usage,
+        response_id: None,
     }))
 }
 

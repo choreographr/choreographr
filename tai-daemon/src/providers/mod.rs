@@ -14,7 +14,7 @@ pub use catalog::{
     PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, ReasoningSupport, all_display_names,
     all_slugs, effective_reasoning_support, lookup_provider,
 };
-pub use traits::{ChatTurnRequest, ProviderClient};
+pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
 
 #[derive(Clone, Debug)]
 pub struct InferenceProvider {

@@ -100,6 +100,8 @@ fn retry_succeeds_with_callback() {
         thinking_effort: ThinkingEffort::Off,
         on_retry: &mut cb,
         cancel_rx: Some(&cancel_rx),
+        previous_response_id: None,
+        tool_results: &[],
     });
 
     match result {
@@ -162,6 +164,8 @@ fn retry_cancelled_during_backoff() {
         thinking_effort: ThinkingEffort::Off,
         on_retry: &mut cb,
         cancel_rx: Some(&cancel_rx),
+        previous_response_id: None,
+        tool_results: &[],
     });
 
     assert!(

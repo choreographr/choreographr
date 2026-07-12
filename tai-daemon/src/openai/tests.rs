@@ -211,3 +211,90 @@ fn daemon_config_errors_on_invalid_toml() {
     let result: Result<crate::openai::DaemonConfig, _> = toml::from_str("[[[");
     assert!(result.is_err());
 }
+
+// ── Responses API SSE stream event parsing tests ────────────────────
+
+#[test]
+fn parse_responses_stream_event_text_delta() {
+    let event =
+        parse_responses_stream_event(r#"{"type":"response.output_text.delta","delta":"Hello"}"#)
+            .expect("parse")
+            .expect("event");
+    match event {
+        ResponsesStreamEvent::TextDelta(text) => assert_eq!(text, "Hello"),
+        _ => panic!("expected TextDelta"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_text_done() {
+    let event = parse_responses_stream_event(r#"{"type":"response.output_text.done"}"#)
+        .expect("parse")
+        .expect("event");
+    match event {
+        ResponsesStreamEvent::TextDone => {}
+        _ => panic!("expected TextDone"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_function_call_args() {
+    // Delta — use r##"..."## so the \" inside doesn't collide with the delimiter.
+    let event = parse_responses_stream_event(
+        r##"{"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"{\"city\":"}"##,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta } => {
+            assert_eq!(call_id, "call_1");
+            assert_eq!(delta, r#"{"city":"#);
+        }
+        _ => panic!("expected FunctionCallArgumentsDelta"),
+    }
+
+    // Done
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.function_call_arguments.done","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"London\"}"}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::FunctionCallArgumentsDone {
+            call_id,
+            name,
+            arguments,
+        } => {
+            assert_eq!(call_id, "call_1");
+            assert_eq!(name, "get_weather");
+            assert_eq!(arguments, r#"{"city":"London"}"#);
+        }
+        _ => panic!("expected FunctionCallArgumentsDone"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_completed_with_usage() {
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.completed","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ResponseCompleted { usage, .. } => {
+            let u = usage.expect("usage should be present");
+            assert_eq!(u.prompt_tokens, 10);
+            assert_eq!(u.completion_tokens, 5);
+            assert_eq!(u.total_tokens, 15);
+        }
+        _ => panic!("expected ResponseCompleted"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_unknown_type_returns_none() {
+    let result =
+        parse_responses_stream_event(r#"{"type":"response.unknown_event","data":"ignored"}"#)
+            .expect("parse");
+    assert!(result.is_none());
+}

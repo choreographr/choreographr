@@ -5,8 +5,8 @@ use crate::openai::{
     ChatToolCall, ChatTurnResult, CompletionChunkKind,
 };
 use crate::providers::{
-    ChatTurnRequest, InferenceProvider, ReasoningSupport, effective_reasoning_support,
-    lookup_provider,
+    ChatTurnRequest, InferenceProvider, ReasoningSupport, ToolResultItem,
+    effective_reasoning_support, lookup_provider,
 };
 use crate::sessions::{RequestContext, SessionCommand, SessionMetadata, SessionState};
 use crate::tools::context::ToolContext;
@@ -354,6 +354,9 @@ pub(crate) fn run_agent_loop(
     let mut next_image_id = 1u32;
     let max_turns = session.config.max_turns.unwrap_or(ctx.max_turns_default);
 
+    let mut prev_resp_id: Option<String> = None;
+    let mut tool_results: Vec<ToolResultItem> = Vec::new();
+
     for turn in 0..max_turns {
         let mut thinking_effort = session
             .config
@@ -431,6 +434,8 @@ pub(crate) fn run_agent_loop(
                 thinking_effort,
                 on_retry: &mut retry_cb,
                 cancel_rx: Some(cancel_rx),
+                previous_response_id: prev_resp_id.as_deref(),
+                tool_results: &tool_results,
             },
             &mut |kind, text| {
                 let stream = match kind {
@@ -466,12 +471,17 @@ pub(crate) fn run_agent_loop(
                 if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, idx, &msg) {
                     tracing::warn!(session_id = ctx.session_id, error = %e, "failed to persist assistant text");
                 }
+                // FinalText ends the agent loop — no next turn to chain to.
+                tool_results.clear();
                 return Ok(false);
             }
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 let token_usage = tool_use.usage.clone();
                 accumulate_token_usage(session, &token_usage, turn, ctx);
                 persist_assistant_tool_use_sync(session, &tool_use, token_usage, ctx);
+                // Store response_id for chaining tool results back to this turn
+                prev_resp_id = tool_use.response_id;
+                tool_results.clear();
 
                 // Partition tool calls into two groups:
                 //   mutators  — tools that need &mut SessionState or deep
@@ -549,6 +559,10 @@ pub(crate) fn run_agent_loop(
                     }
 
                     finish_tool_call(request_id, session, &tool_call, &mut output, ctx);
+                    tool_results.push(ToolResultItem {
+                        call_id: tool_call.id.clone(),
+                        output: output.result.content.clone(),
+                    });
                 }
 
                 // ── Phase 2: All remaining tools (concurrent) ───────
@@ -695,6 +709,10 @@ pub(crate) fn run_agent_loop(
                         }
 
                         finish_tool_call(request_id, session, &tool_call, &mut output, ctx);
+                        tool_results.push(ToolResultItem {
+                            call_id: tool_call.id.clone(),
+                            output: output.result.content.clone(),
+                        });
                     }
                 }
             }

@@ -183,6 +183,11 @@ Each provider from the catalog is pre-configured with sensible defaults (base_ur
 | `model_max_tokens` | Per-model max token caps |
 | `chat_completions_max_tokens_field` | Token field: `"max_tokens"` or `"max_completion_tokens"` |
 | `model_max_tokens_fields` | Per-model token field overrides |
+| `responses_max_output_tokens` | Default max output tokens for Responses API |
+| `responses_store` | Persist Responses API conversations (default: `true`) |
+| `model_responses_max_output_tokens` | Per-model max output tokens for Responses API |
+
+The Responses API is now fully supported — including tool use, streaming, reasoning effort, and multi-turn chaining via `previous_response_id`. When `default_request_format` is set to `"responses"`, the daemon uses the Responses endpoint for all requests (both simple completions and tool-assisted turns), with system messages mapped to the `instructions` field and tool results to `function_call_output` input items.
 
 ## Monitoring
 

@@ -271,6 +271,7 @@ where
                     Some(full_reasoning)
                 },
                 usage: None,
+                response_id: None,
             },
         ));
     }
@@ -287,6 +288,7 @@ where
             Some(full_reasoning)
         },
         usage: None,
+        response_id: None,
     }))
 }
 

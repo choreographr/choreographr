@@ -106,17 +106,138 @@ pub(crate) fn build_sse_event(event_lines: &mut Vec<String>) -> Option<String> {
     if data.is_empty() { None } else { Some(data) }
 }
 
-pub(crate) fn extract_responses_text_delta(data: &str) -> io::Result<Option<String>> {
+/// All typed events that can appear in a Responses API SSE stream.
+///
+/// Every variant is consumed in `responses_request_streaming_with_tools`
+/// to forward text/reasoning deltas to subscribers and to accumulate tool
+/// call arguments across chunks.
+#[derive(Debug, Clone)]
+pub(crate) enum ResponsesStreamEvent {
+    /// Text content delta
+    TextDelta(String),
+    /// Text output is complete
+    TextDone,
+    /// Reasoning summary
+    ReasoningSummary(Vec<serde_json::Value>),
+    /// Function call arguments delta
+    FunctionCallArgumentsDelta { call_id: String, delta: String },
+    /// Function call arguments are complete
+    FunctionCallArgumentsDone {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
+    /// Response is complete with optional id and usage
+    ResponseCompleted {
+        id: Option<String>,
+        usage: Option<super::Usage>,
+    },
+    /// Response failed with an error message
+    ResponseFailed(String),
+    /// Response incomplete
+    ResponseIncomplete,
+}
+
+/// Parse a single Responses API SSE event data string into a typed event.
+///
+/// Returns `Ok(None)` for unknown event types that should be silently ignored.
+pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<ResponsesStreamEvent>> {
     let payload: serde_json::Value = serde_json::from_str(data).map_err(io::Error::other)?;
     let Some(event_type) = payload.get("type").and_then(|value| value.as_str()) else {
         return Ok(None);
     };
 
-    let delta = match event_type {
-        "response.output_text.delta" => payload.get("delta").and_then(|value| value.as_str()),
-        "response.output_text.done" => None,
-        _ => None,
-    };
+    match event_type {
+        "response.output_text.delta" => {
+            let delta = payload
+                .get("delta")
+                .and_then(|value| value.as_str())
+                .map(|s| ResponsesStreamEvent::TextDelta(s.to_string()));
+            Ok(delta)
+        }
+        "response.output_text.done" => Ok(Some(ResponsesStreamEvent::TextDone)),
+        "response.reasoning.summary" => {
+            let summary = payload
+                .get("summary")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            Ok(Some(ResponsesStreamEvent::ReasoningSummary(summary)))
+        }
+        "response.function_call_arguments.delta" => {
+            let call_id = payload
+                .get("call_id")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let delta = payload
+                .get("delta")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            Ok(Some(ResponsesStreamEvent::FunctionCallArgumentsDelta {
+                call_id,
+                delta,
+            }))
+        }
+        "response.function_call_arguments.done" => {
+            let call_id = payload
+                .get("call_id")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let name = payload
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let arguments = payload
+                .get("arguments")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            Ok(Some(ResponsesStreamEvent::FunctionCallArgumentsDone {
+                call_id,
+                name,
+                arguments,
+            }))
+        }
+        "response.completed" => {
+            let id = payload.get("id").and_then(|v| v.as_str()).map(String::from);
+            // If usage is present but unparseable, return None rather than
+            // silently zeroing it — the caller can distinguish "no usage data"
+            // from invalid data.
+            let usage = payload
+                .get("usage")
+                .and_then(|u| serde_json::from_value::<super::Usage>(u.clone()).ok());
+            Ok(Some(ResponsesStreamEvent::ResponseCompleted { id, usage }))
+        }
+        "response.failed" => {
+            let error = payload
+                .get("error")
+                .and_then(|value| value.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            Ok(Some(ResponsesStreamEvent::ResponseFailed(error)))
+        }
+        "response.incomplete" => Ok(Some(ResponsesStreamEvent::ResponseIncomplete)),
+        _ => {
+            // Unknown event types are silently ignored
+            Ok(None)
+        }
+    }
+}
 
-    Ok(delta.map(str::to_string))
+/// Extract text delta from a Responses API SSE event.
+///
+/// This is a convenience wrapper around [`parse_responses_stream_event`]
+/// that only returns text deltas, retained for backward compatibility
+/// in tests.
+#[cfg(test)]
+pub(crate) fn extract_responses_text_delta(data: &str) -> io::Result<Option<String>> {
+    let event = parse_responses_stream_event(data)?;
+    match event {
+        Some(ResponsesStreamEvent::TextDelta(text)) => Ok(Some(text)),
+        _ => Ok(None),
+    }
 }

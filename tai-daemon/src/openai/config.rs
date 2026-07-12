@@ -53,6 +53,9 @@ pub struct ServiceConfig {
     pub model_request_formats: HashMap<String, RequestFormat>,
     pub chat_completions_max_tokens: Option<u32>,
     pub model_max_tokens: HashMap<String, u32>,
+    pub responses_max_output_tokens: Option<u32>,
+    pub model_responses_max_output_tokens: HashMap<String, u32>,
+    pub responses_store: bool,
     pub chat_completions_max_tokens_field: MaxTokensField,
     pub model_max_tokens_fields: HashMap<String, MaxTokensField>,
     pub streaming: bool,
@@ -77,6 +80,9 @@ impl Default for ServiceConfig {
             model_request_formats: HashMap::new(),
             chat_completions_max_tokens: None,
             model_max_tokens: HashMap::new(),
+            responses_max_output_tokens: None,
+            model_responses_max_output_tokens: HashMap::new(),
+            responses_store: true,
             chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
             model_max_tokens_fields: HashMap::new(),
             streaming: true,
@@ -178,6 +184,13 @@ impl ServiceConfig {
             .get(model)
             .copied()
             .unwrap_or(self.default_request_format)
+    }
+
+    pub fn max_output_tokens_for_model(&self, model: &str) -> Option<u32> {
+        self.model_responses_max_output_tokens
+            .get(model)
+            .copied()
+            .or(self.responses_max_output_tokens)
     }
 
     pub fn max_tokens_for_model(&self, model: &str) -> Option<u32> {
