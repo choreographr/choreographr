@@ -26,7 +26,7 @@ pub struct RandomArgs {
 
 pub(crate) fn execute_random_tool(
     args: &RandomArgs,
-    _cwd: Option<&Path>,
+    _working_dir: Option<&Path>,
 ) -> Result<String, ToolError> {
     match args.seed {
         Some(s) => generate(&mut StdRng::seed_from_u64(s), args),

@@ -509,7 +509,7 @@ fn handle_session_list_key(
                 .send(ClientMessage::CreateSession {
                     title: None,
                     parent_session_id: None,
-                    cwd: None,
+                    working_dir: None,
                     max_turns: None,
                     context_config: None,
                     account_name: None,

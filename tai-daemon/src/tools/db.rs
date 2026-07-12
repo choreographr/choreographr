@@ -101,7 +101,7 @@ impl Tool for DbSet {
         &self,
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
+        _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, ToolError> {
         let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
@@ -157,7 +157,7 @@ impl Tool for DbGet {
         &self,
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
+        _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, ToolError> {
         let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
@@ -216,7 +216,7 @@ impl Tool for DbDelete {
         &self,
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
+        _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, ToolError> {
         let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
@@ -282,7 +282,7 @@ impl Tool for DbDeleteRange {
         &self,
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
+        _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, ToolError> {
         let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
@@ -357,7 +357,7 @@ impl Tool for DbGetRange {
         &self,
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
+        _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, ToolError> {
         let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
@@ -439,7 +439,7 @@ impl Tool for DbList {
         &self,
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
+        _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, ToolError> {
         let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
@@ -510,7 +510,7 @@ impl Tool for DbCount {
         &self,
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&std::path::Path>,
+        _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, ToolError> {
         let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;

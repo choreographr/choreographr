@@ -100,7 +100,7 @@ fn path_confinement_allows_subdirectory() {
 
 #[test]
 #[ignore]
-fn no_cwd_skips_confinement() {
+fn no_working_dir_skips_confinement() {
     let result = execute_fish_tool(
         &FishArgs {
             command: "echo ok".into(),

@@ -47,7 +47,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
         ClientMessage::CreateSession {
             title,
             parent_session_id,
-            cwd,
+            working_dir,
             max_turns,
             context_config,
             account_name,
@@ -55,7 +55,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             if !handle_client_create_session(
                 title,
                 parent_session_id,
-                cwd,
+                working_dir,
                 max_turns,
                 context_config,
                 account_name,
@@ -438,19 +438,19 @@ fn switch_attached_session(
 fn handle_client_create_session(
     title: Option<String>,
     parent_session_id: Option<u64>,
-    cwd: Option<String>,
+    working_dir: Option<String>,
     max_turns: Option<u32>,
     context_config: Option<ContextConfig>,
     account_name: Option<String>,
     ctx: &mut ClientCtx,
 ) -> bool {
     info!("client {}: CreateSession", ctx.client_id);
-    let cwd_str = cwd.clone();
+    let cwd_str = working_dir.clone();
     let (reply, rx) = mpsc::channel();
     let _ = ctx.daemon_tx.send(DaemonCommand::CreateSession {
         title: title.clone(),
         parent_session_id,
-        cwd: cwd.map(std::path::PathBuf::from),
+        working_dir: working_dir.map(std::path::PathBuf::from),
         max_turns,
         reasoning_effort: None,
         context_config,
@@ -475,7 +475,7 @@ fn handle_client_create_session(
                 session_id: sid,
                 title,
                 parent_session_id,
-                cwd: cwd_str,
+                working_dir: cwd_str,
                 max_turns,
             });
         }

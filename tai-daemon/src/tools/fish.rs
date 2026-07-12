@@ -30,7 +30,7 @@ define_tool!(
             },
             "workdir": {
                 "type": "string",
-                "description": "Working directory for the command (relative to session CWD, or absolute)"
+                "description": "Working directory for the command (relative to the session working directory, or absolute)"
             },
             "timeout": {
                 "type": "integer",
@@ -44,11 +44,11 @@ define_tool!(
     "shell"
 );
 
-pub fn execute_fish_tool(args: &FishArgs, cwd: Option<&Path>) -> Result<String, ToolError> {
+pub fn execute_fish_tool(args: &FishArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
     let command = &args.command;
     let timeout_ms = args.timeout.unwrap_or(30000);
 
-    let resolved = resolve_and_confine(args.workdir.as_deref(), cwd)?;
+    let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
 
     let mut cmd = std::process::Command::new("fish");
     cmd.args(["-c", command])

@@ -684,7 +684,7 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                     .parent_session_id
                     .map_or("none".to_string(), |id| id.to_string())
             )),
-            Line::from(format!("CWD:           {}", detail.cwd)),
+            Line::from(format!("Working Dir:   {}", detail.working_dir)),
             Line::from(format!(
                 "Created:       {}",
                 format_timestamp(detail.created_at)

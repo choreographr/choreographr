@@ -28,10 +28,10 @@ pub struct FindArgs {
 /// crate's `Walk` traversal.
 pub struct Find;
 
-pub fn execute_find_tool(args: &FindArgs, cwd: Option<&Path>) -> Result<String, ToolError> {
+pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
     // Resolve the search root — use the provided path or default to "."
     let path = args.path.as_deref().unwrap_or(".");
-    let resolved = super::resolve_path(path, cwd);
+    let resolved = super::confine_path(path, working_dir)?;
 
     // Build an optional glob matcher when the caller wants glob matching.
     // For substring mode we don't need a matcher — we do simple contains().
@@ -152,7 +152,7 @@ impl super::Tool for Find {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in (default: current working directory)"
+                    "description": "Directory to search in (default: session working directory)"
                 },
                 "max_results": {
                     "type": "integer",
@@ -171,10 +171,10 @@ impl super::Tool for Find {
         &self,
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&Path>,
+        working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
-        execute_find_tool(&args, cwd)
+        execute_find_tool(&args, working_dir)
     }
 }
 

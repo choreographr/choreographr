@@ -14,13 +14,13 @@ pub struct GitCommitArgs {
 
 pub fn execute_git_commit_tool(
     args: &GitCommitArgs,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     let output = git_commit_impl(
         args.repo_path.as_deref(),
         &args.message,
         args.allow_empty.unwrap_or(false),
-        cwd,
+        working_dir,
     )?;
     Ok(truncate_tool_output(&output))
 }
@@ -29,9 +29,9 @@ fn git_commit_impl(
     repo_path: Option<&str>,
     message: &str,
     allow_empty: bool,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path, cwd)?;
+    let repo = open_repo(repo_path, working_dir)?;
     let message = message.trim();
     if message.is_empty() {
         return Err(ToolError::Other(
@@ -51,7 +51,7 @@ fn git_commit_impl(
     repo.commit("HEAD", message, tree_id, parents)
         .map_err(io::Error::other)?;
 
-    super::log::git_log_impl(repo_path, 1, cwd)
+    super::log::git_log_impl(repo_path, 1, working_dir)
 }
 
 fn ensure_index_has_no_conflicts(index: &gix::index::File) -> Result<(), ToolError> {

@@ -1,4 +1,4 @@
-use super::{ToolError, resolve_path, sha256_hex, truncate_tool_output};
+use super::{ToolError, confine_path, sha256_hex, truncate_tool_output};
 use serde::Deserialize;
 use std::{fs::OpenOptions, io::Write};
 use std::{
@@ -54,14 +54,14 @@ pub struct ListFilesArgs {
 
 pub(crate) fn execute_line_count_tool(
     args: &LineCountArgs,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
 ) -> Result<String, ToolError> {
     if args.path.trim().is_empty() {
         return Err(ToolError::Other(
             "missing required string argument: path".to_string(),
         ));
     }
-    let resolved = resolve_path(&args.path, cwd);
+    let resolved = confine_path(&args.path, working_dir)?;
     let content = std::fs::read_to_string(&resolved)?;
     let line_count = content.lines().count();
     Ok(format!("{}: {} lines", resolved.display(), line_count))
@@ -69,21 +69,21 @@ pub(crate) fn execute_line_count_tool(
 
 pub(crate) fn execute_read_file_tool(
     args: &ReadFileArgs,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
 ) -> Result<String, ToolError> {
     if args.path.trim().is_empty() {
         return Err(ToolError::Other(
             "missing required string argument: path".to_string(),
         ));
     }
-    let resolved = resolve_path(&args.path, cwd);
+    let resolved = confine_path(&args.path, working_dir)?;
     let content = std::fs::read_to_string(&resolved)?;
     Ok(truncate_tool_output(&content))
 }
 
 pub(crate) fn execute_read_file_range_tool(
     args: &ReadFileRangeArgs,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
 ) -> Result<String, ToolError> {
     const MAX_READ_FILE_RANGE_LINES: usize = 200;
 
@@ -107,7 +107,7 @@ pub(crate) fn execute_read_file_range_tool(
         )));
     }
 
-    let resolved = resolve_path(&args.path, cwd);
+    let resolved = confine_path(&args.path, working_dir)?;
     let content = std::fs::read_to_string(&resolved)?;
 
     let lines: Vec<&str> = content.lines().collect();
@@ -142,10 +142,10 @@ pub(crate) fn execute_read_file_range_tool(
 
 pub(crate) fn execute_list_files_tool(
     args: &ListFilesArgs,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
 ) -> Result<String, ToolError> {
     let path = args.path.as_deref().unwrap_or(".");
-    let resolved = resolve_path(path, cwd);
+    let resolved = confine_path(path, working_dir)?;
     let entries = std::fs::read_dir(&resolved)?;
     let mut names = Vec::new();
     for entry in entries {
@@ -162,10 +162,10 @@ pub(crate) fn execute_list_files_tool(
 
 pub(crate) fn execute_write_file_tool(
     args: &WriteFileArgs,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
 ) -> Result<String, ToolError> {
     let path = validate_nonempty_path(&args.path)?;
-    let resolved = resolve_path(&path, cwd);
+    let resolved = confine_path(&path, working_dir)?;
     ensure_parent_directories(&resolved, args.create_parents.unwrap_or(true))?;
 
     match write_text_file(&resolved, &args.content, args.overwrite.unwrap_or(true)) {
@@ -186,7 +186,7 @@ pub(crate) fn execute_write_file_tool(
 
 pub(crate) fn execute_edit_file_tool(
     args: &EditFileArgs,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
 ) -> Result<String, ToolError> {
     let path = validate_nonempty_path(&args.path)?;
 
@@ -196,7 +196,7 @@ pub(crate) fn execute_edit_file_tool(
         ));
     }
 
-    let resolved = resolve_path(&path, cwd);
+    let resolved = confine_path(&path, working_dir)?;
     let original_content = std::fs::read_to_string(&resolved)?;
 
     if let Some(expected_sha256) = args.expected_sha256.as_deref() {

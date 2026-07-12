@@ -166,12 +166,12 @@ fn accumulate_token_usage(
 
 fn refresh_session_context(
     session: &mut SessionState,
-    cwd: &Path,
+    working_dir: &Path,
     context_config: &tai_proto::ContextConfig,
 ) {
     if let Some(old_fp) = session.config.context_fingerprint
         && let Some(idx) = session.config.context_message_index
-        && let Ok(Some(new_bundle)) = context::recheck_context(cwd, context_config, old_fp)
+        && let Ok(Some(new_bundle)) = context::recheck_context(working_dir, context_config, old_fp)
     {
         let new_content = context::assemble_context(&new_bundle);
         if !new_content.is_empty() {
@@ -222,7 +222,7 @@ struct SpawnToolArgs {
     registry: Arc<ToolRegistry>,
     cmd_tx: mpsc::Sender<SessionCommand>,
     x_credentials: Option<ServiceCredential>,
-    cwd: Option<PathBuf>,
+    working_dir: Option<PathBuf>,
     ctx: ToolContext,
 }
 
@@ -240,7 +240,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
         registry,
         cmd_tx,
         x_credentials,
-        cwd,
+        working_dir,
         ctx,
     } = args;
     // Channel for the execution thread to deliver its final result.
@@ -266,7 +266,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
     let tc = tool_call.clone();
     let tr = registry;
     let xc = x_credentials;
-    let c = cwd;
+    let c = working_dir;
     let tool_ctx = ctx;
     thread::spawn(move || {
         let result = tr.execute_streaming(
@@ -347,7 +347,7 @@ pub(crate) fn run_agent_loop(
     session: &mut SessionState,
     model: &str,
     request_id: u32,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
     cancel_rx: &mpsc::Receiver<()>,
     ctx: &RequestContext,
 ) -> io::Result<bool> {
@@ -394,9 +394,9 @@ pub(crate) fn run_agent_loop(
             return Ok(true);
         }
 
-        if let Some(session_cwd) = session.config.cwd.clone() {
+        if let Some(session_working_dir) = session.config.working_dir.clone() {
             let context_config = session.config.context_config.clone();
-            refresh_session_context(session, &session_cwd, &context_config);
+            refresh_session_context(session, &session_working_dir, &context_config);
         }
 
         if ctx
@@ -527,7 +527,7 @@ pub(crate) fn run_agent_loop(
                     let mut output = execute_tool_with_timeout(
                         &tool_call,
                         None,
-                        cwd,
+                        working_dir,
                         tool_timeout,
                         request_id,
                         session,
@@ -592,7 +592,7 @@ pub(crate) fn run_agent_loop(
                         daemon_tx: ctx.daemon_tx.clone(),
                         active_tool_groups: session.config.active_tool_groups.clone(),
                         reasoning_effort: session.config.reasoning_effort,
-                        cwd: cwd.map(|p| p.to_path_buf()),
+                        working_dir: working_dir.map(|p| p.to_path_buf()),
                         cancelled: Arc::clone(&cancel_flag),
                     };
 
@@ -619,7 +619,7 @@ pub(crate) fn run_agent_loop(
                                 registry: Arc::clone(&reg),
                                 cmd_tx: cmd_tx.clone(),
                                 x_credentials: None,
-                                cwd: cwd.map(|p| p.to_path_buf()),
+                                working_dir: working_dir.map(|p| p.to_path_buf()),
                                 ctx: tool_ctx.clone(),
                             });
                             (call_info, handle)
@@ -723,7 +723,7 @@ fn finish_tool_call(
     if let Some(hint) = context::subdirectory_hints(
         &tool_call.name,
         &tool_call.arguments_json,
-        session.config.cwd.as_deref(),
+        session.config.working_dir.as_deref(),
         &session.config.context_file_paths,
     ) {
         output.result.content = format!("{}\n\n---\n{}", output.result.content, hint);
@@ -765,7 +765,7 @@ fn finish_tool_call(
 fn execute_tool_with_timeout(
     tool_call: &crate::openai::ChatToolCall,
     x_credentials: Option<&ServiceCredential>,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
     timeout_dur: Duration,
     request_id: u32,
     session: &mut SessionState,
@@ -847,14 +847,14 @@ fn execute_tool_with_timeout(
     let tc = tool_call.clone();
     let tr = Arc::clone(&ctx.tool_registry);
     let xc = x_credentials.cloned();
-    let c = cwd.map(|p| p.to_path_buf());
+    let c = working_dir.map(|p| p.to_path_buf());
     let tool_ctx = crate::tools::context::ToolContext {
         session_id: ctx.session_id,
         db: Arc::clone(&ctx.db),
         daemon_tx: ctx.daemon_tx.clone(),
         active_tool_groups: session.config.active_tool_groups.clone(),
         reasoning_effort: session.config.reasoning_effort,
-        cwd: cwd.map(|p| p.to_path_buf()),
+        working_dir: working_dir.map(|p| p.to_path_buf()),
         cancelled: Arc::new(AtomicBool::new(false)),
     };
     std::thread::spawn(move || {
@@ -1197,7 +1197,7 @@ mod tests {
             &self,
             _args: Self::Args,
             _xc: Option<&ServiceCredential>,
-            _cwd: Option<&Path>,
+            _working_dir: Option<&Path>,
             _ctx: Option<&ToolContext>,
         ) -> Result<String, ToolError> {
             Ok("fast result".into())
@@ -1230,7 +1230,7 @@ mod tests {
             &self,
             _args: Self::Args,
             _xc: Option<&ServiceCredential>,
-            _cwd: Option<&Path>,
+            _working_dir: Option<&Path>,
             _ctx: Option<&ToolContext>,
         ) -> Result<String, ToolError> {
             Ok("ignored".into())
@@ -1239,7 +1239,7 @@ mod tests {
             &self,
             _args: Self::Args,
             _xc: Option<&ServiceCredential>,
-            _cwd: Option<&Path>,
+            _working_dir: Option<&Path>,
             _output_tx: mpsc::Sender<Vec<u8>>,
             _ctx: Option<&ToolContext>,
         ) -> Result<String, ToolError> {
@@ -1292,7 +1292,7 @@ mod tests {
         let result = execute_tool_with_timeout(
             &tool_call,
             None, // x_credentials
-            None, // cwd
+            None, // working_dir
             timeout_dur,
             1, // request_id
             &mut session,
@@ -1436,7 +1436,7 @@ mod tests {
             &self,
             _args: Self::Args,
             _xc: Option<&ServiceCredential>,
-            _cwd: Option<&Path>,
+            _working_dir: Option<&Path>,
             _ctx: Option<&ToolContext>,
         ) -> Result<String, ToolError> {
             Ok("exec result".into())
@@ -1445,7 +1445,7 @@ mod tests {
             &self,
             _args: Self::Args,
             _xc: Option<&ServiceCredential>,
-            _cwd: Option<&Path>,
+            _working_dir: Option<&Path>,
             output_tx: mpsc::Sender<Vec<u8>>,
             _ctx: Option<&ToolContext>,
         ) -> Result<String, ToolError> {
@@ -1555,7 +1555,7 @@ mod tests {
             daemon_tx: _daemon_tx,
             active_tool_groups: std::collections::HashSet::new(),
             reasoning_effort: None,
-            cwd: None,
+            working_dir: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
@@ -1566,7 +1566,7 @@ mod tests {
             registry,
             cmd_tx,
             x_credentials: None,
-            cwd: None,
+            working_dir: None,
             ctx: tool_ctx,
         });
 

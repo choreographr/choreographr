@@ -74,7 +74,7 @@ fn dispatch_session<H: DaemonMessageHandler>(
             title,
             selected_model,
             parent_session_id,
-            cwd,
+            working_dir,
             max_turns,
             active_tool_groups: _,
             token_usage: _,
@@ -88,8 +88,8 @@ fn dispatch_session<H: DaemonMessageHandler>(
             if let Some(parent) = parent_session_id {
                 handler.push_text(format!("[daemon]   parent: {parent}"));
             }
-            if let Some(cwd) = &cwd {
-                handler.push_text(format!("[daemon]   cwd: {cwd}"));
+            if let Some(working_dir) = &working_dir {
+                handler.push_text(format!("[daemon]   working_dir: {working_dir}"));
             }
             if let Some(mt) = max_turns {
                 handler.push_text(format!("[daemon]   max-turns: {mt}"));
@@ -646,7 +646,7 @@ mod tests {
             title: Some("test".into()),
             selected_model: None,
             parent_session_id: None,
-            cwd: None,
+            working_dir: None,
             max_turns: None,
             messages,
             active_tool_groups: vec![],
@@ -692,7 +692,7 @@ mod tests {
             title: None,
             selected_model: None,
             parent_session_id: None,
-            cwd: None,
+            working_dir: None,
             max_turns: None,
             messages,
             active_tool_groups: vec![],
@@ -720,7 +720,7 @@ mod tests {
             title: None,
             selected_model: None,
             parent_session_id: None,
-            cwd: None,
+            working_dir: None,
             max_turns: None,
             messages: vec![],
             active_tool_groups: vec![],
@@ -743,7 +743,7 @@ mod tests {
             title: Some("work".into()),
             selected_model: Some("gpt-4".into()),
             parent_session_id: Some(7),
-            cwd: Some("/home".into()),
+            working_dir: Some("/home".into()),
             max_turns: Some(10),
             messages: vec![],
             active_tool_groups: vec![],
@@ -751,7 +751,7 @@ mod tests {
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
         let events = h.collect_events();
-        // Expect: session title, model, parent, cwd, max-turns, count
+        // Expect: session title, model, parent, working_dir, max-turns, count
         assert!(
             events
                 .iter()
@@ -790,7 +790,7 @@ mod tests {
                 session_id: 5,
                 title: Some("new-session".into()),
                 parent_session_id: None,
-                cwd: None,
+                working_dir: None,
                 max_turns: None,
             },
         )
@@ -826,7 +826,7 @@ mod tests {
             selected_model: Some("gpt-4".into()),
             reasoning_effort: None,
             parent_session_id: None,
-            cwd: None,
+            working_dir: None,
             created_at: 0,
             message_count: 5,
             max_turns: None,

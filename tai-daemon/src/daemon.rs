@@ -46,7 +46,7 @@ pub enum DaemonCommand {
     CreateSession {
         title: Option<String>,
         parent_session_id: Option<u64>,
-        cwd: Option<PathBuf>,
+        working_dir: Option<PathBuf>,
         max_turns: Option<u32>,
         reasoning_effort: Option<ThinkingEffort>,
         context_config: Option<ContextConfig>,
@@ -147,7 +147,7 @@ impl DaemonState {
             DaemonCommand::CreateSession {
                 title,
                 parent_session_id,
-                cwd,
+                working_dir,
                 max_turns,
                 reasoning_effort,
                 context_config,
@@ -157,7 +157,7 @@ impl DaemonState {
             } => self.handle_create_session(
                 title,
                 parent_session_id,
-                cwd,
+                working_dir,
                 max_turns,
                 reasoning_effort,
                 context_config,
@@ -331,7 +331,7 @@ impl DaemonState {
         &mut self,
         title: Option<String>,
         parent_session_id: Option<u64>,
-        cwd: Option<PathBuf>,
+        working_dir: Option<PathBuf>,
         max_turns: Option<u32>,
         reasoning_effort: Option<ThinkingEffort>,
         context_config: Option<ContextConfig>,
@@ -348,7 +348,7 @@ impl DaemonState {
         self.next_session_id += 1;
         info!("CreateSession: id={}, title={:?}", sid, title);
 
-        let cwd_str = cwd.as_ref().map(|p| p.display().to_string());
+        let cwd_str = working_dir.as_ref().map(|p| p.display().to_string());
         let active_cats = if active_tool_groups.is_empty() {
             vec!["core".into(), "git".into(), "shell".into()]
         } else {
@@ -359,7 +359,7 @@ impl DaemonState {
             selected_model: None,
             reasoning_effort,
             parent_session_id,
-            cwd: cwd_str.clone(),
+            working_dir: cwd_str.clone(),
             max_turns,
             message_count: 0,
             created_at: std::time::SystemTime::now()
@@ -381,7 +381,7 @@ impl DaemonState {
             selected_model: None,
             reasoning_effort,
             parent_session_id,
-            cwd: cwd_str.clone(),
+            working_dir: cwd_str.clone(),
             created_at: record.created_at,
             message_count: 0,
             max_turns,
@@ -398,7 +398,7 @@ impl DaemonState {
             session_id: sid,
             title,
             parent_session_id,
-            cwd: cwd_str,
+            working_dir: cwd_str,
             max_turns,
         };
         let status_msg = DaemonMessage::SessionStatusChanged {
@@ -456,7 +456,7 @@ impl DaemonState {
                 selected_model: meta.selected_model.clone(),
                 reasoning_effort: meta.reasoning_effort,
                 parent_session_id: meta.parent_session_id,
-                cwd: meta.cwd.clone(),
+                working_dir: meta.working_dir.clone(),
                 created_at: meta.created_at,
                 message_count: meta.message_count,
                 max_turns: meta.max_turns,
@@ -486,7 +486,7 @@ impl DaemonState {
                 selected_model: meta.selected_model.clone(),
                 reasoning_effort: meta.reasoning_effort,
                 parent_session_id: meta.parent_session_id,
-                cwd: meta.cwd.clone(),
+                working_dir: meta.working_dir.clone(),
                 created_at: meta.created_at,
                 message_count: meta.message_count,
                 max_turns: meta.max_turns,
@@ -1066,7 +1066,7 @@ mod tests {
                 selected_model: None,
                 reasoning_effort: None,
                 parent_session_id: None,
-                cwd: None,
+                working_dir: None,
                 created_at: 1000,
                 message_count: 3,
                 max_turns: None,
@@ -1106,7 +1106,7 @@ mod tests {
                 selected_model: None,
                 reasoning_effort: None,
                 parent_session_id: None,
-                cwd: None,
+                working_dir: None,
                 created_at: 1000,
                 message_count: 0,
                 max_turns: None,
@@ -1121,7 +1121,7 @@ mod tests {
             selected_model: Some("gpt-4".into()),
             reasoning_effort: None,
             parent_session_id: None,
-            cwd: None,
+            working_dir: None,
             created_at: 2000,
             message_count: 5,
             max_turns: None,
@@ -1206,7 +1206,7 @@ mod tests {
         state.handle_command(DaemonCommand::CreateSession {
             title: None,
             parent_session_id: None,
-            cwd: None,
+            working_dir: None,
             max_turns: None,
             reasoning_effort: None,
             context_config: None,
@@ -1290,7 +1290,7 @@ mod tests {
                 selected_model: None,
                 reasoning_effort: None,
                 parent_session_id: None,
-                cwd: None,
+                working_dir: None,
                 created_at: 1000,
                 message_count: 0,
                 max_turns: None,

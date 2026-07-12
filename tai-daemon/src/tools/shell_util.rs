@@ -14,17 +14,12 @@ pub(crate) fn binary_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve the working directory and enforce that it stays within the session CWD.
+/// Resolve the working directory and enforce that it stays within the session working directory.
 pub(crate) fn resolve_and_confine(
     workdir: Option<&str>,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
 ) -> Result<PathBuf, ToolError> {
-    let workdir_str = workdir.unwrap_or(".");
-    let resolved = super::resolve_path(workdir_str, cwd);
-    if let Some(session_cwd) = cwd {
-        check_path_confinement(&resolved, session_cwd)?;
-    }
-    Ok(resolved)
+    super::confine_path(workdir.unwrap_or("."), working_dir)
 }
 
 /// Strip environment variables that could be used for code injection.
@@ -177,19 +172,4 @@ mod tests {
         assert!(result.contains("stderr"));
         assert!(result.contains("Exit code: 1"));
     }
-}
-
-fn check_path_confinement(resolved: &Path, session_cwd: &Path) -> Result<(), ToolError> {
-    let resolved_canonical = std::fs::canonicalize(resolved)
-        .map_err(|e| ToolError::Other(format!("cannot resolve workdir path: {e}")))?;
-    let cwd_canonical = std::fs::canonicalize(session_cwd)
-        .map_err(|e| ToolError::Other(format!("cannot resolve session cwd: {e}")))?;
-    if !resolved_canonical.starts_with(&cwd_canonical) {
-        return Err(ToolError::Other(format!(
-            "workdir '{}' is outside the session working directory '{}'",
-            resolved.display(),
-            cwd_canonical.display()
-        )));
-    }
-    Ok(())
 }

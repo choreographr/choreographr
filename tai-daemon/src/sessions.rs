@@ -95,7 +95,7 @@ pub struct SessionMetadata {
     pub selected_model: Option<String>,
     pub reasoning_effort: Option<ThinkingEffort>,
     pub parent_session_id: Option<u64>,
-    pub cwd: Option<String>,
+    pub working_dir: Option<String>,
     pub created_at: i64,
     pub message_count: u32,
     pub max_turns: Option<u32>,
@@ -117,7 +117,7 @@ impl From<SessionRecord> for SessionMetadata {
             selected_model: record.selected_model,
             reasoning_effort: record.reasoning_effort,
             parent_session_id: record.parent_session_id,
-            cwd: record.cwd.map(PathBuf::from),
+            working_dir: record.working_dir.map(PathBuf::from),
             max_turns: record.max_turns,
             created_at: record.created_at,
             context_fingerprint: None,
@@ -145,7 +145,7 @@ impl From<SessionMetadata> for SessionRecord {
             selected_model: meta.selected_model,
             reasoning_effort: meta.reasoning_effort,
             parent_session_id: meta.parent_session_id,
-            cwd: meta.cwd,
+            working_dir: meta.working_dir,
             max_turns: meta.max_turns,
             message_count: meta.message_count,
             created_at: meta.created_at,
@@ -161,7 +161,7 @@ impl From<SessionMetadata> for SessionRecord {
 /// in-memory index or for sending through the command channel.
 ///
 /// Fields that don't exist in [`SessionMetadata`] (subscribers, active
-/// requests, message contents, etc.) are dropped. The `PathBuf` CWD is
+/// requests, message contents, etc.) are dropped. The `PathBuf` working_dir is
 /// stringified.
 impl From<&SessionState> for SessionMetadata {
     fn from(state: &SessionState) -> Self {
@@ -181,7 +181,7 @@ pub struct SessionConfig {
     pub selected_model: Option<String>,
     pub reasoning_effort: Option<ThinkingEffort>,
     pub parent_session_id: Option<u64>,
-    pub cwd: Option<PathBuf>,
+    pub working_dir: Option<PathBuf>,
     pub max_turns: Option<u32>,
     pub created_at: i64,
     pub context_fingerprint: Option<u64>,
@@ -201,7 +201,7 @@ impl Default for SessionConfig {
             selected_model: None,
             reasoning_effort: None,
             parent_session_id: None,
-            cwd: None,
+            working_dir: None,
             max_turns: None,
             created_at: 0,
             context_fingerprint: None,
@@ -226,7 +226,7 @@ impl From<&SessionConfig> for SessionMetadata {
             selected_model: config.selected_model.clone(),
             reasoning_effort: config.reasoning_effort,
             parent_session_id: config.parent_session_id,
-            cwd: config.cwd.as_ref().map(|p| p.display().to_string()),
+            working_dir: config.working_dir.as_ref().map(|p| p.display().to_string()),
             created_at: config.created_at,
             message_count: 0,
             max_turns: config.max_turns,
@@ -373,9 +373,9 @@ pub fn session_main(
         selected_model: init_record.as_ref().and_then(|r| r.selected_model.clone()),
         reasoning_effort: init_record.as_ref().and_then(|r| r.reasoning_effort),
         parent_session_id: init_record.as_ref().and_then(|r| r.parent_session_id),
-        cwd: init_record
+        working_dir: init_record
             .as_ref()
-            .and_then(|r| r.cwd.as_ref().map(PathBuf::from)),
+            .and_then(|r| r.working_dir.as_ref().map(PathBuf::from)),
         max_turns: init_record.as_ref().and_then(|r| r.max_turns),
         created_at: init_record
             .as_ref()
@@ -421,19 +421,19 @@ pub fn session_main(
     }
 
     if init_record.is_none() || state.messages.is_empty() {
-        let effective_cwd = state
+        let effective_working_dir = state
             .config
-            .cwd
+            .working_dir
             .as_deref()
             .unwrap_or_else(|| Path::new("."));
-        let skills = context::discover_skills(effective_cwd);
+        let skills = context::discover_skills(effective_working_dir);
         let base_prompt = context::build_base_prompt(&skills, ctx.tool_registry.groups());
         state.messages.push(SessionMessage::SystemText {
             content: base_prompt,
         });
         write_message_retry(&ctx.db, ctx.session_id, 0, &state.messages[0]).ok();
 
-        if let Ok(bundle) = context::discover_context(effective_cwd, &Default::default()) {
+        if let Ok(bundle) = context::discover_context(effective_working_dir, &Default::default()) {
             let context_str = context::assemble_context(&bundle);
             if !context_str.is_empty() {
                 state.messages.push(SessionMessage::SystemText {
@@ -597,7 +597,7 @@ fn handle_run_input(
         .active_requests
         .insert(request_id, ActiveRequest { cancel_tx });
 
-    let cwd = state.config.cwd.clone();
+    let working_dir = state.config.working_dir.clone();
     // Workers don't need their own subscriber map — all broadcasts
     // are routed through SessionCommand::Broadcast to this main
     // session thread which holds the live subscriber set.
@@ -610,7 +610,7 @@ fn handle_run_input(
             provider,
             &mut worker_session,
             model,
-            cwd,
+            working_dir,
             cancel_rx,
             ctx,
             None,
@@ -648,7 +648,7 @@ fn handle_run_child_input(
         return false;
     }
     broadcast(&state.subscribers, DaemonMessage::Started { request_id });
-    let cwd = state.config.cwd.clone();
+    let working_dir = state.config.working_dir.clone();
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     state
         .active_requests
@@ -662,7 +662,7 @@ fn handle_run_child_input(
             provider,
             &mut worker_session,
             model,
-            cwd,
+            working_dir,
             cancel_rx,
             ctx,
             Some(reply),
@@ -790,7 +790,11 @@ fn handle_attach(
         title: state.config.title.clone(),
         selected_model: state.config.selected_model.clone(),
         parent_session_id: state.config.parent_session_id,
-        cwd: state.config.cwd.as_ref().map(|p| p.display().to_string()),
+        working_dir: state
+            .config
+            .working_dir
+            .as_ref()
+            .map(|p| p.display().to_string()),
         max_turns: state.config.max_turns,
         messages: state.messages.clone(),
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
@@ -827,7 +831,11 @@ fn handle_get_summary(
         selected_model: state.config.selected_model.clone(),
         reasoning_effort: state.config.reasoning_effort,
         parent_session_id: state.config.parent_session_id,
-        cwd: state.config.cwd.as_ref().map(|p| p.display().to_string()),
+        working_dir: state
+            .config
+            .working_dir
+            .as_ref()
+            .map(|p| p.display().to_string()),
         created_at: state.config.created_at,
         message_count: state.messages.len() as u32,
         max_turns: state.config.max_turns,
@@ -1007,7 +1015,7 @@ fn run_request_worker(
     client: InferenceProvider,
     session: &mut SessionState,
     model: String,
-    cwd: Option<PathBuf>,
+    working_dir: Option<PathBuf>,
     cancel_rx: mpsc::Receiver<()>,
     ctx: RequestContext,
     child_reply: Option<mpsc::Sender<io::Result<ChildResult>>>,
@@ -1020,7 +1028,7 @@ fn run_request_worker(
             session,
             &model,
             request_id,
-            cwd.as_deref(),
+            working_dir.as_deref(),
             &cancel_rx,
             &ctx,
         )
@@ -1154,7 +1162,7 @@ mod tests {
             selected_model: Some("gpt-4".into()),
             reasoning_effort: None,
             parent_session_id: None,
-            cwd: Some("/tmp".into()),
+            working_dir: Some("/tmp".into()),
             max_turns: Some(10),
             message_count: 3,
             created_at: 1000,
@@ -1172,7 +1180,7 @@ mod tests {
                 selected_model: Some("gpt-4".into()),
                 reasoning_effort: None,
                 parent_session_id: None,
-                cwd: Some(std::path::PathBuf::from("/tmp")),
+                working_dir: Some(std::path::PathBuf::from("/tmp")),
                 max_turns: Some(10),
                 created_at: 1000,
                 context_fingerprint: None,
@@ -1211,7 +1219,7 @@ mod tests {
         assert_eq!(meta.status, SessionStatus::Sleeping);
         assert_eq!(meta.title, record.title);
         assert_eq!(meta.selected_model, record.selected_model);
-        assert_eq!(meta.cwd, record.cwd);
+        assert_eq!(meta.working_dir, record.working_dir);
         assert_eq!(meta.message_count, record.message_count);
         let mut expected = record.active_tool_groups.clone();
         let mut actual = meta.active_tool_groups.clone();
@@ -1227,7 +1235,7 @@ mod tests {
             selected_model: Some("claude-3".into()),
             reasoning_effort: None,
             parent_session_id: Some(42),
-            cwd: Some("/home".into()),
+            working_dir: Some("/home".into()),
             created_at: 2000,
             message_count: 7,
             max_turns: Some(20),
@@ -1251,7 +1259,7 @@ mod tests {
         assert_eq!(record.title, record2.title);
         assert_eq!(record.selected_model, record2.selected_model);
         assert_eq!(record.parent_session_id, record2.parent_session_id);
-        assert_eq!(record.cwd, record2.cwd);
+        assert_eq!(record.working_dir, record2.working_dir);
         assert_eq!(record.max_turns, record2.max_turns);
         assert_eq!(record.message_count, record2.message_count);
         assert_eq!(record.created_at, record2.created_at);
@@ -1270,7 +1278,7 @@ mod tests {
         assert_eq!(meta.selected_model, state.config.selected_model);
         assert_eq!(meta.message_count, 3);
         assert_eq!(meta.status, state.config.status);
-        assert_eq!(meta.cwd, Some("/tmp".into()));
+        assert_eq!(meta.working_dir, Some("/tmp".into()));
         assert_eq!(meta.parent_session_id, state.config.parent_session_id);
     }
 
@@ -1281,7 +1289,7 @@ mod tests {
         assert_eq!(record.title, state.config.title);
         assert_eq!(record.selected_model, state.config.selected_model);
         assert_eq!(record.message_count, 3);
-        assert_eq!(record.cwd, Some("/tmp".into()));
+        assert_eq!(record.working_dir, Some("/tmp".into()));
     }
 
     #[test]
@@ -1582,7 +1590,7 @@ mod tests {
             selected_model: None,
             reasoning_effort: None,
             parent_session_id: None,
-            cwd: Some("/tmp".into()),
+            working_dir: Some("/tmp".into()),
             max_turns: None,
             created_at: 1000,
             message_count: 0,

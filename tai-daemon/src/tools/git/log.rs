@@ -13,12 +13,12 @@ pub struct GitLogArgs {
 
 pub fn execute_git_log_tool(
     args: &GitLogArgs,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     let output = git_log_impl(
         args.repo_path.as_deref(),
         args.limit.unwrap_or(10).clamp(1, 100),
-        cwd,
+        working_dir,
     )?;
     Ok(truncate_tool_output(&output))
 }
@@ -26,9 +26,9 @@ pub fn execute_git_log_tool(
 pub(crate) fn git_log_impl(
     repo_path: Option<&str>,
     limit: usize,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path, cwd)?;
+    let repo = open_repo(repo_path, working_dir)?;
     let head = match repo.head_id() {
         Ok(head) => head,
         Err(_) => return Ok("repository has no commits yet".to_string()),

@@ -30,10 +30,10 @@ pub struct GrepArgs {
 /// Respects `.gitignore`, hidden files, and binary files by default.
 pub struct Grep;
 
-pub fn execute_grep_tool(args: &GrepArgs, cwd: Option<&Path>) -> Result<String, ToolError> {
-    // Resolve the search root — use the provided path or default to cwd
+pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
+    // Resolve the search root — use the provided path or default to working_dir
     let path = args.path.as_deref().unwrap_or(".");
-    let resolved = super::resolve_path(path, cwd);
+    let resolved = super::confine_path(path, working_dir)?;
 
     // Build the pattern matcher: literal text or regex depending on flags
     let matcher: RegexMatcher = if args.regex {
@@ -185,7 +185,7 @@ impl super::Tool for Grep {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search in (default: current working directory)"
+                    "description": "Directory to search in (default: session working directory)"
                 },
                 "max_results": {
                     "type": "integer",
@@ -204,10 +204,10 @@ impl super::Tool for Grep {
         &self,
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&Path>,
+        working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
-        execute_grep_tool(&args, cwd)
+        execute_grep_tool(&args, working_dir)
     }
 }
 

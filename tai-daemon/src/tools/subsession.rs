@@ -74,13 +74,15 @@ impl Tool for SpawnSubsession {
         &self,
         args: Self::Args,
         _x_credentials: Option<&tai_keystore::ServiceCredential>,
-        cwd: Option<&Path>,
+        working_dir: Option<&Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
         let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
 
-        // Determine child CWD: prefer tool-level cwd, fall back to session cwd
-        let child_cwd = cwd.or(ctx.cwd.as_deref()).map(|p| p.to_path_buf());
+        // Determine child working_dir: prefer tool-level parameter, fall back to session context
+        let child_working_dir = working_dir
+            .or(ctx.working_dir.as_deref())
+            .map(|p| p.to_path_buf());
 
         // Inherit or override tool groups
         let categories = args
@@ -93,7 +95,7 @@ impl Tool for SpawnSubsession {
             .send(DaemonCommand::CreateSession {
                 title: args.title,
                 parent_session_id: Some(ctx.session_id),
-                cwd: child_cwd.clone(),
+                working_dir: child_working_dir.clone(),
                 max_turns: args.max_turns,
                 reasoning_effort: ctx.reasoning_effort,
                 context_config: None,

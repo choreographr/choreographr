@@ -136,7 +136,7 @@ fn token_usage_in_session_message_assistant_text_backward_compat() {
 #[test]
 fn token_usage_in_session_summary_backward_compat() {
     // Old JSON (before token_usage was added to SessionSummary)
-    let json = r#"{"session_id":1,"title":null,"selected_model":null,"reasoning_effort":null,"parent_session_id":null,"cwd":null,"created_at":0,"message_count":0,"max_turns":null,"status":"Inactive","active_tool_groups":[],"account_name":null}"#;
+    let json = r#"{"session_id":1,"title":null,"selected_model":null,"reasoning_effort":null,"parent_session_id":null,"working_dir":null,"created_at":0,"message_count":0,"max_turns":null,"status":"Inactive","active_tool_groups":[],"account_name":null}"#;
     let summary: SessionSummary = serde_json::from_str(json).unwrap();
     assert_eq!(summary.session_id, 1);
     assert_eq!(summary.token_usage, None);

@@ -37,7 +37,7 @@ define_tool!(
             },
             "workdir": {
                 "type": "string",
-                "description": "Working directory for the command (relative to session CWD, or absolute)"
+                "description": "Working directory for the command (relative to the session working directory, or absolute)"
             },
             "timeout": {
                 "type": "integer",
@@ -51,12 +51,12 @@ define_tool!(
     "shell"
 );
 
-pub fn execute_exec_tool(args: &ExecArgs, cwd: Option<&Path>) -> Result<String, ToolError> {
+pub fn execute_exec_tool(args: &ExecArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
     let program = &args.command;
     let prog_args = &args.args;
     let timeout_ms = args.timeout.unwrap_or(30000);
 
-    let resolved = resolve_and_confine(args.workdir.as_deref(), cwd)?;
+    let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
 
     let mut cmd = std::process::Command::new(program);
     cmd.args(prog_args)

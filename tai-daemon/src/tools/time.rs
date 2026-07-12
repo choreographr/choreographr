@@ -7,7 +7,10 @@ use std::time::SystemTime;
 /// Propagates a [`ToolError`] if the system clock is set before UNIX_EPOCH
 /// (essentially impossible on real hardware, but handled gracefully rather
 /// than silently returning 0).
-pub(crate) fn execute_get_current_time(_args: &(), _cwd: Option<&Path>) -> Result<u64, ToolError> {
+pub(crate) fn execute_get_current_time(
+    _args: &(),
+    _working_dir: Option<&Path>,
+) -> Result<u64, ToolError> {
     let millis = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| ToolError::Other(format!("system clock before epoch: {e}")))?

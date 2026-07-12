@@ -157,7 +157,7 @@ fn handle_session_message(
                     if let Err(e) = sender.send(ClientMessage::CreateSession {
                         title: Some("default".to_string()),
                         parent_session_id: None,
-                        cwd: None,
+                        working_dir: None,
                         max_turns: None,
                         context_config: None,
                         account_name: None,

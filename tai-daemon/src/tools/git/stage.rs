@@ -18,10 +18,10 @@ pub struct GitAddArgs {
 
 pub fn execute_git_add_tool(
     args: &GitAddArgs,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     let pathspec = normalize_pathspecs(args.pathspec.clone())?;
-    let output = git_add_impl(args.repo_path.as_deref(), pathspec, cwd)?;
+    let output = git_add_impl(args.repo_path.as_deref(), pathspec, working_dir)?;
     Ok(truncate_tool_output(&output))
 }
 
@@ -43,10 +43,10 @@ fn normalize_pathspecs(pathspec: Vec<String>) -> Result<Vec<String>, ToolError> 
 fn git_add_impl(
     repo_path: Option<&str>,
     pathspec: Vec<String>,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path, cwd)?;
-    let effective_pathspec = prefix_pathspecs(&repo, repo_path, &pathspec)?;
+    let repo = open_repo(repo_path, working_dir)?;
+    let effective_pathspec = prefix_pathspecs(&repo, repo_path, &pathspec, working_dir)?;
     let mut index = load_mutable_index(&repo)?;
     let paths = collect_paths_to_stage(&repo, &index, &effective_pathspec)?;
     if paths.is_empty() {
@@ -74,7 +74,7 @@ fn git_add_impl(
         if changed { "yes" } else { "no" }
     )
     .ok();
-    let diff = super::diff::git_diff_impl(repo_path, true, effective_pathspec, cwd)?;
+    let diff = super::diff::git_diff_impl(repo_path, true, effective_pathspec, working_dir)?;
     writeln!(&mut out).ok();
     writeln!(&mut out, "{diff}").ok();
     Ok(out.trim_end().to_string())
@@ -166,6 +166,7 @@ fn prefix_pathspecs(
     repo: &gix::Repository,
     repo_path: Option<&str>,
     pathspec: &[String],
+    working_dir: Option<&Path>,
 ) -> Result<Vec<String>, ToolError> {
     let Some(workdir) = repo.workdir() else {
         return Ok(pathspec.to_vec());
@@ -183,9 +184,9 @@ fn prefix_pathspecs(
     let absolute = if candidate.is_absolute() {
         candidate.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map_err(ToolError::Io)?
-            .join(candidate)
+        // Resolve relative repo_path against the session working_dir,
+        // falling back to the daemon's process CWD when none is set.
+        crate::tools::resolve_path(candidate.to_str().unwrap_or("."), working_dir)
     };
 
     let Ok(prefix) = absolute.strip_prefix(workdir) else {

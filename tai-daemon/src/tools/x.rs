@@ -327,7 +327,7 @@ impl super::Tool for XPost {
         &self,
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&Path>,
+        _working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
         execute_x_post_tool(&args, x_credentials)
@@ -373,7 +373,7 @@ impl super::Tool for XSearchRecent {
         &self,
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&Path>,
+        _working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
         execute_x_search_recent_tool(&args, x_credentials)
@@ -415,7 +415,7 @@ impl super::Tool for XUserLookup {
         &self,
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&Path>,
+        _working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
         execute_x_user_lookup_tool(&args, x_credentials)

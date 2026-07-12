@@ -993,7 +993,7 @@ fn make_session(id: u64, title: &str, model: &str, count: u32) -> tai_proto::Ses
         selected_model: Some(model.to_string()),
         reasoning_effort: None,
         parent_session_id: None,
-        cwd: None,
+        working_dir: None,
         created_at: 1705314000,
         message_count: count,
         max_turns: None,
@@ -1295,7 +1295,7 @@ mod session_manager_key_tests {
             ClientMessage::CreateSession {
                 title: None,
                 parent_session_id: None,
-                cwd: None,
+                working_dir: None,
                 max_turns: None,
                 context_config: None,
                 account_name: None,

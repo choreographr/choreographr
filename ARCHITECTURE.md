@@ -214,13 +214,13 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `google/` | Google Gemini API client (`GoogleClient`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
 | `mistral/` | Mistral API client (`MistralClient`). Implements `ProviderClient`. Uses OpenAI-compatible SSE reader for streaming. |
 | `retry/` | Shared HTTP retry logic extracted from the OpenAI module. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. All provider modules use this via the shared `ProviderError` type conversion. |
-| `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional CWD. |
+| `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional working directory. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading. |
 | `tools/` | `Tool` trait, `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 30 registered tools (including `list_sessions`, `get_session`, `load_skill` via `admin.rs`). |
-| `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, CWD) passed to tools that need DB or daemon access or parent config for sub-sessions. |
+| `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, working directory) passed to tools that need DB or daemon access or parent config for sub-sessions. |
 | `tools/db.rs` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
 
@@ -522,7 +522,7 @@ pub trait Tool: Send + Sync {
         &self,
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&Path>,
+        working_dir: Option<&Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, ToolError>;
 
@@ -530,11 +530,11 @@ pub trait Tool: Send + Sync {
         &self,
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&Path>,
+        working_dir: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, ToolError> {
-        let ret = self.execute(args, x_credentials, cwd, ctx)?;
+        let ret = self.execute(args, x_credentials, working_dir, ctx)?;
         let bytes = postcard::to_allocvec(&ret).map_err(ToolError::Postcard)?;
         let _ = output_tx.send(bytes);
         Ok(ret)
@@ -630,8 +630,8 @@ pub fn execute_dyn(&self, name: &str, args_bytes: &[u8], ...) -> Vec<u8> {
 }
 ```
 
-Each tool receives an optional `cwd: Option<&Path>` parameter that represents the session's
-working directory. Filesystem and Git tools resolve relative paths against this CWD.
+Each tool receives an optional `working_dir: Option<&Path>` parameter that represents the session's
+working directory. Filesystem and Git tools resolve relative paths against this working directory.
 
 ### Postcard binary encoding
 
@@ -730,14 +730,14 @@ If a tool thread panics, the error is caught and reported as a `ToolResult` with
 It runs in the concurrent dispatch path alongside other tools. When invoked:
 
 1. A child session is created via `DaemonCommand::CreateSession` with the parent as
-   `parent_session_id` and inheriting the parent's CWD and tool groups.
+   `parent_session_id` and inheriting the parent's working directory and tool groups.
 2. The prompt argument is pushed as a `SystemText` message into the child session.
 3. The child session runs its own `run_agent_loop()` (model → tools → model, up to 8 iterations).
 4. The child's assistant text output is collected and returned to the parent as the tool result.
 5. The child session persists in the database and is listable/attachable like any other session.
 
 The child session runs to completion regardless of parent cancellation — it uses `ToolContext`
-(`active_tool_groups`, `reasoning_effort`, `cwd`, `daemon_tx`) to inherit parent config and
+(`active_tool_groups`, `reasoning_effort`, `working_dir`, `daemon_tx`) to inherit parent config and
 communicate with the daemon command loop.
 
 
@@ -758,7 +758,7 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 | `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
 | `meta` | `&str` | `u64` counter |
 
-`SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `cwd`,
+`SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `working_dir`,
 `message_count`, `created_at`, `context_config`, `account_name`.
 
 ### Session state (in-memory)
@@ -773,7 +773,7 @@ across snapshot/restore, metadata conversion, and record persistence:
 - `selected_model: Option<String>` — AI model for this session
 - `reasoning_effort: Option<ThinkingEffort>` — per-session reasoning effort
 - `parent_session_id: Option<u64>` — parent session for sub-sessions
-- `cwd: Option<PathBuf>` — working directory for filesystem tools
+- `working_dir: Option<PathBuf>` — working directory for filesystem tools
 - `max_turns: Option<u32>` — per-session tool loop iteration cap (inherits from parent)
 - `created_at: i64` — Unix timestamp of creation
 - `context_fingerprint: Option<u64>` — fingerprint for context file refresh
@@ -792,12 +792,12 @@ across snapshot/restore, metadata conversion, and record persistence:
 - `active_requests: HashMap<u32, ActiveRequest>` — running request cancel flags
 - `provider: Option<InferenceProvider>` — resolved inference provider for the account
 
-### Hierarchy and CWD inheritance
+### Hierarchy and working directory inheritance
 
 Sessions form a tree: a session can have a `parent_session_id` pointing to another
-session. When creating a child session, if no explicit CWD or `max_turns` is provided,
-it inherits the parent's value. This allows sub-sessions (subagents) to operate in the
-same directory as their parent with a default iteration cap.
+session. When creating a child session, if no explicit `working_dir` or `max_turns` is
+provided, it inherits the parent's value. This allows sub-sessions (subagents) to operate
+in the same directory as their parent with a default iteration cap.
 
 ### Persistence lifecycle
 
@@ -994,7 +994,7 @@ User presses Enter on a session in the session manager
    they can be stored in the database without a global passphrase.
 
 4. **Sessions, not per-client state** — sessions are independent from client connections. A
-   session has its own model, CWD, and messages. Clients subscribe/unsubscribe from sessions
+    session has its own model, working directory, and messages. Clients subscribe/unsubscribe from sessions
    via the broadcast system. Sessions persist in a redb database and survive daemon restarts.
    Session lifecycle operations (create, attach, list, delete) succeed even when the daemon
    is locked — credentials are only needed to run models. Sessions carry an optional
@@ -1003,7 +1003,7 @@ User presses Enter on a session in the session manager
    daemon's provider registry when the first RunInput is issued.
 
 5. **Session hierarchy** — sessions can have parent sessions (`parent_session_id`), forming a
-   tree. Child sessions inherit their parent's CWD unless explicitly overridden. The
+    tree. Child sessions inherit their parent's working directory unless explicitly overridden. The
    `spawn_subsession` tool creates autonomous child sessions that run their own tool-calling
    loop and report results back to the parent.
 
@@ -1074,17 +1074,17 @@ messages[1] = volatile project context (AGENTS.md, CLAUDE.md, etc.)
    - `~/.config/tai-daemon/AGENTS.md`
    - `~/.claude/CLAUDE.md` (unless `disable_claude_code_prompt` is set)
    - `~/.agents/AGENTS.md`
-2. **Project files** (walking from session CWD up to the git repository root):
+2. **Project files** (walking from session working directory up to the git repository root):
    - At each ancestor directory, checks `AGENTS.md` first, then `CLAUDE.md`.
    - Only one file per directory (first match in the configured `context_file_names` list).
    - Collected bottom-up (outermost first), then rendered in reverse order so
-     closer-to-CWD instructions appear last.
+     closer-to-working-directory instructions appear last.
 
 ### Subdirectory hints
 
 When filesystem tools (`read_file`, `list_files`, `grep`, `find`, etc.) access a file
-in a subdirectory below the session CWD, the daemon walks up from that file's
-parent toward CWD and checks for `AGENTS.md`/`CLAUDE.md` files not already in
+in a subdirectory below the session working directory, the daemon walks up from that file's
+parent toward the working directory and checks for `AGENTS.md`/`CLAUDE.md` files not already in
 the main context. Any found hint content is appended to the tool result message
 (not the system prompt), preserving prompt cache stability.
 
@@ -1092,7 +1092,7 @@ the main context. Any found hint content is appended to the tool result message
 
 Skills are discovered from:
 - `~/.agents/skills/<name>/SKILL.md` (global)
-- `.agents/skills/<name>/SKILL.md` (project, relative to session CWD)
+- `.agents/skills/<name>/SKILL.md` (project, relative to session working directory)
 
 Each `SKILL.md` must have YAML frontmatter with `name` and `description`.
 
@@ -1131,13 +1131,13 @@ Implementation lives in `tai-daemon/src/context.rs`. Key entry points:
 
 | Function | Purpose |
 |---|---|
-| `discover_context(cwd, config)` | Walk filesystem, return `ContextBundle` with all discovered files |
-| `discover_skills(cwd)` | Scan Agent Skills directories, return `Vec<SkillMeta>` |
+| `discover_context(working_dir, config)` | Walk filesystem, return `ContextBundle` with all discovered files |
+| `discover_skills(working_dir)` | Scan Agent Skills directories, return `Vec<SkillMeta>` |
 | `assemble_context(bundle)` | Render discovered files into an XML-like format for injection |
 | `build_base_prompt(skills)` | Build the stable system prompt (identity + skill metadata) |
-| `recheck_context(cwd, config, old_fp)` | Re-discover and compare fingerprints |
-| `subdirectory_hints(tool_name, args, cwd, known)` | Return subdirectory hint content for tool results |
-| `load_skill_body(name, cwd)` | Load the full body of a SKILL.md, stripping YAML frontmatter |
+| `recheck_context(working_dir, config, old_fp)` | Re-discover and compare fingerprints |
+| `subdirectory_hints(tool_name, args, working_dir, known)` | Return subdirectory hint content for tool results |
+| `load_skill_body(name, working_dir)` | Load the full body of a SKILL.md, stripping YAML frontmatter |
 
 ### New tool: `load_skill`
 
@@ -1155,7 +1155,7 @@ The skill body is available to the model on all subsequent turns.
 
 `run_riscv` is a tool that compiles Rust source code into a RISC-V ELF binary and executes it
 inside a sandboxed virtual machine powered by `ckb-vm`. It is registered manually (not via
-`define_tool!`) to pass `x_credentials` and `cwd` through to the guest syscall handler.
+`define_tool!`) to pass `x_credentials` and `working_dir` through to the guest syscall handler.
 
 **Execution flow:**
 
@@ -1204,7 +1204,7 @@ With `allocator: false`, `args()` is not available and the guest must access `ar
 directly from the RISC-V ABI registers (`a0`/`a1` at `_start`).
 
 **Safety:** The guest runs in an isolated VM with 4 MB of flat memory. All tool access goes
-through the same `ToolRegistry` as the host agent, respecting the same `x_credentials` and `cwd`.
+through the same `ToolRegistry` as the host agent, respecting the same `x_credentials` and `working_dir`.
 The guest cannot access host memory, syscalls, or files outside the VM without going through
 registered tools.
 
@@ -1228,7 +1228,7 @@ Sandboxing (shared across all shell/exec tools via `shell_util.rs`):
 
 3. **Environment sanitization** — dangerous env vars (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `LD_DEBUG`, `PYTHONPATH`, `PERL5LIB`, `RUBYLIB`, `DYLD_INSERT_LIBRARIES`) are stripped in the child before exec.
 
-4. **Path confinement** — the resolved working directory is canonicalized and must be at or below the session CWD. Absolute paths or `..` traversals that escape the project directory are rejected.
+4. **Path confinement** — the resolved working directory is canonicalized and must be at or below the session working directory. Absolute paths or `..` traversals that escape the project directory are rejected.
 
 5. **Output limits** — stdout/stderr are combined and truncated to 16 KB via `truncate_tool_output`, preventing context overflow.
 

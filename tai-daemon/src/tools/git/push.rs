@@ -19,7 +19,7 @@ pub struct GitPushArgs {
 
 pub fn execute_git_push_tool(
     args: &GitPushArgs,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     let output = git_push_impl(
         args.repo_path.as_deref(),
@@ -28,7 +28,7 @@ pub fn execute_git_push_tool(
         args.set_upstream.unwrap_or(false),
         args.force_with_lease.unwrap_or(false),
         args.dry_run.unwrap_or(false),
-        cwd,
+        working_dir,
     )?;
     Ok(truncate_tool_output(&output))
 }
@@ -40,9 +40,9 @@ fn git_push_impl(
     set_upstream: bool,
     force_with_lease: bool,
     dry_run: bool,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path, cwd)?;
+    let repo = open_repo(repo_path, working_dir)?;
     let remote = normalize_nonempty_argument(remote, "remote")?;
     let branch = match branch {
         Some(branch) => normalize_nonempty_argument(branch, "branch")?.to_string(),

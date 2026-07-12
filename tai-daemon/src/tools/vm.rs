@@ -603,7 +603,7 @@ pub struct RunRiscVInput {
 struct TaiSyscall {
     registry: Arc<ToolRegistry>,
     x_credentials: Option<ServiceCredential>,
-    cwd: Option<PathBuf>,
+    working_dir: Option<PathBuf>,
     output_tx: mpsc::Sender<Vec<u8>>,
     write_tx: Option<mpsc::Sender<Vec<u8>>>,
     ctx: Option<crate::tools::context::ToolContext>,
@@ -640,7 +640,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                     &tool_name,
                     rest,
                     self.x_credentials.as_ref(),
-                    self.cwd.as_deref(),
+                    self.working_dir.as_deref(),
                     self.ctx.as_ref(),
                 );
 
@@ -696,7 +696,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                 // which ensures every spawned thread completes before we return.
                 let registry = &self.registry;
                 let xc = self.x_credentials.as_ref();
-                let cw = self.cwd.as_deref();
+                let cw = self.working_dir.as_deref();
                 let ctx = self.ctx.as_ref();
                 let results: Vec<Vec<u8>> = std::thread::scope(|scope| {
                     let handles: Vec<_> = requests
@@ -826,7 +826,7 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
 fn run_riscv_impl(
     input: &RunRiscVInput,
     x_credentials: Option<&ServiceCredential>,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
     write_tx: Option<mpsc::Sender<Vec<u8>>>,
     registry: Arc<ToolRegistry>,
     ctx: Option<crate::tools::context::ToolContext>,
@@ -890,7 +890,7 @@ fn run_riscv_impl(
     let syscall = TaiSyscall {
         registry,
         x_credentials: x_credentials.cloned(),
-        cwd: cwd.map(|p| p.to_path_buf()),
+        working_dir: working_dir.map(|p| p.to_path_buf()),
         output_tx,
         write_tx,
         ctx,
@@ -1048,14 +1048,21 @@ impl Tool for RunRiscV {
         &self,
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&Path>,
+        working_dir: Option<&Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
         let registry = self
             .registry
             .upgrade()
             .ok_or_else(|| ToolError::Other("ToolRegistry no longer available".to_string()))?;
-        let output = run_riscv_impl(&args, x_credentials, cwd, None, registry, ctx.cloned());
+        let output = run_riscv_impl(
+            &args,
+            x_credentials,
+            working_dir,
+            None,
+            registry,
+            ctx.cloned(),
+        );
         if output.result.is_error {
             Err(ToolError::Other(output.result.content))
         } else {
@@ -1067,7 +1074,7 @@ impl Tool for RunRiscV {
         &self,
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
-        cwd: Option<&Path>,
+        working_dir: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
@@ -1078,7 +1085,7 @@ impl Tool for RunRiscV {
         let output = run_riscv_impl(
             &args,
             x_credentials,
-            cwd,
+            working_dir,
             Some(output_tx),
             registry,
             ctx.cloned(),
@@ -1093,10 +1100,10 @@ impl Tool for RunRiscV {
 
 pub fn execute_run_riscv_tool(
     input: &RunRiscVInput,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
 ) -> Result<String, ToolError> {
     let registry = Arc::new(ToolRegistry::new());
-    let output = run_riscv_impl(input, None, cwd, None, registry, None);
+    let output = run_riscv_impl(input, None, working_dir, None, registry, None);
     if output.result.is_error {
         Err(ToolError::Other(output.result.content))
     } else {
@@ -1460,7 +1467,7 @@ mod tests {
             &self,
             _args: Self::Args,
             _xc: Option<&ServiceCredential>,
-            _cwd: Option<&Path>,
+            _working_dir: Option<&Path>,
             _ctx: Option<&ToolContext>,
         ) -> Result<String, ToolError> {
             Ok(self.response.to_string())

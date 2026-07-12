@@ -33,10 +33,10 @@ pub struct SkillMeta {
     pub path: PathBuf,
 }
 
-pub fn discover_context(cwd: &Path, config: &ContextConfig) -> io::Result<ContextBundle> {
+pub fn discover_context(working_dir: &Path, config: &ContextConfig) -> io::Result<ContextBundle> {
     let mut files = Vec::new();
     load_global_files(&mut files, config)?;
-    load_project_files(cwd, &mut files, config)?;
+    load_project_files(working_dir, &mut files, config)?;
     let fingerprint = compute_fingerprint(&files);
     Ok(ContextBundle { files, fingerprint })
 }
@@ -69,16 +69,16 @@ fn load_global_files(files: &mut Vec<DiscoveredFile>, config: &ContextConfig) ->
 }
 
 fn load_project_files(
-    cwd: &Path,
+    working_dir: &Path,
     files: &mut Vec<DiscoveredFile>,
     config: &ContextConfig,
 ) -> io::Result<()> {
-    let git_root = find_git_root(cwd);
+    let git_root = find_git_root(working_dir);
     let boundary = git_root.as_deref().unwrap_or_else(|| Path::new("/"));
 
     let mut seen = HashSet::new();
     let mut found = Vec::new();
-    let mut current = Some(cwd.to_path_buf());
+    let mut current = Some(working_dir.to_path_buf());
 
     while let Some(dir) = current {
         for name in &config.context_file_names {
@@ -103,8 +103,8 @@ fn load_project_files(
     Ok(())
 }
 
-fn find_git_root(cwd: &Path) -> Option<PathBuf> {
-    let mut current = Some(cwd.to_path_buf());
+fn find_git_root(working_dir: &Path) -> Option<PathBuf> {
+    let mut current = Some(working_dir.to_path_buf());
     while let Some(ref dir) = current {
         let git_path = dir.join(".git");
         if git_path.exists() {
@@ -210,7 +210,7 @@ fn default_system_prompt() -> String {
     include_str!("../system.md").to_string()
 }
 
-pub fn discover_skills(cwd: &Path) -> Vec<SkillMeta> {
+pub fn discover_skills(working_dir: &Path) -> Vec<SkillMeta> {
     let mut skills = Vec::new();
     let mut seen = HashSet::new();
 
@@ -218,9 +218,9 @@ pub fn discover_skills(cwd: &Path) -> Vec<SkillMeta> {
         scan_skills_dir(&home.join(".agents").join("skills"), &mut skills, &mut seen);
     }
 
-    let git_root = find_git_root(cwd);
+    let git_root = find_git_root(working_dir);
     let boundary = git_root.as_deref().unwrap_or_else(|| Path::new("/"));
-    let mut current = Some(cwd.to_path_buf());
+    let mut current = Some(working_dir.to_path_buf());
     while let Some(dir) = current {
         scan_skills_dir(&dir.join(".agents").join("skills"), &mut skills, &mut seen);
         if dir == boundary {
@@ -276,8 +276,8 @@ fn extract_yaml_frontmatter(content: &str) -> Option<String> {
     Some(rest[..end].trim().to_string())
 }
 
-pub fn load_skill_body(name: &str, cwd: &Path) -> Option<String> {
-    let skills = discover_skills(cwd);
+pub fn load_skill_body(name: &str, working_dir: &Path) -> Option<String> {
+    let skills = discover_skills(working_dir);
     let meta = skills.into_iter().find(|s| s.name == name)?;
     let content = fs::read_to_string(&meta.path).ok()?;
     let body = extract_skill_body(&content)?;
@@ -299,11 +299,11 @@ fn extract_skill_body(content: &str) -> Option<String> {
 }
 
 pub fn recheck_context(
-    cwd: &Path,
+    working_dir: &Path,
     config: &ContextConfig,
     old_fingerprint: u64,
 ) -> io::Result<Option<ContextBundle>> {
-    let bundle = discover_context(cwd, config)?;
+    let bundle = discover_context(working_dir, config)?;
     if bundle.fingerprint == old_fingerprint {
         Ok(None)
     } else {
@@ -314,23 +314,23 @@ pub fn recheck_context(
 pub fn subdirectory_hints(
     tool_name: &str,
     arguments_json: &str,
-    cwd: Option<&Path>,
+    working_dir: Option<&Path>,
     known_paths: &[PathBuf],
 ) -> Option<String> {
     let target_path = extract_tool_path(tool_name, arguments_json)?;
-    let resolved = crate::tools::resolve_path(&target_path, cwd);
+    let resolved = crate::tools::confine_path(&target_path, working_dir).ok()?;
     let parent = resolved.parent()?;
-    let cwd_canonical = cwd
+    let working_dir_canonical = working_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let cwd_canonical = cwd_canonical
+    let working_dir_canonical = working_dir_canonical
         .canonicalize()
-        .unwrap_or_else(|_| cwd_canonical.clone());
+        .unwrap_or_else(|_| working_dir_canonical.clone());
 
     let mut hints = Vec::new();
     let mut current = Some(parent.to_path_buf());
     while let Some(dir) = current {
-        if !dir.starts_with(&cwd_canonical) || dir == cwd_canonical {
+        if !dir.starts_with(&working_dir_canonical) || dir == working_dir_canonical {
             break;
         }
 

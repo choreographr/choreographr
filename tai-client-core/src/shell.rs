@@ -69,7 +69,7 @@ fn parse_session_subcommand(rest: &str, attached_session_id: Option<u64>) -> Opt
             return Some(ShellCommand::Send(ClientMessage::CreateSession {
                 title,
                 parent_session_id: None,
-                cwd: None,
+                working_dir: None,
                 max_turns: None,
                 context_config: None,
                 account_name: None,
@@ -79,7 +79,7 @@ fn parse_session_subcommand(rest: &str, attached_session_id: Option<u64>) -> Opt
             return Some(ShellCommand::Send(ClientMessage::CreateSession {
                 title: None,
                 parent_session_id: None,
-                cwd: None,
+                working_dir: None,
                 max_turns: None,
                 context_config: None,
                 account_name: None,

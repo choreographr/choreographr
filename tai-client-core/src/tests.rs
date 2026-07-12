@@ -201,7 +201,7 @@ fn session_new_with_title() {
         ShellCommand::Send(ClientMessage::CreateSession {
             title: Some("my title".to_string()),
             parent_session_id: None,
-            cwd: None,
+            working_dir: None,
             max_turns: None,
             context_config: None,
             account_name: None,
@@ -218,7 +218,7 @@ fn session_new_without_title() {
         ShellCommand::Send(ClientMessage::CreateSession {
             title: None,
             parent_session_id: None,
-            cwd: None,
+            working_dir: None,
             max_turns: None,
             context_config: None,
             account_name: None,

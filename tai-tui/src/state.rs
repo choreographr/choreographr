@@ -370,7 +370,7 @@ pub(crate) struct SessionDetailData {
     pub(crate) selected_model: String,
     pub(crate) reasoning_effort: Option<ThinkingEffort>,
     pub(crate) parent_session_id: Option<u64>,
-    pub(crate) cwd: String,
+    pub(crate) working_dir: String,
     pub(crate) created_at: i64,
     pub(crate) message_count: u32,
     pub(crate) max_turns: Option<u32>,
@@ -687,7 +687,7 @@ impl SessionManagerState {
             let title = s.title.clone().unwrap_or_else(|| "untitled".to_string());
             let selected_model = s.selected_model.clone().unwrap_or_else(|| "-".to_string());
             let parent_session_id = s.parent_session_id;
-            let cwd = s.cwd.clone().unwrap_or_else(|| "-".to_string());
+            let working_dir = s.working_dir.clone().unwrap_or_else(|| "-".to_string());
             let created_at = s.created_at;
             let message_count = s.message_count;
             let max_turns = s.max_turns;
@@ -697,7 +697,7 @@ impl SessionManagerState {
                 selected_model,
                 reasoning_effort: s.reasoning_effort,
                 parent_session_id,
-                cwd,
+                working_dir,
                 created_at,
                 message_count,
                 max_turns,
@@ -1513,7 +1513,7 @@ impl App {
                         .send(ClientMessage::CreateSession {
                             title: Some("default".to_string()),
                             parent_session_id: None,
-                            cwd: None,
+                            working_dir: None,
                             max_turns: None,
                             context_config: None,
                             account_name: None,
@@ -1626,7 +1626,7 @@ mod tests {
             selected_model: None,
             reasoning_effort: None,
             parent_session_id: None,
-            cwd: None,
+            working_dir: None,
             created_at: 1000,
             message_count: 0,
             max_turns: None,
@@ -1644,7 +1644,7 @@ mod tests {
             selected_model: String::new(),
             reasoning_effort: None,
             parent_session_id: None,
-            cwd: String::new(),
+            working_dir: String::new(),
             created_at: 0,
             message_count: 0,
             max_turns: None,

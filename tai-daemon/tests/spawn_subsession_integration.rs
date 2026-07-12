@@ -30,7 +30,7 @@ fn spawn_subsession_happy_path() {
             DaemonCommand::CreateSession {
                 title,
                 parent_session_id,
-                cwd,
+                working_dir,
                 max_turns,
                 reasoning_effort,
                 context_config: _,
@@ -41,7 +41,7 @@ fn spawn_subsession_happy_path() {
                 // Verify the tool forwarded the right config.
                 assert_eq!(title.as_deref(), Some("test-sub"));
                 assert_eq!(parent_session_id, Some(1));
-                assert_eq!(cwd, None);
+                assert_eq!(working_dir, None);
                 assert_eq!(max_turns, Some(5));
                 assert_eq!(reasoning_effort, None);
                 assert_eq!(account_name, None);
@@ -95,7 +95,7 @@ fn spawn_subsession_happy_path() {
         daemon_tx,
         active_tool_groups: HashSet::new(),
         reasoning_effort: None,
-        cwd: None,
+        working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
 
@@ -108,7 +108,7 @@ fn spawn_subsession_happy_path() {
             categories: None,
         },
         None, // x_credentials
-        None, // cwd
+        None, // working_dir
         Some(&tool_ctx),
     );
 
@@ -152,7 +152,7 @@ fn spawn_subsession_daemon_rejects_creation() {
         daemon_tx,
         active_tool_groups: HashSet::new(),
         reasoning_effort: None,
-        cwd: None,
+        working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
 
@@ -197,7 +197,7 @@ fn spawn_subsession_daemon_disconnected() {
         daemon_tx,
         active_tool_groups: HashSet::new(),
         reasoning_effort: None,
-        cwd: None,
+        working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
 
@@ -309,7 +309,7 @@ fn spawn_subsession_inherits_categories() {
         daemon_tx,
         active_tool_groups: ["core", "shell"].into_iter().map(String::from).collect(),
         reasoning_effort: None,
-        cwd: None,
+        working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
 
@@ -380,7 +380,7 @@ fn spawn_subsession_overrides_categories() {
         daemon_tx,
         active_tool_groups: ["core", "shell"].into_iter().map(String::from).collect(),
         reasoning_effort: None,
-        cwd: None,
+        working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
 

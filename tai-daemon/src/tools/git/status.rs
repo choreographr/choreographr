@@ -18,17 +18,17 @@ pub struct GitRepoArgs {
 
 pub fn execute_git_status_tool(
     args: &GitRepoArgs,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let output = git_status_impl(args.repo_path.as_deref(), cwd)?;
+    let output = git_status_impl(args.repo_path.as_deref(), working_dir)?;
     Ok(truncate_tool_output(&output))
 }
 
 fn git_status_impl(
     repo_path: Option<&str>,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path, cwd)?;
+    let repo = open_repo(repo_path, working_dir)?;
     let mut staged = Vec::new();
     let mut unstaged = Vec::new();
     let mut untracked = Vec::new();

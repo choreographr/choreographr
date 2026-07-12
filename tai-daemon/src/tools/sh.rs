@@ -37,7 +37,7 @@ fn sh_schema() -> serde_json::Value {
             },
             "workdir": {
                 "type": "string",
-                "description": "Working directory for the command (relative to session CWD, or absolute)"
+                "description": "Working directory for the command (relative to the session working directory, or absolute)"
             },
             "timeout": {
                 "type": "integer",
@@ -63,7 +63,7 @@ define_tool!(
     "shell"
 );
 
-pub fn execute_sh_tool(args: &ShArgs, cwd: Option<&Path>) -> Result<String, ToolError> {
+pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
     let shell = &args.shell;
     let command = &args.command;
     // The per-tool timeout (default 30s) governs shell execution.
@@ -71,7 +71,7 @@ pub fn execute_sh_tool(args: &ShArgs, cwd: Option<&Path>) -> Result<String, Tool
     // absolute safety net — no independent cap needed here.
     let timeout_ms = args.timeout.unwrap_or(30000);
 
-    let resolved = resolve_and_confine(args.workdir.as_deref(), cwd)?;
+    let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
 
     let mut cmd = std::process::Command::new(shell);
     cmd.args(["-c", command])

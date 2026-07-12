@@ -18,7 +18,7 @@ pub struct GitDiffArgs {
 
 pub fn execute_git_diff_tool(
     args: &GitDiffArgs,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     let pathspec = args.pathspec.clone().unwrap_or_default();
     if args.full.unwrap_or(false) {
@@ -26,7 +26,7 @@ pub fn execute_git_diff_tool(
             args.repo_path.as_deref(),
             args.cached.unwrap_or(false),
             pathspec,
-            cwd,
+            working_dir,
         )?;
         Ok(truncate_tool_output(&output))
     } else {
@@ -34,7 +34,7 @@ pub fn execute_git_diff_tool(
             args.repo_path.as_deref(),
             args.cached.unwrap_or(false),
             pathspec,
-            cwd,
+            working_dir,
         )?;
         Ok(truncate_tool_output(&output))
     }
@@ -49,11 +49,11 @@ fn git_full_diff_impl(
     repo_path: Option<&str>,
     cached: bool,
     pathspec: Vec<String>,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     use gix::status::index_worktree::Item as WtItem;
 
-    let repo = open_repo(repo_path, cwd)?;
+    let repo = open_repo(repo_path, working_dir)?;
     let workdir = repo_work_dir_display(&repo);
 
     let mut out = String::new();
@@ -218,9 +218,9 @@ pub(crate) fn git_diff_impl(
     repo_path: Option<&str>,
     cached: bool,
     pathspec: Vec<String>,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path, cwd)?;
+    let repo = open_repo(repo_path, working_dir)?;
     let mut lines = if cached {
         collect_cached_diff_lines(&repo, &pathspec)?
     } else {

@@ -14,7 +14,7 @@ pub struct HttpRequestArgs {
 
 pub fn execute_http_request_tool(
     args: &HttpRequestArgs,
-    _cwd: Option<&Path>,
+    _working_dir: Option<&Path>,
 ) -> Result<String, ToolError> {
     match args.method.as_str() {
         "GET" | "POST" | "HEAD" => {}

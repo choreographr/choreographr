@@ -24,7 +24,7 @@ pub(crate) struct LoadSkillArgs {
 
 fn execute_list_sessions(
     _args: &ListSessionsArgs,
-    _cwd: Option<&Path>,
+    _working_dir: Option<&Path>,
     ctx: Option<&ToolContext>,
 ) -> Result<String, ToolError> {
     let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
@@ -47,10 +47,10 @@ fn execute_list_sessions(
                 .parent_session_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "none".to_string());
-            let cwd = s.cwd.as_deref().unwrap_or("(none)");
+            let working_dir = s.working_dir.as_deref().unwrap_or("(none)");
             format!(
-                "Session {}: \"{}\" | model: {} | messages: {} | parent: {} | cwd: {}",
-                s.session_id, title, model, s.message_count, parent, cwd
+                "Session {}: \"{}\" | model: {} | messages: {} | parent: {} | working_dir: {}",
+                s.session_id, title, model, s.message_count, parent, working_dir
             )
         })
         .collect();
@@ -79,7 +79,7 @@ crate::define_tool!(
 
 fn execute_get_session(
     args: &GetSessionArgs,
-    _cwd: Option<&Path>,
+    _working_dir: Option<&Path>,
     ctx: Option<&ToolContext>,
 ) -> Result<String, ToolError> {
     let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
@@ -133,9 +133,12 @@ crate::define_tool!(
 
 // ── load_skill ─────────────────────────────────────────────────────────────
 
-fn execute_load_skill(args: &LoadSkillArgs, cwd: Option<&Path>) -> Result<String, ToolError> {
-    let effective_cwd = cwd.unwrap_or_else(|| Path::new("."));
-    let body = context::load_skill_body(&args.name, effective_cwd)
+fn execute_load_skill(
+    args: &LoadSkillArgs,
+    working_dir: Option<&Path>,
+) -> Result<String, ToolError> {
+    let effective_working_dir = working_dir.unwrap_or_else(|| Path::new("."));
+    let body = context::load_skill_body(&args.name, effective_working_dir)
         .ok_or_else(|| ToolError::Other(format!("skill not found: {}", args.name)))?;
     let skill_message = format!(
         "The following skill instructions are now active:\n\n<skill name=\"{name}\">\n{body}\n</skill>",
@@ -201,7 +204,7 @@ mod tests {
                             selected_model: Some("gpt-4".into()),
                             reasoning_effort: None,
                             parent_session_id: None,
-                            cwd: Some("/tmp".into()),
+                            working_dir: Some("/tmp".into()),
                             created_at: 1000,
                             message_count: 5,
                             max_turns: None,

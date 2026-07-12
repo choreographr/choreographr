@@ -24,8 +24,8 @@ pub struct ToolContext {
     pub active_tool_groups: HashSet<String>,
     /// Reasoning effort configured for the parent session.
     pub reasoning_effort: Option<ThinkingEffort>,
-    /// Working directory for the parent session (used as fallback CWD).
-    pub cwd: Option<PathBuf>,
+    /// Working directory for the parent session (used as fallback working_dir).
+    pub working_dir: Option<PathBuf>,
     /// Cancellation flag: set to `true` when the parent session is cancelled.
     /// Tools that block indefinitely (e.g. `spawn_subsession`) should poll this
     /// and abort when it becomes `true`.
@@ -35,7 +35,7 @@ pub struct ToolContext {
 impl ToolContext {
     /// Convenience constructor for tests and simple usage where only the
     /// session ID, database, and daemon channel are needed.
-    /// New config fields (`active_tool_groups`, `reasoning_effort`, `cwd`)
+    /// New config fields (`active_tool_groups`, `reasoning_effort`, `working_dir`)
     /// default to empty/None.
     pub fn new(
         session_id: u64,
@@ -48,7 +48,7 @@ impl ToolContext {
             daemon_tx,
             active_tool_groups: HashSet::new(),
             reasoning_effort: None,
-            cwd: None,
+            working_dir: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         }
     }

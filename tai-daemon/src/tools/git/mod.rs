@@ -32,11 +32,11 @@ pub use status::{GitRepoArgs, execute_git_status_tool};
 
 pub(crate) fn open_repo(
     repo_path: Option<&str>,
-    cwd: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> Result<gix::Repository, ToolError> {
     let path = repo_path.unwrap_or(".").trim();
     let path = if path.is_empty() { "." } else { path };
-    let resolved = super::resolve_path(path, cwd);
+    let resolved = super::confine_path(path, working_dir)?;
     gix::discover(&resolved).map_err(|error| {
         ToolError::Other(format!(
             "failed to open git repository from {}: {error}",

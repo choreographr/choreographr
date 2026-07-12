@@ -212,7 +212,7 @@ impl super::Tool for DisplayImage {
         &self,
         args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        _cwd: Option<&Path>,
+        _working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
     ) -> Result<String, ToolError> {
         let image = prepare_image(&args).map_err(|e| ToolError::Other(e.to_string()))?;
