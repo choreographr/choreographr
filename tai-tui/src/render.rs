@@ -863,6 +863,33 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                 ),
                 None => "Tokens:        -".to_string(),
             }),
+            Line::from({
+                let cw = detail.context_window;
+                let tot = detail.accumulated_usage.as_ref().map(|u| u.total_tokens);
+                match (cw, tot) {
+                    (Some(limit), Some(total)) => {
+                        let pct = if limit > 0 {
+                            (total as f64 / limit as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        format!(
+                            "Context:       {}  —  {} / {} ({:.0}%)",
+                            format_count(limit),
+                            format_count(total),
+                            format_count(limit),
+                            pct,
+                        )
+                    }
+                    (Some(limit), None) => {
+                        format!("Context:       {}  —  no usage yet", format_count(limit))
+                    }
+                    (None, Some(total)) => {
+                        format!("Context:       unknown  —  {} total", format_count(total))
+                    }
+                    (None, None) => "Context:       unknown".to_string(),
+                }
+            }),
             Line::from(format!("Status:        {}", format_status(&detail.status))),
             Line::from(format!(
                 "Tool Groups:   {}",
@@ -893,6 +920,24 @@ fn format_timestamp(ts: i64) -> String {
     };
 
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Format a token count for human readability (e.g. 1234 → "1,234", 200000 → "200k").
+fn format_count(n: u32) -> String {
+    if n >= 100_000 {
+        format!("{}k", n / 1000)
+    } else {
+        // Use thousands separator
+        let s = n.to_string();
+        let mut result = String::with_capacity(s.len() + 3);
+        for (i, c) in s.chars().rev().enumerate() {
+            if i > 0 && i % 3 == 0 {
+                result.push(',');
+            }
+            result.push(c);
+        }
+        result.chars().rev().collect()
+    }
 }
 
 // ── AI Provider Accounts ──────────────────────────────────
@@ -1363,5 +1408,48 @@ pub(crate) fn diff_cell_spans(
             pad_style,
         ));
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_count;
+
+    #[test]
+    fn format_count_zero() {
+        assert_eq!(format_count(0), "0");
+    }
+
+    #[test]
+    fn format_count_small() {
+        assert_eq!(format_count(1), "1");
+        assert_eq!(format_count(12), "12");
+        assert_eq!(format_count(123), "123");
+    }
+
+    #[test]
+    fn format_count_thousands_separator() {
+        assert_eq!(format_count(1_234), "1,234");
+        assert_eq!(format_count(12_345), "12,345");
+        assert_eq!(format_count(99_999), "99,999");
+    }
+
+    #[test]
+    fn format_count_boundary() {
+        // 100_000 and above use "k" format
+        assert_eq!(format_count(100_000), "100k");
+        assert_eq!(format_count(100_001), "100k");
+    }
+
+    #[test]
+    fn format_count_large_k() {
+        assert_eq!(format_count(200_000), "200k");
+        assert_eq!(format_count(999_999), "999k");
+        assert_eq!(format_count(1_000_000), "1000k");
+    }
+
+    #[test]
+    fn format_count_u32_max() {
+        assert_eq!(format_count(u32::MAX), "4294967k");
     }
 }

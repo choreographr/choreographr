@@ -53,6 +53,7 @@ pub struct ServiceConfig {
     pub model_request_formats: HashMap<String, RequestFormat>,
     pub chat_completions_max_tokens: Option<u32>,
     pub model_max_tokens: HashMap<String, u32>,
+    pub context_window_config: crate::providers::ContextWindowConfig,
     pub responses_max_output_tokens: Option<u32>,
     pub model_responses_max_output_tokens: HashMap<String, u32>,
     pub responses_store: bool,
@@ -81,6 +82,7 @@ impl Default for ServiceConfig {
             model_request_formats: HashMap::new(),
             chat_completions_max_tokens: None,
             model_max_tokens: HashMap::new(),
+            context_window_config: crate::providers::ContextWindowConfig::default(),
             responses_max_output_tokens: None,
             model_responses_max_output_tokens: HashMap::new(),
             responses_store: true,
@@ -200,6 +202,10 @@ impl ServiceConfig {
             .get(model)
             .copied()
             .or(self.chat_completions_max_tokens)
+    }
+
+    pub fn context_window_for_model(&self, model: &str) -> Option<u32> {
+        self.context_window_config.context_window_for_model(model)
     }
 
     /// Resolve which JSON field to use for the token limit for a given model.

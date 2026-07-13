@@ -12,6 +12,7 @@ use crate::openai::{
     CompletionChunkKind, FinalTextResult,
 };
 use crate::providers::ChatTurnRequest;
+use tai_proto::TokenUsage;
 
 /// Default base URL for the Gemini API.
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -20,6 +21,7 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta
 #[derive(Debug, Clone)]
 pub struct GoogleConfig {
     pub base_url: String,
+    pub context_window_config: crate::providers::ContextWindowConfig,
     pub streaming: bool,
     pub retry_max_attempts: u32,
     pub retry_initial_backoff_ms: u64,
@@ -32,6 +34,7 @@ impl Default for GoogleConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
+            context_window_config: crate::providers::ContextWindowConfig::default(),
             streaming: true,
             retry_max_attempts: 5,
             retry_initial_backoff_ms: 1000,
@@ -66,6 +69,8 @@ impl GoogleConfig {
         if let Some(ms) = cfg.retry_max_backoff_ms {
             self.retry_max_backoff_ms = ms;
         }
+        self.context_window_config
+            .apply_overrides(cfg.context_window, cfg.model_context_windows.as_ref());
     }
 }
 
@@ -217,6 +222,12 @@ impl ProviderClient for GoogleClient {
         let result = self.validate_and_list_models();
         result.map_err(crate::providers::shared::provider_error_to_inference)
     }
+
+    fn context_window_for_model(&self, model: &str) -> Option<u32> {
+        self.config
+            .context_window_config
+            .context_window_for_model(model)
+    }
 }
 
 /// Response from GET /v1beta/models.
@@ -313,6 +324,18 @@ struct FunctionResponsePayload<'a> {
 struct GenerateContentResponse {
     #[serde(default)]
     candidates: Vec<Candidate>,
+    #[serde(default)]
+    usage_metadata: Option<UsageMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct UsageMetadata {
+    #[serde(default, rename = "promptTokenCount")]
+    prompt_token_count: u32,
+    #[serde(default, rename = "candidatesTokenCount")]
+    candidates_token_count: u32,
+    #[serde(default, rename = "totalTokenCount")]
+    total_token_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +525,11 @@ fn thinking_config_payload(effort: ThinkingEffort) -> Option<ThinkingConfigPaylo
 fn response_to_turn_result(
     response: GenerateContentResponse,
 ) -> Result<ChatTurnResult, GoogleError> {
+    let usage: Option<TokenUsage> = response.usage_metadata.map(|u| TokenUsage {
+        input_tokens: u.prompt_token_count,
+        output_tokens: u.candidates_token_count,
+        total_tokens: u.total_token_count,
+    });
     let candidate = response
         .candidates
         .into_iter()
@@ -551,7 +579,7 @@ fn response_to_turn_result(
             content,
             tool_calls,
             reasoning,
-            usage: None,
+            usage,
             response_id: None,
         }));
     }
@@ -564,7 +592,7 @@ fn response_to_turn_result(
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
         reasoning,
-        usage: None,
+        usage,
         response_id: None,
     }))
 }

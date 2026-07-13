@@ -114,6 +114,30 @@ fn test_mistral_config_apply_overrides() {
 }
 
 #[test]
+fn mistral_config_context_window_for_model_resolves_per_model() {
+    let mut cfg = MistralConfig::default();
+    cfg.context_window_config.per_model = [
+        ("codestral-2501".into(), 256_000),
+        ("mistral-large-latest".into(), 128_000),
+    ]
+    .into();
+    cfg.context_window_config.context_window = Some(32_000);
+    let client = MistralClient::new(cfg, "test-key".into()).unwrap();
+    assert_eq!(
+        client.context_window_for_model("codestral-2501"),
+        Some(256_000)
+    );
+    assert_eq!(
+        client.context_window_for_model("mistral-large-latest"),
+        Some(128_000)
+    );
+    assert_eq!(
+        client.context_window_for_model("unknown-model"),
+        Some(32_000)
+    );
+}
+
+#[test]
 fn test_build_message_payloads_system() {
     let messages = vec![ChatRequestMessage::simple(
         "system",

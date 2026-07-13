@@ -605,4 +605,10 @@ impl ProviderClient for OpenAiClient {
     fn supports_programmatic_tool_calling(&self, model: &str) -> bool {
         self.config.programmatic_tool_calling_for_model(model)
     }
+
+    fn context_window_for_model(&self, model: &str) -> Option<u32> {
+        self.config
+            .context_window_config
+            .context_window_for_model(model)
+    }
 }

@@ -187,6 +187,8 @@ Each provider from the catalog is pre-configured with sensible defaults (base_ur
 | `responses_store` | Persist Responses API conversations (default: `true`) |
 | `model_responses_max_output_tokens` | Per-model max output tokens for Responses API |
 | `programmatic_tool_calling` | Enable programmatic tool calling (Responses API, gpt-5.6+) |
+| `context_window` | Default context window for all models (overrides catalog defaults) |
+| `model_context_windows` | Per-model context window overrides (e.g. `{"gpt-4.1-nano": 1048576}`) |
 
 The Responses API is now fully supported — including tool use, streaming, reasoning effort, multi-turn chaining via `previous_response_id`, and **programmatic tool calling** (gpt-5.6+ models). When `default_request_format` is set to `"responses"`, the daemon uses the Responses endpoint for all requests (both simple completions and tool-assisted turns), with system messages mapped to the `instructions` field and tool results to `function_call_output` input items. Programmatic tool calling auto-enables for gpt-5.6 models using the Responses API; set `programmatic_tool_calling = true` in `accounts.toml` to override.
 

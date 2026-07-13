@@ -184,6 +184,9 @@ pub struct SessionSummary {
     /// Total token usage accumulated across all turns in this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
+    /// Model context window size for this session, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,6 +311,9 @@ pub enum DaemonMessage {
         /// Accumulated token usage for this session, if available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token_usage: Option<TokenUsage>,
+        /// Model context window size for this session, if known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window: Option<u32>,
     },
     SessionMessageAppended {
         message: SessionMessage,

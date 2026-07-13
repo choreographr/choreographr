@@ -54,6 +54,11 @@ pub struct AccountConfig {
     pub programmatic_tool_calling: Option<bool>,
     #[serde(default)]
     pub model_max_tokens_fields: Option<HashMap<String, MaxTokensField>>,
+    // Context window overrides
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub model_context_windows: Option<HashMap<String, u32>>,
     // Retry timing (all providers)
     #[serde(default)]
     pub retry_initial_backoff_ms: Option<u64>,
@@ -89,6 +94,8 @@ impl AccountConfig {
             programmatic_tool_calling: None,
             retry_initial_backoff_ms: None,
             retry_max_backoff_ms: None,
+            context_window: None,
+            model_context_windows: None,
         }
     }
 
@@ -157,6 +164,9 @@ impl AccountConfig {
         if let Some(ms) = self.retry_max_backoff_ms {
             config.retry_max_backoff_ms = ms;
         }
+        config
+            .context_window_config
+            .apply_overrides(self.context_window, self.model_context_windows.as_ref());
     }
 
     pub fn to_info(&self, has_credential: bool) -> AccountInfo {

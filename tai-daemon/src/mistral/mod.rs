@@ -21,6 +21,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 pub struct MistralConfig {
     pub base_url: String,
     pub max_tokens: u32,
+    pub context_window_config: crate::providers::ContextWindowConfig,
     pub streaming: bool,
     pub retry_max_attempts: u32,
     pub retry_initial_backoff_ms: u64,
@@ -34,6 +35,7 @@ impl Default for MistralConfig {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            context_window_config: crate::providers::ContextWindowConfig::default(),
             streaming: true,
             retry_max_attempts: 5,
             retry_initial_backoff_ms: 1000,
@@ -67,6 +69,8 @@ impl MistralConfig {
         if let Some(ms) = cfg.retry_max_backoff_ms {
             self.retry_max_backoff_ms = ms;
         }
+        self.context_window_config
+            .apply_overrides(cfg.context_window, cfg.model_context_windows.as_ref());
     }
 }
 
@@ -114,6 +118,12 @@ impl ProviderClient for MistralClient {
     fn list_models(&self) -> Result<Vec<String>, InferenceError> {
         let result = self.validate_and_list_models();
         result.map_err(crate::providers::shared::provider_error_to_inference)
+    }
+
+    fn context_window_for_model(&self, model: &str) -> Option<u32> {
+        self.config
+            .context_window_config
+            .context_window_for_model(model)
     }
 }
 
@@ -347,6 +357,8 @@ pub(crate) struct UsageInfo {
 struct CompletionChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<UsageInfo>,
 }
 
 #[derive(Debug, Deserialize)]

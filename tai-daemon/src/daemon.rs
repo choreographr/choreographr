@@ -370,6 +370,7 @@ impl DaemonState {
             context_config: context_config.clone().unwrap_or_default(),
             account_name: account_name.clone(),
             accumulated_usage: TokenUsage::default(),
+            context_window: None,
         };
 
         if let Err(e) = db::write_session(&self.db, sid, &record) {
@@ -389,9 +390,9 @@ impl DaemonState {
             active_tool_groups: active_cats.clone(),
             account_name: account_name.clone(),
             accumulated_usage: TokenUsage::default(),
+            context_window: None,
         };
         let session_tx = self.spawn_session(sid, record, metadata);
-
         let _ = reply.send(Ok((sid, session_tx)));
         crate::metrics::record_session_created();
         let created_msg = DaemonMessage::SessionCreated {
@@ -464,6 +465,7 @@ impl DaemonState {
                 active_tool_groups: meta.active_tool_groups.clone(),
                 account_name: meta.account_name.clone(),
                 token_usage: Some(meta.accumulated_usage.clone()),
+                context_window: meta.context_window,
             })
             .collect();
 
@@ -494,6 +496,7 @@ impl DaemonState {
                 active_tool_groups: meta.active_tool_groups.clone(),
                 account_name: meta.account_name.clone(),
                 token_usage: Some(meta.accumulated_usage.clone()),
+                context_window: meta.context_window,
             });
         let _ = reply.send(summary);
     }
@@ -1074,11 +1077,12 @@ mod tests {
                 active_tool_groups: vec!["core".into()],
                 account_name: None,
                 accumulated_usage: TokenUsage::default(),
+                context_window: None,
             },
         );
         let (reply, rx) = mpsc::channel();
         state.handle_command(DaemonCommand::ListSessions { reply });
-        let sessions = rx.recv().unwrap();
+        let sessions: Vec<SessionSummary> = rx.recv().unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, 1);
         assert_eq!(sessions[0].title.as_deref(), Some("test"));
@@ -1114,6 +1118,7 @@ mod tests {
                 active_tool_groups: vec!["core".into()],
                 account_name: None,
                 accumulated_usage: TokenUsage::default(),
+                context_window: None,
             },
         );
         let new_meta = SessionMetadata {
@@ -1129,6 +1134,7 @@ mod tests {
             active_tool_groups: vec!["core".into(), "git".into()],
             account_name: None,
             accumulated_usage: TokenUsage::default(),
+            context_window: None,
         };
         state.handle_command(DaemonCommand::UpdateMetadata {
             session_id: 1,
@@ -1298,6 +1304,7 @@ mod tests {
                 active_tool_groups: vec![],
                 account_name: Some("nonexistent".into()),
                 accumulated_usage: TokenUsage::default(),
+                context_window: None,
             },
         );
         let (reply, rx) = mpsc::channel();

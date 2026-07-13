@@ -7,13 +7,16 @@ use crate::openai::{ChatTurnResult, CompletionChunkKind, OpenAiClient};
 use tai_proto::InferenceError;
 
 mod catalog;
+pub(crate) mod context_window;
 pub(crate) mod shared;
 mod traits;
 
 pub use catalog::{
-    PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, ReasoningSupport, all_display_names,
-    all_slugs, effective_reasoning_support, lookup_provider,
+    ModelWindowEntry, PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, ReasoningSupport,
+    all_display_names, all_slugs, effective_reasoning_support, lookup_context_window,
+    lookup_provider,
 };
+pub use context_window::ContextWindowConfig;
 pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
 
 #[derive(Clone, Debug)]
@@ -131,6 +134,14 @@ impl InferenceProvider {
     /// Return the provider slug (e.g. "openai", "anthropic").
     pub fn provider_slug(&self) -> &'static str {
         self.client.provider_slug()
+    }
+
+    /// Resolve the context window for a model, using the client config first
+    /// and falling back to the static catalog for known model slugs.
+    pub fn resolve_context_window(&self, model: &str) -> Option<u32> {
+        self.client
+            .context_window_for_model(model)
+            .or_else(|| catalog::lookup_context_window(self.provider_slug(), model))
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, InferenceError> {
@@ -256,5 +267,39 @@ mod tests {
         let cfg = AccountConfig::simple("mistral", "mistral");
         let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
         assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn resolve_context_window_uses_client_then_catalog() {
+        let mut cfg = crate::openai::ServiceConfig::default();
+        cfg.context_window_config.per_model = [("gpt-4.1-nano".into(), 1_048_576)].into();
+        cfg.context_window_config.context_window = Some(128_000);
+        let client = OpenAiClient::new(cfg, "test-key".into()).unwrap();
+        let provider = InferenceProvider::from_openai(client);
+        // Per-model from client config
+        assert_eq!(
+            provider.resolve_context_window("gpt-4.1-nano"),
+            Some(1_048_576)
+        );
+        // Global fallback from client config
+        assert_eq!(
+            provider.resolve_context_window("unknown-model"),
+            Some(128_000)
+        );
+    }
+
+    #[test]
+    fn resolve_context_window_falls_back_to_catalog() {
+        // Anthropic provider with default config has no per-model map entries
+        // and no global fallback, so it falls back to the catalog.
+        let config = AnthropicConfig::default();
+        let client = AnthropicClient::new(config, "test-key".into()).unwrap();
+        let provider = InferenceProvider::from_anthropic(client);
+        assert_eq!(
+            provider.resolve_context_window("claude-sonnet-4"),
+            Some(200_000)
+        );
+        // Unknown model — neither client nor catalog knows it
+        assert_eq!(provider.resolve_context_window("completely-unknown"), None);
     }
 }

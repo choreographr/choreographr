@@ -209,6 +209,7 @@ mod tests {
                             active_tool_groups: vec!["core".into()],
                             account_name: None,
                             token_usage: Some(TokenUsage::default()),
+                            context_window: None,
                         }));
                     }
                     DaemonCommand::GetSession {

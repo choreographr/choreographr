@@ -997,6 +997,7 @@ fn make_session(id: u64, title: &str, model: &str, count: u32) -> tai_proto::Ses
         active_tool_groups: Vec::new(),
         account_name: None,
         token_usage: None,
+        context_window: None,
     }
 }
 

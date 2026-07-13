@@ -26,6 +26,10 @@ pub enum ReasoningSupport {
     GoogleThinkingConfig,
 }
 
+/// A (model_slug, context_window) pair for catalog lookup.
+/// The model slug is matched exactly against the user-selected model.
+pub type ModelWindowEntry = (&'static str, u32);
+
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderEntry {
     pub slug: &'static str,
@@ -35,6 +39,8 @@ pub struct ProviderEntry {
     pub default_model: &'static str,
     pub reasoning: ReasoningSupport,
     pub max_tokens_field: MaxTokensField,
+    /// Per-model context windows, matched exactly against the model slug.
+    pub model_context_windows: &'static [ModelWindowEntry],
 }
 
 /// Static catalog of all known providers.
@@ -47,6 +53,36 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "gpt-4.1",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[
+            ("gpt-5.6-sol", 272_000),
+            ("gpt-5.6-terra", 272_000),
+            ("gpt-5.6-luna", 272_000),
+            ("gpt-5.5", 272_000),
+            ("gpt-5.5-pro", 1_050_000),
+            ("gpt-5.4", 272_000),
+            ("gpt-5.4-pro", 1_050_000),
+            ("gpt-5.4-mini", 400_000),
+            ("gpt-5.4-nano", 400_000),
+            ("gpt-5.3-codex-spark", 128_000),
+            ("gpt-5.3-codex", 400_000),
+            ("gpt-5.2", 400_000),
+            ("gpt-5.2-codex", 400_000),
+            ("gpt-5.1", 400_000),
+            ("gpt-5.1-codex-max", 400_000),
+            ("gpt-5.1-codex", 400_000),
+            ("gpt-5.1-codex-mini", 400_000),
+            ("gpt-5", 400_000),
+            ("gpt-5-codex", 400_000),
+            ("gpt-5-nano", 400_000),
+            ("gpt-4.1-nano", 1_048_576),
+            ("gpt-4.1-mini", 1_048_576),
+            ("gpt-4.1", 1_048_576),
+            ("gpt-4o", 128_000),
+            ("gpt-4o-mini", 128_000),
+            ("o1", 200_000),
+            ("o3", 200_000),
+            ("o4-mini", 200_000),
+        ],
     },
     ProviderEntry {
         slug: "openai_compatible",
@@ -56,6 +92,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "custom-model",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "opencode",
@@ -65,6 +102,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "deepseek-v4-flash",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "opencode-go",
@@ -74,6 +112,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "deepseek-v4-pro",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "deepseek",
@@ -83,6 +122,12 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "deepseek-chat",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[
+            ("deepseek-v4-flash", 1_000_000),
+            ("deepseek-v4-pro", 1_000_000),
+            ("deepseek-chat", 64_000),
+            ("deepseek-reasoner", 64_000),
+        ],
     },
     ProviderEntry {
         slug: "xai",
@@ -92,6 +137,13 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "grok-4",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[
+            ("grok-build-0.1", 256_000),
+            ("grok-4.5", 500_000),
+            ("grok-4.3", 1_000_000),
+            ("grok-4", 131_072),
+            ("grok-3", 131_072),
+        ],
     },
     ProviderEntry {
         slug: "groq",
@@ -101,6 +153,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "llama-3.3-70b-versatile",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "together",
@@ -110,6 +163,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "mistral",
@@ -119,6 +173,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "mistral-large-latest",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "ollama",
@@ -128,6 +183,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "llama3.1",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "ollama-cloud",
@@ -137,6 +193,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "qwen3-coder:480b",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "openrouter",
@@ -146,6 +203,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "openai/gpt-4.1",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "huggingface",
@@ -155,6 +213,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "meta-llama/Llama-3.3-70B-Instruct",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "github",
@@ -164,6 +223,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "openai/gpt-4.1",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "nvidia",
@@ -173,6 +233,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "nvidia/llama-3.1-nemotron-70b-instruct",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "cerebras",
@@ -182,6 +243,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "cerebras",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "fireworks",
@@ -191,6 +253,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "accounts/fireworks/models/llama-v3p3-70b-instruct",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "xiaomi-mimo",
@@ -200,6 +263,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "mimo-vl",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "dashscope",
@@ -209,6 +273,17 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "qwen-plus",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[
+            ("qwen3.6-plus", 1_000_000),
+            ("qwen3.5-plus", 1_000_000),
+            ("qwen-plus", 131_072),
+            ("qwen-max", 32_000),
+            ("qwen-turbo", 1_000_000),
+            ("qwen2.5", 131_072),
+            ("qwen2", 131_072),
+            ("qwen3", 131_072),
+            ("qwen-vl", 131_072),
+        ],
     },
     ProviderEntry {
         slug: "moonshot",
@@ -218,6 +293,12 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "kimi-k2",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[
+            ("kimi-k2.7-code", 262_144),
+            ("kimi-k2.6", 262_144),
+            ("kimi-k2.5", 262_144),
+            ("kimi-k2", 128_000),
+        ],
     },
     ProviderEntry {
         slug: "perplexity",
@@ -227,6 +308,12 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "sonar-pro",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[
+            ("sonar-pro", 127_000),
+            ("sonar-reasoning", 127_000),
+            ("sonar-deep-research", 127_000),
+            ("sonar", 127_000),
+        ],
     },
     ProviderEntry {
         slug: "zai",
@@ -236,6 +323,13 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "glm-4.5",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[
+            ("glm-5.2", 202_752),
+            ("glm-5.1", 202_752),
+            ("glm-5", 202_752),
+            ("glm-4.5", 128_000),
+            ("glm-4", 128_000),
+        ],
     },
     ProviderEntry {
         slug: "venice",
@@ -245,6 +339,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "qwen-2.5-qwq-32b",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "novita",
@@ -254,6 +349,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "deepseek-v3",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "lmstudio",
@@ -263,6 +359,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "local-model",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "custom-openai",
@@ -272,6 +369,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "custom-model",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "anthropic",
@@ -281,6 +379,19 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "claude-sonnet-4-20250514",
         reasoning: ReasoningSupport::AnthropicThinking,
         max_tokens_field: MaxTokensField::MaxTokens,
+        model_context_windows: &[
+            ("claude-fable-5", 1_000_000),
+            ("claude-opus-4-8", 1_000_000),
+            ("claude-opus-4-7", 1_000_000),
+            ("claude-opus-4-6", 1_000_000),
+            ("claude-opus-4-5", 200_000),
+            ("claude-opus-4-1", 200_000),
+            ("claude-sonnet-5", 1_000_000),
+            ("claude-sonnet-4-6", 1_000_000),
+            ("claude-sonnet-4-5", 1_000_000),
+            ("claude-sonnet-4", 200_000),
+            ("claude-haiku-4-5", 200_000),
+        ],
     },
     ProviderEntry {
         slug: "minimax",
@@ -290,6 +401,11 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "MiniMax-M3",
         reasoning: ReasoningSupport::AnthropicThinking,
         max_tokens_field: MaxTokensField::MaxTokens,
+        model_context_windows: &[
+            ("minimax-m3", 128_000),
+            ("minimax-m2.7", 204_800),
+            ("minimax-m2.5", 204_800),
+        ],
     },
     ProviderEntry {
         slug: "custom-anthropic",
@@ -299,6 +415,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "custom-model",
         reasoning: ReasoningSupport::AnthropicThinking,
         max_tokens_field: MaxTokensField::MaxTokens,
+        model_context_windows: &[],
     },
     ProviderEntry {
         slug: "google",
@@ -308,6 +425,16 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "gemini-2.5-pro",
         reasoning: ReasoningSupport::GoogleThinkingConfig,
         max_tokens_field: MaxTokensField::MaxTokens,
+        model_context_windows: &[
+            ("gemini-3.5-flash", 1_048_576),
+            ("gemini-3.1-pro", 1_048_576),
+            ("gemini-3-flash", 1_048_576),
+            ("gemini-2.5-pro", 1_048_576),
+            ("gemini-2.5-flash", 1_048_576),
+            ("gemini-2.0-flash", 1_048_576),
+            ("gemini-1.5-pro", 2_097_152),
+            ("gemini-1.5-flash", 1_048_576),
+        ],
     },
 ];
 
@@ -325,6 +452,19 @@ impl fmt::Display for ProviderProtocol {
 /// Look up a provider entry by slug. Returns `None` if not found.
 pub fn lookup_provider(slug: &str) -> Option<&'static ProviderEntry> {
     PROVIDER_CATALOG.iter().find(|e| e.slug == slug)
+}
+
+/// Look up the context window for a model on a given provider.
+/// Matches the model slug exactly against known entries.
+/// Returns `None` if no entry matches or the provider is unknown.
+pub fn lookup_context_window(provider_slug: &str, model: &str) -> Option<u32> {
+    let entry = lookup_provider(provider_slug)?;
+    for (slug, window) in entry.model_context_windows {
+        if model == *slug {
+            return Some(*window);
+        }
+    }
+    None
 }
 
 /// Determine whether a specific model actually supports reasoning on a given
@@ -449,7 +589,68 @@ mod tests {
                 "empty model for {}",
                 entry.slug
             );
+            for (slug, window) in entry.model_context_windows {
+                assert!(!slug.is_empty(), "empty model slug in {}", entry.slug);
+                assert!(
+                    *window > 0,
+                    "invalid context window {} for slug '{slug}' in {}",
+                    window,
+                    entry.slug
+                );
+            }
         }
+    }
+
+    #[test]
+    fn lookup_context_window_known_provider() {
+        // OpenAI exact slug matches
+        assert_eq!(
+            lookup_context_window("openai", "gpt-4.1-nano"),
+            Some(1_048_576)
+        );
+        assert_eq!(lookup_context_window("openai", "gpt-5"), Some(400_000));
+        assert_eq!(lookup_context_window("openai", "gpt-5.4"), Some(272_000));
+        assert_eq!(
+            lookup_context_window("openai", "gpt-5.5-pro"),
+            Some(1_050_000)
+        );
+        // DeepSeek exact slug matches
+        assert_eq!(
+            lookup_context_window("deepseek", "deepseek-v4-flash"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            lookup_context_window("deepseek", "deepseek-v4-pro"),
+            Some(1_000_000)
+        );
+        // Anthropic exact slug matches
+        assert_eq!(
+            lookup_context_window("anthropic", "claude-sonnet-4"),
+            Some(200_000)
+        );
+        assert_eq!(
+            lookup_context_window("anthropic", "claude-sonnet-4-6"),
+            Some(1_000_000)
+        );
+        // Google exact slug matches
+        assert_eq!(
+            lookup_context_window("google", "gemini-3.5-flash"),
+            Some(1_048_576)
+        );
+        assert_eq!(
+            lookup_context_window("google", "gemini-2.5-pro"),
+            Some(1_048_576)
+        );
+    }
+
+    #[test]
+    fn lookup_context_window_unknown_provider() {
+        assert_eq!(lookup_context_window("nonexistent", "any-model"), None);
+    }
+
+    #[test]
+    fn lookup_context_window_unknown_model() {
+        assert_eq!(lookup_context_window("openai", "unknown-model-xyz"), None);
     }
 
     #[test]

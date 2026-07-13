@@ -381,6 +381,8 @@ pub(crate) struct SessionDetailData {
     pub(crate) account_name: Option<String>,
     /// Accumulated token usage for this session, if tracked.
     pub(crate) accumulated_usage: Option<TokenUsage>,
+    /// Model context window size for this session, if known.
+    pub(crate) context_window: Option<u32>,
 }
 
 pub(crate) struct SessionManagerState {
@@ -716,6 +718,7 @@ impl SessionManagerState {
                 active_tool_groups: s.active_tool_groups.clone(),
                 account_name: s.account_name.clone(),
                 accumulated_usage: s.token_usage.clone(),
+                context_window: s.context_window,
             }
         });
         if self.detail_data.is_some() {
@@ -1766,6 +1769,7 @@ mod tests {
             active_tool_groups: vec!["core".into()],
             account_name: None,
             token_usage: None,
+            context_window: None,
         }
     }
 
@@ -1784,6 +1788,7 @@ mod tests {
             active_tool_groups: vec![],
             account_name: None,
             accumulated_usage: None,
+            context_window: None,
         }
     }
 

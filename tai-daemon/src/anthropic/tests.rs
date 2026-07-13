@@ -242,6 +242,32 @@ fn config_apply_overrides() {
 }
 
 #[test]
+fn config_context_window_for_model_resolves_per_model() {
+    let mut cfg = AnthropicConfig::default();
+    cfg.context_window_config.per_model = [
+        ("claude-sonnet-4-20250514".into(), 200_000),
+        ("claude-3-haiku-20240307".into(), 48_000),
+    ]
+    .into();
+    cfg.context_window_config.context_window = Some(100_000);
+    let client = AnthropicClient::new(cfg, "test-key".into()).unwrap();
+    // Exact model match takes precedence
+    assert_eq!(
+        client.context_window_for_model("claude-sonnet-4-20250514"),
+        Some(200_000)
+    );
+    assert_eq!(
+        client.context_window_for_model("claude-3-haiku-20240307"),
+        Some(48_000)
+    );
+    // Unknown model falls back to global default
+    assert_eq!(
+        client.context_window_for_model("unknown-model"),
+        Some(100_000)
+    );
+}
+
+#[test]
 fn build_message_payloads_simple() {
     let msgs = vec![ChatRequestMessage::simple("user", "Hello".to_string())];
     let (payloads, system) = build_message_payloads(&msgs, &[]);

@@ -3,6 +3,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use tai_proto::ThinkingEffort;
+use tai_proto::TokenUsage;
 use tracing::debug;
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind};
@@ -209,10 +210,20 @@ where
     let mut full_text = String::new();
     let mut full_reasoning = String::new();
     let mut pending_tool_calls: Vec<super::ChatToolCall> = Vec::new();
+    let mut stream_usage: Option<TokenUsage> = None;
 
     while let Some(data) = reader.next_event()? {
         let payload: GenerateContentResponse =
             serde_json::from_str(&data).map_err(|e| GoogleError::Io(io::Error::other(e)))?;
+
+        // Capture token usage from the streamed response
+        if let Some(ref u) = payload.usage_metadata {
+            stream_usage = Some(TokenUsage {
+                input_tokens: u.prompt_token_count,
+                output_tokens: u.candidates_token_count,
+                total_tokens: u.total_token_count,
+            });
+        }
 
         // Process the first candidate's parts
         let Some(candidate) = payload.candidates.into_iter().next() else {
@@ -271,7 +282,7 @@ where
                 } else {
                     Some(full_reasoning)
                 },
-                usage: None,
+                usage: stream_usage.clone(),
                 response_id: None,
             },
         ));
@@ -288,7 +299,7 @@ where
         } else {
             Some(full_reasoning)
         },
-        usage: None,
+        usage: stream_usage,
         response_id: None,
     }))
 }

@@ -78,6 +78,7 @@ fn dispatch_session<H: DaemonMessageHandler>(
             max_turns,
             active_tool_groups: _,
             token_usage: _,
+            context_window: _,
             messages,
         } => {
             let title = title.unwrap_or_else(|| "untitled".to_string());
@@ -651,6 +652,7 @@ mod tests {
             messages,
             active_tool_groups: vec![],
             token_usage: None,
+            context_window: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
 
@@ -697,6 +699,7 @@ mod tests {
             messages,
             active_tool_groups: vec![],
             token_usage: None,
+            context_window: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
 
@@ -725,6 +728,7 @@ mod tests {
             messages: vec![],
             active_tool_groups: vec![],
             token_usage: None,
+            context_window: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
         let events = h.collect_events();
@@ -748,6 +752,7 @@ mod tests {
             messages: vec![],
             active_tool_groups: vec![],
             token_usage: None,
+            context_window: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
         let events = h.collect_events();
@@ -834,6 +839,7 @@ mod tests {
             active_tool_groups: vec![],
             account_name: None,
             token_usage: None,
+            context_window: None,
         }];
         dispatch_daemon_message(&mut h, DaemonMessage::Sessions { sessions }).unwrap();
         let events = h.collect_events();

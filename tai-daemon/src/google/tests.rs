@@ -124,6 +124,7 @@ fn response_to_turn_result_text_only() {
             finish_reason: Some("STOP".to_string()),
             index: 0,
         }],
+        usage_metadata: None,
     };
     let result = response_to_turn_result(resp).unwrap();
     match result {
@@ -156,6 +157,7 @@ fn response_to_turn_result_with_tool_call() {
             finish_reason: Some("STOP".to_string()),
             index: 0,
         }],
+        usage_metadata: None,
     };
     let result = response_to_turn_result(resp).unwrap();
     match result {
@@ -172,7 +174,10 @@ fn response_to_turn_result_with_tool_call() {
 
 #[test]
 fn response_to_turn_result_empty_error() {
-    let resp = GenerateContentResponse { candidates: vec![] };
+    let resp = GenerateContentResponse {
+        candidates: vec![],
+        usage_metadata: None,
+    };
     let result = response_to_turn_result(resp);
     assert!(result.is_err());
     match result {
@@ -189,6 +194,7 @@ fn response_to_turn_result_no_candidates_error() {
             finish_reason: Some("STOP".to_string()),
             index: 0,
         }],
+        usage_metadata: None,
     };
     let result = response_to_turn_result(resp);
     assert!(result.is_err());
@@ -232,6 +238,30 @@ fn google_config_apply_overrides() {
     assert_eq!(cfg.request_timeout_secs, 60);
     assert_eq!(cfg.retry_initial_backoff_ms, 2000);
     assert_eq!(cfg.retry_max_backoff_ms, 40000);
+}
+
+#[test]
+fn google_config_context_window_for_model_resolves_per_model() {
+    let mut cfg = GoogleConfig::default();
+    cfg.context_window_config.per_model = [
+        ("gemini-2.5-pro-exp-03-25".into(), 1_048_576),
+        ("gemini-1.5-flash-001".into(), 512_000),
+    ]
+    .into();
+    cfg.context_window_config.context_window = Some(128_000);
+    let client = GoogleClient::new(cfg, "test-key".into()).unwrap();
+    assert_eq!(
+        client.context_window_for_model("gemini-2.5-pro-exp-03-25"),
+        Some(1_048_576)
+    );
+    assert_eq!(
+        client.context_window_for_model("gemini-1.5-flash-001"),
+        Some(512_000)
+    );
+    assert_eq!(
+        client.context_window_for_model("unknown-model"),
+        Some(128_000)
+    );
 }
 
 // ── Client tests ──────────────────────────────────────────────────────

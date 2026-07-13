@@ -56,4 +56,9 @@ pub trait ProviderClient: Debug + Send + Sync {
     fn supports_programmatic_tool_calling(&self, _model: &str) -> bool {
         false
     }
+
+    /// Return the context window size for the given model, if known.
+    fn context_window_for_model(&self, _model: &str) -> Option<u32> {
+        None
+    }
 }

@@ -3,6 +3,7 @@ use std::sync::mpsc;
 
 use serde::Deserialize;
 use tai_proto::ThinkingEffort;
+use tai_proto::TokenUsage;
 use tracing::debug;
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind};
@@ -216,6 +217,9 @@ where
     // the same index: id comes from the first chunk that carries it, and
     // arguments are concatenated across chunks.
     let mut tool_calls_accumulated: Vec<super::StreamToolCallDelta> = Vec::new();
+    // Track token usage from the API response, typically sent in the last
+    // chunk alongside the [DONE] marker.
+    let mut stream_usage: Option<TokenUsage> = None;
 
     // Mistral uses the standard OpenAI-compatible SSE streaming format
     // where each event is a JSON-encoded CompletionChunk.
@@ -231,6 +235,15 @@ where
                 }
                 match serde_json::from_str::<super::CompletionChunk>(event) {
                     Ok(chunk) => {
+                        // Capture token usage if the chunk includes it
+                        // (typically the final chunk before [DONE]).
+                        if let Some(ref u) = chunk.usage {
+                            stream_usage = Some(TokenUsage {
+                                input_tokens: u.prompt_tokens,
+                                output_tokens: u.completion_tokens,
+                                total_tokens: u.total_tokens,
+                            });
+                        }
                         for choice in chunk.choices {
                             // Emit content deltas immediately so the caller can forward
                             // them to subscribers without buffering the full response.
@@ -302,7 +315,7 @@ where
                                             },
                                             tool_calls: calls,
                                             reasoning: None,
-                                            usage: None,
+                                            usage: stream_usage.clone(),
                                             response_id: None,
                                         },
                                     ));
@@ -353,7 +366,7 @@ where
                     },
                     tool_calls: calls,
                     reasoning: None,
-                    usage: None,
+                    usage: stream_usage.clone(),
                     response_id: None,
                 },
             ));
@@ -367,7 +380,7 @@ where
     Ok(ChatTurnResult::FinalText(crate::openai::FinalTextResult {
         content: text_accumulated,
         reasoning: None,
-        usage: None,
+        usage: stream_usage,
         response_id: None,
     }))
 }

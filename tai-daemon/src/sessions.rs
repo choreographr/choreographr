@@ -103,6 +103,7 @@ pub struct SessionMetadata {
     pub active_tool_groups: Vec<String>,
     pub account_name: Option<String>,
     pub accumulated_usage: TokenUsage,
+    pub context_window: Option<u32>,
 }
 
 /// Convert a persisted record into metadata. New sessions loaded from the
@@ -128,6 +129,7 @@ impl From<SessionRecord> for SessionMetadata {
             context_config: record.context_config,
             account_name: record.account_name,
             accumulated_usage: record.accumulated_usage,
+            context_window: record.context_window,
         };
         let mut meta = SessionMetadata::from(&config);
         // message_count is a runtime field not stored in SessionConfig,
@@ -153,6 +155,7 @@ impl From<SessionMetadata> for SessionRecord {
             context_config: ContextConfig::default(),
             account_name: meta.account_name,
             accumulated_usage: meta.accumulated_usage,
+            context_window: meta.context_window,
         }
     }
 }
@@ -192,6 +195,7 @@ pub struct SessionConfig {
     pub context_config: ContextConfig,
     pub account_name: Option<String>,
     pub accumulated_usage: TokenUsage,
+    pub context_window: Option<u32>,
 }
 
 impl Default for SessionConfig {
@@ -212,6 +216,7 @@ impl Default for SessionConfig {
             context_config: ContextConfig::default(),
             account_name: None,
             accumulated_usage: TokenUsage::default(),
+            context_window: None,
         }
     }
 }
@@ -234,6 +239,7 @@ impl From<&SessionConfig> for SessionMetadata {
             active_tool_groups: config.active_tool_groups.iter().cloned().collect(),
             account_name: config.account_name.clone(),
             accumulated_usage: config.accumulated_usage.clone(),
+            context_window: config.context_window,
         }
     }
 }
@@ -406,6 +412,7 @@ pub fn session_main(
             .as_ref()
             .map(|r| r.accumulated_usage.clone())
             .unwrap_or_default(),
+        context_window: init_record.as_ref().and_then(|r| r.context_window),
     };
     let mut state = SessionState {
         config,
@@ -698,6 +705,15 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
     }
 
     state.config.selected_model = Some(model.clone());
+    let cw = state
+        .provider
+        .as_ref()
+        .and_then(|p| p.resolve_context_window(&model));
+    debug!(
+        "session {}: resolved context_window={:?} for model={}",
+        ctx.session_id, cw, model
+    );
+    state.config.context_window = cw;
     debug!(
         "session {}: broadcasting ModelSelected model={}",
         ctx.session_id, model
@@ -795,6 +811,7 @@ fn handle_attach(
         messages: state.messages.clone(),
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
         token_usage: Some(state.config.accumulated_usage.clone()),
+        context_window: state.config.context_window,
     };
     if let Some(tx) = state.subscribers.get(&client_id) {
         let _ = tx.send(snapshot);
@@ -839,6 +856,7 @@ fn handle_get_summary(
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
         account_name: state.config.account_name.clone(),
         token_usage: Some(state.config.accumulated_usage.clone()),
+        context_window: state.config.context_window,
     });
     false
 }
@@ -903,6 +921,15 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
         reply,
     });
     if let Ok(Some(provider)) = rx.recv() {
+        // Re-resolve context window if a model is already selected.
+        if let Some(ref model) = state.config.selected_model {
+            let cw = provider.resolve_context_window(model);
+            debug!(
+                "session {}: re-resolved context_window={:?} after account change for model={}",
+                ctx.session_id, cw, model
+            );
+            state.config.context_window = cw;
+        }
         state.provider = Some(provider);
     }
     // Always store the account name on the session, even if the
@@ -1157,6 +1184,7 @@ mod tests {
             context_config: ContextConfig::default(),
             account_name: None,
             accumulated_usage: TokenUsage::default(),
+            context_window: None,
         }
     }
 
@@ -1178,6 +1206,7 @@ mod tests {
                 context_config: ContextConfig::default(),
                 account_name: None,
                 accumulated_usage: TokenUsage::default(),
+                context_window: None,
             },
             messages: vec![
                 SessionMessage::SystemText {
@@ -1230,6 +1259,7 @@ mod tests {
             active_tool_groups: vec!["git".into()],
             account_name: None,
             accumulated_usage: TokenUsage::default(),
+            context_window: None,
         };
         let record: SessionRecord = meta.clone().into();
         // Status field does not exist in record
@@ -1589,6 +1619,7 @@ mod tests {
                 output_tokens: 100,
                 total_tokens: 300,
             },
+            context_window: None,
         };
         // Round-trip through SessionRecord (persisted form)
         let record: SessionRecord = meta.clone().into();

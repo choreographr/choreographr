@@ -249,12 +249,15 @@ pub trait ProviderClient: Debug + Send + Sync {
     fn chat_completion_turn_streaming(&self, params: ChatTurnRequest<'_>, on_chunk: &mut dyn FnMut(...)) -> Result<ChatTurnResult, InferenceError>;
     fn list_models(&self) -> Result<Vec<String>, InferenceError>;
     fn supports_programmatic_tool_calling(&self, model: &str) -> bool;
+    fn context_window_for_model(&self, model: &str) -> Option<u32>;
 }
 ```
 
-`ChatTurnRequest` consolidates the six per-turn parameters into a single struct
+`ChatTurnRequest` consolidates the per-turn parameters into a single struct
 to eliminate repetitive argument passing across all provider implementations.
 Uses `&mut dyn FnMut` for the streaming callback to keep the trait object-safe.
+`context_window_for_model()` returns the model's context window size, using a
+resolution chain: per-model config → global fallback → static catalog.
 Each client implementation maps `ThinkingEffort` to its wire format:
 - **OpenAI**: `reasoning_effort` field (`"low"`, `"medium"`, `"high"`)
 - **Anthropic**: `thinking` block with `budget_tokens` (clamped to `max_tokens - 1024`)
@@ -285,6 +288,7 @@ A static `PROVIDER_CATALOG: &[ProviderEntry]` maps each provider slug to:
 - `default_base_url` — well-known API endpoint
 - `default_model` — sensible default model name
 - `reasoning` — `ReasoningSupport` variant declaring which reasoning parameter protocol the provider speaks
+- `model_context_windows` — static list of `(model_slug, window)` pairs for known models
 
 `ReasoningSupport` enum: `None`, `ReasoningEffort` (OpenAI-style), `AnthropicThinking` (thinking budget block), `GoogleThinkingConfig` (thinkingConfig field). Model-level gating is handled by `effective_reasoning_support()`, which uses name heuristics since the static catalog cannot enumerate every model variant dynamically.
 
@@ -340,9 +344,11 @@ RunInput received
         └► stream chunks via SSE → emit OutputChunk per token → Done
 ```
 
-### Token Usage Tracking
+### Token Usage & Context Window Tracking
 
-Token usage flows from providers through the daemon to all clients:
+Token usage flows from providers through the daemon to all clients.
+Each session also tracks the model's **context window size**, resolved when the model
+is selected. The TUI displays context usage as a percentage (total tokens / context window).
 
 ```
 LLM provider (API response)
@@ -382,6 +388,28 @@ pub struct TokenUsage {
     pub total_tokens: u32,
 }
 ```
+
+**Context window resolution chain (per session):**
+
+```
+handle_set_model / handle_set_account
+  └► InferenceProvider::resolve_context_window(model)
+       ├─ ProviderClient::context_window_for_model(model)
+       │    ├─ model_context_windows (exact model name match)
+       │    └─ context_window (global fallback)
+       └─ catalog::lookup_context_window(provider_slug, model)
+             └─ model_context_windows (exact model slug match)
+       │
+       ▼
+     SessionConfig.context_window: Option<u32>
+       │
+       ▼
+     Client display (e.g. "Context: 128k — 45,000 / 128,000 (35%)")
+```
+
+The `ContextWindowConfig` struct (shared across all provider configs) holds the
+per-model map and global fallback. Provider configs embed this struct; `AccountConfig`
+applies its overrides through the shared `apply_overrides()` method.
 
 All new fields use `#[serde(default)]` so old persisted sessions remain compatible (deserialize to zero usage).
 
@@ -776,7 +804,7 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 | `meta` | `&str` | `u64` counter |
 
 `SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `working_dir`,
-`message_count`, `created_at`, `context_config`, `account_name`.
+`message_count`, `created_at`, `context_config`, `account_name`, `context_window`.
 
 ### Session state (in-memory)
 
@@ -801,6 +829,7 @@ across snapshot/restore, metadata conversion, and record persistence:
 - `context_config: ContextConfig` — file discovery settings (context file names, max bytes)
 - `account_name: Option<String>` — inference account assigned to this session
 - `accumulated_usage: TokenUsage` — session-level token counter
+- `context_window: Option<u32>` — model's context window size, resolved at model selection
 
 **Runtime fields (not persisted directly):**
 
