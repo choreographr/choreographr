@@ -4,6 +4,7 @@ members = [
     "tai-daemon",
     "tai-keystore",
     "tai-markdown",
+    "tai-mcp",
     "tai-proto",
     "tai-tui",
     "tai-dioxus",
@@ -23,6 +24,7 @@ tai-keystore = { path = "tai-keystore" }
 tai-proto = { path = "tai-proto" }
 tai-im = { path = "tai-im" }
 tai-markdown = { path = "tai-markdown" }
+tai-mcp = { path = "tai-mcp" }
 tai-transport = { path = "tai-transport" }
 ureq = { version = "3", features = ["json"] }
 ammonia = "4"

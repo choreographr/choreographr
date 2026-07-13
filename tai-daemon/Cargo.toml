@@ -34,6 +34,7 @@ x25519-dalek.workspace = true
 hkdf.workspace = true
 zeroize.workspace = true
 tai-keystore.workspace = true
+tai-mcp.workspace = true
 tai-proto.workspace = true
 tai-transport.workspace = true
 signal-hook.workspace = true

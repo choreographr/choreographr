@@ -495,9 +495,9 @@ fn build_tool_payloads(tools: &[ChatToolDefinition]) -> serde_json::Value {
         .iter()
         .map(|t| {
             serde_json::json!({
-                "name": t.function.name,
-                "description": t.function.description,
-                "parameters": t.function.parameters,
+                "name": &t.function.name,
+                "description": &t.function.description,
+                "parameters": &t.function.parameters,
             })
         })
         .collect();

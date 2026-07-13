@@ -465,7 +465,7 @@ pub fn session_main(
             .as_deref()
             .unwrap_or_else(|| Path::new("."));
         let skills = context::discover_skills(effective_working_dir);
-        let base_prompt = context::build_base_prompt(&skills, ctx.tool_registry.groups());
+        let base_prompt = context::build_base_prompt(&skills, &ctx.tool_registry.groups());
         state.messages.push(SessionMessage::SystemText {
             content: base_prompt,
         });

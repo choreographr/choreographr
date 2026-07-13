@@ -35,6 +35,7 @@ fn test_daemon_state() -> DaemonState {
         client_streams: Vec::new(),
         summary_subscribers: HashMap::new(),
         model_cache: HashMap::new(),
+        mcp_manager: tai_daemon::mcp::McpManager::empty(),
     }
 }
 

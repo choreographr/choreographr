@@ -27,7 +27,7 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 
 ## Workspace topology
 
-Nine crates in a single Cargo workspace (resolver = "3"):
+Ten crates in a single Cargo workspace (resolver = "3"):
 
 ```
 tai (workspace)
@@ -36,6 +36,8 @@ tai (workspace)
 ├── tai-transport       Noise IK encrypted TCP transport abstraction
 ├── tai-client-core     Shared client logic (parsing, images, history, credentials)
 ├── tai-markdown        Markdown parser and HTML renderer (pulldown-cmark + ammonia)
+├── tai-mcp             MCP (Model Context Protocol) client — spawns subprocess servers,
+│                       discovers tools, and dispatches tool calls over JSON-RPC stdio
 ├── tai-daemon          Unix socket server — the core engine
 ├── tai-tui              Terminal UI client (ratatui + crossterm)
 ├── tai-dioxus          Desktop GUI client (Dioxus)
@@ -60,12 +62,12 @@ tai (workspace)
       └────┬───────┬────┘   │       └───────────────┬──────────┘
            │       │        │                       │
            │  ┌────▼────────▼────┐                  │
-           │  │  tai-transport   │◄─────────────────┘
-           │  └────────┬────────┘
-           │           │
-      ┌────▼───┐ ┌────▼────┐ ┌────▼───┐
-      │tai-tui  │ │tai-dioxus│ │tai-im  │
-      └────────┘ └─────────┘ └────────┘
+            │  │  tai-transport   │◄─────────────────┐
+            │  └────────┬────────┘                  │
+            │           │                   ┌───────▼──────┐
+       ┌────▼───┐ ┌────▼────┐ ┌────▼───┐   │   tai-mcp    │
+       │tai-tui  │ │tai-dioxus│ │tai-im  │   │ (MCP client)│
+       └────────┘ └─────────┘ └────────┘   └──────────────┘
 ```
 
 ---
@@ -194,6 +196,19 @@ Used by `tai-tui`, `tai-dioxus`, and `tai-im`.
 `DaemonMessageHandler` trait uses `ClientError` (thiserror enum) — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `PrivateKeyEncRead`, `PrivateKeyDecrypt`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Postcard`, `Encryption`.
 
 
+### `tai-mcp` — MCP client (Model Context Protocol)
+
+Communicates with MCP server subprocesses over JSON-RPC 2.0 stdio transport.
+Used by `tai-daemon` to spawn external MCP servers and register their tools.
+
+| Module | Purpose |
+|---|---|
+| `client.rs` | `McpClient` — spawns a subprocess, performs MCP initialize handshake, discovers tools (`list_tools`), and dispatches tool calls (`call_tool`) |
+| `protocol.rs` | JSON-RPC 2.0 wire types (`JsonRpcRequest`, `JsonRpcResponse`) and MCP protocol types (`McpTool`, `CallToolResult`, `McpContent`) |
+| `transport.rs` | `StdioTransport` — manages a subprocess stdin/stdout, routes incoming JSON-RPC lines to response/notification channels |
+| `error.rs` | `McpError` enum — `SpawnFailed`, `InitializeFailed`, `JsonRpcError`, `ProtocolError`, `Timeout`, `Io`, `ServerShutdown`, `ToolNotFound`, `InvalidParams` |
+
+
 ### `tai-daemon` — Core server
 
 Entry point: `src/main.rs` → initializes tracing, creates `DaemonState`, runs socket server.
@@ -224,6 +239,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, working directory) passed to tools that need DB or daemon access or parent config for sub-sessions. |
 | `tools/db.rs` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
+| `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json`, spawns subprocesses via `McpClient`, wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) and registers them in the `ToolRegistry` under a `mcp/<slug>` group. |
 
 ### Provider Architecture
 
@@ -1344,6 +1360,8 @@ Sandboxing (shared across all shell/exec tools via `shell_util.rs`):
 | Protocol | Framing, version handling, round-trip encode/decode | `tai-proto/src/tests.rs` |
 | Client core | Shell parsing, markdown→HTML, image assembly, history | `tai-client-core/src/tests.rs` |
 | Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `tai-daemon/src/tests.rs`, `tai-daemon/tests/integration.rs` |
+| MCP (tai-mcp) | Server spawn, tool discovery, echo tool call/response | `tai-mcp/tests/mcp_integration.rs` |
+| MCP (daemon) | McpManager + ToolRegistry integration, dynamic group registration, tool execution | `tai-daemon/tests/mcp_integration.rs` |
 | Daemon OpenAI | SSE parsing, HTTP request construction, config loading | `tai-daemon/src/openai/tests.rs` |
 | Daemon Anthropic | Content block deserialisation, response→turn result conversion, message payload building, config overrides | `tai-daemon/src/anthropic/tests.rs` |
 | tai-tui | SVG rasterization, Unicode width, app state | `tai-tui/src/app_tests.rs`, `tai-tui/src/lib_tests.rs` |

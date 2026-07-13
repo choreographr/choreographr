@@ -118,6 +118,12 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Build the tool registry and initialize MCP servers before wrapping
+    // in Arc (McpManager needs &mut ToolRegistry to register dynamic tools).
+    let mut tool_registry = tai_daemon::tools::ToolRegistry::new();
+    let mcp_manager = tai_daemon::mcp::McpManager::from_config(&mut tool_registry);
+    let tool_registry = tool_registry.build();
+
     let state = DaemonState {
         daemon_tx,
         // Compute the next session ID from actual session records so we
@@ -139,10 +145,11 @@ fn main() -> anyhow::Result<()> {
         credentials: std::collections::HashMap::new(),
         x_credentials: None,
         db,
-        tool_registry: tai_daemon::tools::ToolRegistry::new().build(),
+        tool_registry,
         client_streams: Vec::new(),
         summary_subscribers: std::collections::HashMap::new(),
         model_cache: HashMap::new(),
+        mcp_manager,
     };
 
     // Load or generate the transport keypair for Noise IK.

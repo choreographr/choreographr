@@ -262,18 +262,18 @@ pub(crate) struct Usage {
 pub struct ChatToolDefinition {
     #[serde(rename = "type")]
     kind: &'static str,
-    pub(crate) function: ChatToolFunction,
+    pub function: ChatToolFunction,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct ChatToolFunction {
-    pub(crate) name: &'static str,
-    pub(crate) description: &'static str,
-    pub(crate) parameters: serde_json::Value,
+pub struct ChatToolFunction {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) output_schema: Option<serde_json::Value>,
+    pub output_schema: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) allowed_callers: Option<Vec<AllowedCaller>>,
+    pub allowed_callers: Option<Vec<AllowedCaller>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -431,15 +431,15 @@ pub enum CompletionChunkKind {
 
 impl ChatToolDefinition {
     pub fn function(
-        name: &'static str,
-        description: &'static str,
+        name: impl Into<String>,
+        description: impl Into<String>,
         parameters: serde_json::Value,
     ) -> Self {
         Self {
             kind: "function",
             function: ChatToolFunction {
-                name,
-                description,
+                name: name.into(),
+                description: description.into(),
                 parameters,
                 output_schema: None,
                 allowed_callers: None,
@@ -449,8 +449,8 @@ impl ChatToolDefinition {
 
     /// Create a tool definition with output_schema and allowed_callers.
     pub fn function_with_options(
-        name: &'static str,
-        description: &'static str,
+        name: impl Into<String>,
+        description: impl Into<String>,
         parameters: serde_json::Value,
         output_schema: Option<serde_json::Value>,
         allowed_callers: Option<Vec<AllowedCaller>>,
@@ -458,8 +458,8 @@ impl ChatToolDefinition {
         Self {
             kind: "function",
             function: ChatToolFunction {
-                name,
-                description,
+                name: name.into(),
+                description: description.into(),
                 parameters,
                 output_schema,
                 allowed_callers,

@@ -6,6 +6,7 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::mpsc;
 use tai_keystore::ServiceCredential;
 
@@ -115,7 +116,7 @@ pub struct ToolResult {
 
 #[derive(Debug)]
 pub struct ToolExecutionOutput {
-    pub(crate) result: ToolResult,
+    pub result: ToolResult,
 }
 
 #[derive(Debug)]
@@ -129,8 +130,8 @@ pub struct PreparedImage {
 
 #[derive(Debug, Clone)]
 pub struct ToolGroup {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
 }
 
 /// Typed tool trait. Each tool declares its Args and Return types.
@@ -203,9 +204,9 @@ pub trait Tool: Send + Sync {
 /// Type-erased dispatch trait stored in ToolRegistry.
 /// Converts between JSON/binary and the typed Tool::execute().
 pub trait ToolDyn: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn group(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    fn name(&self) -> &str;
+    fn group(&self) -> &str;
+    fn description(&self) -> &str;
     fn schema(&self) -> serde_json::Value;
     fn output_schema(&self) -> Option<serde_json::Value>;
     fn allowed_callers(&self) -> Vec<AllowedCaller>;
@@ -387,35 +388,41 @@ impl<T: Tool + 'static> ToolDyn for T {
     }
 }
 
-pub const GROUPS: &[ToolGroup] = &[
-    ToolGroup {
-        name: "core",
-        description: "File system operations, HTTP requests, image display, file search, random values, and time queries",
-    },
-    ToolGroup {
-        name: "db",
-        description: "Session-scoped key-value database (redb)",
-    },
-    ToolGroup {
-        name: "git",
-        description: "Local Git repository operations (status, diff, log, add, commit, push)",
-    },
-    ToolGroup {
-        name: "shell",
-        description: "Shell command execution (bash, nushell, fish, exec)",
-    },
-    ToolGroup {
-        name: "x",
-        description: "X/Twitter API (post, search, user lookup)",
-    },
-    ToolGroup {
-        name: "vm",
-        description: "RISC-V sandboxed code execution",
-    },
-];
+pub fn static_groups() -> &'static [ToolGroup] {
+    static GROUPS: OnceLock<Vec<ToolGroup>> = OnceLock::new();
+    GROUPS.get_or_init(|| {
+        vec![
+            ToolGroup {
+                name: "core".into(),
+                description: "File system operations, HTTP requests, image display, file search, random values, and time queries".into(),
+            },
+            ToolGroup {
+                name: "db".into(),
+                description: "Session-scoped key-value database (redb)".into(),
+            },
+            ToolGroup {
+                name: "git".into(),
+                description: "Local Git repository operations (status, diff, log, add, commit, push)".into(),
+            },
+            ToolGroup {
+                name: "shell".into(),
+                description: "Shell command execution (bash, nushell, fish, exec)".into(),
+            },
+            ToolGroup {
+                name: "x".into(),
+                description: "X/Twitter API (post, search, user lookup)".into(),
+            },
+            ToolGroup {
+                name: "vm".into(),
+                description: "RISC-V sandboxed code execution".into(),
+            },
+        ]
+    })
+}
 
 pub struct ToolRegistry {
-    tools: HashMap<&'static str, Box<dyn ToolDyn>>,
+    tools: HashMap<String, Box<dyn ToolDyn>>,
+    dynamic_groups: Vec<(String, String)>,
 }
 
 impl Default for ToolRegistry {
@@ -428,6 +435,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
             tools: HashMap::new(),
+            dynamic_groups: Vec::new(),
         };
         reg.register(fs::ReadFile);
         reg.register(fs::ReadFileRange);
@@ -491,7 +499,7 @@ impl ToolRegistry {
     }
 
     pub(crate) fn register(&mut self, tool: impl Tool + 'static) {
-        let name = tool.name();
+        let name = tool.name().to_string();
         self.tools.insert(name, Box::new(tool));
     }
 
@@ -568,17 +576,54 @@ impl ToolRegistry {
         }
     }
 
-    pub fn groups(&self) -> &[ToolGroup] {
-        GROUPS
+    /// Register a dynamically-loaded tool (e.g. from an MCP server).
+    /// The group name must already be registered via `register_dynamic_group`.
+    pub fn register_dynamic(&mut self, name: String, group: String, tool: Box<dyn ToolDyn>) {
+        tracing::debug!(tool = %name, group = %group, "registered dynamic tool");
+        self.tools.insert(name, tool);
+    }
+
+    /// Register a dynamic tool group name so it appears in group listings.
+    pub fn register_dynamic_group(&mut self, name: String, description: String) {
+        self.dynamic_groups.push((name, description));
+    }
+
+    /// Remove all tools belonging to a dynamic group and return their names.
+    pub fn unregister_group(&mut self, group: &str) -> Vec<String> {
+        let mut removed = Vec::new();
+        self.tools.retain(|name, tool| {
+            if tool.group() == group {
+                removed.push(name.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.dynamic_groups.retain(|(g, _)| g != group);
+        if !removed.is_empty() {
+            tracing::debug!(group = %group, count = removed.len(), "unregistered dynamic group");
+        }
+        removed
+    }
+
+    pub fn groups(&self) -> Vec<ToolGroup> {
+        let mut groups: Vec<ToolGroup> = static_groups().to_vec();
+        for (name, desc) in &self.dynamic_groups {
+            groups.push(ToolGroup {
+                name: name.clone(),
+                description: desc.clone(),
+            });
+        }
+        groups
     }
 
     /// Return group names suitable for a JSON Schema enum (excluding "core", which
     /// is always active and should not appear in load_tools/unload_tools schemas).
-    pub fn group_names(&self) -> Vec<&'static str> {
-        GROUPS
-            .iter()
-            .filter(|c| c.name != "core")
-            .map(|c| c.name)
+    pub fn group_names(&self) -> Vec<String> {
+        self.groups()
+            .into_iter()
+            .filter(|g| g.name != "core")
+            .map(|g| g.name)
             .collect()
     }
 

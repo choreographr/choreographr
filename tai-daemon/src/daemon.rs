@@ -1,5 +1,6 @@
 use crate::accounts::{AccountConfig, AccountManager, accounts_config_path};
 use crate::db::{self, SessionRecord};
+use crate::mcp::McpManager;
 use crate::providers::InferenceProvider;
 use crate::sessions::{
     ActiveSessionEntry, RequestContext, SessionCommand, SessionMetadata, session_main,
@@ -39,6 +40,7 @@ pub struct DaemonState {
     pub client_streams: Vec<UnixStream>,
     pub summary_subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>,
     pub model_cache: HashMap<String, (Vec<String>, Instant)>,
+    pub mcp_manager: McpManager,
 }
 
 pub enum DaemonCommand {
@@ -1050,6 +1052,7 @@ mod tests {
             client_streams: Vec::new(),
             summary_subscribers: HashMap::new(),
             model_cache: HashMap::new(),
+            mcp_manager: crate::mcp::McpManager::empty(),
         };
         (state, daemon_rx)
     }

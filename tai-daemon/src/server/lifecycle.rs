@@ -72,6 +72,8 @@ pub fn run_server(
         for (_, entry) in active_sessions {
             let _ = entry.handle.join();
         }
+        // Shut down MCP servers after all sessions have exited.
+        state.mcp_manager.shutdown_all();
     });
 
     // Initialize the metrics registry so that instrumented code throughout

@@ -542,8 +542,8 @@ fn build_tool_payloads(tools: &[ChatToolDefinition]) -> Vec<ToolPayload<'_>> {
         .map(|t| {
             // Each ChatToolDefinition has a single "function" entry.
             ToolPayload {
-                name: t.function.name,
-                description: t.function.description,
+                name: &t.function.name,
+                description: &t.function.description,
                 input_schema: Some(t.function.parameters.clone()),
             }
         })

@@ -7532,6 +7532,7 @@ dependencies = [
  "sha2 0.11.0",
  "signal-hook 0.4.4",
  "tai-keystore",
+ "tai-mcp",
  "tai-proto",
  "tai-transport",
  "tempfile",
@@ -7608,6 +7609,16 @@ dependencies = [
  "ammonia",
  "pulldown-cmark",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "tai-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
