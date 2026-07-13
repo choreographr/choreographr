@@ -1,11 +1,18 @@
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use thiserror::Error;
 
 use ammonia::Builder as HtmlSanitizer;
 use pulldown_cmark::{
     Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd, html,
 };
+
+/// Error type for markdown parsing. Currently all operations are infallible,
+/// but the type is defined here to establish the error-handling convention.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[error("markdown error")]
+pub struct MarkdownError;
 
 /// A parsed Markdown document, represented as an ordered list of block-level nodes.
 ///
@@ -474,7 +481,7 @@ impl Display for MarkdownDocument {
 }
 
 impl FromStr for MarkdownDocument {
-    type Err = std::convert::Infallible;
+    type Err = MarkdownError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::parse(s))

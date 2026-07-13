@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 pulldown-cmark = "0.13"
 ammonia.workspace = true
+thiserror.workspace = true
