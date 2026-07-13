@@ -4,13 +4,14 @@ use crate::state::*;
 use crate::test_util::test_app;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::text::Line;
+use std::sync::Arc;
 use tai_client_core::DaemonMessageHandler;
 use tai_proto::{ClientMessage, OutputStream};
 use tui_prompts::State;
 
 #[test]
 fn app_push_text_trims_history_to_limit() {
-    let mut app = test_app("/tmp/tai.sock", "Halfblocks");
+    let mut app = test_app("/tmp/tai.sock");
     for index in 0..600 {
         app.push_text(format!("line {index}"));
     }
@@ -28,7 +29,7 @@ fn app_push_text_trims_history_to_limit() {
 
 #[test]
 fn drop_request_removes_active_request() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.active.insert(42);
     app.begin_stream(42);
     app.drop_request(42);
@@ -38,7 +39,7 @@ fn drop_request_removes_active_request() {
 
 #[test]
 fn append_stream_text_updates_mutable_history_entry() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.begin_stream(7);
     app.append_stream_text(7, OutputStream::Reasoning, "thinking");
     app.append_stream_text(7, OutputStream::Answer, "hello");
@@ -57,7 +58,7 @@ fn append_stream_text_updates_mutable_history_entry() {
 
 #[test]
 fn append_stream_text_preserves_manual_scroll_position() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.width = 10;
     app.history_viewport.height = 1;
     app.push_text("older");
@@ -82,7 +83,7 @@ fn append_stream_text_preserves_manual_scroll_position() {
 
 #[test]
 fn append_stream_text_keeps_following_when_at_bottom() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.begin_stream(7);
 
     app.append_stream_text(7, OutputStream::Answer, "hello");
@@ -197,22 +198,18 @@ fn oversized_history_item_keeps_visible_tail() {
 }
 
 #[test]
-fn image_item_height_uses_protocol_size_for() {
-    let picker = ratatui_image::picker::Picker::halfblocks();
-    let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><rect width='100' height='50' fill='red'/></svg>"#;
-    let image = tai_tui::build_rendered_image(
-        &picker,
+fn image_item_height_returns_placeholder_height_when_protocol_none() {
+    let image = tai_tui::RenderedImage::new_placeholder(
         tai_proto::ImageMetadata {
             image_id: 1,
             mime_type: "image/svg+xml".to_string(),
             width: 100,
             height: 50,
-            byte_len: svg.len() as u64,
+            byte_len: 0,
             alt: None,
         },
-        svg.to_vec(),
-    )
-    .expect("svg should render");
+        Arc::<[u8]>::from(vec![]),
+    );
     let item = crate::state::HistoryItem::Image(Box::new(image));
 
     let viewport = crate::state::HistoryViewport {
@@ -220,16 +217,13 @@ fn image_item_height_uses_protocol_size_for() {
         height: 24,
     };
     let height = viewport.item_height(&item);
-    assert!(height >= 1, "image item height must be at least 1");
-    assert!(
-        height <= 12,
-        "image should not exceed half the viewport height (24/2=12)"
-    );
+    // Placeholder height should be half the viewport height
+    assert_eq!(height, 12, "placeholder height should be half the viewport");
 }
 
 #[test]
 fn terminal_event_appends_characters() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
@@ -252,7 +246,7 @@ fn terminal_event_appends_characters() {
 
 #[test]
 fn terminal_event_submits_run_input() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -279,7 +273,7 @@ fn terminal_event_submits_run_input() {
 fn terminal_event_esc_opens_home() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         &mut app,
@@ -294,7 +288,7 @@ fn terminal_event_esc_opens_home() {
 #[test]
 fn terminal_event_ctrl_c_opens_settings() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
@@ -310,7 +304,7 @@ fn terminal_event_ctrl_c_opens_settings() {
 
 #[test]
 fn insert_char_at_cursor_appends_when_at_end() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.insert_char_at_cursor('a');
     app.input.insert_char_at_cursor('b');
     app.input.insert_char_at_cursor('c');
@@ -320,7 +314,7 @@ fn insert_char_at_cursor_appends_when_at_end() {
 
 #[test]
 fn insert_char_at_cursor_inserts_in_middle() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abde".to_string();
     app.input.cursor = 2;
     app.input.insert_char_at_cursor('c');
@@ -330,7 +324,7 @@ fn insert_char_at_cursor_inserts_in_middle() {
 
 #[test]
 fn insert_char_at_cursor_works_at_start() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "bc".to_string();
     app.input.cursor = 0;
     app.input.insert_char_at_cursor('a');
@@ -340,7 +334,7 @@ fn insert_char_at_cursor_works_at_start() {
 
 #[test]
 fn cursor_left_moves_back_by_one_grapheme() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abcd".to_string();
     app.input.cursor = 4;
     app.input.cursor_left();
@@ -351,7 +345,7 @@ fn cursor_left_moves_back_by_one_grapheme() {
 
 #[test]
 fn cursor_left_stops_at_start() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "a".to_string();
     app.input.cursor = 1;
     app.input.cursor_left();
@@ -362,7 +356,7 @@ fn cursor_left_stops_at_start() {
 
 #[test]
 fn cursor_left_is_grapheme_aware() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "a😀b".to_string();
     app.input.cursor = 6;
     app.input.cursor_left();
@@ -375,7 +369,7 @@ fn cursor_left_is_grapheme_aware() {
 
 #[test]
 fn cursor_right_moves_forward_by_one_grapheme() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abcd".to_string();
     app.input.cursor = 0;
     app.input.cursor_right();
@@ -386,7 +380,7 @@ fn cursor_right_moves_forward_by_one_grapheme() {
 
 #[test]
 fn cursor_right_stops_at_end() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "a".to_string();
     app.input.cursor = 0;
     app.input.cursor_right();
@@ -397,7 +391,7 @@ fn cursor_right_stops_at_end() {
 
 #[test]
 fn cursor_right_is_grapheme_aware() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "a😀b".to_string();
     app.input.cursor = 0;
     app.input.cursor_right();
@@ -408,7 +402,7 @@ fn cursor_right_is_grapheme_aware() {
 
 #[test]
 fn cursor_home_moves_to_start() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     app.input.cursor_home();
@@ -417,7 +411,7 @@ fn cursor_home_moves_to_start() {
 
 #[test]
 fn cursor_end_moves_to_end() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
     app.input.cursor = 0;
     app.input.cursor_end();
@@ -426,7 +420,7 @@ fn cursor_end_moves_to_end() {
 
 #[test]
 fn backspace_at_cursor_removes_before_cursor() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abcd".to_string();
     app.input.cursor = 3;
     app.input.backspace_at_cursor();
@@ -436,7 +430,7 @@ fn backspace_at_cursor_removes_before_cursor() {
 
 #[test]
 fn backspace_at_cursor_does_nothing_at_start() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "a".to_string();
     app.input.cursor = 0;
     app.input.backspace_at_cursor();
@@ -446,7 +440,7 @@ fn backspace_at_cursor_does_nothing_at_start() {
 
 #[test]
 fn backspace_at_cursor_is_grapheme_aware() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "a😀".to_string();
     app.input.cursor = 5;
     app.input.backspace_at_cursor();
@@ -456,7 +450,7 @@ fn backspace_at_cursor_is_grapheme_aware() {
 
 #[test]
 fn delete_at_cursor_removes_at_cursor() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abcd".to_string();
     app.input.cursor = 1;
     app.input.delete_at_cursor();
@@ -466,7 +460,7 @@ fn delete_at_cursor_removes_at_cursor() {
 
 #[test]
 fn delete_at_cursor_does_nothing_at_end() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "a".to_string();
     app.input.cursor = 1;
     app.input.delete_at_cursor();
@@ -476,7 +470,7 @@ fn delete_at_cursor_does_nothing_at_end() {
 
 #[test]
 fn delete_at_cursor_is_grapheme_aware() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "a😀b".to_string();
     app.input.cursor = 1;
     app.input.delete_at_cursor();
@@ -486,7 +480,7 @@ fn delete_at_cursor_is_grapheme_aware() {
 
 #[test]
 fn word_left_moves_to_previous_word() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello world foo".to_string();
     app.input.cursor = 15;
     app.input.word_left();
@@ -499,7 +493,7 @@ fn word_left_moves_to_previous_word() {
 
 #[test]
 fn word_left_stays_at_zero() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
     app.input.cursor = 0;
     app.input.word_left();
@@ -508,7 +502,7 @@ fn word_left_stays_at_zero() {
 
 #[test]
 fn word_right_moves_to_next_word() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello world foo".to_string();
     app.input.cursor = 0;
     app.input.word_right();
@@ -521,7 +515,7 @@ fn word_right_moves_to_next_word() {
 
 #[test]
 fn word_right_stays_at_end() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     app.input.word_right();
@@ -530,7 +524,7 @@ fn word_right_stays_at_end() {
 
 #[test]
 fn word_right_skips_whitespace() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "  hello  ".to_string();
     app.input.cursor = 0;
     app.input.word_right();
@@ -539,7 +533,7 @@ fn word_right_skips_whitespace() {
 
 #[test]
 fn delete_word_backward_removes_previous_word() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello world".to_string();
     app.input.cursor = 11;
     app.input.delete_word_backward();
@@ -549,7 +543,7 @@ fn delete_word_backward_removes_previous_word() {
 
 #[test]
 fn delete_word_backward_at_start_does_nothing() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
     app.input.cursor = 0;
     app.input.delete_word_backward();
@@ -559,7 +553,7 @@ fn delete_word_backward_at_start_does_nothing() {
 
 #[test]
 fn delete_word_forward_removes_next_word() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello world foo".to_string();
     app.input.cursor = 6;
     app.input.delete_word_forward();
@@ -569,7 +563,7 @@ fn delete_word_forward_removes_next_word() {
 
 #[test]
 fn delete_word_forward_at_end_does_nothing() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     app.input.delete_word_forward();
@@ -579,7 +573,7 @@ fn delete_word_forward_at_end_does_nothing() {
 
 #[test]
 fn delete_to_start_removes_from_beginning_to_cursor() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello world".to_string();
     app.input.cursor = 6;
     app.input.delete_to_start();
@@ -589,7 +583,7 @@ fn delete_to_start_removes_from_beginning_to_cursor() {
 
 #[test]
 fn delete_to_start_when_at_end_clears_input() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     app.input.delete_to_start();
@@ -599,7 +593,7 @@ fn delete_to_start_when_at_end_clears_input() {
 
 #[test]
 fn delete_to_start_when_at_zero_does_nothing() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
     app.input.cursor = 0;
     app.input.delete_to_start();
@@ -609,7 +603,7 @@ fn delete_to_start_when_at_zero_does_nothing() {
 
 #[test]
 fn terminal_event_submit_resets_cursor() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -627,7 +621,7 @@ fn terminal_event_submit_resets_cursor() {
 
 #[test]
 fn terminal_event_arrow_keys_move_cursor() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abc".to_string();
     app.input.cursor = 3;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -651,7 +645,7 @@ fn terminal_event_arrow_keys_move_cursor() {
 
 #[test]
 fn terminal_event_home_end_move_cursor() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abc".to_string();
     app.input.cursor = 1;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -675,7 +669,7 @@ fn terminal_event_home_end_move_cursor() {
 
 #[test]
 fn terminal_event_delete_removes_at_cursor() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abcd".to_string();
     app.input.cursor = 1;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -693,7 +687,7 @@ fn terminal_event_delete_removes_at_cursor() {
 
 #[test]
 fn terminal_event_backspace_uses_cursor() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abcd".to_string();
     app.input.cursor = 3;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -711,7 +705,7 @@ fn terminal_event_backspace_uses_cursor() {
 
 #[test]
 fn terminal_event_inserts_char_at_cursor() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abd".to_string();
     app.input.cursor = 2;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -729,7 +723,7 @@ fn terminal_event_inserts_char_at_cursor() {
 
 #[test]
 fn terminal_event_ctrl_backspace_deletes_word_backward() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello world".to_string();
     app.input.cursor = 11;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -747,7 +741,7 @@ fn terminal_event_ctrl_backspace_deletes_word_backward() {
 
 #[test]
 fn terminal_event_ctrl_w_deletes_word_backward() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello world".to_string();
     app.input.cursor = 11;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -765,7 +759,7 @@ fn terminal_event_ctrl_w_deletes_word_backward() {
 
 #[test]
 fn terminal_event_ctrl_u_deletes_to_start() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello world".to_string();
     app.input.cursor = 6;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -783,7 +777,7 @@ fn terminal_event_ctrl_u_deletes_to_start() {
 
 #[test]
 fn terminal_event_ctrl_delete_deletes_word_forward() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello world foo".to_string();
     app.input.cursor = 6;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -822,7 +816,7 @@ fn word_right_respects_punctuation_boundaries() {
 
 #[test]
 fn word_delete_within_whitespace_does_not_panic() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "  hello  world  ".to_string();
     app.input.cursor = 8;
     // Must not panic when cursor sits within whitespace between words.
@@ -833,7 +827,7 @@ fn word_delete_within_whitespace_does_not_panic() {
 #[test]
 fn mouse_scroll_outside_history_box_does_not_change_scroll() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.height = 1;
     for index in 0..8 {
         app.push_text(format!("line {index}"));
@@ -860,7 +854,7 @@ fn mouse_scroll_outside_history_box_does_not_change_scroll() {
 
 #[test]
 fn scrolling_up_disables_follow_and_scrolling_back_to_bottom_enables_it() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
 
     app.scroll_up(3);
     assert_eq!(app.history_scroll.scroll(), 0);
@@ -868,7 +862,8 @@ fn scrolling_up_disables_follow_and_scrolling_back_to_bottom_enables_it() {
 
     app.history_viewport.height = 1;
     app.scroll_up(3);
-    assert_eq!(app.history_scroll.scroll(), 3);
+    // With 1 initial history item (2 rows), max scroll is 1.
+    assert_eq!(app.history_scroll.scroll(), 1);
     assert!(!app.history_scroll.follow_output());
 
     app.scroll_down(3);
@@ -878,7 +873,7 @@ fn scrolling_up_disables_follow_and_scrolling_back_to_bottom_enables_it() {
 
 #[test]
 fn push_text_respects_follow_output_mode() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.width = 10;
     app.history_viewport.height = 1;
     for index in 0..8 {
@@ -905,7 +900,7 @@ fn push_text_respects_follow_output_mode() {
 
 #[test]
 fn streaming_growth_above_viewport_preserves_visible_content_offset() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.width = 5;
     app.history_viewport.height = 1;
     app.push_text("older history");
@@ -923,7 +918,7 @@ fn streaming_growth_above_viewport_preserves_visible_content_offset() {
 
 #[test]
 fn trimming_history_reduces_scroll_by_trimmed_height() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.width = 10;
     app.history_viewport.height = 1;
     app.history_scroll.follow_output = false;
@@ -948,14 +943,15 @@ fn trimming_history_reduces_scroll_by_trimmed_height() {
 
 #[test]
 fn scrolling_to_top_clamps_without_emptying_history_view() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.height = 1;
 
     app.scroll_up(100);
 
-    assert_eq!(app.max_scroll_offset(), 3);
-    assert_eq!(app.effective_scroll(), 3);
-    assert_eq!(app.history_scroll.scroll(), 3);
+    // With 1 initial history item (2 rows), max scroll offset is 1.
+    assert_eq!(app.max_scroll_offset(), 1);
+    assert_eq!(app.effective_scroll(), 1);
+    assert_eq!(app.history_scroll.scroll(), 1);
     assert_eq!(app.history_scroll.scroll_compensation(), 0);
     assert!(!app.history_scroll.follow_output());
 }
@@ -964,7 +960,7 @@ fn scrolling_to_top_clamps_without_emptying_history_view() {
 
 #[test]
 fn app_starts_in_chat_page() {
-    let app = test_app("/tmp/tai.sock", "Halfblocks");
+    let app = test_app("/tmp/tai.sock");
     assert_eq!(app.page, Page::Chat);
 }
 
@@ -1110,7 +1106,7 @@ mod session_manager_key_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_sm_app() -> App {
-        let mut app = test_app("/tmp/tai.sock", "Kitty");
+        let mut app = test_app("/tmp/tai.sock");
         app.page = Page::SessionManager;
         app.session_mgr.set_sessions(vec![
             make_session(1, "first", "gpt-4", 3),
@@ -1205,7 +1201,7 @@ mod session_manager_key_tests {
     #[test]
     fn chat_ctrl_s_enters_session_manager() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut app = test_app("/tmp/tai.sock", "Kitty");
+        let mut app = test_app("/tmp/tai.sock");
         assert_eq!(app.page, Page::Chat);
 
         handle_terminal_event(
@@ -1309,7 +1305,7 @@ mod session_manager_key_tests {
 #[test]
 fn scroll_accumulator_increments_on_scroll_up() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.height = 10;
 
     handle_terminal_event(
@@ -1330,7 +1326,7 @@ fn scroll_accumulator_increments_on_scroll_up() {
 #[test]
 fn scroll_accumulator_decrements_on_scroll_down() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.height = 10;
 
     handle_terminal_event(
@@ -1351,7 +1347,7 @@ fn scroll_accumulator_decrements_on_scroll_down() {
 #[test]
 fn scroll_accumulator_accumulates_multiple_events() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.height = 10;
 
     for _ in 0..3 {
@@ -1373,7 +1369,7 @@ fn scroll_accumulator_accumulates_multiple_events() {
 
 #[test]
 fn apply_scroll_delta_consumes_accumulator_scroll_up() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.width = 10;
     app.history_viewport.height = 1;
     for _ in 0..5 {
@@ -1390,7 +1386,7 @@ fn apply_scroll_delta_consumes_accumulator_scroll_up() {
 
 #[test]
 fn apply_scroll_delta_consumes_accumulator_scroll_down() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.width = 10;
     app.history_viewport.height = 1;
     for _ in 0..5 {
@@ -1408,7 +1404,7 @@ fn apply_scroll_delta_consumes_accumulator_scroll_down() {
 
 #[test]
 fn apply_scroll_delta_zero_does_nothing() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.width = 10;
     app.history_viewport.height = 1;
     for _ in 0..5 {
@@ -1425,7 +1421,7 @@ fn apply_scroll_delta_zero_does_nothing() {
 #[test]
 fn scroll_up_mouse_inside_history_box_via_accumulator() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.width = 10;
     app.history_viewport.height = 1;
     for _ in 0..5 {
@@ -1454,7 +1450,7 @@ fn scroll_up_mouse_inside_history_box_via_accumulator() {
 #[test]
 fn scroll_down_mouse_inside_history_box_via_accumulator() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.width = 10;
     app.history_viewport.height = 1;
     for _ in 0..5 {
@@ -1486,7 +1482,7 @@ fn scroll_down_mouse_inside_history_box_via_accumulator() {
 
 #[test]
 fn commit_to_history_adds_entry() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     assert!(app.command_history.is_empty());
 
     app.commit_to_history("hello".to_string());
@@ -1498,14 +1494,14 @@ fn commit_to_history_adds_entry() {
 
 #[test]
 fn commit_to_history_skips_empty() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.commit_to_history("".to_string());
     assert!(app.command_history.is_empty());
 }
 
 #[test]
 fn commit_to_history_skips_duplicate_of_most_recent() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.commit_to_history("hello".to_string());
     app.commit_to_history("hello".to_string());
     assert_eq!(app.command_history.len(), 1);
@@ -1513,7 +1509,7 @@ fn commit_to_history_skips_duplicate_of_most_recent() {
 
 #[test]
 fn commit_to_history_inserts_newest_first() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.commit_to_history("first".to_string());
     app.commit_to_history("second".to_string());
     assert_eq!(app.command_history.len(), 2);
@@ -1523,7 +1519,7 @@ fn commit_to_history_inserts_newest_first() {
 
 #[test]
 fn navigate_history_up_loads_most_recent() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.command_history = vec!["cmd-2".into(), "cmd-1".into(), "cmd-0".into()];
     app.input.text = "typing".to_string();
     app.input.cursor = 6;
@@ -1538,7 +1534,7 @@ fn navigate_history_up_loads_most_recent() {
 
 #[test]
 fn navigate_history_up_moves_to_older() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.command_history = vec!["c".into(), "b".into(), "a".into()];
     app.history_index = Some(0);
 
@@ -1553,7 +1549,7 @@ fn navigate_history_up_moves_to_older() {
 
 #[test]
 fn navigate_history_up_stops_at_oldest() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.command_history = vec!["c".into(), "b".into()];
     app.history_index = Some(1);
 
@@ -1567,7 +1563,7 @@ fn navigate_history_up_stops_at_oldest() {
 
 #[test]
 fn navigate_history_up_empty_history_does_nothing() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
 
     app.navigate_history_up();
@@ -1577,7 +1573,7 @@ fn navigate_history_up_empty_history_does_nothing() {
 
 #[test]
 fn navigate_history_down_restores_draft() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.command_history = vec!["cmd".into()];
     app.history_index = Some(0);
     app.saved_draft = "draft".to_string();
@@ -1592,7 +1588,7 @@ fn navigate_history_down_restores_draft() {
 
 #[test]
 fn navigate_history_down_moves_to_newer() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.command_history = vec!["c".into(), "b".into(), "a".into()];
     app.history_index = Some(2);
     app.input.text = "a".to_string();
@@ -1611,7 +1607,7 @@ fn navigate_history_down_moves_to_newer() {
 
 #[test]
 fn history_nav_resets_after_commit() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.command_history = vec!["old".into()];
     app.history_index = Some(0);
     app.saved_draft = "draft".to_string();
@@ -1628,7 +1624,7 @@ fn terminal_event_up_down_navigates_history() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.command_history = vec!["recent".into(), "older".into()];
 
     // Press Up — loads most recent
@@ -1675,7 +1671,7 @@ fn terminal_event_enter_saves_to_history() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.input.text = "test command".to_string();
     app.input.cursor = 12;
 
@@ -1706,7 +1702,7 @@ fn terminal_event_enter_empty_does_not_save_to_history() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1721,7 +1717,7 @@ fn terminal_event_enter_empty_does_not_save_to_history() {
 #[test]
 fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     app.history_viewport.height = 1;
 
     let (_, height) = crossterm::terminal::size().expect("terminal size");
@@ -1754,7 +1750,7 @@ fn setup_providers_new_form(app: &mut App) {
 
 #[test]
 fn ai_providers_new_form_entering_focuses_name() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     setup_providers_new_form(&mut app);
     assert!(app.ai_providers.new_name_state.is_focused());
     assert!(!app.ai_providers.new_provider_state.is_focused());
@@ -1763,7 +1759,7 @@ fn ai_providers_new_form_entering_focuses_name() {
 
 #[test]
 fn ai_providers_new_form_enter_advances_name_to_provider() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -1797,7 +1793,7 @@ fn ai_providers_new_form_enter_advances_name_to_provider() {
 
 #[test]
 fn ai_providers_new_form_enter_advances_provider_to_apikey() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -1831,7 +1827,7 @@ fn ai_providers_new_form_enter_advances_provider_to_apikey() {
 
 #[test]
 fn ai_providers_new_form_name_validation_empty() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -1855,7 +1851,7 @@ fn ai_providers_new_form_name_validation_empty() {
 
 #[test]
 fn ai_providers_new_form_name_validation_invalid() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -1882,7 +1878,7 @@ fn ai_providers_new_form_name_validation_invalid() {
 
 #[test]
 fn ai_providers_new_form_esc_cancels() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -1900,7 +1896,7 @@ fn ai_providers_new_form_esc_cancels() {
 
 #[test]
 fn ai_providers_new_form_enter_on_apikey_submits() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     let (tx, rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -1956,7 +1952,7 @@ fn ai_providers_new_form_enter_on_apikey_submits() {
 
 #[test]
 fn ai_providers_new_form_keys_go_to_correct_field() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2002,7 +1998,7 @@ fn ai_providers_new_form_keys_go_to_correct_field() {
 
 #[test]
 fn ai_providers_new_form_jk_remapped_to_up_down_on_provider() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2060,7 +2056,7 @@ fn ai_providers_new_form_jk_remapped_to_up_down_on_provider() {
 
 #[test]
 fn ai_providers_new_form_down_up_navigates_provider() {
-    let mut app = test_app("/tmp/tai.sock", "Kitty");
+    let mut app = test_app("/tmp/tai.sock");
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 

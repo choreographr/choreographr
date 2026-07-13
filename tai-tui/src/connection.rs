@@ -1,4 +1,4 @@
-use crate::render::{mouse_in_history_box, render, render_fullscreen_only};
+use crate::render::{mouse_in_history_box, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
     AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, HomeMenuItem, InputBuffer,
@@ -22,6 +22,7 @@ use tai_client_core::{
 };
 use tai_keystore::ensure_keypair;
 use tai_proto::{ClientMessage, DaemonMessage};
+use tai_tui::image_worker::{ImageResult, ImageWorker};
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
 use tui_prompts::State;
 
@@ -47,7 +48,10 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     let (ui_tx, mut ui_rx) = mpsc::sync_channel::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
 
     let picker = build_picker();
-    let picker_protocol = format!("{:?}", picker.protocol_type());
+
+    // Spawn the background image worker that handles SVG rasterisation and
+    // terminal protocol encoding without blocking the UI thread.
+    let worker = ImageWorker::spawn(picker);
 
     let connection_ui_tx = ui_tx.clone();
     let connection_task = std::thread::spawn(move || {
@@ -78,19 +82,24 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(app_socket_path, picker_protocol);
+    let mut app = App::new(app_socket_path);
+    app.image_job_tx = Some(worker.job_tx);
     client_tx
         .send(ClientMessage::ListSessions)
         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
     let result = run_ui_loop(
         &mut terminal,
         &mut app,
-        &picker,
         &client_tx,
         &mut ui_rx,
+        worker.result_rx,
         &interrupted,
     )
     .map_err(io::Error::from);
+
+    // Signal the image worker to shut down and wait for it to finish.
+    app.image_job_tx = None;
+    let _ = worker.handle.join();
 
     let _ = shutdown_tx.send(());
     drop(client_tx);
@@ -117,9 +126,9 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 pub(crate) fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
-    picker: &ratatui_image::picker::Picker,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
     ui_rx: &mut mpsc::Receiver<UiEvent>,
+    image_result_rx: mpsc::Receiver<ImageResult>,
     interrupted: &AtomicBool,
 ) -> Result<(), ClientError> {
     while !app.should_quit {
@@ -130,19 +139,16 @@ pub(crate) fn run_ui_loop(
         }
 
         // Drain *all* pending crossterm events before processing UI messages
-        // and rendering.  If we only handled one per iteration, a fast
-        // trackpad scroll could fall behind, and scrolling would continue
-        // after the finger lifts because unprocessed events would still be
-        // applied on subsequent frames.  The `while let Ok(true)` pattern
-        // keeps polling with a zero timeout as long as events are ready.
+        // and rendering.
         while let Ok(true) = event::poll(Duration::from_millis(0)) {
             handle_terminal_event(event::read()?, app, client_tx)?;
         }
 
+        // Drain daemon messages.
         while let Ok(message) = ui_rx.try_recv() {
             match message {
                 UiEvent::Daemon(message) => {
-                    handle_daemon_message(message, app, picker, client_tx)?;
+                    handle_daemon_message(message, app, client_tx)?;
                 }
                 UiEvent::ReaderClosed => {
                     app.push_text("daemon connection closed");
@@ -151,8 +157,12 @@ pub(crate) fn run_ui_loop(
             }
         }
 
-        // Consume the frame's accumulated scroll delta in one batch
-        // (read-then-reset so no momentum carries forward).
+        // Drain completed image encoding results.
+        while let Ok(result) = image_result_rx.try_recv() {
+            app.apply_image_result(result);
+        }
+
+        // Consume the frame's accumulated scroll delta in one batch.
         app.apply_scroll_delta();
 
         // Update viewport dimensions and clamp scroll *outside* the
@@ -160,25 +170,12 @@ pub(crate) fn run_ui_loop(
         app.update_viewport_from_terminal_size();
         app.clamp_scroll_state();
 
-        // Hide the cursor while the fullscreen overlay is active so the
-        // blinking block/line doesn't distract.  Using the Terminal API
-        // rather than raw crossterm so that ratatui's internal cursor-
-        // visibility tracking stays in sync.
+        // Hide the cursor while the fullscreen overlay is active.
         if app.fullscreen_image_idx.is_some() {
             terminal.hide_cursor()?;
         }
 
         terminal.draw(|frame| render(frame, app))?;
-
-        // If we just showed a loading placeholder, immediately render
-        // the actual fullscreen image on a second draw so the user sees
-        // instant feedback while the protocol encodes at full size.
-        if app.fullscreen_placeholder {
-            app.fullscreen_placeholder = false;
-            terminal.draw(|frame| {
-                render_fullscreen_only(frame, app);
-            })?;
-        }
 
         // Re-show the cursor once the overlay is dismissed.
         if app.fullscreen_image_idx.is_none() {
@@ -186,10 +183,7 @@ pub(crate) fn run_ui_loop(
         }
 
         // Block for up to ~60 Hz to pace the frame rate without
-        // busy-waiting.  Any event that arrives during this interval
-        // will be handled at the top of the next iteration's drain
-        // loop — ensuring all events are processed in a single batch
-        // before the next render.
+        // busy-waiting.
         let _ = event::poll(Duration::from_millis(UI_FRAME_POLL_MS))?;
     }
 
@@ -319,7 +313,6 @@ fn handle_fullscreen_event(
     match key.code {
         KeyCode::Esc => {
             app.fullscreen_image_idx = None;
-            app.fullscreen_placeholder = false;
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
@@ -490,7 +483,6 @@ fn handle_chat_event(
                         && matches!(&app.client.history[idx], HistoryItem::Image(_))
                     {
                         app.fullscreen_image_idx = Some(idx);
-                        app.fullscreen_placeholder = true;
                     }
                 }
                 _ => {}
@@ -917,11 +909,8 @@ fn submit_new_account(
 pub(crate) fn handle_daemon_message(
     message: DaemonMessage,
     app: &mut App,
-    picker: &ratatui_image::picker::Picker,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    app.picker = Some(picker.clone());
-
     // Dispatch per-variant handlers first, then let the generic
     // dispatch in tai_client_core handle the rest (text notifications,
     // stream appends, image assembly, etc.).

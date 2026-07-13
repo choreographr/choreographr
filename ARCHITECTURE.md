@@ -396,14 +396,15 @@ main()
 ├── writer task: receive ClientMessages from mpsc → write to socket
 └── UI loop: crossterm events (keyboard/mouse) + ratatui rendering
                │
-               └── per-frame sequence:
-                   1. Drain all pending crossterm events (zero-timeout poll)
-                   2. Drain UI event channel (daemon messages)
-                   3. Consume scroll accumulator → apply batched delta
-                   4. Update history viewport dimensions from terminal size
-                   5. Clamp scroll state to valid range
-                   6. Render via ratatui terminal.draw()
-                   7. Blocking poll (~16 ms) to pace frame rate
+                └── per-frame sequence:
+                    1. Drain all pending crossterm events (zero-timeout poll)
+                    2. Drain UI event channel (daemon messages)
+                    3. Drain completed image encoding results from worker thread
+                    4. Consume scroll accumulator → apply batched delta
+                    5. Update history viewport dimensions from terminal size
+                    6. Clamp scroll state to valid range
+                    7. Render via ratatui terminal.draw()
+                    8. Blocking poll (~16 ms) to pace frame rate
 ```
 
 **Module breakdown:**
@@ -416,7 +417,8 @@ main()
 | `syntax.rs` | Shared syntect helpers (`syntax_set`, `theme_set`, `highlight_theme`, `to_ratatui_color`, `language_for_path`). Extracted to avoid duplication between `markdown_render.rs` and `diff_render.rs`. |
 | `diff_render.rs` | Diff parser and side-by-side pane builder. Detects unified diff text, parses into `FileDiff` structs, builds aligned left/right display rows. Applies per-token syntax highlighting via the two-bucket algorithm (same approach as opencode's `@pierre/diffs`): all deletion lines are concatenated into one pseudo-file and highlighted as a whole, all addition lines into another, giving syntect the sequential context it needs for accurate tokenization. |
 | `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `tai-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Code blocks are syntax-highlighted via `syntect` (shared setup from `syntax.rs`). |
-| `lib.rs` | SVG rasterization (resvg), PNG/JPEG decoding (image crate), ratatui-image protocol picker |
+| `lib.rs` | `RenderedImage` struct, `build_picker()` helper, public re-exports |
+| `image_worker.rs` | Background worker thread for SVG rasterization and terminal protocol encoding. Communicates with the UI thread via `mpsc` channels; raw image data shared through `Arc<Vec<u8>>` to avoid copies. |
 
 
 ### `tai-dioxus` — Desktop client
@@ -989,7 +991,7 @@ User presses Enter on a session in the session manager
   → daemon responds with SessionState { messages: Vec<SessionMessage>, … }
     where messages may include SessionMessage::DisplayedImage for persisted images
   → for each message:
-    DisplayedImage → build_rendered_image(picker, metadata, data) → HistoryItem::Image
+    DisplayedImage → RenderedImage::new_placeholder(metadata, Arc::from(data)) → HistoryItem::Image
     other         → classify_session_message → HistoryItem::{SessionMessage,Text,Diff}
 ```
 

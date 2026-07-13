@@ -7,7 +7,6 @@ use crate::state::{
     AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache,
     SessionManagerView, history_text_height,
 };
-use image::imageops::FilterType;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
@@ -15,12 +14,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use ratatui_image::{Resize, StatefulImage, picker::Picker};
+use ratatui_image::StatefulImage;
 use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
-use tai_proto::SessionMessage;
-use tai_proto::SessionStatus;
-use tai_proto::ThinkingEffort;
-use tai_tui::RenderedImage;
+use tai_proto::{ImageMetadata, SessionMessage, SessionStatus, ThinkingEffort};
+
 use tui_prompts::{
     Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
 };
@@ -40,16 +37,8 @@ pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
-    // When the user just clicked an image, show a loading placeholder on
-    // the very first frame.  `run_ui_loop` will follow up with a second
-    // draw that actually encodes the image at full size.
-    if app.fullscreen_placeholder {
-        render_fullscreen_placeholder(frame);
-        return;
-    }
-
-    // Fullscreen image overlay — rendered directly from the existing
-    // `StatefulProtocol` in history (no re-decode of raw bytes on click).
+    // Fullscreen image overlay — submit encoding job if needed, show
+    // placeholder while pending, or render the encoded protocol directly.
     if render_fullscreen_only(frame, app) {
         return;
     }
@@ -64,26 +53,24 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 /// Look up the fullscreen image by index and render it.  Returns `true` if
-/// a valid image was found and rendered, `false` if the index was stale.
-/// This is `pub(crate)` so `run_ui_loop` can call it directly for the
-/// follow-up draw after the loading placeholder.
+/// a valid image was found (or a placeholder is shown), `false` if the
+/// index was stale.
 pub(crate) fn render_fullscreen_only(frame: &mut Frame<'_>, app: &mut App) -> bool {
-    if let Some(idx) = app.fullscreen_image_idx {
-        if idx < app.client.history.len()
-            && matches!(&app.client.history[idx], HistoryItem::Image(_))
-            && let Some(HistoryItem::Image(rendered)) = app.client.history.get_mut(idx)
-        {
-            render_fullscreen_image(frame, rendered, app.picker.as_ref());
-            return true;
-        }
+    let Some(idx) = app.fullscreen_image_idx else {
+        return false;
+    };
+    if idx >= app.client.history.len() || !matches!(&app.client.history[idx], HistoryItem::Image(_))
+    {
         // History mutated (trimmed from front); index no longer valid.
         app.fullscreen_image_idx = None;
+        return false;
     }
-    false
+    render_fullscreen_image(frame, idx, app);
+    true
 }
 
 /// Draw a centered "Loading image …" placeholder that fills the terminal.
-/// Used as instant feedback before the protocol encodes at full size.
+/// Used as instant feedback while the worker encodes the image at full size.
 fn render_fullscreen_placeholder(frame: &mut Frame<'_>) {
     let area = frame.area();
     let block = Block::bordered()
@@ -93,47 +80,85 @@ fn render_fullscreen_placeholder(frame: &mut Frame<'_>) {
 }
 
 /// Render the fullscreen image overlay at the full terminal size with
-/// Lanczos3 quality.  The protocol's built-in cache avoids re-encoding on
-/// subsequent frames (the first frame encodes, all later frames hit the
-/// cache).  The cursor is hidden so it doesn't distract.
-///
-/// If the image is an SVG that hasn't been re-rasterized yet, this is the
-/// moment we rasterize the vector graphics directly at the terminal's pixel
-/// resolution (using `picker` to map terminal cells to pixels) so that the
-/// fullscreen display is crisp rather than upscaled from the SVG's native
-/// viewport size.
-fn render_fullscreen_image(
-    frame: &mut Frame<'_>,
-    rendered: &mut Box<RenderedImage>,
-    picker: Option<&Picker>,
-) {
+/// Lanczos3 quality.  If the protocol is not yet encoded, submit an
+/// encoding job and show a loading placeholder.
+fn render_fullscreen_image(frame: &mut Frame<'_>, idx: usize, app: &mut App) {
     let area = frame.area();
     let full = Size::new(area.width, area.height);
 
-    // Ensure the SVG is rasterized at the full terminal pixel resolution.
-    // Non-SVG images and cache hits are no-ops internally.
-    if let Some(picker) = picker {
-        let _ = rendered.ensure_display_resolution(picker, full);
+    // Fast path — already encoded at full size.
+    {
+        let HistoryItem::Image(ref mut rendered) = app.client.history[idx] else {
+            return;
+        };
+        if let Some(protocol) = rendered.protocols.get_mut(&full) {
+            let target = protocol.size_for(tai_tui::IMAGE_RESIZE, full);
+            let centered = Rect {
+                x: area.x + (area.width.saturating_sub(target.width)) / 2,
+                y: area.y + (area.height.saturating_sub(target.height)) / 2,
+                width: target.width.min(area.width),
+                height: target.height.min(area.height),
+            };
+            frame.render_stateful_widget(
+                StatefulImage::new().resize(tai_tui::IMAGE_RESIZE),
+                centered,
+                protocol,
+            );
+            return;
+        }
     }
 
-    // Compute the aspect-ratio-correct cell size at terminal dimensions.
-    let target = rendered
-        .protocol
-        .size_for(Resize::Scale(Some(FilterType::Lanczos3)), full);
+    submit_image_job_if_needed(app, idx, full);
 
-    // Center the image within the terminal.
-    let centered = Rect {
-        x: area.x + (area.width.saturating_sub(target.width)) / 2,
-        y: area.y + (area.height.saturating_sub(target.height)) / 2,
-        width: target.width.min(area.width),
-        height: target.height.min(area.height),
+    render_fullscreen_placeholder(frame);
+}
+
+/// Submit an encoding job for the image at `history_idx` if it needs encoding,
+/// hasn't previously failed, and no job is already in-flight.
+/// Returns `true` when a job was submitted.
+fn submit_image_job_if_needed(app: &mut App, history_idx: usize, target_size: Size) -> bool {
+    let (needs_job, why_not, job_data, job_meta) = {
+        let HistoryItem::Image(ref image) = app.client.history[history_idx] else {
+            return false;
+        };
+        (
+            image.pending_job.is_none()
+                && !image.failed_sizes.contains(&target_size)
+                && !image.protocols.contains_key(&target_size),
+            if image.pending_job.is_some() {
+                "pending_job"
+            } else if image.failed_sizes.contains(&target_size) {
+                "failed_sizes"
+            } else if image.protocols.contains_key(&target_size) {
+                "already_cached"
+            } else {
+                ""
+            },
+            image.data.clone(),
+            image.metadata.clone(),
+        )
     };
-
-    frame.render_stateful_widget(
-        StatefulImage::new().resize(Resize::Scale(Some(FilterType::Lanczos3))),
-        centered,
-        &mut rendered.protocol,
-    );
+    if needs_job {
+        app.submit_image_job(
+            history_idx,
+            job_data,
+            job_meta,
+            target_size,
+            tai_tui::IMAGE_RESIZE,
+        );
+        true
+    } else {
+        if !why_not.is_empty() {
+            tracing::trace!(
+                "[tai-tui] skipping image job for history idx {} @ {}x{}: {}",
+                history_idx,
+                target_size.width,
+                target_size.height,
+                why_not,
+            );
+        }
+        false
+    }
 }
 
 fn render_settings(frame: &mut Frame<'_>, _app: &mut App) {
@@ -277,15 +302,15 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     content_width,
                 );
             }
-            HistoryItem::Image(image) => {
+            HistoryItem::Image(_) => {
                 render_item_image(
                     frame,
                     area,
-                    image,
+                    i,
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
-                    app.picker.as_ref(),
+                    app,
                 );
             }
             HistoryItem::Diff(diffs) => {
@@ -572,74 +597,103 @@ fn render_item_streaming(
     );
 }
 
-/// Render a `HistoryItem::Image`, clipped to the visible scroll area.
-/// The underlying image protocol is only rendered when the item is fully
-/// visible to avoid rescaling during scrolling.
+/// Render the common image-block frame (bordered title block) clipped to the
+/// visible viewport.  Returns the inner content area and whether the item is
+/// fully visible (no vertical clipping).
 ///
-/// If the image is an SVG that hasn't been re-rasterized yet, we rasterize
-/// the vector graphics directly at the inline pixel resolution so that the
-/// image is crisp rather than upscaled from the SVG's native viewport size
-/// by ratatui-image's Lanczos3 filter.
-fn render_item_image(
+/// Takes a `&ImageMetadata` rather than a `&RenderedImage` so callers can
+/// use it while a mutable borrow on `protocol` is active.
+fn render_image_frame(
     frame: &mut Frame<'_>,
+    meta: &ImageMetadata,
     area: Rect,
-    image: &mut Box<RenderedImage>,
+    full_height: usize,
     rows_remaining: &mut usize,
     y: &mut u16,
     rows_to_skip: &mut usize,
-    picker: Option<&Picker>,
-) {
-    let inline_size = ratatui::layout::Size::new(area.width, (area.height / 2).max(1));
-
-    // Ensure the SVG is rasterized at the inline display resolution.
-    // Non-SVG images and cache hits are no-ops internally.
-    if let Some(picker) = picker {
-        let _ = image.ensure_display_resolution(picker, inline_size);
-    }
-
-    let rendered = image
-        .protocol
-        .size_for(Resize::Scale(Some(FilterType::Lanczos3)), inline_size);
-    let full_height = rendered.height.max(1) as usize;
-
-    // Use the shared clipped_area helper just like the text/diff renderers.
-    let Some((_top_line, visible_height)) =
-        clipped_area(full_height, rows_to_skip, rows_remaining, y)
-    else {
-        // The item is entirely above the viewport; carry on to the next item.
-        // (Unlike text renderers we return from the helper directly here so the
-        // caller can distinguish "fully skipped" from "viewport exhausted".)
-        return;
-    };
-
-    let height = visible_height as u16;
-
+) -> Option<(Rect, bool)> {
+    let (_, visible_height) = clipped_area(full_height, rows_to_skip, rows_remaining, y)?;
+    let fully_visible = visible_height >= full_height;
+    let h = visible_height as u16;
     let block = Block::default().title(format!(
         "image {} ({} {}x{})",
-        image.metadata.image_id,
-        image.metadata.mime_type,
-        image.metadata.width,
-        image.metadata.height
+        meta.image_id, meta.mime_type, meta.width, meta.height
     ));
     let rect = Rect {
         x: area.x,
         y: *y,
         width: area.width,
-        height,
+        height: h,
     };
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
+    Some((inner, fully_visible))
+}
 
-    // Only render the image when fully visible — the image is not clipped
-    // by scroll offset or viewport space, so its rect is stable and
-    // ratatui_image never rescales during scrolling.
-    if visible_height == full_height {
-        frame.render_stateful_widget(
-            StatefulImage::new().resize(Resize::Scale(Some(FilterType::Lanczos3))),
-            inner,
-            &mut image.protocol,
-        );
+/// Render a `HistoryItem::Image`, clipped to the visible scroll area.
+/// The block frame (title) is shown whenever visible; the actual image
+/// pixels are only rendered when the item is fully visible so that
+/// ratatui-image does not rescale the protocol to the clipped area.
+/// While encoding is pending, a placeholder block is shown instead.
+fn render_item_image(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    history_idx: usize,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+    app: &mut App,
+) {
+    let inline_size = Size::new(area.width, (area.height / 2).max(1));
+
+    // Fast path — already encoded at target size.
+    {
+        let HistoryItem::Image(ref mut image) = app.client.history[history_idx] else {
+            return;
+        };
+        if let Some(protocol) = image.protocols.get_mut(&inline_size) {
+            let rendered_at = protocol.size_for(tai_tui::IMAGE_RESIZE, inline_size);
+            let full_height = rendered_at.height.max(1) as usize;
+            if let Some((inner, fully_visible)) = render_image_frame(
+                frame,
+                &image.metadata,
+                area,
+                full_height,
+                rows_remaining,
+                y,
+                rows_to_skip,
+            ) {
+                // Only render the actual image pixels when the item is
+                // fully visible — partial visibility means the scroll
+                // clipped the area, and ratatui-image would rescale the
+                // protocol to the clipped size, causing visual reflow.
+                if fully_visible {
+                    frame.render_stateful_widget(
+                        StatefulImage::new().resize(tai_tui::IMAGE_RESIZE),
+                        inner,
+                        protocol,
+                    );
+                }
+            }
+            return;
+        }
     }
+
+    submit_image_job_if_needed(app, history_idx, inline_size);
+
+    // Placeholder block while encoding is pending or failed.
+    let HistoryItem::Image(ref image) = app.client.history[history_idx] else {
+        return;
+    };
+    let _ = render_image_frame(
+        frame,
+        &image.metadata,
+        area,
+        inline_size.height.max(1) as usize,
+        rows_remaining,
+        y,
+        rows_to_skip,
+    );
 }
 
 // ── Session Manager ──────────────────────────────────────────

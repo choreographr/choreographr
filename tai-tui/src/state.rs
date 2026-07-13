@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Rect, Size};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tai_client_core::{
     ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
     MAX_HISTORY_ITEMS, broken_pipe,
@@ -9,15 +10,14 @@ use tai_proto::{
     AccountInfo, ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionStatus,
     SessionSummary, ThinkingEffort, TokenUsage,
 };
-use tai_tui::{ImageAssembler, RenderedImage, StreamingText, build_rendered_image};
+use tai_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
+use tai_tui::{ImageAssembler, RenderedImage, StreamingText};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::db::{self, CommandEntry};
 use crate::diff_render::{diff_display_height, is_diff_text, parse_diff};
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
-use image::imageops::FilterType;
 use ratatui::text::Line;
-use ratatui_image::Resize;
 use tai_client_core::FileDiff;
 use tui_prompts::{SelectState, State, TextState};
 
@@ -419,7 +419,11 @@ pub(crate) struct App {
     pub(crate) history_scroll: HistoryScrollState,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
-    pub(crate) picker: Option<ratatui_image::picker::Picker>,
+    pub(crate) image_job_tx: Option<std::sync::mpsc::Sender<ImageJob>>,
+    /// Maps in-flight job IDs to their history index for O(1) result
+    /// dispatch.  Entries are inserted when a job is submitted and removed
+    /// when the result arrives or the image is trimmed from history.
+    pub(crate) pending_job_idx: HashMap<ImageId, usize>,
     pub(crate) attached_session_id: Option<u64>,
     pub(crate) page: Page,
     /// The page the user was on before opening the Home menu.  `Esc` on the
@@ -473,12 +477,6 @@ pub(crate) struct App {
     /// fullscreen.  `None` means no fullscreen overlay is active.
     /// The existing `StatefulProtocol` is rendered directly (no re-decode).
     pub(crate) fullscreen_image_idx: Option<usize>,
-
-    /// When `true`, the very first fullscreen frame should show a loading
-    /// placeholder instead of the image (the protocol may take ~3 s to
-    /// encode at full terminal size).  Set in the click handler and consumed
-    /// by `run_ui_loop` which immediately follows up with a second draw.
-    pub(crate) fullscreen_placeholder: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -534,12 +532,13 @@ impl HistoryViewport {
                 let lines = streaming_text_lines(text, content_width);
                 lines_height(&lines, content_width).max(1) + 1
             }
-            HistoryItem::Image(image) => {
-                let rendered = image.protocol.size_for(
-                    Resize::Scale(Some(FilterType::Lanczos3)),
-                    Size::new(self.width, (self.height / 2).max(1)),
-                );
-                rendered.height.max(1) as usize
+            HistoryItem::Image(_) => {
+                // Use a stable height for layout and click-target calculations
+                // regardless of encoding state.  The actual rendered height
+                // in render_item_image uses the protocol dimensions, but the
+                // scroll / click logic always sees the same value so that
+                // find_history_item_at_row does not shift after encoding.
+                (self.height / 2).max(1) as usize
             }
             HistoryItem::Diff(diffs) => diff_display_height(diffs) + 2,
         }
@@ -998,7 +997,7 @@ impl InputBuffer {
 }
 
 impl App {
-    pub(crate) fn new(socket_path: String, picker_protocol: String) -> Self {
+    pub(crate) fn new(socket_path: String) -> Self {
         let (db, command_history) = match db::open_db() {
             Ok(database) => {
                 let history = db::load_recent_commands(&database, 100)
@@ -1015,10 +1014,9 @@ impl App {
             }
         };
 
-        let initial_items = vec![
-            HistoryItem::Text(format!("Connected to tai-daemon at {socket_path}")),
-            HistoryItem::Text(format!("image protocol: {picker_protocol}")),
-        ];
+        let initial_items = vec![HistoryItem::Text(format!(
+            "Connected to tai-daemon at {socket_path}"
+        ))];
         let render_cache = vec![None; initial_items.len()];
 
         Self {
@@ -1030,7 +1028,8 @@ impl App {
             history_scroll: HistoryScrollState::new(),
             history_viewport: HistoryViewport::new(),
             should_quit: false,
-            picker: None,
+            image_job_tx: None,
+            pending_job_idx: HashMap::new(),
             attached_session_id: None,
             page: Page::Chat,
             previous_page: Page::Chat,
@@ -1043,7 +1042,6 @@ impl App {
             saved_draft: String::new(),
             db,
             fullscreen_image_idx: None,
-            fullscreen_placeholder: false,
         }
     }
 
@@ -1189,17 +1187,8 @@ impl App {
     pub(crate) fn push_session_message(&mut self, message: SessionMessage) {
         match message {
             SessionMessage::DisplayedImage(record) => {
-                if let Some(picker) = self.picker.as_ref() {
-                    match build_rendered_image(picker, record.metadata, record.data) {
-                        Ok(img) => self.push_image(img),
-                        Err(e) => self
-                            .push_text(format!("[tai-tui] failed to decode replayed image: {e}")),
-                    }
-                } else {
-                    self.push_text(
-                        "[tai-tui] no image picker available for replayed image".to_string(),
-                    );
-                }
+                let img = RenderedImage::new_placeholder(record.metadata, Arc::from(record.data));
+                self.push_image(img);
             }
             other => {
                 self.push_history_item(Self::classify_session_message(other));
@@ -1212,6 +1201,74 @@ impl App {
         self.push_history_item(item);
     }
 
+    /// Apply a completed [`ImageResult`] to the corresponding placeholder in
+    /// history using an O(1) job-id → history-index map.  Stale results
+    /// (image already trimmed or replaced) are silently dropped.
+    pub(crate) fn apply_image_result(&mut self, result: ImageResult) {
+        let idx = match self.pending_job_idx.remove(&result.id) {
+            Some(idx) if idx < self.client.history.len() => idx,
+            _ => return,
+        };
+        if let Some(HistoryItem::Image(img)) = self.client.history.get_mut(idx)
+            && img.pending_job == Some(result.id)
+        {
+            tracing::trace!(
+                "[tai-tui] image job {} completed for history idx {} ({} {}x{})",
+                result.id,
+                idx,
+                img.metadata.mime_type,
+                img.metadata.width,
+                img.metadata.height,
+            );
+            img.apply_result(result);
+        }
+    }
+
+    /// Submit an encoding job for the image at `history_idx` and record the
+    /// mapping so the result can be dispatched in O(1) time.  Returns the
+    /// assigned job ID, or `None` if the worker sender is missing.
+    pub(crate) fn submit_image_job(
+        &mut self,
+        history_idx: usize,
+        data: Arc<[u8]>,
+        metadata: ImageMetadata,
+        cell_size: Size,
+        resize: ratatui_image::Resize,
+    ) -> Option<ImageId> {
+        let tx = self.image_job_tx.as_ref()?;
+        let id = next_job_id();
+
+        tracing::trace!(
+            "[tai-tui] submitting image job {} for history idx {} ({} {}x{} @ {}x{})",
+            id,
+            history_idx,
+            metadata.mime_type,
+            metadata.width,
+            metadata.height,
+            cell_size.width,
+            cell_size.height,
+        );
+
+        // Record the mapping before the worker picks up the job so that
+        // apply_image_result is always ready.
+        self.pending_job_idx.insert(id, history_idx);
+
+        // Update the RenderedImage's pending_job so duplicate submissions
+        // are prevented.
+        if let Some(HistoryItem::Image(img)) = self.client.history.get_mut(history_idx) {
+            img.pending_job = Some(id);
+        }
+
+        let _ = tx.send(ImageJob {
+            id,
+            data,
+            metadata,
+            cell_size,
+            resize,
+        });
+        Some(id)
+    }
+
     /// Clear all per-session state when switching to a different session.
     ///
     /// Called from the Enter-key handlers in `connection.rs` before sending
@@ -1221,6 +1278,7 @@ impl App {
         self.client.history.clear();
         self.render_cache.clear();
         self.history_scroll = HistoryScrollState::new();
+        self.pending_job_idx.clear();
         self.active.clear();
         self.client.in_progress.clear();
         self.client.pending_images = ImageAssembler::new();
@@ -1249,9 +1307,44 @@ impl App {
     }
 
     pub(crate) fn push_history_item(&mut self, item: HistoryItem) {
+        // Capture the job ID before moving the item.
+        let job_id = match &item {
+            HistoryItem::Image(img) => img.pending_job,
+            _ => None,
+        };
+
+        let old_len = self.client.history.len();
         let added_height = self.history_viewport.item_height(&item);
         let trimmed_height = self.trimmed_height_on_append();
         self.client.push_history_item(item);
+
+        // Compute how many items were trimmed from the front.
+        // `push_history_item` on `ClientHistory` trims down to
+        // `MAX_HISTORY_ITEMS`, so the number removed is:
+        //   (old_len + 1) - new_len
+        let trimmed = old_len
+            .saturating_add(1)
+            .saturating_sub(self.client.history.len());
+
+        // Shift pending_job_idx entries to account for items trimmed from
+        // the front of the history ring buffer.
+        if trimmed > 0 {
+            self.pending_job_idx.retain(|_, idx| {
+                if *idx < trimmed {
+                    false // trimmed away
+                } else {
+                    *idx -= trimmed;
+                    true
+                }
+            });
+        }
+
+        // Record the mapping for images that already carry a pending job.
+        if let Some(id) = job_id {
+            self.pending_job_idx
+                .insert(id, self.client.history.len().saturating_sub(1));
+        }
+
         self.ensure_cache_synced();
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
@@ -1613,11 +1706,7 @@ impl DaemonMessageHandler for App {
 
     fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError> {
         let (metadata, data) = self.client.finish_image(request_id, image_id)?;
-        let picker = self
-            .picker
-            .as_ref()
-            .ok_or_else(|| ClientError::Io(std::io::Error::other("image picker not set")))?;
-        let rendered = build_rendered_image(picker, metadata, data)?;
+        let rendered = RenderedImage::new_placeholder(metadata, Arc::from(data));
         self.push_image(rendered);
         Ok(())
     }
@@ -1804,7 +1893,7 @@ mod tests {
 
     #[test]
     fn push_tool_text_with_diff_creates_diff_item() {
-        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
+        let mut app = test_app("/tmp/tai.sock");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1819,7 +1908,7 @@ mod tests {
 
     #[test]
     fn push_tool_text_with_plain_text_creates_text_item() {
-        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
+        let mut app = test_app("/tmp/tai.sock");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1835,7 +1924,7 @@ mod tests {
 
     #[test]
     fn push_session_message_tool_result_with_diff_creates_diff_item() {
-        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
+        let mut app = test_app("/tmp/tai.sock");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1855,7 +1944,7 @@ mod tests {
 
     #[test]
     fn push_session_message_tool_result_with_error_stays_session_message() {
-        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
+        let mut app = test_app("/tmp/tai.sock");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1875,7 +1964,7 @@ mod tests {
 
     #[test]
     fn push_session_message_plain_text_stays_session_message() {
-        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
+        let mut app = test_app("/tmp/tai.sock");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1896,11 +1985,10 @@ mod tests {
     // ── push_session_message with DisplayedImage ──
 
     #[test]
-    fn push_session_message_displayed_image_no_picker() {
-        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
+    fn push_session_message_displayed_image_creates_placeholder() {
+        let mut app = test_app("/tmp/tai.sock");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
-        // App::new() initialises picker to None.
 
         let msg = SessionMessage::DisplayedImage(DisplayedImageRecord {
             metadata: ImageMetadata {
@@ -1916,49 +2004,17 @@ mod tests {
         app.push_session_message(msg);
 
         let last = app.client.history.last().unwrap();
-        match last {
-            HistoryItem::Text(t) => assert!(t.contains("no image picker"), "{t}"),
-            _ => panic!("expected Text"),
-        }
+        assert!(
+            matches!(last, HistoryItem::Image(_)),
+            "DisplayedImage should create a placeholder Image"
+        );
     }
 
     #[test]
-    fn push_session_message_displayed_image_decode_failure() {
-        use ratatui_image::picker::Picker;
-
-        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
+    fn push_session_message_displayed_image_svg_creates_placeholder() {
+        let mut app = test_app("/tmp/tai.sock");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
-        app.picker = Some(Picker::halfblocks());
-
-        let msg = SessionMessage::DisplayedImage(DisplayedImageRecord {
-            metadata: ImageMetadata {
-                image_id: 0,
-                mime_type: "image/png".into(),
-                width: 1,
-                height: 1,
-                byte_len: 3,
-                alt: None,
-            },
-            data: vec![1, 2, 3],
-        });
-        app.push_session_message(msg);
-
-        let last = app.client.history.last().unwrap();
-        match last {
-            HistoryItem::Text(t) => assert!(t.contains("failed to decode"), "{t}"),
-            _ => panic!("expected Text with error"),
-        }
-    }
-
-    #[test]
-    fn push_session_message_displayed_image_svg() {
-        use ratatui_image::picker::Picker;
-
-        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-        app.picker = Some(Picker::halfblocks());
 
         let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='red'/></svg>"#;
         let msg = SessionMessage::DisplayedImage(DisplayedImageRecord {
@@ -1975,14 +2031,17 @@ mod tests {
         app.push_session_message(msg);
 
         let last = app.client.history.last().unwrap();
-        assert!(matches!(last, HistoryItem::Image(_)), "expected Image");
+        assert!(
+            matches!(last, HistoryItem::Image(_)),
+            "expected Image placeholder"
+        );
     }
 
     // ── reset_for_session_switch ──
 
     #[test]
     fn reset_for_session_switch_clears_state() {
-        let mut app = test_app("/tmp/tai.sock", "Halfblocks");
+        let mut app = test_app("/tmp/tai.sock");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -2002,5 +2061,256 @@ mod tests {
         assert!(app.active.is_empty(), "active not cleared");
         assert!(app.client.in_progress.is_empty(), "in_progress not cleared");
         // pending_images is replaced with ImageAssembler::new(), which is always empty.
+    }
+
+    // ── image job lifecycle ──
+
+    #[test]
+    fn submit_image_job_returns_none_when_no_tx() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.image_job_tx = None;
+
+        let id = app.submit_image_job(
+            0,
+            Arc::<[u8]>::from(vec![]),
+            ImageMetadata {
+                image_id: 1,
+                mime_type: "image/png".into(),
+                width: 1,
+                height: 1,
+                byte_len: 0,
+                alt: None,
+            },
+            Size::new(20, 16),
+            tai_tui::IMAGE_RESIZE,
+        );
+        assert!(id.is_none(), "no job should be submitted when tx is None");
+    }
+
+    #[test]
+    fn submit_image_job_sends_job_and_records_mapping() {
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let worker = tai_tui::image_worker::ImageWorker::spawn(picker);
+
+        let mut app = test_app("/tmp/tai.sock");
+        app.image_job_tx = Some(worker.job_tx);
+
+        // The app starts with 1 text item at index 0.  Push an image
+        // placeholder so there is an image at index 1.
+        let img = tai_tui::RenderedImage::new_placeholder(
+            ImageMetadata {
+                image_id: 1,
+                mime_type: "image/png".into(),
+                width: 4,
+                height: 3,
+                byte_len: 0,
+                alt: None,
+            },
+            Arc::<[u8]>::from(vec![]),
+        );
+        app.push_image(img);
+
+        let id = app
+            .submit_image_job(
+                1,
+                Arc::<[u8]>::from(vec![]),
+                ImageMetadata {
+                    image_id: 1,
+                    mime_type: "image/png".into(),
+                    width: 4,
+                    height: 3,
+                    byte_len: 0,
+                    alt: None,
+                },
+                Size::new(20, 16),
+                tai_tui::IMAGE_RESIZE,
+            )
+            .expect("job should be submitted");
+
+        // pending_job_idx should contain the mapping.
+        assert_eq!(
+            app.pending_job_idx.get(&id),
+            Some(&1),
+            "pending_job_idx should map job id to history index"
+        );
+
+        // The RenderedImage's pending_job should be set.
+        let HistoryItem::Image(image) = &app.client.history[1] else {
+            panic!("expected Image history item");
+        };
+        assert_eq!(
+            image.pending_job,
+            Some(id),
+            "pending_job should be set on the image"
+        );
+
+        // Drop the sender so the worker thread can shut down before join.
+        app.image_job_tx = None;
+        let _ = worker.handle.join();
+    }
+
+    #[test]
+    fn apply_image_result_updates_image_protocol() {
+        let mut app = test_app("/tmp/tai.sock");
+
+        // The app starts with 1 text item at index 0.  Push an image
+        // placeholder so there is an image at index 1.
+        let img = tai_tui::RenderedImage::new_placeholder(
+            ImageMetadata {
+                image_id: 1,
+                mime_type: "image/png".into(),
+                width: 4,
+                height: 3,
+                byte_len: 0,
+                alt: None,
+            },
+            Arc::<[u8]>::from(vec![]),
+        );
+        app.push_image(img);
+
+        // Simulate an in-flight job at index 1.
+        let job_id = 42usize;
+        app.pending_job_idx.insert(job_id, 1);
+        let HistoryItem::Image(image) = &mut app.client.history[1] else {
+            panic!("expected Image");
+        };
+        image.pending_job = Some(job_id);
+
+        // Apply a successful result.
+        let cell_size = Size::new(20, 16);
+        app.apply_image_result(tai_tui::image_worker::ImageResult {
+            id: job_id,
+            protocol: None, // protocol encoding not needed for this test
+            cell_size,
+        });
+
+        // The image should have pending_job cleared and marked as failed
+        // (since protocol was None, the worker signalled failure).
+        let HistoryItem::Image(image) = &app.client.history[1] else {
+            panic!("expected Image");
+        };
+        assert!(
+            image.failed_sizes.contains(&cell_size),
+            "image should have failed_sizes when protocol is None"
+        );
+        assert!(image.pending_job.is_none(), "pending_job should be cleared");
+        assert!(
+            app.pending_job_idx.get(&job_id).is_none(),
+            "job id should be removed from pending_job_idx"
+        );
+    }
+
+    #[test]
+    fn apply_image_result_drops_stale_job() {
+        let mut app = test_app("/tmp/tai.sock");
+
+        // Job ID 99 is not in pending_job_idx — result should be silently dropped.
+        app.apply_image_result(tai_tui::image_worker::ImageResult {
+            id: 99,
+            protocol: None,
+            cell_size: Size::new(20, 16),
+        });
+        // No panic = pass.
+    }
+
+    #[test]
+    fn apply_image_result_drops_result_for_trimmed_index() {
+        let mut app = test_app("/tmp/tai.sock");
+
+        // Register a job that maps to an out-of-bounds index.
+        app.pending_job_idx.insert(7, 999);
+
+        // Should not panic — the result is silently dropped.
+        app.apply_image_result(tai_tui::image_worker::ImageResult {
+            id: 7,
+            protocol: None,
+            cell_size: Size::new(20, 16),
+        });
+    }
+
+    #[test]
+    fn push_history_item_shifts_pending_job_idx_on_trim() {
+        use tai_client_core::MAX_HISTORY_ITEMS;
+
+        let mut app = test_app("/tmp/tai.sock");
+        app.image_job_tx = None;
+
+        // Fill history so the next push triggers trimming.  The app starts
+        // with 1 text item ("Connected to …"), so we fill MAX - 1 items
+        // to reach a total of 1 + (MAX - 1) = MAX.
+        for i in 0..MAX_HISTORY_ITEMS - 1 {
+            app.client
+                .history
+                .push(HistoryItem::Text(format!("line {i}")));
+        }
+        // Register a pending job for the initial text at index 0.
+        let job_id = next_job_id();
+        app.pending_job_idx.insert(job_id, 0);
+
+        // Push one more item.  The initial text at old index 0 will be trimmed.
+        app.push_history_item(HistoryItem::Text("new item".into()));
+
+        // The stale mapping should be removed.
+        assert!(
+            app.pending_job_idx.get(&job_id).is_none(),
+            "stale job mapping should be removed on trim"
+        );
+    }
+
+    #[test]
+    fn push_history_item_adjusts_pending_job_idx_for_surviving_items() {
+        use tai_client_core::MAX_HISTORY_ITEMS;
+
+        let mut app = test_app("/tmp/tai.sock");
+
+        // App starts with 1 text item at index 0.  Fill so total exceeds MAX.
+        // Fill MAX items + 2 extra survivors: total = 1 + MAX + 2 = MAX + 3.
+        for i in 0..MAX_HISTORY_ITEMS + 2 {
+            app.client
+                .history
+                .push(HistoryItem::Text(format!("line {i}")));
+        }
+
+        // After fill: index 0 = initial text, index 1 = "line 0", …
+        // index 500 = "line 499", index 501 = "line 500", index 502 = "line 501"
+        // total = 1 + 503 = 504 items.
+        //
+        // After push: old_len = 503, push → 504, trim → 500.
+        // trimmed = 503 + 1 - 500 = 4 items removed from front.
+
+        // A job at old index 0 will be trimmed (0 < 4).
+        let trimmed_job = next_job_id();
+        // A job at old index 6 survives and shifts to new index 2 (6 - 4 = 2).
+        let surviving_job = next_job_id();
+        app.pending_job_idx.insert(trimmed_job, 0);
+        app.pending_job_idx.insert(surviving_job, 6);
+
+        app.push_history_item(HistoryItem::Text("new item".into()));
+
+        assert_eq!(
+            app.pending_job_idx.get(&surviving_job),
+            Some(&2),
+            "surviving job should be shifted by trimmed count (6 - 4 = 2)"
+        );
+        assert!(
+            app.pending_job_idx.get(&trimmed_job).is_none(),
+            "trimmed job should be removed"
+        );
+    }
+
+    #[test]
+    fn reset_for_session_switch_clears_pending_job_idx() {
+        let mut app = test_app("/tmp/tai.sock");
+
+        app.pending_job_idx.insert(1, 0);
+        app.pending_job_idx.insert(2, 1);
+        assert!(!app.pending_job_idx.is_empty());
+
+        app.reset_for_session_switch();
+
+        assert!(
+            app.pending_job_idx.is_empty(),
+            "pending_job_idx should be cleared on session switch"
+        );
     }
 }
