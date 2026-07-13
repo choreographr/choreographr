@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_output_invalid_utf8_returns_error() {
+    fn tool_call_output_invalid_utf8_does_not_error() {
         let mut h = TestHandler::new();
         let result = dispatch_daemon_message(
             &mut h,
@@ -1110,7 +1110,9 @@ mod tests {
                 data: vec![0xFF, 0xFE], // invalid UTF-8
             },
         );
-        assert!(result.is_err(), "invalid UTF-8 must produce an error");
+        assert!(result.is_ok(), "invalid UTF-8 should be lossy-converted, not rejected");
+        let events = h.collect_events();
+        assert!(events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains('\u{FFFD}'))));
     }
 
     // ── Image handling ───────────────────────────────────────────────────
@@ -1618,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn output_chunk_invalid_utf8_returns_error() {
+    fn output_chunk_invalid_utf8_does_not_error() {
         let mut h = TestHandler::new();
         let result = dispatch_daemon_message(
             &mut h,
@@ -1628,6 +1630,8 @@ mod tests {
                 data: vec![0xFF, 0xFE],
             },
         );
-        assert!(result.is_err(), "invalid UTF-8 must produce an error");
+        assert!(result.is_ok(), "invalid UTF-8 should be lossy-converted, not rejected");
+        let events = h.collect_events();
+        assert!(events.iter().any(|e| matches!(e, TestEvent::AppendStream(7, OutputStream::Answer, t) if t.contains('\u{FFFD}'))));
     }
 }
