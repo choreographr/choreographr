@@ -3,24 +3,26 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct RandomArgs {
-    /// Kind of random value: "int" (default), "float", "bool", "bytes", "uuid"
+    /// Type of random value to generate: "int", "float", "string", or "bytes"
+    #[schemars(rename = "type")]
     pub r#type: Option<String>,
-    /// Minimum value for type "int" (inclusive). Default: 0
+    /// Minimum value (inclusive) for integers
     pub min: Option<i64>,
-    /// Maximum value for type "int" (inclusive). Default: 100
+    /// Maximum value (inclusive) for integers
     pub max: Option<i64>,
-    /// Minimum value for type "float" (inclusive). Default: 0.0
+    /// Minimum value (inclusive) for floats
     pub min_float: Option<f64>,
-    /// Maximum value for type "float" (exclusive). Default: 1.0
+    /// Maximum value (inclusive) for floats
     pub max_float: Option<f64>,
-    /// Number of random bytes for type "bytes". Default: 16, Max: 65536
+    /// Length of string or bytes output
     pub length: Option<u32>,
-    /// Optional seed for deterministic (reproducible) output
+    /// Optional seed for reproducible results
     pub seed: Option<u64>,
 }
 
@@ -118,43 +120,6 @@ define_tool!(
     "Generate random values: integers, floats, booleans, bytes (base64), or UUID v4. Supports optional seed for reproducibility.",
     RandomArgs,
     execute_random_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "type": {
-                "type": "string",
-                "enum": ["int", "float", "bool", "bytes", "uuid"],
-                "description": "Kind of random value to generate (default: int)"
-            },
-            "min": {
-                "type": "integer",
-                "description": "Minimum value for type 'int' (inclusive, default: 0)"
-            },
-            "max": {
-                "type": "integer",
-                "description": "Maximum value for type 'int' (inclusive, default: 100)"
-            },
-            "min_float": {
-                "type": "number",
-                "description": "Minimum value for type 'float' (inclusive, default: 0.0)"
-            },
-            "max_float": {
-                "type": "number",
-                "description": "Maximum value for type 'float' (exclusive, default: 1.0)"
-            },
-            "length": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 65536,
-                "description": "Number of random bytes for type 'bytes' (default: 16, max: 65536)"
-            },
-            "seed": {
-                "type": "integer",
-                "description": "Optional seed for deterministic (reproducible) results"
-            }
-        },
-        "additionalProperties": false
-    }),
     "core"
 );
 

@@ -2,15 +2,20 @@ use super::{
     ToolError,
     shell_util::{format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
 };
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecArgs {
+    /// Program or command to execute (first argument)
     pub command: String,
+    /// Additional arguments passed to the program
     #[serde(default)]
     pub args: Vec<String>,
+    /// Working directory for the command (relative to the session working directory, or absolute)
     pub workdir: Option<String>,
+    /// Timeout in milliseconds (default 30000; capped by outer tool deadline)
     pub timeout: Option<u64>,
 }
 
@@ -22,31 +27,6 @@ define_tool!(
     "Execute a program directly without a shell. The command is not parsed by a shell — no pipes, redirects, glob expansion, or environment variable interpolation. Prefer this over `sh` when you only need to run a single program with arguments (lower risk of shell-injection issues).",
     ExecArgs,
     execute_exec_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "Executable path or name (resolved against PATH if not absolute)"
-            },
-            "args": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Arguments passed to the executable"
-            },
-            "workdir": {
-                "type": "string",
-                "description": "Working directory for the command (relative to the session working directory, or absolute)"
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Timeout in milliseconds (default 30000; capped by outer tool deadline)",
-                "default": 30000
-            }
-        },
-        "required": ["command"],
-        "additionalProperties": false
-    }),
     "shell"
 );
 

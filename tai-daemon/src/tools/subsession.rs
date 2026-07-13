@@ -1,6 +1,7 @@
 use crate::daemon::DaemonCommand;
 use crate::tools::context::ToolContext;
 use crate::tools::{Tool, ToolError};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -9,42 +10,15 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
 use tai_proto::SessionMessage;
 
-/// JSON schema for spawn_subsession arguments — reused by the Tool impl
-/// and the LLM tool-definition builder in available_definitions.
-pub(crate) fn spawn_subsession_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "prompt": {
-                "type": "string",
-                "description": "Task description for the sub-session to work on autonomously"
-            },
-            "title": {
-                "type": "string",
-                "description": "Optional title for the sub-session"
-            },
-            "max_turns": {
-                "type": "integer",
-                "description": "Optional maximum tool-calling iterations for this sub-session. Inherits from parent if not set."
-            },
-            "categories": {
-                "type": "array",
-                "items": {
-                    "type": "string"
-                },
-                "description": "Optional tool categories to activate. Inherits from parent session if not set."
-            }
-        },
-        "required": ["prompt"],
-        "additionalProperties": false
-    })
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct SpawnSubsessionArgs {
+    /// Task description for the sub-session to work on autonomously
     pub prompt: String,
+    /// Optional title for the sub-session
     pub title: Option<String>,
+    /// Optional maximum tool-calling iterations for this sub-session
     pub max_turns: Option<u32>,
+    /// Optional tool categories to activate. Inherits from parent session if not set.
     pub categories: Option<Vec<String>>,
 }
 
@@ -64,10 +38,6 @@ impl Tool for SpawnSubsession {
 
     fn description(&self) -> &'static str {
         "Spawn a sub-session to autonomously work on a task. The sub-session inherits the parent session's working directory and runs its own tool-calling loop."
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        spawn_subsession_schema()
     }
 
     fn execute(
@@ -167,7 +137,7 @@ mod tests {
 
     #[test]
     fn spawn_subsession_schema_has_required_prompt() {
-        let schema = spawn_subsession_schema();
+        let schema = SpawnSubsession.schema();
         let obj = schema.as_object().expect("schema should be an object");
         let required = obj
             .get("required")

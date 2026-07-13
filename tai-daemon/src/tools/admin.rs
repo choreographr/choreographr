@@ -1,22 +1,26 @@
 use crate::context;
 use crate::daemon::DaemonCommand;
 use crate::tools::context::ToolContext;
-use crate::tools::{ToolError, truncate_tool_output};
+use crate::tools::{Tool, ToolError, truncate_tool_output};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
+use tai_keystore::ServiceCredential;
 
 // ── Args structs ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct ListSessionsArgs {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct GetSessionArgs {
+    /// Session ID to inspect
     session_id: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct LoadSkillArgs {
+    /// Name of the skill to load
     name: String,
 }
 
@@ -59,20 +63,32 @@ fn execute_list_sessions(
 
 pub(crate) struct ListSessions;
 
-define_tool!(
-    ListSessions,
-    "list_sessions",
-    "List all sessions known to the daemon. Returns session ID, title, model, message count, parent session ID, and working directory for each session.",
-    ListSessionsArgs,
-    execute_list_sessions,
-    serde_json::json!({
-        "type": "object",
-        "properties": {},
-        "additionalProperties": false
-    }),
-    "core",
-    use_context
-);
+impl Tool for ListSessions {
+    type Args = ListSessionsArgs;
+    type Return = String;
+
+    fn name(&self) -> &'static str {
+        "list_sessions"
+    }
+
+    fn group(&self) -> &'static str {
+        "core"
+    }
+
+    fn description(&self) -> &'static str {
+        "List all sessions known to the daemon. Returns session ID, title, model, message count, parent session ID, and working directory for each session."
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        execute_list_sessions(&args, working_dir, ctx)
+    }
+}
 
 // ── get_session ────────────────────────────────────────────────────────────
 
@@ -108,26 +124,32 @@ fn execute_get_session(
 
 pub(crate) struct GetSession;
 
-define_tool!(
-    GetSession,
-    "get_session",
-    "Read the full message history of a session by its ID. Returns all messages (system, user, assistant, tool calls, tool results) with role labels.",
-    GetSessionArgs,
-    execute_get_session,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "session_id": {
-                "type": "integer",
-                "description": "The ID of the session to inspect"
-            }
-        },
-        "required": ["session_id"],
-        "additionalProperties": false
-    }),
-    "core",
-    use_context
-);
+impl Tool for GetSession {
+    type Args = GetSessionArgs;
+    type Return = String;
+
+    fn name(&self) -> &'static str {
+        "get_session"
+    }
+
+    fn group(&self) -> &'static str {
+        "core"
+    }
+
+    fn description(&self) -> &'static str {
+        "Read the full message history of a session by its ID. Returns all messages (system, user, assistant, tool calls, tool results) with role labels."
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        execute_get_session(&args, working_dir, ctx)
+    }
+}
 
 // ── load_skill ─────────────────────────────────────────────────────────────
 
@@ -156,17 +178,6 @@ define_tool!(
     "Load the full instructions for a skill by name. Use this when a task matches one of the available skill descriptions.",
     LoadSkillArgs,
     execute_load_skill,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "Name of the skill to load"
-            }
-        },
-        "required": ["name"],
-        "additionalProperties": false
-    }),
     "core"
 );
 

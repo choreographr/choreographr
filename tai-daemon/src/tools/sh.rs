@@ -1,53 +1,32 @@
 use super::{
     ToolError,
-    shell_util::{
-        binary_exists, format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog,
-    },
+    shell_util::{format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
 };
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 
-#[derive(Debug, Deserialize)]
-pub struct ShArgs {
-    pub command: String,
-    pub shell: String,
-    pub workdir: Option<String>,
-    pub timeout: Option<u64>,
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Shell {
+    /// Bourne Again SHell
+    Bash,
+    /// Debian Almquist SHell
+    Dash,
+    /// Z SHell
+    Zsh,
 }
 
-/// Build the JSON schema dynamically so the `shell` enum only lists
-/// shells that are actually installed on the current system.
-fn sh_schema() -> serde_json::Value {
-    let shells: Vec<&str> = ["bash", "dash", "zsh"]
-        .iter()
-        .filter(|s| binary_exists(s))
-        .copied()
-        .collect();
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "The shell command to execute (runs via `<shell> -c`)"
-            },
-            "shell": {
-                "type": "string",
-                "enum": shells,
-                "description": "Which POSIX-compatible shell to use. Must be one of the available variants on this system."
-            },
-            "workdir": {
-                "type": "string",
-                "description": "Working directory for the command (relative to the session working directory, or absolute)"
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Timeout in milliseconds (default 30000; capped by outer tool deadline)",
-                "default": 30000
-            }
-        },
-        "required": ["command", "shell"],
-        "additionalProperties": false
-    })
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ShArgs {
+    /// The shell command to execute (runs via `<shell> -c`)
+    pub command: String,
+    /// Which POSIX-compatible shell to use
+    pub shell: Shell,
+    /// Working directory for the command (relative to the session working directory, or absolute)
+    pub workdir: Option<String>,
+    /// Timeout in milliseconds (default 30000; capped by outer tool deadline)
+    pub timeout: Option<u64>,
 }
 
 pub(crate) struct Sh;
@@ -58,12 +37,15 @@ define_tool!(
     "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified.",
     ShArgs,
     execute_sh_tool,
-    sh_schema(),
     "shell"
 );
 
 pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
-    let shell = &args.shell;
+    let shell_str = match args.shell {
+        Shell::Bash => "bash",
+        Shell::Dash => "dash",
+        Shell::Zsh => "zsh",
+    };
     let command = &args.command;
     // The per-tool timeout (default 30s) governs shell execution.
     // The outer deadline in execute_tool_with_timeout (300s) is the
@@ -72,7 +54,7 @@ pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<Stri
 
     let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
 
-    let mut cmd = std::process::Command::new(shell);
+    let mut cmd = std::process::Command::new(shell_str);
     cmd.args(["-c", command])
         .current_dir(&resolved)
         .stdout(std::process::Stdio::piped())

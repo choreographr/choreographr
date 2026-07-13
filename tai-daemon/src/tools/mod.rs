@@ -1,6 +1,7 @@
 pub(crate) use crate::openai::AllowedCaller;
 use crate::openai::ChatToolCall;
 use crate::openai::ChatToolDefinition;
+use schemars::JsonSchema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -26,7 +27,7 @@ fn encode_result<R: Serialize>(result: Result<R, impl ToString>) -> Vec<u8> {
 /// returns, or `use_credentials`, write `impl Tool` manually.
 macro_rules! define_tool {
     ($struct:ident, $name:literal, $desc:literal, $args_ty:ty,
-     $exec_fn:path, $schema:expr, $group:literal, use_context) => {
+     $exec_fn:path, $group:literal) => {
         impl $crate::tools::Tool for $struct {
             type Args = $args_ty;
             type Return = String;
@@ -38,37 +39,6 @@ macro_rules! define_tool {
             }
             fn description(&self) -> &'static str {
                 $desc
-            }
-            fn schema(&self) -> serde_json::Value {
-                $schema
-            }
-            fn execute(
-                &self,
-                args: Self::Args,
-                _x_credentials: Option<&$crate::tools::ServiceCredential>,
-                working_dir: Option<&std::path::Path>,
-                ctx: Option<&$crate::tools::context::ToolContext>,
-            ) -> Result<Self::Return, $crate::tools::ToolError> {
-                $exec_fn(&args, working_dir, ctx)
-            }
-        }
-    };
-    ($struct:ident, $name:literal, $desc:literal, $args_ty:ty,
-     $exec_fn:path, $schema:expr, $group:literal) => {
-        impl $crate::tools::Tool for $struct {
-            type Args = $args_ty;
-            type Return = String;
-            fn name(&self) -> &'static str {
-                $name
-            }
-            fn group(&self) -> &'static str {
-                $group
-            }
-            fn description(&self) -> &'static str {
-                $desc
-            }
-            fn schema(&self) -> serde_json::Value {
-                $schema
             }
             fn execute(
                 &self,
@@ -139,23 +109,31 @@ pub struct ToolGroup {
 /// Both must be serde-compatible (JSON path uses serde_json, binary path uses postcard).
 pub trait Tool: Send + Sync {
     /// Argument type — must be deserializable from both JSON and postcard.
-    type Args: DeserializeOwned + 'static;
+    type Args: DeserializeOwned + JsonSchema + 'static;
     /// Return type — must be serializable to both JSON and postcard.
-    type Return: Serialize + 'static;
+    type Return: Serialize + JsonSchema + 'static;
 
     fn name(&self) -> &'static str;
     fn group(&self) -> &'static str {
         "core"
     }
     fn description(&self) -> &'static str;
-    fn schema(&self) -> serde_json::Value;
+
+    /// Auto-derived JSON Schema for the tool's input arguments.
+    fn schema(&self) -> serde_json::Value {
+        let mut schema =
+            serde_json::to_value(schemars::schema_for!(Self::Args)).unwrap_or_default();
+        if let Some(obj) = schema.as_object_mut() {
+            obj.insert("additionalProperties".into(), false.into());
+        }
+        schema
+    }
 
     /// JSON Schema for the tool's return value (for Programmatic Tool Calling).
-    /// The default assumes the tool returns a string, which covers the vast
-    /// majority of tools. Override this for tools that return integers,
-    /// arrays, binary data, or unstructured output.
+    /// The default auto-derives the schema from the return type. Override this
+    /// for tools with custom deserialization that schemars cannot represent.
     fn output_schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({"type": "string"}))
+        Some(serde_json::to_value(schemars::schema_for!(Self::Return)).unwrap_or_default())
     }
 
     /// Controls which callers can invoke this tool.
@@ -456,13 +434,7 @@ impl ToolRegistry {
         reg.register(git::GitAdd);
         reg.register(git::GitCommit);
         reg.register(git::GitPush);
-        // Only register the shell tool when at least one POSIX variant is found.
-        if shell_util::binary_exists("bash")
-            || shell_util::binary_exists("dash")
-            || shell_util::binary_exists("zsh")
-        {
-            reg.register(sh::Sh);
-        }
+        reg.register(sh::Sh);
         if shell_util::binary_exists("nu") {
             reg.register(nu::NuShell);
         }
@@ -881,10 +853,8 @@ mod tests {
     #[test]
     fn default_output_schema_is_string() {
         let tool = DefaultTool;
-        assert_eq!(
-            Tool::output_schema(&tool),
-            Some(serde_json::json!({"type": "string"}))
-        );
+        let schema = Tool::output_schema(&tool).expect("schema");
+        assert_eq!(schema["type"], "string");
     }
 
     #[test]
@@ -909,10 +879,8 @@ mod tests {
     #[test]
     fn tooldyn_delegates_output_schema() {
         let tool: Box<dyn ToolDyn> = Box::new(DefaultTool);
-        assert_eq!(
-            tool.output_schema(),
-            Some(serde_json::json!({"type": "string"}))
-        );
+        let schema = tool.output_schema().expect("schema");
+        assert_eq!(schema["type"], "string");
     }
 
     #[test]

@@ -1,9 +1,9 @@
-use super::{ToolError, context::ToolContext, truncate_tool_output};
+use super::{ToolError, truncate_tool_output};
 use globset::Glob;
 use ignore::Walk;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
-use tai_keystore::ServiceCredential;
 
 /// Default result limit when the caller doesn't specify one.
 const DEFAULT_MAX_RESULTS: u32 = 50;
@@ -12,12 +12,16 @@ const DEFAULT_MAX_RESULTS: u32 = 50;
 /// LLM context window.
 const MAX_RESULTS_CAP: u32 = 200;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindArgs {
+    /// File name pattern to search for (supports glob like '*.rs')
     pub pattern: String,
+    /// When true, treat pattern as a glob instead of a substring match
     #[serde(default)]
     pub glob: bool,
+    /// Directory to search in (defaults to working directory)
     pub path: Option<String>,
+    /// Maximum number of matching files to return
     pub max_results: Option<u32>,
 }
 
@@ -121,62 +125,14 @@ pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<
     Ok(truncate_tool_output(&results.join("\n")))
 }
 
-impl super::Tool for Find {
-    type Args = FindArgs;
-    type Return = String;
-
-    fn name(&self) -> &'static str {
-        "find"
-    }
-
-    fn group(&self) -> &'static str {
-        "core"
-    }
-
-    fn description(&self) -> &'static str {
-        "Find files and directories by name. Respects .gitignore and hidden files."
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "File/directory name to search for (case-insensitive substring match by default)"
-                },
-                "glob": {
-                    "type": "boolean",
-                    "description": "If true, pattern is treated as a glob (e.g. '*test*', '*.rs', 'src/**')",
-                    "default": false
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Directory to search in (default: session working directory)"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of results to return",
-                    "default": 50,
-                    "minimum": 1,
-                    "maximum": 200
-                }
-            },
-            "required": ["pattern"],
-            "additionalProperties": false
-        })
-    }
-
-    fn execute(
-        &self,
-        args: Self::Args,
-        _x_credentials: Option<&ServiceCredential>,
-        working_dir: Option<&Path>,
-        _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
-        execute_find_tool(&args, working_dir)
-    }
-}
+define_tool!(
+    Find,
+    "find",
+    "Find files and directories by name. Respects .gitignore and hidden files.",
+    FindArgs,
+    execute_find_tool,
+    "core"
+);
 
 #[cfg(test)]
 mod tests {

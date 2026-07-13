@@ -2,6 +2,7 @@ use super::{PreparedImage, ToolError, context::ToolContext, truncate_tool_output
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::GenericImageView;
 use resvg::usvg;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::Mutex;
@@ -9,13 +10,19 @@ use std::{io, time::Duration};
 use tai_keystore::ServiceCredential;
 use url::Url;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DisplayImageArgs {
+    /// MIME type of the image (e.g. "image/png", "image/svg+xml")
     mime_type: String,
+    /// Path to an image file on disk
     path: Option<String>,
+    /// URL of an image to fetch and display
     url: Option<String>,
+    /// Base64-encoded image data
     base64_data: Option<String>,
+    /// Raw SVG markup to render
     svg_text: Option<String>,
+    /// Alt text description of the image
     alt: Option<String>,
 }
 
@@ -175,40 +182,6 @@ impl super::Tool for DisplayImage {
     fn description(&self) -> &'static str {
         "Display a PNG, JPEG, or SVG image in the client UI."
     }
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "mime_type": {
-                    "type": "string",
-                    "enum": ["image/png", "image/jpeg", "image/svg+xml"]
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Relative or absolute path to an image file"
-                },
-                "url": {
-                    "type": "string",
-                    "description": "Absolute http or https URL to an image"
-                },
-                "base64_data": {
-                    "type": "string",
-                    "description": "Raw image bytes encoded as base64"
-                },
-                "svg_text": {
-                    "type": "string",
-                    "description": "Inline SVG document text; only valid with mime_type image/svg+xml"
-                },
-                "alt": {
-                    "type": "string",
-                    "description": "Optional accessible description"
-                }
-            },
-            "required": ["mime_type"],
-            "additionalProperties": false
-        })
-    }
-
     fn execute(
         &self,
         args: Self::Args,

@@ -1,4 +1,5 @@
 use crate::tools::{ToolError, truncate_tool_output};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::fmt::Write as _;
 
@@ -7,7 +8,7 @@ use super::{
     open_repo, repo_work_dir_display, run_git_command, yes_no,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitPushArgs {
     pub repo_path: Option<String>,
     pub remote: String,
@@ -112,6 +113,5 @@ define_tool!(
     "Push to a Git remote branch.",
     GitPushArgs,
     execute_git_push_tool,
-    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"remote":{"type":"string","description":"Remote name","default":"origin"},"branch":{"type":"string","description":"Remote branch name"},"set_upstream":{"type":"boolean","description":"Set upstream tracking reference","default":false},"force_with_lease":{"type":"boolean","description":"Force push with lease (safe force push)","default":false},"dry_run":{"type":"boolean","description":"Simulate push without sending data","default":false}},"required":[],"additionalProperties":false}),
     "git"
 );

@@ -2,13 +2,17 @@ use super::{
     ToolError,
     shell_util::{format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
 };
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct NuArgs {
+    /// The nushell command to execute (runs via `nu -c`)
     pub command: String,
+    /// Working directory for the command (relative to the session working directory, or absolute)
     pub workdir: Option<String>,
+    /// Timeout in milliseconds (default 30000; capped by outer tool deadline)
     pub timeout: Option<u64>,
 }
 
@@ -20,26 +24,6 @@ define_tool!(
     "Execute a nushell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang.",
     NuArgs,
     execute_nu_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "The nushell command to execute (runs via `nu -c`)"
-            },
-            "workdir": {
-                "type": "string",
-                "description": "Working directory for the command (relative to the session working directory, or absolute)"
-            },
-            "timeout": {
-                "type": "integer",
-                "description": "Timeout in milliseconds (default 30000; capped by outer tool deadline)",
-                "default": 30000
-            }
-        },
-        "required": ["command"],
-        "additionalProperties": false
-    }),
     "shell"
 );
 

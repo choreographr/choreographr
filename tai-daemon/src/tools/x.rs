@@ -1,21 +1,26 @@
 use crate::tools::{ToolError, context::ToolContext, truncate_tool_output};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 use tai_keystore::{ServiceCredential, XCredentialView};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct XPostArgs {
+    /// Text content of the post
     pub text: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct XSearchRecentArgs {
+    /// Search query
     pub query: String,
+    /// Maximum number of results to return
     pub max_results: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct XUserLookupArgs {
+    /// X/Twitter username (without @)
     pub username: String,
 }
 
@@ -310,19 +315,6 @@ impl super::Tool for XPost {
         "Post a tweet to X (Twitter). Requires X credentials to be configured via the keystore."
     }
 
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "The text content of the tweet (max 280 characters)"
-                }
-            },
-            "required": ["text"]
-        })
-    }
-
     fn execute(
         &self,
         args: Self::Args,
@@ -352,23 +344,6 @@ impl super::Tool for XSearchRecent {
         "Search recent tweets on X (Twitter). Requires X credentials to be configured via the keystore."
     }
 
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query (max 512 characters)"
-                },
-                "max_results": {
-                    "type": "number",
-                    "description": "Maximum number of results to return (10-100, default 10)"
-                }
-            },
-            "required": ["query"]
-        })
-    }
-
     fn execute(
         &self,
         args: Self::Args,
@@ -396,19 +371,6 @@ impl super::Tool for XUserLookup {
 
     fn description(&self) -> &'static str {
         "Look up a user on X (Twitter) by username or ID. Requires X credentials to be configured via the keystore."
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "username": {
-                    "type": "string",
-                    "description": "The X username (without @) to look up"
-                }
-            },
-            "required": ["username"]
-        })
     }
 
     fn execute(

@@ -1,7 +1,7 @@
 use std::path::Path;
-use tai_daemon::{ShArgs, execute_sh_tool};
+use tai_daemon::{ShArgs, Shell, execute_sh_tool};
 
-const SHELL: &str = "bash";
+const SHELL: Shell = Shell::Bash;
 
 #[test]
 #[ignore]
@@ -9,7 +9,7 @@ fn echo_hello() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "echo hello world".into(),
-            shell: SHELL.into(),
+            shell: SHELL,
             workdir: None,
             timeout: None,
         },
@@ -26,7 +26,7 @@ fn exit_nonzero() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "exit 42".into(),
-            shell: SHELL.into(),
+            shell: SHELL,
             workdir: None,
             timeout: None,
         },
@@ -43,7 +43,7 @@ fn working_directory() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "pwd".into(),
-            shell: SHELL.into(),
+            shell: SHELL,
             workdir: Some(dir.display().to_string()),
             timeout: None,
         },
@@ -59,7 +59,7 @@ fn timeout_kills_command() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "sleep 10".into(),
-            shell: SHELL.into(),
+            shell: SHELL,
             workdir: None,
             timeout: Some(500),
         },
@@ -76,7 +76,7 @@ fn path_confinement_rejects_escape() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "echo escape".into(),
-            shell: SHELL.into(),
+            shell: SHELL,
             workdir: Some("/etc".into()),
             timeout: None,
         },
@@ -97,7 +97,7 @@ fn path_confinement_allows_subdirectory() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "echo ok".into(),
-            shell: SHELL.into(),
+            shell: SHELL,
             workdir: None,
             timeout: None,
         },
@@ -112,7 +112,7 @@ fn no_working_dir_skips_confinement() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "echo ok".into(),
-            shell: SHELL.into(),
+            shell: SHELL,
             workdir: None,
             timeout: None,
         },
@@ -127,7 +127,7 @@ fn output_truncation() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "head -c 100000 /dev/zero | tr '\\0' 'x'".into(),
-            shell: SHELL.into(),
+            shell: SHELL,
             workdir: None,
             timeout: None,
         },
@@ -143,7 +143,7 @@ fn stderr_output_included() {
     let result = execute_sh_tool(
         &ShArgs {
             command: "echo out && echo err >&2".into(),
-            shell: SHELL.into(),
+            shell: SHELL,
             workdir: None,
             timeout: None,
         },

@@ -2,61 +2,113 @@ use crate::db;
 use crate::tools::context::ToolContext;
 use crate::tools::{Tool, ToolError};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use serde::de::{self, Deserializer};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tai_keystore::ServiceCredential;
 use tracing::{debug, error};
 
-fn from_base64<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-    let s = String::deserialize(d)?;
-    BASE64.decode(&s).map_err(de::Error::custom)
+// ── DbValue: binary-safe value wrapper ──────────────────────────────────
+
+/// A database value that preserves raw bytes through postcard (VM path)
+/// while presenting as a plain string through JSON (LLM path).
+#[derive(Debug, Clone)]
+pub struct DbValue(pub Vec<u8>);
+
+impl Serialize for DbValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&String::from_utf8_lossy(&self.0))
+        } else {
+            serializer.serialize_bytes(&self.0)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DbValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            Ok(DbValue(s.into_bytes()))
+        } else {
+            Vec::<u8>::deserialize(deserializer).map(DbValue)
+        }
+    }
+}
+
+impl JsonSchema for DbValue {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("DbValue")
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(concat!(module_path!(), "::DbValue"))
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "The value to store"
+        })
+    }
 }
 
 // ── Args structs ────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DbSetArgs {
+    /// The key to set
     key: String,
-    #[serde(rename = "value_b64", deserialize_with = "from_base64")]
-    value: Vec<u8>,
+    /// The value to store
+    value: DbValue,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DbGetArgs {
+    /// The key to retrieve
     key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DbDeleteArgs {
+    /// The key to delete
     key: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DbDeleteRangeArgs {
+    /// Start of the key range (inclusive)
     start: String,
+    /// End of the key range (exclusive). If omitted, deletes from start to end of session's keys.
     end: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DbGetRangeArgs {
+    /// Start of the key range (inclusive)
     start: String,
+    /// End of the key range (exclusive). If omitted, retrieves from start to end of session's keys.
     end: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DbListArgs {
+    /// Start of the key range (inclusive). If omitted, starts from the beginning.
     start: Option<String>,
+    /// End of the key range (exclusive). If omitted, goes to the end.
     end: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct DbCountArgs {
+    /// Optional prefix to filter keys by. If omitted, counts all keys.
     prefix: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, JsonSchema)]
 pub struct DbGetRangeEntry {
+    /// The key
     key: String,
+    /// The value, base64-encoded
     value_b64: String,
 }
 
@@ -77,24 +129,7 @@ impl Tool for DbSet {
     }
 
     fn description(&self) -> &'static str {
-        "Insert or overwrite a key-value pair in the session's database. Value must be base64-encoded."
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "key": {
-                    "type": "string",
-                    "description": "The key to set"
-                },
-                "value_b64": {
-                    "type": "string",
-                    "description": "The value, base64-encoded"
-                }
-            },
-            "required": ["key", "value_b64"]
-        })
+        "Insert or overwrite a key-value pair in the session's database."
     }
 
     fn execute(
@@ -105,8 +140,8 @@ impl Tool for DbSet {
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, ToolError> {
         let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
-        let value_len = args.value.len();
-        db::kv_set(ctx.db.as_ref(), ctx.session_id, &args.key, &args.value).map_err(|e| {
+        let value_len = args.value.0.len();
+        db::kv_set(ctx.db.as_ref(), ctx.session_id, &args.key, &args.value.0).map_err(|e| {
             error!(session = ctx.session_id, key = &args.key, error = %e, "db_set failed");
             ToolError::Other(format!("db_set failed: {e}"))
         })?;
@@ -126,7 +161,7 @@ pub(crate) struct DbGet;
 
 impl Tool for DbGet {
     type Args = DbGetArgs;
-    type Return = Option<Vec<u8>>;
+    type Return = Option<String>;
 
     fn name(&self) -> &'static str {
         "db_get"
@@ -140,25 +175,6 @@ impl Tool for DbGet {
         "Retrieve a value by key from the session's database."
     }
 
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "key": {
-                    "type": "string",
-                    "description": "The key to retrieve"
-                }
-            },
-            "required": ["key"]
-        })
-    }
-
-    fn output_schema(&self) -> Option<serde_json::Value> {
-        // Returns None because the output is raw binary (Vec<u8>), not a structured JSON type.
-        // Callers must handle the opaque byte sequence as-is.
-        None
-    }
-
     fn execute(
         &self,
         args: Self::Args,
@@ -169,13 +185,15 @@ impl Tool for DbGet {
         let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
         match db::kv_get(ctx.db.as_ref(), ctx.session_id, &args.key) {
             Ok(value) => {
+                let value_len = value.as_ref().map_or(0, Vec::len);
+                let value_str = value.map(|v| String::from_utf8_lossy(&v).into_owned());
                 debug!(
                     session = ctx.session_id,
                     key = &args.key,
-                    value_len = value.as_ref().map_or(0, Vec::len),
+                    value_len,
                     "db_get ok"
                 );
-                Ok(value)
+                Ok(value_str)
             }
             Err(e) => {
                 error!(session = ctx.session_id, key = &args.key, error = %e, "db_get failed");
@@ -203,19 +221,6 @@ impl Tool for DbDelete {
 
     fn description(&self) -> &'static str {
         "Remove a single key from the session's database. Returns 'deleted' or 'not found'."
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "key": {
-                    "type": "string",
-                    "description": "The key to delete"
-                }
-            },
-            "required": ["key"]
-        })
     }
 
     fn execute(
@@ -265,23 +270,6 @@ impl Tool for DbDeleteRange {
 
     fn description(&self) -> &'static str {
         "Delete all keys in the range [start, end). If end is omitted, deletes from start to the end of the session's keys."
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "start": {
-                    "type": "string",
-                    "description": "Start of the key range (inclusive)"
-                },
-                "end": {
-                    "type": "string",
-                    "description": "End of the key range (exclusive). If omitted, deletes from start to end of session's keys."
-                }
-            },
-            "required": ["start"]
-        })
     }
 
     fn execute(
@@ -340,37 +328,6 @@ impl Tool for DbGetRange {
 
     fn description(&self) -> &'static str {
         "Retrieve all key-value pairs in the key range [start, end). Returns a JSON array of {key, value_b64} objects."
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "start": {
-                    "type": "string",
-                    "description": "Start of the key range (inclusive)"
-                },
-                "end": {
-                    "type": "string",
-                    "description": "End of the key range (exclusive). If omitted, retrieves from start to end of session's keys."
-                }
-            },
-            "required": ["start"]
-        })
-    }
-
-    fn output_schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "key": {"type": "string"},
-                    "value_b64": {"type": "string"}
-                },
-                "required": ["key", "value_b64"]
-            }
-        }))
     }
 
     fn execute(
@@ -439,26 +396,6 @@ impl Tool for DbList {
         "List key names in the key range [start, end). Both start and end are optional. Returns a JSON array of key strings."
     }
 
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "start": {
-                    "type": "string",
-                    "description": "Start of the key range (inclusive). If omitted, starts from the beginning."
-                },
-                "end": {
-                    "type": "string",
-                    "description": "End of the key range (exclusive). If omitted, goes to the end."
-                }
-            }
-        })
-    }
-
-    fn output_schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({"type": "array", "items": {"type": "string"}}))
-    }
-
     fn execute(
         &self,
         args: Self::Args,
@@ -518,22 +455,6 @@ impl Tool for DbCount {
         "Count keys in the session's database, optionally filtered by prefix."
     }
 
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "prefix": {
-                    "type": "string",
-                    "description": "Optional prefix to filter keys by. If omitted, counts all keys."
-                }
-            }
-        })
-    }
-
-    fn output_schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({"type": "integer"}))
-    }
-
     fn execute(
         &self,
         args: Self::Args,
@@ -587,7 +508,7 @@ mod tests {
         let result = DbSet.execute(
             DbSetArgs {
                 key: "greeting".into(),
-                value: b"hello".to_vec(),
+                value: DbValue(b"hello".to_vec()),
             },
             None,
             None,
@@ -603,7 +524,7 @@ mod tests {
             None,
             Some(&ctx),
         );
-        assert_eq!(result.unwrap(), Some(b"hello".to_vec()));
+        assert_eq!(result.unwrap(), Some("hello".into()));
     }
 
     #[test]
@@ -627,7 +548,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "x".into(),
-                    value: b"x".to_vec(),
+                    value: DbValue(b"x".to_vec()),
                 },
                 None,
                 None,
@@ -659,7 +580,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "a".into(),
-                    value: b"a".to_vec(),
+                    value: DbValue(b"a".to_vec()),
                 },
                 None,
                 None,
@@ -670,7 +591,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "b".into(),
-                    value: b"b".to_vec(),
+                    value: DbValue(b"b".to_vec()),
                 },
                 None,
                 None,
@@ -688,7 +609,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "aa".into(),
-                    value: b"aa".to_vec(),
+                    value: DbValue(b"aa".to_vec()),
                 },
                 None,
                 None,
@@ -699,7 +620,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "ab".into(),
-                    value: b"ab".to_vec(),
+                    value: DbValue(b"ab".to_vec()),
                 },
                 None,
                 None,
@@ -710,7 +631,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "ba".into(),
-                    value: b"ba".to_vec(),
+                    value: DbValue(b"ba".to_vec()),
                 },
                 None,
                 None,
@@ -735,7 +656,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "apple".into(),
-                    value: b"a".to_vec(),
+                    value: DbValue(b"a".to_vec()),
                 },
                 None,
                 None,
@@ -746,7 +667,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "banana".into(),
-                    value: b"b".to_vec(),
+                    value: DbValue(b"b".to_vec()),
                 },
                 None,
                 None,
@@ -757,7 +678,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "cherry".into(),
-                    value: b"c".to_vec(),
+                    value: DbValue(b"c".to_vec()),
                 },
                 None,
                 None,
@@ -783,7 +704,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "x".into(),
-                    value: b"xxx".to_vec(),
+                    value: DbValue(b"xxx".to_vec()),
                 },
                 None,
                 None,
@@ -812,7 +733,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "a".into(),
-                    value: b"a".to_vec(),
+                    value: DbValue(b"a".to_vec()),
                 },
                 None,
                 None,
@@ -823,7 +744,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "b".into(),
-                    value: b"b".to_vec(),
+                    value: DbValue(b"b".to_vec()),
                 },
                 None,
                 None,
@@ -834,7 +755,7 @@ mod tests {
             .execute(
                 DbSetArgs {
                     key: "c".into(),
-                    value: b"c".to_vec(),
+                    value: DbValue(b"c".to_vec()),
                 },
                 None,
                 None,
@@ -858,7 +779,7 @@ mod tests {
         let result = DbSet.execute(
             DbSetArgs {
                 key: "x".into(),
-                value: b"x".to_vec(),
+                value: DbValue(b"x".to_vec()),
             },
             None,
             None,
@@ -871,26 +792,40 @@ mod tests {
     // ── output_schema tests ──────────────────────────────────────────
 
     #[test]
-    fn db_get_output_schema_is_none() {
-        assert!(
-            DbGet.output_schema().is_none(),
-            "DbGet returns raw bytes, no structured JSON schema"
-        );
+    fn db_get_output_schema_is_nullable_string() {
+        let schema = DbGet.output_schema().expect("schema");
+        // Option<String> generates type as an array of ["string", "null"]
+        let type_val = schema.get("type").and_then(|v| v.as_array());
+        assert!(type_val.is_some(), "type should be an array");
+        let types: Vec<&str> = type_val
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(types.contains(&"string"), "should include string");
+        assert!(types.contains(&"null"), "should include null");
     }
 
     #[test]
     fn db_get_range_output_schema_is_array_of_objects() {
         let schema = DbGetRange.output_schema().expect("schema");
         assert_eq!(schema["type"], "array");
-        assert_eq!(schema["items"]["type"], "object");
+        // Follow $ref to the definition if present (Draft 2020-12 uses $defs)
+        let items = if let Some(ref_path) = schema["items"]["$ref"].as_str() {
+            let def_key = ref_path.trim_start_matches("#/$defs/");
+            &schema["$defs"][def_key]
+        } else {
+            &schema["items"]
+        };
+        assert_eq!(items["type"], "object");
         assert!(
-            schema["items"]["required"]
+            items["required"]
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::Value::String("key".into()))
         );
         assert!(
-            schema["items"]["required"]
+            items["required"]
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::Value::String("value_b64".into()))

@@ -3,6 +3,7 @@ use gix::{
     ObjectId,
     bstr::{BStr, BString, ByteSlice},
 };
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{collections::BTreeSet, fmt::Write as _, io, path::Path};
 
@@ -10,7 +11,7 @@ use super::{
     describe_head, load_mutable_index, open_repo, pathspec_patterns, repo_work_dir_display,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitAddArgs {
     pub repo_path: Option<String>,
     pub pathspec: Vec<String>,
@@ -260,6 +261,5 @@ define_tool!(
     "Stage a file or pathspec in Git.",
     GitAddArgs,
     execute_git_add_tool,
-    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"pathspec":{"type":"array","items":{"type":"string"},"description":"Files or pathspecs to stage"}},"required":["pathspec"],"additionalProperties":false}),
     "git"
 );

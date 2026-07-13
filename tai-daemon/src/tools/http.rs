@@ -1,14 +1,20 @@
 use super::{ToolError, truncate_tool_output};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{collections::HashMap, path::Path, time::Duration};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct HttpRequestArgs {
+    /// HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD)
     pub method: String,
+    /// Request URL
     pub url: String,
+    /// Optional HTTP headers as key-value pairs
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Optional request body
     pub body: Option<String>,
+    /// Optional timeout in seconds (default 30)
     pub timeout_secs: Option<u64>,
 }
 
@@ -154,37 +160,5 @@ define_tool!(
     "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests.",
     HttpRequestArgs,
     execute_http_request_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "method": {
-                "type": "string",
-                "enum": ["GET", "POST", "HEAD"]
-            },
-            "url": {
-                "type": "string",
-                "description": "Absolute http or https URL"
-            },
-            "headers": {
-                "type": "object",
-                "description": "Optional request headers, including Range",
-                "additionalProperties": {
-                    "type": "string"
-                }
-            },
-            "body": {
-                "type": "string",
-                "description": "Optional UTF-8 request body"
-            },
-            "timeout_secs": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 30,
-                "default": 10
-            }
-        },
-        "required": ["method", "url"],
-        "additionalProperties": false
-    }),
     "core"
 );

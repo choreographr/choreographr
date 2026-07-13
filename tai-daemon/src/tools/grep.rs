@@ -1,11 +1,11 @@
-use super::{ToolError, context::ToolContext, truncate_tool_output};
+use super::{ToolError, truncate_tool_output};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::Walk;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use tai_keystore::ServiceCredential;
 
 /// Default result limit when the caller doesn't specify one.
 const DEFAULT_MAX_RESULTS: u32 = 50;
@@ -14,13 +14,18 @@ const DEFAULT_MAX_RESULTS: u32 = 50;
 /// LLM context window.
 const MAX_RESULTS_CAP: u32 = 200;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GrepArgs {
+    /// Search pattern (plain text or regex)
     pub pattern: String,
+    /// When true, treat pattern as a regular expression
     #[serde(default)]
     pub regex: bool,
+    /// File glob pattern to filter which files are searched (e.g. '*.rs')
     pub include: Option<String>,
+    /// Directory or file to search in (defaults to working directory)
     pub path: Option<String>,
+    /// Maximum number of matching lines to return
     pub max_results: Option<u32>,
 }
 
@@ -150,66 +155,14 @@ pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<
     Ok(truncate_tool_output(&lines.join("\n")))
 }
 
-impl super::Tool for Grep {
-    type Args = GrepArgs;
-    type Return = String;
-
-    fn name(&self) -> &'static str {
-        "grep"
-    }
-
-    fn group(&self) -> &'static str {
-        "core"
-    }
-
-    fn description(&self) -> &'static str {
-        "Search file contents for a pattern. Respects .gitignore, hidden, and binary files. Results in file:line:content format."
-    }
-
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Text pattern to search for in file contents"
-                },
-                "regex": {
-                    "type": "boolean",
-                    "description": "If true, pattern is treated as a regular expression (Rust regex syntax)",
-                    "default": false
-                },
-                "include": {
-                    "type": "string",
-                    "description": "Glob pattern to filter files by path (e.g. '*.rs', 'src/**/*.rs', '*.{ts,js}')"
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Directory to search in (default: session working directory)"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of matching lines to return",
-                    "default": 50,
-                    "minimum": 1,
-                    "maximum": 200
-                }
-            },
-            "required": ["pattern"],
-            "additionalProperties": false
-        })
-    }
-
-    fn execute(
-        &self,
-        args: Self::Args,
-        _x_credentials: Option<&ServiceCredential>,
-        working_dir: Option<&Path>,
-        _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
-        execute_grep_tool(&args, working_dir)
-    }
-}
+define_tool!(
+    Grep,
+    "grep",
+    "Search file contents for a pattern. Respects .gitignore, hidden, and binary files. Results in file:line:content format.",
+    GrepArgs,
+    execute_grep_tool,
+    "core"
+);
 
 /// Custom Sink that collects matching lines up to a configured limit.
 ///

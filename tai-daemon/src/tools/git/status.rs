@@ -3,6 +3,7 @@ use gix::{
     bstr::BString,
     status::{Item as StatusItem, UntrackedFiles},
 };
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{fmt::Write as _, io};
 
@@ -11,7 +12,7 @@ use super::{
     path_from_bytes, repo_work_dir_display, sort_and_dedup, write_section,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitRepoArgs {
     pub repo_path: Option<String>,
 }
@@ -79,6 +80,5 @@ define_tool!(
     "Show the status of the Git repository containing the given path.",
     GitRepoArgs,
     execute_git_status_tool,
-    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."}},"additionalProperties":false}),
     "git"
 );

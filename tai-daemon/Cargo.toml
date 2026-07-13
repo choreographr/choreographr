@@ -24,6 +24,7 @@ redb.workspace = true
 ureq.workspace = true
 url.workspace = true
 resvg.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 yaml_serde.workspace = true

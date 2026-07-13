@@ -1,5 +1,6 @@
 use crate::tools::{ToolError, truncate_tool_output};
 use gix::status::UntrackedFiles;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{fmt::Write as _, io, ops::Deref};
 
@@ -8,7 +9,7 @@ use super::{
     pathspec_patterns, repo_work_dir_display, sort_and_dedup,
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitDiffArgs {
     pub repo_path: Option<String>,
     pub cached: Option<bool>,
@@ -277,6 +278,5 @@ define_tool!(
     "Show the diff for a file or repository. When `full` is true, returns line-by-line unified diff instead of file status summary.",
     GitDiffArgs,
     execute_git_diff_tool,
-    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"cached":{"type":"boolean","description":"Show staged (cached) changes instead of worktree changes","default":false},"pathspec":{"type":"array","items":{"type":"string"},"description":"Optional pathspecs to filter"},"full":{"type":"boolean","description":"Return full unified diff instead of file status summary","default":false}},"additionalProperties":false}),
     "git"
 );

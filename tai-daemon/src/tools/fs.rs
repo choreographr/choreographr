@@ -1,4 +1,5 @@
 use super::{ToolError, confine_path, sha256_hex, truncate_tool_output};
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{fs::OpenOptions, io::Write};
 use std::{
@@ -7,48 +8,65 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadFileArgs {
+    /// Relative or absolute path to a text file
     pub path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct WriteFileArgs {
+    /// Relative or absolute path to the file to write
     pub path: String,
+    /// Full UTF-8 file contents to write
     pub content: String,
+    /// Whether to overwrite an existing file
     pub overwrite: Option<bool>,
+    /// Whether to create missing parent directories
     pub create_parents: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct EditFileArgs {
+    /// Relative or absolute path to the file to edit
     pub path: String,
+    /// One or more exact text replacements to apply
     pub edits: Vec<TextEditArgs>,
+    /// If set, the tool will verify the file matches this SHA-256 before editing (safety check)
     pub expected_sha256: Option<String>,
+    /// When true, preview changes without applying them
     pub dry_run: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct TextEditArgs {
+    /// Exact text to replace (must match at least once)
     pub old_text: String,
+    /// Replacement text
     pub new_text: String,
+    /// When true, replace all exact matches instead of requiring exactly one match
     pub replace_all: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadFileRangeArgs {
+    /// Relative or absolute path to a text file
     pub path: String,
+    /// 1-based inclusive start line
     pub start_line: usize,
+    /// Maximum number of lines to return
     pub max_lines: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct LineCountArgs {
+    /// Relative or absolute path to a text file
     pub path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesArgs {
+    /// Relative or absolute path to a directory (defaults to working directory)
     pub path: Option<String>,
 }
 
@@ -396,17 +414,6 @@ define_tool!(
     "Read a UTF-8 text file from the local workspace.",
     ReadFileArgs,
     execute_read_file_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Relative or absolute path to a text file"
-            }
-        },
-        "required": ["path"],
-        "additionalProperties": false
-    }),
     "core"
 );
 
@@ -418,28 +425,6 @@ define_tool!(
     "Read a line range from a UTF-8 text file in the local workspace.",
     ReadFileRangeArgs,
     execute_read_file_range_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Relative or absolute path to a text file"
-            },
-            "start_line": {
-                "type": "integer",
-                "minimum": 1,
-                "description": "1-based inclusive start line"
-            },
-            "max_lines": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 200,
-                "description": "Maximum number of lines to return"
-            }
-        },
-        "required": ["path", "start_line", "max_lines"],
-        "additionalProperties": false
-    }),
     "core"
 );
 
@@ -451,17 +436,6 @@ define_tool!(
     "List files in a local directory.",
     ListFilesArgs,
     execute_list_files_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Relative or absolute path to a directory",
-                "default": "."
-            }
-        },
-        "additionalProperties": false
-    }),
     "core"
 );
 
@@ -473,17 +447,6 @@ define_tool!(
     "Count the number of lines in a UTF-8 text file.",
     LineCountArgs,
     execute_line_count_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Relative or absolute path to a text file"
-            }
-        },
-        "required": ["path"],
-        "additionalProperties": false
-    }),
     "core"
 );
 
@@ -495,31 +458,6 @@ define_tool!(
     "Write a UTF-8 text file to the local workspace.",
     WriteFileArgs,
     execute_write_file_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Relative or absolute path to the file to write"
-            },
-            "content": {
-                "type": "string",
-                "description": "Full UTF-8 file contents to write"
-            },
-            "overwrite": {
-                "type": "boolean",
-                "description": "Whether to overwrite an existing file",
-                "default": true
-            },
-            "create_parents": {
-                "type": "boolean",
-                "description": "Whether to create missing parent directories",
-                "default": true
-            }
-        },
-        "required": ["path", "content"],
-        "additionalProperties": false
-    }),
     "core"
 );
 
@@ -531,50 +469,6 @@ define_tool!(
     "Edit a UTF-8 text file by applying one or more exact text replacements. Each edit must match at least once; non-replace_all edits must match exactly once.",
     EditFileArgs,
     execute_edit_file_tool,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "Relative or absolute path to the file to edit"
-            },
-            "edits": {
-                "type": "array",
-                "minItems": 1,
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "old_text": {
-                            "type": "string",
-                            "description": "Exact text to replace"
-                        },
-                        "new_text": {
-                            "type": "string",
-                            "description": "Replacement text"
-                        },
-                        "replace_all": {
-                            "type": "boolean",
-                            "description": "When true, replace all exact matches instead of requiring exactly one match",
-                            "default": false
-                        }
-                    },
-                    "required": ["old_text", "new_text"],
-                    "additionalProperties": false
-                }
-            },
-            "expected_sha256": {
-                "type": "string",
-                "description": "Optional lowercase hex SHA-256 of the file before editing"
-            },
-            "dry_run": {
-                "type": "boolean",
-                "description": "When true, validate and preview the edit without writing the file",
-                "default": false
-            }
-        },
-        "required": ["path", "edits"],
-        "additionalProperties": false
-    }),
     "core"
 );
 

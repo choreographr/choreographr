@@ -583,22 +583,33 @@ startup                    /unlock [passphrase]
 ### Generic `Tool` trait
 
 The tool trait is generic over argument and return types. Each tool declares its own
-`type Args` (must implement `DeserializeOwned`) and `type Return` (must implement `Serialize`).
+`type Args` (must implement `DeserializeOwned + JsonSchema`) and `type Return`
+(must implement `Serialize + JsonSchema`). Both `schema()` and `output_schema()` are
+auto-derived via `schemars` by default, eliminating the need for hand-written JSON schemas.
 
 ```rust
 pub trait Tool: Send + Sync {
-    type Args: DeserializeOwned + 'static;
-    type Return: Serialize + 'static;
+    type Args: DeserializeOwned + JsonSchema + 'static;
+    type Return: Serialize + JsonSchema + 'static;
 
     fn name(&self) -> &'static str;
     fn group(&self) -> &'static str { "core" }
     fn description(&self) -> &'static str;
-    fn schema(&self) -> serde_json::Value;
+
+    /// Auto-derived JSON Schema for the tool's input arguments.
+    fn schema(&self) -> serde_json::Value {
+        let mut schema =
+            serde_json::to_value(schemars::schema_for!(Self::Args)).unwrap_or_default();
+        if let Some(obj) = schema.as_object_mut() {
+            obj.insert("additionalProperties".into(), false.into());
+        }
+        schema
+    }
 
     /// JSON Schema for the tool's return value (for Programmatic Tool Calling).
-    /// The default assumes the tool returns a string.
+    /// Auto-derived from the return type. Override for types schemars cannot represent.
     fn output_schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({"type": "string"}))
+        Some(serde_json::to_value(schemars::schema_for!(Self::Return)).unwrap_or_default())
     }
 
     /// Controls which callers can invoke this tool
@@ -639,7 +650,6 @@ receive it in the `ctx` parameter. Tools that return structured data override
 them programmatically (see [Programmatic Tool Calling](#114-programmatic-tool-calling-responses-api-gpt-56)).
 Tools can restrict callers via `allowed_callers()`, gating whether the model calls
 them directly, from generated JavaScript, or both.
-```
 
 Tools that produce images (e.g. `display_image`) override `extract_image()` to return a
 `PreparedImage` from the typed return value. The conversion layer (see `ToolDyn` below)
@@ -683,24 +693,21 @@ deserialization and serialization, enabling compact cross-VM communication.
 ### `define_tool!` macro
 
 The `define_tool!` macro reduces boilerplate for the common tool case
-(`Return = String`, no credentials needed). It lives in `tai-daemon/src/tools/mod.rs`
-and has two variants:
+(`Return = String`, no credentials needed). It lives in `tai-daemon/src/tools/mod.rs`.
+The JSON schema is auto-derived from the args type via `schemars`, so no manual
+schema parameter is needed:
 
-**Default (no flags):** The implementation function receives `(&Args, Option<&Path>)`:
 ```rust
 define_tool!(MyTool, "my_tool", "Description...", MyToolArgs,
-    execute_my_tool, serde_json::json!({...}), "core");
-```
-
-**`use_context`:** The implementation receives `(&Args, Option<&Path>, Option<&ToolContext>)`:
-```rust
-define_tool!(MyTool, ..., "core", use_context);
+    execute_my_tool, "core");
 ```
 
 Tools that need custom `output_schema()`, `allowed_callers()`, non-`String` return types,
-or `use_credentials` are written as manual `impl Tool` blocks instead. Examples:
+session context (`ToolContext`), or credentials (`ServiceCredential`) are written as
+manual `impl Tool` blocks instead. Examples:
 `DbGet`/`DbGetRange`/`DbList`/`DbCount` (custom `output_schema`),
-`GetCurrentTime` (`Return = u64`), `DisplayImage` (overrides `extract_image`).
+`GetCurrentTime` (`Return = u64`), `DisplayImage` (overrides `extract_image`),
+`ListSessions`/`GetSession` (need `ToolContext`).
 
 ### Registry
 

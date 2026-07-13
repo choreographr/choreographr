@@ -1,11 +1,12 @@
 use crate::tools::{ToolError, truncate_tool_output};
 use gix::bstr::ByteSlice;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{fmt::Write as _, io};
 
 use super::{describe_head, open_repo, repo_work_dir_display};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitLogArgs {
     pub repo_path: Option<String>,
     pub limit: Option<usize>,
@@ -80,6 +81,5 @@ define_tool!(
     "Show recent Git commits for the repository containing the given path.",
     GitLogArgs,
     execute_git_log_tool,
-    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"max_count":{"type":"integer","minimum":1,"maximum":100,"default":10}},"additionalProperties":false}),
     "git"
 );

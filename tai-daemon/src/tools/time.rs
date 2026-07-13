@@ -37,14 +37,6 @@ impl super::Tool for GetCurrentTime {
         "Get the current Unix timestamp in milliseconds since epoch"
     }
 
-    fn schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false
-        })
-    }
-
     fn execute(
         &self,
         args: Self::Args,
@@ -53,10 +45,6 @@ impl super::Tool for GetCurrentTime {
         _ctx: Option<&crate::tools::context::ToolContext>,
     ) -> Result<Self::Return, ToolError> {
         execute_get_current_time(&args, working_dir)
-    }
-
-    fn output_schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({"type": "integer"}))
     }
 }
 

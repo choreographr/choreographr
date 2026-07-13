@@ -9,6 +9,7 @@ use ckb_vm::{
     FlatMemory, ISA_A, ISA_B, ISA_IMC, ISA_MOP, SupportMachine, Syscalls, TraceMachine,
     memory::Memory, registers,
 };
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -398,6 +399,15 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         results
     }
 
+    // ── Shell variants (mirrors host Shell enum) ─────────────────────
+
+    /// Shell variants matching the host Shell enum for `sh()`.
+    pub enum Shell {
+        Bash,
+        Dash,
+        Zsh,
+    }
+
     // ── Per-tool wrappers ─────────────────────────────────────────────
 
     /// db_get(key: &str) -> raw value bytes. Empty vec = not found or error.
@@ -503,11 +513,13 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         }
     }
 
-    /// sh(command: &str, shell: &str, workdir: Option<&str>, timeout_ms: Option<u64>) -> command output string.
-    pub fn sh(command: &str, shell: &str, workdir: Option<&str>, timeout_ms: Option<u64>) -> String {
+    /// sh(command: &str, shell: Shell) -> command output string.
+    /// Execute a shell command using the specified POSIX-compatible shell.
+    pub fn sh(command: &str, shell: Shell, workdir: Option<&str>, timeout_ms: Option<u64>) -> String {
         let mut args = Vec::new();
         enc_str(command, &mut args);
-        enc_str(shell, &mut args);
+        // Encode Shell as a postcard unit variant index (0 = Bash, 1 = Dash, 2 = Zsh)
+        enc_varint(shell as u64, &mut args);
         enc_option_str(workdir, &mut args);
         enc_option_u64(timeout_ms, &mut args);
         let resp = call("sh", &args);
@@ -590,7 +602,7 @@ fn format_rust_source(source: &str) -> String {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize, JsonSchema)]
 pub struct RunRiscVInput {
     pub source: Option<String>,
     pub program: Option<String>,

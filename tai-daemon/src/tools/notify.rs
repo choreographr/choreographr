@@ -1,6 +1,7 @@
 use super::ToolError;
 use notify_rust::Notification;
 use notify_rust::Urgency;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -8,16 +9,21 @@ use std::path::Path;
 /// are confusing.  Reject them at argument-deserialisation time.
 const SUMMARY_REQUIRED: &str = "summary must be a non-empty string";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct NotifySendArgs {
+    /// Notification title/summary (required)
     pub summary: String,
+    /// Optional notification body text providing more details
     pub body: Option<String>,
+    /// Urgency level of the notification
     pub urgency: Option<UrgencyLevel>,
+    /// Notification expiration timeout: "default" for server default, "never" to require manual dismissal, or a positive integer for milliseconds
     pub timeout: Option<Timeout>,
+    /// Optional icon path or name
     pub icon: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum UrgencyLevel {
     Low,
@@ -80,6 +86,29 @@ impl From<Timeout> for notify_rust::Timeout {
     }
 }
 
+impl JsonSchema for Timeout {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("Timeout")
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(concat!(module_path!(), "::Timeout"))
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description":
+                "Notification expiration timeout: \"default\" for server default, \
+                 \"never\" to require manual dismissal, or a positive integer \
+                 for milliseconds",
+            "oneOf": [
+                { "type": "string", "enum": ["default", "never"] },
+                { "type": "integer", "minimum": 0 }
+            ]
+        })
+    }
+}
+
 pub fn execute_notify_send(
     args: &NotifySendArgs,
     _working_dir: Option<&Path>,
@@ -130,37 +159,6 @@ define_tool!(
     "Send a desktop notification to the user. Use this to alert the user, notify them of completed tasks, or provide information that requires their attention.",
     NotifySendArgs,
     execute_notify_send,
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "summary": {
-                "type": "string",
-                "description": "Notification title/summary (required)"
-            },
-            "body": {
-                "type": "string",
-                "description": "Optional notification body text providing more details"
-            },
-            "urgency": {
-                "type": "string",
-                "enum": ["low", "normal", "critical"],
-                "description": "Urgency level of the notification (default: normal)"
-            },
-            "timeout": {
-                "description": "Notification expiration timeout: \"default\" for server default, \"never\" to require manual dismissal, or a positive integer for milliseconds",
-                "oneOf": [
-                    { "type": "string", "enum": ["default", "never"] },
-                    { "type": "integer", "minimum": 0 }
-                ]
-            },
-            "icon": {
-                "type": "string",
-                "description": "Icon name from the system freedesktop.org icon theme (e.g. 'dialog-warning', 'firefox', 'thunderbird') or an absolute path to an image file"
-            }
-        },
-        "required": ["summary"],
-        "additionalProperties": false
-    }),
     "desktop"
 );
 

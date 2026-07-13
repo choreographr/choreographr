@@ -1,11 +1,12 @@
 use crate::tools::{ToolError, truncate_tool_output};
 use gix::ObjectId;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::io;
 
 use super::{collect_cached_diff_lines, load_mutable_index, open_repo, path_from_bytes};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GitCommitArgs {
     pub repo_path: Option<String>,
     pub message: String,
@@ -114,6 +115,5 @@ define_tool!(
     "Create a Git commit from the current index.",
     GitCommitArgs,
     execute_git_commit_tool,
-    serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Relative or absolute path inside a Git repository","default":"."},"message":{"type":"string","description":"Commit message"}},"required":["message"],"additionalProperties":false}),
     "git"
 );
