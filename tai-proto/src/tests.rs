@@ -202,6 +202,133 @@ fn daemon_message_done_with_usage_round_trip() {
     }
 }
 
+// ── Postcard round-trip with None optionals ─────────────────────────────
+// These verify that postcard handles trailing Option fields correctly when
+// they are None — a regression test for the skip_serializing_if bug.
+
+#[test]
+fn session_summary_none_optionals_round_trip() {
+    let summary = SessionSummary {
+        session_id: 1,
+        title: Some("test".into()),
+        selected_model: None,
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir: None,
+        created_at: 0,
+        message_count: 0,
+        max_turns: None,
+        status: SessionStatus::Inactive,
+        active_tool_groups: vec![],
+        account_name: None,
+        token_usage: None,
+        context_window: None,
+    };
+    let frame = encode_frame(&summary).expect("encode");
+    let decoded: SessionSummary = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, summary);
+}
+
+#[test]
+fn session_summary_some_token_usage_round_trip() {
+    let usage = TokenUsage {
+        input_tokens: 10,
+        output_tokens: 20,
+        total_tokens: 30,
+    };
+    let summary = SessionSummary {
+        session_id: 2,
+        title: None,
+        selected_model: None,
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir: None,
+        created_at: 0,
+        message_count: 0,
+        max_turns: None,
+        status: SessionStatus::Inactive,
+        active_tool_groups: vec![],
+        account_name: None,
+        token_usage: Some(usage.clone()),
+        context_window: None,
+    };
+    let frame = encode_frame(&summary).expect("encode");
+    let decoded: SessionSummary = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded.token_usage, Some(usage));
+}
+
+#[test]
+fn assistant_text_none_token_usage_round_trip() {
+    let msg = SessionMessage::AssistantText {
+        content: "hello".into(),
+        reasoning: None,
+        token_usage: None,
+    };
+    let frame = encode_frame(&msg).expect("encode");
+    let decoded: SessionMessage = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, msg);
+}
+
+#[test]
+fn assistant_tool_use_none_token_usage_round_trip() {
+    let msg = SessionMessage::AssistantToolUse {
+        content: None,
+        tool_calls: vec![],
+        reasoning: None,
+        token_usage: None,
+    };
+    let frame = encode_frame(&msg).expect("encode");
+    let decoded: SessionMessage = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, msg);
+}
+
+#[test]
+fn session_state_none_optionals_round_trip() {
+    let state = DaemonMessage::SessionState {
+        session_id: 1,
+        title: None,
+        selected_model: None,
+        parent_session_id: None,
+        working_dir: None,
+        max_turns: None,
+        messages: vec![],
+        active_tool_groups: vec![],
+        token_usage: None,
+        context_window: None,
+    };
+    let frame = encode_frame(&state).expect("encode");
+    let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, state);
+}
+
+#[test]
+fn sessions_with_none_optionals_round_trip() {
+    // DaemonMessage::Sessions wraps Vec<SessionSummary>; test that a
+    // session list containing summaries with None optionals round-trips.
+    let summary = SessionSummary {
+        session_id: 1,
+        title: None,
+        selected_model: None,
+        reasoning_effort: None,
+        parent_session_id: None,
+        working_dir: None,
+        created_at: 0,
+        message_count: 0,
+        max_turns: None,
+        status: SessionStatus::Inactive,
+        active_tool_groups: vec![],
+        account_name: None,
+        token_usage: None,
+        context_window: None,
+    };
+    let msg = DaemonMessage::Sessions {
+        sessions: vec![summary.clone(), summary],
+    };
+    let frame = encode_frame(&msg).expect("encode");
+    let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, msg);
+}
+
 // ── ThinkingEffort tests ─────────────────────────────────────────────────
 
 #[test]

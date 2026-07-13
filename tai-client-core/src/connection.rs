@@ -35,8 +35,19 @@ pub fn run_daemon_reader<R: BufRead>(
             {
                 break;
             }
-            // Any other protocol or I/O error is fatal.
-            Err(error) => return Err(error.into()),
+            // Non-EOF I/O errors (broken pipe, connection aborted, etc.)
+            // are also fatal — the transport is gone.
+            Err(ProtoError::Io(error)) => {
+                error!(kind = %error.kind(), "daemon reader I/O error");
+                return Err(error.into());
+            }
+            // Protocol-level decode errors (Postcard, FrameTooLarge,
+            // TrailingBytes, UnsupportedVersion) are per-message failures.
+            // Because we use length-prefixed framing, a corrupt payload
+            // never desynchronises the stream — log and carry on.
+            Err(error) => {
+                error!(%error, "skipping corrupt daemon message");
+            }
         }
     }
     info!("daemon reader loop ended normally");

@@ -146,7 +146,7 @@ pub enum SessionMessage {
         content: String,
         reasoning: Option<String>,
         /// Token usage for this assistant response, if reported by the provider.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         token_usage: Option<TokenUsage>,
     },
     AssistantToolUse {
@@ -154,7 +154,7 @@ pub enum SessionMessage {
         tool_calls: Vec<AssistantToolCallRecord>,
         reasoning: Option<String>,
         /// Token usage for this assistant response, if reported by the provider.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         token_usage: Option<TokenUsage>,
     },
     ToolResult {
@@ -182,10 +182,10 @@ pub struct SessionSummary {
     /// The AI provider account name associated with this session, if any.
     pub account_name: Option<String>,
     /// Total token usage accumulated across all turns in this session.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub token_usage: Option<TokenUsage>,
     /// Model context window size for this session, if known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub context_window: Option<u32>,
 }
 
@@ -309,10 +309,10 @@ pub enum DaemonMessage {
         messages: Vec<SessionMessage>,
         active_tool_groups: Vec<String>,
         /// Accumulated token usage for this session, if available.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         token_usage: Option<TokenUsage>,
         /// Model context window size for this session, if known.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         context_window: Option<u32>,
     },
     SessionMessageAppended {
