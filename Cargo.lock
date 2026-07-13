@@ -7601,6 +7601,7 @@ version = "0.1.0"
 dependencies = [
  "ammonia",
  "pulldown-cmark",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
