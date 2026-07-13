@@ -84,6 +84,7 @@ fn bridge_text_streaming() {
         &DaemonMessage::Done {
             request_id: 1,
             token_usage: None,
+            last_prompt_tokens: None,
         },
     )
     .unwrap();

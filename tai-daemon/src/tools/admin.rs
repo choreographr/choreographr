@@ -210,6 +210,7 @@ mod tests {
                             account_name: None,
                             token_usage: Some(TokenUsage::default()),
                             context_window: None,
+                            last_prompt_tokens: None,
                         }));
                     }
                     DaemonCommand::GetSession {

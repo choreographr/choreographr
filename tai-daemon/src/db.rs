@@ -55,6 +55,8 @@ pub struct SessionRecord {
     pub accumulated_usage: TokenUsage,
     #[serde(default)]
     pub context_window: Option<u32>,
+    #[serde(default)]
+    pub last_prompt_tokens: Option<u32>,
 }
 
 pub fn db_path() -> io::Result<PathBuf> {
@@ -720,6 +722,7 @@ mod tests {
             account_name: None,
             accumulated_usage: TokenUsage::default(),
             context_window: None,
+            last_prompt_tokens: None,
         };
         write_session(&db, id, &record).unwrap();
 

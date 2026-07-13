@@ -383,6 +383,9 @@ pub(crate) struct SessionDetailData {
     pub(crate) accumulated_usage: Option<TokenUsage>,
     /// Model context window size for this session, if known.
     pub(crate) context_window: Option<u32>,
+    /// The prompt_tokens from the most recent API response (the actual
+    /// context size being sent to the model), if available.
+    pub(crate) last_prompt_tokens: Option<u32>,
 }
 
 pub(crate) struct SessionManagerState {
@@ -485,6 +488,9 @@ pub(crate) struct App {
     pub(crate) attached_token_usage: Option<TokenUsage>,
     /// Context window size for the currently-attached session's model.
     pub(crate) attached_context_window: Option<u32>,
+    /// The prompt_tokens from the most recent API response (the actual
+    /// context size being sent to the model) for the attached session.
+    pub(crate) attached_last_prompt_tokens: Option<u32>,
     /// Set to `true` when the terminal-native progress bar data or current
     /// page changes.  The render loop checks and clears this once per frame
     /// instead of emitting the OSC sequence unconditionally.
@@ -729,6 +735,7 @@ impl SessionManagerState {
                 account_name: s.account_name.clone(),
                 accumulated_usage: s.token_usage.clone(),
                 context_window: s.context_window,
+                last_prompt_tokens: s.last_prompt_tokens,
             }
         });
         if self.detail_data.is_some() {
@@ -1057,6 +1064,7 @@ impl App {
             fullscreen_image_idx: None,
             attached_token_usage: None,
             attached_context_window: None,
+            attached_last_prompt_tokens: None,
             progress_dirty: false,
         }
     }
@@ -1585,6 +1593,7 @@ impl App {
         {
             self.attached_token_usage = s.token_usage.clone();
             self.attached_context_window = s.context_window;
+            self.attached_last_prompt_tokens = s.last_prompt_tokens;
         }
         self.progress_dirty = true;
     }
@@ -1804,6 +1813,7 @@ mod tests {
             account_name: None,
             token_usage: None,
             context_window: None,
+            last_prompt_tokens: None,
         }
     }
 
@@ -1823,6 +1833,7 @@ mod tests {
             account_name: None,
             accumulated_usage: None,
             context_window: None,
+            last_prompt_tokens: None,
         }
     }
 

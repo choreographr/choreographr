@@ -102,7 +102,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "deepseek-v4-flash",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxTokens,
-        model_context_windows: &[],
+        model_context_windows: &[("big-pickle", 200_000)],
     },
     ProviderEntry {
         slug: "opencode-go",

@@ -191,7 +191,7 @@ pub(crate) fn run_ui_loop(
             app.progress_dirty = false;
             if app.page == Page::Chat && app.attached_session_id.is_some() {
                 terminal_progress::update_terminal_progress(
-                    app.attached_token_usage.as_ref(),
+                    app.attached_last_prompt_tokens,
                     app.attached_context_window,
                 );
             } else {
@@ -1009,6 +1009,7 @@ pub(crate) fn handle_daemon_message(
             session_id,
             token_usage,
             context_window,
+            last_prompt_tokens,
             ..
         } => {
             // Only update progress data when the message is for the
@@ -1017,12 +1018,14 @@ pub(crate) fn handle_daemon_message(
             if app.attached_session_id == Some(*session_id) {
                 app.attached_token_usage = token_usage.clone();
                 app.attached_context_window = *context_window;
+                app.attached_last_prompt_tokens = *last_prompt_tokens;
                 app.progress_dirty = true;
             }
             // Fall through to dispatch_daemon_message for message processing.
         }
         DaemonMessage::Done {
             token_usage: Some(usage),
+            last_prompt_tokens,
             ..
         } => {
             // Capture per-request token usage (e.g. final streaming chunk).
@@ -1030,10 +1033,13 @@ pub(crate) fn handle_daemon_message(
             // attached session (the daemon only sends Done for active
             // requests on the session the client subscribed to).
             app.attached_token_usage = Some(usage.clone());
+            app.attached_last_prompt_tokens = *last_prompt_tokens;
             app.progress_dirty = true;
             // Fall through to dispatch_daemon_message.
         }
-        DaemonMessage::Done { token_usage: None, .. } => {
+        DaemonMessage::Done {
+            token_usage: None, ..
+        } => {
             // No token usage data — fall through.
         }
 

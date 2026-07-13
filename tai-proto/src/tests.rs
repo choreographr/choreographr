@@ -151,6 +151,7 @@ fn token_usage_in_daemon_message_done_backward_compat() {
         DaemonMessage::Done {
             request_id,
             token_usage,
+            ..
         } => {
             assert_eq!(request_id, 42);
             assert_eq!(token_usage, None);
@@ -164,11 +165,13 @@ fn daemon_message_done_without_usage() {
     let msg = DaemonMessage::Done {
         request_id: 7,
         token_usage: None,
+        last_prompt_tokens: None,
     };
     match msg {
         DaemonMessage::Done {
             request_id,
             token_usage,
+            ..
         } => {
             assert_eq!(request_id, 7);
             assert_eq!(token_usage, None);
@@ -187,6 +190,7 @@ fn daemon_message_done_with_usage_round_trip() {
     let msg = DaemonMessage::Done {
         request_id: 3,
         token_usage: Some(usage.clone()),
+        last_prompt_tokens: None,
     };
     let frame = encode_frame(&msg).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
@@ -194,6 +198,7 @@ fn daemon_message_done_with_usage_round_trip() {
         DaemonMessage::Done {
             request_id,
             token_usage,
+            ..
         } => {
             assert_eq!(request_id, 3);
             assert_eq!(token_usage, Some(usage));
@@ -223,6 +228,7 @@ fn session_summary_none_optionals_round_trip() {
         account_name: None,
         token_usage: None,
         context_window: None,
+        last_prompt_tokens: None,
     };
     let frame = encode_frame(&summary).expect("encode");
     let decoded: SessionSummary = decode_frame(&frame[4..]).expect("decode");
@@ -251,6 +257,7 @@ fn session_summary_some_token_usage_round_trip() {
         account_name: None,
         token_usage: Some(usage.clone()),
         context_window: None,
+        last_prompt_tokens: None,
     };
     let frame = encode_frame(&summary).expect("encode");
     let decoded: SessionSummary = decode_frame(&frame[4..]).expect("decode");
@@ -295,6 +302,7 @@ fn session_state_none_optionals_round_trip() {
         active_tool_groups: vec![],
         token_usage: None,
         context_window: None,
+        last_prompt_tokens: None,
     };
     let frame = encode_frame(&state).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
@@ -320,6 +328,7 @@ fn sessions_with_none_optionals_round_trip() {
         account_name: None,
         token_usage: None,
         context_window: None,
+        last_prompt_tokens: None,
     };
     let msg = DaemonMessage::Sessions {
         sessions: vec![summary.clone(), summary],

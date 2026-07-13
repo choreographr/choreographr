@@ -371,6 +371,7 @@ impl DaemonState {
             account_name: account_name.clone(),
             accumulated_usage: TokenUsage::default(),
             context_window: None,
+            last_prompt_tokens: None,
         };
 
         if let Err(e) = db::write_session(&self.db, sid, &record) {
@@ -391,6 +392,7 @@ impl DaemonState {
             account_name: account_name.clone(),
             accumulated_usage: TokenUsage::default(),
             context_window: None,
+            last_prompt_tokens: None,
         };
         let session_tx = self.spawn_session(sid, record, metadata);
         let _ = reply.send(Ok((sid, session_tx)));
@@ -466,6 +468,7 @@ impl DaemonState {
                 account_name: meta.account_name.clone(),
                 token_usage: Some(meta.accumulated_usage.clone()),
                 context_window: meta.context_window,
+                last_prompt_tokens: meta.last_prompt_tokens,
             })
             .collect();
 
@@ -497,6 +500,7 @@ impl DaemonState {
                 account_name: meta.account_name.clone(),
                 token_usage: Some(meta.accumulated_usage.clone()),
                 context_window: meta.context_window,
+                last_prompt_tokens: meta.last_prompt_tokens,
             });
         let _ = reply.send(summary);
     }
@@ -1078,6 +1082,7 @@ mod tests {
                 account_name: None,
                 accumulated_usage: TokenUsage::default(),
                 context_window: None,
+                last_prompt_tokens: None,
             },
         );
         let (reply, rx) = mpsc::channel();
@@ -1119,6 +1124,7 @@ mod tests {
                 account_name: None,
                 accumulated_usage: TokenUsage::default(),
                 context_window: None,
+                last_prompt_tokens: None,
             },
         );
         let new_meta = SessionMetadata {
@@ -1135,6 +1141,7 @@ mod tests {
             account_name: None,
             accumulated_usage: TokenUsage::default(),
             context_window: None,
+            last_prompt_tokens: None,
         };
         state.handle_command(DaemonCommand::UpdateMetadata {
             session_id: 1,
@@ -1305,6 +1312,7 @@ mod tests {
                 account_name: Some("nonexistent".into()),
                 accumulated_usage: TokenUsage::default(),
                 context_window: None,
+                last_prompt_tokens: None,
             },
         );
         let (reply, rx) = mpsc::channel();

@@ -104,6 +104,7 @@ pub struct SessionMetadata {
     pub account_name: Option<String>,
     pub accumulated_usage: TokenUsage,
     pub context_window: Option<u32>,
+    pub last_prompt_tokens: Option<u32>,
 }
 
 /// Convert a persisted record into metadata. New sessions loaded from the
@@ -130,6 +131,7 @@ impl From<SessionRecord> for SessionMetadata {
             account_name: record.account_name,
             accumulated_usage: record.accumulated_usage,
             context_window: record.context_window,
+            last_prompt_tokens: record.last_prompt_tokens,
         };
         let mut meta = SessionMetadata::from(&config);
         // message_count is a runtime field not stored in SessionConfig,
@@ -156,6 +158,7 @@ impl From<SessionMetadata> for SessionRecord {
             account_name: meta.account_name,
             accumulated_usage: meta.accumulated_usage,
             context_window: meta.context_window,
+            last_prompt_tokens: meta.last_prompt_tokens,
         }
     }
 }
@@ -196,6 +199,7 @@ pub struct SessionConfig {
     pub account_name: Option<String>,
     pub accumulated_usage: TokenUsage,
     pub context_window: Option<u32>,
+    pub last_prompt_tokens: Option<u32>,
 }
 
 impl Default for SessionConfig {
@@ -217,6 +221,7 @@ impl Default for SessionConfig {
             account_name: None,
             accumulated_usage: TokenUsage::default(),
             context_window: None,
+            last_prompt_tokens: None,
         }
     }
 }
@@ -240,6 +245,7 @@ impl From<&SessionConfig> for SessionMetadata {
             account_name: config.account_name.clone(),
             accumulated_usage: config.accumulated_usage.clone(),
             context_window: config.context_window,
+            last_prompt_tokens: config.last_prompt_tokens,
         }
     }
 }
@@ -281,6 +287,25 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Re-resolve context window from the catalog when the stored value
+    /// is `None` (e.g. sessions created before a model was added to the
+    /// catalog, or after the provider was lazily resolved on unlock).
+    fn resolve_context_window_if_missing(&mut self, session_id: u64) {
+        if self.config.context_window.is_some() {
+            return;
+        }
+        let (Some(model), Some(provider)) = (&self.config.selected_model, &self.provider) else {
+            return;
+        };
+        if let Some(cw) = provider.resolve_context_window(model) {
+            debug!(
+                "session {}: re-resolved context_window={} for model={}",
+                session_id, cw, model
+            );
+            self.config.context_window = Some(cw);
+        }
+    }
+
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             config: self.config.clone(),
@@ -413,6 +438,7 @@ pub fn session_main(
             .map(|r| r.accumulated_usage.clone())
             .unwrap_or_default(),
         context_window: init_record.as_ref().and_then(|r| r.context_window),
+        last_prompt_tokens: init_record.as_ref().and_then(|r| r.last_prompt_tokens),
     };
     let mut state = SessionState {
         config,
@@ -421,6 +447,11 @@ pub fn session_main(
         active_requests: HashMap::new(),
         provider,
     };
+
+    // Re-resolve context window from the catalog when loading an existing
+    // session whose stored context_window is None (e.g. sessions created
+    // before a model was added to the catalog).
+    state.resolve_context_window_if_missing(ctx.session_id);
 
     match db::read_messages(&ctx.db, ctx.session_id) {
         Ok(msgs) => state.messages = msgs,
@@ -544,6 +575,9 @@ fn handle_run_input(
         match rx.recv() {
             Ok(Some(provider)) => {
                 state.provider = Some(provider);
+                // Re-resolve context window now that the provider is
+                // available (e.g. after unlocking the daemon).
+                state.resolve_context_window_if_missing(ctx.session_id);
                 let Some(p) = state.provider.as_ref() else {
                     return fail_request(
                         &state.subscribers,
@@ -812,6 +846,7 @@ fn handle_attach(
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
         token_usage: Some(state.config.accumulated_usage.clone()),
         context_window: state.config.context_window,
+        last_prompt_tokens: state.config.last_prompt_tokens,
     };
     if let Some(tx) = state.subscribers.get(&client_id) {
         let _ = tx.send(snapshot);
@@ -857,6 +892,7 @@ fn handle_get_summary(
         account_name: state.config.account_name.clone(),
         token_usage: Some(state.config.accumulated_usage.clone()),
         context_window: state.config.context_window,
+        last_prompt_tokens: state.config.last_prompt_tokens,
     });
     false
 }
@@ -1086,6 +1122,7 @@ fn run_request_worker(
                 .send(SessionCommand::Broadcast(DaemonMessage::Done {
                     request_id,
                     token_usage: Some(usage.clone()),
+                    last_prompt_tokens: session.config.last_prompt_tokens,
                 }));
         }
         RequestOutcome::Failed(error) => {
@@ -1185,6 +1222,7 @@ mod tests {
             account_name: None,
             accumulated_usage: TokenUsage::default(),
             context_window: None,
+            last_prompt_tokens: None,
         }
     }
 
@@ -1207,6 +1245,7 @@ mod tests {
                 account_name: None,
                 accumulated_usage: TokenUsage::default(),
                 context_window: None,
+                last_prompt_tokens: None,
             },
             messages: vec![
                 SessionMessage::SystemText {
@@ -1260,6 +1299,7 @@ mod tests {
             account_name: None,
             accumulated_usage: TokenUsage::default(),
             context_window: None,
+            last_prompt_tokens: None,
         };
         let record: SessionRecord = meta.clone().into();
         // Status field does not exist in record
@@ -1355,6 +1395,7 @@ mod tests {
             SessionCommand::Broadcast(DaemonMessage::Done {
                 request_id: 5,
                 token_usage: None,
+                last_prompt_tokens: None,
             }),
             &mut state,
             &mut shutdown,
@@ -1366,6 +1407,7 @@ mod tests {
             DaemonMessage::Done {
                 request_id: 5,
                 token_usage: None,
+                last_prompt_tokens: None,
             }
         );
         assert_eq!(
@@ -1373,6 +1415,7 @@ mod tests {
             DaemonMessage::Done {
                 request_id: 5,
                 token_usage: None,
+                last_prompt_tokens: None,
             }
         );
         assert!(!shutdown);
@@ -1429,6 +1472,7 @@ mod tests {
             SessionCommand::Broadcast(DaemonMessage::Done {
                 request_id: 0,
                 token_usage: None,
+                last_prompt_tokens: None,
             }),
             &mut state,
             &mut shutdown,
@@ -1620,6 +1664,7 @@ mod tests {
                 total_tokens: 300,
             },
             context_window: None,
+            last_prompt_tokens: None,
         };
         // Round-trip through SessionRecord (persisted form)
         let record: SessionRecord = meta.clone().into();

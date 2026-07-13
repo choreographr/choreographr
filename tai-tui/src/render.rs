@@ -863,32 +863,25 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                 ),
                 None => "Tokens:        -".to_string(),
             }),
-            Line::from({
-                let cw = detail.context_window;
-                let tot = detail.accumulated_usage.as_ref().map(|u| u.total_tokens);
-                match (cw, tot) {
-                    (Some(limit), Some(total)) => {
-                        let pct = if limit > 0 {
-                            (total as f64 / limit as f64) * 100.0
-                        } else {
-                            0.0
-                        };
-                        format!(
-                            "Context:       {}  —  {} / {} ({:.0}%)",
-                            format_count(limit),
-                            format_count(total),
-                            format_count(limit),
-                            pct,
-                        )
-                    }
-                    (Some(limit), None) => {
-                        format!("Context:       {}  —  no usage yet", format_count(limit))
-                    }
-                    (None, Some(total)) => {
-                        format!("Context:       unknown  —  {} total", format_count(total))
-                    }
-                    (None, None) => "Context:       unknown".to_string(),
+            Line::from(match (detail.context_window, detail.last_prompt_tokens) {
+                (Some(limit), Some(current)) => {
+                    let pct = if limit > 0 {
+                        (current as f64 / limit as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    format!(
+                        "Context:       {} / {} ({:.0}%)",
+                        format_count(current),
+                        format_count(limit),
+                        pct,
+                    )
                 }
+                (Some(limit), None) => {
+                    format!("Context:       ? / {}", format_count(limit))
+                }
+                (None, Some(current)) => format!("Context:       {} / ?", format_count(current)),
+                (None, None) => "Context:       unknown".to_string(),
             }),
             Line::from(format!("Status:        {}", format_status(&detail.status))),
             Line::from(format!(

@@ -86,7 +86,8 @@ Defines all shared message types and framing. No dependencies on other workspace
 | `ImageMetadata` | Mime type, dimensions, byte length for streamed images |
 | `DisplayedImageRecord` | Binary image data + `ImageMetadata` for persisted image replay (carried inside `SessionMessage::DisplayedImage`) |
 | `ThinkingEffort` | Enum controlling how much reasoning/thinking the model performs: `Off`, `Low`, `Medium`, `High`. Stored per-session and passed through to each provider's wire format. |
-| `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessage::AssistantText` and `AssistantToolUse` for per-turn accounting, and in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals. |
+| `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessage::AssistantText` and `AssistantToolUse` for per-turn accounting, in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals, and in `DaemonMessage::Done` for per-request usage. |
+| `last_prompt_tokens` | `Option<u32>` field on session metadata and protocol messages tracking the `input_tokens` from the most recent API response — the actual context size being sent to the model, used for context-window progress displays. |
 
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
@@ -348,7 +349,15 @@ RunInput received
 
 Token usage flows from providers through the daemon to all clients.
 Each session also tracks the model's **context window size**, resolved when the model
-is selected. The TUI displays context usage as a percentage (total tokens / context window).
+is selected. The TUI displays context usage as a fraction
+(`last_prompt_tokens / context_window`), showing the actual context size sent in the
+most recent request rather than accumulated totals.
+
+Additionally, each session tracks `last_prompt_tokens: Option<u32>` — the `input_tokens`
+from the most recent API response. This is stored separately from `accumulated_usage`
+(the billing counter) and reflects the actual context payload the model sees on the
+latest turn. When an existing session is loaded from the database but has no stored
+`context_window`, the daemon re-resolves it from the provider catalog.
 
 ```
 LLM provider (API response)
@@ -366,18 +375,25 @@ LLM provider (API response)
        ▼
       run_agent_loop (tai-daemon/src/requests.rs)
         ├─ embeds per-turn TokenUsage into SessionMessage::AssistantText / AssistantToolUse
+        ├─ tracks last_prompt_tokens = Some(usage.input_tokens) for context-window display
         └─ accumulates into SessionState.config.accumulated_usage (TokenUsage)
         │
         ▼
       SessionState (tai-daemon/src/sessions.rs)
         ├─ persisted via SessionRecord.accumulated_usage (through SessionConfig)
-       ├─ sent to subscribers via DaemonMessage::SessionState.token_usage
-       ├─ sent to clients via DaemonMessage::Done.token_usage
-       └─ included in SessionSummary.token_usage (listing / get-session)
-       │
-       ▼
+        ├─ sent to subscribers via DaemonMessage::SessionState.token_usage
+        ├─ sent to clients via DaemonMessage::Done.token_usage
+        ├─ included in SessionSummary.token_usage (listing / get-session)
+        └─ last_prompt_tokens flows through the same channels (SessionRecord,
+           SessionState, DaemonMessage::SessionState, DaemonMessage::Done,
+           SessionSummary)
+        │
+        ▼
      Clients (tai-tui, tai-dioxus, tai-im)
-       └─ tai-tui: displays in session detail view (render.rs:render_session_detail_view)
+       ├─ tai-tui: displays in session detail view (render.rs:render_session_detail_view)
+       │  as "Context:  current / limit (pct%)"
+       └─ tai-tui: terminal progress bar uses last_prompt_tokens vs context_window
+          for the OSC 9;4 percentage sequence
 ```
 
 **Key type** — `TokenUsage` (tai-proto/src/types.rs):
@@ -404,7 +420,14 @@ handle_set_model / handle_set_account
      SessionConfig.context_window: Option<u32>
        │
        ▼
-     Client display (e.g. "Context: 128k — 45,000 / 128,000 (35%)")
+     Re-resolved on session startup if None
+       (session_main + handle_run_input both call
+        SessionState::resolve_context_window_if_missing(),
+        handling sessions created before the model was
+        in the catalog or providers resolved after unlock)
+       │
+       ▼
+     Client display (e.g. "Context: 45,000 / 128,000 (35%)")
 ```
 
 The `ContextWindowConfig` struct (shared across all provider configs) holds the
@@ -433,7 +456,7 @@ main()
                     6. Clamp scroll state to valid range
                     7. Render via ratatui terminal.draw()
                     8. If `progress_dirty`, emit OSC 9;4 terminal progress bar
-                       (percentage of `total_tokens / context_window` for the
+                       (percentage of `last_prompt_tokens / context_window` for the
                        attached session, or clear/indeterminate if no data)
                     9. Blocking poll (~16 ms) to pace frame rate
 ```
@@ -450,7 +473,7 @@ main()
 | `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `tai-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Code blocks are syntax-highlighted via `syntect` (shared setup from `syntax.rs`). |
 | `lib.rs` | `RenderedImage` struct, `build_picker()` helper, public re-exports |
 | `image_worker.rs` | Background worker thread for SVG rasterization and terminal protocol encoding. Communicates with the UI thread via `mpsc` channels; raw image data shared through `Arc<Vec<u8>>` to avoid copies. |
-| `terminal_progress.rs` | Terminal-native progress bar via OSC 9;4 escape sequences. Cached capability detection, percentage/indeterminate/remove modes based on token usage vs context window. |
+| `terminal_progress.rs` | Terminal-native progress bar via OSC 9;4 escape sequences. Cached capability detection, percentage/indeterminate/remove modes based on `last_prompt_tokens` vs `context_window`. |
 
 
 ### `tai-dioxus` — Desktop client
@@ -808,7 +831,8 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 | `meta` | `&str` | `u64` counter |
 
 `SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `working_dir`,
-`message_count`, `created_at`, `context_config`, `account_name`, `context_window`.
+`message_count`, `created_at`, `context_config`, `account_name`, `context_window`,
+`last_prompt_tokens`.
 
 ### Session state (in-memory)
 
@@ -834,6 +858,8 @@ across snapshot/restore, metadata conversion, and record persistence:
 - `account_name: Option<String>` — inference account assigned to this session
 - `accumulated_usage: TokenUsage` — session-level token counter
 - `context_window: Option<u32>` — model's context window size, resolved at model selection
+- `last_prompt_tokens: Option<u32>` — `input_tokens` from the most recent API response;
+  used for context-window progress displays (separate from the billing counter)
 
 **Runtime fields (not persisted directly):**
 

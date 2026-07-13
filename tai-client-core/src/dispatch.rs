@@ -76,10 +76,8 @@ fn dispatch_session<H: DaemonMessageHandler>(
             parent_session_id,
             working_dir,
             max_turns,
-            active_tool_groups: _,
-            token_usage: _,
-            context_window: _,
             messages,
+            ..
         } => {
             let title = title.unwrap_or_else(|| "untitled".to_string());
             handler.push_text(format!("[daemon] session {session_id}: {title}"));
@@ -189,10 +187,7 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
             );
             Ok(())
         }
-        DaemonMessage::Done {
-            request_id,
-            token_usage: _,
-        } => {
+        DaemonMessage::Done { request_id, .. } => {
             handler.push_text(format!("[{request_id}] done"));
             handler.drop_request(request_id);
             Ok(())
@@ -653,6 +648,7 @@ mod tests {
             active_tool_groups: vec![],
             token_usage: None,
             context_window: None,
+            last_prompt_tokens: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
 
@@ -700,6 +696,7 @@ mod tests {
             active_tool_groups: vec![],
             token_usage: None,
             context_window: None,
+            last_prompt_tokens: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
 
@@ -729,6 +726,7 @@ mod tests {
             active_tool_groups: vec![],
             token_usage: None,
             context_window: None,
+            last_prompt_tokens: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
         let events = h.collect_events();
@@ -753,6 +751,7 @@ mod tests {
             active_tool_groups: vec![],
             token_usage: None,
             context_window: None,
+            last_prompt_tokens: None,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
         let events = h.collect_events();
@@ -840,6 +839,7 @@ mod tests {
             account_name: None,
             token_usage: None,
             context_window: None,
+            last_prompt_tokens: None,
         }];
         dispatch_daemon_message(&mut h, DaemonMessage::Sessions { sessions }).unwrap();
         let events = h.collect_events();
@@ -947,6 +947,7 @@ mod tests {
             DaemonMessage::Done {
                 request_id: 7,
                 token_usage: None,
+                last_prompt_tokens: None,
             },
         )
         .unwrap();

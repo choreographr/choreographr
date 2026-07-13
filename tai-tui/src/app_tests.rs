@@ -998,6 +998,7 @@ fn make_session(id: u64, title: &str, model: &str, count: u32) -> tai_proto::Ses
         account_name: None,
         token_usage: None,
         context_window: None,
+        last_prompt_tokens: None,
     }
 }
 
@@ -2117,6 +2118,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
                 total_tokens: 3,
             }),
             context_window: Some(4096),
+            last_prompt_tokens: Some(1),
         },
         &mut app,
         &tx,
@@ -2157,6 +2159,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
                 total_tokens: 99,
             }),
             context_window: Some(1024),
+            last_prompt_tokens: None,
         },
         &mut app,
         &tx,
@@ -2182,6 +2185,7 @@ fn daemon_message_done_with_token_usage_updates_progress() {
                 output_tokens: 10,
                 total_tokens: 15,
             }),
+            last_prompt_tokens: Some(5),
         },
         &mut app,
         &tx,
@@ -2208,6 +2212,7 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
         DaemonMessage::Done {
             request_id: 1,
             token_usage: None,
+            last_prompt_tokens: None,
         },
         &mut app,
         &tx,

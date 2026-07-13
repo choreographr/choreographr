@@ -151,6 +151,9 @@ fn accumulate_token_usage(
         session.config.accumulated_usage.input_tokens += u.input_tokens;
         session.config.accumulated_usage.output_tokens += u.output_tokens;
         session.config.accumulated_usage.total_tokens += u.total_tokens;
+        // Track the latest prompt_tokens (the actual context size being sent
+        // to the model) separately from the accumulated billing counter.
+        session.config.last_prompt_tokens = Some(u.input_tokens);
         debug!(
             session_id = ctx.session_id,
             turn,

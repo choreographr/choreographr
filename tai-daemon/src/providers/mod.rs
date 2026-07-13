@@ -22,24 +22,31 @@ pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
 #[derive(Clone, Debug)]
 pub struct InferenceProvider {
     client: Arc<dyn ProviderClient>,
+    /// The provider slug from the catalog (e.g. "openai", "anthropic", "opencode").
+    /// Used for catalog lookups instead of delegating to the client, which may
+    /// return a generic value (e.g. OpenAiClient always says "openai").
+    slug: &'static str,
 }
 
 impl InferenceProvider {
     pub fn from_openai(client: OpenAiClient) -> Self {
         Self {
             client: Arc::new(client),
+            slug: "openai",
         }
     }
 
     pub fn from_anthropic(client: AnthropicClient) -> Self {
         Self {
             client: Arc::new(client),
+            slug: "anthropic",
         }
     }
 
     pub fn from_mistral(client: MistralClient) -> Self {
         Self {
             client: Arc::new(client),
+            slug: "mistral",
         }
     }
 
@@ -67,6 +74,7 @@ impl InferenceProvider {
                     .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
+                    slug: entry.slug,
                 })
             }
             ProviderProtocol::AnthropicMessages => {
@@ -82,6 +90,7 @@ impl InferenceProvider {
                     .map_err(|e| format!("failed to create Anthropic client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
+                    slug: entry.slug,
                 })
             }
             ProviderProtocol::GoogleGenerativeAi => {
@@ -97,6 +106,7 @@ impl InferenceProvider {
                     .map_err(|e| format!("failed to create Google client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
+                    slug: entry.slug,
                 })
             }
             ProviderProtocol::Mistral => {
@@ -111,6 +121,7 @@ impl InferenceProvider {
                     .map_err(|e| format!("failed to create Mistral client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
+                    slug: entry.slug,
                 })
             }
         }
@@ -133,7 +144,7 @@ impl InferenceProvider {
 
     /// Return the provider slug (e.g. "openai", "anthropic").
     pub fn provider_slug(&self) -> &'static str {
-        self.client.provider_slug()
+        self.slug
     }
 
     /// Resolve the context window for a model, using the client config first
@@ -141,7 +152,7 @@ impl InferenceProvider {
     pub fn resolve_context_window(&self, model: &str) -> Option<u32> {
         self.client
             .context_window_for_model(model)
-            .or_else(|| catalog::lookup_context_window(self.provider_slug(), model))
+            .or_else(|| catalog::lookup_context_window(self.slug, model))
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, InferenceError> {

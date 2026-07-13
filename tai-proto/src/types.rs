@@ -187,6 +187,10 @@ pub struct SessionSummary {
     /// Model context window size for this session, if known.
     #[serde(default)]
     pub context_window: Option<u32>,
+    /// The prompt_tokens from the most recent API response (the actual
+    /// context size being sent to the model), if available.
+    #[serde(default)]
+    pub last_prompt_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -314,6 +318,10 @@ pub enum DaemonMessage {
         /// Model context window size for this session, if known.
         #[serde(default)]
         context_window: Option<u32>,
+        /// The prompt_tokens from the most recent API response (the actual
+        /// context size being sent to the model), if available.
+        #[serde(default)]
+        last_prompt_tokens: Option<u32>,
     },
     SessionMessageAppended {
         message: SessionMessage,
@@ -374,6 +382,10 @@ pub enum DaemonMessage {
         request_id: u32,
         /// Token usage for the completed request, if reported by the provider.
         token_usage: Option<TokenUsage>,
+        /// The prompt_tokens from the most recent API response (the actual
+        /// context size that was sent to the model), if available.
+        #[serde(default)]
+        last_prompt_tokens: Option<u32>,
     },
     Failed {
         request_id: u32,
