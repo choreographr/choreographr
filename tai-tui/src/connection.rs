@@ -23,6 +23,7 @@ use tai_client_core::{
 use tai_keystore::ensure_keypair;
 use tai_proto::{ClientMessage, DaemonMessage};
 use tai_tui::image_worker::{ImageResult, ImageWorker};
+use tai_tui::terminal_progress;
 use tai_tui::{ShellCommand, build_picker, parse_input_line};
 use tui_prompts::State;
 
@@ -111,6 +112,8 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         crossterm::event::DisableMouseCapture
     )?;
     terminal.show_cursor()?;
+    // Clear the terminal-native progress bar now that the TUI is exiting.
+    terminal_progress::update_terminal_progress(None, None);
 
     match connection_task.join() {
         Ok(Ok(())) => {}
@@ -182,6 +185,20 @@ pub(crate) fn run_ui_loop(
             terminal.show_cursor()?;
         }
 
+        // Update the terminal-native progress bar only when the
+        // underlying data or page has changed since the last frame.
+        if app.progress_dirty {
+            app.progress_dirty = false;
+            if app.page == Page::Chat && app.attached_session_id.is_some() {
+                terminal_progress::update_terminal_progress(
+                    app.attached_token_usage.as_ref(),
+                    app.attached_context_window,
+                );
+            } else {
+                terminal_progress::update_terminal_progress(None, None);
+            }
+        }
+
         // Block for up to ~60 Hz to pace the frame rate without
         // busy-waiting.
         let _ = event::poll(Duration::from_millis(UI_FRAME_POLL_MS))?;
@@ -222,7 +239,7 @@ fn handle_home_event(
     match key.code {
         // Esc returns to the previous page the user was on.
         KeyCode::Esc => {
-            app.page = app.previous_page;
+            app.set_page(app.previous_page);
         }
         // Navigate menu with j/k or Up/Down
         KeyCode::Up | KeyCode::Char('k') => {
@@ -238,16 +255,16 @@ fn handle_home_event(
         // Select a menu item
         KeyCode::Enter => match HOME_MENU_ITEMS[app.home_selection] {
             HomeMenuItem::Sessions => {
-                app.page = Page::SessionManager;
+                app.set_page(Page::SessionManager);
                 let _ = client_tx.send(ClientMessage::ListSessions);
                 let _ = client_tx.send(ClientMessage::SubscribeSessionsSummary);
             }
             HomeMenuItem::AIProviders => {
-                app.page = Page::AIProviders;
+                app.set_page(Page::AIProviders);
                 let _ = client_tx.send(ClientMessage::ListAccounts);
             }
             HomeMenuItem::Settings => {
-                app.page = Page::Settings;
+                app.set_page(Page::Settings);
             }
             HomeMenuItem::Exit => {
                 app.should_quit = true;
@@ -255,12 +272,12 @@ fn handle_home_event(
         },
         // Letter shortcuts for each menu item
         KeyCode::Char('s') => {
-            app.page = Page::SessionManager;
+            app.set_page(Page::SessionManager);
             let _ = client_tx.send(ClientMessage::ListSessions);
             let _ = client_tx.send(ClientMessage::SubscribeSessionsSummary);
         }
         KeyCode::Char('t') => {
-            app.page = Page::Settings;
+            app.set_page(Page::Settings);
         }
         KeyCode::Char('q') => {
             app.should_quit = true;
@@ -288,7 +305,7 @@ fn handle_settings_event(
         }
         // Esc returns to the home page
         KeyCode::Esc => {
-            app.page = Page::Home;
+            app.set_page(Page::Home);
         }
         _ => {}
     }
@@ -334,7 +351,7 @@ fn handle_chat_event(
             }
             match key.code {
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.page = Page::SessionManager;
+                    app.set_page(Page::SessionManager);
                     client_tx
                         .send(ClientMessage::ListSessions)
                         .map_err(broken_pipe)?;
@@ -343,13 +360,13 @@ fn handle_chat_event(
                         .map_err(broken_pipe)?;
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.page = Page::Settings;
+                    app.set_page(Page::Settings);
                 }
                 KeyCode::Esc => {
                     // Save where we came from so Home can return to Chat.
                     app.previous_page = Page::Chat;
                     app.home_selection = 0;
-                    app.page = Page::Home;
+                    app.set_page(Page::Home);
                 }
                 KeyCode::Up => {
                     app.navigate_history_up();
@@ -551,7 +568,7 @@ fn handle_session_list_key(
                 && let Some(session) = app.session_mgr.sessions.get(sel)
             {
                 let session_id = session.session_id;
-                app.page = Page::Chat;
+                app.set_page(Page::Chat);
                 let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
                 app.reset_for_session_switch();
                 app.attached_session_id = Some(session_id);
@@ -586,7 +603,7 @@ fn handle_session_list_key(
         KeyCode::Esc | KeyCode::Char('q') => {
             app.previous_page = Page::SessionManager;
             app.home_selection = 0;
-            app.page = Page::Home;
+            app.set_page(Page::Home);
             let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
         }
         _ => {}
@@ -609,7 +626,7 @@ fn handle_session_detail_key(
         KeyCode::Enter => {
             if let Some(ref detail) = app.session_mgr.detail_data {
                 let session_id = detail.session_id;
-                app.page = Page::Chat;
+                app.set_page(Page::Chat);
                 let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
                 app.reset_for_session_switch();
                 app.attached_session_id = Some(session_id);
@@ -698,7 +715,7 @@ fn handle_ai_providers_list_key(
         KeyCode::Esc | KeyCode::Char('q') => {
             app.previous_page = Page::AIProviders;
             app.home_selection = 0;
-            app.page = Page::Home;
+            app.set_page(Page::Home);
         }
         _ => {}
     }
@@ -986,6 +1003,38 @@ pub(crate) fn handle_daemon_message(
         }
         DaemonMessage::AccountRemoveFailed { name, error } => {
             app.push_text(format!("[daemon] failed to remove account {name}: {error}"));
+        }
+
+        DaemonMessage::SessionState {
+            session_id,
+            token_usage,
+            context_window,
+            ..
+        } => {
+            // Only update progress data when the message is for the
+            // currently-attached session; stale messages from a previous
+            // session that the daemon is still draining should be ignored.
+            if app.attached_session_id == Some(*session_id) {
+                app.attached_token_usage = token_usage.clone();
+                app.attached_context_window = *context_window;
+                app.progress_dirty = true;
+            }
+            // Fall through to dispatch_daemon_message for message processing.
+        }
+        DaemonMessage::Done {
+            token_usage: Some(usage),
+            ..
+        } => {
+            // Capture per-request token usage (e.g. final streaming chunk).
+            // This lacks a session_id, so we trust it belongs to the
+            // attached session (the daemon only sends Done for active
+            // requests on the session the client subscribed to).
+            app.attached_token_usage = Some(usage.clone());
+            app.progress_dirty = true;
+            // Fall through to dispatch_daemon_message.
+        }
+        DaemonMessage::Done { token_usage: None, .. } => {
+            // No token usage data — fall through.
         }
 
         _ => {}

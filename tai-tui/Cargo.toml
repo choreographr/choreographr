@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anstyle-progress = "0.1.0"
 anyhow.workspace = true
 postcard.workspace = true
 clap.workspace = true

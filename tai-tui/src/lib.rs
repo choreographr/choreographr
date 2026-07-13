@@ -75,6 +75,7 @@ pub fn build_picker() -> Picker {
 }
 
 pub mod image_worker;
+pub mod terminal_progress;
 
 #[cfg(test)]
 mod lib_tests;

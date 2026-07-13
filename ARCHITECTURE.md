@@ -432,7 +432,10 @@ main()
                     5. Update history viewport dimensions from terminal size
                     6. Clamp scroll state to valid range
                     7. Render via ratatui terminal.draw()
-                    8. Blocking poll (~16 ms) to pace frame rate
+                    8. If `progress_dirty`, emit OSC 9;4 terminal progress bar
+                       (percentage of `total_tokens / context_window` for the
+                       attached session, or clear/indeterminate if no data)
+                    9. Blocking poll (~16 ms) to pace frame rate
 ```
 
 **Module breakdown:**
@@ -447,6 +450,7 @@ main()
 | `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `tai-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Code blocks are syntax-highlighted via `syntect` (shared setup from `syntax.rs`). |
 | `lib.rs` | `RenderedImage` struct, `build_picker()` helper, public re-exports |
 | `image_worker.rs` | Background worker thread for SVG rasterization and terminal protocol encoding. Communicates with the UI thread via `mpsc` channels; raw image data shared through `Arc<Vec<u8>>` to avoid copies. |
+| `terminal_progress.rs` | Terminal-native progress bar via OSC 9;4 escape sequences. Cached capability detection, percentage/indeterminate/remove modes based on token usage vs context window. |
 
 
 ### `tai-dioxus` — Desktop client

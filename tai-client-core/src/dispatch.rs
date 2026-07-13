@@ -1110,9 +1110,16 @@ mod tests {
                 data: vec![0xFF, 0xFE], // invalid UTF-8
             },
         );
-        assert!(result.is_ok(), "invalid UTF-8 should be lossy-converted, not rejected");
+        assert!(
+            result.is_ok(),
+            "invalid UTF-8 should be lossy-converted, not rejected"
+        );
         let events = h.collect_events();
-        assert!(events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains('\u{FFFD}'))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains('\u{FFFD}')))
+        );
     }
 
     // ── Image handling ───────────────────────────────────────────────────
@@ -1630,7 +1637,10 @@ mod tests {
                 data: vec![0xFF, 0xFE],
             },
         );
-        assert!(result.is_ok(), "invalid UTF-8 should be lossy-converted, not rejected");
+        assert!(
+            result.is_ok(),
+            "invalid UTF-8 should be lossy-converted, not rejected"
+        );
         let events = h.collect_events();
         assert!(events.iter().any(|e| matches!(e, TestEvent::AppendStream(7, OutputStream::Answer, t) if t.contains('\u{FFFD}'))));
     }

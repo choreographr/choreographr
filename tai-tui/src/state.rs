@@ -479,6 +479,16 @@ pub(crate) struct App {
     /// fullscreen.  `None` means no fullscreen overlay is active.
     /// The existing `StatefulProtocol` is rendered directly (no re-decode).
     pub(crate) fullscreen_image_idx: Option<usize>,
+
+    /// Token usage for the currently-attached session, updated from
+    /// `SessionState` and `Done` messages.
+    pub(crate) attached_token_usage: Option<TokenUsage>,
+    /// Context window size for the currently-attached session's model.
+    pub(crate) attached_context_window: Option<u32>,
+    /// Set to `true` when the terminal-native progress bar data or current
+    /// page changes.  The render loop checks and clears this once per frame
+    /// instead of emitting the OSC sequence unconditionally.
+    pub(crate) progress_dirty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1045,6 +1055,9 @@ impl App {
             saved_draft: String::new(),
             db,
             fullscreen_image_idx: None,
+            attached_token_usage: None,
+            attached_context_window: None,
+            progress_dirty: false,
         }
     }
 
@@ -1523,6 +1536,15 @@ impl App {
             .account_for_trimmed_height(trimmed_height, self.max_scroll_offset());
     }
 
+    // ── Navigation helpers ───────────────────────────────────────
+
+    /// Navigate to a new page and mark the terminal-native progress bar
+    /// dirty so it gets re-evaluated on the next frame.
+    pub(crate) fn set_page(&mut self, page: Page) {
+        self.page = page;
+        self.progress_dirty = true;
+    }
+
     // ── Daemon message handlers ──────────────────────────────────
 
     /// Handle `SessionCreated`: if on the session-manager page, request a
@@ -1553,6 +1575,18 @@ impl App {
     /// Handle `SessionAttached`: record the attached session ID.
     pub(crate) fn handle_session_attached(&mut self, session_id: u64) {
         self.attached_session_id = Some(session_id);
+        // Seed token usage / context window from the session manager data,
+        // so the progress bar has data even before SessionState arrives.
+        if let Some(s) = self
+            .session_mgr
+            .sessions
+            .iter()
+            .find(|s| s.session_id == session_id)
+        {
+            self.attached_token_usage = s.token_usage.clone();
+            self.attached_context_window = s.context_window;
+        }
+        self.progress_dirty = true;
     }
 
     /// Handle `SessionStatusChanged`: propagate the new status into the
@@ -2317,5 +2351,55 @@ mod tests {
             app.pending_job_idx.is_empty(),
             "pending_job_idx should be cleared on session switch"
         );
+    }
+
+    // ── set_page ──
+
+    #[test]
+    fn set_page_sets_page_and_dirty_flag() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.progress_dirty = false;
+        app.set_page(Page::Settings);
+        assert_eq!(app.page, Page::Settings);
+        assert!(app.progress_dirty);
+    }
+
+    // ── handle_session_attached progress seeding ──
+
+    #[test]
+    fn handle_session_attached_seeds_progress_from_session_manager() {
+        let mut app = test_app("/tmp/tai.sock");
+        let mut s = make_session(42, "test");
+        s.token_usage = Some(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            total_tokens: 30,
+        });
+        s.context_window = Some(4096);
+        app.session_mgr.sessions.push(s);
+
+        app.handle_session_attached(42);
+
+        assert_eq!(app.attached_session_id, Some(42));
+        assert_eq!(
+            app.attached_token_usage,
+            Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+                total_tokens: 30,
+            })
+        );
+        assert_eq!(app.attached_context_window, Some(4096));
+        assert!(app.progress_dirty);
+    }
+
+    #[test]
+    fn handle_session_attached_ignores_unknown_session() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.handle_session_attached(99);
+        assert_eq!(app.attached_session_id, Some(99));
+        assert!(app.attached_token_usage.is_none());
+        assert!(app.attached_context_window.is_none());
+        assert!(app.progress_dirty);
     }
 }

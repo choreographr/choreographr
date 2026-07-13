@@ -1,4 +1,4 @@
-use crate::connection::handle_terminal_event;
+use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::markdown_render::*;
 use crate::state::*;
 use crate::test_util::test_app;
@@ -6,7 +6,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Mouse
 use ratatui::text::Line;
 use std::sync::Arc;
 use tai_client_core::DaemonMessageHandler;
-use tai_proto::{ClientMessage, OutputStream};
+use tai_proto::{ClientMessage, DaemonMessage, OutputStream, TokenUsage};
 use tui_prompts::State;
 
 #[test]
@@ -2091,4 +2091,130 @@ fn ai_providers_new_form_down_up_navigates_provider() {
     .expect("up on provider");
     // No assertion on index — option_count is 0 before render.
     // This test validates that Down/Up don't trigger other side effects.
+}
+
+// ── handle_daemon_message progress bar integration ──
+
+#[test]
+fn daemon_message_session_state_updates_progress_for_attached_session() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(7);
+
+    handle_daemon_message(
+        DaemonMessage::SessionState {
+            session_id: 7,
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            working_dir: None,
+            max_turns: None,
+            messages: vec![],
+            active_tool_groups: vec![],
+            token_usage: Some(TokenUsage {
+                input_tokens: 1,
+                output_tokens: 2,
+                total_tokens: 3,
+            }),
+            context_window: Some(4096),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    assert_eq!(
+        app.attached_token_usage,
+        Some(TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+        })
+    );
+    assert_eq!(app.attached_context_window, Some(4096));
+    assert!(app.progress_dirty);
+}
+
+#[test]
+fn daemon_message_session_state_ignores_wrong_session() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(7);
+
+    handle_daemon_message(
+        DaemonMessage::SessionState {
+            session_id: 99, // different from attached_session_id
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            working_dir: None,
+            max_turns: None,
+            messages: vec![],
+            active_tool_groups: vec![],
+            token_usage: Some(TokenUsage {
+                input_tokens: 99,
+                output_tokens: 99,
+                total_tokens: 99,
+            }),
+            context_window: Some(1024),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    // Must NOT have been overwritten by the wrong session's data.
+    assert!(app.attached_token_usage.is_none());
+    assert!(app.attached_context_window.is_none());
+    assert!(!app.progress_dirty);
+}
+
+#[test]
+fn daemon_message_done_with_token_usage_updates_progress() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_daemon_message(
+        DaemonMessage::Done {
+            request_id: 1,
+            token_usage: Some(TokenUsage {
+                input_tokens: 5,
+                output_tokens: 10,
+                total_tokens: 15,
+            }),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    assert_eq!(
+        app.attached_token_usage,
+        Some(TokenUsage {
+            input_tokens: 5,
+            output_tokens: 10,
+            total_tokens: 15,
+        })
+    );
+    assert!(app.progress_dirty);
+}
+
+#[test]
+fn daemon_message_done_without_token_usage_does_not_change_progress() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_daemon_message(
+        DaemonMessage::Done {
+            request_id: 1,
+            token_usage: None,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    // Must remain at defaults — no data written, no dirty flag set.
+    assert!(app.attached_token_usage.is_none());
+    assert!(!app.progress_dirty);
 }
