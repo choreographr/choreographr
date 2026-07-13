@@ -34,6 +34,7 @@ pub use crate::tools::git::{
     execute_git_push_tool, execute_git_status_tool,
 };
 pub use crate::tools::grep::{GrepArgs, execute_grep_tool};
+pub use crate::tools::notify::{NotifySendArgs, execute_notify_send};
 pub use crate::tools::nu::{NuArgs, execute_nu_tool};
 pub use crate::tools::sh::{ShArgs, execute_sh_tool};
 #[cfg(test)]

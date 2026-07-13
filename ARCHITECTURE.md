@@ -744,6 +744,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 | **Shell** | `exec` (direct program execution), `sh` (bash/dash/zsh — detected at startup), `nushell` (if `nu` is installed), `fish` (if `fish` is installed) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |
 | **DB** | `db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count` |
+| **Desktop** | `notify_send` (desktop notifications with configurable summary, body, urgency, and icon) |
 | **Sub-session** | `spawn_subsession` (spawns an autonomous child session with its own tool-calling loop) |
 
 ### Tool groups
@@ -754,6 +755,7 @@ via `fn group() -> &'static str` on the `Tool` trait. Groups are:
 | Group | Default | Description |
 |---|---|---|
 | `core` | always on | File system, HTTP, images, file search, random values, and time queries |
+| `desktop` | off | Desktop notifications via notify-send |
 | `db` | off | Session-scoped key-value database |
 | `git` | on | Local Git operations |
 | `shell` | on | Shell and exec |

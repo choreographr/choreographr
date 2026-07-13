@@ -37,6 +37,8 @@ tai-keystore.workspace = true
 tai-mcp.workspace = true
 tai-proto.workspace = true
 tai-transport.workspace = true
+# Linux-only desktop notifications; "d" selects the DBus backend
+notify-rust = { version = "4.18.0", default-features = false, features = ["d"] }
 signal-hook.workspace = true
 toml = "1.1"
 tracing.workspace = true

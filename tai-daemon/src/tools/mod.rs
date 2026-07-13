@@ -99,6 +99,7 @@ pub(crate) mod grep;
 pub(crate) mod groups;
 pub mod http;
 mod image;
+pub(crate) mod notify;
 pub(crate) mod nu;
 pub(crate) mod random;
 pub(crate) mod sh;
@@ -397,6 +398,10 @@ pub fn static_groups() -> &'static [ToolGroup] {
                 description: "File system operations, HTTP requests, image display, file search, random values, and time queries".into(),
             },
             ToolGroup {
+                name: "desktop".into(),
+                description: "Desktop notifications via notify-send".into(),
+            },
+            ToolGroup {
                 name: "db".into(),
                 description: "Session-scoped key-value database (redb)".into(),
             },
@@ -468,6 +473,7 @@ impl ToolRegistry {
         reg.register(grep::Grep);
         reg.register(find::Find);
         reg.register(random::Random);
+        reg.register(notify::NotifySend);
         reg.register(time::GetCurrentTime);
         reg.register(x::XPost);
         reg.register(x::XSearchRecent);
