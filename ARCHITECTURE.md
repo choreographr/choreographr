@@ -102,7 +102,6 @@ Defines all shared message types and framing. No dependencies on other workspace
 - Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionMessageAppended`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`
 - Request lifecycle: `Started`, `OutputChunk`, `Done`, `Failed`, `Cancelled`
 - Tool lifecycle: `ToolCallStarted`, `ToolCallFinished`, `ToolCallFailed`, `ToolCallOutput`
-- Image streaming: `ImageStart`, `ImageChunk`, `ImageEnd`
 - Model management: `Models`, `ModelsFailed`, `ModelSelected`, `ModelSelectionFailed`
 - Locking: `Unlocked`, `Locked`, `LockedError`
 - Credential management: `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`
@@ -188,7 +187,7 @@ Used by `tai-tui`, `tai-dioxus`, and `tai-im`.
 |---|---|---|
 | `shell.rs` | Parses terminal input into `ShellCommand`: `/ping`, `/models`, `/model` (alias), `/cancel`, `/unlock`, `/lock`, `/image`, `/add-key`, `/add-x`, `/remove-key`, or `RunInput(prompt)`. All commands use `/` prefix exclusively; `parse_command()` is the single dispatch point. |
 | `credentials.rs` | Shared helpers: `resolve_private_key()` (read or decrypt the identity key), `build_add_credential_message()` (encrypt and package a credential for the daemon), `read_public_key_bytes()`. Eliminates duplicated logic across `tai-tui`, `tai-dioxus`, and `tai-im`. |
-| `image.rs` | `ImageAssembler` reconstructs images from chunked stream protocol (`ImageStart` → `ImageChunk`* → `ImageEnd`), validating byte count |
+| `image.rs` | `ImageAssembler` — kept for legacy `tai-im` use. No longer used by TUI/Dioxus (images delivered mid-turn as `DisplayedImage` via `SessionMessageAppended`). |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text, structured diffs) |
 | `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
 | `connection.rs` | Daemon connection helpers: `run_daemon_connection()` (Unix socket), `run_daemon_tcp_connection()` (Noise IK), `run_daemon_connection_with_mode()` (dispatch), `run_daemon_reader()` (blocking reader). `ConnectionMode` enum (`UnixSocket` | `Tcp`) selects the transport. |
@@ -1061,23 +1060,21 @@ Model calls display_image tool
   → passes image_tx to ToolDyn::execute_json → execute_streaming_json
   → tool extracts PreparedImage from typed return → sends via image_tx
   → agent loop drains image_rx after tool completion
-  ├── Persistence path:
-  │     → SessionMessage::DisplayedImage(DisplayedImageRecord)
-  │     → push to session messages + write to DB via write_message_retry
-  │     → replayed on session re-attach via DaemonMessage::SessionState
-  └── Live broadcast path:
-        → DaemonMessage::ImageStart { request_id, metadata }
-        → DaemonMessage::ImageChunk { request_id, data (≤64 KiB) } × N
-        → DaemonMessage::ImageEnd { request_id }
-        → client ImageAssembler reconstructs full image
-        → client renders image in terminal (ratatui-image) or desktop (data: URL)
+  → emit_and_persist_image creates SessionMessage::DisplayedImage
+  → broadcasts it to live subscribers mid-turn via
+    SessionCommand::Broadcast(SessionMessageAppended { DisplayedImage })
+  → client push_session_message converts DisplayedImage → RenderedImage
+  → also persists to DB + pushes to session messages for replay
+  → after request completes, handle_request_finished skips DisplayedImage
+    entries in its snapshot delta (already delivered mid-turn) and
+    broadcasts only non-image messages (AssistantText, ToolResult, …)
 ```
 
 ### Session switch flow (updated)
 
 ```
 User presses Enter on a session in the session manager
-  → history cleared (client.history, render_cache, scroll, in_progress, pending_images)
+  → history cleared (client.history, render_cache, scroll, in_progress)
   → AttachSession sent to daemon
   → daemon responds with SessionState { messages: Vec<SessionMessage>, … }
     where messages may include SessionMessage::DisplayedImage for persisted images
@@ -1119,22 +1116,19 @@ User presses Enter on a session in the session manager
    configurable `max_turns` per session, default 25) rather than pushing that complexity to
    the client or model. The client just sees `ToolCallStarted`/`ToolCallFinished` events.
 
-7. **Chunked image streaming** — images are streamed in ≤64 KiB chunks to avoid blocking the
-   socket on large payloads. The client assembles and validates on receipt.
-
-8. **Session subscription model** — multiple clients can subscribe to the same session. Events
+7. **Session subscription model** — multiple clients can subscribe to the same session. Events
    are broadcast to all subscribers except the originator, enabling shared session viewing.
 
-9. **SSE streaming** — a custom `SseReader` (not a library) handles `data:` lines and `[DONE]`
+8. **SSE streaming** — a custom `SseReader` (not a library) handles `data:` lines and `[DONE]`
    for OpenAI SSE, giving full control over parsing and buffering behavior. The Anthropic
    module has its own `AnthropicSseReader` that handles both `event:` and `data:` lines
    (required by the Anthropic Messages streaming format) and yields `(event_type, data)` pairs.
 
-10. **Markdown as the intermediate format** — all text (tool output, assistant text, error
+9. **Markdown as the intermediate format** — all text (tool output, assistant text, error
     messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
     (tai-tui), providing a consistent rendering layer.
 
-11. **Flexible API format** — both OpenAI Chat Completions and Responses are first-class
+10. **Flexible API format** — both OpenAI Chat Completions and Responses are first-class
     citizens, selectable per-model via a `RequestFormat` enum (`ChatCompletions` / `Responses`).
     The dispatch mechanism lives in `ServiceConfig::request_format_for_model()`: it checks
     per-model overrides (`model_request_formats`) and falls back to `default_request_format`.
@@ -1157,14 +1151,14 @@ User presses Enter on a session in the session manager
     `ServiceConfig::programmatic_tool_calling_for_model()`; account-level override via
     `accounts.toml`'s `programmatic_tool_calling` field.
 
-12. **Pluggable providers via `InferenceProvider`** — the provider system supports OpenAI-compatible,
+11. **Pluggable providers via `InferenceProvider`** — the provider system supports OpenAI-compatible,
     Anthropic Messages, Google Gemini, and Mistral APIs. Each provider implements the same interface
     (`chat_completion_turn`, `chat_completion_turn_streaming`, `list_models`) and is constructed
     from an `AccountConfig` + credential. Accounts are defined in `accounts.toml` with a
     `provider` field (`"openai"`, `"opencode"`, `"anthropic"`, etc.). The TUI new-account form
     offers all registered provider options via a shared `PROVIDER_OPTIONS` array.
 
-13. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
+12. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
     where third-party libraries (alloy) require it. A global `OnceLock<tokio::runtime::Runtime>`
     serves as a sidecar for those async calls via `block_on()`. This simplifies the mental model
     (each thread owns its data, no `Send` bounds on shared state, no `Pin<Box<dyn Future>>`),

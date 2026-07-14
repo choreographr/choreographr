@@ -917,7 +917,37 @@ fn handle_request_finished(
     shutdown_requested: &bool,
     ctx: &RequestContext,
 ) -> bool {
+    // Record how many messages were in the session before the worker's
+    // snapshot is merged.  Everything past this point was created by the
+    // agent loop (AssistantToolUse, ToolResult, DisplayedImage, AssistantText)
+    // and must be broadcast to subscribers now — they were never delivered
+    // during streaming.
+    let pre_len = state.messages.len();
     state.apply_snapshot(snapshot);
+
+    // Deliver new messages the worker added during the agent loop.
+    // DisplayedImage entries were already broadcast mid-turn by
+    // emit_and_persist_image, so skip them to avoid duplicates.
+    let Some(new_msgs) = state.messages.get(pre_len..) else {
+        warn!(
+            "handle_request_finished: snapshot had fewer messages ({}) than expected ({})",
+            state.messages.len(),
+            pre_len,
+        );
+        return false;
+    };
+    for msg in new_msgs {
+        if matches!(msg, SessionMessage::DisplayedImage(_)) {
+            continue;
+        }
+        broadcast(
+            &state.subscribers,
+            DaemonMessage::SessionMessageAppended {
+                message: msg.clone(),
+            },
+        );
+    }
+
     state.active_requests.remove(&request_id);
     state.config.status = SessionStatus::Inactive;
     let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
@@ -1204,7 +1234,9 @@ mod tests {
     use crate::db::SessionRecord;
     use crate::tools::ToolRegistry;
     use std::collections::HashMap;
-    use tai_proto::{OutputStream, SessionMessage, SessionStatus};
+    use tai_proto::{
+        DisplayedImageRecord, ImageMetadata, OutputStream, SessionMessage, SessionStatus,
+    };
     use tempfile::tempdir;
 
     fn test_record() -> SessionRecord {
@@ -1500,6 +1532,63 @@ mod tests {
         );
 
         assert!(!shutdown);
+    }
+
+    // -- handle_request_finished tests ------------------------------------
+
+    #[test]
+    fn request_finished_broadcasts_new_messages_skipping_displayed_images() {
+        let (sub_tx, sub_rx) = mpsc::channel();
+        let (mut state, ctx) = broadcast_setup();
+        state.subscribers.insert(10, sub_tx);
+
+        // Snapshot with additional messages: a DisplayedImage (should be
+        // skipped — already broadcast mid-turn) and a ToolResult (should
+        // be delivered via SessionMessageAppended).
+        let mut snap_msgs = state.messages.clone();
+        snap_msgs.push(SessionMessage::DisplayedImage(DisplayedImageRecord {
+            metadata: ImageMetadata {
+                image_id: 1,
+                mime_type: "image/png".into(),
+                width: 100,
+                height: 50,
+                byte_len: 64,
+                alt: None,
+            },
+            data: vec![0u8; 64],
+        }));
+        snap_msgs.push(SessionMessage::ToolResult {
+            call_id: "call_1".into(),
+            name: "echo".into(),
+            content: "hello".into(),
+            is_error: false,
+        });
+        let snapshot = SessionSnapshot {
+            config: state.config.clone(),
+            messages: snap_msgs,
+        };
+
+        let shutdown = false;
+        handle_request_finished(1, snapshot, &mut state, &shutdown, &ctx);
+
+        // Collect all broadcasts from the subscriber.
+        let mut saw_tool_result = false;
+        let mut saw_displayed_image = false;
+        while let Ok(msg) = sub_rx.try_recv() {
+            if let DaemonMessage::SessionMessageAppended { message } = &msg {
+                match message {
+                    SessionMessage::DisplayedImage(_) => saw_displayed_image = true,
+                    SessionMessage::ToolResult { .. } => saw_tool_result = true,
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(saw_tool_result, "ToolResult should have been broadcast");
+        assert!(
+            !saw_displayed_image,
+            "DisplayedImage should have been skipped (broadcast mid-turn already)"
+        );
     }
 
     // -- Cancel / Shutdown tests -------------------------------------------

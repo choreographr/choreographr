@@ -1,6 +1,6 @@
 use super::*;
 use crate::state::HistoryItem;
-use tai_proto::{DaemonMessage, ImageMetadata, OutputStream};
+use tai_proto::{DaemonMessage, ImageMetadata, OutputStream, SessionMessage};
 
 #[test]
 fn app_state_stream_updates_history() {
@@ -26,7 +26,7 @@ fn app_state_stream_updates_history() {
 }
 
 #[test]
-fn apply_daemon_image_messages_pushes_renderable_image() {
+fn apply_daemon_image_message_pushes_displayed_image() {
     let mut state = AppState::new("/tmp/tai.sock".to_string());
     let metadata = ImageMetadata {
         image_id: 5,
@@ -44,34 +44,19 @@ fn apply_daemon_image_messages_pushes_renderable_image() {
         0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
+    // DisplayedImage is now delivered as SessionMessageAppended after
+    // request completion, not streamed via ImageStart/Chunk/End.
     apply_daemon_message(
         &mut state,
-        DaemonMessage::ImageStart {
-            request_id: 7,
-            metadata: metadata.clone(),
+        DaemonMessage::SessionMessageAppended {
+            message: SessionMessage::DisplayedImage(tai_proto::DisplayedImageRecord {
+                metadata: metadata.clone(),
+                data: png,
+            }),
         },
         None,
     )
-    .expect("start");
-    apply_daemon_message(
-        &mut state,
-        DaemonMessage::ImageChunk {
-            request_id: 7,
-            image_id: 5,
-            data: png,
-        },
-        None,
-    )
-    .expect("chunk");
-    apply_daemon_message(
-        &mut state,
-        DaemonMessage::ImageEnd {
-            request_id: 7,
-            image_id: 5,
-        },
-        None,
-    )
-    .expect("end");
+    .expect("append");
 
     match state.client.history.last().expect("image history item") {
         HistoryItem::Image(image) => {

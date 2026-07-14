@@ -1,7 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tai_client_core::{
-    ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
-    StreamingText,
+    ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem, StreamingText,
 };
 use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
 
@@ -55,7 +54,22 @@ impl DaemonMessageHandler for AppState {
     }
 
     fn push_session_message(&mut self, message: SessionMessage) {
-        self.client.push_session_message(message);
+        // DisplayedImage is delivered post-turn as SessionMessageAppended
+        // and should be converted to a renderable image item, same as the
+        // TUI client does — the old ImageStart/Chunk/End streaming path
+        // is no longer used.
+        if let SessionMessage::DisplayedImage(record) = &message {
+            self.client.push_image(DisplayImage {
+                data_url: format!(
+                    "data:{};base64,{}",
+                    record.metadata.mime_type,
+                    BASE64.encode(&record.data),
+                ),
+                metadata: record.metadata.clone(),
+            });
+        } else {
+            self.client.push_session_message(message);
+        }
     }
 
     fn insert_session_message_before_stream(&mut self, request_id: u32, message: SessionMessage) {
@@ -78,33 +92,6 @@ impl DaemonMessageHandler for AppState {
     }
 
     fn drop_request(&mut self, request_id: u32) {
-        self.client.finalize_stream(request_id);
-        self.client.pending_images.drop_request(request_id);
-    }
-
-    fn handle_image_start(
-        &mut self,
-        request_id: u32,
-        metadata: ImageMetadata,
-    ) -> Result<(), ClientError> {
-        self.client.start_image(request_id, metadata)
-    }
-
-    fn handle_image_chunk(
-        &mut self,
-        request_id: u32,
-        image_id: u32,
-        data: &[u8],
-    ) -> Result<(), ClientError> {
-        self.client.push_image_chunk(request_id, image_id, data)
-    }
-
-    fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError> {
-        let (metadata, data) = self.client.finish_image(request_id, image_id)?;
-        self.client.push_image(DisplayImage {
-            data_url: format!("data:{};base64,{}", metadata.mime_type, BASE64.encode(data)),
-            metadata,
-        });
-        Ok(())
+        self.client.drop_request(request_id);
     }
 }

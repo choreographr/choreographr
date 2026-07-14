@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use tai_proto::{DaemonMessage, ImageMetadata, OutputStream, SessionMessage};
+use tai_proto::{DaemonMessage, OutputStream, SessionMessage};
 use tracing::debug;
 
 pub trait DaemonMessageHandler {
@@ -20,18 +20,6 @@ pub trait DaemonMessageHandler {
     fn drop_request(&mut self, request_id: u32) {
         self.finalize_stream(request_id);
     }
-    fn handle_image_start(
-        &mut self,
-        request_id: u32,
-        metadata: ImageMetadata,
-    ) -> Result<(), ClientError>;
-    fn handle_image_chunk(
-        &mut self,
-        request_id: u32,
-        image_id: u32,
-        data: &[u8],
-    ) -> Result<(), ClientError>;
-    fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError>;
 }
 
 // ── Session lifecycle ─────────────────────────────────────────
@@ -146,21 +134,10 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
             );
             Ok(())
         }
-        DaemonMessage::ToolCallFinished {
-            request_id,
-            call_id,
-            tool_name,
-            output,
-        } => {
-            handler.insert_session_message_before_stream(
-                request_id,
-                SessionMessage::ToolResult {
-                    call_id,
-                    name: tool_name,
-                    content: output,
-                    is_error: false,
-                },
-            );
+        DaemonMessage::ToolCallFinished { .. } => {
+            // ToolResult is now delivered as SessionMessageAppended after
+            // request completion via handle_request_finished's snapshot
+            // delta.  The real message is created once by the daemon.
             Ok(())
         }
         DaemonMessage::ToolCallFailed {
@@ -200,39 +177,6 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
         DaemonMessage::Cancelled { request_id } => {
             handler.push_text(format!("[{request_id}] cancelled"));
             handler.drop_request(request_id);
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-// ── Image assembly ────────────────────────────────────────────
-
-fn dispatch_image<H: DaemonMessageHandler>(
-    handler: &mut H,
-    msg: DaemonMessage,
-) -> Result<(), ClientError> {
-    match msg {
-        DaemonMessage::ImageStart {
-            request_id,
-            metadata,
-        } => {
-            handler.handle_image_start(request_id, metadata)?;
-            Ok(())
-        }
-        DaemonMessage::ImageChunk {
-            request_id,
-            image_id,
-            data,
-        } => {
-            handler.handle_image_chunk(request_id, image_id, &data)?;
-            Ok(())
-        }
-        DaemonMessage::ImageEnd {
-            request_id,
-            image_id,
-        } => {
-            handler.handle_image_end(request_id, image_id)?;
             Ok(())
         }
         _ => Ok(()),
@@ -462,11 +406,6 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
             Ok(())
         }
 
-        // Image assembly
-        m @ (DaemonMessage::ImageStart { .. }
-        | DaemonMessage::ImageChunk { .. }
-        | DaemonMessage::ImageEnd { .. }) => dispatch_image(handler, m),
-
         // Model management
         m @ (DaemonMessage::Models { .. }
         | DaemonMessage::ModelsFailed { .. }
@@ -512,15 +451,11 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use tai_proto::{
-        AccountInfo, ImageMetadata, OutputStream, SessionMessage, SessionStatus, SessionSummary,
-    };
+    use tai_proto::{AccountInfo, OutputStream, SessionMessage, SessionStatus, SessionSummary};
 
     /// A test handler that records every method call in a VecDeque of events.
     struct TestHandler {
         events: VecDeque<TestEvent>,
-        /// Returned by `handle_image_start`, controlled for error-testing.
-        image_start_result: Result<(), ClientError>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -531,16 +466,12 @@ mod tests {
         BeginStream(u32),
         AppendStream(u32, OutputStream, String),
         FinalizeStream(u32),
-        HandleImageStart(u32, ImageMetadata),
-        HandleImageChunk(u32, u32, Vec<u8>),
-        HandleImageEnd(u32, u32),
     }
 
     impl TestHandler {
         fn new() -> Self {
             Self {
                 events: VecDeque::new(),
-                image_start_result: Ok(()),
             }
         }
 
@@ -579,48 +510,6 @@ mod tests {
         }
         fn finalize_stream(&mut self, request_id: u32) {
             self.events.push_back(TestEvent::FinalizeStream(request_id));
-        }
-        fn handle_image_start(
-            &mut self,
-            request_id: u32,
-            metadata: ImageMetadata,
-        ) -> Result<(), ClientError> {
-            self.events
-                .push_back(TestEvent::HandleImageStart(request_id, metadata));
-            // Take the stored result and reset to Ok for subsequent calls,
-            // so the error is only returned once.
-            std::mem::replace(&mut self.image_start_result, Ok(()))
-        }
-        fn handle_image_chunk(
-            &mut self,
-            request_id: u32,
-            image_id: u32,
-            data: &[u8],
-        ) -> Result<(), ClientError> {
-            self.events.push_back(TestEvent::HandleImageChunk(
-                request_id,
-                image_id,
-                data.to_vec(),
-            ));
-            Ok(())
-        }
-        fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError> {
-            self.events
-                .push_back(TestEvent::HandleImageEnd(request_id, image_id));
-            Ok(())
-        }
-    }
-
-    // ── Helper factories ────────────────────────────────────────────────
-
-    fn sample_image_metadata() -> ImageMetadata {
-        ImageMetadata {
-            image_id: 1,
-            mime_type: "image/png".into(),
-            width: 100,
-            height: 50,
-            byte_len: 4096,
-            alt: Some("sample".into()),
         }
     }
 
@@ -1038,7 +927,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_finished_inserts_tool_result() {
+    fn tool_call_finished_is_noop() {
         let mut h = TestHandler::new();
         dispatch_daemon_message(
             &mut h,
@@ -1051,16 +940,7 @@ mod tests {
         )
         .unwrap();
         let events = h.collect_events();
-        let expected = TestEvent::InsertSessionMessageBeforeStream(
-            7,
-            SessionMessage::ToolResult {
-                call_id: "c1".into(),
-                name: "ls".into(),
-                content: "file.txt".into(),
-                is_error: false,
-            },
-        );
-        assert!(events.contains(&expected));
+        assert!(events.is_empty(), "ToolCallFinished should be a no-op");
     }
 
     #[test]
@@ -1121,72 +1001,6 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, TestEvent::PushText(t) if t.contains('\u{FFFD}')))
         );
-    }
-
-    // ── Image handling ───────────────────────────────────────────────────
-
-    #[test]
-    fn image_start_forwards_to_handler() {
-        let mut h = TestHandler::new();
-        let metadata = sample_image_metadata();
-        dispatch_daemon_message(
-            &mut h,
-            DaemonMessage::ImageStart {
-                request_id: 7,
-                metadata: metadata.clone(),
-            },
-        )
-        .unwrap();
-        let events = h.collect_events();
-        assert!(events.contains(&TestEvent::HandleImageStart(7, metadata)));
-    }
-
-    #[test]
-    fn image_start_error_propagates() {
-        let mut h = TestHandler::new();
-        h.image_start_result = Err(ClientError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "no space",
-        )));
-        let result = dispatch_daemon_message(
-            &mut h,
-            DaemonMessage::ImageStart {
-                request_id: 7,
-                metadata: sample_image_metadata(),
-            },
-        );
-        assert!(result.is_err(), "handler error must propagate");
-    }
-
-    #[test]
-    fn image_chunk_forwards_to_handler() {
-        let mut h = TestHandler::new();
-        dispatch_daemon_message(
-            &mut h,
-            DaemonMessage::ImageChunk {
-                request_id: 7,
-                image_id: 1,
-                data: b"chunk data".to_vec(),
-            },
-        )
-        .unwrap();
-        let events = h.collect_events();
-        assert!(events.contains(&TestEvent::HandleImageChunk(7, 1, b"chunk data".to_vec())));
-    }
-
-    #[test]
-    fn image_end_forwards_to_handler() {
-        let mut h = TestHandler::new();
-        dispatch_daemon_message(
-            &mut h,
-            DaemonMessage::ImageEnd {
-                request_id: 7,
-                image_id: 1,
-            },
-        )
-        .unwrap();
-        let events = h.collect_events();
-        assert!(events.contains(&TestEvent::HandleImageEnd(7, 1)));
     }
 
     // ── Pong ─────────────────────────────────────────────────────────────

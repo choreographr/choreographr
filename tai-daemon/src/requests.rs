@@ -22,59 +22,22 @@ use std::time::Duration;
 use std::time::Instant;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
-    AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata,
-    MAX_IMAGE_CHUNK_SIZE, OutputStream, SessionMessage, SessionStatus, ThinkingEffort, TokenUsage,
+    AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream,
+    SessionMessage, SessionStatus, ThinkingEffort, TokenUsage,
 };
 use tracing::{debug, info, warn};
 
-/// Route an image-sync broadcast through the session command channel so the
-/// main session thread dispatches it to its live subscriber map.
-fn emit_prepared_image_sync(
-    cmd_tx: &mpsc::Sender<SessionCommand>,
-    request_id: u32,
-    image_id: u32,
-    image: &PreparedImage,
-) {
-    // Safety: image.data.len() fits in u64 on all supported platforms.
-    let byte_len = image.data.len() as u64;
-    let metadata = ImageMetadata {
-        image_id,
-        mime_type: image.mime_type.clone(),
-        width: image.width,
-        height: image.height,
-        byte_len,
-        alt: image.alt.clone(),
-    };
-    let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::ImageStart {
-        request_id,
-        metadata,
-    }));
-    for chunk in image.data.chunks(MAX_IMAGE_CHUNK_SIZE) {
-        let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::ImageChunk {
-            request_id,
-            image_id,
-            data: chunk.to_vec(),
-        }));
-    }
-    let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::ImageEnd {
-        request_id,
-        image_id,
-    }));
-}
-
-/// Emit a `PreparedImage` to subscribers and persist it to the database as a
-/// `DisplayedImage` message.  Used by both the serial and concurrent tool paths.
+/// Persist a `PreparedImage` to the database as a `DisplayedImage` message,
+/// push it into the session's in-memory message list, and broadcast it to
+/// live subscribers immediately (mid-turn) so the image appears as soon as
+/// the tool finishes rather than waiting for request completion.
+/// Used by both the serial and concurrent tool paths.
 fn emit_and_persist_image(
     cmd_tx: &mpsc::Sender<SessionCommand>,
-    request_id: u32,
-    next_image_id: &mut u32,
     image: PreparedImage,
     session: &mut SessionState,
     ctx: &RequestContext,
 ) {
-    emit_prepared_image_sync(cmd_tx, request_id, *next_image_id, &image);
-    *next_image_id = next_image_id.wrapping_add(1);
-
     let persisted = SessionMessage::DisplayedImage(DisplayedImageRecord {
         metadata: ImageMetadata {
             image_id: 0,
@@ -86,6 +49,15 @@ fn emit_and_persist_image(
         },
         data: image.data,
     });
+
+    // Broadcast to live subscribers mid-turn so subscribers see the image
+    // immediately, not just at request completion.
+    let _ = cmd_tx.send(SessionCommand::Broadcast(
+        DaemonMessage::SessionMessageAppended {
+            message: persisted.clone(),
+        },
+    ));
+
     let img_idx = session.messages().len() as u32;
     if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, img_idx, &persisted) {
         tracing::warn!(
@@ -353,7 +325,6 @@ pub(crate) fn run_agent_loop(
     cancel_rx: &mpsc::Receiver<()>,
     ctx: &RequestContext,
 ) -> io::Result<bool> {
-    let mut next_image_id = 1u32;
     let max_turns = session.config.max_turns.unwrap_or(ctx.max_turns_default);
 
     let mut prev_resp_id: Option<String> = None;
@@ -555,14 +526,7 @@ pub(crate) fn run_agent_loop(
 
                     // Drain any image emitted by the tool.
                     if let Ok(image) = image_rx.try_recv() {
-                        emit_and_persist_image(
-                            &ctx.cmd_tx,
-                            request_id,
-                            &mut next_image_id,
-                            image,
-                            session,
-                            ctx,
-                        );
+                        emit_and_persist_image(&ctx.cmd_tx, image, session, ctx);
                     }
 
                     finish_tool_call(request_id, session, &tool_call, &mut output, ctx);
@@ -707,14 +671,7 @@ pub(crate) fn run_agent_loop(
 
                         // Emit and persist any image the tool produced.
                         if let Some(image) = image {
-                            emit_and_persist_image(
-                                &ctx.cmd_tx,
-                                request_id,
-                                &mut next_image_id,
-                                image,
-                                session,
-                                ctx,
-                            );
+                            emit_and_persist_image(&ctx.cmd_tx, image, session, ctx);
                         }
 
                         finish_tool_call(request_id, session, &tool_call, &mut output, ctx);
@@ -1740,7 +1697,6 @@ mod tests {
         let registry = ToolRegistry::new().build();
 
         let mut session = SessionState::empty();
-        let mut next_image_id = 1u32;
 
         let ctx = RequestContext {
             cmd_tx,
@@ -1759,17 +1715,7 @@ mod tests {
             alt: Some("test image".into()),
         };
 
-        emit_and_persist_image(
-            &ctx.cmd_tx,
-            7, // request_id
-            &mut next_image_id,
-            image,
-            &mut session,
-            &ctx,
-        );
-
-        // Image ID should have been incremented.
-        assert_eq!(next_image_id, 2);
+        emit_and_persist_image(&ctx.cmd_tx, image, &mut session, &ctx);
 
         // Session should have one message: a DisplayedImage.
         assert_eq!(session.messages().len(), 1);
@@ -1784,33 +1730,18 @@ mod tests {
             other => panic!("expected DisplayedImage, got {other:?}"),
         }
 
-        // Should have received an ImageStart broadcast.
-        match cmd_rx.recv() {
-            Ok(SessionCommand::Broadcast(DaemonMessage::ImageStart {
-                request_id,
-                metadata,
+        // Should have received a mid-turn broadcast of the DisplayedImage.
+        match cmd_rx.try_recv() {
+            Ok(SessionCommand::Broadcast(DaemonMessage::SessionMessageAppended {
+                message: SessionMessage::DisplayedImage(record),
             })) => {
-                assert_eq!(request_id, 7);
-                assert_eq!(metadata.mime_type, "image/png");
+                assert_eq!(record.metadata.mime_type, "image/png");
+                assert_eq!(record.data, b"fakedata");
             }
-            Ok(_) => panic!("expected DaemonMessage::ImageStart"),
-            Err(e) => panic!("channel error: {e}"),
-        }
-
-        // Then ImageChunk with the data.
-        match cmd_rx.recv() {
-            Ok(SessionCommand::Broadcast(DaemonMessage::ImageChunk { data, .. })) => {
-                assert_eq!(data, b"fakedata");
-            }
-            Ok(_) => panic!("expected DaemonMessage::ImageChunk"),
-            Err(e) => panic!("channel error: {e}"),
-        }
-
-        // Then ImageEnd.
-        match cmd_rx.recv() {
-            Ok(SessionCommand::Broadcast(DaemonMessage::ImageEnd { .. })) => {}
-            Ok(_) => panic!("expected DaemonMessage::ImageEnd"),
-            Err(e) => panic!("channel error: {e}"),
+            Ok(_) => panic!(
+                "expected SessionCommand::Broadcast with SessionMessageAppended, got Broadcast with something else"
+            ),
+            Err(e) => panic!("expected broadcast, got {e:?}"),
         }
     }
 

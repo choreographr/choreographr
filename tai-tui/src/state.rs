@@ -11,7 +11,7 @@ use tai_proto::{
     SessionSummary, ThinkingEffort, TokenUsage,
 };
 use tai_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
-use tai_tui::{ImageAssembler, RenderedImage, StreamingText};
+use tai_tui::{RenderedImage, StreamingText};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::db::{self, CommandEntry};
@@ -1326,7 +1326,6 @@ impl App {
         self.pending_job_idx.clear();
         self.active.clear();
         self.client.in_progress.clear();
-        self.client.pending_images = ImageAssembler::new();
     }
 
     /// Ensure the render cache is aligned with the history vector.
@@ -1819,32 +1818,7 @@ impl DaemonMessageHandler for App {
 
     fn drop_request(&mut self, request_id: u32) {
         self.active.remove(&request_id);
-        self.client.in_progress.remove(&request_id);
-        self.client.pending_images.drop_request(request_id);
-    }
-
-    fn handle_image_start(
-        &mut self,
-        request_id: u32,
-        metadata: ImageMetadata,
-    ) -> Result<(), ClientError> {
-        self.client.start_image(request_id, metadata)
-    }
-
-    fn handle_image_chunk(
-        &mut self,
-        request_id: u32,
-        image_id: u32,
-        data: &[u8],
-    ) -> Result<(), ClientError> {
-        self.client.push_image_chunk(request_id, image_id, data)
-    }
-
-    fn handle_image_end(&mut self, request_id: u32, image_id: u32) -> Result<(), ClientError> {
-        let (metadata, data) = self.client.finish_image(request_id, image_id)?;
-        let rendered = RenderedImage::new_placeholder(metadata, Arc::from(data));
-        self.push_image(rendered);
-        Ok(())
+        self.client.drop_request(request_id);
     }
 }
 
@@ -2200,7 +2174,6 @@ mod tests {
         assert!(app.history_scroll.follow_output);
         assert!(app.active.is_empty(), "active not cleared");
         assert!(app.client.in_progress.is_empty(), "in_progress not cleared");
-        // pending_images is replaced with ImageAssembler::new(), which is always empty.
     }
 
     // ── image job lifecycle ──

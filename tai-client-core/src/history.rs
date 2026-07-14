@@ -1,7 +1,6 @@
-use crate::error::ClientError;
-use crate::{FileDiff, ImageAssembler};
+use crate::FileDiff;
 use std::collections::HashMap;
-use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
+use tai_proto::{OutputStream, SessionMessage};
 use tracing::{debug, info, trace};
 
 pub const MAX_HISTORY_ITEMS: usize = 500;
@@ -44,7 +43,6 @@ pub enum HistoryItem<TImage> {
 pub struct ClientHistory<TImage> {
     pub history: Vec<HistoryItem<TImage>>,
     pub in_progress: HashMap<u32, usize>,
-    pub pending_images: ImageAssembler,
 }
 
 impl<TImage> ClientHistory<TImage> {
@@ -52,7 +50,6 @@ impl<TImage> ClientHistory<TImage> {
         Self {
             history,
             in_progress: HashMap::new(),
-            pending_images: ImageAssembler::new(),
         }
     }
 
@@ -124,32 +121,6 @@ impl<TImage> ClientHistory<TImage> {
     pub fn finalize_stream(&mut self, request_id: u32) {
         trace!("finalize stream for request {request_id}");
         self.in_progress.remove(&request_id);
-        self.pending_images.drop_request(request_id);
-    }
-
-    pub fn start_image(
-        &mut self,
-        request_id: u32,
-        metadata: ImageMetadata,
-    ) -> Result<(), ClientError> {
-        self.pending_images.start(request_id, metadata)
-    }
-
-    pub fn push_image_chunk(
-        &mut self,
-        request_id: u32,
-        image_id: u32,
-        data: &[u8],
-    ) -> Result<(), ClientError> {
-        self.pending_images.push_chunk(request_id, image_id, data)
-    }
-
-    pub fn finish_image(
-        &mut self,
-        request_id: u32,
-        image_id: u32,
-    ) -> Result<(ImageMetadata, Vec<u8>), ClientError> {
-        self.pending_images.finish(request_id, image_id)
     }
 
     pub fn drop_request(&mut self, request_id: u32) {
