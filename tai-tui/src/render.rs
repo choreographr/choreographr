@@ -675,7 +675,11 @@ fn render_item_session_message(
     content_width: u16,
     assistant_content_width: u16,
 ) {
-    if matches!(message, SessionMessage::AssistantText { .. }) {
+    let is_assistant = matches!(
+        message,
+        SessionMessage::AssistantText { .. } | SessionMessage::AssistantToolUse { .. }
+    );
+    if is_assistant {
         let lines = cached_or_compute_lines(cache, idx, assistant_content_width, || {
             session_message_lines(message, assistant_content_width)
         });

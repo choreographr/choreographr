@@ -124,7 +124,24 @@ impl<TImage> ClientHistory<TImage> {
     }
 
     pub fn drop_request(&mut self, request_id: u32) {
+        // Save the index before calling finalize_stream so we can also remove
+        // the streaming item from history — this prevents a stale duplicate
+        // when the daemon later sends a SessionMessageAppended for the same
+        // content (AssistantText, ToolResult, etc.) after Done.
+        let index = self.in_progress.get(&request_id).copied();
         self.finalize_stream(request_id);
+        if let Some(index) = index
+            && index < self.history.len()
+        {
+            self.history.remove(index);
+            // Slide back any other in-progress entries that pointed past
+            // the removed streaming item.
+            for other in self.in_progress.values_mut() {
+                if *other > index {
+                    *other -= 1;
+                }
+            }
+        }
     }
 
     fn trim_history(&mut self) {
@@ -137,11 +154,17 @@ impl<TImage> ClientHistory<TImage> {
             self.history.len()
         );
         self.history.drain(0..excess);
-        for index in self.in_progress.values_mut() {
-            *index = index.saturating_sub(excess);
-        }
-        self.in_progress
-            .retain(|_, index| *index < self.history.len());
+        // Remove any in-progress entries whose streaming items were in the
+        // drained range, and shift the rest down by `excess`.
+        self.in_progress.retain(|_, index| {
+            if *index < excess {
+                // Streaming item was at an index that got drained — drop the
+                // tracking entry so we don't point to a different item.
+                return false;
+            }
+            *index -= excess;
+            *index < self.history.len()
+        });
     }
 }
 

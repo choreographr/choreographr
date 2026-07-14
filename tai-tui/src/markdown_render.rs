@@ -125,18 +125,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             reasoning,
             ..
         } => {
-            let mut lines = vec![Line::from(Span::styled(
-                format!(
-                    "tool-call: {}",
-                    humfmt::list(
-                        &tool_calls
-                            .iter()
-                            .map(|call| format!("{}({})", call.name, call.arguments_json))
-                            .collect::<Vec<_>>(),
-                    )
-                ),
-                Style::default().fg(Color::Yellow),
-            ))];
+            let mut lines = Vec::new();
             if let Some(reasoning_text) = reasoning
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
@@ -156,6 +145,18 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
                     Color::Cyan,
                 );
             }
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "tool-call: {}",
+                    humfmt::list(
+                        &tool_calls
+                            .iter()
+                            .map(|call| format!("{}({})", call.name, call.arguments_json))
+                            .collect::<Vec<_>>(),
+                    )
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
             lines
         }
         SessionMessage::ToolResult {
