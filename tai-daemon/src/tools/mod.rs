@@ -790,7 +790,7 @@ pub(crate) fn sha256_hex(content: &str) -> String {
 }
 
 pub(crate) fn truncate_tool_output(content: &str) -> String {
-    const MAX_TOOL_OUTPUT_CHARS: usize = 16 * 1024;
+    const MAX_TOOL_OUTPUT_CHARS: usize = 64 * 1024;
     if content.chars().count() <= MAX_TOOL_OUTPUT_CHARS {
         return content.to_string();
     }
