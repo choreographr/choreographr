@@ -1,11 +1,11 @@
 use super::{ToolError, truncate_tool_output};
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
-use ignore::Walk;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
+use zlob::{ZlobFlags, ZlobPattern};
 
 /// Default result limit when the caller doesn't specify one.
 const DEFAULT_MAX_RESULTS: u32 = 50;
@@ -30,7 +30,7 @@ pub struct GrepArgs {
 }
 
 /// Stateless, zero-sized tool that searches file contents using the
-/// ripgrep ecosystem (grep-regex + grep-searcher + ignore).
+/// ripgrep ecosystem (grep-regex + grep-searcher).
 ///
 /// Respects `.gitignore`, hidden files, and binary files by default.
 pub struct Grep;
@@ -53,18 +53,11 @@ pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<
             .map_err(|e| ToolError::Other(format!("invalid pattern: {e}")))?
     };
 
-    // Optionally build a GlobSet from the `include` filter so we can
-    // skip files that don't match the caller's path constraint.
-    let glob_set: Option<GlobSet> = if let Some(ref include) = args.include {
-        let mut builder = GlobSetBuilder::new();
-        builder.add(
-            Glob::new(include)
-                .map_err(|e| ToolError::Other(format!("invalid include glob: {e}")))?,
-        );
+    // Optionally compile an include glob pattern for file filtering.
+    let include_pattern: Option<ZlobPattern> = if let Some(ref include) = args.include {
         Some(
-            builder
-                .build()
-                .map_err(|e| ToolError::Other(format!("invalid glob set: {e}")))?,
+            ZlobPattern::compile(include, ZlobFlags::empty())
+                .map_err(|e| ToolError::Other(format!("invalid include glob: {e}")))?,
         )
     } else {
         None
@@ -76,10 +69,6 @@ pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<
         .max_results
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, MAX_RESULTS_CAP) as usize;
-
-    // Walk the directory tree with .gitignore-aware traversal. By default
-    // ignore::Walk also skips hidden files and respects ignore rules.
-    let walk = Walk::new(&resolved);
 
     // Shared sink collects matches across all visited files. The
     // `current_path` field is updated before each file so the sink
@@ -94,48 +83,54 @@ pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<
 
     let mut searcher = SearcherBuilder::new().build();
 
-    for entry in walk {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                // Per-entry walk errors (permissions, broken symlinks, etc.)
-                // are logged but do not abort the entire search.
-                tracing::warn!(error = %e, "grep walk error, skipping entry");
-                continue;
+    // Walk the directory tree with gitignore-aware traversal.
+    // WalkFlags::RECOMMENDED skips hidden files and respects .gitignore rules.
+    WalkBuilder::new(&resolved)
+        .map_err(|e| ToolError::Other(format!("failed to create walker: {e}")))?
+        .options(WalkFlags::RECOMMENDED)
+        .run_serial(|entry| {
+            // Skip non-file entries (directories, symlinks, etc.)
+            if !entry.is_file() {
+                return WalkState::Continue;
             }
-        };
 
-        // Skip non-file entries (directories, symlinks, etc.)
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
+            // Apply the include glob filter if one was configured.
+            // zlob uses POSIX-compatible matching: `*` does not match `/`,
+            // so use `**/*.rs` for recursive matching.
+            if let Some(ref pat) = include_pattern
+                && !pat.matches_default(entry.path().to_string_lossy().as_ref())
+            {
+                return WalkState::Continue;
+            }
 
-        // Apply the include glob filter if one was configured
-        if let Some(ref gs) = glob_set
-            && !gs.is_match(entry.path())
-        {
-            continue;
-        }
+            // Tell the sink which file we're about to search so it can
+            // attach the path to any matches it collects.
+            sink.current_path = entry.path().to_path_buf();
 
-        // Tell the sink which file we're about to search so it can
-        // attach the path to any matches it collects.
-        sink.current_path = entry.path().to_path_buf();
+            // Search the file. Individual read errors are non-fatal — we log
+            // and continue to the next file.
+            if let Err(e) = searcher.search_path(&matcher, entry.path(), &mut sink) {
+                tracing::debug!(
+                    path = %entry.path().display(),
+                    error = %e,
+                    "grep search error on file, skipping"
+                );
+            }
 
-        // Search the file. Individual read errors are non-fatal — we log
-        // and continue to the next file.
-        if let Err(e) = searcher.search_path(&matcher, entry.path(), &mut sink) {
-            tracing::debug!(
-                path = %entry.path().display(),
-                error = %e,
-                "grep search error on file, skipping"
-            );
-        }
-
-        // Stop early once we've accumulated enough results
-        if sink.done {
-            break;
-        }
-    }
+            // Stop early once we've accumulated enough results
+            if sink.done {
+                WalkState::Quit
+            } else {
+                WalkState::Continue
+            }
+        })
+        .map_err(|e| {
+            // zlob's walker skips per-entry I/O errors internally (permission
+            // denied, broken symlinks, etc.) — only truly fatal errors surface
+            // here (e.g. root-dir missing, OOM).
+            tracing::warn!(error = %e, "grep walk aborted due to fatal error");
+            ToolError::Other(format!("walk error: {e}"))
+        })?;
 
     if sink.results.is_empty() {
         return Ok(String::new());

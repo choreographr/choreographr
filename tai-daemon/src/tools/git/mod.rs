@@ -9,6 +9,7 @@ use gix::{
 use std::{fmt::Write as _, io, path::Path};
 
 use super::ToolError;
+use zlob::{ZlobFlags, ZlobPattern};
 
 mod commit;
 mod diff;
@@ -191,36 +192,14 @@ pub(crate) fn pathspec_matches(pathspec: &[String], path: &str) -> bool {
 }
 
 pub(crate) fn simple_glob_matches(pattern: &str, text: &str) -> bool {
-    if !pattern.contains('*') {
+    // Early-out for patterns without glob wildcards — these are handled by
+    // the exact-match and prefix-match checks in pathspec_matches.
+    if !zlob::has_wildcards(pattern, ZlobFlags::empty()) {
         return false;
     }
-    let parts = pattern.split('*').collect::<Vec<_>>();
-    let mut rest = text;
-    let mut first = true;
-    for (index, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if first && !pattern.starts_with('*') {
-            if let Some(stripped) = rest.strip_prefix(part) {
-                rest = stripped;
-            } else {
-                return false;
-            }
-            first = false;
-            continue;
-        }
-        if index == parts.len() - 1 && !pattern.ends_with('*') {
-            return rest.ends_with(part);
-        }
-        if let Some(found) = rest.find(part) {
-            rest = &rest[(found + part.len())..];
-        } else {
-            return false;
-        }
-        first = false;
-    }
-    true
+    ZlobPattern::compile(pattern, ZlobFlags::empty())
+        .map(|p| p.matches_default(text))
+        .unwrap_or(false)
 }
 
 pub(crate) fn format_tree_index_change(change: &gix::diff::index::Change) -> String {

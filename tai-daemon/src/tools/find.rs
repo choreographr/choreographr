@@ -1,9 +1,9 @@
 use super::{ToolError, truncate_tool_output};
-use globset::Glob;
-use ignore::Walk;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
+use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
+use zlob::{ZlobFlags, ZlobPattern};
 
 /// Default result limit when the caller doesn't specify one.
 const DEFAULT_MAX_RESULTS: u32 = 50;
@@ -28,8 +28,8 @@ pub struct FindArgs {
 /// Stateless, zero-sized tool that finds files and directories by name.
 ///
 /// Supports case-insensitive substring matching (default) and glob-based
-/// pattern matching. Respects `.gitignore` and hidden files via the `ignore`
-/// crate's `Walk` traversal.
+/// pattern matching. Respects `.gitignore` and hidden files via zlob's
+/// gitignore-aware walker.
 pub struct Find;
 
 pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
@@ -39,11 +39,10 @@ pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<
 
     // Build an optional glob matcher when the caller wants glob matching.
     // For substring mode we don't need a matcher — we do simple contains().
-    let glob_matcher: Option<globset::GlobMatcher> = if args.glob {
+    let glob_matcher: Option<ZlobPattern> = if args.glob {
         Some(
-            Glob::new(&args.pattern)
-                .map_err(|e| ToolError::Other(format!("invalid glob pattern: {e}")))?
-                .compile_matcher(),
+            ZlobPattern::compile(&args.pattern, ZlobFlags::RECOMMENDED)
+                .map_err(|e| ToolError::Other(format!("invalid glob pattern: {e}")))?,
         )
     } else {
         None
@@ -60,63 +59,64 @@ pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, MAX_RESULTS_CAP) as usize;
 
-    // Walk the directory tree with .gitignore-aware traversal.
-    // ignore::Walk skips hidden files and respects ignore rules by default.
-    let walk = Walk::new(&resolved);
-
+    // Walk the directory tree with gitignore-aware traversal.
+    // WalkFlags::RECOMMENDED skips hidden files and respects .gitignore rules.
     let mut results: Vec<String> = Vec::new();
 
-    for entry in walk {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                // Per-entry walk errors (permissions, broken symlinks, etc.)
-                // are logged but do not abort the entire search.
-                tracing::warn!(error = %e, "find walk error, skipping entry");
-                continue;
+    WalkBuilder::new(&resolved)
+        .map_err(|e| ToolError::Other(format!("failed to create walker: {e}")))?
+        .options(WalkFlags::RECOMMENDED)
+        .run_serial(|entry| {
+            // Get the file or directory name for matching against the pattern.
+            // Convert to OsStr → Cow<str> so non-UTF-8 filenames are
+            // handled via replacement characters (like the old ignore crate).
+            let name = entry
+                .path()
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default();
+
+            // Check whether the entry's name matches the search pattern
+            let matched = if let Some(ref matcher) = glob_matcher {
+                // Glob mode: delegate to zlob's compiled matcher
+                matcher.matches_default(&name)
+            } else {
+                // Substring mode: case-insensitive contains check
+                name.to_lowercase().contains(&pattern_lower)
+            };
+
+            if !matched {
+                return WalkState::Continue;
             }
-        };
 
-        // Get the file or directory name for matching against the pattern
-        let name = entry.file_name().to_string_lossy();
+            // Compute the relative path from the search root via zlob's
+            // built-in relative_path() method — avoids a strip_prefix roundtrip.
+            let rel = entry.relative_path().to_string_lossy().to_string();
 
-        // Check whether the entry's name matches the search pattern
-        let matched = if let Some(ref matcher) = glob_matcher {
-            // Glob mode: delegate to globset's compiled matcher
-            matcher.is_match(name.as_ref())
-        } else {
-            // Substring mode: case-insensitive contains check
-            name.to_lowercase().contains(&pattern_lower)
-        };
+            // Append a trailing slash for directories — a visual cue that the
+            // entry is a directory, matching common ls/find conventions.
+            let rel = if entry.is_dir() {
+                format!("{rel}/")
+            } else {
+                rel
+            };
 
-        if !matched {
-            continue;
-        }
+            results.push(rel);
 
-        // Compute the relative path from the search root so results are
-        // easy to use (e.g. "src/main.rs" instead of "/abs/path/src/main.rs").
-        let rel = entry
-            .path()
-            .strip_prefix(&resolved)
-            .unwrap_or(entry.path())
-            .to_string_lossy()
-            .to_string();
-
-        // Append a trailing slash for directories — a visual cue that the
-        // entry is a directory, matching common ls/find conventions.
-        let rel = if entry.file_type().is_some_and(|t| t.is_dir()) {
-            format!("{rel}/")
-        } else {
-            rel
-        };
-
-        results.push(rel);
-
-        // Stop early once we've accumulated enough results
-        if results.len() >= max_results {
-            break;
-        }
-    }
+            // Stop early once we've accumulated enough results
+            if results.len() >= max_results {
+                WalkState::Quit
+            } else {
+                WalkState::Continue
+            }
+        })
+        .map_err(|e| {
+            // zlob's walker skips per-entry I/O errors internally (permission
+            // denied, broken symlinks, etc.) — only truly fatal errors surface
+            // here (e.g. root-dir missing, OOM).
+            tracing::warn!(error = %e, "find walk aborted due to fatal error");
+            ToolError::Other(format!("walk error: {e}"))
+        })?;
 
     if results.is_empty() {
         return Ok(String::new());
