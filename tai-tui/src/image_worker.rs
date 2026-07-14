@@ -1,10 +1,10 @@
+use crossbeam::channel;
 use image::{DynamicImage, RgbaImage, load_from_memory};
 use ratatui::layout::Size;
 use ratatui_image::{Resize, ResizeEncodeRender, picker::Picker, protocol::StatefulProtocol};
 use resvg::{tiny_skia, usvg};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::thread;
 use tai_proto::ImageMetadata;
 
@@ -33,8 +33,8 @@ pub struct ImageResult {
 }
 
 pub struct ImageWorker {
-    pub job_tx: mpsc::Sender<ImageJob>,
-    pub result_rx: mpsc::Receiver<ImageResult>,
+    pub job_tx: channel::Sender<ImageJob>,
+    pub result_rx: channel::Receiver<ImageResult>,
     pub handle: thread::JoinHandle<()>,
 }
 
@@ -50,8 +50,8 @@ impl ImageWorker {
     /// The worker owns a clone of `picker` and uses it to create and encode
     /// terminal protocols from raw image bytes.
     pub fn spawn(picker: Picker) -> Self {
-        let (job_tx, job_rx) = mpsc::channel::<ImageJob>();
-        let (result_tx, result_rx) = mpsc::channel::<ImageResult>();
+        let (job_tx, job_rx) = channel::unbounded::<ImageJob>();
+        let (result_tx, result_rx) = channel::unbounded::<ImageResult>();
 
         let handle = thread::spawn(move || {
             loop {
@@ -79,7 +79,7 @@ impl ImageWorker {
 ///
 /// On failure, a result with `protocol: None` is still sent so the caller
 /// can clear `pending_job` and allow a retry on the next frame.
-fn process_job(picker: &Picker, result_tx: &mpsc::Sender<ImageResult>, job: ImageJob) {
+fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: ImageJob) {
     tracing::debug!(
         "[tai-tui] image worker processing job {} ({} {}x{})",
         job.id,
@@ -244,8 +244,8 @@ mod tests {
     #[test]
     fn process_job_sends_result_with_encoded_protocol() {
         let picker = Picker::halfblocks();
-        let (job_tx, job_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
+        let (job_tx, job_rx) = channel::unbounded();
+        let (result_tx, result_rx) = channel::unbounded();
 
         let handle = std::thread::spawn(move || {
             if let Ok(job) = job_rx.recv() {
@@ -283,8 +283,8 @@ mod tests {
     #[test]
     fn process_job_sends_failure_on_corrupt_image() {
         let picker = Picker::halfblocks();
-        let (job_tx, job_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
+        let (job_tx, job_rx) = channel::unbounded();
+        let (result_tx, result_rx) = channel::unbounded();
 
         let handle = std::thread::spawn(move || {
             if let Ok(job) = job_rx.recv() {

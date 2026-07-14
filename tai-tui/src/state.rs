@@ -440,7 +440,7 @@ pub(crate) struct App {
     pub(crate) history_scroll: HistoryScrollState,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
-    pub(crate) image_job_tx: Option<std::sync::mpsc::Sender<ImageJob>>,
+    pub(crate) image_job_tx: Option<crossbeam::channel::Sender<ImageJob>>,
     /// Maps in-flight job IDs to their history index for O(1) result
     /// dispatch.  Entries are inserted when a job is submitted and removed
     /// when the result arrives or the image is trimmed from history.

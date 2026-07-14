@@ -4,17 +4,16 @@ use crate::state::{
     AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, HomeMenuItem, InputBuffer,
     PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent, find_history_item_at_row,
 };
+use crossbeam::channel;
+use crossbeam::select;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
+use mio::unix::pipe;
+use mio::{Events, Interest, Poll, Token};
 use ratatui::{Terminal, backend::CrosstermBackend};
-use signal_hook::consts::SIGINT;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
-use std::{io, time::Duration};
+use std::os::unix::io::AsRawFd;
+use std::{io, thread, time::Duration};
 use tai_client_core::{
     ClientError, ConnectionMode, broken_pipe, build_add_credential_message,
     dispatch_daemon_message, is_valid_account_name, resolve_private_key,
@@ -28,7 +27,6 @@ use tai_tui::{ShellCommand, build_picker, parse_input_line};
 use tui_prompts::State;
 
 const UI_EVENT_CHANNEL_SIZE: usize = 4096;
-const UI_FRAME_POLL_MS: u64 = 16;
 
 pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     tracing::info!("[tai-tui] run_app starting");
@@ -46,7 +44,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     };
     let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
-    let (ui_tx, mut ui_rx) = mpsc::sync_channel::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
+    let (ui_tx, ui_rx) = channel::bounded::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
 
     let picker = build_picker();
 
@@ -55,7 +53,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     let worker = ImageWorker::spawn(picker);
 
     let connection_ui_tx = ui_tx.clone();
-    let connection_task = std::thread::spawn(move || {
+    let connection_task = thread::spawn(move || {
         let result = run_daemon_connection_with_mode(
             mode,
             |message| {
@@ -70,9 +68,6 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         result
     });
 
-    let interrupted = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGINT, Arc::clone(&interrupted)).map_err(io::Error::other)?;
-
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     crossterm::execute!(
@@ -82,6 +77,64 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    // Spawn a background thread that reads terminal events via crossterm and
+    // forwards them through a crossbeam channel so the main loop can block on
+    // all event sources simultaneously via select!.
+    //
+    // The thread uses mio::Poll to wait on TWO file descriptors:
+    //   1. stdin (fd 0) — for crossterm events (keyboard, mouse, resize)
+    //   2. a notification pipe — for clean shutdown signalling
+    //
+    // This is truly event-driven: the thread parks in epoll_wait with no
+    // timeout and zero CPU usage while idle.
+    let (terminal_tx, terminal_rx) = channel::unbounded::<Event>();
+    let (notify_tx, mut notify_rx) = pipe::new()?;
+
+    let mut poll = Poll::new()?;
+    poll.registry()
+        .register(&mut notify_rx, Token(0), Interest::READABLE)?;
+
+    let stdin_fd = io::stdin().as_raw_fd();
+    let mut stdin_source = mio::unix::SourceFd(&stdin_fd);
+    poll.registry()
+        .register(&mut stdin_source, Token(1), Interest::READABLE)?;
+
+    let terminal_handle = thread::spawn(move || {
+        let mut events = Events::with_capacity(2);
+        loop {
+            // Block in epoll_wait until stdin data or shutdown signal.
+            if let Err(e) = poll.poll(&mut events, None) {
+                tracing::warn!("[tai-tui] terminal mio poll error: {e}");
+                break;
+            }
+            for event in &events {
+                match event.token() {
+                    Token(0) => return, // shutdown via pipe
+                    Token(1) => {}      // stdin — drain below
+                    _ => {}
+                }
+            }
+            // Drain all pending crossterm events.  Our mio instance was woken
+            // because stdin is readable; crossterm's own internal mio was also
+            // woken and has already buffered parsed events, so read() will
+            // return immediately without blocking.
+            loop {
+                match event::poll(Duration::ZERO) {
+                    Ok(true) => match event::read() {
+                        Ok(ev) => {
+                            if terminal_tx.send(ev).is_err() {
+                                return;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                    Ok(false) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+    });
 
     let mut app = App::new(app_socket_path);
     app.image_job_tx = Some(worker.job_tx);
@@ -95,9 +148,9 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         &mut terminal,
         &mut app,
         &client_tx,
-        &mut ui_rx,
+        &ui_rx,
         worker.result_rx,
-        &interrupted,
+        &terminal_rx,
     )
     .map_err(io::Error::from);
 
@@ -107,6 +160,13 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 
     let _ = shutdown_tx.send(());
     drop(client_tx);
+
+    // Signal the terminal thread to stop by closing the notification pipe,
+    // then wait for it to exit.  This must happen *before* disable_raw_mode
+    // so the thread isn't still blocked in crossterm when we restore the
+    // terminal.
+    drop(notify_tx);
+    let _ = terminal_handle.join();
 
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
@@ -133,40 +193,93 @@ pub(crate) fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
-    ui_rx: &mut mpsc::Receiver<UiEvent>,
-    image_result_rx: mpsc::Receiver<ImageResult>,
-    interrupted: &AtomicBool,
+    ui_rx: &channel::Receiver<UiEvent>,
+    image_result_rx: channel::Receiver<ImageResult>,
+    terminal_rx: &channel::Receiver<Event>,
 ) -> Result<(), ClientError> {
+    // Render the initial frame immediately so the user sees the UI before
+    // any events arrive (the select! below would otherwise block forever).
+    app.update_viewport_from_terminal_size();
+    app.clamp_scroll_state();
+    terminal.draw(|frame| render(frame, app))?;
+    if app.fullscreen_image_idx.is_none() {
+        terminal.show_cursor()?;
+    }
+    if app.page == Page::Chat && app.attached_session_id.is_some() {
+        terminal_progress::update_terminal_progress(
+            app.attached_last_prompt_tokens,
+            app.attached_context_window,
+        );
+    }
+
+    let mut dirty = false;
+
     while !app.should_quit {
-        if interrupted.load(Ordering::Relaxed) {
-            app.push_text("interrupt received");
-            app.should_quit = true;
-            break;
-        }
-
-        // Drain *all* pending crossterm events before processing UI messages
-        // and rendering.
-        while let Ok(true) = event::poll(Duration::from_millis(0)) {
-            handle_terminal_event(event::read()?, app, client_tx)?;
-        }
-
-        // Drain daemon messages.
-        while let Ok(message) = ui_rx.try_recv() {
-            match message {
-                UiEvent::Daemon(message) => {
-                    handle_daemon_message(message, app, client_tx)?;
+        // Wait for an event from any source.  The thread is blocked in the
+        // kernel here — zero CPU usage while idle.
+        select! {
+            recv(terminal_rx) -> msg => {
+                if let Ok(event) = msg {
+                    handle_terminal_event(event, app, client_tx)?;
+                    dirty = true;
                 }
-                UiEvent::ReaderClosed => {
-                    app.push_text("daemon connection closed");
-                    app.should_quit = true;
+            }
+            recv(ui_rx) -> msg => {
+                match msg {
+                    Ok(event) => {
+                        if handle_ui_event(event, app, client_tx)? {
+                            dirty = true;
+                        }
+                    }
+                    Err(_) => {
+                        // Daemon channel disconnected — treat as closed.
+                        app.should_quit = true;
+                    }
+                }
+            }
+            recv(image_result_rx) -> msg => {
+                if let Ok(result) = msg {
+                    app.apply_image_result(result);
+                    dirty = true;
                 }
             }
         }
 
-        // Drain completed image encoding results.
-        while let Ok(result) = image_result_rx.try_recv() {
-            app.apply_image_result(result);
+        // Drain all remaining events from every channel before rendering
+        // so that a burst (e.g. fast touchpad scrolling) is consumed in a
+        // single batch and triggers only one repaint.
+        loop {
+            let mut progress = false;
+
+            while let Ok(event) = terminal_rx.try_recv() {
+                handle_terminal_event(event, app, client_tx)?;
+                progress = true;
+                dirty = true;
+            }
+            while let Ok(msg) = ui_rx.try_recv() {
+                progress = true;
+                if handle_ui_event(msg, app, client_tx)? {
+                    dirty = true;
+                }
+            }
+            while let Ok(result) = image_result_rx.try_recv() {
+                app.apply_image_result(result);
+                progress = true;
+                dirty = true;
+            }
+
+            // If none of the channels had anything new the drain is
+            // complete and we can proceed to render.
+            if !progress {
+                break;
+            }
         }
+
+        // Skip rendering entirely when nothing has changed.
+        if !dirty {
+            continue;
+        }
+        dirty = false;
 
         // Consume the frame's accumulated scroll delta in one batch.
         app.apply_scroll_delta();
@@ -201,10 +314,6 @@ pub(crate) fn run_ui_loop(
                 terminal_progress::update_terminal_progress(None, None);
             }
         }
-
-        // Block for up to ~60 Hz to pace the frame rate without
-        // busy-waiting.
-        let _ = event::poll(Duration::from_millis(UI_FRAME_POLL_MS))?;
     }
 
     Ok(())
@@ -950,6 +1059,28 @@ fn submit_new_account(
 
     app.ai_providers.leave_new_form();
     Ok(())
+}
+
+/// Process a single UiEvent and return whether the event was meaningful
+/// (i.e., not a control-flow event like ReaderClosed).
+///
+/// Returns `Ok(true)` when the event warrants a re-render, `Ok(false)` for
+/// control flow events, or `Err` on error.
+fn handle_ui_event(
+    event: UiEvent,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<bool, ClientError> {
+    match event {
+        UiEvent::Daemon(message) => {
+            handle_daemon_message(message, app, client_tx)?;
+            Ok(true)
+        }
+        UiEvent::ReaderClosed => {
+            app.should_quit = true;
+            Ok(false)
+        }
+    }
 }
 
 pub(crate) fn handle_daemon_message(

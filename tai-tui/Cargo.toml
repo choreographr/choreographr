@@ -26,8 +26,9 @@ tai-proto.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 lru.workspace = true
-signal-hook.workspace = true
 chrono.workspace = true
+crossbeam = "0.8"
+mio = { version = "1.2", features = ["os-ext"] }
 tui-prompts = "0.6"
 humfmt.workspace = true
 
