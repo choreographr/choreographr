@@ -4,15 +4,15 @@ use crate::markdown_render::{
 };
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache,
-    STATUS_BAR_HEIGHT, SessionManagerView, history_text_height,
+    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT,
+    Page, RenderedCache, STATUS_BAR_HEIGHT, SessionManagerView, history_text_height,
 };
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
 };
 use ratatui_image::StatefulImage;
 use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
@@ -22,18 +22,46 @@ use tui_prompts::{
     Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
 };
 
-pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
+/// Terminal dimensions for the chat history page, excluding the input bar
+/// and status bar at the bottom. Returns `None` when the terminal is too
+/// small for the history area to be meaningful.
+fn history_area() -> Option<(u16, u16)> {
     let Ok((width, height)) = crossterm::terminal::size() else {
-        return false;
+        return None;
     };
-
     let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT;
-    if width == 0 || height == 0 || height <= bottom_height {
-        return false;
+    if width < 2 || height <= bottom_height {
+        return None;
     }
+    Some((width, height.saturating_sub(bottom_height)))
+}
 
-    let history_height = height.saturating_sub(bottom_height);
-    column < width && row < history_height
+pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
+    let (width, history_height) = match history_area() {
+        Some(v) => v,
+        None => return false,
+    };
+    // Exclude the 1-column scrollbar on the right
+    column < width.saturating_sub(1) && row < history_height
+}
+
+/// Returns `true` when the mouse position falls in the scrollbar column
+/// on the chat history page.
+pub(crate) fn mouse_in_scrollbar_column(column: u16, row: u16) -> bool {
+    let (width, history_height) = match history_area() {
+        Some(v) => v,
+        None => return false,
+    };
+    column == width.saturating_sub(1) && row < history_height
+}
+
+/// Build a `Scrollbar` widget with the shared style used across all list views.
+fn vertical_scrollbar() -> Scrollbar<'static> {
+    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .thumb_symbol("░")
+        .track_symbol(None)
+        .begin_symbol(None)
+        .end_symbol(None)
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -227,7 +255,31 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(frame.area());
 
-    render_history(frame, chunks[0], app);
+    // Reserve 1 column on the right for the scrollbar
+    let history_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(chunks[0]);
+
+    render_history(frame, history_chunks[0], app);
+
+    // ── Scrollbar ────────────────────────────────────────────
+    let total_height = app.total_history_height();
+    let viewport_height = app.history_viewport.height as usize;
+    if total_height > viewport_height {
+        // Our effective_scroll is 0 at the bottom (auto-follow), but
+        // ScrollbarState expects position=0 at the top, so we invert.
+        let position = app
+            .max_scroll_offset()
+            .saturating_sub(app.effective_scroll());
+        frame.render_stateful_widget(
+            vertical_scrollbar(),
+            history_chunks[1],
+            &mut ScrollbarState::new(total_height)
+                .position(position)
+                .viewport_content_length(viewport_height),
+        );
+    }
 
     // ── Command input box ──────────────────────────────────────
     let input = Paragraph::new(app.input.as_str())
@@ -795,8 +847,15 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     let inner = block.inner(chunks[0]);
     frame.render_widget(block, chunks[0]);
 
+    // Reserve 1 column on the right for the scrollbar
+    let list_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
     let scroll = app.session_mgr.scroll;
-    let max_rows = inner.height as usize;
+    let max_rows = list_chunks[0].height as usize;
+    let total_items = app.session_mgr.sessions.len();
 
     // Show error message if one is set (e.g. daemon locked when creating).
     if let Some(ref err) = app.session_mgr.error {
@@ -804,20 +863,20 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         let err_text = format!("Error: {err}");
         let err_para = Paragraph::new(Line::from(Span::styled(err_text, err_style)));
         let err_area = Rect {
-            x: inner.x + 1,
-            y: inner.y + 1,
-            width: inner.width.saturating_sub(2),
+            x: list_chunks[0].x + 1,
+            y: list_chunks[0].y + 1,
+            width: list_chunks[0].width.saturating_sub(2),
             height: 1,
         };
         frame.render_widget(err_para, err_area);
     }
 
-    if app.session_mgr.sessions.is_empty() {
+    if total_items == 0 {
         let msg = Paragraph::new("No sessions. Press 'n' to create one.");
-        frame.render_widget(msg, inner);
+        frame.render_widget(msg, list_chunks[0]);
     } else {
         let mut lines: Vec<Line> = Vec::new();
-        for i in scroll..app.session_mgr.sessions.len() {
+        for i in scroll..total_items {
             if lines.len() >= max_rows {
                 break;
             }
@@ -871,7 +930,18 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         }
 
         let paragraph = Paragraph::new(lines);
-        frame.render_widget(paragraph, inner);
+        frame.render_widget(paragraph, list_chunks[0]);
+    }
+
+    // ── Scrollbar ────────────────────────────────────────────
+    if total_items > max_rows {
+        frame.render_stateful_widget(
+            vertical_scrollbar(),
+            list_chunks[1],
+            &mut ScrollbarState::new(total_items)
+                .position(scroll)
+                .viewport_content_length(max_rows),
+        );
     }
 
     let status = if let Some((_id, title)) = &app.session_mgr.confirm_delete {
@@ -879,7 +949,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         Paragraph::new(Line::from(format!(
             " <j/k nav>  <Enter switch>  <i details>  <n new>  <d delete>  <Esc back>  —  {} sessions",
-            app.session_mgr.sessions.len()
+            total_items
         )))
     };
     frame.render_widget(status, chunks[1]);
@@ -1019,16 +1089,23 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
     let inner = block.inner(chunks[0]);
     frame.render_widget(block, chunks[0]);
 
-    let scroll = app.ai_providers.scroll;
-    let max_rows = inner.height as usize;
+    // Reserve 1 column on the right for the scrollbar
+    let list_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
 
-    if app.ai_providers.accounts.is_empty() {
+    let scroll = app.ai_providers.scroll;
+    let max_rows = list_chunks[0].height as usize;
+    let total_items = app.ai_providers.accounts.len();
+
+    if total_items == 0 {
         let msg = Paragraph::new("No AI provider accounts configured. Press 'n' to add one.");
-        frame.render_widget(msg, inner);
+        frame.render_widget(msg, list_chunks[0]);
     } else {
         let mut lines: Vec<Line> = Vec::new();
 
-        for i in scroll..app.ai_providers.accounts.len() {
+        for i in scroll..total_items {
             // Each account takes 3 lines (name + provider + credential).
             // If we would exceed the available rows, stop.
             if lines.len() + 3 > max_rows && i != scroll {
@@ -1080,13 +1157,27 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
             )]));
 
             // Blank line separator between cards (but not after the last one)
-            if lines.len() < max_rows && i + 1 < app.ai_providers.accounts.len() {
+            if lines.len() < max_rows && i + 1 < total_items {
                 lines.push(Line::from(Span::styled(String::new(), Style::default())));
             }
         }
 
         let paragraph = Paragraph::new(lines);
-        frame.render_widget(paragraph, inner);
+        frame.render_widget(paragraph, list_chunks[0]);
+    }
+
+    // ── Scrollbar ────────────────────────────────────────────
+    // Each account entry takes AI_PROVIDER_ITEM_LINES terminal rows, so the
+    // number of items visible at once is max_rows / AI_PROVIDER_ITEM_LINES.
+    let items_per_page = (max_rows / AI_PROVIDER_ITEM_LINES).max(1);
+    if total_items > items_per_page {
+        frame.render_stateful_widget(
+            vertical_scrollbar(),
+            list_chunks[1],
+            &mut ScrollbarState::new(total_items)
+                .position(scroll)
+                .viewport_content_length(items_per_page),
+        );
     }
 
     let status = if let Some(ref name) = app.ai_providers.confirm_remove {
@@ -1094,7 +1185,7 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         Paragraph::new(Line::from(format!(
             " <j/k nav>  <r remove>  <c credential>  <n new>  <Esc back>  —  {} accounts",
-            app.ai_providers.accounts.len()
+            total_items
         )))
     };
     frame.render_widget(status, chunks[1]);

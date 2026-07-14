@@ -1,4 +1,4 @@
-use crate::render::{mouse_in_history_box, render};
+use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
     AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, HomeMenuItem, InputBuffer,
@@ -508,6 +508,20 @@ fn handle_chat_event(
                 _ => {}
             }
         }
+        // Left-click in the scrollbar column jumps to that position.
+        Event::Mouse(mouse) if mouse_in_scrollbar_column(mouse.column, mouse.row) => {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let track_height = app.history_viewport.height;
+                if track_height > 1 {
+                    let max_scroll = app.max_scroll_offset();
+                    let ratio = (mouse.row as f64) / (track_height.saturating_sub(1) as f64);
+                    let target = (ratio * max_scroll as f64).round() as usize;
+                    // ScrollbarState position is 0 at the top, but our
+                    // effective_scroll is 0 at the bottom, so invert.
+                    app.scroll_to(max_scroll.saturating_sub(target.min(max_scroll)));
+                }
+            }
+        }
         Event::Mouse(_) => {}
         _ => {}
     }
@@ -566,6 +580,12 @@ fn handle_session_list_key(
         }
         KeyCode::Up | KeyCode::Char('k') => app.session_mgr.select_up(),
         KeyCode::Down | KeyCode::Char('j') => app.session_mgr.select_down(),
+        KeyCode::PageUp => {
+            app.session_mgr.scroll_up_page();
+        }
+        KeyCode::PageDown => {
+            app.session_mgr.scroll_down_page();
+        }
         KeyCode::Enter => {
             if let Some(sel) = app.session_mgr.selection
                 && let Some(session) = app.session_mgr.sessions.get(sel)
@@ -694,6 +714,12 @@ fn handle_ai_providers_list_key(
         }
         KeyCode::Up | KeyCode::Char('k') => app.ai_providers.select_up(),
         KeyCode::Down | KeyCode::Char('j') => app.ai_providers.select_down(),
+        KeyCode::PageUp => {
+            app.ai_providers.scroll_up_page();
+        }
+        KeyCode::PageDown => {
+            app.ai_providers.scroll_down_page();
+        }
 
         // Remove account (with confirmation)
         KeyCode::Char('r') => {

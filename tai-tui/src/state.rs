@@ -37,6 +37,10 @@ pub(crate) const INPUT_BAR_HEIGHT: u16 = 3;
 pub(crate) const STATUS_BAR_HEIGHT: u16 = 2;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
+/// Number of terminal lines occupied by one AI provider account entry in the
+/// list view (3 content lines + 1 blank separator).
+pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
+
 /// A menu item on the Home page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HomeMenuItem {
@@ -303,6 +307,17 @@ impl AIProvidersState {
         let sel = self.selection.unwrap_or(0);
         if sel < max {
             self.selection = Some(sel + 1);
+        }
+    }
+
+    pub(crate) fn scroll_up_page(&mut self) {
+        self.scroll = self.scroll.saturating_sub(1);
+    }
+
+    pub(crate) fn scroll_down_page(&mut self) {
+        if !self.accounts.is_empty() {
+            let max_scroll = self.accounts.len().saturating_sub(1);
+            self.scroll = (self.scroll + 1).min(max_scroll);
         }
     }
 
@@ -722,6 +737,17 @@ impl SessionManagerState {
         }
     }
 
+    pub(crate) fn scroll_up_page(&mut self) {
+        self.scroll = self.scroll.saturating_sub(PAGE_SCROLL_LINES);
+    }
+
+    pub(crate) fn scroll_down_page(&mut self) {
+        if !self.sessions.is_empty() {
+            let max_scroll = self.sessions.len().saturating_sub(1);
+            self.scroll = (self.scroll + PAGE_SCROLL_LINES).min(max_scroll);
+        }
+    }
+
     pub(crate) fn enter_detail(&mut self) {
         let sel = self.selection;
         let sum = sel.and_then(|i| self.sessions.get(i));
@@ -1136,14 +1162,14 @@ impl App {
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
         let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT;
         if let Ok((width, height)) = crossterm::terminal::size()
-            && width > 0
+            && width > 1
             && height > bottom_height
         {
             let old_width = self.history_viewport.width;
             self.history_viewport.update(Rect {
                 x: 0,
                 y: 0,
-                width,
+                width: width - 1,
                 height: height - bottom_height,
             });
             // All cached entries were computed at the old width and are
@@ -1454,6 +1480,15 @@ impl App {
     pub(crate) fn scroll_down(&mut self, amount: usize) {
         self.history_scroll
             .scroll_down(amount, self.max_scroll_offset());
+    }
+
+    /// Jump directly to a specific scroll row (used by scrollbar clicks).
+    pub(crate) fn scroll_to(&mut self, row: usize) {
+        let max_scroll = self.max_scroll_offset();
+        let amount = row.min(max_scroll);
+        self.history_scroll.scroll = amount;
+        self.history_scroll.scroll_compensation = 0;
+        self.history_scroll.follow_output = amount == 0;
     }
 
     /// Consume the frame-accumulated scroll delta and apply it as a
@@ -2425,6 +2460,165 @@ mod tests {
             app.pending_job_idx.is_empty(),
             "pending_job_idx should be cleared on session switch"
         );
+    }
+
+    // ── scroll_to ──
+
+    #[test]
+    fn scroll_to_sets_scroll_and_disables_follow() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        for i in 0..10 {
+            app.push_text(format!("line {i}"));
+        }
+
+        let max_scroll = app.max_scroll_offset();
+        assert!(max_scroll > 0, "should have scrollable content");
+
+        app.scroll_to(max_scroll);
+        assert_eq!(app.history_scroll.scroll, max_scroll);
+        assert_eq!(app.history_scroll.scroll_compensation, 0);
+        assert!(!app.history_scroll.follow_output);
+    }
+
+    #[test]
+    fn scroll_to_zero_enables_follow() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        app.push_text("hello");
+        app.scroll_to(0);
+        assert!(app.history_scroll.follow_output);
+    }
+
+    #[test]
+    fn scroll_to_clamps_to_max() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        app.push_text("hello");
+        let max_scroll = app.max_scroll_offset();
+        app.scroll_to(max_scroll + 100);
+        assert_eq!(app.history_scroll.scroll, max_scroll);
+    }
+
+    // ── SessionManagerState scroll page ──
+
+    #[test]
+    fn session_list_scroll_up_page() {
+        let mut mgr = SessionManagerState::new();
+        mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
+        mgr.scroll = 5;
+
+        mgr.scroll_up_page();
+        assert_eq!(mgr.scroll, 2);
+    }
+
+    #[test]
+    fn session_list_scroll_up_page_clamps_at_zero() {
+        let mut mgr = SessionManagerState::new();
+        mgr.scroll = 1;
+
+        mgr.scroll_up_page();
+        assert_eq!(mgr.scroll, 0);
+    }
+
+    #[test]
+    fn session_list_scroll_down_page() {
+        let mut mgr = SessionManagerState::new();
+        mgr.sessions = vec![
+            make_session(1, "a"),
+            make_session(2, "b"),
+            make_session(3, "c"),
+        ];
+
+        mgr.scroll_down_page();
+        assert_eq!(mgr.scroll, 2);
+    }
+
+    #[test]
+    fn session_list_scroll_down_page_clamps_to_max() {
+        let mut mgr = SessionManagerState::new();
+        mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
+
+        mgr.scroll_down_page();
+        assert_eq!(mgr.scroll, 1);
+    }
+
+    #[test]
+    fn session_list_scroll_down_page_on_empty_list_is_noop() {
+        let mut mgr = SessionManagerState::new();
+        mgr.scroll_down_page();
+        assert_eq!(mgr.scroll, 0);
+    }
+
+    // ── AIProvidersState scroll page ──
+
+    #[test]
+    fn ai_providers_scroll_up_page() {
+        let mut mgr = AIProvidersState::new();
+        mgr.accounts = vec![AccountInfo {
+            name: "a".into(),
+            provider: "o".into(),
+            has_credential: false,
+        }];
+        mgr.scroll = 1;
+
+        mgr.scroll_up_page();
+        assert_eq!(mgr.scroll, 0);
+    }
+
+    #[test]
+    fn ai_providers_scroll_up_page_clamps_at_zero() {
+        let mut mgr = AIProvidersState::new();
+        mgr.scroll = 0;
+
+        mgr.scroll_up_page();
+        assert_eq!(mgr.scroll, 0);
+    }
+
+    #[test]
+    fn ai_providers_scroll_down_page() {
+        let mut mgr = AIProvidersState::new();
+        mgr.accounts = vec![
+            AccountInfo {
+                name: "a".into(),
+                provider: "o".into(),
+                has_credential: false,
+            },
+            AccountInfo {
+                name: "b".into(),
+                provider: "o".into(),
+                has_credential: false,
+            },
+        ];
+
+        mgr.scroll_down_page();
+        assert_eq!(mgr.scroll, 1);
+    }
+
+    #[test]
+    fn ai_providers_scroll_down_page_on_empty_list_is_noop() {
+        let mut mgr = AIProvidersState::new();
+        mgr.scroll_down_page();
+        assert_eq!(mgr.scroll, 0);
+    }
+
+    #[test]
+    fn ai_providers_scroll_down_page_clamps_to_max() {
+        let mut mgr = AIProvidersState::new();
+        mgr.accounts = vec![AccountInfo {
+            name: "a".into(),
+            provider: "o".into(),
+            has_credential: false,
+        }];
+
+        mgr.scroll_down_page();
+        assert_eq!(mgr.scroll, 0); // only 1 item → max_scroll = 0
     }
 
     // ── set_page ──
