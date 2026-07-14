@@ -5,7 +5,7 @@ use crate::markdown_render::{
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
     AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT, Page, RenderedCache,
-    SessionManagerView, history_text_height,
+    STATUS_BAR_HEIGHT, SessionManagerView, history_text_height,
 };
 use ratatui::{
     Frame,
@@ -27,12 +27,12 @@ pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
         return false;
     };
 
-    if width == 0 || height == 0 || height <= 3 {
+    let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT;
+    if width == 0 || height == 0 || height <= bottom_height {
         return false;
     }
 
-    let input_height = 3;
-    let history_height = height.saturating_sub(input_height);
+    let history_height = height.saturating_sub(bottom_height);
     column < width && row < history_height
 }
 
@@ -220,11 +220,16 @@ fn render_home(frame: &mut Frame<'_>, app: &mut App) {
 fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(INPUT_BAR_HEIGHT)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(INPUT_BAR_HEIGHT),
+            Constraint::Length(STATUS_BAR_HEIGHT),
+        ])
         .split(frame.area());
 
     render_history(frame, chunks[0], app);
 
+    // ── Command input box ──────────────────────────────────────
     let input = Paragraph::new(app.input.as_str())
         .block(Block::default().borders(Borders::ALL).title("command"))
         .wrap(Wrap { trim: false });
@@ -235,6 +240,32 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     );
     let cursor_y = chunks[1].y.saturating_add(1);
     frame.set_cursor_position((cursor_x, cursor_y));
+
+    // ── Status bar ────────────────────────────────────────────
+    let status_line = if app.attached_session_id.is_some() {
+        let wd = app.attached_working_dir.as_deref().unwrap_or("-");
+        let provider = app.attached_provider_slug.as_deref().unwrap_or("-");
+        let model = app.attached_model.as_deref().unwrap_or("-");
+        let reasoning = app
+            .attached_reasoning_effort
+            .as_ref()
+            .map(|e| e.as_label())
+            .unwrap_or("-");
+
+        Line::from(vec![
+            Span::styled(wd, Style::default().fg(Color::White)),
+            Span::raw("  |  "),
+            Span::styled(provider, Style::default().fg(Color::White)),
+            Span::raw("  |  "),
+            Span::styled(model, Style::default().fg(Color::White)),
+            Span::raw("  |  "),
+            Span::styled(reasoning, Style::default().fg(Color::White)),
+        ])
+    } else {
+        Line::from("")
+    };
+    let status_bar = Paragraph::new(status_line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
+    frame.render_widget(status_bar, chunks[2]);
 }
 
 fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {

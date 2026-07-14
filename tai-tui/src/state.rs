@@ -34,6 +34,7 @@ fn try_parse_as_diff(text: &str) -> Option<Vec<FileDiff>> {
 }
 
 pub(crate) const INPUT_BAR_HEIGHT: u16 = 3;
+pub(crate) const STATUS_BAR_HEIGHT: u16 = 1;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
 /// A menu item on the Home page.
@@ -430,6 +431,19 @@ pub(crate) struct App {
     /// when the result arrives or the image is trimmed from history.
     pub(crate) pending_job_idx: HashMap<ImageId, usize>,
     pub(crate) attached_session_id: Option<u64>,
+    /// Cached account name for the attached session — populated by
+    /// `handle_session_attached` so the status bar can render without
+    /// iterating the session list each frame.
+    pub(crate) attached_account_name: Option<String>,
+    /// Cached model name for the attached session.
+    pub(crate) attached_model: Option<String>,
+    /// Cached reasoning effort for the attached session.
+    pub(crate) attached_reasoning_effort: Option<ThinkingEffort>,
+    /// Cached provider slug for the attached session, resolved from the
+    /// account name against `ai_providers.accounts`.
+    pub(crate) attached_provider_slug: Option<String>,
+    /// Cached working directory for the attached session.
+    pub(crate) attached_working_dir: Option<String>,
     pub(crate) page: Page,
     /// The page the user was on before opening the Home menu.  `Esc` on the
     /// Home page returns to this page.
@@ -1051,6 +1065,11 @@ impl App {
             image_job_tx: None,
             pending_job_idx: HashMap::new(),
             attached_session_id: None,
+            attached_account_name: None,
+            attached_model: None,
+            attached_reasoning_effort: None,
+            attached_provider_slug: None,
+            attached_working_dir: None,
             page: Page::Chat,
             previous_page: Page::Chat,
             home_selection: 0,
@@ -1109,21 +1128,23 @@ impl App {
     }
 
     /// Query the terminal size and update the history viewport to match,
-    /// reserving `INPUT_BAR_HEIGHT` rows for the input bar.
+    /// reserving `INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT` rows for the input
+    /// bar and the status bar.
     ///
     /// When the width changes, all cached renderings are stale — entries are
     /// invalidated so the next frame recomputes at the new width.
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
+        let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT;
         if let Ok((width, height)) = crossterm::terminal::size()
             && width > 0
-            && height > INPUT_BAR_HEIGHT
+            && height > bottom_height
         {
             let old_width = self.history_viewport.width;
             self.history_viewport.update(Rect {
                 x: 0,
                 y: 0,
                 width,
-                height: height - INPUT_BAR_HEIGHT,
+                height: height - bottom_height,
             });
             // All cached entries were computed at the old width and are
             // now stale — invalidate every entry so the next render
@@ -1583,8 +1604,8 @@ impl App {
     /// Handle `SessionAttached`: record the attached session ID.
     pub(crate) fn handle_session_attached(&mut self, session_id: u64) {
         self.attached_session_id = Some(session_id);
-        // Seed token usage / context window from the session manager data,
-        // so the progress bar has data even before SessionState arrives.
+        // Seed token usage / context window / status-bar data from the
+        // session manager so UI has values even before SessionState arrives.
         if let Some(s) = self
             .session_mgr
             .sessions
@@ -1594,8 +1615,70 @@ impl App {
             self.attached_token_usage = s.token_usage.clone();
             self.attached_context_window = s.context_window;
             self.attached_last_prompt_tokens = s.last_prompt_tokens;
+            self.attached_account_name = s.account_name.clone();
+            self.attached_model = s.selected_model.clone();
+            self.attached_reasoning_effort = s.reasoning_effort;
+            self.attached_working_dir = s.working_dir.clone();
         }
+        self.refresh_attached_provider_slug();
         self.progress_dirty = true;
+    }
+
+    /// Resolve the provider slug for the attached session from the accounts
+    /// list and cache it in `attached_provider_slug`.
+    pub(crate) fn refresh_attached_provider_slug(&mut self) {
+        self.attached_provider_slug = self.attached_account_name.as_ref().and_then(|name| {
+            self.ai_providers
+                .accounts
+                .iter()
+                .find(|a| a.name == *name)
+                .map(|a| a.provider.clone())
+        });
+    }
+
+    /// Shortcut: return a mutable reference to the session-manager entry
+    /// for the currently-attached session, if any.
+    fn attached_session_mut(&mut self) -> Option<&mut SessionSummary> {
+        self.session_mgr
+            .sessions
+            .iter_mut()
+            .find(|s| Some(s.session_id) == self.attached_session_id)
+    }
+
+    /// Handle `ModelSelected`: cache the model name on `App` and sync it
+    /// into the session-manager list entry so the status bar and Session
+    /// Manager detail page are both up to date.
+    pub(crate) fn handle_model_selected(&mut self, model: &str) {
+        if self.attached_session_id.is_some() {
+            self.attached_model = Some(model.to_owned());
+            if let Some(s) = self.attached_session_mut() {
+                s.selected_model = Some(model.to_owned());
+            }
+        }
+    }
+
+    /// Handle `ReasoningEffortSet`: cache the effort on `App` and sync it
+    /// into the session-manager list entry.
+    pub(crate) fn handle_reasoning_effort_set(&mut self, effort: ThinkingEffort) {
+        if self.attached_session_id.is_some() {
+            self.attached_reasoning_effort = Some(effort);
+            if let Some(s) = self.attached_session_mut() {
+                s.reasoning_effort = Some(effort);
+            }
+        }
+    }
+
+    /// Handle `SessionAccountSet`: cache the account name on `App`,
+    /// re-resolve the provider slug, and sync into the session-manager
+    /// list entry.
+    pub(crate) fn handle_session_account_set(&mut self, account: &str) {
+        if self.attached_session_id.is_some() {
+            self.attached_account_name = Some(account.to_owned());
+            self.refresh_attached_provider_slug();
+            if let Some(s) = self.attached_session_mut() {
+                s.account_name = Some(account.to_owned());
+            }
+        }
     }
 
     /// Handle `SessionStatusChanged`: propagate the new status into the
@@ -1624,6 +1707,8 @@ impl App {
     /// chat page, and auto-attach or auto-create when no session is attached.
     pub(crate) fn handle_accounts(&mut self, accounts: &[AccountInfo]) {
         self.ai_providers.set_accounts(accounts.to_vec());
+        // Re-resolve the provider slug with the now-current accounts list.
+        self.refresh_attached_provider_slug();
     }
 
     pub(crate) fn handle_sessions(
@@ -1686,6 +1771,11 @@ impl App {
         self.session_mgr.remove_session(session_id);
         if self.attached_session_id == Some(session_id) {
             self.attached_session_id = None;
+            self.attached_account_name = None;
+            self.attached_model = None;
+            self.attached_reasoning_effort = None;
+            self.attached_provider_slug = None;
+            self.attached_working_dir = None;
         }
     }
 
@@ -2387,6 +2477,9 @@ mod tests {
             total_tokens: 30,
         });
         s.context_window = Some(4096);
+        s.account_name = Some("my-account".into());
+        s.selected_model = Some("gpt-4o".into());
+        s.reasoning_effort = Some(ThinkingEffort::Medium);
         app.session_mgr.sessions.push(s);
 
         app.handle_session_attached(42);
@@ -2401,6 +2494,9 @@ mod tests {
             })
         );
         assert_eq!(app.attached_context_window, Some(4096));
+        assert_eq!(app.attached_account_name.as_deref(), Some("my-account"),);
+        assert_eq!(app.attached_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(app.attached_reasoning_effort, Some(ThinkingEffort::Medium),);
         assert!(app.progress_dirty);
     }
 
@@ -2411,6 +2507,129 @@ mod tests {
         assert_eq!(app.attached_session_id, Some(99));
         assert!(app.attached_token_usage.is_none());
         assert!(app.attached_context_window.is_none());
+        assert!(app.attached_account_name.is_none());
+        assert!(app.attached_model.is_none());
+        assert!(app.attached_reasoning_effort.is_none());
         assert!(app.progress_dirty);
+    }
+
+    // ── handle_model_selected ──
+
+    #[test]
+    fn handle_model_selected_updates_cached_value_and_session_entry() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.session_mgr.sessions.push(make_session(1, "s1"));
+        app.handle_session_attached(1);
+
+        app.handle_model_selected("gpt-4o");
+
+        assert_eq!(
+            app.attached_model.as_deref(),
+            Some("gpt-4o"),
+            "cached model should be set",
+        );
+        assert_eq!(
+            app.session_mgr.sessions[0].selected_model.as_deref(),
+            Some("gpt-4o"),
+            "session-manager entry should be updated",
+        );
+    }
+
+    #[test]
+    fn handle_model_selected_skipped_when_no_attached_session() {
+        let mut app = test_app("/tmp/tai.sock");
+        let saved = app.attached_model.clone();
+        app.handle_model_selected("gpt-4o");
+        assert_eq!(app.attached_model, saved, "should be a no-op");
+    }
+
+    // ── handle_reasoning_effort_set ──
+
+    #[test]
+    fn handle_reasoning_effort_set_updates_cached_value_and_session_entry() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.session_mgr.sessions.push(make_session(1, "s1"));
+        app.handle_session_attached(1);
+
+        app.handle_reasoning_effort_set(ThinkingEffort::High);
+
+        assert_eq!(app.attached_reasoning_effort, Some(ThinkingEffort::High),);
+        assert_eq!(
+            app.session_mgr.sessions[0].reasoning_effort,
+            Some(ThinkingEffort::High),
+        );
+    }
+
+    #[test]
+    fn handle_reasoning_effort_set_skipped_when_no_attached_session() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.handle_reasoning_effort_set(ThinkingEffort::Low);
+        assert!(app.attached_reasoning_effort.is_none());
+    }
+
+    // ── handle_session_account_set ──
+
+    #[test]
+    fn handle_session_account_set_updates_cached_value_and_session_entry() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.ai_providers.set_accounts(vec![tai_proto::AccountInfo {
+            name: "my-acc".into(),
+            provider: "openai".into(),
+            has_credential: true,
+        }]);
+        app.session_mgr.sessions.push(make_session(1, "s1"));
+        app.handle_session_attached(1);
+
+        app.handle_session_account_set("my-acc");
+
+        assert_eq!(app.attached_account_name.as_deref(), Some("my-acc"));
+        assert_eq!(app.attached_provider_slug.as_deref(), Some("openai"));
+        assert_eq!(
+            app.session_mgr.sessions[0].account_name.as_deref(),
+            Some("my-acc"),
+        );
+    }
+
+    #[test]
+    fn handle_session_account_set_skipped_when_no_attached_session() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.handle_session_account_set("my-acc");
+        assert!(app.attached_account_name.is_none());
+        assert!(app.attached_provider_slug.is_none());
+    }
+
+    // ── attached_session_mut ──
+
+    #[test]
+    fn attached_session_mut_returns_none_when_not_attached() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.session_mgr.sessions.push(make_session(1, "s1"));
+        assert!(app.attached_session_mut().is_none());
+    }
+
+    #[test]
+    fn attached_session_mut_returns_the_attached_session() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.session_mgr.sessions.push(make_session(1, "s1"));
+        app.handle_session_attached(1);
+
+        let entry = app.attached_session_mut();
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().session_id, 1);
+    }
+
+    #[test]
+    fn attached_session_mut_allows_mutation() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.session_mgr.sessions.push(make_session(1, "s1"));
+        app.handle_session_attached(1);
+
+        if let Some(s) = app.attached_session_mut() {
+            s.title = Some("mutated".into());
+        }
+        assert_eq!(
+            app.session_mgr.sessions[0].title.as_deref(),
+            Some("mutated"),
+        );
     }
 }

@@ -88,6 +88,9 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     client_tx
         .send(ClientMessage::ListSessions)
         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
+    client_tx
+        .send(ClientMessage::ListAccounts)
+        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
     let result = run_ui_loop(
         &mut terminal,
         &mut app,
@@ -1010,6 +1013,7 @@ pub(crate) fn handle_daemon_message(
             token_usage,
             context_window,
             last_prompt_tokens,
+            working_dir,
             ..
         } => {
             // Only update progress data when the message is for the
@@ -1019,6 +1023,7 @@ pub(crate) fn handle_daemon_message(
                 app.attached_token_usage = token_usage.clone();
                 app.attached_context_window = *context_window;
                 app.attached_last_prompt_tokens = *last_prompt_tokens;
+                app.attached_working_dir = working_dir.clone();
                 app.progress_dirty = true;
             }
             // Fall through to dispatch_daemon_message for message processing.
@@ -1041,6 +1046,15 @@ pub(crate) fn handle_daemon_message(
             token_usage: None, ..
         } => {
             // No token usage data — fall through.
+        }
+        DaemonMessage::ModelSelected { model } => {
+            app.handle_model_selected(model);
+        }
+        DaemonMessage::ReasoningEffortSet { effort } => {
+            app.handle_reasoning_effort_set(*effort);
+        }
+        DaemonMessage::SessionAccountSet { account } => {
+            app.handle_session_account_set(account);
         }
 
         _ => {}
