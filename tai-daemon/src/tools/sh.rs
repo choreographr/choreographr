@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Shell {
     /// Bourne Again SHell
@@ -15,6 +15,26 @@ pub enum Shell {
     Dash,
     /// Z SHell
     Zsh,
+}
+
+impl JsonSchema for Shell {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("Shell")
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed(concat!(module_path!(), "::Shell"))
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Use the simple "enum" format instead of schemars' default
+        // "oneOf" with "const" — many OpenAI-compatible providers do
+        // not support the const keyword in tool parameter schemas.
+        schemars::json_schema!({
+            "type": "string",
+            "enum": ["bash", "dash", "zsh"]
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -72,6 +92,8 @@ pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use crate::tools::Tool;
+    use schemars::JsonSchema;
+    use schemars::SchemaGenerator;
 
     #[test]
     fn sh_tool_has_valid_metadata() {
@@ -80,5 +102,36 @@ mod tests {
         assert!(!tool.description().is_empty());
         let schema = tool.schema();
         assert!(schema.is_object());
+    }
+
+    #[test]
+    fn shell_enum_json_schema_uses_flat_enum_format() {
+        let mut generator = SchemaGenerator::default();
+        let schema = super::Shell::json_schema(&mut generator);
+        let json: serde_json::Value = serde_json::to_value(&schema).unwrap();
+        // Should use simple string enum, not oneOf/const
+        assert_eq!(json["type"], "string", "Shell should be a string schema");
+        let variants: Vec<&str> = json["enum"]
+            .as_array()
+            .expect("Shell should have an enum array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(variants, vec!["bash", "dash", "zsh"]);
+    }
+
+    #[test]
+    fn sh_tool_schema_shell_param_uses_flat_enum() {
+        let schema = super::Sh.schema();
+        // The shell property should use the flat enum format
+        let shell_schema = &schema["properties"]["shell"];
+        assert_eq!(shell_schema["type"], "string");
+        let variants: Vec<&str> = shell_schema["enum"]
+            .as_array()
+            .expect("shell parameter should have enum")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(variants, vec!["bash", "dash", "zsh"]);
     }
 }

@@ -175,6 +175,14 @@ impl Tool for DbGet {
         "Retrieve a value by key from the session's database."
     }
 
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        // Returns None so the field is omitted from the wire format.
+        // Output is a lossy UTF-8 conversion of arbitrary binary data;
+        // the nullable-string schema would mislead callers into thinking
+        // the value is always valid UTF-8.
+        None
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -792,40 +800,26 @@ mod tests {
     // ── output_schema tests ──────────────────────────────────────────
 
     #[test]
-    fn db_get_output_schema_is_nullable_string() {
-        let schema = DbGet.output_schema().expect("schema");
-        // Option<String> generates type as an array of ["string", "null"]
-        let type_val = schema.get("type").and_then(|v| v.as_array());
-        assert!(type_val.is_some(), "type should be an array");
-        let types: Vec<&str> = type_val
-            .unwrap()
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect();
-        assert!(types.contains(&"string"), "should include string");
-        assert!(types.contains(&"null"), "should include null");
+    fn db_get_output_schema_is_none() {
+        assert!(
+            DbGet.output_schema().is_none(),
+            "DbGet returns raw bytes converted lossily to string; no structured JSON schema"
+        );
     }
 
     #[test]
     fn db_get_range_output_schema_is_array_of_objects() {
         let schema = DbGetRange.output_schema().expect("schema");
         assert_eq!(schema["type"], "array");
-        // Follow $ref to the definition if present (Draft 2020-12 uses $defs)
-        let items = if let Some(ref_path) = schema["items"]["$ref"].as_str() {
-            let def_key = ref_path.trim_start_matches("#/$defs/");
-            &schema["$defs"][def_key]
-        } else {
-            &schema["items"]
-        };
-        assert_eq!(items["type"], "object");
+        assert_eq!(schema["items"]["type"], "object");
         assert!(
-            items["required"]
+            schema["items"]["required"]
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::Value::String("key".into()))
         );
         assert!(
-            items["required"]
+            schema["items"]["required"]
                 .as_array()
                 .unwrap()
                 .contains(&serde_json::Value::String("value_b64".into()))

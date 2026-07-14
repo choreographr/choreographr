@@ -586,6 +586,9 @@ The tool trait is generic over argument and return types. Each tool declares its
 `type Args` (must implement `DeserializeOwned + JsonSchema`) and `type Return`
 (must implement `Serialize + JsonSchema`). Both `schema()` and `output_schema()` are
 auto-derived via `schemars` by default, eliminating the need for hand-written JSON schemas.
+The generated schemas are then sanitized — `$schema`, `title`, and `$defs`/`$ref` are
+stripped/resolved for compatibility with providers that do not support Draft 2020-12
+meta-schema features, and `additionalProperties: false` is injected for parameter schemas.
 
 ```rust
 pub trait Tool: Send + Sync {
@@ -597,19 +600,23 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &'static str;
 
     /// Auto-derived JSON Schema for the tool's input arguments.
+    /// Sanitized via `sanitize_params_schema` (strips `$schema`/`title`/`$defs`,
+    /// resolves `$ref`s inline, injects `additionalProperties: false`, converts
+    /// unit-arg `{"type":"null"}` to empty object).
     fn schema(&self) -> serde_json::Value {
-        let mut schema =
-            serde_json::to_value(schemars::schema_for!(Self::Args)).unwrap_or_default();
-        if let Some(obj) = schema.as_object_mut() {
-            obj.insert("additionalProperties".into(), false.into());
-        }
-        schema
+        sanitize_params_schema(
+            serde_json::to_value(schemars::schema_for!(Self::Args)).unwrap_or_default(),
+        )
     }
 
     /// JSON Schema for the tool's return value (for Programmatic Tool Calling).
     /// Auto-derived from the return type. Override for types schemars cannot represent.
+    /// Sanitized via `sanitize_output_schema` (same as above but without
+    /// `additionalProperties`).
     fn output_schema(&self) -> Option<serde_json::Value> {
-        Some(serde_json::to_value(schemars::schema_for!(Self::Return)).unwrap_or_default())
+        Some(sanitize_output_schema(
+            serde_json::to_value(schemars::schema_for!(Self::Return)).unwrap_or_default(),
+        ))
     }
 
     /// Controls which callers can invoke this tool
@@ -1339,7 +1346,7 @@ Use `exec` when the command is a single program with explicit arguments. Prefer 
 
 ### `sh` — POSIX shell command execution
 
-`sh` runs shell commands via a POSIX-compatible shell (`bash`, `dash`, or `zsh`). The available variants are detected at startup by probing `PATH`; only installed shells are listed in the tool schema. The `shell` parameter must be explicitly specified (no default), and `sh` itself is intentionally excluded — use `bash`, `dash`, or `zsh` directly.
+`sh` runs shell commands via a POSIX-compatible shell (`bash`, `dash`, or `zsh`). The `shell` parameter lists all three variants unconditionally (the manual `JsonSchema` impl emits a flat `"enum"` array instead of `oneOf`/`const` for wider provider compatibility). The `shell` parameter must be explicitly specified (no default), and `sh` itself is intentionally excluded — use `bash`, `dash`, or `zsh` directly.
 
 Sandboxing (shared across all shell/exec tools via `shell_util.rs`):
 
