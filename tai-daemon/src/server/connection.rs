@@ -500,10 +500,13 @@ fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
         .send(DaemonCommand::AttachSession { session_id, reply });
     match rx.recv() {
         Ok(Ok(session_tx)) => {
-            switch_attached_session(session_id, session_tx, ctx);
+            // Send SessionAttached before SessionCommand::Attach so that
+            // the TUI's attached_session_id is set before SessionState
+            // arrives — otherwise SessionState is silently dropped.
             let _ = ctx
                 .writer_tx
                 .send(DaemonMessage::SessionAttached { session_id });
+            switch_attached_session(session_id, session_tx, ctx);
         }
         Ok(Err(e)) => {
             let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
