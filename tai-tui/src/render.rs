@@ -242,7 +242,16 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     frame.set_cursor_position((cursor_x, cursor_y));
 
     // ── Status bar ────────────────────────────────────────────
-    let status_line = if app.attached_session_id.is_some() {
+    let status_area = chunks[2];
+    let status_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(status_area);
+
+    let has_session = app.attached_session_id.is_some();
+
+    // Row 1: working directory, provider, model, reasoning effort
+    let status_line = if has_session {
         let wd = app.attached_working_dir.as_deref().unwrap_or("-");
         let provider = app.attached_provider_slug.as_deref().unwrap_or("-");
         let model = app.attached_model.as_deref().unwrap_or("-");
@@ -265,7 +274,44 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         Line::from("")
     };
     let status_bar = Paragraph::new(status_line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
-    frame.render_widget(status_bar, chunks[2]);
+    frame.render_widget(status_bar, status_rows[0]);
+
+    // Row 2: tokens (output↑ / input↓) and context window
+    let tokens_line = if has_session {
+        let tokens = match &app.attached_token_usage {
+            Some(usage) => format!("↑{}  ↓{}", usage.output_tokens, usage.input_tokens),
+            None => String::new(),
+        };
+        let context = match (app.attached_context_window, app.attached_last_prompt_tokens) {
+            (Some(limit), Some(current)) => {
+                let pct = if limit > 0 {
+                    (current as f64 / limit as f64) * 100.0
+                } else {
+                    0.0
+                };
+                format!(
+                    "{} / {} ({:.0}%)",
+                    humfmt::number(current),
+                    humfmt::number(limit),
+                    pct,
+                )
+            }
+            (Some(limit), None) => format!("? / {}", humfmt::number(limit)),
+            (None, Some(current)) => format!("{} / ?", humfmt::number(current)),
+            (None, None) => String::new(),
+        };
+        let combined = match (tokens.is_empty(), context.is_empty()) {
+            (true, true) => String::new(),
+            (true, false) => context,
+            (false, true) => tokens,
+            (false, false) => format!("{}  |  {}", tokens, context),
+        };
+        Line::from(Span::styled(combined, Style::default().fg(Color::White)))
+    } else {
+        Line::from("")
+    };
+    let tokens_bar = Paragraph::new(tokens_line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
+    frame.render_widget(tokens_bar, status_rows[1]);
 }
 
 fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -903,15 +949,15 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                     };
                     format!(
                         "Context:       {} / {} ({:.0}%)",
-                        format_count(current),
-                        format_count(limit),
+                        humfmt::number(current),
+                        humfmt::number(limit),
                         pct,
                     )
                 }
                 (Some(limit), None) => {
-                    format!("Context:       ? / {}", format_count(limit))
+                    format!("Context:       ? / {}", humfmt::number(limit))
                 }
-                (None, Some(current)) => format!("Context:       {} / ?", format_count(current)),
+                (None, Some(current)) => format!("Context:       {} / ?", humfmt::number(current)),
                 (None, None) => "Context:       unknown".to_string(),
             }),
             Line::from(format!("Status:        {}", format_status(&detail.status))),
@@ -944,24 +990,6 @@ fn format_timestamp(ts: i64) -> String {
     };
 
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-/// Format a token count for human readability (e.g. 1234 → "1,234", 200000 → "200k").
-fn format_count(n: u32) -> String {
-    if n >= 100_000 {
-        format!("{}k", n / 1000)
-    } else {
-        // Use thousands separator
-        let s = n.to_string();
-        let mut result = String::with_capacity(s.len() + 3);
-        for (i, c) in s.chars().rev().enumerate() {
-            if i > 0 && i % 3 == 0 {
-                result.push(',');
-            }
-            result.push(c);
-        }
-        result.chars().rev().collect()
-    }
 }
 
 // ── AI Provider Accounts ──────────────────────────────────
@@ -1432,48 +1460,5 @@ pub(crate) fn diff_cell_spans(
             pad_style,
         ));
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::format_count;
-
-    #[test]
-    fn format_count_zero() {
-        assert_eq!(format_count(0), "0");
-    }
-
-    #[test]
-    fn format_count_small() {
-        assert_eq!(format_count(1), "1");
-        assert_eq!(format_count(12), "12");
-        assert_eq!(format_count(123), "123");
-    }
-
-    #[test]
-    fn format_count_thousands_separator() {
-        assert_eq!(format_count(1_234), "1,234");
-        assert_eq!(format_count(12_345), "12,345");
-        assert_eq!(format_count(99_999), "99,999");
-    }
-
-    #[test]
-    fn format_count_boundary() {
-        // 100_000 and above use "k" format
-        assert_eq!(format_count(100_000), "100k");
-        assert_eq!(format_count(100_001), "100k");
-    }
-
-    #[test]
-    fn format_count_large_k() {
-        assert_eq!(format_count(200_000), "200k");
-        assert_eq!(format_count(999_999), "999k");
-        assert_eq!(format_count(1_000_000), "1000k");
-    }
-
-    #[test]
-    fn format_count_u32_max() {
-        assert_eq!(format_count(u32::MAX), "4294967k");
     }
 }

@@ -29,6 +29,7 @@ lru.workspace = true
 signal-hook.workspace = true
 chrono.workspace = true
 tui-prompts = "0.6"
+humfmt = "0.6.0"
 
 [dev-dependencies]
 tempfile.workspace = true

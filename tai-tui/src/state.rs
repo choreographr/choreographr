@@ -34,7 +34,7 @@ fn try_parse_as_diff(text: &str) -> Option<Vec<FileDiff>> {
 }
 
 pub(crate) const INPUT_BAR_HEIGHT: u16 = 3;
-pub(crate) const STATUS_BAR_HEIGHT: u16 = 1;
+pub(crate) const STATUS_BAR_HEIGHT: u16 = 2;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
 /// A menu item on the Home page.
