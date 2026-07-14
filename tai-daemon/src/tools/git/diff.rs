@@ -238,7 +238,7 @@ pub(crate) fn git_diff_impl(
     )
     .ok();
     if !pathspec.is_empty() {
-        writeln!(&mut out, "pathspec: {}", pathspec.join(", ")).ok();
+        writeln!(&mut out, "pathspec: {}", humfmt::list(&pathspec)).ok();
     }
     if lines.is_empty() {
         writeln!(&mut out, "no changes").ok();

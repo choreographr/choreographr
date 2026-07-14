@@ -78,7 +78,7 @@ pub(crate) fn execute_load_tools(
     if loaded.is_empty() {
         "All specified groups were already active.".to_string()
     } else {
-        format!("Activated tool groups: {}", loaded.join(", "))
+        format!("Activated tool groups: {}", humfmt::list(&loaded))
     }
 }
 
@@ -133,7 +133,10 @@ pub(crate) fn execute_unload_tools(
 
     let mut parts = Vec::new();
     if !unloaded.is_empty() {
-        parts.push(format!("Deactivated tool groups: {}", unloaded.join(", ")));
+        parts.push(format!(
+            "Deactivated tool groups: {}",
+            humfmt::list(&unloaded)
+        ));
     }
     if !protected.is_empty() {
         parts.push("The 'core' group cannot be unloaded.".to_string());
@@ -183,7 +186,7 @@ mod tests {
         let mut active: std::collections::HashSet<String> =
             ["core".into(), "git".into()].into_iter().collect();
         let result = execute_load_tools(&mut active, r#"{"groups": ["shell", "x"]}"#);
-        assert_eq!(result, "Activated tool groups: shell, x");
+        assert_eq!(result, "Activated tool groups: shell and x");
         assert!(active.contains("shell"));
         assert!(active.contains("x"));
         assert!(active.contains("core"));

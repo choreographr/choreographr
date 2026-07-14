@@ -284,16 +284,16 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         };
         let context = match (app.attached_context_window, app.attached_last_prompt_tokens) {
             (Some(limit), Some(current)) => {
-                let pct = if limit > 0 {
-                    (current as f64 / limit as f64) * 100.0
+                let ratio = if limit > 0 {
+                    current as f64 / limit as f64
                 } else {
                     0.0
                 };
                 format!(
-                    "{} / {} ({:.0}%)",
+                    "{} / {} ({})",
                     humfmt::number(current),
                     humfmt::number(limit),
-                    pct,
+                    humfmt::percent(ratio),
                 )
             }
             (Some(limit), None) => format!("? / {}", humfmt::number(limit)),
@@ -942,16 +942,16 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
             }),
             Line::from(match (detail.context_window, detail.last_prompt_tokens) {
                 (Some(limit), Some(current)) => {
-                    let pct = if limit > 0 {
-                        (current as f64 / limit as f64) * 100.0
+                    let ratio = if limit > 0 {
+                        current as f64 / limit as f64
                     } else {
                         0.0
                     };
                     format!(
-                        "Context:       {} / {} ({:.0}%)",
+                        "Context:       {} / {} ({})",
                         humfmt::number(current),
                         humfmt::number(limit),
-                        pct,
+                        humfmt::percent(ratio),
                     )
                 }
                 (Some(limit), None) => {
@@ -963,7 +963,7 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
             Line::from(format!("Status:        {}", format_status(&detail.status))),
             Line::from(format!(
                 "Tool Groups:   {}",
-                detail.active_tool_groups.join(", ")
+                humfmt::list(&detail.active_tool_groups)
             )),
         ];
         let paragraph = Paragraph::new(lines);
@@ -1267,7 +1267,10 @@ pub(crate) fn format_status(status: &SessionStatus) -> String {
             max_attempts,
             delay_ms,
         } => {
-            format!("retrying ({attempt}/{max_attempts}, {delay_ms}ms)")
+            format!(
+                "retrying ({attempt}/{max_attempts}, {})",
+                humfmt::duration(std::time::Duration::from_millis(*delay_ms)),
+            )
         }
         _ => "unknown".to_string(),
     }

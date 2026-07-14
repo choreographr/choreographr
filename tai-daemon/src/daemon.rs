@@ -658,7 +658,7 @@ impl DaemonState {
                 if cached_models.contains(&model) {
                     let _ = reply.send(Ok(()));
                 } else {
-                    let available = cached_models.join(", ");
+                    let available = humfmt::list(cached_models);
                     let _ = reply.send(Err(format!(
                         "model '{model}' not found. Available: {available}"
                     )));

@@ -75,7 +75,11 @@ fn mcp_result_to_text_parts(result: &CallToolResult) -> (Vec<String>, bool) {
             McpContent::Text { text } => text_parts.push(text.clone()),
             McpContent::Image { data, mime_type } => {
                 let mime = mime_type.clone().unwrap_or_else(|| "image/png".to_string());
-                text_parts.push(format!("[Image: {} ({} bytes)]", mime, data.len()));
+                text_parts.push(format!(
+                    "[Image: {} ({})]",
+                    mime,
+                    humfmt::bytes(data.len() as u64),
+                ));
             }
             McpContent::Resource { resource } => {
                 text_parts.push(format!("[Resource: {}]", resource));

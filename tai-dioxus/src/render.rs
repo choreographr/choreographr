@@ -196,11 +196,13 @@ fn render_session_message(message: SessionMessage) -> Element {
             reasoning,
             ..
         } => {
-            let name = tool_calls
-                .iter()
-                .map(|call| format!("{}({})", call.name, call.arguments_json))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let name = humfmt::list(
+                &tool_calls
+                    .iter()
+                    .map(|call| format!("{}({})", call.name, call.arguments_json))
+                    .collect::<Vec<_>>(),
+            )
+            .to_string();
             let resolved_reasoning = reasoning.filter(|value| !value.trim().is_empty());
             let content = content
                 .filter(|value| !value.trim().is_empty())

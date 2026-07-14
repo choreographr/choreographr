@@ -128,11 +128,12 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             let mut lines = vec![Line::from(Span::styled(
                 format!(
                     "tool-call: {}",
-                    tool_calls
-                        .iter()
-                        .map(|call| format!("{}({})", call.name, call.arguments_json))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    humfmt::list(
+                        &tool_calls
+                            .iter()
+                            .map(|call| format!("{}({})", call.name, call.arguments_json))
+                            .collect::<Vec<_>>(),
+                    )
                 ),
                 Style::default().fg(Color::Yellow),
             ))];

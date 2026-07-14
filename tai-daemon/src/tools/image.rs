@@ -69,8 +69,8 @@ fn prepare_image(args: &DisplayImageArgs) -> io::Result<PreparedImage> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "image exceeds maximum allowed size of {} bytes",
-                MAX_DISPLAY_IMAGE_BYTES
+                "image exceeds maximum allowed size of {}",
+                humfmt::bytes(MAX_DISPLAY_IMAGE_BYTES as u64),
             ),
         ));
     }
@@ -196,7 +196,8 @@ impl super::Tool for DisplayImage {
         let byte_len = image.data.len();
         *self.last_image.lock().unwrap_or_else(|e| e.into_inner()) = Some(image);
         Ok(truncate_tool_output(&format!(
-            "displayed image ({mime_type}, {width}x{height}, {byte_len} bytes)"
+            "displayed image ({mime_type}, {width}x{height}, {})",
+            humfmt::bytes(byte_len as u64),
         )))
     }
 

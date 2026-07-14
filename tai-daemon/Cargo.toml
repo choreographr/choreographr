@@ -34,6 +34,7 @@ sha2.workspace = true
 x25519-dalek.workspace = true
 hkdf.workspace = true
 zeroize.workspace = true
+humfmt.workspace = true
 tai-keystore.workspace = true
 tai-mcp.workspace = true
 tai-proto.workspace = true

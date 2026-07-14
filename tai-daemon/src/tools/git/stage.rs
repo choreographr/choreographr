@@ -53,7 +53,7 @@ fn git_add_impl(
     if paths.is_empty() {
         return Err(ToolError::Other(format!(
             "pathspec did not match any tracked or untracked paths: {}",
-            pathspec.join(", ")
+            humfmt::list(&pathspec)
         )));
     }
 
