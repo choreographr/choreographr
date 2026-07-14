@@ -72,6 +72,7 @@ mod image;
 pub(crate) mod notify;
 pub(crate) mod nu;
 pub(crate) mod random;
+pub(crate) mod series;
 pub(crate) mod sh;
 pub(crate) mod shell_util;
 pub mod subsession;
@@ -448,7 +449,7 @@ pub fn static_groups() -> &'static [ToolGroup] {
         vec![
             ToolGroup {
                 name: "core".into(),
-                description: "File system operations, HTTP requests, image display, file search, random values, and time queries".into(),
+                description: "File system operations, HTTP requests, image display, file search, random values, time queries, and series execution".into(),
             },
             ToolGroup {
                 name: "desktop".into(),
@@ -547,6 +548,7 @@ impl ToolRegistry {
         Arc::new_cyclic(|weak| {
             let mut reg = self;
             reg.register(vm::RunRiscV::new(weak.clone()));
+            reg.register(series::RunSeries::new(weak.clone()));
             reg
         })
     }
