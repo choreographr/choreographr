@@ -542,7 +542,7 @@ fn format_status_retrying() {
         max_attempts: 5,
         delay_ms: 3000,
     };
-    assert_eq!(format_status(&status), "retrying (2/5, 3000ms)");
+    assert_eq!(format_status(&status), "retrying (2/5, 3s)");
 }
 
 #[test]
@@ -552,7 +552,7 @@ fn format_status_retrying_first_attempt() {
         max_attempts: 3,
         delay_ms: 1500,
     };
-    assert_eq!(format_status(&status), "retrying (1/3, 1500ms)");
+    assert_eq!(format_status(&status), "retrying (1/3, 1s 500ms)");
 }
 
 #[test]
