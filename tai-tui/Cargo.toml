@@ -15,6 +15,7 @@ redb.workspace = true
 serde.workspace = true
 ratatui = "0.30"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
+signal-hook.workspace = true
 resvg.workspace = true
 syntect = "5.3"
 tai-client-core.workspace = true
@@ -31,7 +32,7 @@ crossbeam = "0.8"
 mio = { version = "1.2", features = ["os-ext"] }
 tui-prompts = "0.6"
 humfmt.workspace = true
-nix = { workspace = true, features = ["signal"] }
+nix = { workspace = true, features = ["signal", "fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -11,11 +11,13 @@ use crossterm::event::{
 };
 use mio::unix::pipe;
 use mio::{Events, Interest, Poll, Token};
-use nix::sys::signal::{SigSet, Signal, raise};
-use nix::sys::signalfd::{SfdFlags, SignalFd};
+use nix::fcntl::{F_SETFD, F_SETFL, FdFlag, OFlag, fcntl};
+use nix::sys::signal::{Signal, raise};
 use ratatui::{Terminal, backend::CrosstermBackend};
+use signal_hook::low_level::pipe as signal_pipe;
+use std::io::{self, Read};
 use std::os::unix::io::AsRawFd;
-use std::{io, thread, time::Duration};
+use std::{thread, time::Duration};
 use tai_client_core::{
     ClientError, ConnectionMode, broken_pipe, build_add_credential_message,
     dispatch_daemon_message, is_valid_account_name, resolve_private_key,
@@ -76,21 +78,32 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // terminal protocol encoding without blocking the UI thread.
     let worker = ImageWorker::spawn(picker);
 
-    // Block SIGCONT and SIGTSTP on this thread so the signalfd (created
-    // below) receives them instead of the default disposition.  The mask
-    // is inherited by all threads spawned after this point, ensuring
-    // signals are never consumed by a thread that isn't watching the
-    // signalfd.
+    // Use the self-pipe trick to catch SIGCONT and SIGTSTP on any POSIX
+    // platform (the signalfd approach used here previously was Linux-only).
+    // Compatible with Linux and macOS.
+    //
+    // signal_hook installs signal handlers that atomically write the signal
+    // number to a pipe; the terminal-event thread monitors the pipe's read
+    // end via mio::Poll alongside stdin and the notification pipe.
     //
     // NOTE: In raw mode, termios ISIG is disabled, so pressing Ctrl+Z in the
     // terminal sends byte 0x1A to stdin as a regular character — it does NOT
-    // generate SIGTSTP.  The signalfd only catches external SIGTSTP (kill -TSTP,
+    // generate SIGTSTP.  The pipe only catches external SIGTSTP (kill -TSTP,
     // shell job control).  For Ctrl+Z keyboard suspend, add an explicit
     // KeyCode::Char('z') + Ctrl match in the page event handlers that calls
     // handle_resume_command(PrepareForSuspend, ...) and returns early.
-    let sigset = SigSet::from(Signal::SIGCONT) | Signal::SIGTSTP;
-    sigset.thread_block()?;
-    let sig_fd = SignalFd::with_flags(&sigset, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)?;
+    //
+    // O_NONBLOCK ensures the read-end drain loop never blocks (the pipe is
+    // drained inside the Token(2) handler).  O_CLOEXEC prevents the pipe fds
+    // from leaking to child processes on fork+exec.
+    let (signal_rx, signal_tx) = nix::unistd::pipe()?;
+    fcntl(&signal_rx, F_SETFD(FdFlag::FD_CLOEXEC))?;
+    fcntl(&signal_rx, F_SETFL(OFlag::O_NONBLOCK))?;
+    fcntl(&signal_tx, F_SETFD(FdFlag::FD_CLOEXEC))?;
+    signal_pipe::register(Signal::SIGCONT as i32, signal_tx.try_clone()?)?;
+    signal_pipe::register(Signal::SIGTSTP as i32, signal_tx)?;
+    let mut signal_rx_file: std::fs::File = signal_rx.into();
+    let signal_rx_fd = signal_rx_file.as_raw_fd();
 
     let connection_ui_tx = ui_tx.clone();
     let connection_task = thread::spawn(move || {
@@ -122,12 +135,12 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // forwards them through a crossbeam channel so the main loop can block on
     // all event sources simultaneously via select!.
     //
-    // The thread uses mio::Poll to wait on THREE file descriptors:
+    // The thread uses mio::Poll to wait on THREE sources:
     //   1. stdin (fd 0) — for crossterm events (keyboard, mouse, resize)
     //   2. a notification pipe — for clean shutdown signalling
-    //   3. a signalfd — for SIGCONT/SIGTSTP (suspend/resume)
+    //   3. a signal pipe — for SIGCONT/SIGTSTP (suspend/resume)
     //
-    // This is truly event-driven: the thread parks in epoll_wait with no
+    // This is truly event-driven: the thread parks in poll with no
     // timeout and zero CPU usage while idle.
     let (terminal_tx, terminal_rx) = channel::unbounded::<Event>();
     let (notify_tx, mut notify_rx) = pipe::new()?;
@@ -142,17 +155,16 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     poll.registry()
         .register(&mut stdin_source, Token(1), Interest::READABLE)?;
 
-    // Register the signalfd with the mio poll instance so the terminal
+    // Register the signal pipe with the mio poll instance so the terminal
     // thread can wait on it alongside stdin and the notification pipe.
-    let sig_fd_raw = sig_fd.as_raw_fd();
-    let mut sig_source = mio::unix::SourceFd(&sig_fd_raw);
+    let mut sig_source = mio::unix::SourceFd(&signal_rx_fd);
     poll.registry()
         .register(&mut sig_source, Token(2), Interest::READABLE)?;
 
     let terminal_handle = thread::spawn(move || {
         let mut events = Events::with_capacity(3);
         loop {
-            // Block in epoll_wait until stdin data, shutdown signal,
+            // Block in poll until stdin data, shutdown signal,
             // or a caught signal (SIGCONT / SIGTSTP).
             if let Err(e) = poll.poll(&mut events, None) {
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -180,21 +192,22 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
                         }
                     }
                     Token(2) => {
-                        // Drain all pending signals from the signalfd,
+                        // Drain all pending signals from the self-pipe,
                         // logging and discarding read errors so a
                         // transient fd issue doesn't hang the thread.
                         loop {
-                            match sig_fd.read_signal() {
-                                Ok(Some(info)) => {
-                                    if let Some(cmd) =
-                                        signal_to_resume_command(info.ssi_signo as i32)
-                                    {
+                            let mut buf = [0u8; 4];
+                            match signal_rx_file.read(&mut buf) {
+                                Ok(4) => {
+                                    let signo = i32::from_ne_bytes(buf);
+                                    if let Some(cmd) = signal_to_resume_command(signo) {
                                         let _ = resume_tx.send(cmd);
                                     }
                                 }
-                                Ok(None) => break,
+                                Ok(_) => break,
+                                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                 Err(e) => {
-                                    tracing::warn!("[tai-tui] signalfd read error: {e}");
+                                    tracing::warn!("[tai-tui] signal pipe read error: {e}");
                                     break;
                                 }
                             }

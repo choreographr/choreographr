@@ -461,29 +461,32 @@ Entry point: `src/main.rs`
 main()
 ├── reader task: read DaemonMessages from socket → push to UI event channel
 ├── writer task: receive ClientMessages from mpsc → write to socket
-├── terminal-event thread: mio::Poll on three fds —
+├── terminal-event thread: mio::Poll on three sources —
 │   ├── stdin (fd 0) → crossterm events (keyboard, mouse, resize)
 │   ├── notification pipe → clean shutdown signal
-│   └── signalfd → SIGCONT/SIGTSTP (suspend/resume)
+│   └── signal pipe (self-pipe trick) → SIGCONT/SIGTSTP (suspend/resume)
 │       └── forwards signals as ResumeCommand via crossbeam channel
 └── UI loop: crossbeam select! on five event sources + ratatui rendering
 ```
 
 **Signal handling (suspend/resume):**
 
-`SIGCONT` and `SIGTSTP` are blocked on the main thread via `SigSet::thread_block()`
-before any child threads are spawned, so every thread inherits the mask.
-A `nix::sys::signalfd::SignalFd` registered with `mio::Poll` in the terminal-event
-thread receives these signals and forwards them as `ResumeCommand` messages through
-a crossbeam channel to the UI loop. The UI loop handles `PrepareForSuspend`
-(disable raw mode, leave alternate screen, `raise(SIGSTOP)`) and `ReinitTerminal`
-(re-enable raw mode, re-enter alternate screen, clear).
+`SIGCONT` and `SIGTSTP` are caught using the self-pipe trick for POSIX
+portability (Linux and macOS). A pair of pipe fds (FD_CLOEXEC) is created;
+the read end is registered with `mio::Poll` in the terminal-event thread,
+and `signal_hook::low_level::pipe` installs signal handlers that atomically
+write the signal number to the write end. The terminal-event thread reads
+from the pipe and forwards `ResumeCommand` messages through a crossbeam
+channel to the UI loop. The UI loop handles `PrepareForSuspend`
+(disable raw mode, leave alternate screen, `raise(SIGSTOP)`) and
+`ReinitTerminal` (re-enable raw mode, re-enter alternate screen, clear).
 
-> **Note:** In raw mode, `termios` `ISIG` is disabled, so pressing Ctrl+Z in the terminal
-> sends byte `0x1A` to stdin as a regular character — it does **not** generate a `SIGTSTP`
-> signal. The signalfd-based suspend only catches external `SIGTSTP` (e.g. from `kill`,
-> shell job control, or another terminal). To support Ctrl+Z keyboard suspend from within
-> the TUI, the page event handlers (`handle_chat_event`, etc.) would need an explicit
+> **Note:** In raw mode, `termios` `ISIG` is disabled, so pressing Ctrl+Z in the
+> terminal sends byte `0x1A` to stdin as a regular character — it does **not**
+> generate a `SIGTSTP` signal. The self-pipe suspend only catches external
+> `SIGTSTP` (e.g. from `kill`, shell job control, or another terminal).
+> To support Ctrl+Z keyboard suspend from within the TUI, the page event
+> handlers (`handle_chat_event`, etc.) would need an explicit
 > `KeyCode::Char('z')` + `KeyModifiers::CONTROL` match that calls
 > `handle_resume_command(PrepareForSuspend, …)`.
 
