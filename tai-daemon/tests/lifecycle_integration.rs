@@ -80,9 +80,7 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
     // Trigger graceful shutdown by sending SIGINT.
     // The signal handler thread sets the shutdown flag and self-connects
     // to the socket, which unblocks the accept loop.
-    unsafe {
-        libc::raise(libc::SIGINT);
-    }
+    let _ = nix::sys::signal::raise(nix::sys::signal::Signal::SIGINT);
 
     // The server thread should exit cleanly within a reasonable timeout.
     handle.join().expect("server thread panicked");

@@ -41,18 +41,14 @@ pub(crate) fn sanitize_env(cmd: &mut Command) {
 /// Attach resource limits (AS, FSIZE) via a pre-exec hook.
 /// Must be called inside an `unsafe { cmd.pre_exec(|| …) }` block.
 pub(crate) fn apply_rlimits() -> Result<(), std::io::Error> {
+    use nix::sys::resource::{Resource, setrlimit};
+
     let limits = [
-        (libc::RLIMIT_AS, 4 * 1024 * 1024 * 1024),
-        (libc::RLIMIT_FSIZE, 100 * 1024 * 1024),
+        (Resource::RLIMIT_AS, 4 * 1024 * 1024 * 1024),
+        (Resource::RLIMIT_FSIZE, 100 * 1024 * 1024),
     ];
     for (resource, value) in limits {
-        let lim = libc::rlimit {
-            rlim_cur: value,
-            rlim_max: value,
-        };
-        if unsafe { libc::setrlimit(resource, &lim) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        setrlimit(resource, value, value)?;
     }
     Ok(())
 }
@@ -91,10 +87,13 @@ pub(crate) fn spawn_with_watchdog(
             // Only set was_killed when kill actually succeeds (ESRCH means the
             // child already exited normally, which can happen in a narrow race
             // where the timeout fires at the same instant the child finishes).
-            unsafe {
-                if libc::kill(pid as i32, libc::SIGKILL) == 0 {
-                    let _ = killed_tx.send(());
-                }
+            if nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .is_ok()
+            {
+                let _ = killed_tx.send(());
             }
         }
     });
