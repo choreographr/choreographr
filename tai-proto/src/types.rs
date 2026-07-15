@@ -166,6 +166,27 @@ pub enum SessionMessage {
     DisplayedImage(DisplayedImageRecord),
 }
 
+impl SessionMessage {
+    /// Returns `true` for variants rendered with a vertical accent bar and
+    /// shaded background ("margin styling"): `AssistantText`,
+    /// `AssistantToolUse`, and `UserText`.
+    ///
+    /// Non-margin variants (`SystemText`, `ToolResult`, `DisplayedImage`)
+    /// render as plain text blocks without the bar.
+    ///
+    /// Both `tai-tui::state::HistoryViewport::item_height` and
+    /// `tai-tui::render::render_item_session_message` use this so that the
+    /// margin-variant set is defined in exactly one place.
+    pub fn is_margin_message(&self) -> bool {
+        matches!(
+            self,
+            SessionMessage::AssistantText { .. }
+                | SessionMessage::AssistantToolUse { .. }
+                | SessionMessage::UserText { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSummary {
     pub session_id: u64,

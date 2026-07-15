@@ -6,7 +6,8 @@ use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT,
-    Page, RenderedCache, STATUS_BAR_HEIGHT, SessionManagerView, history_text_height,
+    Page, RenderedCache, STATUS_BAR_HEIGHT, STRUCTURAL_ROWS, SessionManagerView,
+    history_text_height,
 };
 use ratatui::{
     Frame,
@@ -568,10 +569,6 @@ pub(crate) fn render_history_text(
     );
 }
 
-/// Number of structural rows added by `add_margin_lines` around the content:
-/// top separator, top padding, bottom padding, bottom separator.
-const STRUCTURAL_ROWS: usize = 4;
-
 /// Wrap content lines with a vertical accent bar on the left and dark-gray
 /// background shading, so assistant and user messages share the same layout
 /// but differ only in the bar colour.
@@ -808,6 +805,10 @@ struct RenderWidths {
 /// Render a `HistoryItem::SessionMessage`: retrieve cached lines (or compute
 /// on cache miss), then render via the appropriate helper (assistant margin
 /// for `AssistantText`, user styling for `UserText`, plain lines otherwise).
+///
+/// Must stay in sync with `HistoryViewport::item_height` in `state.rs` —
+/// the height returned for each variant must match the number of terminal
+/// rows this function produces.
 #[allow(clippy::too_many_arguments)]
 fn render_item_session_message(
     frame: &mut Frame<'_>,
@@ -820,36 +821,35 @@ fn render_item_session_message(
     rows_to_skip: &mut usize,
     widths: &RenderWidths,
 ) {
-    let is_assistant = matches!(
-        message,
-        SessionMessage::AssistantText { .. } | SessionMessage::AssistantToolUse { .. }
-    );
-    if is_assistant {
+    if message.is_margin_message() {
+        let is_assistant = matches!(
+            message,
+            SessionMessage::AssistantText { .. } | SessionMessage::AssistantToolUse { .. }
+        );
         let lines = cached_or_compute_lines(cache, idx, widths.user_content_width, || {
             session_message_lines(message, widths.user_content_width)
         });
-        render_assistant_lines(
-            frame,
-            area,
-            lines,
-            rows_remaining,
-            y,
-            rows_to_skip,
-            widths.user_content_width,
-        );
-    } else if matches!(message, SessionMessage::UserText { .. }) {
-        let lines = cached_or_compute_lines(cache, idx, widths.user_content_width, || {
-            session_message_lines(message, widths.user_content_width)
-        });
-        render_user_lines(
-            frame,
-            area,
-            lines,
-            rows_remaining,
-            y,
-            rows_to_skip,
-            widths.user_content_width,
-        );
+        if is_assistant {
+            render_assistant_lines(
+                frame,
+                area,
+                lines,
+                rows_remaining,
+                y,
+                rows_to_skip,
+                widths.user_content_width,
+            );
+        } else {
+            render_user_lines(
+                frame,
+                area,
+                lines,
+                rows_remaining,
+                y,
+                rows_to_skip,
+                widths.user_content_width,
+            );
+        }
     } else {
         let lines = cached_or_compute_lines(cache, idx, widths.content_width, || {
             session_message_lines(message, widths.content_width)

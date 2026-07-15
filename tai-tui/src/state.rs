@@ -41,6 +41,15 @@ pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 /// list view (3 content lines + 1 blank separator).
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
 
+/// Structural rows added by `add_margin_lines` in the renderer around
+/// assistant/user messages: top separator, top padding, bottom padding,
+/// bottom separator.
+///
+/// Defined here (rather than in `render.rs`) because `item_height` in
+/// `HistoryViewport` must mirror the layout that `render` produces, and
+/// state should not depend on the render module.
+pub(crate) const STRUCTURAL_ROWS: usize = 4;
+
 /// A menu item on the Home page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HomeMenuItem {
@@ -593,18 +602,30 @@ impl HistoryViewport {
                 history_text_height(text, self.width.saturating_sub(2)).max(1) + 1
             }
             HistoryItem::SessionMessage(message) => {
-                let content_width = if matches!(
-                    message,
-                    SessionMessage::AssistantText { .. }
-                        | SessionMessage::AssistantToolUse { .. }
-                        | SessionMessage::UserText { .. }
-                ) {
+                // Margin-styled variants (AssistantText, AssistantToolUse,
+                // UserText) reserve 9 columns for the accent bar + padding,
+                // and add 4 structural rows (top sep, top pad, bottom pad,
+                // bottom sep).  See add_margin_lines in render.rs.
+                //
+                // Non-margin variants use a 2-column indent and a single
+                // blank-line separator.  Both must match the height that
+                // the renderer actually produces — keep in sync with
+                // render_item_session_message and helpers in render.rs.
+                let content_width = if message.is_margin_message() {
                     self.width.saturating_sub(9)
                 } else {
                     self.width.saturating_sub(2)
                 };
                 let lines = session_message_lines(message, content_width);
-                lines_height(&lines, content_width).max(1) + 1
+                let content_height = lines_height(&lines, content_width).max(1);
+                if message.is_margin_message() {
+                    // 4 structural rows: top separator, top padding,
+                    // bottom padding, bottom separator.
+                    content_height + STRUCTURAL_ROWS
+                } else {
+                    // 1 blank-line separator below the content block.
+                    content_height + 1
+                }
             }
             HistoryItem::Streaming(text) => {
                 let content_width = self.width.saturating_sub(2);
@@ -2177,6 +2198,101 @@ mod tests {
     #[test]
     fn try_parse_returns_none_for_empty_string() {
         assert!(try_parse_as_diff("").is_none());
+    }
+
+    // ── HistoryViewport::item_height ──
+
+    /// Compute the content-height portion of `item_height` for a
+    /// `SessionMessage` at the viewport width, so we can assert on the
+    /// structural-row contribution independently of the exact output from
+    /// `session_message_lines` / `lines_height`.
+    fn content_height_for_msg(msg: &SessionMessage, viewport_width: u16) -> usize {
+        let content_width = if msg.is_margin_message() {
+            viewport_width.saturating_sub(9)
+        } else {
+            viewport_width.saturating_sub(2)
+        };
+        let lines = session_message_lines(msg, content_width);
+        lines_height(&lines, content_width).max(1)
+    }
+
+    #[test]
+    fn item_height_margin_message_includes_structural_rows() {
+        let vp = HistoryViewport {
+            width: 80,
+            height: 24,
+        };
+        let msg = SessionMessage::AssistantText {
+            content: "Hello".into(),
+            reasoning: None,
+            token_usage: None,
+        };
+        let content_h = content_height_for_msg(&msg, vp.width);
+        let item = HistoryItem::SessionMessage(msg);
+        assert_eq!(
+            vp.item_height(&item),
+            content_h + STRUCTURAL_ROWS,
+            "margin message height should be content + {} structural rows",
+            STRUCTURAL_ROWS,
+        );
+    }
+
+    #[test]
+    fn item_height_margin_message_user_text_includes_structural_rows() {
+        let vp = HistoryViewport {
+            width: 80,
+            height: 24,
+        };
+        let msg = SessionMessage::UserText {
+            content: "Hi".into(),
+        };
+        let content_h = content_height_for_msg(&msg, vp.width);
+        let item = HistoryItem::SessionMessage(msg);
+        assert_eq!(
+            vp.item_height(&item),
+            content_h + STRUCTURAL_ROWS,
+            "user text height should be content + {} structural rows",
+            STRUCTURAL_ROWS,
+        );
+    }
+
+    #[test]
+    fn item_height_non_margin_message_uses_single_separator() {
+        let vp = HistoryViewport {
+            width: 80,
+            height: 24,
+        };
+        let msg = SessionMessage::SystemText {
+            content: "System message".into(),
+        };
+        let content_h = content_height_for_msg(&msg, vp.width);
+        let item = HistoryItem::SessionMessage(msg);
+        assert_eq!(
+            vp.item_height(&item),
+            content_h + 1,
+            "non-margin height should be content + 1 separator row",
+        );
+    }
+
+    #[test]
+    fn item_height_tool_result_uses_single_separator() {
+        let vp = HistoryViewport {
+            width: 80,
+            height: 24,
+        };
+        let msg = SessionMessage::ToolResult {
+            call_id: "c1".into(),
+            name: "read_file".into(),
+            content: "file content".into(),
+            is_error: false,
+        };
+        let content_h = content_height_for_msg(&msg, vp.width);
+        let item = HistoryItem::SessionMessage(msg);
+        assert_eq!(
+            vp.item_height(&item),
+            content_h + 1,
+            "ToolResult height should be content + 1 separator row",
+        );
     }
 
     // ── push_tool_text ──
