@@ -1798,6 +1798,23 @@ impl App {
         }
     }
 
+    /// Handle `SessionWorkingDirSet`: cache the working directory on `App`,
+    /// sync it into the session-manager list entry, and flag the progress
+    /// bar as dirty so the status bar updates immediately.
+    pub(crate) fn handle_session_working_dir_set(
+        &mut self,
+        session_id: u64,
+        path: &Option<String>,
+    ) {
+        if self.attached_session_id == Some(session_id) {
+            self.attached_working_dir = path.clone();
+            self.progress_dirty = true;
+            if let Some(s) = self.attached_session_mut() {
+                s.working_dir = path.clone();
+            }
+        }
+    }
+
     /// Handle `SessionAccountSet`: cache the account name on `App`,
     /// re-resolve the provider slug, and sync into the session-manager
     /// list entry.
@@ -3115,6 +3132,53 @@ mod tests {
         app.handle_session_account_set("my-acc");
         assert!(app.attached_account_name.is_none());
         assert!(app.attached_provider_slug.is_none());
+    }
+
+    // ── handle_session_working_dir_set ──
+
+    #[test]
+    fn handle_session_working_dir_set_updates_cached_field_and_session_entry() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.session_mgr.sessions.push(make_session(1, "s1"));
+        app.handle_session_attached(1);
+
+        app.handle_session_working_dir_set(1, &Some("/home/user/project".into()));
+
+        assert_eq!(
+            app.attached_working_dir.as_deref(),
+            Some("/home/user/project"),
+        );
+        assert_eq!(
+            app.session_mgr.sessions[0].working_dir.as_deref(),
+            Some("/home/user/project"),
+        );
+        assert!(app.progress_dirty);
+    }
+
+    #[test]
+    fn handle_session_working_dir_set_skipped_for_non_attached_session() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.session_mgr.sessions.push(make_session(1, "s1"));
+        app.handle_session_attached(1);
+
+        // Send a message for a different session ID.
+        app.handle_session_working_dir_set(42, &Some("/other".into()));
+
+        assert!(app.attached_working_dir.is_none());
+    }
+
+    #[test]
+    fn handle_session_working_dir_set_clears_field_when_path_is_none() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.session_mgr.sessions.push(make_session(1, "s1"));
+        app.handle_session_attached(1);
+        app.attached_working_dir = Some("/old".into());
+        app.session_mgr.sessions[0].working_dir = Some("/old".into());
+
+        app.handle_session_working_dir_set(1, &None);
+
+        assert!(app.attached_working_dir.is_none());
+        assert!(app.session_mgr.sessions[0].working_dir.is_none());
     }
 
     // ── attached_session_mut ──

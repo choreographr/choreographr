@@ -862,6 +862,21 @@ fn execute_tool_with_timeout(
 
             session.config.working_dir = Some(canonical.clone());
 
+            // Notify session subscribers (e.g. TUI) so the status bar
+            // updates to reflect the new working directory immediately.
+            let path_str = canonical.to_string_lossy().into_owned();
+            debug!(
+                session_id = ctx.session_id,
+                path = %path_str,
+                "set_working_dir: broadcasting SessionWorkingDirSet",
+            );
+            let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                DaemonMessage::SessionWorkingDirSet {
+                    session_id: ctx.session_id,
+                    path: Some(path_str),
+                },
+            ));
+
             // Notify the daemon so the TUI/inspector can reflect the change
             // immediately without waiting for the next persist cycle.
             let _ = ctx

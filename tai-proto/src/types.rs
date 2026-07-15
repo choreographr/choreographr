@@ -462,6 +462,10 @@ pub enum DaemonMessage {
     SessionAccountSet {
         account: String,
     },
+    SessionWorkingDirSet {
+        session_id: u64,
+        path: Option<String>,
+    },
     ReasoningEffortSet {
         effort: ThinkingEffort,
     },

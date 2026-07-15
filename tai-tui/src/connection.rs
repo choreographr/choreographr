@@ -1348,6 +1348,9 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::SessionAccountSet { account } => {
             app.handle_session_account_set(account);
         }
+        DaemonMessage::SessionWorkingDirSet { session_id, path } => {
+            app.handle_session_working_dir_set(*session_id, path);
+        }
 
         _ => {}
     }
