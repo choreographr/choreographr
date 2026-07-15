@@ -477,6 +477,10 @@ pub(crate) struct App {
     pub(crate) attached_provider_slug: Option<String>,
     /// Cached working directory for the attached session.
     pub(crate) attached_working_dir: Option<String>,
+    /// Cached status for the attached session, updated live from
+    /// `SessionStatusChanged` so the chat toolbar can render it
+    /// without iterating the session list each frame.
+    pub(crate) attached_status: Option<SessionStatus>,
     pub(crate) page: Page,
     /// The page the user was on before opening the Home menu.  `Esc` on the
     /// Home page returns to this page.
@@ -1172,6 +1176,7 @@ impl App {
             attached_reasoning_effort: None,
             attached_provider_slug: None,
             attached_working_dir: None,
+            attached_status: None,
             page: Page::Chat,
             previous_page: Page::Chat,
             home_selection: 0,
@@ -1935,6 +1940,7 @@ impl App {
             self.attached_model = s.selected_model.clone();
             self.attached_reasoning_effort = s.reasoning_effort;
             self.attached_working_dir = s.working_dir.clone();
+            self.attached_status = Some(s.status.clone());
         }
         self.refresh_attached_provider_slug();
         self.progress_dirty = true;
@@ -2015,7 +2021,10 @@ impl App {
     }
 
     /// Handle `SessionStatusChanged`: propagate the new status into the
-    /// session list and into the detail view if it's open for this session.
+    /// session list, the detail view (if open for this session), and the
+    /// attached-status cache.  All three need updating because the toolbar
+    /// reads from the cache, the session list reads from `session_mgr`, and
+    /// the detail view reads from `detail_data`.
     pub(crate) fn handle_session_status_changed(
         &mut self,
         session_id: u64,
@@ -2033,6 +2042,9 @@ impl App {
             && detail.session_id == session_id
         {
             detail.status = status.clone();
+        }
+        if self.attached_session_id == Some(session_id) {
+            self.attached_status = Some(status.clone());
         }
     }
 

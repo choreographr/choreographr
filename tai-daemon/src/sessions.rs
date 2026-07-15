@@ -847,6 +847,7 @@ fn handle_attach(
         token_usage: Some(state.config.accumulated_usage.clone()),
         context_window: state.config.context_window,
         last_prompt_tokens: state.config.last_prompt_tokens,
+        status: state.config.status.clone(),
     };
     if let Some(tx) = state.subscribers.get(&client_id) {
         let _ = tx.send(snapshot);

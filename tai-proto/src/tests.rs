@@ -303,6 +303,7 @@ fn session_state_none_optionals_round_trip() {
         token_usage: None,
         context_window: None,
         last_prompt_tokens: None,
+        status: SessionStatus::Inactive,
     };
     let frame = encode_frame(&state).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");

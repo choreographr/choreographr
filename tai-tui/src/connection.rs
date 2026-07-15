@@ -1308,6 +1308,7 @@ pub(crate) fn handle_daemon_message(
         }
         DaemonMessage::SessionStatusChanged { session_id, status } => {
             app.handle_session_status_changed(*session_id, status);
+            app.progress_dirty = true;
         }
         DaemonMessage::Sessions { sessions } => {
             // The Sessions handler manages the full lifecycle and should not
@@ -1366,6 +1367,7 @@ pub(crate) fn handle_daemon_message(
             context_window,
             last_prompt_tokens,
             working_dir,
+            status,
             ..
         } => {
             // Only update progress data when the message is for the
@@ -1376,6 +1378,7 @@ pub(crate) fn handle_daemon_message(
                 app.attached_context_window = *context_window;
                 app.attached_last_prompt_tokens = *last_prompt_tokens;
                 app.attached_working_dir = working_dir.clone();
+                app.attached_status = Some(status.clone());
                 app.progress_dirty = true;
             }
             // Fall through to dispatch_daemon_message for message processing.

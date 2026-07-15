@@ -538,6 +538,7 @@ mod tests {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            status: SessionStatus::Inactive,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
 
@@ -586,6 +587,7 @@ mod tests {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            status: SessionStatus::Inactive,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
 
@@ -616,6 +618,7 @@ mod tests {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            status: SessionStatus::Inactive,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
         let events = h.collect_events();
@@ -641,6 +644,52 @@ mod tests {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            status: SessionStatus::Inactive,
+        };
+        dispatch_daemon_message(&mut h, msg).unwrap();
+        let events = h.collect_events();
+        let info_lines: Vec<&TestEvent> = events
+            .iter()
+            .filter(|e| matches!(e, TestEvent::PushText(_)))
+            .collect();
+        // Should have 6 info lines: session+title, model, parent,
+        // working_dir, max-turns, count
+        assert_eq!(info_lines.len(), 6);
+        assert!(
+            matches!(&info_lines[0], TestEvent::PushText(t) if t.contains("session 42") && t.contains("work"))
+        );
+        assert!(matches!(&info_lines[1], TestEvent::PushText(t) if t.contains("gpt-4")));
+        assert!(matches!(&info_lines[2], TestEvent::PushText(t) if t.contains("7")));
+        assert!(matches!(&info_lines[3], TestEvent::PushText(t) if t.contains("/home")));
+        assert!(matches!(&info_lines[4], TestEvent::PushText(t) if t.contains("10")));
+        assert!(matches!(&info_lines[5], TestEvent::PushText(t) if t.contains("0 messages")));
+    }
+
+    #[test]
+    fn session_state_show_counts_line() {
+        let mut h = TestHandler::new();
+        let msg = DaemonMessage::SessionState {
+            session_id: 42,
+            title: Some("work".into()),
+            selected_model: Some("gpt-4".into()),
+            parent_session_id: Some(7),
+            working_dir: Some("/home".into()),
+            max_turns: Some(10),
+            messages: vec![
+                SessionMessage::UserText {
+                    content: "a".into(),
+                },
+                SessionMessage::AssistantText {
+                    content: "b".into(),
+                    reasoning: None,
+                    token_usage: None,
+                },
+            ],
+            active_tool_groups: vec![],
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+            status: SessionStatus::Inactive,
         };
         dispatch_daemon_message(&mut h, msg).unwrap();
         let events = h.collect_events();
@@ -649,6 +698,11 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("session 42")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("work")))
         );
         assert!(
             events
@@ -669,6 +723,11 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("10")))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("2 messages")))
         );
     }
 

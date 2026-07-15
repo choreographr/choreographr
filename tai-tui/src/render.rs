@@ -364,13 +364,24 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             (None, Some(current)) => format!("{} / ?", humfmt::number(current)),
             (None, None) => String::new(),
         };
-        let combined = match (tokens.is_empty(), context.is_empty()) {
-            (true, true) => String::new(),
-            (true, false) => context,
-            (false, true) => tokens,
-            (false, false) => format!("{}  |  {}", tokens, context),
-        };
-        Line::from(Span::styled(combined, Style::default().fg(Color::White)))
+        let mut spans: Vec<Span> = Vec::new();
+        if !tokens.is_empty() {
+            spans.push(Span::styled(tokens, Style::default().fg(Color::White)));
+        }
+        if !context.is_empty() {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  |  "));
+            }
+            spans.push(Span::styled(context, Style::default().fg(Color::White)));
+        }
+        if let Some(status) = &app.attached_status {
+            let (label, color) = status_display(status);
+            if !spans.is_empty() {
+                spans.push(Span::raw("  |  "));
+            }
+            spans.push(Span::styled(label, Style::default().fg(color)));
+        }
+        Line::from(spans)
     } else {
         Line::from("")
     };
@@ -1069,14 +1080,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
                 SessionStatus::Retrying { .. } => "retry",
                 _ => "unknown",
             };
-            let status_style = match &session.status {
-                SessionStatus::Sleeping => Color::DarkGray,
-                SessionStatus::Inactive => Color::Green,
-                SessionStatus::Inference => Color::Yellow,
-                SessionStatus::ToolCall(_) => Color::Cyan,
-                SessionStatus::Retrying { .. } => Color::Magenta,
-                _ => Color::White,
-            };
+            let status_style = status_color(&session.status);
             let row = format!(
                 "{sel}{att} {:>4}  \"{title}\"  {model_display}  — {} messages  [",
                 session.session_id, session.message_count,
@@ -1512,24 +1516,33 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(status, chunks[1]);
 }
 
-pub(crate) fn format_status(status: &SessionStatus) -> String {
+pub(crate) fn status_display(status: &SessionStatus) -> (String, Color) {
     match status {
-        SessionStatus::Sleeping => "sleeping".to_string(),
-        SessionStatus::Inactive => "idle".to_string(),
-        SessionStatus::Inference => "inferring".to_string(),
-        SessionStatus::ToolCall(name) => format!("tool call: {name}"),
+        SessionStatus::Sleeping => ("sleeping".into(), Color::DarkGray),
+        SessionStatus::Inactive => ("idle".into(), Color::Green),
+        SessionStatus::Inference => ("inferring".into(), Color::Yellow),
+        SessionStatus::ToolCall(name) => (format!("tool call: {name}"), Color::Cyan),
         SessionStatus::Retrying {
             attempt,
             max_attempts,
             delay_ms,
-        } => {
+        } => (
             format!(
                 "retrying ({attempt}/{max_attempts}, {})",
                 humfmt::duration(std::time::Duration::from_millis(*delay_ms)),
-            )
-        }
-        _ => "unknown".to_string(),
+            ),
+            Color::Magenta,
+        ),
+        _ => ("unknown".into(), Color::White),
     }
+}
+
+pub(crate) fn format_status(status: &SessionStatus) -> String {
+    status_display(status).0
+}
+
+pub(crate) fn status_color(status: &SessionStatus) -> Color {
+    status_display(status).1
 }
 
 // ── Diff rendering ─────────────────────────────────────────

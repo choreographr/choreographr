@@ -6,7 +6,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Mouse
 use ratatui::text::Line;
 use std::sync::Arc;
 use tai_client_core::DaemonMessageHandler;
-use tai_proto::{ClientMessage, DaemonMessage, OutputStream, TokenUsage};
+use tai_proto::{ClientMessage, DaemonMessage, OutputStream, SessionStatus, TokenUsage};
 use tui_prompts::State;
 
 #[test]
@@ -2120,6 +2120,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
             }),
             context_window: Some(4096),
             last_prompt_tokens: Some(1),
+            status: SessionStatus::Inactive,
         },
         &mut app,
         &tx,
@@ -2135,6 +2136,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
         })
     );
     assert_eq!(app.attached_context_window, Some(4096));
+    assert_eq!(app.attached_status, Some(SessionStatus::Inactive));
     assert!(app.progress_dirty);
 }
 
@@ -2161,6 +2163,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
             }),
             context_window: Some(1024),
             last_prompt_tokens: None,
+            status: SessionStatus::Inactive,
         },
         &mut app,
         &tx,
@@ -2170,6 +2173,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
     // Must NOT have been overwritten by the wrong session's data.
     assert!(app.attached_token_usage.is_none());
     assert!(app.attached_context_window.is_none());
+    assert!(app.attached_status.is_none());
     assert!(!app.progress_dirty);
 }
 
@@ -2223,4 +2227,30 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
     // Must remain at defaults — no data written, no dirty flag set.
     assert!(app.attached_token_usage.is_none());
     assert!(!app.progress_dirty);
+}
+
+#[test]
+fn handle_session_status_changed_updates_attached_status() {
+    let mut app = test_app("/tmp/tai.sock");
+    assert!(app.attached_status.is_none());
+
+    // With no attached session, status should not be cached.
+    app.handle_session_status_changed(42, &SessionStatus::Inference);
+    assert!(app.attached_status.is_none());
+
+    // Once attached, a status change for that session should be cached.
+    app.attached_session_id = Some(42);
+    app.handle_session_status_changed(42, &SessionStatus::Inference);
+    assert_eq!(app.attached_status, Some(SessionStatus::Inference));
+
+    // A status change for a different session should not overwrite.
+    app.handle_session_status_changed(99, &SessionStatus::Sleeping);
+    assert_eq!(app.attached_status, Some(SessionStatus::Inference));
+
+    // A subsequent change for the attached session should update.
+    app.handle_session_status_changed(42, &SessionStatus::ToolCall("test".into()));
+    assert_eq!(
+        app.attached_status,
+        Some(SessionStatus::ToolCall("test".into()))
+    );
 }

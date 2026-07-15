@@ -116,10 +116,12 @@ pub struct AssistantToolCallRecord {
     pub arguments_json: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionStatus {
     Sleeping,
+    /// Default initial state — session is loaded and ready but not processing.
+    #[default]
     Inactive,
     Inference,
     ToolCall(String),
@@ -343,6 +345,9 @@ pub enum DaemonMessage {
         /// context size being sent to the model), if available.
         #[serde(default)]
         last_prompt_tokens: Option<u32>,
+        /// Current session status (Inactive, Inference, ToolCall, etc.).
+        #[serde(default)]
+        status: SessionStatus,
     },
     SessionMessageAppended {
         message: SessionMessage,

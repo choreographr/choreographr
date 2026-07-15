@@ -90,6 +90,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 | `ThinkingEffort` | Enum controlling how much reasoning/thinking the model performs: `Off`, `Low`, `Medium`, `High`. Stored per-session and passed through to each provider's wire format. |
 | `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessage::AssistantText` and `AssistantToolUse` for per-turn accounting, in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals, and in `DaemonMessage::Done` for per-request usage. |
 | `last_prompt_tokens` | `Option<u32>` field on session metadata and protocol messages tracking the `input_tokens` from the most recent API response — the actual context size being sent to the model, used for context-window progress displays. |
+| `SessionStatus` | Enum representing the current session state: `Inactive`, `Inference`, `ToolCall(String)`, `Retrying {…}`, `Sleeping`. Included in `SessionSummary` and `DaemonMessage::SessionState` for live status display in client toolbars. |
 
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
@@ -99,7 +100,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 - `CreateSession` now carries optional `context_config` and `account_name` fields
 
 `DaemonMessage` variants:
-- Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionMessageAppended`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`
+- Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionStatusChanged`, `SessionMessageAppended`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`
 - Request lifecycle: `Started`, `OutputChunk`, `Done`, `Failed`, `Cancelled`
 - Tool lifecycle: `ToolCallStarted`, `ToolCallFinished`, `ToolCallFailed`, `ToolCallOutput`
 - Model management: `Models`, `ModelsFailed`, `ModelSelected`, `ModelSelectionFailed`
@@ -399,9 +400,11 @@ LLM provider (API response)
         ├─ sent to subscribers via DaemonMessage::SessionState.token_usage
         ├─ sent to clients via DaemonMessage::Done.token_usage
         ├─ included in SessionSummary.token_usage (listing / get-session)
-        └─ last_prompt_tokens flows through the same channels (SessionRecord,
-           SessionState, DaemonMessage::SessionState, DaemonMessage::Done,
-           SessionSummary)
+        ├─ last_prompt_tokens flows through the same channels (SessionRecord,
+        │  SessionState, DaemonMessage::SessionState, DaemonMessage::Done,
+        │  SessionSummary)
+        └─ status flows through DaemonMessage::SessionState.status and
+           DaemonMessage::SessionStatusChanged for live toolbar display
         │
         ▼
      Clients (tai-tui, tai-gui, tai-im)
