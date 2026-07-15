@@ -11,6 +11,8 @@ use crossterm::event::{
 };
 use mio::unix::pipe;
 use mio::{Events, Interest, Poll, Token};
+use nix::sys::signal::{SigSet, Signal, raise};
+use nix::sys::signalfd::{SfdFlags, SignalFd};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::os::unix::io::AsRawFd;
 use std::{io, thread, time::Duration};
@@ -27,6 +29,28 @@ use tai_tui::{ShellCommand, build_picker, parse_input_line};
 use tui_prompts::State;
 
 const UI_EVENT_CHANNEL_SIZE: usize = 4096;
+
+/// Commands sent from the terminal-event thread to the main loop for
+/// coordinating terminal state around suspend/resume cycles.
+#[derive(Debug)]
+enum ResumeCommand {
+    /// SIGCONT was received — re-initialise raw mode, alternate screen,
+    /// and mouse capture after the terminal pty state was reset.
+    ReinitTerminal,
+    /// SIGTSTP was received — restore the terminal to normal (cooked)
+    /// mode before the process is suspended.
+    PrepareForSuspend,
+}
+
+/// Convert a raw signal number to the corresponding `ResumeCommand`.
+/// Returns `None` for uninteresting signals (including invalid numbers).
+fn signal_to_resume_command(signo: i32) -> Option<ResumeCommand> {
+    match Signal::try_from(signo) {
+        Ok(Signal::SIGCONT) => Some(ResumeCommand::ReinitTerminal),
+        Ok(Signal::SIGTSTP) => Some(ResumeCommand::PrepareForSuspend),
+        _ => None,
+    }
+}
 
 pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     tracing::info!("[tai-tui] run_app starting");
@@ -51,6 +75,22 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // Spawn the background image worker that handles SVG rasterisation and
     // terminal protocol encoding without blocking the UI thread.
     let worker = ImageWorker::spawn(picker);
+
+    // Block SIGCONT and SIGTSTP on this thread so the signalfd (created
+    // below) receives them instead of the default disposition.  The mask
+    // is inherited by all threads spawned after this point, ensuring
+    // signals are never consumed by a thread that isn't watching the
+    // signalfd.
+    //
+    // NOTE: In raw mode, termios ISIG is disabled, so pressing Ctrl+Z in the
+    // terminal sends byte 0x1A to stdin as a regular character — it does NOT
+    // generate SIGTSTP.  The signalfd only catches external SIGTSTP (kill -TSTP,
+    // shell job control).  For Ctrl+Z keyboard suspend, add an explicit
+    // KeyCode::Char('z') + Ctrl match in the page event handlers that calls
+    // handle_resume_command(PrepareForSuspend, ...) and returns early.
+    let sigset = SigSet::from(Signal::SIGCONT) | Signal::SIGTSTP;
+    sigset.thread_block()?;
+    let sig_fd = SignalFd::with_flags(&sigset, SfdFlags::SFD_NONBLOCK | SfdFlags::SFD_CLOEXEC)?;
 
     let connection_ui_tx = ui_tx.clone();
     let connection_task = thread::spawn(move || {
@@ -82,14 +122,16 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // forwards them through a crossbeam channel so the main loop can block on
     // all event sources simultaneously via select!.
     //
-    // The thread uses mio::Poll to wait on TWO file descriptors:
+    // The thread uses mio::Poll to wait on THREE file descriptors:
     //   1. stdin (fd 0) — for crossterm events (keyboard, mouse, resize)
     //   2. a notification pipe — for clean shutdown signalling
+    //   3. a signalfd — for SIGCONT/SIGTSTP (suspend/resume)
     //
     // This is truly event-driven: the thread parks in epoll_wait with no
     // timeout and zero CPU usage while idle.
     let (terminal_tx, terminal_rx) = channel::unbounded::<Event>();
     let (notify_tx, mut notify_rx) = pipe::new()?;
+    let (resume_tx, resume_rx) = channel::unbounded::<ResumeCommand>();
 
     let mut poll = Poll::new()?;
     poll.registry()
@@ -100,18 +142,64 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     poll.registry()
         .register(&mut stdin_source, Token(1), Interest::READABLE)?;
 
+    // Register the signalfd with the mio poll instance so the terminal
+    // thread can wait on it alongside stdin and the notification pipe.
+    let sig_fd_raw = sig_fd.as_raw_fd();
+    let mut sig_source = mio::unix::SourceFd(&sig_fd_raw);
+    poll.registry()
+        .register(&mut sig_source, Token(2), Interest::READABLE)?;
+
     let terminal_handle = thread::spawn(move || {
-        let mut events = Events::with_capacity(2);
+        let mut events = Events::with_capacity(3);
         loop {
-            // Block in epoll_wait until stdin data or shutdown signal.
+            // Block in epoll_wait until stdin data, shutdown signal,
+            // or a caught signal (SIGCONT / SIGTSTP).
             if let Err(e) = poll.poll(&mut events, None) {
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
                 tracing::warn!("[tai-tui] terminal mio poll error: {e}");
                 break;
             }
             for event in &events {
                 match event.token() {
-                    Token(0) => return, // shutdown via pipe
-                    Token(1) => {}      // stdin — drain below
+                    Token(0) => {
+                        // Shutdown via pipe — writer end was dropped
+                        // or an error occurred.  Return unconditionally
+                        // so the thread exits and the main loop can
+                        // join it during cleanup.
+                        return;
+                    }
+                    Token(1) => {
+                        // stdin pty closed — terminal emulator was
+                        // killed or the SSH session dropped.  Break
+                        // out so the main loop sees the channel close
+                        // and shuts down cleanly.
+                        if event.is_read_closed() || event.is_error() {
+                            return;
+                        }
+                    }
+                    Token(2) => {
+                        // Drain all pending signals from the signalfd,
+                        // logging and discarding read errors so a
+                        // transient fd issue doesn't hang the thread.
+                        loop {
+                            match sig_fd.read_signal() {
+                                Ok(Some(info)) => {
+                                    if let Some(cmd) =
+                                        signal_to_resume_command(info.ssi_signo as i32)
+                                    {
+                                        let _ = resume_tx.send(cmd);
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    tracing::warn!("[tai-tui] signalfd read error: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -151,6 +239,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         &ui_rx,
         worker.result_rx,
         &terminal_rx,
+        &resume_rx,
     )
     .map_err(io::Error::from);
 
@@ -189,13 +278,14 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     result
 }
 
-pub(crate) fn run_ui_loop(
+fn run_ui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
     ui_rx: &channel::Receiver<UiEvent>,
     image_result_rx: channel::Receiver<ImageResult>,
     terminal_rx: &channel::Receiver<Event>,
+    resume_rx: &channel::Receiver<ResumeCommand>,
 ) -> Result<(), ClientError> {
     // Render the initial frame immediately so the user sees the UI before
     // any events arrive (the select! below would otherwise block forever).
@@ -243,6 +333,11 @@ pub(crate) fn run_ui_loop(
                     dirty = true;
                 }
             }
+            recv(resume_rx) -> msg => {
+                if let Ok(cmd) = msg {
+                    dirty = handle_resume_command(cmd, terminal)?;
+                }
+            }
         }
 
         // Drain all remaining events from every channel before rendering
@@ -266,6 +361,10 @@ pub(crate) fn run_ui_loop(
                 app.apply_image_result(result);
                 progress = true;
                 dirty = true;
+            }
+            while let Ok(cmd) = resume_rx.try_recv() {
+                progress = true;
+                dirty = handle_resume_command(cmd, terminal)?;
             }
 
             // If none of the channels had anything new the drain is
@@ -317,6 +416,42 @@ pub(crate) fn run_ui_loop(
     }
 
     Ok(())
+}
+
+/// React to a suspend/resume signal from the terminal-event thread.
+///
+/// Returns `true` when re-rendering is necessary (`ReinitTerminal`),
+/// or `false` when the terminal was only torn down (`PrepareForSuspend`).
+fn handle_resume_command(
+    cmd: ResumeCommand,
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+) -> io::Result<bool> {
+    match cmd {
+        ResumeCommand::ReinitTerminal => {
+            tracing::info!("[tai-tui] reinitialising terminal after resume");
+            crossterm::terminal::enable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::terminal::EnterAlternateScreen,
+                crossterm::event::EnableMouseCapture,
+            )?;
+            terminal.clear()?;
+            Ok(true)
+        }
+        ResumeCommand::PrepareForSuspend => {
+            tracing::info!("[tai-tui] restoring terminal for suspend");
+            crossterm::terminal::disable_raw_mode()?;
+            crossterm::execute!(
+                terminal.backend_mut(),
+                crossterm::event::DisableMouseCapture,
+                crossterm::terminal::LeaveAlternateScreen,
+            )?;
+            // Suspend the process.  When SIGCONT resumes us the
+            // terminal-event thread will send ReinitTerminal.
+            raise(Signal::SIGSTOP)?;
+            Ok(false)
+        }
+    }
 }
 
 pub(crate) fn handle_terminal_event(
@@ -1230,4 +1365,36 @@ pub(crate) fn handle_daemon_message(
     tracing::trace!(replaying = was_replay, "replay: restored prior replay flag");
     result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sigcont_maps_to_reinit_terminal() {
+        assert!(matches!(
+            signal_to_resume_command(Signal::SIGCONT as i32),
+            Some(ResumeCommand::ReinitTerminal),
+        ));
+    }
+
+    #[test]
+    fn sigtstp_maps_to_prepare_for_suspend() {
+        assert!(matches!(
+            signal_to_resume_command(Signal::SIGTSTP as i32),
+            Some(ResumeCommand::PrepareForSuspend),
+        ));
+    }
+
+    #[test]
+    fn uninteresting_signal_returns_none() {
+        assert!(signal_to_resume_command(Signal::SIGINT as i32).is_none());
+        assert!(signal_to_resume_command(Signal::SIGTERM as i32).is_none());
+    }
+
+    #[test]
+    fn invalid_signal_number_returns_none() {
+        assert!(signal_to_resume_command(9999).is_none());
+    }
 }

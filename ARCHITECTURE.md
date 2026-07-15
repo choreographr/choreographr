@@ -455,32 +455,67 @@ All new fields use `#[serde(default)]` so old persisted sessions remain compatib
 
 Entry point: `src/main.rs`
 
-Three concurrent tasks:
+**Thread topology:**
+
 ```
 main()
 ├── reader task: read DaemonMessages from socket → push to UI event channel
 ├── writer task: receive ClientMessages from mpsc → write to socket
-└── UI loop: crossterm events (keyboard/mouse) + ratatui rendering
-               │
-                └── per-frame sequence:
-                    1. Drain all pending crossterm events (zero-timeout poll)
-                    2. Drain UI event channel (daemon messages)
-                    3. Drain completed image encoding results from worker thread
-                    4. Consume scroll accumulator → apply batched delta
-                    5. Update history viewport dimensions from terminal size
-                    6. Clamp scroll state to valid range
-                    7. Render via ratatui terminal.draw()
-                    8. If `progress_dirty`, emit OSC 9;4 terminal progress bar
-                       (percentage of `last_prompt_tokens / context_window` for the
-                       attached session, or clear/indeterminate if no data)
-                    9. Blocking poll (~16 ms) to pace frame rate
+├── terminal-event thread: mio::Poll on three fds —
+│   ├── stdin (fd 0) → crossterm events (keyboard, mouse, resize)
+│   ├── notification pipe → clean shutdown signal
+│   └── signalfd → SIGCONT/SIGTSTP (suspend/resume)
+│       └── forwards signals as ResumeCommand via crossbeam channel
+└── UI loop: crossbeam select! on five event sources + ratatui rendering
+```
+
+**Signal handling (suspend/resume):**
+
+`SIGCONT` and `SIGTSTP` are blocked on the main thread via `SigSet::thread_block()`
+before any child threads are spawned, so every thread inherits the mask.
+A `nix::sys::signalfd::SignalFd` registered with `mio::Poll` in the terminal-event
+thread receives these signals and forwards them as `ResumeCommand` messages through
+a crossbeam channel to the UI loop. The UI loop handles `PrepareForSuspend`
+(disable raw mode, leave alternate screen, `raise(SIGSTOP)`) and `ReinitTerminal`
+(re-enable raw mode, re-enter alternate screen, clear).
+
+> **Note:** In raw mode, `termios` `ISIG` is disabled, so pressing Ctrl+Z in the terminal
+> sends byte `0x1A` to stdin as a regular character — it does **not** generate a `SIGTSTP`
+> signal. The signalfd-based suspend only catches external `SIGTSTP` (e.g. from `kill`,
+> shell job control, or another terminal). To support Ctrl+Z keyboard suspend from within
+> the TUI, the page event handlers (`handle_chat_event`, etc.) would need an explicit
+> `KeyCode::Char('z')` + `KeyModifiers::CONTROL` match that calls
+> `handle_resume_command(PrepareForSuspend, …)`.
+
+**Per-frame sequence (UI loop):**
+
+```
+while !app.should_quit:
+  1. Block in crossbeam select! until any event arrives:
+     - terminal events (keyboard, mouse, resize)
+     - daemon messages from the reader task
+     - image encoding results from the worker thread
+     - resume commands from the terminal-event thread
+  2. Drain all five event sources (non-blocking try_recv):
+     - crossterm events
+     - UI event channel (daemon messages)
+     - image result channel
+     - resume commands
+  3. If nothing was dirty, skip render (continue)
+  4. Consume scroll accumulator → apply batched delta
+  5. Update history viewport dimensions from terminal size
+  6. Clamp scroll state to valid range
+  7. Render via ratatui terminal.draw()
+  8. If `progress_dirty`, emit OSC 9;4 terminal progress bar
+     (percentage of `last_prompt_tokens / context_window` for the
+     attached session, or clear/indeterminate if no data)
 ```
 
 **Module breakdown:**
 
 | Module | Purpose |
 |---|---|---|
-| `connection.rs` | Socket setup, event loop, shutdown signal handling, input/keyboard/mouse dispatch, daemon message routing. Mouse scroll events are accumulated per-frame rather than applied immediately — the delta is consumed in batch before each render (see `apply_scroll_delta`). |
+| `connection.rs` | Socket setup, event loop, shutdown signal handling, input/keyboard/mouse dispatch, daemon message routing, terminal suspend/resume signal handling. Mouse scroll events are accumulated per-frame rather than applied immediately — the delta is consumed in batch before each render (see `apply_scroll_delta`). |
 | `state.rs` | `App` struct: input buffer, request tracking, `ClientHistory`, scroll state (`HistoryScrollState`), and the per-frame scroll accumulator (`scroll_accumulator`) consumed by `apply_scroll_delta()`. |
 | `render.rs` | Ratatui rendering: history pane (top) + command input + status bar (bottom), word wrap, Unicode width. Includes side-by-side diff rendering with syntax-highlighted per-token spans overlaid on red/green structural diff backgrounds. Does **not** mutate scroll state or viewport dimensions — those are updated in the event loop before `terminal.draw()`. |
 | `syntax.rs` | Shared syntect helpers (`syntax_set`, `theme_set`, `highlight_theme`, `to_ratatui_color`, `language_for_path`). Extracted to avoid duplication between `markdown_render.rs` and `diff_render.rs`. |

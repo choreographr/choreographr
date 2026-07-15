@@ -12,7 +12,7 @@ zlob = "1.6"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 hex = "0.4"
-libc = "0.2"
+libc.workspace = true
 
 gix = { version = "0.85", features = ["tree-editor"] }
 gix-imara-diff = { version = "0.2", features = ["unified_diff"] }
@@ -55,5 +55,5 @@ postcard.workspace = true
 
 [dev-dependencies]
 filetime = "0.2"
-libc = "0.2"
+libc.workspace = true
 serial_test = "3"
