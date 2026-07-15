@@ -3,33 +3,34 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::StatefulWidget;
 
-/// A vertical scrollbar with a fixed 1-cell-high thumb rendered at
-/// half-block sub-cell precision.
+/// A vertical scrollbar whose thumb height is proportional to the
+/// fraction of content visible in the viewport.
 ///
-/// The thumb is always 1 terminal cell tall but can start at any
-/// half-cell boundary, producing smooth sub-cell movement using
-/// `▀`/`▄`/`█` Unicode block characters.
+/// The thumb is rendered at half-block sub-cell precision using
+/// `▀`/`▄`/`█` Unicode block characters.  When almost all content fits
+/// the viewport the thumb fills most of the track; when only a small
+/// fraction is visible the thumb shrinks to a minimum of one cell.
 ///
 /// Clicking on the track jumps to that position. Dragging the thumb
 /// is supported via the `scrollbar_dragging` field on `App`.
 #[derive(Debug, Clone)]
-pub(crate) struct FixedScrollbar {
+pub(crate) struct SmoothScrollbar {
     thumb_fg: Option<Color>,
     track_bg: Option<Color>,
 }
 
-/// State for [`FixedScrollbar`].
+/// State for [`SmoothScrollbar`].
 ///
 /// Mirrors ratatui's `ScrollbarState` in API so the two can be
 /// swapped with minimal diff.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash)]
-pub(crate) struct FixedScrollbarState {
+pub(crate) struct SmoothScrollbarState {
     content_length: usize,
     position: usize,
     viewport_content_length: usize,
 }
 
-impl FixedScrollbar {
+impl SmoothScrollbar {
     pub(crate) const fn new() -> Self {
         Self {
             thumb_fg: None,
@@ -52,7 +53,7 @@ impl FixedScrollbar {
     }
 }
 
-impl FixedScrollbarState {
+impl SmoothScrollbarState {
     pub(crate) const fn new(content_length: usize) -> Self {
         Self {
             content_length,
@@ -72,8 +73,8 @@ impl FixedScrollbarState {
     }
 }
 
-impl StatefulWidget for FixedScrollbar {
-    type State = FixedScrollbarState;
+impl StatefulWidget for SmoothScrollbar {
+    type State = SmoothScrollbarState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let track_height = area.height as usize;
@@ -86,12 +87,21 @@ impl StatefulWidget for FixedScrollbar {
             .saturating_sub(state.viewport_content_length)
             .max(1);
 
-        // 2× virtual resolution — each terminal cell has two
-        // half-cell slots (top and bottom). The thumb occupies
-        // exactly 2 virtual units (1 cell) and can start at any
-        // half-cell boundary for smooth sub-cell motion.
-        let max_virtual = 2 * track_height - 2;
-        let thumb_start = (state.position * 2 * track_height / scroll_range).min(max_virtual);
+        let virtual_track = 2 * track_height;
+
+        // Thumb height in virtual half-cell slots, proportional to
+        // the fraction of content visible in the viewport, clamped
+        // to at least 1 terminal cell (2 slots).
+        let thumb_slots = (state.viewport_content_length * virtual_track / state.content_length)
+            .clamp(2, virtual_track);
+
+        // The thumb can slide through the remaining virtual space.
+        let virtual_scroll_range = virtual_track - thumb_slots;
+
+        // Start position of the thumb (in virtual slots) mapped from
+        // the content-scroll position.
+        let thumb_start =
+            (state.position * virtual_scroll_range / scroll_range).min(virtual_scroll_range);
 
         // Build the three style variants from the optional colors.
         let mut full_style = Style::default();
@@ -110,8 +120,9 @@ impl StatefulWidget for FixedScrollbar {
             let top_slot = 2 * i;
             let bot_slot = 2 * i + 1;
 
-            let top_in_thumb = top_slot >= thumb_start && top_slot < thumb_start + 2;
-            let bot_in_thumb = bot_slot >= thumb_start && bot_slot < thumb_start + 2;
+            let thumb_end = thumb_start + thumb_slots;
+            let top_in_thumb = top_slot >= thumb_start && top_slot < thumb_end;
+            let bot_in_thumb = bot_slot >= thumb_start && bot_slot < thumb_end;
 
             let y = area.y + i as u16;
             let x = area.x;
@@ -151,10 +162,10 @@ mod tests {
         position: usize,
     ) -> Vec<String> {
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, height));
-        let scrollbar = FixedScrollbar::new()
+        let scrollbar = SmoothScrollbar::new()
             .thumb_fg(Color::Gray)
             .track_bg(Color::DarkGray);
-        let mut state = FixedScrollbarState::new(content_length)
+        let mut state = SmoothScrollbarState::new(content_length)
             .position(position)
             .viewport_content_length(viewport_content_length);
         scrollbar.render(buf.area, &mut buf, &mut state);
@@ -165,54 +176,63 @@ mod tests {
 
     #[test]
     fn thumb_at_top_when_position_zero() {
-        // H=5, content=10, viewport=3 → scroll_range=7
-        // position=0 → thumb_start = 0*2*5/7 = 0
-        // virtual [0,2) → row 0: both halves → "█"
-        //              → rows 1..4: neither → " "
+        // H=5, content=10, viewport=3 → virtual_track=10,
+        //   thumb_slots = 3*10/10 = 3, virtual_scroll_range=7,
+        //   scroll_range=7
+        // position=0 → thumb_start = 0*7/7 = 0
+        // virtual [0,3) → row 0: slots [0,1] → "█"
+        //              → row 1: slots [2,3) → top (2) in, bot (3) not → "▀"
+        //              → rows 2..4: neither → " "
         let symbols = render_to_symbols(5, 10, 3, 0);
-        assert_eq!(symbols[0], "█", "thumb should be at row 0");
-        for i in 1..5 {
+        assert_eq!(symbols[0], "█", "row 0 should be full thumb");
+        assert_eq!(symbols[1], "▀", "row 1 should be upper half");
+        for i in 2..5 {
             assert_eq!(symbols[i], " ", "row {i} should be track");
         }
     }
 
     #[test]
     fn thumb_at_bottom_when_position_at_max() {
-        // H=5, content=10, viewport=3 → scroll_range=7
-        // position=7 → thumb_start = min(7*2*5/7=10, 8) = 8
-        // virtual [8,10) → row 4: both halves → "█"
+        // H=5, content=10, viewport=3 → virtual_track=10,
+        //   thumb_slots=3, virtual_scroll_range=7, scroll_range=7
+        // position=7 → thumb_start = 7*7/7 = 7
+        // virtual [7,10) → row 3: slot 6 not in, slot 7 in → "▄"
+        //               → row 4: slots [8,9] → "█"
         let symbols = render_to_symbols(5, 10, 3, 7);
-        assert_eq!(symbols[4], "█", "thumb should be at row 4");
-        for i in 0..4 {
+        assert_eq!(symbols[3], "▄", "row 3 should be lower half");
+        assert_eq!(symbols[4], "█", "row 4 should be full thumb");
+        for i in 0..3 {
             assert_eq!(symbols[i], " ", "row {i} should be track");
         }
     }
 
     #[test]
     fn thumb_mid_position() {
-        // H=5, content=10, viewport=1 → scroll_range=9
-        // position=4 → thumb_start = 4*2*5/9 = 4
-        // virtual [4,6) → row 2 covers slots 4,5 → "█"
-        let symbols = render_to_symbols(5, 10, 1, 4);
-        assert_eq!(symbols[2], "█", "thumb should be at row 2");
-    }
-
-    #[test]
-    fn subcell_precision_halfway() {
-        // H=5, content=10, viewport=1 → scroll_range=9
-        // position=3 → thumb_start = 3*2*5/9 = 3 (truncated)
+        // H=5, content=10, viewport=1 → thumb_slots=2 (min),
+        //   virtual_scroll_range=8, scroll_range=9
+        // position=4 → thumb_start = 4*8/9 = 3
         // virtual [3,5) → row 1: bottom half (slot 3)  → "▄"
         //              → row 2: top half (slot 4)     → "▀"
-        let symbols = render_to_symbols(5, 10, 1, 3);
+        let symbols = render_to_symbols(5, 10, 1, 4);
         assert_eq!(symbols[1], "▄", "row 1 should be lower half (slot 3)");
         assert_eq!(symbols[2], "▀", "row 2 should be upper half (slot 4)");
     }
 
     #[test]
+    fn subcell_precision_halfway() {
+        // H=5, content=10, viewport=1 → thumb_slots=2 (min),
+        //   virtual_scroll_range=8, scroll_range=9
+        // position=3 → thumb_start = 3*8/9 = 2
+        // virtual [2,4) → row 1: both halves (slots 2,3) → "█"
+        let symbols = render_to_symbols(5, 10, 1, 3);
+        assert_eq!(symbols[1], "█", "row 1 should be full thumb");
+    }
+
+    #[test]
     fn empty_content_renders_nothing() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, 5));
-        let mut state = FixedScrollbarState::new(0);
-        FixedScrollbar::new().render(buf.area, &mut buf, &mut state);
+        let mut state = SmoothScrollbarState::new(0);
+        SmoothScrollbar::new().render(buf.area, &mut buf, &mut state);
         for i in 0..5u16 {
             assert_eq!(buf.cell((0, i)).unwrap().symbol(), " ");
         }
@@ -221,17 +241,33 @@ mod tests {
     #[test]
     fn zero_height_does_not_panic() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, 0));
-        let mut state = FixedScrollbarState::new(10)
+        let mut state = SmoothScrollbarState::new(10)
             .position(5)
             .viewport_content_length(3);
-        FixedScrollbar::new().render(buf.area, &mut buf, &mut state);
+        SmoothScrollbar::new().render(buf.area, &mut buf, &mut state);
     }
 
     #[test]
-    fn content_fits_viewport() {
-        // When content_length == viewport_content_length, scroll_range == 1.
-        // position=0 → thumb_start = 0 → row 0: full thumb.
+    fn content_fills_track_when_viewport_matches_content() {
+        // content=10, viewport=10 → thumb_slots = 10*10/10 = 10
+        // (fills the whole 5-cell track).  scroll_range = max(1) = 1.
         let symbols = render_to_symbols(5, 10, 10, 0);
-        assert_eq!(symbols[0], "█");
+        for i in 0..5 {
+            assert_eq!(symbols[i as usize], "█", "row {i} should be full thumb");
+        }
+    }
+
+    #[test]
+    fn thumb_size_scales_with_viewport_ratio() {
+        // H=10, content=100, viewport=50 → 50% visible.
+        //   thumb_slots = 50*20/100 = 10 (5 cells out of 10).
+        let symbols = render_to_symbols(10, 100, 50, 0);
+        // First 5 rows are thumb (10 virtual slots = 5 cells).
+        for i in 0..5 {
+            assert_eq!(symbols[i], "█", "row {i} should be full thumb");
+        }
+        for i in 5..10 {
+            assert_eq!(symbols[i], " ", "row {i} should be track");
+        }
     }
 }

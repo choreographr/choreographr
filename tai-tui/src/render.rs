@@ -2,7 +2,7 @@ use crate::diff_render::build_diff_panes;
 use crate::markdown_render::{
     display_width, lines_height, session_message_lines, streaming_text_lines,
 };
-use crate::scrollbar::{FixedScrollbar, FixedScrollbarState};
+use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT,
@@ -59,11 +59,12 @@ pub(crate) fn mouse_in_scrollbar_column(column: u16, row: u16) -> bool {
 /// Build a scrollbar widget with the shared style used across all
 /// list views.
 ///
-/// Uses a light-gray thumb on a dark-gray track.  The thumb is
-/// always 1 cell tall and rendered with half-block Unicode
-/// characters for smooth sub-cell positioning.
-fn vertical_scrollbar() -> FixedScrollbar {
-    FixedScrollbar::new()
+/// Uses a light-gray thumb on a dark-gray track.  The thumb height
+/// is proportional to the fraction of content visible in the
+/// viewport, rendered with half-block Unicode characters for
+/// smooth sub-cell positioning.
+fn vertical_scrollbar() -> SmoothScrollbar {
+    SmoothScrollbar::new()
         .thumb_fg(Color::DarkGray)
         .track_bg(Color::Rgb(60, 60, 60))
 }
@@ -279,7 +280,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_stateful_widget(
             vertical_scrollbar(),
             history_chunks[1],
-            &mut FixedScrollbarState::new(total_height)
+            &mut SmoothScrollbarState::new(total_height)
                 .position(position)
                 .viewport_content_length(viewport_height),
         );
@@ -1100,7 +1101,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_stateful_widget(
             vertical_scrollbar(),
             list_chunks[1],
-            &mut FixedScrollbarState::new(total_items)
+            &mut SmoothScrollbarState::new(total_items)
                 .position(scroll)
                 .viewport_content_length(max_rows),
         );
@@ -1336,7 +1337,7 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_stateful_widget(
             vertical_scrollbar(),
             list_chunks[1],
-            &mut FixedScrollbarState::new(total_items)
+            &mut SmoothScrollbarState::new(total_items)
                 .position(scroll)
                 .viewport_content_length(items_per_page),
         );
