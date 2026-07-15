@@ -9,7 +9,7 @@ A local AI terminal interface in Rust. Supports multiple LLM providers (OpenAI-c
 | `tai-daemon` | Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directory), runs requests with tool-call loop, and streams responses |
 | `tai-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio |
 | `tai-tui` | Full-screen terminal UI client (ratatui + crossterm) |
-| `tai-dioxus` | Minimal desktop GUI client |
+| `tai-gui` | Minimal desktop GUI client |
 | `tai-im` | Instant messaging bridge (Telegram) that connects to the daemon |
 | `tai-client-core` | Shared parsing, markdown, and image assembly for UI clients |
 | `tai-proto` | Framed binary protocol used between client and daemon |
@@ -79,7 +79,7 @@ Then a client:
 
 ```bash
 cargo run -p tai-tui     # terminal UI
-cargo run -p tai-dioxus  # desktop app
+cargo run -p tai-gui  # desktop app
 cargo run -p tai-im      # IM bridge
 ```
 

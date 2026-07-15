@@ -7,7 +7,7 @@ members = [
     "tai-mcp",
     "tai-proto",
     "tai-tui",
-    "tai-dioxus",
+    "tai-gui",
     "tai-im",
     "tai-transport",
 ]

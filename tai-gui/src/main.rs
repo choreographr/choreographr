@@ -20,7 +20,7 @@ use tai_proto::socket_path;
 static CONNECTION_MODE: OnceLock<ConnectionMode> = OnceLock::new();
 
 #[derive(Parser)]
-#[command(name = "tai-dioxus", about = "Tai AI desktop GUI")]
+#[command(name = "tai-gui", about = "Tai AI desktop GUI")]
 struct Cli {
     /// Connect via TCP/Noise IK at this address (e.g. 127.0.0.1:9443)
     #[arg(long = "tcp-addr")]
@@ -51,7 +51,7 @@ fn main() {
     let _ = CONNECTION_MODE.set(mode);
 
     dioxus::LaunchBuilder::desktop()
-        .with_cfg(Config::new().with_window(WindowBuilder::new().with_title("tai-dioxus")))
+        .with_cfg(Config::new().with_window(WindowBuilder::new().with_title("tai-gui")))
         .launch(App);
 }
 

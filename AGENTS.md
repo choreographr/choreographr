@@ -42,7 +42,7 @@ Never use `expect()`, `unwrap()`, or `panic!()` in production code. These create
 
 ## Logging
 
-All crates in the workspace (`tai-daemon`, `tai-client-core`, `tai-keystore`, `tai-im`, `tai-dioxus`, `tai-markdown`, `tai-proto`, `tai-tui`) must log extensively using the `tracing` crate. Every module should emit `tracing` events (`info!`, `warn!`, `error!`, `debug!`, `trace!`) at appropriate levels to provide observability into key operations, state transitions, and error conditions.
+All crates in the workspace (`tai-daemon`, `tai-client-core`, `tai-keystore`, `tai-im`, `tai-gui`, `tai-markdown`, `tai-proto`, `tai-tui`) must log extensively using the `tracing` crate. Every module should emit `tracing` events (`info!`, `warn!`, `error!`, `debug!`, `trace!`) at appropriate levels to provide observability into key operations, state transitions, and error conditions.
 
 In the `tai-tui` crate specifically, do not use `eprintln!` for diagnostics — output goes to `/tmp/tai-tui.log`.
 

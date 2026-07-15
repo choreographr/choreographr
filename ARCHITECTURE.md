@@ -12,7 +12,7 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 │   tai-tui     │◄──────────────────►│              │◄──────────────►│  OpenAI API          │
 │  (terminal)  │                    │              │                ├──────────────────────┤
 ├──────────────┤                    │  tai-daemon  │◄──────────────►│  Anthropic Messages   │
-│ tai-dioxus   │◄──────────────────►│              │                ├──────────────────────┤
+│ tai-gui       │◄──────────────────►│              │                ├──────────────────────┤
 │  (desktop)   │    Unix socket     │              │◄──────────────►│  Google Gemini API    │
 ├──────────────┤                    │              │                ├──────────────────────┤
 │   tai-im     │◄──────────────────►│              │◄──────────────►│  Mistral API          │
@@ -40,7 +40,7 @@ tai (workspace)
 │                       discovers tools, and dispatches tool calls over JSON-RPC stdio
 ├── tai-daemon          Unix socket server — the core engine
 ├── tai-tui              Terminal UI client (ratatui + crossterm)
-├── tai-dioxus          Desktop GUI client (Dioxus)
+├── tai-gui              Desktop GUI client (Dioxus)
 └── tai-im              IM platform bridge (Telegram)
 ```
 
@@ -66,7 +66,7 @@ tai (workspace)
             │  └────────┬────────┘                  │
             │           │                   ┌───────▼──────┐
        ┌────▼───┐ ┌────▼────┐ ┌────▼───┐   │   tai-mcp    │
-       │tai-tui  │ │tai-dioxus│ │tai-im  │   │ (MCP client)│
+       │tai-tui  │ │tai-gui   │ │tai-im  │   │ (MCP client)│
        └────────┘ └─────────┘ └────────┘   └──────────────┘
 ```
 
@@ -181,12 +181,12 @@ encrypted stream enters the same dispatch loop as Unix socket clients.
 
 ### `tai-client-core` — Shared client logic
 
-Used by `tai-tui`, `tai-dioxus`, and `tai-im`.
+Used by `tai-tui`, `tai-gui`, and `tai-im`.
 
 | Module | Purpose |
 |---|---|---|
 | `shell.rs` | Parses terminal input into `ShellCommand`: `/ping`, `/models`, `/model` (alias), `/cancel`, `/unlock`, `/lock`, `/image`, `/add-key`, `/add-x`, `/remove-key`, or `RunInput(prompt)`. All commands use `/` prefix exclusively; `parse_command()` is the single dispatch point. |
-| `credentials.rs` | Shared helpers: `resolve_private_key()` (read or decrypt the identity key), `build_add_credential_message()` (encrypt and package a credential for the daemon), `read_public_key_bytes()`. Eliminates duplicated logic across `tai-tui`, `tai-dioxus`, and `tai-im`. |
+| `credentials.rs` | Shared helpers: `resolve_private_key()` (read or decrypt the identity key), `build_add_credential_message()` (encrypt and package a credential for the daemon), `read_public_key_bytes()`. Eliminates duplicated logic across `tai-tui`, `tai-gui`, and `tai-im`. |
 | `image.rs` | `ImageAssembler` — kept for legacy `tai-im` use. No longer used by TUI/Dioxus (images delivered mid-turn as `DisplayedImage` via `SessionMessageAppended`). |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text, structured diffs) |
 | `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
@@ -404,7 +404,7 @@ LLM provider (API response)
            SessionSummary)
         │
         ▼
-     Clients (tai-tui, tai-dioxus, tai-im)
+     Clients (tai-tui, tai-gui, tai-im)
        ├─ tai-tui: displays in session detail view (render.rs:render_session_detail_view)
        │  as "Context:  current / limit (pct%)"
        └─ tai-tui: terminal progress bar uses last_prompt_tokens vs context_window
@@ -526,7 +526,7 @@ while !app.should_quit:
 | `terminal_progress.rs` | Terminal-native progress bar via OSC 9;4 escape sequences. Cached capability detection, percentage/indeterminate/remove modes based on `last_prompt_tokens` vs `context_window`. |
 
 
-### `tai-dioxus` — Desktop client
+### `tai-gui` — Desktop client
 
 Entry point: `src/main.rs`
 
@@ -1410,7 +1410,7 @@ Sandboxing (shared across all shell/exec tools via `shell_util.rs`):
 | Daemon OpenAI | SSE parsing, HTTP request construction, config loading | `tai-daemon/src/openai/tests.rs` |
 | Daemon Anthropic | Content block deserialisation, response→turn result conversion, message payload building, config overrides | `tai-daemon/src/anthropic/tests.rs` |
 | tai-tui | SVG rasterization, Unicode width, app state | `tai-tui/src/app_tests.rs`, `tai-tui/src/lib_tests.rs` |
-| tai-dioxus | App state, render helpers | `tai-dioxus/src/app_tests.rs` |
+| tai-gui | App state, render helpers | `tai-gui/src/app_tests.rs` |
 
 **Test infrastructure:** Tests use `UnixStream::pair()` for socket-less daemon↔client
 communication, and mock HTTP servers for API simulation.
@@ -1439,7 +1439,7 @@ cargo run -p tai-daemon
 cargo run -p tai-tui
 
 # Run desktop client
-cargo run -p tai-dioxus
+cargo run -p tai-gui
 
 # Run IM bridge (Telegram)
 cargo run -p tai-im -- telegram
@@ -1458,7 +1458,7 @@ cargo run -p tai-im -- telegram
 | `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
 | `ratatui` + `crossterm` | tai-tui | Terminal UI |
-| `dioxus` | tai-dioxus | Desktop UI |
+| `dioxus` | tai-gui | Desktop UI |
 | `image` + `resvg` | daemon, tai-tui | Image decoding, SVG rasterization |
 | `syntect` | tai-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
