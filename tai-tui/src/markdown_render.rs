@@ -108,15 +108,11 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
             {
-                append_section(
-                    &mut lines,
-                    "reasoning",
-                    plain_text_lines(reasoning_text),
-                    Color::DarkGray,
-                );
+                heading_line(&mut lines, "Reasoning", Color::DarkGray);
+                lines.extend(markdown_lines(reasoning_text, width));
             }
-            let body = markdown_lines(content, width);
-            append_section(&mut lines, "assistant", body, Color::Cyan);
+            heading_line(&mut lines, "Response", Color::Cyan);
+            lines.extend(markdown_lines(content, width));
             lines
         }
         SessionMessage::AssistantToolUse {
@@ -130,20 +126,12 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
             {
-                append_section(
-                    &mut lines,
-                    "reasoning",
-                    plain_text_lines(reasoning_text),
-                    Color::DarkGray,
-                );
+                heading_line(&mut lines, "Reasoning", Color::DarkGray);
+                lines.extend(markdown_lines(reasoning_text, width));
             }
             if let Some(content) = content.as_deref().filter(|value| !value.trim().is_empty()) {
-                append_section(
-                    &mut lines,
-                    "content",
-                    markdown_lines(content, width),
-                    Color::Cyan,
-                );
+                heading_line(&mut lines, "Response", Color::Cyan);
+                lines.extend(markdown_lines(content, width));
             }
             lines.push(Line::from(Span::styled(
                 format!(
@@ -206,21 +194,13 @@ pub(crate) fn streaming_text_lines(text: &StreamingText, width: u16) -> Vec<Line
     ))];
 
     if !text.reasoning.is_empty() {
-        append_section(
-            &mut lines,
-            "reasoning",
-            plain_text_lines(&text.reasoning),
-            Color::DarkGray,
-        );
+        heading_line(&mut lines, "Reasoning", Color::DarkGray);
+        lines.extend(plain_text_lines(&text.reasoning));
     }
 
     if !text.answer.is_empty() {
-        append_section(
-            &mut lines,
-            "answer",
-            markdown_lines(&text.answer, width),
-            Color::Cyan,
-        );
+        heading_line(&mut lines, "Response", Color::Cyan);
+        lines.extend(markdown_lines(&text.answer, width));
     }
 
     if text.reasoning.is_empty() && text.answer.is_empty() {
@@ -244,6 +224,24 @@ fn prefixed_lines(
     let mut lines = Vec::new();
     append_section(&mut lines, label, body, color);
     lines
+}
+
+/// Push a standalone heading line (e.g. "Reasoning:" or "Response:") with a
+/// blank separator before it if there is already content above.
+///
+/// Why a standalone heading instead of the old `append_section` approach
+/// (which prefixed the label to the first content line)?  Because the new
+/// assistant-message visual style renders headings on their own row, and
+/// streaming text should match the non-streaming layout so that section
+/// headers look consistent whether or not the stream has finished.
+fn heading_line(lines: &mut Vec<Line<'static>>, heading: &'static str, color: Color) {
+    if !lines.is_empty() {
+        lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("{heading}:"),
+        Style::default().fg(color),
+    )));
 }
 
 fn append_section(
@@ -1437,10 +1435,11 @@ mod tests {
             token_usage: None,
         };
         let lines = session_message_lines(&msg, 80);
-        // First line should be the "reasoning" label
-        assert!(
-            lines[0].to_string().contains("reasoning"),
-            "first line should show reasoning label: {:?}",
+        // The "Reasoning" heading should be on its own line
+        assert_eq!(
+            lines[0].to_string(),
+            "Reasoning:",
+            "first line should be the Reasoning heading: {:?}",
             lines[0].to_string()
         );
         // The reasoning body should be present
@@ -1453,7 +1452,12 @@ mod tests {
             all_text.contains("Let me think step by step."),
             "reasoning text should appear"
         );
-        // The answer text should appear after the reasoning section
+        // The "Response" heading should appear before the answer
+        assert!(
+            all_text.contains("Response:"),
+            "Response heading should appear"
+        );
+        // The answer text should appear after the Reasoning section
         assert!(
             all_text.contains("The answer is 42."),
             "answer text should appear"
@@ -1540,10 +1544,11 @@ mod tests {
             token_usage: None,
         };
         let lines = session_message_lines(&msg, 80);
-        // Should start directly with the assistant label
-        assert!(
-            lines[0].to_string().contains("assistant"),
-            "first line should show assistant label: {:?}",
+        // First line should be the "Response" heading
+        assert_eq!(
+            lines[0].to_string(),
+            "Response:",
+            "first line should be the Response heading: {:?}",
             lines[0].to_string()
         );
         let all_text: String = lines

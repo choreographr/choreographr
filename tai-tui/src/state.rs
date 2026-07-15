@@ -593,8 +593,13 @@ impl HistoryViewport {
                 history_text_height(text, self.width.saturating_sub(2)).max(1) + 1
             }
             HistoryItem::SessionMessage(message) => {
-                let content_width = if matches!(message, SessionMessage::AssistantText { .. }) {
-                    self.width.saturating_sub(4)
+                let content_width = if matches!(
+                    message,
+                    SessionMessage::AssistantText { .. }
+                        | SessionMessage::AssistantToolUse { .. }
+                        | SessionMessage::UserText { .. }
+                ) {
+                    self.width.saturating_sub(9)
                 } else {
                     self.width.saturating_sub(2)
                 };

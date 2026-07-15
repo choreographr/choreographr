@@ -76,8 +76,8 @@ fn append_stream_text_preserves_manual_scroll_position() {
         app.history_scroll.follow_output()
     );
     assert_eq!(app.history_scroll.scroll(), 3);
-    assert_eq!(app.history_scroll.scroll_compensation(), 2);
-    assert_eq!(app.effective_scroll(), 5);
+    assert_eq!(app.history_scroll.scroll_compensation(), 3);
+    assert_eq!(app.effective_scroll(), 6);
     assert!(!app.history_scroll.follow_output());
 }
 
@@ -127,8 +127,9 @@ fn streaming_text_lines_include_reasoning_and_answer() {
     );
 
     assert_eq!(lines[0].to_string(), "[9]");
-    assert_eq!(lines[2].to_string(), "reasoning: step by step");
-    assert_eq!(lines[4].to_string(), "answer: final");
+    // Indices: [9], "", "Reasoning:", "step by step", "", "Response:", "final"
+    assert_eq!(lines[3].to_string(), "step by step");
+    assert_eq!(lines[6].to_string(), "final");
 }
 
 #[test]
@@ -143,10 +144,11 @@ fn streaming_text_lines_preserve_newlines() {
     );
 
     assert_eq!(lines[0].to_string(), "[3]");
-    assert_eq!(lines[2].to_string(), "reasoning: line one");
-    assert_eq!(lines[3].to_string(), "line two");
-    assert_eq!(lines[5].to_string(), "answer: final one");
-    assert_eq!(lines[6].to_string(), "final two");
+    // Indices: [3], "", "Reasoning:", "line one", "line two", "", "Response:", "final one", "final two"
+    assert_eq!(lines[3].to_string(), "line one");
+    assert_eq!(lines[4].to_string(), "line two");
+    assert_eq!(lines[7].to_string(), "final one");
+    assert_eq!(lines[8].to_string(), "final two");
 }
 
 #[test]
@@ -911,8 +913,8 @@ fn streaming_growth_above_viewport_preserves_visible_content_offset() {
     app.append_stream_text(7, OutputStream::Answer, "123456");
 
     assert_eq!(app.history_scroll.scroll(), 2);
-    assert_eq!(app.history_scroll.scroll_compensation(), 5);
-    assert_eq!(app.effective_scroll(), 7);
+    assert_eq!(app.history_scroll.scroll_compensation(), 6);
+    assert_eq!(app.effective_scroll(), 8);
     assert!(!app.history_scroll.follow_output());
 }
 

@@ -23,6 +23,10 @@ use tui_prompts::{
     Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
 };
 
+/// Dark-gray background shade used for highlighted message bodies and the
+/// scrollbar track.
+const BG_SHADE: Color = Color::Rgb(60, 60, 60);
+
 /// Terminal dimensions for the chat history page, excluding the input bar
 /// and status bar at the bottom. Returns `None` when the terminal is too
 /// small for the history area to be meaningful.
@@ -66,7 +70,7 @@ pub(crate) fn mouse_in_scrollbar_column(column: u16, row: u16) -> bool {
 fn vertical_scrollbar() -> SmoothScrollbar {
     SmoothScrollbar::new()
         .thumb_fg(Color::DarkGray)
-        .track_bg(Color::Rgb(60, 60, 60))
+        .track_bg(BG_SHADE)
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -377,7 +381,6 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 
     let content_width = area.width.saturating_sub(2);
-    let assistant_content_width = area.width.saturating_sub(4);
     let user_content_width = area.width.saturating_sub(9);
 
     // Ensure the render cache is aligned with the history vector before
@@ -415,7 +418,6 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             HistoryItem::SessionMessage(message) => {
                 let widths = RenderWidths {
                     content_width,
-                    assistant_content_width,
                     user_content_width,
                 };
                 render_item_session_message(
@@ -566,38 +568,78 @@ pub(crate) fn render_history_text(
     );
 }
 
-/// Wrap each content line with green margin characters on the left and right,
-/// and prepend a blank separator line that also has margin characters.
-/// Returns the display-ready lines and the total row count.
-fn add_margin_lines(lines: Vec<Line<'static>>, content_width: u16) -> (Vec<Line<'static>>, usize) {
-    let margin_green = Style::default().fg(Color::Green);
-    let cw = content_width as usize;
+/// Number of structural rows added by `add_margin_lines` around the content:
+/// top separator, top padding, bottom padding, bottom separator.
+const STRUCTURAL_ROWS: usize = 4;
 
-    // Blank separator line: "│" + spaces + "│"
-    let separator = Line::from(vec![
-        Span::styled("│ ".to_string(), margin_green),
-        Span::styled(" ".repeat(cw), Style::default()),
-        Span::styled(" │".to_string(), margin_green),
+/// Wrap content lines with a vertical accent bar on the left and dark-gray
+/// background shading, so assistant and user messages share the same layout
+/// but differ only in the bar colour.
+///
+/// Layout per text row (see also doc-comment on `add_user_margin_lines`):
+///   Col 0-1     empty, no shading
+///   Col 2       ┃ (heavy vertical, `accent` colour)
+///   Col 3-4     padding, shaded (`BG_SHADE`)
+///   Col 5..W-5  text content, shaded
+///   Col W-4..W-3  padding, shaded
+///   Col W-2..W-1  empty, no shading
+///
+/// The caller must apply `.style(Style::default().bg(BG_SHADE))` on the
+/// Paragraph so text spans inherit the background without per-span overrides.
+fn add_margin_lines(
+    lines: Vec<Line<'static>>,
+    content_width: u16,
+    accent: Color,
+) -> (Vec<Line<'static>>, usize) {
+    let gray = Style::default().bg(BG_SHADE);
+    let no_shading = Style::default().bg(Color::Reset);
+    let accent_line = Style::default().fg(accent).bg(Color::Reset);
+    let total_width = content_width as usize + 9; // full row width = area.width
+    let shaded_content = content_width as usize + 4; // cols 3..W-3 for padding rows
+
+    // Top/bottom separator: no shading
+    let separator = Line::from(vec![Span::styled(" ".repeat(total_width), no_shading)]);
+
+    // Padding row: shading on cols 3..W-3, no text
+    let padding = Line::from(vec![
+        Span::styled("  ", no_shading),
+        Span::styled("┃", accent_line),
+        Span::styled(" ".repeat(shaded_content), gray),
+        Span::styled("  ", no_shading),
     ]);
 
-    let mut result = Vec::with_capacity(lines.len() + 1);
-    result.push(separator);
+    let mut result = Vec::with_capacity(lines.len() + STRUCTURAL_ROWS);
+    result.push(separator.clone());
+    result.push(padding.clone());
 
     for line in lines {
-        let text_width: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
-        let mut spans = Vec::with_capacity(line.spans.len() + 3);
-        spans.push(Span::styled("│ ".to_string(), margin_green));
+        let fill = (content_width as usize).saturating_sub(line.width());
+
+        let mut spans = vec![
+            Span::styled("  ", no_shading),
+            Span::styled("┃", accent_line),
+            Span::styled("  ", gray),
+        ];
         spans.extend(line.spans);
-        let padding = cw.saturating_sub(text_width);
-        if padding > 0 {
-            spans.push(Span::styled(" ".repeat(padding), Style::default()));
-        }
-        spans.push(Span::styled(" │".to_string(), margin_green));
+        spans.push(Span::styled(" ".repeat(fill), gray));
+        spans.push(Span::styled("  ", gray));
+        spans.push(Span::styled("  ", no_shading));
+
         result.push(Line::from(spans));
     }
 
+    result.push(padding);
+    result.push(separator);
+
     let total_rows = result.len();
     (result, total_rows)
+}
+
+fn add_assistant_margin_lines(
+    lines: Vec<Line<'static>>,
+    content_width: u16,
+) -> (Vec<Line<'static>>, usize) {
+    add_margin_lines(lines, content_width, Color::Blue)
 }
 
 /// Wrap user-content lines with the user-message visual styling:
@@ -616,56 +658,14 @@ fn add_margin_lines(lines: Vec<Line<'static>>, content_width: u16) -> (Vec<Line<
 ///   Col W-4..W-3: padding, shaded
 ///   Col W-2..W-1: empty, no shading
 ///
-/// The caller must apply `.style(Style::default().bg(Color::Rgb(60, 60, 60)))`
+/// The caller must apply `.style(Style::default().bg(BG_SHADE))`
 /// on the Paragraph so text spans inherit the gray background without explicit
 /// per-span overrides.
 fn add_user_margin_lines(
     lines: Vec<Line<'static>>,
     content_width: u16,
 ) -> (Vec<Line<'static>>, usize) {
-    let gray = Style::default().bg(Color::Rgb(60, 60, 60));
-    let no_shading = Style::default().bg(Color::Reset);
-    let green_line = Style::default().fg(Color::Green).bg(Color::Reset);
-    let total_width = content_width as usize + 9; // full row width = area.width
-    let shaded_content = content_width as usize + 4; // cols 3..W-3 for padding rows
-
-    // Top/bottom separator: no shading
-    let separator = Line::from(vec![Span::styled(" ".repeat(total_width), no_shading)]);
-
-    // Padding row: shading on cols 3..W-3, no text
-    let padding = Line::from(vec![
-        Span::styled("  ", no_shading),
-        Span::styled("┃", green_line),
-        Span::styled(" ".repeat(shaded_content), gray),
-        Span::styled("  ", no_shading),
-    ]);
-
-    let mut result = Vec::with_capacity(lines.len() + 4);
-    result.push(separator.clone());
-    result.push(padding.clone());
-
-    for line in lines {
-        let text_width: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
-        let fill = (content_width as usize).saturating_sub(text_width);
-
-        let mut spans = vec![
-            Span::styled("  ", no_shading),
-            Span::styled("┃", green_line),
-            Span::styled("  ", gray),
-        ];
-        spans.extend(line.spans);
-        spans.push(Span::styled(" ".repeat(fill), gray));
-        spans.push(Span::styled("  ", gray));
-        spans.push(Span::styled("  ", no_shading));
-
-        result.push(Line::from(spans));
-    }
-
-    result.push(padding);
-    result.push(separator);
-
-    let total_rows = result.len();
-    (result, total_rows)
+    add_margin_lines(lines, content_width, Color::Green)
 }
 
 pub(crate) fn render_history_lines(
@@ -743,7 +743,9 @@ fn render_margin_lines(
     );
 }
 
-/// Render assistant-text lines with green margin characters on the left and right.
+/// Render assistant-text lines with a blue vertical bar on the left and
+/// dark-gray background shading, matching the user text style but with a
+/// different accent color.
 fn render_assistant_lines(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -761,8 +763,8 @@ fn render_assistant_lines(
         y,
         rows_to_skip,
         content_width,
-        Style::default(),
-        add_margin_lines,
+        Style::default().bg(BG_SHADE),
+        add_assistant_margin_lines,
     );
 }
 
@@ -785,7 +787,7 @@ fn render_user_lines(
         y,
         rows_to_skip,
         content_width,
-        Style::default().bg(Color::Rgb(60, 60, 60)),
+        Style::default().bg(BG_SHADE),
         add_user_margin_lines,
     );
 }
@@ -798,10 +800,7 @@ struct RenderWidths {
     /// Width for plain-text items (SystemText, ToolResult, etc.):
     ///   area.width - 2  (1-cell left + 1-cell right padding)
     content_width: u16,
-    /// Width for assistant messages (margin chars on both sides):
-    ///   area.width - 4
-    assistant_content_width: u16,
-    /// Width for user messages (green bar + left/right padding):
+    /// Width for user and assistant messages (bar + left/right padding):
     ///   area.width - 9
     user_content_width: u16,
 }
@@ -826,8 +825,8 @@ fn render_item_session_message(
         SessionMessage::AssistantText { .. } | SessionMessage::AssistantToolUse { .. }
     );
     if is_assistant {
-        let lines = cached_or_compute_lines(cache, idx, widths.assistant_content_width, || {
-            session_message_lines(message, widths.assistant_content_width)
+        let lines = cached_or_compute_lines(cache, idx, widths.user_content_width, || {
+            session_message_lines(message, widths.user_content_width)
         });
         render_assistant_lines(
             frame,
@@ -836,7 +835,7 @@ fn render_item_session_message(
             rows_remaining,
             y,
             rows_to_skip,
-            widths.assistant_content_width,
+            widths.user_content_width,
         );
     } else if matches!(message, SessionMessage::UserText { .. }) {
         let lines = cached_or_compute_lines(cache, idx, widths.user_content_width, || {
@@ -1806,18 +1805,18 @@ mod tests {
 
         // Span 2: 2 chars of left padding, shaded (bg explicitly set)
         assert_eq!(spans[2].content, "  ");
-        assert_eq!(spans[2].style.bg, Some(Color::Rgb(60, 60, 60)));
+        assert_eq!(spans[2].style.bg, Some(BG_SHADE));
 
         // Span 3: text content (bg inherited from Paragraph style at render time)
         assert_eq!(spans[3].content, "text");
 
         // Span 4: fill to content_width (bg explicitly set)
-        assert_eq!(spans[4].style.bg, Some(Color::Rgb(60, 60, 60)));
+        assert_eq!(spans[4].style.bg, Some(BG_SHADE));
         assert_eq!(spans[4].content.len(), 16); // 20 - 4 text length
 
         // Span 5: right padding 2 cols, shaded (bg explicitly set)
         assert_eq!(spans[5].content, "  ");
-        assert_eq!(spans[5].style.bg, Some(Color::Rgb(60, 60, 60)));
+        assert_eq!(spans[5].style.bg, Some(BG_SHADE));
 
         // Span 6: right margin 2 cols, no shading
         assert_eq!(spans[6].content, "  ");
