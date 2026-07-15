@@ -99,7 +99,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
         SessionMessage::SystemText { content } => {
             labeled_text_lines("system", content, Color::DarkGray)
         }
-        SessionMessage::UserText { content } => labeled_text_lines("user", content, Color::Green),
+        SessionMessage::UserText { content } => markdown_lines(content, width),
         SessionMessage::AssistantText {
             content, reasoning, ..
         } => {
@@ -1458,6 +1458,78 @@ mod tests {
             all_text.contains("The answer is 42."),
             "answer text should appear"
         );
+    }
+
+    // ── UserText rendering (markdown) ──────────────────────────────────
+
+    #[test]
+    fn user_text_renders_plain_text_through_markdown_pipeline() {
+        let msg = SessionMessage::UserText {
+            content: "hello world".into(),
+        };
+        let lines = session_message_lines(&msg, 80);
+        assert_eq!(lines.len(), 1, "plain text should produce one line");
+        assert_eq!(
+            lines[0].to_string(),
+            "hello world",
+            "content should be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn user_text_renders_code_block_with_syntax_highlighting() {
+        let msg = SessionMessage::UserText {
+            content: "```rust\nfn main() {}\n```".into(),
+        };
+        let lines = session_message_lines(&msg, 80);
+        // Should have: ```rust, highlighted code line, ```
+        assert!(
+            lines.len() >= 3,
+            "code block should produce at least 3 lines, got {}",
+            lines.len()
+        );
+        assert!(
+            lines[0].to_string().contains("```rust"),
+            "first line should be the opening fence"
+        );
+        // The highlighted line should have colour spans from syntect
+        let has_syntax_colour = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
+        assert!(
+            has_syntax_colour,
+            "Rust code in user text should have coloured spans"
+        );
+        assert!(
+            lines.last().unwrap().to_string().contains("```"),
+            "last line should be the closing fence"
+        );
+    }
+
+    #[test]
+    fn user_text_empty_produces_single_empty_line() {
+        let msg = SessionMessage::UserText { content: "".into() };
+        let lines = session_message_lines(&msg, 80);
+        assert!(!lines.is_empty(), "should not return empty vec");
+        assert_eq!(lines[0].width(), 0, "empty input → empty line");
+    }
+
+    #[test]
+    fn user_text_multi_line_markdown_renders_all_blocks() {
+        let msg = SessionMessage::UserText {
+            content: "# heading\n\nparagraph\n\n- item1\n- item2".into(),
+        };
+        let lines = session_message_lines(&msg, 80);
+        let all_text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all_text.contains("# heading"), "should render heading");
+        assert!(all_text.contains("paragraph"), "should render paragraph");
+        assert!(all_text.contains("item1"), "should render list item");
+        assert!(all_text.contains("item2"), "should render second list item");
     }
 
     #[test]

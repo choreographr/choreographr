@@ -377,6 +377,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     let content_width = area.width.saturating_sub(2);
     let assistant_content_width = area.width.saturating_sub(4);
+    let user_content_width = area.width.saturating_sub(9);
 
     // Ensure the render cache is aligned with the history vector before
     // we start iterating.  If items were pushed/inserted/trimmed since the
@@ -411,6 +412,11 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 );
             }
             HistoryItem::SessionMessage(message) => {
+                let widths = RenderWidths {
+                    content_width,
+                    assistant_content_width,
+                    user_content_width,
+                };
                 render_item_session_message(
                     frame,
                     area,
@@ -420,8 +426,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
-                    content_width,
-                    assistant_content_width,
+                    &widths,
                 );
             }
             HistoryItem::Streaming(text) => {
@@ -594,6 +599,74 @@ fn add_margin_lines(lines: Vec<Line<'static>>, content_width: u16) -> (Vec<Line<
     (result, total_rows)
 }
 
+/// Wrap user-content lines with the user-message visual styling:
+///
+///   Row 0:          (empty, no shading)     ← separator
+///   Row 1:    ┃░░░░ (padding, shading)      ← first shading row, no text
+///   Row 2..N: ┃░░ text ░░                   ← text rows with shading
+///   Row N-1:  ┃░░░░ (padding, shading)      ← last shading row, no text
+///   Row N:          (empty, no shading)     ← separator
+///
+/// Left-to-right per text row:
+///   Col 0-1:   empty, no shading
+///   Col 2:     ┃ (heavy vertical, green)
+///   Col 3-4:   padding, shaded (dark gray)
+///   Col 5..W-5: text content, shaded
+///   Col W-4..W-3: padding, shaded
+///   Col W-2..W-1: empty, no shading
+///
+/// The caller must apply `.style(Style::default().bg(Color::Rgb(60, 60, 60)))`
+/// on the Paragraph so text spans inherit the gray background without explicit
+/// per-span overrides.
+fn add_user_margin_lines(
+    lines: Vec<Line<'static>>,
+    content_width: u16,
+) -> (Vec<Line<'static>>, usize) {
+    let gray = Style::default().bg(Color::Rgb(60, 60, 60));
+    let no_shading = Style::default().bg(Color::Reset);
+    let green_line = Style::default().fg(Color::Green).bg(Color::Reset);
+    let total_width = content_width as usize + 9; // full row width = area.width
+    let shaded_content = content_width as usize + 4; // cols 3..W-3 for padding rows
+
+    // Top/bottom separator: no shading
+    let separator = Line::from(vec![Span::styled(" ".repeat(total_width), no_shading)]);
+
+    // Padding row: shading on cols 3..W-3, no text
+    let padding = Line::from(vec![
+        Span::styled("  ", no_shading),
+        Span::styled("┃", green_line),
+        Span::styled(" ".repeat(shaded_content), gray),
+        Span::styled("  ", no_shading),
+    ]);
+
+    let mut result = Vec::with_capacity(lines.len() + 4);
+    result.push(separator.clone());
+    result.push(padding.clone());
+
+    for line in lines {
+        let text_width: usize = line.spans.iter().map(|s| display_width(&s.content)).sum();
+        let fill = (content_width as usize).saturating_sub(text_width);
+
+        let mut spans = vec![
+            Span::styled("  ", no_shading),
+            Span::styled("┃", green_line),
+            Span::styled("  ", gray),
+        ];
+        spans.extend(line.spans);
+        spans.push(Span::styled(" ".repeat(fill), gray));
+        spans.push(Span::styled("  ", gray));
+        spans.push(Span::styled("  ", no_shading));
+
+        result.push(Line::from(spans));
+    }
+
+    result.push(padding);
+    result.push(separator);
+
+    let total_rows = result.len();
+    (result, total_rows)
+}
+
 pub(crate) fn render_history_lines(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -630,8 +703,11 @@ pub(crate) fn render_history_lines(
     );
 }
 
-/// Render assistant-text lines with green margin characters on the left and right.
-fn render_assistant_lines(
+/// Render lines wrapped with margin decoration, clipped to the visible
+/// viewport.  The `add_margin` callback produces the decorated lines;
+/// the caller provides the paragraph background style.
+#[allow(clippy::too_many_arguments)]
+fn render_margin_lines(
     frame: &mut Frame<'_>,
     area: Rect,
     lines: Vec<Line<'static>>,
@@ -639,8 +715,10 @@ fn render_assistant_lines(
     y: &mut u16,
     rows_to_skip: &mut usize,
     content_width: u16,
+    paragraph_style: Style,
+    add_margin: fn(Vec<Line<'static>>, u16) -> (Vec<Line<'static>>, usize),
 ) {
-    let (display_lines, total_rows) = add_margin_lines(lines, content_width);
+    let (display_lines, total_rows) = add_margin(lines, content_width);
 
     let Some((top_line, visible_height)) =
         clipped_area(total_rows, rows_to_skip, rows_remaining, y)
@@ -657,15 +735,79 @@ fn render_assistant_lines(
 
     frame.render_widget(
         Paragraph::new(display_lines)
+            .style(paragraph_style)
             .wrap(Wrap { trim: false })
             .scroll((top_line as u16, 0)),
         rect,
     );
 }
 
+/// Render assistant-text lines with green margin characters on the left and right.
+fn render_assistant_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+    content_width: u16,
+) {
+    render_margin_lines(
+        frame,
+        area,
+        lines,
+        rows_remaining,
+        y,
+        rows_to_skip,
+        content_width,
+        Style::default(),
+        add_margin_lines,
+    );
+}
+
+/// Render user-text lines with a heavy green vertical line in the left
+/// margin and a dark-gray background shading the message body.
+fn render_user_lines(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+    content_width: u16,
+) {
+    render_margin_lines(
+        frame,
+        area,
+        lines,
+        rows_remaining,
+        y,
+        rows_to_skip,
+        content_width,
+        Style::default().bg(Color::Rgb(60, 60, 60)),
+        add_user_margin_lines,
+    );
+}
+
+/// Holds the three content-width values used when rendering a
+/// `SessionMessage`.  Each variant needs a different amount of
+/// horizontal margin, so the content area shrinks accordingly.
+#[derive(Clone, Copy)]
+struct RenderWidths {
+    /// Width for plain-text items (SystemText, ToolResult, etc.):
+    ///   area.width - 2  (1-cell left + 1-cell right padding)
+    content_width: u16,
+    /// Width for assistant messages (margin chars on both sides):
+    ///   area.width - 4
+    assistant_content_width: u16,
+    /// Width for user messages (green bar + left/right padding):
+    ///   area.width - 9
+    user_content_width: u16,
+}
+
 /// Render a `HistoryItem::SessionMessage`: retrieve cached lines (or compute
 /// on cache miss), then render via the appropriate helper (assistant margin
-/// for `AssistantText`, plain lines otherwise).
+/// for `AssistantText`, user styling for `UserText`, plain lines otherwise).
 #[allow(clippy::too_many_arguments)]
 fn render_item_session_message(
     frame: &mut Frame<'_>,
@@ -676,16 +818,15 @@ fn render_item_session_message(
     rows_remaining: &mut usize,
     y: &mut u16,
     rows_to_skip: &mut usize,
-    content_width: u16,
-    assistant_content_width: u16,
+    widths: &RenderWidths,
 ) {
     let is_assistant = matches!(
         message,
         SessionMessage::AssistantText { .. } | SessionMessage::AssistantToolUse { .. }
     );
     if is_assistant {
-        let lines = cached_or_compute_lines(cache, idx, assistant_content_width, || {
-            session_message_lines(message, assistant_content_width)
+        let lines = cached_or_compute_lines(cache, idx, widths.assistant_content_width, || {
+            session_message_lines(message, widths.assistant_content_width)
         });
         render_assistant_lines(
             frame,
@@ -694,11 +835,24 @@ fn render_item_session_message(
             rows_remaining,
             y,
             rows_to_skip,
-            assistant_content_width,
+            widths.assistant_content_width,
+        );
+    } else if matches!(message, SessionMessage::UserText { .. }) {
+        let lines = cached_or_compute_lines(cache, idx, widths.user_content_width, || {
+            session_message_lines(message, widths.user_content_width)
+        });
+        render_user_lines(
+            frame,
+            area,
+            lines,
+            rows_remaining,
+            y,
+            rows_to_skip,
+            widths.user_content_width,
         );
     } else {
-        let lines = cached_or_compute_lines(cache, idx, content_width, || {
-            session_message_lines(message, content_width)
+        let lines = cached_or_compute_lines(cache, idx, widths.content_width, || {
+            session_message_lines(message, widths.content_width)
         });
         render_history_lines(
             frame,
@@ -707,7 +861,7 @@ fn render_item_session_message(
             rows_remaining,
             y,
             rows_to_skip,
-            content_width,
+            widths.content_width,
         );
     }
 }
@@ -1562,5 +1716,132 @@ pub(crate) fn diff_cell_spans(
             pad_style,
         ));
         result
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── add_user_margin_lines ─────────────────────────────────────────────
+
+    #[test]
+    fn user_margin_lines_structure() {
+        let cw: u16 = 20;
+        let content = vec![Line::from("hello")];
+        let (lines, total) = add_user_margin_lines(content, cw);
+
+        let total_width = cw as usize + 9;
+
+        // 2 separators + 2 padding + 1 content = 5 rows
+        assert_eq!(total, 5, "should have 2 sep + 2 pad + 1 content = 5 rows");
+        assert_eq!(lines.len(), 5);
+
+        // Row 0: separator (no shading, no green line)
+        assert!(
+            !lines[0].to_string().contains('┃'),
+            "separator should not have green line"
+        );
+
+        // Row 1: padding row (has ┃)
+        assert!(
+            lines[1].to_string().contains('┃'),
+            "padding row should have green line"
+        );
+
+        // Row 2: text row
+        assert!(
+            lines[2].to_string().contains('┃'),
+            "text row should have green line"
+        );
+        assert!(
+            lines[2].to_string().contains("hello"),
+            "text row should contain content"
+        );
+
+        // All rows should have the same total width
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(
+                line.spans
+                    .iter()
+                    .map(|s| display_width(&s.content))
+                    .sum::<usize>(),
+                total_width,
+                "row {i} display width should be {total_width}"
+            );
+        }
+
+        // Row 3: padding row (same structure as row 1)
+        assert_eq!(
+            lines[3].spans.len(),
+            lines[1].spans.len(),
+            "padding rows should have same span count"
+        );
+
+        // Row 4: separator (same structure as row 0)
+        assert_eq!(
+            lines[4].spans.len(),
+            lines[0].spans.len(),
+            "separator rows should have same span count"
+        );
+    }
+
+    #[test]
+    fn user_margin_lines_style_spans() {
+        let content = vec![Line::from("text")];
+        let (lines, _) = add_user_margin_lines(content, 20);
+        let spans = &lines[2].spans; // text row
+
+        // Span 0: 2 chars, no shading (bg = Reset)
+        assert_eq!(spans[0].content, "  ");
+        assert_eq!(spans[0].style.bg, Some(Color::Reset));
+
+        // Span 1: ┃, green fg, no shading
+        assert_eq!(spans[1].content, "┃");
+        assert_eq!(spans[1].style.fg, Some(Color::Green));
+        assert_eq!(spans[1].style.bg, Some(Color::Reset));
+
+        // Span 2: 2 chars of left padding, shaded (bg explicitly set)
+        assert_eq!(spans[2].content, "  ");
+        assert_eq!(spans[2].style.bg, Some(Color::Rgb(60, 60, 60)));
+
+        // Span 3: text content (bg inherited from Paragraph style at render time)
+        assert_eq!(spans[3].content, "text");
+
+        // Span 4: fill to content_width (bg explicitly set)
+        assert_eq!(spans[4].style.bg, Some(Color::Rgb(60, 60, 60)));
+        assert_eq!(spans[4].content.len(), 16); // 20 - 4 text length
+
+        // Span 5: right padding 2 cols, shaded (bg explicitly set)
+        assert_eq!(spans[5].content, "  ");
+        assert_eq!(spans[5].style.bg, Some(Color::Rgb(60, 60, 60)));
+
+        // Span 6: right margin 2 cols, no shading
+        assert_eq!(spans[6].content, "  ");
+        assert_eq!(spans[6].style.bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn user_margin_lines_multiple_content_lines() {
+        let content = vec![Line::from("line one"), Line::from("line two")];
+        let (lines, total) = add_user_margin_lines(content, 30);
+        // 2 sep + 2 pad + 2 content = 6
+        assert_eq!(total, 6);
+
+        assert!(lines[2].to_string().contains("line one"));
+        assert!(lines[3].to_string().contains("line two"));
+    }
+
+    #[test]
+    fn user_margin_lines_empty_content() {
+        let content = vec![Line::from(Span::styled(String::new(), Style::default()))];
+        let (lines, total) = add_user_margin_lines(content, 20);
+        // 2 sep + 2 pad + 1 content = 5
+        assert_eq!(total, 5);
+        // The text row should have the green line and shaded area but no text
+        let text_row = &lines[2];
+        assert!(text_row.to_string().contains('┃'));
     }
 }
