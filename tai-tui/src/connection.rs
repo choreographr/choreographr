@@ -787,7 +787,21 @@ fn handle_chat_event(
         Event::Mouse(mouse) if mouse_in_scrollbar_column(mouse.column, mouse.row) => {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 app.scrollbar_dragging = true;
-                app.scroll_to_track_row(mouse.row, app.history_viewport.height);
+
+                // Check whether the click lands on a user-text marker.
+                let top_slot = 2 * mouse.row as usize;
+                let bot_slot = top_slot + 1;
+
+                let marker_hit = app
+                    .markers
+                    .iter()
+                    .find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot);
+
+                if let Some(marker) = marker_hit {
+                    app.scroll_to_content_line(marker.content_line);
+                } else {
+                    app.scroll_to_track_row(mouse.row, app.history_viewport.height);
+                }
             }
         }
         Event::Mouse(_) => {}

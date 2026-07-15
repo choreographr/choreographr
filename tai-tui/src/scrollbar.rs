@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -13,10 +15,18 @@ use ratatui::widgets::StatefulWidget;
 ///
 /// Clicking on the track jumps to that position. Dragging the thumb
 /// is supported via the `scrollbar_dragging` field on `App`.
+///
+/// User-text markers (green indicator dots on the track) are rendered
+/// from pre-computed virtual-slot positions passed via [`with_markers`].
 #[derive(Debug, Clone)]
 pub(crate) struct SmoothScrollbar {
     thumb_fg: Option<Color>,
     track_bg: Option<Color>,
+    marker_fg: Option<Color>,
+    /// Pre-computed virtual-slot positions where user-text markers
+    /// appear on the track.  Computed at render time from content-line
+    /// positions and the virtual-track scale.
+    markers: HashSet<usize>,
 }
 
 /// State for [`SmoothScrollbar`].
@@ -31,10 +41,12 @@ pub(crate) struct SmoothScrollbarState {
 }
 
 impl SmoothScrollbar {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             thumb_fg: None,
             track_bg: None,
+            marker_fg: None,
+            markers: HashSet::new(),
         }
     }
 
@@ -49,6 +61,19 @@ impl SmoothScrollbar {
     /// thumb).
     pub(crate) const fn track_bg(mut self, color: Color) -> Self {
         self.track_bg = Some(color);
+        self
+    }
+
+    /// Set the foreground color for user-text markers on the track.
+    pub(crate) const fn marker_fg(mut self, color: Color) -> Self {
+        self.marker_fg = Some(color);
+        self
+    }
+
+    /// Attach pre-computed virtual-slot positions where user-text
+    /// markers should appear on the track.
+    pub(crate) fn with_markers(mut self, markers: Vec<usize>) -> Self {
+        self.markers = markers.into_iter().collect();
         self
     }
 }
@@ -116,6 +141,11 @@ impl StatefulWidget for SmoothScrollbar {
             track_style = track_style.bg(bg);
         }
 
+        // Marker style: marker_fg on the filled half, track_bg on the
+        // unfilled half so the un-filled portion inherits the track.
+        let marker_fg = self.marker_fg;
+        let track_bg = self.track_bg;
+
         for i in 0..track_height {
             let top_slot = 2 * i;
             let bot_slot = 2 * i + 1;
@@ -127,26 +157,68 @@ impl StatefulWidget for SmoothScrollbar {
             let y = area.y + i as u16;
             let x = area.x;
 
-            match (top_in_thumb, bot_in_thumb) {
+            let marker_top = self.markers.contains(&top_slot);
+            let marker_bot = self.markers.contains(&bot_slot);
+
+            match (marker_top, marker_bot) {
+                // Both halves are markers.
                 (true, true) => {
-                    // Entire cell covered by thumb.
-                    buf.set_string(x, y, "█", full_style);
+                    let s = style_from_opts(marker_fg, track_bg);
+                    buf.set_string(x, y, "█", s);
                 }
+                // Only the top half is a marker.
                 (true, false) => {
-                    // Only the top half is covered.
-                    buf.set_string(x, y, "▀", half_style);
+                    if bot_in_thumb {
+                        let s = style_from_opts(marker_fg, self.thumb_fg);
+                        buf.set_string(x, y, "▀", s);
+                    } else {
+                        let s = style_from_opts(marker_fg, track_bg);
+                        buf.set_string(x, y, "▀", s);
+                    }
                 }
+                // Only the bottom half is a marker.
                 (false, true) => {
-                    // Only the bottom half is covered.
-                    buf.set_string(x, y, "▄", half_style);
+                    if top_in_thumb {
+                        let s = style_from_opts(marker_fg, self.thumb_fg);
+                        buf.set_string(x, y, "▄", s);
+                    } else {
+                        let s = style_from_opts(marker_fg, track_bg);
+                        buf.set_string(x, y, "▄", s);
+                    }
                 }
-                (false, false) => {
-                    // No thumb coverage — plain track cell.
-                    buf.set_string(x, y, " ", track_style);
-                }
+                // No marker — original thumb/track logic.
+                (false, false) => match (top_in_thumb, bot_in_thumb) {
+                    (true, true) => {
+                        buf.set_string(x, y, "█", full_style);
+                    }
+                    (true, false) => {
+                        buf.set_string(x, y, "▀", half_style);
+                    }
+                    (false, true) => {
+                        buf.set_string(x, y, "▄", half_style);
+                    }
+                    (false, false) => {
+                        buf.set_string(x, y, " ", track_style);
+                    }
+                },
             }
         }
     }
+}
+
+/// Build a Style with an optional foreground and background.
+/// When an option is `None` the default (inherited) value is used,
+/// avoiding hardcoded fallbacks that could diverge from builder-set
+/// colors elsewhere.
+fn style_from_opts(fg: Option<Color>, bg: Option<Color>) -> Style {
+    let mut s = Style::default();
+    if let Some(fg) = fg {
+        s = s.fg(fg);
+    }
+    if let Some(bg) = bg {
+        s = s.bg(bg);
+    }
+    s
 }
 
 #[cfg(test)]
@@ -269,5 +341,132 @@ mod tests {
         for i in 5..10 {
             assert_eq!(symbols[i], " ", "row {i} should be track");
         }
+    }
+
+    // ── Marker tests ─────────────────────────────────────────────
+
+    /// Like `render_to_symbols` but with markers and marker_fg set.
+    /// Markers are pre-computed virtual-slot positions.
+    fn render_to_symbols_with_markers(
+        height: u16,
+        content_length: usize,
+        viewport_content_length: usize,
+        position: usize,
+        marker_slots: Vec<usize>,
+    ) -> Vec<String> {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, height));
+        let scrollbar = SmoothScrollbar::new()
+            .thumb_fg(Color::Gray)
+            .track_bg(Color::DarkGray)
+            .marker_fg(Color::Green)
+            .with_markers(marker_slots);
+        let mut state = SmoothScrollbarState::new(content_length)
+            .position(position)
+            .viewport_content_length(viewport_content_length);
+        scrollbar.render(buf.area, &mut buf, &mut state);
+        (0..height)
+            .map(|i| buf.cell((0, i)).unwrap().symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn marker_shows_on_track_when_not_covered_by_thumb() {
+        // H=5, content=10, viewport=3, position=0
+        //   virtual_track=10, thumb_slots=3, virtual_scroll_range=7,
+        //   scroll_range=7, thumb_start=0 → thumb covers [0,3) → rows 0-1
+        // Marker at line 5 → virtual slot 5*10/10=5 → row 2 bottom half.
+        let symbols = render_to_symbols_with_markers(5, 10, 3, 0, vec![5]);
+        assert_eq!(symbols[0], "█", "row 0 thumb");
+        assert_eq!(symbols[1], "▀", "row 1 thumb upper half");
+        assert_eq!(symbols[2], "▄", "row 2 should be marker lower half");
+        assert_eq!(symbols[3], " ", "row 3 track");
+        assert_eq!(symbols[4], " ", "row 4 track");
+    }
+
+    #[test]
+    fn marker_visible_when_covered_by_thumb() {
+        // Same layout — marker at line 0 falls in virtual slot 0
+        // which is inside the thumb range [0,3).
+        //   Row 0: top_slot=0 (marker + top thumb), bot_slot=1 (thumb only)
+        //     → marker_top=true → "▀" fg=green bg=thumb (marker over thumb)
+        //   Row 1: top_slot=2 (thumb only), bot_slot=3 (track)
+        //     → "▀" half_style (original thumb behavior)
+        let symbols = render_to_symbols_with_markers(5, 10, 3, 0, vec![0]);
+        assert_eq!(symbols[0], "▀", "row 0 marker top half over thumb");
+        assert_eq!(symbols[1], "▀", "row 1 thumb upper half");
+    }
+
+    #[test]
+    fn multiple_markers_across_track() {
+        // H=6, content=12, viewport=2, position=0
+        //   virtual_track=12, thumb_slots=2*12/12=2, virtual_scroll_range=10,
+        //   scroll_range=10, thumb_start=0 → thumb covers [0,2) → row 0
+        // virtual slot = line*12/12 = line
+        // Marker at line 2  → slot 2  → row 1 top   → "▀"
+        // Marker at line 5  → slot 5  → row 2 bot   → "▄"
+        // Marker at line 9  → slot 9  → row 4 bot   → "▄"
+        // Marker at line 11 → slot 11 → row 5 bot   → "▄"
+        let symbols = render_to_symbols_with_markers(6, 12, 2, 0, vec![2, 5, 9, 11]);
+        assert_eq!(symbols[0], "█", "row 0 thumb");
+        assert_eq!(symbols[1], "▀", "row 1 marker top half");
+        assert_eq!(symbols[2], "▄", "row 2 marker bottom half");
+        assert_eq!(symbols[3], " ", "row 3 track");
+        assert_eq!(symbols[4], "▄", "row 4 marker bottom half");
+        assert_eq!(symbols[5], "▄", "row 5 marker bottom half (slot 11)");
+    }
+
+    #[test]
+    fn empty_markers_unchanged() {
+        // No markers → regular thumb rendering.
+        let symbols = render_to_symbols_with_markers(5, 10, 3, 0, vec![]);
+        assert_eq!(symbols[0], "█", "row 0 thumb");
+        assert_eq!(symbols[1], "▀", "row 1 thumb upper half");
+        for i in 2..5 {
+            assert_eq!(symbols[i], " ", "row {i} track (no markers)");
+        }
+    }
+
+    #[test]
+    fn marker_uses_green_fg_color() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 5));
+        let scrollbar = SmoothScrollbar::new()
+            .thumb_fg(Color::Gray)
+            .track_bg(Color::DarkGray)
+            .marker_fg(Color::Green)
+            .with_markers(vec![6]);
+        // Position=0, content=10, viewport=3 → thumb covers rows 0-1.
+        // Marker at line 6 → virtual slot 6 → row 3 top half.
+        let mut state = SmoothScrollbarState::new(10)
+            .position(0)
+            .viewport_content_length(3);
+        scrollbar.render(buf.area, &mut buf, &mut state);
+        let cell = buf.cell((0, 3)).unwrap();
+        assert_eq!(
+            cell.fg,
+            Color::Green,
+            "marker cell should use green foreground"
+        );
+    }
+
+    #[test]
+    fn marker_mixed_with_thumb_has_green_fg_and_thumb_bg() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 5));
+        let scrollbar = SmoothScrollbar::new()
+            .thumb_fg(Color::Gray)
+            .track_bg(Color::DarkGray)
+            .marker_fg(Color::Green)
+            .with_markers(vec![0]);
+        // Position=0, content=10, viewport=3 → thumb covers rows 0-1.
+        // Marker at line 0 → virtual slot 0 → row 0 top half, which is
+        // also inside the thumb range → mixed marker+thumb rendering.
+        let mut state = SmoothScrollbarState::new(10)
+            .position(0)
+            .viewport_content_length(3);
+        scrollbar.render(buf.area, &mut buf, &mut state);
+        // Row 0: top marker (slot 0) + bottom thumb (slot 1).
+        let cell = buf.cell((0, 0)).unwrap();
+        assert_eq!(cell.symbol(), "▀", "marker top half over thumb");
+        assert_eq!(cell.fg, Color::Green, "marker half should be green");
+        assert_eq!(cell.bg, Color::Gray, "thumb half should use thumb fg as bg");
     }
 }

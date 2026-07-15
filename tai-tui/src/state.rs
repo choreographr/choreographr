@@ -426,6 +426,18 @@ pub(crate) struct SessionManagerState {
     pub(crate) error: Option<String>,
 }
 
+/// A user-text marker on the scrollbar track, indicating the position
+/// of a `UserText` message in the chat history.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Marker {
+    /// 0-based content-line position in the full history (oldest-first).
+    pub content_line: usize,
+    /// Virtual-track slot position, pre-computed at render time so the
+    /// click handler does not need to recompute it with a potentially
+    /// different total_height (which changes as streaming content grows).
+    pub virtual_slot: usize,
+}
+
 /// Cached rendering of a history item whose content does not change between
 /// frames.  Stored alongside the item in `App::render_cache` to avoid
 /// re-running markdown parsing and syntect highlighting on every render.
@@ -433,11 +445,8 @@ pub(crate) struct SessionManagerState {
 pub(crate) struct RenderedCache {
     /// The rendered styled lines at `width`.
     pub lines: Vec<Line<'static>>,
-    /// The number of wrapped terminal rows this item occupies at `width`.
-    pub height: usize,
-    /// Terminal width at which `lines` and `height` were computed.
-    /// When the terminal is resized the next render will detect the mismatch
-    /// and recompute.
+    /// Terminal width at which `lines` were computed. When the terminal is
+    /// resized the next render will detect the mismatch and recompute.
     pub width: u16,
 }
 
@@ -491,6 +500,11 @@ pub(crate) struct App {
     /// narrow scrollbar column.  Cleared on mouse-up or any mouse
     /// event that is not a drag.
     pub(crate) scrollbar_dragging: bool,
+
+    /// User-text marker positions on the scrollbar track, recomputed each
+    /// frame during rendering.  Used by the scrollbar click handler to
+    /// jump to the corresponding UserText.
+    pub(crate) markers: Vec<Marker>,
 
     // ── Command history ─────────────────────────────────────────
     /// Command history entries, newest first.  Loaded from redb on startup
@@ -621,7 +635,10 @@ impl HistoryViewport {
                 if message.is_margin_message() {
                     // 4 structural rows: top separator, top padding,
                     // bottom padding, bottom separator.
-                    content_height + STRUCTURAL_ROWS
+                    // Use unwrapped line count to match add_margin_lines
+                    // in render.rs — lines_height would overcount when
+                    // lines wrap across terminal rows.
+                    lines.len() + STRUCTURAL_ROWS
                 } else {
                     // 1 blank-line separator below the content block.
                     content_height + 1
@@ -1156,6 +1173,7 @@ impl App {
             ai_providers: AIProvidersState::new(),
             scroll_accumulator: 0,
             scrollbar_dragging: false,
+            markers: Vec::new(),
             command_history,
             history_index: None,
             saved_draft: String::new(),
@@ -1173,8 +1191,6 @@ impl App {
     }
 
     pub(crate) fn total_history_height(&self) -> usize {
-        // If the cache is out of sync (mutation happened before next render),
-        // fall back to the uncached path.
         if self.render_cache.len() != self.client.history.len() {
             return self
                 .client
@@ -1188,17 +1204,108 @@ impl App {
             .history
             .iter()
             .zip(self.render_cache.iter())
-            .map(|(item, cached)| {
-                // Use the cached height if available and at the current width.
-                if let Some(cached) = cached
-                    && cached.width == self.history_viewport.width
-                {
-                    return cached.height;
-                }
-                // Fall back to uncached height computation.
-                self.history_viewport.item_height(item)
-            })
+            .map(|(item, cached)| self.item_height_from_cache(item, cached))
             .sum()
+    }
+
+    /// Compute the visual height of a history item, using the render
+    /// cache when available to avoid re-parsing markdown.
+    ///
+    /// The cache stores the *content* width (viewport minus margins),
+    /// not the full viewport width, so the comparison against each
+    /// item's content width must use the same margin formula.
+    fn item_height_from_cache(&self, item: &HistoryItem, cached: &Option<RenderedCache>) -> usize {
+        let Some(cached) = cached else {
+            return self.history_viewport.item_height(item);
+        };
+        let vp_width = self.history_viewport.width;
+        match item {
+            HistoryItem::SessionMessage(msg) if msg.is_margin_message() => {
+                // Margin messages use 9 columns for the accent bar + padding.
+                let content_width = vp_width.saturating_sub(9);
+                if cached.width != content_width {
+                    return self.history_viewport.item_height(item);
+                }
+                // Height = logical line count + structural overhead
+                // (no wrapping involvement — the add_margin_lines helper
+                // packs each logical line as one terminal row).
+                cached.lines.len() + STRUCTURAL_ROWS
+            }
+            HistoryItem::SessionMessage(_) => {
+                // Non-margin messages use 2 columns of indent.
+                let content_width = vp_width.saturating_sub(2);
+                if cached.width != content_width {
+                    return self.history_viewport.item_height(item);
+                }
+                lines_height(&cached.lines, content_width).max(1) + 1
+            }
+            // Streaming items are never cached (always recomputed),
+            // Text, Image, and Diff use cheap height computations
+            // that don't benefit from the render cache.
+            _ => self.history_viewport.item_height(item),
+        }
+    }
+
+    /// Compute the total history height and build user-text marker
+    /// positions in a single pass over the history.  Returns
+    /// `(total_height, marker_virtual_slots, markers)` where each slot is a
+    /// pre-computed position on the virtual track (0..2*viewport_height).
+    ///
+    /// Uses the render cache where available to avoid redundant height
+    /// computation, ensuring marker positions are consistent with
+    /// [`total_history_height`].
+    pub(crate) fn compute_total_height_and_markers(&self) -> (usize, Vec<usize>, Vec<Marker>) {
+        let viewport_height = self.history_viewport.height as usize;
+        let virtual_track = 2 * viewport_height;
+        let mut total = 0usize;
+        let mut raw_markers: Vec<(usize, usize)> = Vec::new();
+
+        // Use the render cache for height if available, falling back to
+        // the uncached path for consistency with total_history_height.
+        if self.render_cache.len() == self.client.history.len() {
+            for (i, (item, cached)) in self
+                .client
+                .history
+                .iter()
+                .zip(self.render_cache.iter())
+                .enumerate()
+            {
+                let h = self.item_height_from_cache(item, cached);
+                if matches!(
+                    item,
+                    HistoryItem::SessionMessage(SessionMessage::UserText { .. })
+                ) {
+                    raw_markers.push((i, total));
+                }
+                total += h;
+            }
+        } else {
+            for (i, item) in self.client.history.iter().enumerate() {
+                let h = self.history_viewport.item_height(item);
+                if matches!(
+                    item,
+                    HistoryItem::SessionMessage(SessionMessage::UserText { .. })
+                ) {
+                    raw_markers.push((i, total));
+                }
+                total += h;
+            }
+        }
+
+        let total = total.max(1); // avoid division by zero on empty history
+        let mut slot_positions = Vec::with_capacity(raw_markers.len());
+        let marker_structs: Vec<Marker> = raw_markers
+            .into_iter()
+            .map(|(_, content_line)| {
+                let slot = content_line * virtual_track / total;
+                slot_positions.push(slot);
+                Marker {
+                    content_line,
+                    virtual_slot: slot,
+                }
+            })
+            .collect();
+        (total, slot_positions, marker_structs)
     }
 
     pub(crate) fn max_scroll_offset(&self) -> usize {
@@ -1481,6 +1588,7 @@ impl App {
         self.client.in_progress.clear();
         self.replay_call_id_to_rid.clear();
         self.replay_rid_pending.clear();
+        self.markers.clear();
     }
 
     /// Ensure the render cache is aligned with the history vector.
@@ -1634,6 +1742,29 @@ impl App {
             // our effective_scroll is 0 at the bottom, so invert.
             self.scroll_to(max_scroll.saturating_sub(target.min(max_scroll)));
         }
+    }
+
+    /// Scroll so that the given content line appears at the top of the
+    /// viewport.  If the content line is too close to the bottom to fill
+    /// the viewport, scroll to the bottom instead.
+    ///
+    /// Returns immediately if the content line is already visible within
+    /// the current viewport.
+    pub(crate) fn scroll_to_content_line(&mut self, content_line: usize) {
+        let total = self.total_history_height();
+        let viewport = self.history_viewport.height as usize;
+        let effective = self.effective_scroll();
+
+        // Fast path: the content line is already visible.
+        let scroll_bottom = effective; // 0 at the bottom, positive when scrolled up
+        let visible_start = total.saturating_sub(scroll_bottom + viewport);
+        let visible_end = total.saturating_sub(scroll_bottom);
+        if content_line >= visible_start && content_line < visible_end {
+            return;
+        }
+
+        let target = total.saturating_sub(content_line + viewport);
+        self.scroll_to(target.min(self.max_scroll_offset()));
     }
 
     /// Consume the frame-accumulated scroll delta and apply it as a
@@ -2324,6 +2455,123 @@ mod tests {
             HistoryItem::Text(t) => assert!(t.contains("just some output")),
             _ => panic!("expected Text"),
         }
+    }
+
+    // ── scroll_to_content_line ──
+
+    #[test]
+    fn scroll_to_content_line_scrolls_to_content_line() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 5;
+
+        // Fill with enough content to need scrolling.
+        for i in 0..20 {
+            app.push_history_item(HistoryItem::Text(format!("line {i}")));
+        }
+
+        // test_app starts with a "Connected" Text item (2 rows), then 20 more
+        // Text items each at 2 rows = 40, total = 42.  Viewport=5.
+        // scroll=0 → bottom (latest message visible).
+        // content_line=0 → first item → target=42-(0+5)=37 → scroll to top.
+        app.scroll_to_content_line(0);
+        assert_eq!(app.history_scroll.scroll, 37, "should scroll to top");
+        assert!(!app.history_scroll.follow_output, "not following output");
+    }
+
+    #[test]
+    fn scroll_to_content_line_fast_path_skips_when_already_visible() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        for i in 0..10 {
+            app.push_history_item(HistoryItem::Text(format!("line {i}")));
+        }
+        // Total ~20, viewport=10 → max_scroll=10.
+        // At bottom (scroll=0), visible range: items 10..20 → content lines 20..40.
+        // content_line=30 is in the visible range → fast-path should skip.
+        let scroll_before = app.history_scroll.scroll;
+        app.scroll_to_content_line(30);
+        assert_eq!(
+            app.history_scroll.scroll, scroll_before,
+            "scroll should not change when content_line is already visible"
+        );
+    }
+
+    #[test]
+    fn scroll_to_content_line_clamps_to_bottom_when_line_too_close() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        for i in 0..5 {
+            app.push_history_item(HistoryItem::Text(format!("line {i}")));
+        }
+        // Total ~10, viewport=10 → max_scroll=0.
+        // content_line=18 > total → target=saturating_sub(10-(18+10)) = 0
+        app.scroll_to_content_line(18);
+        assert_eq!(
+            app.history_scroll.scroll, 0,
+            "should clamp to bottom (0) when line is beyond content end"
+        );
+    }
+
+    // ── compute_total_height_and_markers ──
+
+    #[test]
+    fn compute_total_height_and_markers_produces_markers_for_user_text() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        // Add some history items including UserText messages.
+        app.push_history_item(HistoryItem::Text("hello".into()));
+        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::UserText {
+            content: "user message 1".into(),
+        }));
+        app.push_history_item(HistoryItem::Text("world".into()));
+        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::UserText {
+            content: "user message 2".into(),
+        }));
+        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::AssistantText {
+            content: "assistant reply".into(),
+            reasoning: None,
+            token_usage: None,
+        }));
+
+        let (total, slots, markers) = app.compute_total_height_and_markers();
+
+        assert!(
+            total > 0,
+            "total height should be positive with history items"
+        );
+        assert_eq!(markers.len(), 2, "should have 2 user-text markers");
+        assert_eq!(slots.len(), 2, "should have 2 slot positions");
+        // Both markers should have valid virtual slots within range.
+        for marker in &markers {
+            assert!(
+                marker.virtual_slot <= 2 * app.history_viewport.height as usize,
+                "virtual slot {} should be within track range",
+                marker.virtual_slot
+            );
+        }
+    }
+
+    #[test]
+    fn compute_total_height_and_markers_empty_history() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        let (total, slots, markers) = app.compute_total_height_and_markers();
+
+        assert!(total > 0, "total height should be positive");
+        assert!(
+            markers.is_empty(),
+            "no markers for empty history (test_app has no UserText)"
+        );
+        assert!(slots.is_empty(), "no slots for empty history");
     }
 
     // ── push_session_message ──

@@ -72,6 +72,7 @@ fn vertical_scrollbar() -> SmoothScrollbar {
     SmoothScrollbar::new()
         .thumb_fg(Color::DarkGray)
         .track_bg(BG_SHADE)
+        .marker_fg(Color::Green)
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -274,8 +275,9 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     render_history(frame, history_chunks[0], app);
 
     // ── Scrollbar ────────────────────────────────────────────
-    let total_height = app.total_history_height();
     let viewport_height = app.history_viewport.height as usize;
+    let (total_height, marker_slots, markers) = app.compute_total_height_and_markers();
+    app.markers = markers;
     if total_height > viewport_height {
         // Our effective_scroll is 0 at the bottom (auto-follow), but
         // ScrollbarState expects position=0 at the top, so we invert.
@@ -283,7 +285,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             .max_scroll_offset()
             .saturating_sub(app.effective_scroll());
         frame.render_stateful_widget(
-            vertical_scrollbar(),
+            vertical_scrollbar().with_markers(marker_slots),
             history_chunks[1],
             &mut SmoothScrollbarState::new(total_height)
                 .position(position)
@@ -486,11 +488,9 @@ fn cached_or_compute_lines(
 
     // Cache miss: compute, store, and return.
     let lines = compute();
-    let height = lines_height(&lines, width);
     if let Some(slot) = cache.get_mut(index) {
         *slot = Some(RenderedCache {
             lines: lines.clone(),
-            height,
             width,
         });
     }
