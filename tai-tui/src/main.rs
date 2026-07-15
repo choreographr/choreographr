@@ -4,6 +4,7 @@ mod db;
 mod diff_render;
 mod markdown_render;
 mod render;
+mod scrollbar;
 mod state;
 mod syntax;
 

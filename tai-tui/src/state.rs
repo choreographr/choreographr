@@ -476,6 +476,12 @@ pub(crate) struct App {
     /// trackpad scrolling smooth while ensuring scrolling stops
     /// instantly when the finger lifts (no momentum carry-over).
     pub(crate) scroll_accumulator: isize,
+    /// `true` while the user is dragging the scrollbar thumb with
+    /// the mouse button held.  While active, `Drag` events update
+    /// the scroll position even when the cursor moves outside the
+    /// narrow scrollbar column.  Cleared on mouse-up or any mouse
+    /// event that is not a drag.
+    pub(crate) scrollbar_dragging: bool,
 
     // ── Command history ─────────────────────────────────────────
     /// Command history entries, newest first.  Loaded from redb on startup
@@ -1123,6 +1129,7 @@ impl App {
             session_mgr: SessionManagerState::new(),
             ai_providers: AIProvidersState::new(),
             scroll_accumulator: 0,
+            scrollbar_dragging: false,
             command_history,
             history_index: None,
             saved_draft: String::new(),
@@ -1585,6 +1592,22 @@ impl App {
         self.history_scroll.scroll = amount;
         self.history_scroll.scroll_compensation = 0;
         self.history_scroll.follow_output = amount == 0;
+    }
+
+    /// Map a mouse row within the scrollbar track to a scroll position
+    /// and jump there.  The row is clamped to the track so that clicks
+    /// or drags beyond the last row still behave correctly.
+    pub(crate) fn scroll_to_track_row(&mut self, mouse_row: u16, track_height: u16) {
+        let track_height = track_height as usize;
+        if track_height > 1 {
+            let row = (mouse_row as usize).min(track_height.saturating_sub(1));
+            let max_scroll = self.max_scroll_offset();
+            let ratio = row as f64 / track_height.saturating_sub(1) as f64;
+            let target = (ratio * max_scroll as f64).round() as usize;
+            // The scrollbar coordinate system has 0 at the top, but
+            // our effective_scroll is 0 at the bottom, so invert.
+            self.scroll_to(max_scroll.saturating_sub(target.min(max_scroll)));
+        }
     }
 
     /// Consume the frame-accumulated scroll delta and apply it as a

@@ -739,6 +739,24 @@ fn handle_chat_event(
                 _ => {}
             }
         }
+        // While the user is dragging the scrollbar thumb, route all
+        // mouse events through the drag handler regardless of whether
+        // the cursor is inside or outside the narrow scrollbar column.
+        Event::Mouse(mouse) if app.scrollbar_dragging => {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    app.scroll_to_track_row(mouse.row, app.history_viewport.height);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    app.scrollbar_dragging = false;
+                }
+                _ => {
+                    // Any other mouse event (scroll, right-click, etc.)
+                    // cancels the drag.
+                    app.scrollbar_dragging = false;
+                }
+            }
+        }
         Event::Mouse(mouse) if mouse_in_history_box(mouse.column, mouse.row) => {
             // Accumulate scroll events rather than scrolling immediately.
             // All accumulated deltas are applied in a single batch each
@@ -765,18 +783,11 @@ fn handle_chat_event(
                 _ => {}
             }
         }
-        // Left-click in the scrollbar column jumps to that position.
+        // Left-click (and drag) in the scrollbar column.
         Event::Mouse(mouse) if mouse_in_scrollbar_column(mouse.column, mouse.row) => {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                let track_height = app.history_viewport.height;
-                if track_height > 1 {
-                    let max_scroll = app.max_scroll_offset();
-                    let ratio = (mouse.row as f64) / (track_height.saturating_sub(1) as f64);
-                    let target = (ratio * max_scroll as f64).round() as usize;
-                    // ScrollbarState position is 0 at the top, but our
-                    // effective_scroll is 0 at the bottom, so invert.
-                    app.scroll_to(max_scroll.saturating_sub(target.min(max_scroll)));
-                }
+                app.scrollbar_dragging = true;
+                app.scroll_to_track_row(mouse.row, app.history_viewport.height);
             }
         }
         Event::Mouse(_) => {}
