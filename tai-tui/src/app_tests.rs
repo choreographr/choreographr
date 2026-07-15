@@ -59,7 +59,7 @@ fn append_stream_text_updates_mutable_history_entry() {
 #[test]
 fn append_stream_text_preserves_manual_scroll_position() {
     let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 10;
+    app.history_viewport.width = 80;
     app.history_viewport.height = 1;
     app.push_text("older");
     app.push_text("older still");
@@ -68,16 +68,12 @@ fn append_stream_text_preserves_manual_scroll_position() {
 
     app.append_stream_text(7, OutputStream::Answer, "hello");
 
-    tracing::info!(
-        "A1 scroll={} comp={} eff={} fol={}",
-        app.history_scroll.scroll(),
-        app.history_scroll.scroll_compensation(),
-        app.effective_scroll(),
-        app.history_scroll.follow_output()
-    );
+    // Empty streaming: 2 lines ([7] + blank) → height = 2 + 4 = 6
+    // After "hello": 4 lines ([7], blank, Response:, hello) → height = 4 + 4 = 8
+    // growth = 2, scroll_compensation increases by 2
     assert_eq!(app.history_scroll.scroll(), 3);
-    assert_eq!(app.history_scroll.scroll_compensation(), 3);
-    assert_eq!(app.effective_scroll(), 6);
+    assert_eq!(app.history_scroll.scroll_compensation(), 2);
+    assert_eq!(app.effective_scroll(), 5);
     assert!(!app.history_scroll.follow_output());
 }
 
@@ -903,7 +899,7 @@ fn push_text_respects_follow_output_mode() {
 #[test]
 fn streaming_growth_above_viewport_preserves_visible_content_offset() {
     let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 5;
+    app.history_viewport.width = 80;
     app.history_viewport.height = 1;
     app.push_text("older history");
     app.push_text("older history two");
@@ -912,9 +908,12 @@ fn streaming_growth_above_viewport_preserves_visible_content_offset() {
 
     app.append_stream_text(7, OutputStream::Answer, "123456");
 
+    // Empty streaming: 2 lines → height = 2 + 4 = 6
+    // After "123456": 4 lines → height = 4 + 4 = 8
+    // growth = 2, scroll_compensation increases by 2
     assert_eq!(app.history_scroll.scroll(), 2);
-    assert_eq!(app.history_scroll.scroll_compensation(), 6);
-    assert_eq!(app.effective_scroll(), 8);
+    assert_eq!(app.history_scroll.scroll_compensation(), 2);
+    assert_eq!(app.effective_scroll(), 4);
     assert!(!app.history_scroll.follow_output());
 }
 

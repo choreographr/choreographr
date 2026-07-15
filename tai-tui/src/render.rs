@@ -443,7 +443,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     &mut rows_remaining,
                     &mut y,
                     &mut rows_to_skip,
-                    content_width,
+                    user_content_width,
                 );
             }
             HistoryItem::Image(_) => {
@@ -867,6 +867,9 @@ fn render_item_session_message(
 }
 
 /// Render a `HistoryItem::Streaming` — text that changes every frame (never cached).
+/// Renders with the assistant margin style (blue `┃` bar + dark-gray shading)
+/// so the user sees the same visual treatment during streaming as after the
+/// final `SessionMessageAppended` arrives.
 fn render_item_streaming(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -874,17 +877,17 @@ fn render_item_streaming(
     rows_remaining: &mut usize,
     y: &mut u16,
     rows_to_skip: &mut usize,
-    content_width: u16,
+    user_content_width: u16,
 ) {
-    let lines = streaming_text_lines(text, content_width);
-    render_history_lines(
+    let lines = streaming_text_lines(text, user_content_width);
+    render_assistant_lines(
         frame,
         area,
         lines,
         rows_remaining,
         y,
         rows_to_skip,
-        content_width,
+        user_content_width,
     );
 }
 

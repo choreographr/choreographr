@@ -110,12 +110,34 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         let result = run_daemon_connection_with_mode(
             mode,
             |message| {
-                let _ = connection_ui_tx.send(UiEvent::Daemon(message));
+                // Use try_send so the daemon reader thread never blocks when
+                // the UI event loop is temporarily backed up (e.g. during a
+                // slow render).  Dropping a streaming chunk is acceptable
+                // because the next chunk carries cumulative content and the
+                // final Done/SessionMessageAppended delivers the complete
+                // text; a blocking send would stall the reader thread, fill
+                // the socket buffer, and cascade back to the daemon's
+                // session thread — effectively killing all streaming.
+                //
+                // A Disconnected error (receiver dropped) is silently
+                // ignored — the terminal thread has already begun tearing
+                // down the UI, so there is no consumer left to process this
+                // event and no point in propagating the error.
+                if let Err(e) = connection_ui_tx.try_send(UiEvent::Daemon(message))
+                    && e.is_full()
+                {
+                    tracing::warn!(
+                        "[tai-tui] daemon reader channel full, dropping event ({} queued)",
+                        connection_ui_tx.len(),
+                    );
+                }
             },
             client_rx,
             Some(shutdown_rx),
         );
         if result.is_ok() {
+            // ReaderClosed must always be delivered — blocking is safe here
+            // because no more daemon messages are coming after this.
             let _ = connection_ui_tx.send(UiEvent::ReaderClosed);
         }
         result

@@ -645,9 +645,15 @@ impl HistoryViewport {
                 }
             }
             HistoryItem::Streaming(text) => {
-                let content_width = self.width.saturating_sub(2);
+                // Use the same layout as AssistantText: 9 columns for the
+                // accent bar + padding, and STRUCTURAL_ROWS (top sep, top
+                // pad, bottom pad, bottom sep).  Must stay in sync with
+                // render_item_streaming in render.rs.
+                let content_width = self.width.saturating_sub(9);
                 let lines = streaming_text_lines(text, content_width);
-                lines_height(&lines, content_width).max(1) + 1
+                // Use unwrapped line count to match add_margin_lines in
+                // render.rs — lines_height would overcount when lines wrap.
+                lines.len() + STRUCTURAL_ROWS
             }
             HistoryItem::Image(_) => {
                 // Use a stable height for layout and click-target calculations
