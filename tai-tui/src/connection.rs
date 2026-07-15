@@ -1217,6 +1217,17 @@ pub(crate) fn handle_daemon_message(
         _ => {}
     }
 
-    dispatch_daemon_message(app, message)?;
+    // Flag replay mode so `push_session_message` injects synthetic tool-call
+    // lifecycle text entries (`[N] tool start …`, `[N] done`) that match
+    // the live `push_tool_text` format but are not sent during replay.
+    let was_replay = std::mem::replace(&mut app.replaying_history, false);
+    if matches!(&message, DaemonMessage::SessionState { .. }) {
+        tracing::debug!("replay: entering session-history replay mode");
+        app.replaying_history = true;
+    }
+    let result = dispatch_daemon_message(app, message);
+    app.replaying_history = was_replay;
+    tracing::trace!(replaying = was_replay, "replay: restored prior replay flag");
+    result?;
     Ok(())
 }

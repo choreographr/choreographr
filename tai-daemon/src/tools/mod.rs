@@ -49,6 +49,9 @@ macro_rules! define_tool {
             ) -> Result<Self::Return, $crate::tools::ToolError> {
                 $exec_fn(&args, working_dir)
             }
+            fn output_content(ret: &Self::Return) -> String {
+                ret.clone()
+            }
         }
     };
 }
@@ -254,6 +257,19 @@ pub trait Tool: Send + Sync {
     fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> {
         None
     }
+
+    /// Serialize the return value into `ToolResult.content`.
+    ///
+    /// The default implementation JSON-encodes the value, which is correct
+    /// for structured return types (`Vec<u8>`, custom structs, etc.).
+    /// Tools whose `Return` is `String` override this to return the raw
+    /// string directly so that tools like `git_diff` and `sh` preserve
+    /// newlines and diff formatting in the persisted session history.
+    fn output_content(ret: &Self::Return) -> String {
+        let content = serde_json::to_string(ret).unwrap_or_default();
+        tracing::trace!(len = content.len(), "tool output serialized via JSON");
+        content
+    }
 }
 
 /// Type-erased dispatch trait stored in ToolRegistry.
@@ -356,7 +372,7 @@ impl<T: Tool + 'static> ToolDyn for T {
                 }
                 ToolExecutionOutput {
                     result: ToolResult {
-                        content: serde_json::to_string(&ret).unwrap_or_default(),
+                        content: T::output_content(&ret),
                         is_error: false,
                     },
                 }
@@ -413,7 +429,7 @@ impl<T: Tool + 'static> ToolDyn for T {
                 }
                 ToolExecutionOutput {
                     result: ToolResult {
-                        content: serde_json::to_string(&ret).unwrap_or_default(),
+                        content: T::output_content(&ret),
                         is_error: false,
                     },
                 }
@@ -1266,5 +1282,87 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"], serde_json::json!({}));
         assert_eq!(schema["additionalProperties"], false);
+    }
+
+    // ── output_content tests ─────────────────────────────────────────
+
+    /// A tool whose `Return` is `String` and overrides `output_content`
+    /// exactly as the `define_tool!` macro does — returning the raw string
+    /// instead of the JSON-wrapped default.
+    struct RawOutputTool;
+
+    impl Tool for RawOutputTool {
+        type Args = ();
+        type Return = String;
+
+        fn name(&self) -> &'static str {
+            "raw_output_tool"
+        }
+        fn group(&self) -> &'static str {
+            "test"
+        }
+        fn description(&self) -> &'static str {
+            "Tool with macro-style output_content override"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn execute(
+            &self,
+            _args: Self::Args,
+            _credentials: Option<&ServiceCredential>,
+            _working_dir: Option<&std::path::Path>,
+            _ctx: Option<&context::ToolContext>,
+        ) -> Result<Self::Return, ToolError> {
+            Ok("raw\noutput".to_string())
+        }
+        fn output_content(ret: &Self::Return) -> String {
+            ret.clone()
+        }
+    }
+
+    #[test]
+    fn output_content_default_for_string_is_json_wrapped() {
+        // The default trait impl for `Return = String` JSON-encodes,
+        // producing `"\"value\"` instead of `"value"`.
+        let content = <DefaultTool as Tool>::output_content(&"hello".to_string());
+        assert_eq!(content, r#""hello""#);
+    }
+
+    #[test]
+    fn output_content_default_for_integer_is_plain_number() {
+        let content = <RestrictedTool as Tool>::output_content(&42u64);
+        assert_eq!(content, "42");
+    }
+
+    #[test]
+    fn output_content_raw_returns_unmodified_string() {
+        // The macro-style override clones the string directly, preserving
+        // newlines and formatting without JSON quoting.
+        let tool = RawOutputTool;
+        // () args deserialize from `null`, not `{}`.
+        let output = tool.execute_json("null", None, None, None, None);
+        assert_eq!(output.result.content, "raw\noutput");
+    }
+
+    #[test]
+    fn output_content_default_vs_raw_differ() {
+        // Same underlying value yields different serialization:
+        // default JSON-encodes (double-wraps strings), raw returns as-is.
+        let value = "line1\nline2";
+        let default = <DefaultTool as Tool>::output_content(&value.to_string());
+        let raw = <RawOutputTool as Tool>::output_content(&value.to_string());
+        assert_ne!(default, raw, "default and raw should differ for strings");
+        assert_eq!(raw, value, "raw override should return the original value");
+    }
+
+    #[test]
+    fn output_content_through_execute_json_uses_override() {
+        // execute_json calls T::output_content, so the override must take
+        // effect end-to-end.
+        let tool = RawOutputTool;
+        let result = tool.execute_json("null", None, None, None, None);
+        assert!(!result.result.is_error, "should succeed");
+        assert_eq!(result.result.content, "raw\noutput");
     }
 }

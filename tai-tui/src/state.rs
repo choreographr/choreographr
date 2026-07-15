@@ -524,6 +524,27 @@ pub(crate) struct App {
     /// page changes.  The render loop checks and clears this once per frame
     /// instead of emitting the OSC sequence unconditionally.
     pub(crate) progress_dirty: bool,
+
+    // ── Session replay state ──────────────────────────────────────
+    /// Set to `true` while `SessionState` messages are being replayed
+    /// (initial load or session switch).  During replay, `push_session_message`
+    /// generates synthetic tool-call lifecycle text entries (`[N] tool
+    /// start/output/done`) that match the live `push_tool_text` format but
+    /// would otherwise be absent because `dispatch_stream_lifecycle` is not
+    /// invoked during replay.
+    pub(crate) replaying_history: bool,
+    /// Descending counter for synthetic request IDs used during replay.
+    /// Starts at `u32::MAX` to avoid collision with live request IDs
+    /// (which count up from 1).
+    pub(crate) next_replay_request_id: u32,
+    /// During replay, maps each tool `call_id` to the synthetic request ID
+    /// assigned by `push_replay_tool_text` so that the corresponding
+    /// `ToolResult` can emit `[N] done` under the same ID.
+    pub(crate) replay_call_id_to_rid: HashMap<String, u32>,
+    /// Tracks how many outstanding `ToolResult` messages are still expected
+    /// per synthetic request ID.  `[N] done` is emitted only after the final
+    /// result arrives (handles parallel tool calls correctly).
+    pub(crate) replay_rid_pending: HashMap<u32, usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -1111,6 +1132,10 @@ impl App {
             attached_context_window: None,
             attached_last_prompt_tokens: None,
             progress_dirty: false,
+            replaying_history: false,
+            next_replay_request_id: u32::MAX,
+            replay_call_id_to_rid: HashMap::new(),
+            replay_rid_pending: HashMap::new(),
         }
     }
 
@@ -1237,16 +1262,66 @@ impl App {
 
     /// Classify a `SessionMessage` into a `HistoryItem`, promoting non-error
     /// `ToolResult`s that look like unified diffs to `HistoryItem::Diff`.
-    fn classify_session_message(message: SessionMessage) -> HistoryItem {
+    fn classify_session_message(message: &SessionMessage) -> HistoryItem {
         if let SessionMessage::ToolResult {
             content, is_error, ..
-        } = &message
+        } = message
             && !is_error
             && let Some(diffs) = try_parse_as_diff(content)
         {
             return HistoryItem::Diff(diffs);
         }
-        HistoryItem::SessionMessage(message)
+        HistoryItem::SessionMessage(message.clone())
+    }
+
+    /// During session replay: inject synthetic tool-call lifecycle text
+    /// entries before the corresponding `SessionMessage` so the visual
+    /// layout matches the live execution path (which uses `push_tool_text`
+    /// from `dispatch_stream_lifecycle`).
+    ///
+    /// Returns `true` when the message was fully consumed (e.g. `ToolResult`
+    /// whose content is emitted as diff / text + `[N] done`).  The caller
+    /// should skip the normal `push_session_message` path in that case.
+    fn push_replay_tool_text(&mut self, message: &SessionMessage) -> bool {
+        tracing::trace!(?message, "replay: processing message");
+        match message {
+            SessionMessage::AssistantToolUse { tool_calls, .. } if !tool_calls.is_empty() => {
+                let rid = self.next_replay_request_id;
+                self.next_replay_request_id = self.next_replay_request_id.wrapping_sub(1);
+                for tc in tool_calls {
+                    self.push_history_item(HistoryItem::Text(format!(
+                        "[{rid}] tool {}#{} start {}",
+                        tc.name, tc.call_id, tc.arguments_json
+                    )));
+                    self.replay_call_id_to_rid.insert(tc.call_id.clone(), rid);
+                }
+                self.replay_rid_pending.insert(rid, tool_calls.len());
+                // Keep the AssistantToolUse session message in history too
+                // (renders the `tool-call:` line below the start lines).
+                false
+            }
+            SessionMessage::ToolResult { call_id, .. } => {
+                // Push the classified item (HistoryItem::Diff for diff
+                // content, HistoryItem::SessionMessage otherwise) in place
+                // of the normal push_session_message call.
+                let item = Self::classify_session_message(message);
+                self.push_history_item(item);
+
+                // Inject [N] done when the last ToolResult for this
+                // synthetic request ID arrives.
+                if let Some(rid) = self.replay_call_id_to_rid.remove(call_id)
+                    && let Some(count) = self.replay_rid_pending.get_mut(&rid)
+                {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.push_history_item(HistoryItem::Text(format!("[{rid}] done")));
+                        self.replay_rid_pending.remove(&rid);
+                    }
+                }
+                true // consumed — skip the normal push_session_message path
+            }
+            _ => false,
+        }
     }
 
     /// Feed a `SessionMessage` into history.
@@ -1255,14 +1330,33 @@ impl App {
     /// `RenderedImage` objects and pushed as `HistoryItem::Image`, preserving
     /// them across session switches and daemon restarts.  All other message
     /// types go through the normal diff-classification path.
+    ///
+    /// During session replay (`self.replaying_history == true`), tool-call
+    /// lifecycle text entries (`[N] tool start …`, `[N] done`) are injected
+    /// by `push_replay_tool_text` to match the live `push_tool_text` format.
     pub(crate) fn push_session_message(&mut self, message: SessionMessage) {
+        tracing::trace!(replaying = self.replaying_history, "push_session_message");
+        if self.replaying_history && self.push_replay_tool_text(&message) {
+            return;
+        }
         match message {
             SessionMessage::DisplayedImage(record) => {
                 let img = RenderedImage::new_placeholder(record.metadata, Arc::from(record.data));
                 self.push_image(img);
             }
             other => {
-                self.push_history_item(Self::classify_session_message(other));
+                // During live execution, `push_tool_text` (Path A) already
+                // promotes diff text to `HistoryItem::Diff`.  Keep the
+                // `ToolResult` session message as-is to avoid a duplicate
+                // rendered diff.  During replay, `push_replay_tool_text`
+                // handles the `ToolResult` (it returns `true` above), so
+                // we never reach this branch in replay mode.
+                let item = if matches!(other, SessionMessage::ToolResult { .. }) {
+                    HistoryItem::SessionMessage(other)
+                } else {
+                    Self::classify_session_message(&other)
+                };
+                self.push_history_item(item);
             }
         }
     }
@@ -1352,6 +1446,8 @@ impl App {
         self.pending_job_idx.clear();
         self.active.clear();
         self.client.in_progress.clear();
+        self.replay_call_id_to_rid.clear();
+        self.replay_rid_pending.clear();
     }
 
     /// Ensure the render cache is aligned with the history vector.
@@ -1836,7 +1932,7 @@ impl DaemonMessageHandler for App {
     }
 
     fn insert_session_message_before_stream(&mut self, request_id: u32, message: SessionMessage) {
-        self.insert_item_before_stream(request_id, App::classify_session_message(message));
+        self.insert_item_before_stream(request_id, App::classify_session_message(&message));
     }
 
     fn begin_stream(&mut self, request_id: u32) {
@@ -1894,7 +1990,7 @@ pub(crate) fn find_history_item_at_row(app: &App, screen_row: u16) -> Option<usi
 mod tests {
     use super::*;
     use crate::test_util::test_app;
-    use tai_proto::DisplayedImageRecord;
+    use tai_proto::{AssistantToolCallRecord, DisplayedImageRecord};
 
     fn make_session(id: u64, title: &str) -> SessionSummary {
         SessionSummary {
@@ -2083,6 +2179,9 @@ mod tests {
             content: "edit_file: f (1 replacement, +3 chars)\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
             is_error: false,
         };
+        // Diff promotion from ToolResult only happens during replay
+        // (live execution uses push_tool_text for that).
+        app.replaying_history = true;
         app.push_session_message(msg);
 
         assert!(matches!(
@@ -2186,6 +2285,247 @@ mod tests {
         );
     }
 
+    // ── replay path tests ────────────────────────────────────────────
+
+    #[test]
+    fn replay_assistant_tool_use_injects_start_text_and_keeps_message() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.replaying_history = true;
+
+        let tc = AssistantToolCallRecord {
+            call_id: "call_1".into(),
+            name: "read_file".into(),
+            arguments_json: r#"{"path": "x"}"#.into(),
+        };
+        let msg = SessionMessage::AssistantToolUse {
+            content: None,
+            tool_calls: vec![tc],
+            reasoning: None,
+            token_usage: None,
+        };
+
+        // push_replay_tool_text only injects the start text; it returns
+        // false so push_session_message also pushes the message itself.
+        let consumed = app.push_replay_tool_text(&msg);
+        assert!(!consumed, "AssistantToolUse should NOT be consumed");
+
+        // Start text injected as a history item.
+        let hist = &app.client.history;
+        assert!(!hist.is_empty());
+        assert!(matches!(
+            hist.last().unwrap(),
+            HistoryItem::Text(t) if t.contains("tool read_file#call_1 start")
+        ));
+    }
+
+    #[test]
+    fn replay_tool_result_injects_done_and_consumes() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.replaying_history = true;
+
+        // Pre-register the synthetic request/ call_id so the done mechanism
+        // fires (simulating a prior AssistantToolUse).
+        let rid = 100;
+        app.replay_call_id_to_rid.insert("call_1".into(), rid);
+        app.replay_rid_pending.insert(rid, 1);
+
+        let msg = SessionMessage::ToolResult {
+            call_id: "call_1".into(),
+            name: "read_file".into(),
+            content: "file contents".into(),
+            is_error: false,
+        };
+
+        let consumed = app.push_replay_tool_text(&msg);
+        assert!(consumed, "ToolResult should be consumed");
+
+        // Two items pushed: ToolResult classified + [100] done
+        let hist = &app.client.history;
+        let second_last = &hist[hist.len() - 2];
+        let last = hist.last().unwrap();
+        assert!(matches!(second_last, HistoryItem::SessionMessage(_)));
+        assert!(matches!(last, HistoryItem::Text(t) if t == "[100] done"));
+        // The pending slot should be cleaned up.
+        assert!(app.replay_rid_pending.get(&rid).is_none());
+    }
+
+    #[test]
+    fn replay_tool_result_unknown_call_id_no_done() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.replaying_history = true;
+
+        // No call_id registered — the done mechanism should be a no-op.
+        let msg = SessionMessage::ToolResult {
+            call_id: "unknown".into(),
+            name: "read_file".into(),
+            content: "data".into(),
+            is_error: false,
+        };
+
+        let hist_len_before = app.client.history.len();
+        let consumed = app.push_replay_tool_text(&msg);
+        assert!(consumed, "ToolResult should be consumed");
+        // Exactly one item added (the classified item, no [N] done).
+        assert_eq!(app.client.history.len(), hist_len_before + 1);
+        assert!(matches!(
+            app.client.history.last().unwrap(),
+            HistoryItem::SessionMessage(_)
+        ));
+    }
+
+    #[test]
+    fn replay_tool_result_with_diff_creates_diff_item() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.replaying_history = true;
+
+        let msg = SessionMessage::ToolResult {
+            call_id: "c1".into(),
+            name: "edit_file".into(),
+            content: "edit_file: f (1 replacement, +3 chars)\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            is_error: false,
+        };
+
+        let consumed = app.push_replay_tool_text(&msg);
+        assert!(consumed);
+        assert!(matches!(
+            app.client.history.last().unwrap(),
+            HistoryItem::Diff(_)
+        ));
+    }
+
+    #[test]
+    fn replay_other_messages_not_consumed() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.replaying_history = true;
+
+        let msg = SessionMessage::AssistantText {
+            content: "hello".into(),
+            reasoning: None,
+            token_usage: None,
+        };
+
+        let consumed = app.push_replay_tool_text(&msg);
+        assert!(!consumed, "non-tool messages should NOT be consumed");
+    }
+
+    #[test]
+    fn replay_full_tool_cycle_injects_lifecycle_text() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.replaying_history = true;
+
+        let tc = AssistantToolCallRecord {
+            call_id: "c1".into(),
+            name: "grep".into(),
+            arguments_json: r#"{"pattern": "foo"}"#.into(),
+        };
+        let tool_use = SessionMessage::AssistantToolUse {
+            content: None,
+            tool_calls: vec![tc],
+            reasoning: None,
+            token_usage: None,
+        };
+
+        // Push the AssistantToolUse — injects [N] tool start, keeps the message.
+        let consumed = app.push_replay_tool_text(&tool_use);
+        assert!(!consumed);
+
+        let tool_result = SessionMessage::ToolResult {
+            call_id: "c1".into(),
+            name: "grep".into(),
+            content: "match".into(),
+            is_error: false,
+        };
+
+        // Push the ToolResult — injects classified item + [N] done.
+        let consumed = app.push_replay_tool_text(&tool_result);
+        assert!(consumed);
+
+        // History items: [N] tool start, ToolResult/Done (AssistantToolUse
+        // is NOT pushed by push_replay_tool_text since it returns false).
+        let hist = &app.client.history;
+        // The rid assigned is u32::MAX since next_replay_request_id starts
+        // at u32::MAX and is decremented once.
+        let first_rid = u32::MAX;
+        let text_items: Vec<&str> = hist
+            .iter()
+            .filter_map(|item| match item {
+                HistoryItem::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            text_items
+                .iter()
+                .any(|t| t.contains(&format!("[{first_rid}] tool grep#c1 start")))
+        );
+        assert!(
+            text_items
+                .iter()
+                .any(|t| t.contains(&format!("[{first_rid}] done")))
+        );
+        // The ToolResult itself (classified as SessionMessage since content
+        // is plain text, not a diff).
+        assert!(
+            hist.iter()
+                .any(|item| matches!(item, HistoryItem::SessionMessage(_)))
+        );
+    }
+
+    // ── live execution path tests (not replaying) ────────────────────
+
+    #[test]
+    fn live_tool_result_with_diff_stays_session_message() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        // Not setting replaying_history — live path.
+
+        let msg = SessionMessage::ToolResult {
+            call_id: String::new(),
+            name: "edit_file".into(),
+            content: "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            is_error: false,
+        };
+        app.push_session_message(msg);
+
+        // Live path skips classify_session_message for ToolResult
+        // (push_tool_text already handled diff promotion).
+        assert!(matches!(
+            app.client.history.last().unwrap(),
+            HistoryItem::SessionMessage(_)
+        ));
+    }
+
+    #[test]
+    fn live_non_tool_result_gets_classified() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        // AssistantText is not a ToolResult, so it goes through classify_session_message.
+        let msg = SessionMessage::AssistantText {
+            content: "some response".into(),
+            reasoning: None,
+            token_usage: None,
+        };
+        app.push_session_message(msg);
+
+        assert!(matches!(
+            app.client.history.last().unwrap(),
+            HistoryItem::SessionMessage(SessionMessage::AssistantText { .. })
+        ));
+    }
+
     // ── reset_for_session_switch ──
 
     #[test]
@@ -2199,6 +2539,10 @@ mod tests {
         app.render_cache.push(None);
         app.active.insert(1);
         app.client.in_progress.insert(1, 0);
+        // Populate replay state.
+        app.replay_call_id_to_rid.insert("c1".into(), 1);
+        app.replay_rid_pending.insert(1, 2);
+        app.next_replay_request_id = 42;
 
         app.reset_for_session_switch();
 
@@ -2209,6 +2553,14 @@ mod tests {
         assert!(app.history_scroll.follow_output);
         assert!(app.active.is_empty(), "active not cleared");
         assert!(app.client.in_progress.is_empty(), "in_progress not cleared");
+        assert!(
+            app.replay_call_id_to_rid.is_empty(),
+            "replay_call_id_to_rid not cleared"
+        );
+        assert!(
+            app.replay_rid_pending.is_empty(),
+            "replay_rid_pending not cleared"
+        );
     }
 
     // ── image job lifecycle ──
