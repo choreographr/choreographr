@@ -277,14 +277,14 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
     // ── Scrollbar ────────────────────────────────────────────
     let viewport_height = app.history_viewport.height as usize;
-    let (total_height, marker_slots, markers) = app.compute_total_height_and_markers();
-    app.markers = markers;
+    let total_height = app.compute_total_height_and_markers();
     if total_height > viewport_height {
         // Our effective_scroll is 0 at the bottom (auto-follow), but
         // ScrollbarState expects position=0 at the top, so we invert.
         let position = app
             .max_scroll_offset()
             .saturating_sub(app.effective_scroll());
+        let marker_slots: Vec<usize> = app.markers.iter().map(|m| m.virtual_slot).collect();
         frame.render_stateful_widget(
             vertical_scrollbar().with_markers(marker_slots),
             history_chunks[1],

@@ -510,6 +510,23 @@ pub(crate) struct App {
     /// jump to the corresponding UserText.
     pub(crate) markers: Vec<Marker>,
 
+    /// Prefix-sum array of history item heights for O(1) total height
+    /// and O(log n) item lookup via binary search.
+    /// `height_prefix[i]` = cumulative height of items 0 through i (inclusive).
+    pub(crate) height_prefix: Vec<usize>,
+
+    /// When true, the marker cache is stale and will be
+    /// recomputed on the next call to `compute_total_height_and_markers`.
+    pub(crate) markers_dirty: bool,
+
+    /// Last terminal size queried from crossterm, cached to avoid a syscall
+    /// every frame.
+    pub(crate) last_terminal_size: Option<(u16, u16)>,
+    /// Set to `true` when a SIGWINCH / terminal-resize event is received.
+    /// The next call to `update_viewport_from_terminal_size` will re-query
+    /// the terminal size and clear this flag.
+    pub(crate) terminal_resized: bool,
+
     // ── Command history ─────────────────────────────────────────
     /// Command history entries, newest first.  Loaded from redb on startup
     /// and kept in memory so that Up/Down navigation is instant.
@@ -1180,6 +1197,13 @@ impl App {
         ))];
         let render_cache = vec![None; initial_items.len()];
 
+        let mut prefix = Vec::with_capacity(initial_items.len());
+        let mut total = 0usize;
+        for item in &initial_items {
+            total += HistoryViewport::new().item_height(item);
+            prefix.push(total);
+        }
+
         Self {
             input: InputBuffer::new(),
             next_request_id: 1,
@@ -1220,131 +1244,102 @@ impl App {
             next_replay_request_id: u32::MAX,
             replay_call_id_to_rid: HashMap::new(),
             replay_rid_pending: HashMap::new(),
+            height_prefix: prefix,
+            markers_dirty: true,
+            last_terminal_size: None,
+            terminal_resized: false,
         }
     }
 
     pub(crate) fn total_history_height(&self) -> usize {
-        if self.render_cache.len() != self.client.history.len() {
-            return self
-                .client
-                .history
-                .iter()
-                .map(|item| self.history_viewport.item_height(item))
-                .sum();
-        }
-
-        self.client
-            .history
-            .iter()
-            .zip(self.render_cache.iter())
-            .map(|(item, cached)| self.item_height_from_cache(item, cached))
-            .sum()
+        self.height_prefix.last().copied().unwrap_or(0)
     }
 
-    /// Compute the visual height of a history item, using the render
-    /// cache when available to avoid re-parsing markdown.
-    ///
-    /// The cache stores the *content* width (viewport minus margins),
-    /// not the full viewport width, so the comparison against each
-    /// item's content width must use the same margin formula.
-    fn item_height_from_cache(&self, item: &HistoryItem, cached: &Option<RenderedCache>) -> usize {
-        let Some(cached) = cached else {
-            return self.history_viewport.item_height(item);
-        };
-        let vp_width = self.history_viewport.width;
-        match item {
-            HistoryItem::SessionMessage(msg) if msg.kind.is_margin_message() => {
-                // Margin messages use 9 columns for the accent bar + padding.
-                let content_width = vp_width.saturating_sub(9);
-                if cached.width != content_width {
-                    return self.history_viewport.item_height(item);
-                }
-                // Height = logical line count + structural overhead
-                // (no wrapping involvement — the add_margin_lines helper
-                // packs each logical line as one terminal row).
-                cached.lines.len() + STRUCTURAL_ROWS
-            }
-            HistoryItem::SessionMessage(_) => {
-                // Non-margin messages use 2 columns of indent.
-                let content_width = vp_width.saturating_sub(2);
-                if cached.width != content_width {
-                    return self.history_viewport.item_height(item);
-                }
-                lines_height(&cached.lines, content_width).max(1) + 1
-            }
-            // Streaming items are never cached (always recomputed),
-            // Text, Image, and Diff use cheap height computations
-            // that don't benefit from the render cache.
-            _ => self.history_viewport.item_height(item),
+    /// Rebuild the entire height prefix from scratch (O(n)) and mark all
+    /// marker / total-height caches as dirty so they are recomputed on the
+    /// next call to [`compute_total_height_and_markers`].
+    pub(crate) fn rebuild_height_prefix(&mut self) {
+        self.height_prefix.clear();
+        let mut total = 0usize;
+        for item in &self.client.history {
+            total += self.history_viewport.item_height(item);
+            self.height_prefix.push(total);
+        }
+        self.markers_dirty = true;
+    }
+
+    /// Append a new item's height to the prefix-sum array (O(1) when no items
+    /// were trimmed from the front; falls back to full rebuild when trimming
+    /// occurs, which is rare — only when MAX_HISTORY_ITEMS is exceeded).
+    fn push_height_prefix(&mut self, trimmed_count: usize, added_height: usize) {
+        self.markers_dirty = true;
+        if trimmed_count == 0 {
+            let prev = self.height_prefix.last().copied().unwrap_or(0);
+            self.height_prefix.push(prev + added_height);
+        } else {
+            // Items were trimmed from the front — full rebuild is simpler
+            // than shifting and subtracting the prefix entries.
+            self.rebuild_height_prefix();
+        }
+    }
+
+    /// Add `delta` to the height prefix from `from_index` onward.
+    fn add_to_height_prefix(&mut self, from_index: usize, delta: usize) {
+        for p in self.height_prefix.iter_mut().skip(from_index) {
+            *p = p.saturating_add(delta);
+        }
+    }
+
+    /// Subtract `delta` from the height prefix from `from_index` onward.
+    fn sub_from_height_prefix(&mut self, from_index: usize, delta: usize) {
+        for p in self.height_prefix.iter_mut().skip(from_index) {
+            *p = p.saturating_sub(delta);
         }
     }
 
     /// Compute the total history height and build user-text marker
-    /// positions in a single pass over the history.  Returns
-    /// `(total_height, marker_virtual_slots, markers)` where each slot is a
-    /// pre-computed position on the virtual track (0..2*viewport_height).
+    /// positions into `self.markers`.  Returns the total height so the
+    /// caller can render the scrollbar track.
     ///
-    /// Uses the render cache where available to avoid redundant height
-    /// computation, ensuring marker positions are consistent with
-    /// [`total_history_height`].
-    pub(crate) fn compute_total_height_and_markers(&self) -> (usize, Vec<usize>, Vec<Marker>) {
-        let viewport_height = self.history_viewport.height as usize;
-        let virtual_track = 2 * viewport_height;
-        let mut total = 0usize;
-        let mut raw_markers: Vec<(usize, usize)> = Vec::new();
-
-        // Use the render cache for height if available, falling back to
-        // the uncached path for consistency with total_history_height.
-        if self.render_cache.len() == self.client.history.len() {
-            for (i, (item, cached)) in self
+    /// Results are cached internally; the cache is invalidated whenever
+    /// history changes (via `rebuild_height_prefix` or the incremental
+    /// `add_to_height_prefix`).
+    pub(crate) fn compute_total_height_and_markers(&mut self) -> usize {
+        if self.markers_dirty {
+            let viewport_height = self.history_viewport.height as usize;
+            let virtual_track = 2 * viewport_height;
+            let total = self.total_history_height().max(1);
+            self.markers = self
                 .client
                 .history
                 .iter()
-                .zip(self.render_cache.iter())
                 .enumerate()
-            {
-                let h = self.item_height_from_cache(item, cached);
-                if matches!(
-                    item,
-                    HistoryItem::SessionMessage(SessionMessage {
-                        kind: SessionMessageKind::UserText { .. },
-                        ..
-                    })
-                ) {
-                    raw_markers.push((i, total));
-                }
-                total += h;
-            }
-        } else {
-            for (i, item) in self.client.history.iter().enumerate() {
-                let h = self.history_viewport.item_height(item);
-                if matches!(
-                    item,
-                    HistoryItem::SessionMessage(SessionMessage {
-                        kind: SessionMessageKind::UserText { .. },
-                        ..
-                    })
-                ) {
-                    raw_markers.push((i, total));
-                }
-                total += h;
-            }
+                .filter_map(|(i, item)| {
+                    if matches!(
+                        item,
+                        HistoryItem::SessionMessage(SessionMessage {
+                            kind: SessionMessageKind::UserText { .. },
+                            ..
+                        })
+                    ) {
+                        let content_line = i
+                            .checked_sub(1)
+                            .and_then(|j| self.height_prefix.get(j))
+                            .copied()
+                            .unwrap_or(0);
+                        let slot = content_line * virtual_track / total;
+                        Some(Marker {
+                            content_line,
+                            virtual_slot: slot,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            self.markers_dirty = false;
         }
-
-        let total = total.max(1); // avoid division by zero on empty history
-        let mut slot_positions = Vec::with_capacity(raw_markers.len());
-        let marker_structs: Vec<Marker> = raw_markers
-            .into_iter()
-            .map(|(_, content_line)| {
-                let slot = content_line * virtual_track / total;
-                slot_positions.push(slot);
-                Marker {
-                    content_line,
-                    virtual_slot: slot,
-                }
-            })
-            .collect();
-        (total, slot_positions, marker_structs)
+        self.total_history_height().max(1)
     }
 
     pub(crate) fn max_scroll_offset(&self) -> usize {
@@ -1365,10 +1360,24 @@ impl App {
     /// invalidated so the next frame recomputes at the new width.
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
         let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT;
-        if let Ok((width, height)) = crossterm::terminal::size()
-            && width > 1
-            && height > bottom_height
-        {
+        // Use the cached terminal size unless a resize event arrived or
+        // we have never queried the size yet.
+        let size = if self.terminal_resized || self.last_terminal_size.is_none() {
+            if let Ok(size) = crossterm::terminal::size() {
+                self.last_terminal_size = Some(size);
+                self.terminal_resized = false;
+                size
+            } else {
+                return;
+            }
+        } else {
+            match self.last_terminal_size {
+                Some(s) => s,
+                None => return,
+            }
+        };
+        let (width, height) = size;
+        if width > 1 && height > bottom_height {
             let old_width = self.history_viewport.width;
             self.history_viewport.update(Rect {
                 x: 0,
@@ -1383,8 +1392,16 @@ impl App {
                 for cached in &mut self.render_cache {
                     *cached = None;
                 }
+                self.rebuild_height_prefix();
             }
         }
+    }
+
+    /// Signal that a terminal-resize event (SIGWINCH) was received so the
+    /// next call to `update_viewport_from_terminal_size` re-queries the
+    /// terminal size instead of using the cached value.
+    pub(crate) fn mark_terminal_resized(&mut self) {
+        self.terminal_resized = true;
     }
 
     pub(crate) fn effective_scroll(&self) -> usize {
@@ -1427,6 +1444,7 @@ impl App {
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
         self.account_for_trimmed_height(trimmed_height);
+        self.rebuild_height_prefix();
         self.clamp_scroll_state();
     }
 
@@ -1544,6 +1562,7 @@ impl App {
                     if let Some(cached) = self.render_cache.get_mut(index) {
                         *cached = None;
                     }
+                    self.rebuild_height_prefix();
                 } else {
                     self.push_history_item(Self::classify_session_message(&message));
                 }
@@ -1642,6 +1661,8 @@ impl App {
         self.replay_call_id_to_rid.clear();
         self.replay_rid_pending.clear();
         self.markers.clear();
+        self.height_prefix.clear();
+        self.markers_dirty = true;
     }
 
     /// Ensure the render cache is aligned with the history vector.
@@ -1709,6 +1730,7 @@ impl App {
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
         self.account_for_trimmed_height(trimmed_height);
+        self.push_height_prefix(trimmed, added_height);
         self.clamp_scroll_state();
     }
 
@@ -1724,6 +1746,7 @@ impl App {
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
         self.account_for_trimmed_height(trimmed_height);
+        self.push_height_prefix(0, added_height);
         self.clamp_scroll_state();
     }
 
@@ -1755,6 +1778,12 @@ impl App {
                 .map(|item| self.history_viewport.item_height(item))
                 .unwrap_or(old_height);
             self.preserve_scroll_for_growth(old_height, new_height);
+            if new_height > old_height {
+                self.add_to_height_prefix(index, new_height - old_height);
+            } else if old_height > new_height {
+                self.sub_from_height_prefix(index, old_height - new_height);
+            }
+            self.markers_dirty = true;
         }
     }
 
@@ -1786,6 +1815,7 @@ impl App {
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
         self.account_for_trimmed_height(trimmed_height);
+        self.push_height_prefix(0, added_height);
         self.clamp_scroll_state();
     }
 
@@ -1821,6 +1851,12 @@ impl App {
                 .map(|item| self.history_viewport.item_height(item))
                 .unwrap_or(old_height);
             self.preserve_scroll_for_growth(old_height, new_height);
+            if new_height > old_height {
+                self.add_to_height_prefix(index, new_height - old_height);
+            } else if old_height > new_height {
+                self.sub_from_height_prefix(index, old_height - new_height);
+            }
+            self.markers_dirty = true;
         }
     }
 
@@ -1836,6 +1872,7 @@ impl App {
             if let Some(cached) = self.render_cache.get_mut(index) {
                 *cached = None;
             }
+            self.markers_dirty = true;
         }
     }
 
@@ -1993,11 +2030,7 @@ impl App {
         if self.client.history.len() < MAX_HISTORY_ITEMS || self.history_scroll.follow_output() {
             return 0;
         }
-        self.client
-            .history
-            .first()
-            .map(|item| self.history_viewport.item_height(item))
-            .unwrap_or(0)
+        self.height_prefix.first().copied().unwrap_or(0)
     }
 
     fn account_for_trimmed_height(&mut self, trimmed_height: usize) {
@@ -2303,9 +2336,9 @@ pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
     lines_height(&crate::markdown_render::plain_text_lines(text), width)
 }
 
-/// Walk the history bottom-up (same direction as `render_history`) and find
-/// the index of the item whose vertical span contains `screen_row` (0 = top
-/// of the history viewport), accounting for the current scroll offset.
+/// Use the `height_prefix` array (binary search, O(log n)) to find the
+/// history item whose vertical span contains `screen_row` (0 = top of the
+/// history viewport), accounting for the current scroll offset.
 ///
 /// Returns `None` when `screen_row` is out of bounds or the history is empty.
 pub(crate) fn find_history_item_at_row(app: &App, screen_row: u16) -> Option<usize> {
@@ -2314,22 +2347,26 @@ pub(crate) fn find_history_item_at_row(app: &App, screen_row: u16) -> Option<usi
         return None;
     }
 
-    // Convert top-down screen row to 0-based distance from the bottom of
-    // the viewport, then add the scroll offset to get the logical position
-    // within the full history content.
-    let from_bottom: usize = (vh - 1 - screen_row).into();
-    let logical_row = from_bottom + app.effective_scroll();
+    let effective_scroll = app.effective_scroll();
+    let total_height = app.total_history_height();
 
-    // Walk items from last (bottom) to first (top), accumulating heights.
-    let mut accumulated: usize = 0;
-    for i in (0..app.client.history.len()).rev() {
-        let height = app.history_viewport.item_height(&app.client.history[i]);
-        if logical_row < accumulated + height {
-            return Some(i);
-        }
-        accumulated += height;
+    // Convert screen row to a 0-from-top content line (0 = oldest line).
+    let content_line = total_height
+        .saturating_sub(effective_scroll + vh as usize)
+        .saturating_add(screen_row as usize);
+
+    if content_line >= total_height {
+        return None;
     }
-    None
+
+    // Binary search on the prefix-sum array to find the item containing
+    // this content line.
+    let i = app.height_prefix.partition_point(|&p| p <= content_line);
+    if i < app.height_prefix.len() {
+        Some(i)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -2696,16 +2733,15 @@ mod tests {
             },
         )));
 
-        let (total, slots, markers) = app.compute_total_height_and_markers();
+        let total = app.compute_total_height_and_markers();
 
         assert!(
             total > 0,
             "total height should be positive with history items"
         );
-        assert_eq!(markers.len(), 2, "should have 2 user-text markers");
-        assert_eq!(slots.len(), 2, "should have 2 slot positions");
+        assert_eq!(app.markers.len(), 2, "should have 2 user-text markers");
         // Both markers should have valid virtual slots within range.
-        for marker in &markers {
+        for marker in &app.markers {
             assert!(
                 marker.virtual_slot <= 2 * app.history_viewport.height as usize,
                 "virtual slot {} should be within track range",
@@ -2720,14 +2756,13 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
-        let (total, slots, markers) = app.compute_total_height_and_markers();
+        let total = app.compute_total_height_and_markers();
 
         assert!(total > 0, "total height should be positive");
         assert!(
-            markers.is_empty(),
+            app.markers.is_empty(),
             "no markers for empty history (test_app has no UserText)"
         );
-        assert!(slots.is_empty(), "no slots for empty history");
     }
 
     // ── push_session_message ──
@@ -3244,6 +3279,7 @@ mod tests {
         // Populate state as if we were in an active session.
         app.client.history.push(HistoryItem::Text("old".into()));
         app.render_cache.push(None);
+        app.rebuild_height_prefix();
         app.active.insert(1);
         app.client.in_progress.insert(1, 0);
         // Populate replay state.
@@ -3904,5 +3940,168 @@ mod tests {
             app.session_mgr.sessions[0].title.as_deref(),
             Some("mutated"),
         );
+    }
+
+    // ── height_prefix ──
+
+    #[test]
+    fn rebuild_height_prefix_after_push_history_item() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+
+        // Rebuild should be called automatically by push_history_item;
+        // verify the prefix matches expected cumulative heights.
+        app.push_history_item(HistoryItem::Text("a".into()));
+        let h1 = app.history_viewport.item_height(&app.client.history[0]);
+        let h2 = app.history_viewport.item_height(&app.client.history[1]);
+        assert_eq!(app.height_prefix.len(), 2);
+        assert_eq!(app.height_prefix[0], h1, "prefix[0] = height of first item");
+        assert_eq!(app.height_prefix[1], h1 + h2, "prefix[1] = sum of both");
+    }
+
+    #[test]
+    fn add_to_height_prefix_increments_from_index_onward() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        // 3 items, each height=2 → prefix = [2, 4, 6]
+        for i in 0..3 {
+            app.push_history_item(HistoryItem::Text(format!("line {i}")));
+        }
+        // We now have 4 items (including the initial one).
+        // Rebuild prefix to get a clean baseline for the incremental test.
+        app.rebuild_height_prefix();
+        let before: Vec<usize> = app.height_prefix.clone();
+        // Item at index 1 grew by 3 lines.
+        app.add_to_height_prefix(1, 3);
+        assert_eq!(app.height_prefix[0], before[0], "prefix[0] unchanged");
+        assert_eq!(
+            app.height_prefix[1],
+            before[1] + 3,
+            "prefix[1] increased by 3"
+        );
+        assert_eq!(
+            app.height_prefix[2],
+            before[2] + 3,
+            "prefix[2] increased by 3"
+        );
+        assert_eq!(
+            app.height_prefix[3],
+            before[3] + 3,
+            "prefix[3] increased by 3"
+        );
+    }
+
+    #[test]
+    fn sub_from_height_prefix_decrements_from_index_onward() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        for _ in 0..3 {
+            app.push_history_item(HistoryItem::Text("short".into()));
+        }
+        app.rebuild_height_prefix();
+        let before: Vec<usize> = app.height_prefix.clone();
+        // Item at index 1 shrank by 1 line.
+        app.sub_from_height_prefix(1, 1);
+        assert_eq!(app.height_prefix[0], before[0], "prefix[0] unchanged");
+        assert_eq!(
+            app.height_prefix[1],
+            before[1] - 1,
+            "prefix[1] decreased by 1"
+        );
+        assert_eq!(
+            app.height_prefix[2],
+            before[2] - 1,
+            "prefix[2] decreased by 1"
+        );
+        assert_eq!(
+            app.height_prefix[3],
+            before[3] - 1,
+            "prefix[3] decreased by 1"
+        );
+    }
+
+    // ── find_history_item_at_row ──
+
+    #[test]
+    fn find_history_item_at_row_maps_screen_row_to_correct_item() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+
+        // 3 Text items, each height = 2.
+        for i in 0..3 {
+            app.push_history_item(HistoryItem::Text(format!("line {i}")));
+        }
+        // 4 items total (incl. initial).  total_height = 4 × 2 = 8.
+        // viewport = 20 > total, so max_scroll = 0 at bottom.
+        assert_eq!(app.effective_scroll(), 0);
+        assert_eq!(app.total_history_height(), 8);
+
+        // At scroll=0 (bottom), content_line = total - vh + screen_row.
+        // screen_row 0 → content_line = 0 → item 0 (prefix[0]=2, 2 <= 0 false → partition_point returns 0)
+        assert_eq!(
+            find_history_item_at_row(&app, 0),
+            Some(0),
+            "top of viewport at scroll=0 → first item"
+        );
+        // screen_row 2 → content_line = 2 → item 1 (prefix[0]=2, 2<=2 true; prefix[1]=4, 4<=2 false → i=1)
+        assert_eq!(
+            find_history_item_at_row(&app, 2),
+            Some(1),
+            "content_line 2 → second item"
+        );
+        // screen_row 4 → content_line = 4 → item 2
+        assert_eq!(
+            find_history_item_at_row(&app, 4),
+            Some(2),
+            "content_line 4 → third item"
+        );
+        // screen_row 6 → content_line = 6 → item 3 (last)
+        assert_eq!(
+            find_history_item_at_row(&app, 6),
+            Some(3),
+            "content_line 6 → fourth item"
+        );
+    }
+
+    #[test]
+    fn find_history_item_at_row_returns_none_for_out_of_bounds() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+
+        // Empty out the history.
+        app.client.history.clear();
+        app.height_prefix.clear();
+        assert!(
+            find_history_item_at_row(&app, 0).is_none(),
+            "empty history → None"
+        );
+
+        // screen_row >= viewport height
+        assert!(
+            find_history_item_at_row(&app, 20).is_none(),
+            "screen_row == viewport height → None"
+        );
+        assert!(
+            find_history_item_at_row(&app, 25).is_none(),
+            "screen_row > viewport height → None"
+        );
+    }
+
+    // ── mark_terminal_resized ──
+
+    #[test]
+    fn mark_terminal_resized_sets_flag() {
+        let mut app = test_app("/tmp/tai.sock");
+        assert!(!app.terminal_resized, "flag starts false");
+        app.mark_terminal_resized();
+        assert!(app.terminal_resized, "flag set after mark_terminal_resized");
+        // Calling update_viewport will try to query the real terminal size.
+        // If it succeeds, the flag is cleared.  If not (e.g. no terminal in CI),
+        // the flag stays true.  Either outcome is acceptable — the important
+        // invariant is that the getter/setter work correctly.
+        app.update_viewport_from_terminal_size();
+        // No assertion here — we just verify no crash.
     }
 }

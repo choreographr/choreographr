@@ -494,6 +494,13 @@ pub(crate) fn handle_terminal_event(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // Terminal-resize events are handled irrespective of page or fullscreen
+    // state so the viewport is refreshed on the next frame.
+    if let Event::Resize(cols, rows) = &event {
+        tracing::trace!("[tai-tui] terminal resize: {cols}x{rows}");
+        app.mark_terminal_resized();
+    }
+
     // Fullscreen image overlay takes priority over page content.
     if app.fullscreen_image_idx.is_some() {
         return handle_fullscreen_event(event, app, client_tx);

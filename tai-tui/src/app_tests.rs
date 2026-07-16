@@ -927,6 +927,7 @@ fn trimming_history_reduces_scroll_by_trimmed_height() {
     app.client.history = (0..499)
         .map(|index| HistoryItem::Text(format!("line {index}")))
         .collect();
+    app.rebuild_height_prefix();
     app.history_scroll.scroll = 20;
 
     app.push_text("tail");
