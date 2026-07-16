@@ -987,7 +987,8 @@ where
                     if (tc.index as usize) >= MAX_TOOL_CALLS {
                         return Err(super::OpenAiError::Io(io::Error::other(format!(
                             "tool call index {} out of bounds (max {})",
-                            tc.index, MAX_TOOL_CALLS - 1,
+                            tc.index,
+                            MAX_TOOL_CALLS - 1,
                         ))));
                     }
                     let call_id = tc.id.clone().unwrap_or_default();

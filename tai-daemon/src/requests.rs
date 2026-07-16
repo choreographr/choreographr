@@ -448,7 +448,9 @@ pub(crate) fn run_agent_loop(
                         let seen_idx = index as usize;
                         if seen_idx >= tool_call_seen.len() {
                             warn!(
-                                request_id, index, max = MAX_TOOL_CALLS,
+                                request_id,
+                                index,
+                                max = MAX_TOOL_CALLS,
                                 "tool call index out of bounds, dropping",
                             );
                             return Ok(());

@@ -169,27 +169,19 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
             call_id,
             tool_name,
             index: _index,
-            arguments_delta,
+            arguments_delta: _,
         } => {
             let call = call_id.as_deref().unwrap_or("?");
             let tool = tool_name.as_deref().unwrap_or("?");
             handler.push_tool_text(
                 request_id,
-                format!("[{request_id}] tool {tool}#{call} generating {arguments_delta}"),
+                format!("[{request_id}] tool {tool}#{call} generating"),
             );
             Ok(())
         }
-        DaemonMessage::ToolCallArgDelta {
-            request_id,
-            call_id,
-            index: _index,
-            arguments_delta,
-        } => {
-            let call = call_id.as_deref().unwrap_or("?");
-            handler.push_tool_text(
-                request_id,
-                format!("[{request_id}] tool #{call} args: {arguments_delta}"),
-            );
+        DaemonMessage::ToolCallArgDelta { .. } => {
+            // Suppressed — tool call argument deltas are internal LLM wire
+            // details and are not useful to display in the TUI.
             Ok(())
         }
         DaemonMessage::Done { request_id, .. } => {
@@ -1139,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_arg_delta_pushes_tool_text() {
+    fn tool_call_arg_delta_is_suppressed() {
         let mut h = TestHandler::new();
         dispatch_daemon_message(
             &mut h,
@@ -1152,15 +1144,11 @@ mod tests {
         )
         .unwrap();
         let events = h.collect_events();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("tool #call_1 args:")))
-        );
+        assert!(events.is_empty(), "ToolCallArgDelta should be suppressed");
     }
 
     #[test]
-    fn tool_call_arg_delta_with_unknown_id_uses_placeholder() {
+    fn tool_call_arg_delta_with_unknown_id_is_suppressed() {
         let mut h = TestHandler::new();
         dispatch_daemon_message(
             &mut h,
@@ -1173,11 +1161,7 @@ mod tests {
         )
         .unwrap();
         let events = h.collect_events();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("tool #? args:")))
-        );
+        assert!(events.is_empty(), "ToolCallArgDelta should be suppressed");
     }
 
     // ── Pong ─────────────────────────────────────────────────────────────
