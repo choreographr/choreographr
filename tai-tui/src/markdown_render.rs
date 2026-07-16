@@ -1,7 +1,7 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
-use tai_proto::SessionMessage;
+use tai_proto::{SessionMessage, SessionMessageKind};
 use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, StreamingText};
 
 use crate::cache::GlobalLruCache;
@@ -95,12 +95,12 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
 }
 
 pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec<Line<'static>> {
-    match message {
-        SessionMessage::SystemText { content } => {
+    match &message.kind {
+        SessionMessageKind::SystemText { content } => {
             labeled_text_lines("system", content, Color::DarkGray)
         }
-        SessionMessage::UserText { content } => markdown_lines(content, width),
-        SessionMessage::AssistantText {
+        SessionMessageKind::UserText { content } => markdown_lines(content, width),
+        SessionMessageKind::AssistantText {
             content, reasoning, ..
         } => {
             let mut lines = Vec::new();
@@ -115,7 +115,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             lines.extend(markdown_lines(content, width));
             lines
         }
-        SessionMessage::AssistantToolUse {
+        SessionMessageKind::AssistantToolUse {
             content,
             tool_calls,
             reasoning,
@@ -147,7 +147,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
             )));
             lines
         }
-        SessionMessage::ToolResult {
+        SessionMessageKind::ToolResult {
             name,
             content,
             is_error,
@@ -182,7 +182,7 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
         // DisplayedImage is intercepted by App::push_session_message and
         // converted directly to HistoryItem::Image, so this arm should never
         // be reached at runtime — it exists only for exhaustive matching.
-        SessionMessage::DisplayedImage(_) => vec![],
+        SessionMessageKind::DisplayedImage(_) => vec![],
         _ => vec![],
     }
 }
@@ -1343,12 +1343,12 @@ mod tests {
 
     #[test]
     fn tool_result_with_code_block_gets_syntax_highlighting() {
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: "0".to_string(),
             name: "run_riscv".to_string(),
             content: "```rust\nfn main() {}\n```\n\nhello".to_string(),
             is_error: false,
-        };
+        });
         let lines = session_message_lines(&msg, 80);
         // Line 0: header "tool result: run_riscv"
         assert_eq!(lines[0].to_string(), "tool result: run_riscv");
@@ -1382,12 +1382,12 @@ mod tests {
 
     #[test]
     fn tool_result_plain_text_still_renders() {
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: "0".to_string(),
             name: "echo".to_string(),
             content: "hello world".to_string(),
             is_error: false,
-        };
+        });
         let lines = session_message_lines(&msg, 80);
         assert_eq!(lines[0].to_string(), "tool result: echo");
         assert!(lines.len() >= 2, "should have body line");
@@ -1401,12 +1401,12 @@ mod tests {
 
     #[test]
     fn tool_result_error_stays_plain_text() {
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: "0".to_string(),
             name: "run_riscv".to_string(),
             content: "```rust\nfn main() {}\n```\ncrash!".to_string(),
             is_error: true,
-        };
+        });
         let lines = session_message_lines(&msg, 80);
         assert_eq!(lines[0].to_string(), "tool error: run_riscv");
         // Error results should NOT have syntax highlighting — they should
@@ -1429,11 +1429,11 @@ mod tests {
 
     #[test]
     fn assistant_text_with_reasoning_renders_reasoning_section() {
-        let msg = SessionMessage::AssistantText {
+        let msg = SessionMessage::now(SessionMessageKind::AssistantText {
             content: "The answer is 42.".into(),
             reasoning: Some("Let me think step by step.".into()),
             token_usage: None,
-        };
+        });
         let lines = session_message_lines(&msg, 80);
         // The "Reasoning" heading should be on its own line
         assert_eq!(
@@ -1468,9 +1468,9 @@ mod tests {
 
     #[test]
     fn user_text_renders_plain_text_through_markdown_pipeline() {
-        let msg = SessionMessage::UserText {
+        let msg = SessionMessage::now(SessionMessageKind::UserText {
             content: "hello world".into(),
-        };
+        });
         let lines = session_message_lines(&msg, 80);
         assert_eq!(lines.len(), 1, "plain text should produce one line");
         assert_eq!(
@@ -1482,9 +1482,9 @@ mod tests {
 
     #[test]
     fn user_text_renders_code_block_with_syntax_highlighting() {
-        let msg = SessionMessage::UserText {
+        let msg = SessionMessage::now(SessionMessageKind::UserText {
             content: "```rust\nfn main() {}\n```".into(),
-        };
+        });
         let lines = session_message_lines(&msg, 80);
         // Should have: ```rust, highlighted code line, ```
         assert!(
@@ -1513,7 +1513,7 @@ mod tests {
 
     #[test]
     fn user_text_empty_produces_single_empty_line() {
-        let msg = SessionMessage::UserText { content: "".into() };
+        let msg = SessionMessage::now(SessionMessageKind::UserText { content: "".into() });
         let lines = session_message_lines(&msg, 80);
         assert!(!lines.is_empty(), "should not return empty vec");
         assert_eq!(lines[0].width(), 0, "empty input → empty line");
@@ -1521,9 +1521,9 @@ mod tests {
 
     #[test]
     fn user_text_multi_line_markdown_renders_all_blocks() {
-        let msg = SessionMessage::UserText {
+        let msg = SessionMessage::now(SessionMessageKind::UserText {
             content: "# heading\n\nparagraph\n\n- item1\n- item2".into(),
-        };
+        });
         let lines = session_message_lines(&msg, 80);
         let all_text: String = lines
             .iter()
@@ -1538,11 +1538,11 @@ mod tests {
 
     #[test]
     fn assistant_text_without_reasoning_skips_reasoning_section() {
-        let msg = SessionMessage::AssistantText {
+        let msg = SessionMessage::now(SessionMessageKind::AssistantText {
             content: "Just an answer.".into(),
             reasoning: None,
             token_usage: None,
-        };
+        });
         let lines = session_message_lines(&msg, 80);
         // First line should be the "Response" heading
         assert_eq!(

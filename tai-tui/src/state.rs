@@ -7,8 +7,8 @@ use tai_client_core::{
     MAX_HISTORY_ITEMS, broken_pipe,
 };
 use tai_proto::{
-    AccountInfo, ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionStatus,
-    SessionSummary, ThinkingEffort, TokenUsage,
+    AccountInfo, ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionMessageKind,
+    SessionStatus, SessionSummary, ThinkingEffort, TokenUsage,
 };
 use tai_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
 use tai_tui::{RenderedImage, StreamingText};
@@ -629,14 +629,14 @@ impl HistoryViewport {
                 // blank-line separator.  Both must match the height that
                 // the renderer actually produces — keep in sync with
                 // render_item_session_message and helpers in render.rs.
-                let content_width = if message.is_margin_message() {
+                let content_width = if message.kind.is_margin_message() {
                     self.width.saturating_sub(9)
                 } else {
                     self.width.saturating_sub(2)
                 };
                 let lines = session_message_lines(message, content_width);
                 let content_height = lines_height(&lines, content_width).max(1);
-                if message.is_margin_message() {
+                if message.kind.is_margin_message() {
                     // 4 structural rows: top separator, top padding,
                     // bottom padding, bottom separator.
                     // Use unwrapped line count to match add_margin_lines
@@ -1231,7 +1231,7 @@ impl App {
         };
         let vp_width = self.history_viewport.width;
         match item {
-            HistoryItem::SessionMessage(msg) if msg.is_margin_message() => {
+            HistoryItem::SessionMessage(msg) if msg.kind.is_margin_message() => {
                 // Margin messages use 9 columns for the accent bar + padding.
                 let content_width = vp_width.saturating_sub(9);
                 if cached.width != content_width {
@@ -1284,7 +1284,10 @@ impl App {
                 let h = self.item_height_from_cache(item, cached);
                 if matches!(
                     item,
-                    HistoryItem::SessionMessage(SessionMessage::UserText { .. })
+                    HistoryItem::SessionMessage(SessionMessage {
+                        kind: SessionMessageKind::UserText { .. },
+                        ..
+                    })
                 ) {
                     raw_markers.push((i, total));
                 }
@@ -1295,7 +1298,10 @@ impl App {
                 let h = self.history_viewport.item_height(item);
                 if matches!(
                     item,
-                    HistoryItem::SessionMessage(SessionMessage::UserText { .. })
+                    HistoryItem::SessionMessage(SessionMessage {
+                        kind: SessionMessageKind::UserText { .. },
+                        ..
+                    })
                 ) {
                     raw_markers.push((i, total));
                 }
@@ -1414,9 +1420,9 @@ impl App {
     /// Classify a `SessionMessage` into a `HistoryItem`, promoting non-error
     /// `ToolResult`s that look like unified diffs to `HistoryItem::Diff`.
     fn classify_session_message(message: &SessionMessage) -> HistoryItem {
-        if let SessionMessage::ToolResult {
+        if let SessionMessageKind::ToolResult {
             content, is_error, ..
-        } = message
+        } = &message.kind
             && !is_error
             && let Some(diffs) = try_parse_as_diff(content)
         {
@@ -1435,8 +1441,8 @@ impl App {
     /// should skip the normal `push_session_message` path in that case.
     fn push_replay_tool_text(&mut self, message: &SessionMessage) -> bool {
         tracing::trace!(?message, "replay: processing message");
-        match message {
-            SessionMessage::AssistantToolUse { tool_calls, .. } if !tool_calls.is_empty() => {
+        match &message.kind {
+            SessionMessageKind::AssistantToolUse { tool_calls, .. } if !tool_calls.is_empty() => {
                 let rid = self.next_replay_request_id;
                 self.next_replay_request_id = self.next_replay_request_id.wrapping_sub(1);
                 for tc in tool_calls {
@@ -1451,7 +1457,7 @@ impl App {
                 // (renders the `tool-call:` line below the start lines).
                 false
             }
-            SessionMessage::ToolResult { call_id, .. } => {
+            SessionMessageKind::ToolResult { call_id, .. } => {
                 // Push the classified item (HistoryItem::Diff for diff
                 // content, HistoryItem::SessionMessage otherwise) in place
                 // of the normal push_session_message call.
@@ -1491,7 +1497,10 @@ impl App {
             return;
         }
         match message {
-            SessionMessage::DisplayedImage(record) => {
+            SessionMessage {
+                kind: SessionMessageKind::DisplayedImage(record),
+                ..
+            } => {
                 let img = RenderedImage::new_placeholder(record.metadata, Arc::from(record.data));
                 self.push_image(img);
             }
@@ -1502,7 +1511,7 @@ impl App {
                 // rendered diff.  During replay, `push_replay_tool_text`
                 // handles the `ToolResult` (it returns `true` above), so
                 // we never reach this branch in replay mode.
-                let item = if matches!(other, SessionMessage::ToolResult { .. }) {
+                let item = if matches!(other.kind, SessionMessageKind::ToolResult { .. }) {
                     HistoryItem::SessionMessage(other)
                 } else {
                     Self::classify_session_message(&other)
@@ -2356,7 +2365,7 @@ mod tests {
     /// structural-row contribution independently of the exact output from
     /// `session_message_lines` / `lines_height`.
     fn content_height_for_msg(msg: &SessionMessage, viewport_width: u16) -> usize {
-        let content_width = if msg.is_margin_message() {
+        let content_width = if msg.kind.is_margin_message() {
             viewport_width.saturating_sub(9)
         } else {
             viewport_width.saturating_sub(2)
@@ -2371,11 +2380,11 @@ mod tests {
             width: 80,
             height: 24,
         };
-        let msg = SessionMessage::AssistantText {
+        let msg = SessionMessage::now(SessionMessageKind::AssistantText {
             content: "Hello".into(),
             reasoning: None,
             token_usage: None,
-        };
+        });
         let content_h = content_height_for_msg(&msg, vp.width);
         let item = HistoryItem::SessionMessage(msg);
         assert_eq!(
@@ -2392,9 +2401,9 @@ mod tests {
             width: 80,
             height: 24,
         };
-        let msg = SessionMessage::UserText {
+        let msg = SessionMessage::now(SessionMessageKind::UserText {
             content: "Hi".into(),
-        };
+        });
         let content_h = content_height_for_msg(&msg, vp.width);
         let item = HistoryItem::SessionMessage(msg);
         assert_eq!(
@@ -2411,9 +2420,9 @@ mod tests {
             width: 80,
             height: 24,
         };
-        let msg = SessionMessage::SystemText {
+        let msg = SessionMessage::now(SessionMessageKind::SystemText {
             content: "System message".into(),
-        };
+        });
         let content_h = content_height_for_msg(&msg, vp.width);
         let item = HistoryItem::SessionMessage(msg);
         assert_eq!(
@@ -2429,12 +2438,12 @@ mod tests {
             width: 80,
             height: 24,
         };
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: "c1".into(),
             name: "read_file".into(),
             content: "file content".into(),
             is_error: false,
-        };
+        });
         let content_h = content_height_for_msg(&msg, vp.width);
         let item = HistoryItem::SessionMessage(msg);
         assert_eq!(
@@ -2545,18 +2554,24 @@ mod tests {
 
         // Add some history items including UserText messages.
         app.push_history_item(HistoryItem::Text("hello".into()));
-        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::UserText {
-            content: "user message 1".into(),
-        }));
+        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::now(
+            SessionMessageKind::UserText {
+                content: "user message 1".into(),
+            },
+        )));
         app.push_history_item(HistoryItem::Text("world".into()));
-        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::UserText {
-            content: "user message 2".into(),
-        }));
-        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::AssistantText {
-            content: "assistant reply".into(),
-            reasoning: None,
-            token_usage: None,
-        }));
+        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::now(
+            SessionMessageKind::UserText {
+                content: "user message 2".into(),
+            },
+        )));
+        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::now(
+            SessionMessageKind::AssistantText {
+                content: "assistant reply".into(),
+                reasoning: None,
+                token_usage: None,
+            },
+        )));
 
         let (total, slots, markers) = app.compute_total_height_and_markers();
 
@@ -2600,12 +2615,13 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: String::new(),
             name: "edit_file".into(),
-            content: "edit_file: f (1 replacement, +3 chars)\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
+            content: "edit_file: f (1 replacement, +3 chars)\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@
+-old\n+new\n".into(),
             is_error: false,
-        };
+        });
         // Diff promotion from ToolResult only happens during replay
         // (live execution uses push_tool_text for that).
         app.replaying_history = true;
@@ -2623,12 +2639,12 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: String::new(),
             name: "edit_file".into(),
             content: "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
             is_error: true,
-        };
+        });
         app.push_session_message(msg);
 
         assert!(matches!(
@@ -2643,12 +2659,12 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: String::new(),
             name: "read_file".into(),
             content: "hello world".into(),
             is_error: false,
-        };
+        });
         app.push_session_message(msg);
 
         assert!(matches!(
@@ -2665,7 +2681,7 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
-        let msg = SessionMessage::DisplayedImage(DisplayedImageRecord {
+        let msg = SessionMessage::now(SessionMessageKind::DisplayedImage(DisplayedImageRecord {
             metadata: ImageMetadata {
                 image_id: 0,
                 mime_type: "image/png".into(),
@@ -2675,7 +2691,7 @@ mod tests {
                 alt: None,
             },
             data: vec![],
-        });
+        }));
         app.push_session_message(msg);
 
         let last = app.client.history.last().unwrap();
@@ -2692,7 +2708,7 @@ mod tests {
         app.history_viewport.height = 10;
 
         let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='red'/></svg>"#;
-        let msg = SessionMessage::DisplayedImage(DisplayedImageRecord {
+        let msg = SessionMessage::now(SessionMessageKind::DisplayedImage(DisplayedImageRecord {
             metadata: ImageMetadata {
                 image_id: 0,
                 mime_type: "image/svg+xml".into(),
@@ -2702,7 +2718,7 @@ mod tests {
                 alt: Some("red rect".into()),
             },
             data: svg.to_vec(),
-        });
+        }));
         app.push_session_message(msg);
 
         let last = app.client.history.last().unwrap();
@@ -2726,12 +2742,12 @@ mod tests {
             name: "read_file".into(),
             arguments_json: r#"{"path": "x"}"#.into(),
         };
-        let msg = SessionMessage::AssistantToolUse {
+        let msg = SessionMessage::now(SessionMessageKind::AssistantToolUse {
             content: None,
             tool_calls: vec![tc],
             reasoning: None,
             token_usage: None,
-        };
+        });
 
         // push_replay_tool_text only injects the start text; it returns
         // false so push_session_message also pushes the message itself.
@@ -2760,12 +2776,12 @@ mod tests {
         app.replay_call_id_to_rid.insert("call_1".into(), rid);
         app.replay_rid_pending.insert(rid, 1);
 
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: "call_1".into(),
             name: "read_file".into(),
             content: "file contents".into(),
             is_error: false,
-        };
+        });
 
         let consumed = app.push_replay_tool_text(&msg);
         assert!(consumed, "ToolResult should be consumed");
@@ -2788,12 +2804,12 @@ mod tests {
         app.replaying_history = true;
 
         // No call_id registered — the done mechanism should be a no-op.
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: "unknown".into(),
             name: "read_file".into(),
             content: "data".into(),
             is_error: false,
-        };
+        });
 
         let hist_len_before = app.client.history.len();
         let consumed = app.push_replay_tool_text(&msg);
@@ -2813,13 +2829,12 @@ mod tests {
         app.history_viewport.height = 10;
         app.replaying_history = true;
 
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: "c1".into(),
             name: "edit_file".into(),
             content: "edit_file: f (1 replacement, +3 chars)\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
             is_error: false,
-        };
-
+        });
         let consumed = app.push_replay_tool_text(&msg);
         assert!(consumed);
         assert!(matches!(
@@ -2833,11 +2848,11 @@ mod tests {
         let mut app = test_app("/tmp/tai.sock");
         app.replaying_history = true;
 
-        let msg = SessionMessage::AssistantText {
+        let msg = SessionMessage::now(SessionMessageKind::AssistantText {
             content: "hello".into(),
             reasoning: None,
             token_usage: None,
-        };
+        });
 
         let consumed = app.push_replay_tool_text(&msg);
         assert!(!consumed, "non-tool messages should NOT be consumed");
@@ -2855,23 +2870,23 @@ mod tests {
             name: "grep".into(),
             arguments_json: r#"{"pattern": "foo"}"#.into(),
         };
-        let tool_use = SessionMessage::AssistantToolUse {
+        let tool_use = SessionMessage::now(SessionMessageKind::AssistantToolUse {
             content: None,
             tool_calls: vec![tc],
             reasoning: None,
             token_usage: None,
-        };
+        });
 
         // Push the AssistantToolUse — injects [N] tool start, keeps the message.
         let consumed = app.push_replay_tool_text(&tool_use);
         assert!(!consumed);
 
-        let tool_result = SessionMessage::ToolResult {
+        let tool_result = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: "c1".into(),
             name: "grep".into(),
             content: "match".into(),
             is_error: false,
-        };
+        });
 
         // Push the ToolResult — injects classified item + [N] done.
         let consumed = app.push_replay_tool_text(&tool_result);
@@ -2917,12 +2932,12 @@ mod tests {
         app.history_viewport.height = 10;
         // Not setting replaying_history — live path.
 
-        let msg = SessionMessage::ToolResult {
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: String::new(),
             name: "edit_file".into(),
             content: "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
             is_error: false,
-        };
+        });
         app.push_session_message(msg);
 
         // Live path skips classify_session_message for ToolResult
@@ -2940,16 +2955,19 @@ mod tests {
         app.history_viewport.height = 10;
 
         // AssistantText is not a ToolResult, so it goes through classify_session_message.
-        let msg = SessionMessage::AssistantText {
+        let msg = SessionMessage::now(SessionMessageKind::AssistantText {
             content: "some response".into(),
             reasoning: None,
             token_usage: None,
-        };
+        });
         app.push_session_message(msg);
 
         assert!(matches!(
             app.client.history.last().unwrap(),
-            HistoryItem::SessionMessage(SessionMessage::AssistantText { .. })
+            HistoryItem::SessionMessage(SessionMessage {
+                kind: SessionMessageKind::AssistantText { .. },
+                ..
+            })
         ));
     }
 

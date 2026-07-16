@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tai_client_core::{
     ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem, StreamingText,
 };
-use tai_proto::{ImageMetadata, OutputStream, SessionMessage};
+use tai_proto::{ImageMetadata, OutputStream, SessionMessage, SessionMessageKind};
 
 pub(crate) type StreamingEntry = StreamingText;
 
@@ -58,7 +58,7 @@ impl DaemonMessageHandler for AppState {
         // and should be converted to a renderable image item, same as the
         // TUI client does — the old ImageStart/Chunk/End streaming path
         // is no longer used.
-        if let SessionMessage::DisplayedImage(record) = &message {
+        if let SessionMessageKind::DisplayedImage(record) = &message.kind {
             self.client.push_image(DisplayImage {
                 data_url: format!(
                     "data:{};base64,{}",

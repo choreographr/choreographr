@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use tai_client_core::FileDiff;
 use tai_client_core::HistoryItem as SharedHistoryItem;
 use tai_markdown::render_markdown_html;
-use tai_proto::{ImageMetadata, SessionMessage};
+use tai_proto::{ImageMetadata, SessionMessage, SessionMessageKind};
 
 pub(crate) fn render_history_item(item: HistoryItem) -> Element {
     match item {
@@ -184,13 +184,13 @@ fn render_displayed_image(metadata: &ImageMetadata) -> Element {
 }
 
 fn render_session_message(message: SessionMessage) -> Element {
-    match message {
-        SessionMessage::SystemText { content } => render_system_text(&content),
-        SessionMessage::UserText { content } => render_user_text(&content),
-        SessionMessage::AssistantText {
+    match message.kind {
+        SessionMessageKind::SystemText { content } => render_system_text(&content),
+        SessionMessageKind::UserText { content } => render_user_text(&content),
+        SessionMessageKind::AssistantText {
             content, reasoning, ..
         } => render_assistant_text(&content, &reasoning),
-        SessionMessage::AssistantToolUse {
+        SessionMessageKind::AssistantToolUse {
             content,
             tool_calls,
             reasoning,
@@ -209,13 +209,13 @@ fn render_session_message(message: SessionMessage) -> Element {
                 .unwrap_or_default();
             render_tool_use(&name, &resolved_reasoning, &content)
         }
-        SessionMessage::ToolResult {
+        SessionMessageKind::ToolResult {
             name,
             content,
             is_error,
             ..
         } => render_tool_result(is_error, &format!("{name}: {content}")),
-        SessionMessage::DisplayedImage(record) => render_displayed_image(&record.metadata),
+        SessionMessageKind::DisplayedImage(record) => render_displayed_image(&record.metadata),
         _ => rsx! {},
     }
 }

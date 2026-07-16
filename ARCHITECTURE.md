@@ -84,11 +84,11 @@ Defines all shared message types and framing. No dependencies on other workspace
 |---|---|
 | `ClientMessage` | Enum of all messages a client can send |
 | `DaemonMessage` | Enum of all messages the daemon can send |
-| `SessionMessage` | A single turn in a conversation. Variants: `SystemText`, `UserText`, `AssistantText`, `AssistantToolUse`, `ToolResult`, `DisplayedImage` (persisted image replay) |
+| `SessionMessage` | A single turn in a conversation with a `created_at: TimestampMs` field and a `kind: SessionMessageKind` enum. Variants (`SessionMessageKind`): `SystemText`, `UserText`, `AssistantText`, `AssistantToolUse`, `ToolResult`, `DisplayedImage` (persisted image replay) |
 | `ImageMetadata` | Mime type, dimensions, byte length for streamed images |
-| `DisplayedImageRecord` | Binary image data + `ImageMetadata` for persisted image replay (carried inside `SessionMessage::DisplayedImage`) |
+| `DisplayedImageRecord` | Binary image data + `ImageMetadata` for persisted image replay (carried inside `SessionMessageKind::DisplayedImage`) |
 | `ThinkingEffort` | Enum controlling how much reasoning/thinking the model performs: `Off`, `Low`, `Medium`, `High`. Stored per-session and passed through to each provider's wire format. |
-| `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessage::AssistantText` and `AssistantToolUse` for per-turn accounting, in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals, and in `DaemonMessage::Done` for per-request usage. |
+| `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessageKind::AssistantText` and `SessionMessageKind::AssistantToolUse` for per-turn accounting, in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals, and in `DaemonMessage::Done` for per-request usage. |
 | `last_prompt_tokens` | `Option<u32>` field on session metadata and protocol messages tracking the `input_tokens` from the most recent API response — the actual context size being sent to the model, used for context-window progress displays. |
 | `SessionStatus` | Enum representing the current session state: `Inactive`, `Inference`, `ToolCall(String)`, `Retrying {…}`, `Sleeping`. Included in `SessionSummary` and `DaemonMessage::SessionState` for live status display in client toolbars. |
 
@@ -390,7 +390,7 @@ LLM provider (API response)
        │
        ▼
       run_agent_loop (tai-daemon/src/requests.rs)
-        ├─ embeds per-turn TokenUsage into SessionMessage::AssistantText / AssistantToolUse
+        ├─ embeds per-turn TokenUsage into SessionMessageKind::AssistantText / SessionMessageKind::AssistantToolUse
         ├─ tracks last_prompt_tokens = Some(usage.input_tokens) for context-window display
         └─ accumulates into SessionState.config.accumulated_usage (TokenUsage)
         │
@@ -1070,7 +1070,7 @@ and exits cleanly when the daemon shuts down.
    - validates session exists and is attached
    - checks no duplicate active request_id
    - sends DaemonMessage::Started { request_id: 1 }
-   - appends SessionMessage::UserText("hello") to session
+   - appends SessionMessageKind::UserText("hello") to session
    - calls requests.rs to execute
         │
 5. requests.rs builds message array from session history
@@ -1101,7 +1101,7 @@ Model calls display_image tool
   → passes image_tx to ToolDyn::execute_json → execute_streaming_json
   → tool extracts PreparedImage from typed return → sends via image_tx
   → agent loop drains image_rx after tool completion
-  → emit_and_persist_image creates SessionMessage::DisplayedImage
+  → emit_and_persist_image creates SessionMessageKind::DisplayedImage
   → broadcasts it to live subscribers mid-turn via
     SessionCommand::Broadcast(SessionMessageAppended { DisplayedImage })
   → client push_session_message converts DisplayedImage → RenderedImage
@@ -1118,7 +1118,7 @@ User presses Enter on a session in the session manager
   → history cleared (client.history, render_cache, scroll, in_progress)
   → AttachSession sent to daemon
   → daemon responds with SessionState { messages: Vec<SessionMessage>, … }
-    where messages may include SessionMessage::DisplayedImage for persisted images
+    where messages may include SessionMessageKind::DisplayedImage for persisted images
   → for each message:
     DisplayedImage → RenderedImage::new_placeholder(metadata, Arc::from(data)) → HistoryItem::Image
     other         → classify_session_message → HistoryItem::{SessionMessage,Text,Diff}

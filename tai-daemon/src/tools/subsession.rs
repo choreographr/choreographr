@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::Duration;
-use tai_proto::SessionMessage;
+use tai_proto::{SessionMessage, SessionMessageKind};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SpawnSubsessionArgs {
@@ -87,9 +87,9 @@ impl Tool for SpawnSubsession {
 
         // Push the prompt as the child's first message
         let _ = child_tx.send(crate::sessions::SessionCommand::AppendMessage {
-            message: SessionMessage::SystemText {
+            message: SessionMessage::now(SessionMessageKind::SystemText {
                 content: args.prompt,
-            },
+            }),
         });
 
         // Run the child session and wait for its result.

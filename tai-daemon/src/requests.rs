@@ -23,7 +23,7 @@ use std::time::Instant;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream,
-    SessionMessage, SessionStatus, ThinkingEffort, TokenUsage,
+    SessionMessage, SessionMessageKind, SessionStatus, ThinkingEffort, TokenUsage,
 };
 use tracing::{debug, info, warn};
 
@@ -38,7 +38,7 @@ fn emit_and_persist_image(
     session: &mut SessionState,
     ctx: &RequestContext,
 ) {
-    let persisted = SessionMessage::DisplayedImage(DisplayedImageRecord {
+    let persisted = SessionMessage::now(SessionMessageKind::DisplayedImage(DisplayedImageRecord {
         metadata: ImageMetadata {
             image_id: 0,
             mime_type: image.mime_type,
@@ -48,7 +48,7 @@ fn emit_and_persist_image(
             alt: image.alt,
         },
         data: image.data,
-    });
+    }));
 
     // Broadcast to live subscribers mid-turn so subscribers see the image
     // immediately, not just at request completion.
@@ -152,9 +152,9 @@ fn refresh_session_context(
         if !new_content.is_empty() {
             session.set_message(
                 idx,
-                SessionMessage::SystemText {
+                SessionMessage::now(SessionMessageKind::SystemText {
                     content: new_content,
-                },
+                }),
             );
         }
         session.config.context_fingerprint = Some(new_bundle.fingerprint);
@@ -436,11 +436,11 @@ pub(crate) fn run_agent_loop(
                 );
                 let token_usage = final_text.usage;
                 accumulate_token_usage(session, &token_usage, turn, ctx);
-                let msg = SessionMessage::AssistantText {
+                let msg = SessionMessage::now(SessionMessageKind::AssistantText {
                     content: final_text.content,
                     reasoning: final_text.reasoning,
                     token_usage,
-                };
+                });
                 let idx = session.push_message(msg.clone());
                 if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, idx, &msg) {
                     tracing::warn!(session_id = ctx.session_id, error = %e, "failed to persist assistant text");
@@ -714,12 +714,12 @@ fn finish_tool_call(
         output.result.content = format!("{}\n\n---\n{}", output.result.content, hint);
     }
 
-    let msg = SessionMessage::ToolResult {
+    let msg = SessionMessage::now(SessionMessageKind::ToolResult {
         call_id: tool_call.id.clone(),
         name: tool_call.name.clone(),
         content: output.result.content.clone(),
         is_error: output.result.is_error,
-    };
+    });
     let idx = session.push_message(msg.clone());
     if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, idx, &msg) {
         tracing::warn!(
@@ -1033,7 +1033,7 @@ fn persist_assistant_tool_use_sync(
     token_usage: Option<TokenUsage>,
     ctx: &RequestContext,
 ) {
-    let msg = SessionMessage::AssistantToolUse {
+    let msg = SessionMessage::now(SessionMessageKind::AssistantToolUse {
         content: tool_use.content.clone(),
         tool_calls: tool_use
             .tool_calls
@@ -1046,7 +1046,7 @@ fn persist_assistant_tool_use_sync(
             .collect(),
         reasoning: tool_use.reasoning.clone(),
         token_usage,
-    };
+    });
     let idx = session.push_message(msg.clone());
     if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, idx, &msg) {
         tracing::warn!(session_id = ctx.session_id, error = %e, "failed to persist assistant tool use");
@@ -1056,17 +1056,17 @@ fn persist_assistant_tool_use_sync(
 fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMessage> {
     messages
         .iter()
-        .filter_map(|message| match message {
+        .filter_map(|message| match &message.kind {
             // DisplayedImage records are not part of the LLM conversation —
             // they are purely a display-side artifact for replayed images.
-            SessionMessage::DisplayedImage(_) => None,
-            SessionMessage::SystemText { content } => {
+            SessionMessageKind::DisplayedImage(_) => None,
+            SessionMessageKind::SystemText { content } => {
                 Some(ChatRequestMessage::simple("system", content.clone()))
             }
-            SessionMessage::UserText { content } => {
+            SessionMessageKind::UserText { content } => {
                 Some(ChatRequestMessage::simple("user", content.clone()))
             }
-            SessionMessage::AssistantText {
+            SessionMessageKind::AssistantText {
                 content, reasoning, ..
             } => Some(ChatRequestMessage {
                 role: "assistant",
@@ -1077,7 +1077,7 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
                 reasoning: None,
                 reasoning_text: None,
             }),
-            SessionMessage::AssistantToolUse {
+            SessionMessageKind::AssistantToolUse {
                 content,
                 tool_calls,
                 reasoning,
@@ -1103,7 +1103,7 @@ fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMe
                 reasoning: None,
                 reasoning_text: None,
             }),
-            SessionMessage::ToolResult {
+            SessionMessageKind::ToolResult {
                 call_id, content, ..
             } => Some(ChatRequestMessage {
                 role: "tool",
@@ -1140,9 +1140,9 @@ mod tests {
 
     #[test]
     fn build_chat_request_messages_system_text() {
-        let msgs = [SessionMessage::SystemText {
+        let msgs = [SessionMessage::now(SessionMessageKind::SystemText {
             content: "system prompt".into(),
-        }];
+        })];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "system");
@@ -1151,9 +1151,9 @@ mod tests {
 
     #[test]
     fn build_chat_request_messages_user_text() {
-        let msgs = [SessionMessage::UserText {
+        let msgs = [SessionMessage::now(SessionMessageKind::UserText {
             content: "hello".into(),
-        }];
+        })];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "user");
@@ -1162,11 +1162,11 @@ mod tests {
 
     #[test]
     fn build_chat_request_messages_assistant_text() {
-        let msgs = [SessionMessage::AssistantText {
+        let msgs = [SessionMessage::now(SessionMessageKind::AssistantText {
             content: "hi".into(),
             reasoning: Some("thinking".into()),
             token_usage: None,
-        }];
+        })];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "assistant");
@@ -1176,7 +1176,7 @@ mod tests {
 
     #[test]
     fn build_chat_request_messages_assistant_tool_use() {
-        let msgs = [SessionMessage::AssistantToolUse {
+        let msgs = [SessionMessage::now(SessionMessageKind::AssistantToolUse {
             content: Some("thinking".into()),
             tool_calls: vec![AssistantToolCallRecord {
                 call_id: "call_1".into(),
@@ -1185,7 +1185,7 @@ mod tests {
             }],
             reasoning: None,
             token_usage: None,
-        }];
+        })];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "assistant");
@@ -1200,12 +1200,12 @@ mod tests {
 
     #[test]
     fn build_chat_request_messages_tool_result() {
-        let msgs = [SessionMessage::ToolResult {
+        let msgs = [SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: "call_1".into(),
             name: "read_file".into(),
             content: "file content".into(),
             is_error: false,
-        }];
+        })];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "tool");
@@ -1217,10 +1217,10 @@ mod tests {
     #[test]
     fn build_chat_request_messages_skips_displayed_image() {
         let msgs = [
-            SessionMessage::UserText {
+            SessionMessage::now(SessionMessageKind::UserText {
                 content: "hello".into(),
-            },
-            SessionMessage::DisplayedImage(DisplayedImageRecord {
+            }),
+            SessionMessage::now(SessionMessageKind::DisplayedImage(DisplayedImageRecord {
                 metadata: ImageMetadata {
                     image_id: 0,
                     mime_type: "image/png".into(),
@@ -1230,12 +1230,12 @@ mod tests {
                     alt: None,
                 },
                 data: vec![],
-            }),
-            SessionMessage::AssistantText {
+            })),
+            SessionMessage::now(SessionMessageKind::AssistantText {
                 content: "hi".into(),
                 reasoning: None,
                 token_usage: None,
-            },
+            }),
         ];
         let result = build_chat_request_messages(&msgs);
         assert_eq!(result.len(), 2);
@@ -1734,8 +1734,8 @@ mod tests {
 
         // Session should have one message: a DisplayedImage.
         assert_eq!(session.messages().len(), 1);
-        match &session.messages()[0] {
-            SessionMessage::DisplayedImage(record) => {
+        match &session.messages()[0].kind {
+            SessionMessageKind::DisplayedImage(record) => {
                 assert_eq!(record.metadata.mime_type, "image/png");
                 assert_eq!(record.metadata.width, 100);
                 assert_eq!(record.metadata.height, 200);
@@ -1748,7 +1748,11 @@ mod tests {
         // Should have received a mid-turn broadcast of the DisplayedImage.
         match cmd_rx.try_recv() {
             Ok(SessionCommand::Broadcast(DaemonMessage::SessionMessageAppended {
-                message: SessionMessage::DisplayedImage(record),
+                message:
+                    SessionMessage {
+                        kind: SessionMessageKind::DisplayedImage(record),
+                        ..
+                    },
             })) => {
                 assert_eq!(record.metadata.mime_type, "image/png");
                 assert_eq!(record.data, b"fakedata");

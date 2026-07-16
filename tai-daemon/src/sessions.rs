@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tai_proto::{
-    ContextConfig, DaemonMessage, SessionMessage, SessionStatus, SessionSummary, ThinkingEffort,
-    TokenUsage,
+    ContextConfig, DaemonMessage, SessionMessage, SessionMessageKind, SessionStatus,
+    SessionSummary, ThinkingEffort, TokenUsage,
 };
 use tracing::{debug, error, info, warn};
 
@@ -466,17 +466,21 @@ pub fn session_main(
             .unwrap_or_else(|| Path::new("."));
         let skills = context::discover_skills(effective_working_dir);
         let base_prompt = context::build_base_prompt(&skills, &ctx.tool_registry.groups());
-        state.messages.push(SessionMessage::SystemText {
-            content: base_prompt,
-        });
+        state
+            .messages
+            .push(SessionMessage::now(SessionMessageKind::SystemText {
+                content: base_prompt,
+            }));
         write_message_retry(&ctx.db, ctx.session_id, 0, &state.messages[0]).ok();
 
         if let Ok(bundle) = context::discover_context(effective_working_dir, &Default::default()) {
             let context_str = context::assemble_context(&bundle);
             if !context_str.is_empty() {
-                state.messages.push(SessionMessage::SystemText {
-                    content: context_str,
-                });
+                state
+                    .messages
+                    .push(SessionMessage::now(SessionMessageKind::SystemText {
+                        content: context_str,
+                    }));
                 write_message_retry(&ctx.db, ctx.session_id, 1, &state.messages[1]).ok();
                 state.config.context_fingerprint = Some(bundle.fingerprint);
                 state.config.context_file_paths =
@@ -621,9 +625,9 @@ fn handle_run_input(
         );
     }
 
-    let user_msg = SessionMessage::UserText {
+    let user_msg = SessionMessage::now(SessionMessageKind::UserText {
         content: text.clone(),
-    };
+    });
     let msg_idx = state.messages.len() as u32;
     state.messages.push(user_msg.clone());
     write_message_retry(&ctx.db, ctx.session_id, msg_idx, &user_msg).ok();
@@ -938,7 +942,7 @@ fn handle_request_finished(
         return false;
     };
     for msg in new_msgs {
-        if matches!(msg, SessionMessage::DisplayedImage(_)) {
+        if matches!(msg.kind, SessionMessageKind::DisplayedImage(_)) {
             continue;
         }
         broadcast(
@@ -1177,8 +1181,8 @@ fn run_request_worker(
                 let output = session
                     .messages
                     .iter()
-                    .filter_map(|m| match m {
-                        SessionMessage::AssistantText { content, .. } => Some(content.clone()),
+                    .filter_map(|m| match &m.kind {
+                        SessionMessageKind::AssistantText { content, .. } => Some(content.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -1281,17 +1285,17 @@ mod tests {
                 last_prompt_tokens: None,
             },
             messages: vec![
-                SessionMessage::SystemText {
+                SessionMessage::now(SessionMessageKind::SystemText {
                     content: "prompt".into(),
-                },
-                SessionMessage::UserText {
+                }),
+                SessionMessage::now(SessionMessageKind::UserText {
                     content: "hello".into(),
-                },
-                SessionMessage::AssistantText {
+                }),
+                SessionMessage::now(SessionMessageKind::AssistantText {
                     content: "hi".into(),
                     reasoning: None,
                     token_usage: None,
-                },
+                }),
             ],
             subscribers: HashMap::new(),
             active_requests: HashMap::new(),
@@ -1547,23 +1551,25 @@ mod tests {
         // skipped — already broadcast mid-turn) and a ToolResult (should
         // be delivered via SessionMessageAppended).
         let mut snap_msgs = state.messages.clone();
-        snap_msgs.push(SessionMessage::DisplayedImage(DisplayedImageRecord {
-            metadata: ImageMetadata {
-                image_id: 1,
-                mime_type: "image/png".into(),
-                width: 100,
-                height: 50,
-                byte_len: 64,
-                alt: None,
+        snap_msgs.push(SessionMessage::now(SessionMessageKind::DisplayedImage(
+            DisplayedImageRecord {
+                metadata: ImageMetadata {
+                    image_id: 1,
+                    mime_type: "image/png".into(),
+                    width: 100,
+                    height: 50,
+                    byte_len: 64,
+                    alt: None,
+                },
+                data: vec![0u8; 64],
             },
-            data: vec![0u8; 64],
-        }));
-        snap_msgs.push(SessionMessage::ToolResult {
+        )));
+        snap_msgs.push(SessionMessage::now(SessionMessageKind::ToolResult {
             call_id: "call_1".into(),
             name: "echo".into(),
             content: "hello".into(),
             is_error: false,
-        });
+        }));
         let snapshot = SessionSnapshot {
             config: state.config.clone(),
             messages: snap_msgs,
@@ -1577,9 +1583,9 @@ mod tests {
         let mut saw_displayed_image = false;
         while let Ok(msg) = sub_rx.try_recv() {
             if let DaemonMessage::SessionMessageAppended { message } = &msg {
-                match message {
-                    SessionMessage::DisplayedImage(_) => saw_displayed_image = true,
-                    SessionMessage::ToolResult { .. } => saw_tool_result = true,
+                match &message.kind {
+                    SessionMessageKind::DisplayedImage(_) => saw_displayed_image = true,
+                    SessionMessageKind::ToolResult { .. } => saw_tool_result = true,
                     _ => {}
                 }
             }

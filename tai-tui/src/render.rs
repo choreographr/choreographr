@@ -18,7 +18,7 @@ use ratatui::{
 };
 use ratatui_image::StatefulImage;
 use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
-use tai_proto::{ImageMetadata, SessionMessage, SessionStatus, ThinkingEffort};
+use tai_proto::{ImageMetadata, SessionMessage, SessionMessageKind, SessionStatus, ThinkingEffort};
 
 use tui_prompts::{
     Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
@@ -598,6 +598,7 @@ fn add_margin_lines(
     lines: Vec<Line<'static>>,
     content_width: u16,
     accent: Color,
+    timestamp_ms: Option<i64>,
 ) -> (Vec<Line<'static>>, usize) {
     let gray = Style::default().bg(BG_SHADE);
     let no_shading = Style::default().bg(Color::Reset);
@@ -605,7 +606,7 @@ fn add_margin_lines(
     let total_width = content_width as usize + 9; // full row width = area.width
     let shaded_content = content_width as usize + 4; // cols 3..W-3 for padding rows
 
-    // Top/bottom separator: no shading
+    // Top separator: no shading
     let separator = Line::from(vec![Span::styled(" ".repeat(total_width), no_shading)]);
 
     // Padding row: shading on cols 3..W-3, no text
@@ -617,7 +618,7 @@ fn add_margin_lines(
     ]);
 
     let mut result = Vec::with_capacity(lines.len() + STRUCTURAL_ROWS);
-    result.push(separator.clone());
+    result.push(separator);
     result.push(padding.clone());
 
     for line in lines {
@@ -637,7 +638,24 @@ fn add_margin_lines(
     }
 
     result.push(padding);
-    result.push(separator);
+
+    // Bottom separator: right-aligned timestamp (user messages only)
+    // Pad to total_width so the paragraph background doesn't peek through.
+    if let Some(ms) = timestamp_ms {
+        let ts_text = format_timestamp(ms / 1000);
+        let ts_len = ts_text.len();
+        let left_fill = total_width.saturating_sub(ts_len + 4);
+        result.push(Line::from(vec![
+            Span::styled(" ".repeat(left_fill), no_shading),
+            Span::styled(ts_text, no_shading),
+            Span::styled(" ".repeat(4), no_shading),
+        ]));
+    } else {
+        result.push(Line::from(vec![Span::styled(
+            " ".repeat(total_width),
+            no_shading,
+        )]));
+    }
 
     let total_rows = result.len();
     (result, total_rows)
@@ -646,8 +664,9 @@ fn add_margin_lines(
 fn add_assistant_margin_lines(
     lines: Vec<Line<'static>>,
     content_width: u16,
+    timestamp_ms: Option<i64>,
 ) -> (Vec<Line<'static>>, usize) {
-    add_margin_lines(lines, content_width, Color::Blue)
+    add_margin_lines(lines, content_width, Color::Blue, timestamp_ms)
 }
 
 /// Wrap user-content lines with the user-message visual styling:
@@ -672,8 +691,9 @@ fn add_assistant_margin_lines(
 fn add_user_margin_lines(
     lines: Vec<Line<'static>>,
     content_width: u16,
+    timestamp_ms: Option<i64>,
 ) -> (Vec<Line<'static>>, usize) {
-    add_margin_lines(lines, content_width, Color::Green)
+    add_margin_lines(lines, content_width, Color::Green, timestamp_ms)
 }
 
 pub(crate) fn render_history_lines(
@@ -712,8 +732,11 @@ pub(crate) fn render_history_lines(
     );
 }
 
+/// Signature for margin-decoration callbacks passed to `render_margin_lines`.
+type MarginFn = fn(Vec<Line<'static>>, u16, Option<i64>) -> (Vec<Line<'static>>, usize);
+
 /// Render lines wrapped with margin decoration, clipped to the visible
-/// viewport.  The `add_margin` callback produces the decorated lines;
+/// viewport.  The `margin_fn` callback produces the decorated lines;
 /// the caller provides the paragraph background style.
 #[allow(clippy::too_many_arguments)]
 fn render_margin_lines(
@@ -725,9 +748,10 @@ fn render_margin_lines(
     rows_to_skip: &mut usize,
     content_width: u16,
     paragraph_style: Style,
-    add_margin: fn(Vec<Line<'static>>, u16) -> (Vec<Line<'static>>, usize),
+    margin_fn: MarginFn,
+    timestamp_ms: Option<i64>,
 ) {
-    let (display_lines, total_rows) = add_margin(lines, content_width);
+    let (display_lines, total_rows) = margin_fn(lines, content_width, timestamp_ms);
 
     let Some((top_line, visible_height)) =
         clipped_area(total_rows, rows_to_skip, rows_remaining, y)
@@ -748,55 +772,6 @@ fn render_margin_lines(
             .wrap(Wrap { trim: false })
             .scroll((top_line as u16, 0)),
         rect,
-    );
-}
-
-/// Render assistant-text lines with a blue vertical bar on the left and
-/// dark-gray background shading, matching the user text style but with a
-/// different accent color.
-fn render_assistant_lines(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    lines: Vec<Line<'static>>,
-    rows_remaining: &mut usize,
-    y: &mut u16,
-    rows_to_skip: &mut usize,
-    content_width: u16,
-) {
-    render_margin_lines(
-        frame,
-        area,
-        lines,
-        rows_remaining,
-        y,
-        rows_to_skip,
-        content_width,
-        Style::default().bg(BG_SHADE),
-        add_assistant_margin_lines,
-    );
-}
-
-/// Render user-text lines with a heavy green vertical line in the left
-/// margin and a dark-gray background shading the message body.
-fn render_user_lines(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    lines: Vec<Line<'static>>,
-    rows_remaining: &mut usize,
-    y: &mut u16,
-    rows_to_skip: &mut usize,
-    content_width: u16,
-) {
-    render_margin_lines(
-        frame,
-        area,
-        lines,
-        rows_remaining,
-        y,
-        rows_to_skip,
-        content_width,
-        Style::default().bg(BG_SHADE),
-        add_user_margin_lines,
     );
 }
 
@@ -832,35 +807,34 @@ fn render_item_session_message(
     rows_to_skip: &mut usize,
     widths: &RenderWidths,
 ) {
-    if message.is_margin_message() {
+    if message.kind.is_margin_message() {
         let is_assistant = matches!(
-            message,
-            SessionMessage::AssistantText { .. } | SessionMessage::AssistantToolUse { .. }
+            message.kind,
+            SessionMessageKind::AssistantText { .. } | SessionMessageKind::AssistantToolUse { .. }
         );
         let lines = cached_or_compute_lines(cache, idx, widths.user_content_width, || {
             session_message_lines(message, widths.user_content_width)
         });
-        if is_assistant {
-            render_assistant_lines(
-                frame,
-                area,
-                lines,
-                rows_remaining,
-                y,
-                rows_to_skip,
-                widths.user_content_width,
-            );
+        let (margin_fn, timestamp_ms) = if is_assistant {
+            (add_assistant_margin_lines as MarginFn, None)
         } else {
-            render_user_lines(
-                frame,
-                area,
-                lines,
-                rows_remaining,
-                y,
-                rows_to_skip,
-                widths.user_content_width,
-            );
-        }
+            (
+                add_user_margin_lines as MarginFn,
+                Some(message.created_at.as_millis()),
+            )
+        };
+        render_margin_lines(
+            frame,
+            area,
+            lines,
+            rows_remaining,
+            y,
+            rows_to_skip,
+            widths.user_content_width,
+            Style::default().bg(BG_SHADE),
+            margin_fn,
+            timestamp_ms,
+        );
     } else {
         let lines = cached_or_compute_lines(cache, idx, widths.content_width, || {
             session_message_lines(message, widths.content_width)
@@ -891,7 +865,7 @@ fn render_item_streaming(
     user_content_width: u16,
 ) {
     let lines = streaming_text_lines(text, user_content_width);
-    render_assistant_lines(
+    render_margin_lines(
         frame,
         area,
         lines,
@@ -899,6 +873,9 @@ fn render_item_streaming(
         y,
         rows_to_skip,
         user_content_width,
+        Style::default().bg(BG_SHADE),
+        add_assistant_margin_lines,
+        None,
     );
 }
 
@@ -1213,8 +1190,8 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(status, chunks[1]);
 }
 
-fn format_timestamp(ts: i64) -> String {
-    if ts <= 0 {
+fn format_timestamp(ts_secs: i64) -> String {
+    if ts_secs <= 0 {
         return "-".to_string();
     }
 
@@ -1223,12 +1200,17 @@ fn format_timestamp(ts: i64) -> String {
     // timestamp_opt handles DST ambiguity and out-of-range inputs.
     // If the result is ambiguous or invalid we fall back to a safe epoch
     // display rather than panicking.
-    let dt = match Local.timestamp_opt(ts, 0) {
+    let dt = match Local.timestamp_opt(ts_secs, 0) {
         chrono::LocalResult::Single(dt) => dt,
         _ => return "-".to_string(),
     };
 
-    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    let now = Local::now();
+    if dt.date_naive() == now.date_naive() {
+        dt.format("%H:%M").to_string()
+    } else {
+        dt.format("%Y-%m-%d %H:%M").to_string()
+    }
 }
 
 // ── AI Provider Accounts ──────────────────────────────────
@@ -1747,7 +1729,7 @@ mod tests {
     fn user_margin_lines_structure() {
         let cw: u16 = 20;
         let content = vec![Line::from("hello")];
-        let (lines, total) = add_user_margin_lines(content, cw);
+        let (lines, total) = add_user_margin_lines(content, cw, None);
 
         let total_width = cw as usize + 9;
 
@@ -1807,7 +1789,7 @@ mod tests {
     #[test]
     fn user_margin_lines_style_spans() {
         let content = vec![Line::from("text")];
-        let (lines, _) = add_user_margin_lines(content, 20);
+        let (lines, _) = add_user_margin_lines(content, 20, None);
         let spans = &lines[2].spans; // text row
 
         // Span 0: 2 chars, no shading (bg = Reset)
@@ -1842,7 +1824,7 @@ mod tests {
     #[test]
     fn user_margin_lines_multiple_content_lines() {
         let content = vec![Line::from("line one"), Line::from("line two")];
-        let (lines, total) = add_user_margin_lines(content, 30);
+        let (lines, total) = add_user_margin_lines(content, 30, None);
         // 2 sep + 2 pad + 2 content = 6
         assert_eq!(total, 6);
 
@@ -1853,11 +1835,186 @@ mod tests {
     #[test]
     fn user_margin_lines_empty_content() {
         let content = vec![Line::from(Span::styled(String::new(), Style::default()))];
-        let (lines, total) = add_user_margin_lines(content, 20);
+        let (lines, total) = add_user_margin_lines(content, 20, None);
         // 2 sep + 2 pad + 1 content = 5
         assert_eq!(total, 5);
         // The text row should have the green line and shaded area but no text
         let text_row = &lines[2];
         assert!(text_row.to_string().contains('┃'));
+    }
+
+    // ── timestamp in bottom separator ───────────────────────────────────
+
+    #[test]
+    fn user_margin_lines_with_timestamp_renders_in_bottom_separator() {
+        // Use a deterministic timestamp: epoch second 1000000000 = 2001-09-09
+        let ts_ms = 1_000_000_000_000i64;
+        let cw: u16 = 30;
+        let content = vec![Line::from("test")];
+        let (lines, total) = add_user_margin_lines(content, cw, Some(ts_ms));
+
+        let total_width = cw as usize + 9; // 39
+
+        // 2 sep + 2 pad + 1 content = 5 rows
+        assert_eq!(total, 5);
+        assert_eq!(lines.len(), 5);
+
+        // Row 4 is the bottom separator — should contain a timestamp
+        let bottom = &lines[4];
+        let bottom_text = bottom.to_string().trim().to_string();
+        assert!(
+            !bottom_text.is_empty(),
+            "bottom separator should contain a formatted timestamp, got empty"
+        );
+        // Must contain a colon (HH:MM or YYYY-MM-DD HH:MM)
+        assert!(
+            bottom_text.contains(':'),
+            "bottom separator should contain formatted time with colon, got: {bottom_text:?}"
+        );
+
+        // Bottom separator should span the full width
+        let bottom_width: usize = bottom.spans.iter().map(|s| display_width(&s.content)).sum();
+        assert_eq!(
+            bottom_width, total_width,
+            "bottom separator should span total_width"
+        );
+
+        // First span is left fill (no shading)
+        assert_eq!(bottom.spans[0].style.bg, Some(Color::Reset));
+
+        // Timestamp span should also have no shading
+        assert_eq!(bottom.spans[1].style.bg, Some(Color::Reset));
+
+        // Trailing 4 columns of clean padding (no shading)
+        assert_eq!(bottom.spans[2].style.bg, Some(Color::Reset));
+        assert_eq!(bottom.spans[2].content, "    ");
+    }
+
+    #[test]
+    fn user_margin_lines_with_timestamp_same_day_shows_hhmm() {
+        use chrono::Local;
+        // Current time in ms — format_timestamp compares against its own
+        // Local::now() call, so the same-day branch is always taken.
+        let now_ms = Local::now().timestamp_millis();
+        let content = vec![Line::from("test")];
+        let (lines, _) = add_user_margin_lines(content, 30, Some(now_ms));
+
+        let bottom_text = lines[4].to_string();
+        // HH:MM is 5 chars (e.g. "14:30")
+        let ts_part = bottom_text.trim();
+        assert_eq!(
+            ts_part.len(),
+            5,
+            "same-day format should be HH:MM, got: {ts_part:?}"
+        );
+        assert!(
+            ts_part.contains(':'),
+            "HH:MM should contain a colon, got: {ts_part:?}"
+        );
+    }
+
+    #[test]
+    fn user_margin_lines_with_timestamp_previous_day_shows_date_time() {
+        use chrono::Local;
+        // 48 hours ago in ms — guaranteed different date from Local::now().
+        let two_days_ago_ms = Local::now().timestamp_millis() - 172_800_000;
+        let content = vec![Line::from("test")];
+        let (lines, _) = add_user_margin_lines(content, 30, Some(two_days_ago_ms));
+
+        let bottom_text = lines[4].to_string();
+        // YYYY-MM-DD HH:MM is 16 chars
+        let ts_part = bottom_text.trim();
+        assert_eq!(
+            ts_part.len(),
+            16,
+            "previous-day format should be YYYY-MM-DD HH:MM (16 chars), got: {ts_part:?}"
+        );
+        assert!(
+            ts_part.contains('-'),
+            "date should contain hyphens, got: {ts_part:?}"
+        );
+        assert!(
+            ts_part.contains(':'),
+            "time should contain a colon, got: {ts_part:?}"
+        );
+    }
+
+    #[test]
+    fn add_assistant_margin_lines_no_timestamp() {
+        // Assistant messages pass None — bottom separator should be blank
+        let content = vec![Line::from("test")];
+        let cw: u16 = 30;
+        let (lines, total) = add_assistant_margin_lines(content, cw, None);
+
+        let total_width = cw as usize + 9;
+        assert_eq!(total, 5);
+
+        // Bottom separator should have no timestamp — just blank
+        let bottom = &lines[4];
+        let bottom_width: usize = bottom.spans.iter().map(|s| display_width(&s.content)).sum();
+        assert_eq!(
+            bottom_width, total_width,
+            "blank bottom separator should span full width"
+        );
+        assert_eq!(
+            bottom.to_string().trim(),
+            "",
+            "assistant bottom separator should be blank"
+        );
+    }
+
+    #[test]
+    fn user_margin_lines_timestamp_edge_zero() {
+        // Zero / negative timestamps should render as "-"
+        let content = vec![Line::from("test")];
+        let (lines, _) = add_user_margin_lines(content, 30, Some(0));
+        let bottom_text = lines[4].to_string();
+        assert!(
+            bottom_text.contains('-'),
+            "zero timestamp should render as '-', got: {bottom_text:?}"
+        );
+    }
+
+    // ── format_timestamp ─────────────────────────────────────────────────
+
+    #[test]
+    fn format_timestamp_negative_or_zero_returns_dash() {
+        assert_eq!(format_timestamp(0), "-");
+        assert_eq!(format_timestamp(-1), "-");
+        assert_eq!(format_timestamp(-999), "-");
+    }
+
+    #[test]
+    fn format_timestamp_same_day_returns_hhmm() {
+        let now_secs = chrono::Local::now().timestamp();
+        let result = format_timestamp(now_secs);
+        assert_eq!(
+            result.len(),
+            5,
+            "same-day format should be HH:MM, got: {result:?}"
+        );
+        assert!(
+            result.contains(':'),
+            "HH:MM should contain a colon, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn format_timestamp_yesterday_returns_date_time() {
+        let yesterday_secs = chrono::Local::now().timestamp() - 86400;
+        let result = format_timestamp(yesterday_secs);
+        assert_eq!(
+            result.len(),
+            16,
+            "previous-day format should be YYYY-MM-DD HH:MM (16 chars), got: {result:?}"
+        );
+        assert!(
+            result.contains('-'),
+            "date should contain hyphens, got: {result:?}"
+        );
+        assert!(
+            result.contains(':'),
+            "time should contain a colon, got: {result:?}"
+        );
     }
 }

@@ -1,3 +1,5 @@
+use tracing;
+
 use serde::{Deserialize, Serialize};
 
 pub const MAX_IMAGE_CHUNK_SIZE: usize = 64 * 1024;
@@ -60,6 +62,32 @@ pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
+}
+
+/// Unix-epoch-milliseconds timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimestampMs(i64);
+
+impl TimestampMs {
+    /// Sentinel value for when the real timestamp is unavailable (e.g. corrupt
+    /// DB entries).
+    pub const ZERO: Self = Self(0);
+
+    pub fn now() -> Self {
+        Self(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or_else(|_| {
+                    tracing::warn!("system clock before UNIX_EPOCH, using 0");
+                    0
+                }),
+        )
+    }
+
+    pub fn as_millis(&self) -> i64 {
+        self.0
+    }
 }
 
 /// Unified error type for all inference providers.
@@ -137,7 +165,7 @@ pub enum SessionStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum SessionMessage {
+pub enum SessionMessageKind {
     SystemText {
         content: String,
     },
@@ -168,7 +196,7 @@ pub enum SessionMessage {
     DisplayedImage(DisplayedImageRecord),
 }
 
-impl SessionMessage {
+impl SessionMessageKind {
     /// Returns `true` for variants rendered with a vertical accent bar and
     /// shaded background ("margin styling"): `AssistantText`,
     /// `AssistantToolUse`, and `UserText`.
@@ -182,10 +210,27 @@ impl SessionMessage {
     pub fn is_margin_message(&self) -> bool {
         matches!(
             self,
-            SessionMessage::AssistantText { .. }
-                | SessionMessage::AssistantToolUse { .. }
-                | SessionMessage::UserText { .. }
+            SessionMessageKind::AssistantText { .. }
+                | SessionMessageKind::AssistantToolUse { .. }
+                | SessionMessageKind::UserText { .. }
         )
+    }
+}
+
+/// A session message with a creation timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMessage {
+    pub created_at: TimestampMs,
+    pub kind: SessionMessageKind,
+}
+
+impl SessionMessage {
+    /// Create a new session message with the current timestamp.
+    pub fn now(kind: SessionMessageKind) -> Self {
+        Self {
+            created_at: TimestampMs::now(),
+            kind,
+        }
     }
 }
 

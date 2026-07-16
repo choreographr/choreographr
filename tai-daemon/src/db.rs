@@ -7,7 +7,9 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
-use tai_proto::{ContextConfig, SessionMessage, ThinkingEffort, TokenUsage};
+use tai_proto::{
+    ContextConfig, SessionMessage, SessionMessageKind, ThinkingEffort, TimestampMs, TokenUsage,
+};
 use tracing::{debug, error, info, warn};
 
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
@@ -304,8 +306,11 @@ pub fn read_messages(db: &redb::Database, session_id: u64) -> io::Result<Vec<Ses
                     );
                     messages.push((
                         idx,
-                        SessionMessage::UserText {
-                            content: String::new(),
+                        SessionMessage {
+                            created_at: TimestampMs::ZERO,
+                            kind: SessionMessageKind::UserText {
+                                content: String::new(),
+                            },
                         },
                     ));
                 }
@@ -734,9 +739,9 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].0, id);
 
-        let msg = SessionMessage::UserText {
+        let msg = SessionMessage::now(SessionMessageKind::UserText {
             content: "hello".into(),
-        };
+        });
         write_message(&db, id, 0, &msg).unwrap();
 
         let messages = read_messages(&db, id).unwrap();
@@ -760,9 +765,9 @@ mod tests {
         let id = 1u64;
 
         // Write a valid message at index 0
-        let valid_msg = SessionMessage::UserText {
+        let valid_msg = SessionMessage::now(SessionMessageKind::UserText {
             content: "valid".into(),
-        };
+        });
         write_message(&db, id, 0, &valid_msg).unwrap();
 
         // Manually insert a corrupt blob at index 1 (not valid postcard)
@@ -778,9 +783,9 @@ mod tests {
         }
 
         // Write another valid message at index 2
-        let valid_msg2 = SessionMessage::UserText {
+        let valid_msg2 = SessionMessage::now(SessionMessageKind::UserText {
             content: "also valid".into(),
-        };
+        });
         write_message(&db, id, 2, &valid_msg2).unwrap();
 
         // read_messages should insert a placeholder for the corrupt entry
@@ -792,8 +797,8 @@ mod tests {
         );
         assert_eq!(messages[0], valid_msg);
         assert_eq!(
-            messages[1],
-            SessionMessage::UserText {
+            messages[1].kind,
+            SessionMessageKind::UserText {
                 content: String::new(),
             },
             "corrupt entry should be replaced with empty UserText placeholder"

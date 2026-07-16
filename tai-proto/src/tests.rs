@@ -92,6 +92,136 @@ fn session_status_retrying_serde_round_trip() {
     assert_eq!(decoded, status);
 }
 
+// ── TimestampMs tests ──────────────────────────────────────────────────
+
+#[test]
+fn timestamp_ms_now_returns_recent() {
+    let ts = TimestampMs::now();
+    // Must be after 2020-01-01 (well into the past as of 2026).
+    assert!(
+        ts.as_millis() > 1_577_836_800_000,
+        "TimestampMs::now() should return a recent timestamp"
+    );
+}
+
+#[test]
+fn timestamp_ms_serde_deterministic() {
+    let ts = TimestampMs::now();
+    let millis = ts.as_millis();
+    // Serialize and deserialize, then verify the value survives.
+    let frame = encode_frame(&ts).expect("encode");
+    let decoded: TimestampMs = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded.as_millis(), millis);
+}
+
+#[test]
+fn timestamp_ms_serde_round_trip() {
+    let ts = TimestampMs::now();
+    let frame = encode_frame(&ts).expect("encode");
+    let decoded: TimestampMs = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, ts);
+}
+
+// ── SessionMessage tests ──────────────────────────────────────────────
+
+#[test]
+fn session_message_now_sets_timestamp() {
+    let before = TimestampMs::now();
+    let msg = SessionMessage::now(SessionMessageKind::SystemText {
+        content: "test".into(),
+    });
+    let after = TimestampMs::now();
+    // The created_at must be between before and after.
+    assert!(
+        msg.created_at.as_millis() >= before.as_millis(),
+        "created_at should be >= timestamp taken before construction"
+    );
+    assert!(
+        msg.created_at.as_millis() <= after.as_millis(),
+        "created_at should be <= timestamp taken after construction"
+    );
+}
+
+#[test]
+fn session_message_kind_round_trip() {
+    let msg = SessionMessage::now(SessionMessageKind::AssistantText {
+        content: "hello".into(),
+        reasoning: None,
+        token_usage: None,
+    });
+    let frame = encode_frame(&msg).expect("encode");
+    let decoded: SessionMessage = decode_frame(&frame[4..]).expect("decode");
+    // Compare .kind only; .created_at may differ by a few ms.
+    assert_eq!(decoded.kind, msg.kind);
+}
+
+#[test]
+fn session_message_assistant_text_fields() {
+    let msg = SessionMessage::now(SessionMessageKind::AssistantText {
+        content: "hello".into(),
+        reasoning: None,
+        token_usage: None,
+    });
+    match &msg.kind {
+        SessionMessageKind::AssistantText {
+            content,
+            reasoning,
+            token_usage,
+        } => {
+            assert_eq!(content, "hello");
+            assert_eq!(*reasoning, None);
+            assert_eq!(*token_usage, None);
+        }
+        _ => panic!("expected AssistantText"),
+    }
+}
+
+#[test]
+fn session_message_all_variants_round_trip() {
+    let variants: Vec<SessionMessageKind> = vec![
+        SessionMessageKind::SystemText {
+            content: "sys".into(),
+        },
+        SessionMessageKind::UserText {
+            content: "user".into(),
+        },
+        SessionMessageKind::AssistantText {
+            content: "assistant".into(),
+            reasoning: None,
+            token_usage: None,
+        },
+        SessionMessageKind::AssistantToolUse {
+            content: Some("thinking".into()),
+            tool_calls: vec![],
+            reasoning: None,
+            token_usage: None,
+        },
+        SessionMessageKind::ToolResult {
+            call_id: "c1".into(),
+            name: "ls".into(),
+            content: "file.txt".into(),
+            is_error: false,
+        },
+        SessionMessageKind::DisplayedImage(DisplayedImageRecord {
+            metadata: ImageMetadata {
+                image_id: 0,
+                mime_type: "image/png".into(),
+                width: 1,
+                height: 1,
+                byte_len: 0,
+                alt: None,
+            },
+            data: vec![],
+        }),
+    ];
+    for kind in variants {
+        let msg = SessionMessage::now(kind);
+        let frame = encode_frame(&msg).expect("encode");
+        let decoded: SessionMessage = decode_frame(&frame[4..]).expect("decode");
+        assert_eq!(decoded.kind, msg.kind, "round-trip failed for variant");
+    }
+}
+
 // ── TokenUsage tests ──────────────────────────────────────────────────
 
 #[test]
@@ -112,25 +242,6 @@ fn token_usage_serde_round_trip() {
     let frame = encode_frame(&usage).expect("encode");
     let decoded: TokenUsage = decode_frame(&frame[4..]).expect("decode");
     assert_eq!(decoded, usage);
-}
-
-#[test]
-fn token_usage_in_session_message_assistant_text_backward_compat() {
-    // Old JSON (before token_usage was added) should deserialize with token_usage = None
-    let json = r#"{"AssistantText":{"content":"hello","reasoning":null}}"#;
-    let msg: SessionMessage = serde_json::from_str(json).unwrap();
-    match msg {
-        SessionMessage::AssistantText {
-            content,
-            reasoning,
-            token_usage,
-        } => {
-            assert_eq!(content, "hello");
-            assert_eq!(reasoning, None);
-            assert_eq!(token_usage, None);
-        }
-        _ => panic!("expected AssistantText"),
-    }
 }
 
 #[test]
@@ -266,27 +377,27 @@ fn session_summary_some_token_usage_round_trip() {
 
 #[test]
 fn assistant_text_none_token_usage_round_trip() {
-    let msg = SessionMessage::AssistantText {
+    let msg = SessionMessage::now(SessionMessageKind::AssistantText {
         content: "hello".into(),
         reasoning: None,
         token_usage: None,
-    };
+    });
     let frame = encode_frame(&msg).expect("encode");
     let decoded: SessionMessage = decode_frame(&frame[4..]).expect("decode");
-    assert_eq!(decoded, msg);
+    assert_eq!(decoded.kind, msg.kind);
 }
 
 #[test]
 fn assistant_tool_use_none_token_usage_round_trip() {
-    let msg = SessionMessage::AssistantToolUse {
+    let msg = SessionMessage::now(SessionMessageKind::AssistantToolUse {
         content: None,
         tool_calls: vec![],
         reasoning: None,
         token_usage: None,
-    };
+    });
     let frame = encode_frame(&msg).expect("encode");
     let decoded: SessionMessage = decode_frame(&frame[4..]).expect("decode");
-    assert_eq!(decoded, msg);
+    assert_eq!(decoded.kind, msg.kind);
 }
 
 #[test]

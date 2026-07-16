@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use tai_proto::{DaemonMessage, OutputStream, SessionMessage};
+use tai_proto::{DaemonMessage, OutputStream, SessionMessage, SessionMessageKind};
 use tracing::debug;
 
 pub trait DaemonMessageHandler {
@@ -83,7 +83,7 @@ fn dispatch_session<H: DaemonMessageHandler>(
             }
             handler.push_text(format!("[daemon]   {} messages", messages.len()));
             for message in messages {
-                if !matches!(message, SessionMessage::SystemText { .. }) {
+                if !matches!(message.kind, SessionMessageKind::SystemText { .. }) {
                     handler.push_session_message(message);
                 }
             }
@@ -519,12 +519,12 @@ mod tests {
     fn session_state_filters_system_text() {
         let mut h = TestHandler::new();
         let messages = vec![
-            SessionMessage::SystemText {
+            SessionMessage::now(SessionMessageKind::SystemText {
                 content: "system prompt".into(),
-            },
-            SessionMessage::UserText {
+            }),
+            SessionMessage::now(SessionMessageKind::UserText {
                 content: "hello".into(),
-            },
+            }),
         ];
         let msg = DaemonMessage::SessionState {
             session_id: 1,
@@ -549,7 +549,11 @@ mod tests {
             .filter(|e| matches!(e, TestEvent::PushSessionMessage(_)))
             .collect();
         assert_eq!(pushed.len(), 1, "SystemText must be filtered out");
-        if let TestEvent::PushSessionMessage(SessionMessage::UserText { content }) = &pushed[0] {
+        if let TestEvent::PushSessionMessage(SessionMessage {
+            kind: SessionMessageKind::UserText { content },
+            ..
+        }) = &pushed[0]
+        {
             assert_eq!(content, "hello");
         } else {
             panic!("expected UserText, got {:#?}", pushed[0]);
@@ -560,20 +564,20 @@ mod tests {
     fn session_state_passes_non_system_messages() {
         let mut h = TestHandler::new();
         let messages = vec![
-            SessionMessage::UserText {
+            SessionMessage::now(SessionMessageKind::UserText {
                 content: "user msg".into(),
-            },
-            SessionMessage::AssistantText {
+            }),
+            SessionMessage::now(SessionMessageKind::AssistantText {
                 content: "assistant msg".into(),
                 reasoning: None,
                 token_usage: None,
-            },
-            SessionMessage::ToolResult {
+            }),
+            SessionMessage::now(SessionMessageKind::ToolResult {
                 call_id: "c1".into(),
                 name: "ls".into(),
                 content: "file.txt".into(),
                 is_error: false,
-            },
+            }),
         ];
         let msg = DaemonMessage::SessionState {
             session_id: 1,
@@ -676,14 +680,14 @@ mod tests {
             working_dir: Some("/home".into()),
             max_turns: Some(10),
             messages: vec![
-                SessionMessage::UserText {
+                SessionMessage::now(SessionMessageKind::UserText {
                     content: "a".into(),
-                },
-                SessionMessage::AssistantText {
+                }),
+                SessionMessage::now(SessionMessageKind::AssistantText {
                     content: "b".into(),
                     reasoning: None,
                     token_usage: None,
-                },
+                }),
             ],
             active_tool_groups: vec![],
             token_usage: None,
@@ -859,9 +863,9 @@ mod tests {
     #[test]
     fn session_message_appended_pushes_message() {
         let mut h = TestHandler::new();
-        let msg = SessionMessage::UserText {
+        let msg = SessionMessage::now(SessionMessageKind::UserText {
             content: "hi".into(),
-        };
+        });
         dispatch_daemon_message(
             &mut h,
             DaemonMessage::SessionMessageAppended {

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 postcard.workspace = true
 
 [dev-dependencies]

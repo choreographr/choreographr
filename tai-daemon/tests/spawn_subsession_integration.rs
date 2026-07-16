@@ -7,7 +7,7 @@ use tai_daemon::tools::Tool;
 use tai_daemon::tools::context::ToolContext;
 use tai_daemon::tools::subsession::{SpawnSubsession, SpawnSubsessionArgs};
 use tai_daemon::{ChildResult, DaemonCommand, SessionCommand};
-use tai_proto::SessionMessage;
+use tai_proto::SessionMessageKind;
 
 mod common;
 
@@ -58,8 +58,8 @@ fn spawn_subsession_happy_path() {
 
                 // ── Receive and verify AppendMessage ─────────────
                 match child_rx.recv().unwrap() {
-                    SessionCommand::AppendMessage { message } => match &message {
-                        SessionMessage::SystemText { content } => {
+                    SessionCommand::AppendMessage { message } => match &message.kind {
+                        SessionMessageKind::SystemText { content } => {
                             assert_eq!(content, "work on this task");
                         }
                         _ => panic!("expected SystemText"),

@@ -1,6 +1,6 @@
 use super::*;
 use crate::state::HistoryItem;
-use tai_proto::{DaemonMessage, ImageMetadata, OutputStream, SessionMessage};
+use tai_proto::{DaemonMessage, ImageMetadata, OutputStream, SessionMessage, SessionMessageKind};
 
 #[test]
 fn app_state_stream_updates_history() {
@@ -49,10 +49,12 @@ fn apply_daemon_image_message_pushes_displayed_image() {
     apply_daemon_message(
         &mut state,
         DaemonMessage::SessionMessageAppended {
-            message: SessionMessage::DisplayedImage(tai_proto::DisplayedImageRecord {
-                metadata: metadata.clone(),
-                data: png,
-            }),
+            message: SessionMessage::now(SessionMessageKind::DisplayedImage(
+                tai_proto::DisplayedImageRecord {
+                    metadata: metadata.clone(),
+                    data: png,
+                },
+            )),
         },
         None,
     )
