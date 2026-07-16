@@ -122,11 +122,19 @@ fn bridge_tool_call_events() {
 
     write_message(
         &mut daemon_writer,
+        &DaemonMessage::ToolResultChunk {
+            request_id: 1,
+            call_id: "call_1".into(),
+            data: b"file contents".to_vec(),
+        },
+    )
+    .unwrap();
+    write_message(
+        &mut daemon_writer,
         &DaemonMessage::ToolCallFinished {
             request_id: 1,
             call_id: "call_1".into(),
             tool_name: "read_file".into(),
-            output: "file contents".into(),
         },
     )
     .unwrap();

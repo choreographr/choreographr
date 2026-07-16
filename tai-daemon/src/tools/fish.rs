@@ -1,10 +1,16 @@
 use super::{
-    ToolError,
-    shell_util::{format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
+    Tool, ToolError,
+    context::ToolContext,
+    shell_util::{
+        format_shell_output, resolve_and_confine, run_shell_streaming, setup_child,
+        spawn_with_watchdog,
+    },
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::mpsc;
+use tai_keystore::ServiceCredential;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FishArgs {
@@ -18,14 +24,57 @@ pub struct FishArgs {
 
 pub(crate) struct FishShell;
 
-define_tool!(
-    FishShell,
-    "fish",
-    "Execute a fish shell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang.",
-    FishArgs,
-    execute_fish_tool,
-    "shell"
-);
+impl Tool for FishShell {
+    type Args = FishArgs;
+    type Return = String;
+
+    fn name(&self) -> &'static str {
+        "fish"
+    }
+
+    fn group(&self) -> &'static str {
+        "shell"
+    }
+
+    fn description(&self) -> &'static str {
+        "Execute a fish shell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang."
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        execute_fish_tool(&args, working_dir)
+    }
+
+    fn execute_streaming(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        let command = &args.command;
+        let timeout_ms = args.timeout.unwrap_or(30000);
+        let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
+
+        let mut cmd = std::process::Command::new("fish");
+        cmd.args(["-c", command])
+            .current_dir(&resolved)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        run_shell_streaming(&mut cmd, command, timeout_ms, output_tx)
+    }
+
+    fn output_content(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+}
 
 pub fn execute_fish_tool(args: &FishArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
     let command = &args.command;

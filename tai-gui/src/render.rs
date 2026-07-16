@@ -44,6 +44,15 @@ pub(crate) fn render_history_item(item: HistoryItem) -> Element {
                 }
             }
         },
+        SharedHistoryItem::ToolResultStream(data) => {
+            let msg = SessionMessage::now(SessionMessageKind::ToolResult {
+                call_id: data.call_id.clone(),
+                name: data.tool_name.clone(),
+                content: data.accumulated_text.clone(),
+                is_error: data.is_error,
+            });
+            render_session_message(msg)
+        }
     }
 }
 

@@ -17,6 +17,29 @@ pub trait DaemonMessageHandler {
     fn begin_stream(&mut self, request_id: u32);
     fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str);
     fn finalize_stream(&mut self, request_id: u32);
+
+    /// Begin a tool result stream for the given tool call.
+    /// Default implementation falls back to push_tool_text.
+    fn begin_tool_result_stream(&mut self, request_id: u32, call_id: &str, tool_name: &str) {
+        self.push_tool_text(
+            request_id,
+            format!("[{request_id}] tool {tool_name}#{call_id} streaming"),
+        );
+    }
+
+    /// Append a chunk of tool result content to the active stream.
+    fn append_tool_result_chunk(&mut self, request_id: u32, call_id: &str, data: &[u8]) {
+        let text = String::from_utf8_lossy(data);
+        self.push_tool_text(
+            request_id,
+            format!("[{request_id}] tool #{call_id} output: {text}"),
+        );
+    }
+
+    /// Finalize a tool result stream. The handler uses its own accumulated
+    /// state to produce the final display. Default does nothing.
+    fn finalize_tool_result_stream(&mut self, _request_id: u32, _call_id: &str) {}
+
     fn drop_request(&mut self, request_id: u32) {
         self.finalize_stream(request_id);
     }
@@ -128,16 +151,19 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
             tool_name,
             arguments_json,
         } => {
+            handler.begin_tool_result_stream(request_id, &call_id, &tool_name);
             handler.push_tool_text(
                 request_id,
                 format!("[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"),
             );
             Ok(())
         }
-        DaemonMessage::ToolCallFinished { .. } => {
-            // ToolResult is now delivered as SessionMessageAppended after
-            // request completion via handle_request_finished's snapshot
-            // delta.  The real message is created once by the daemon.
+        DaemonMessage::ToolCallFinished {
+            request_id,
+            call_id,
+            ..
+        } => {
+            handler.finalize_tool_result_stream(request_id, &call_id);
             Ok(())
         }
         DaemonMessage::ToolCallFailed {
@@ -150,6 +176,7 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
                 request_id,
                 format!("[{request_id}] tool {tool_name}#{call_id} failed: {error}"),
             );
+            handler.finalize_tool_result_stream(request_id, &call_id);
             Ok(())
         }
         DaemonMessage::ToolCallOutput {
@@ -157,11 +184,15 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
             call_id,
             data,
         } => {
-            let text = String::from_utf8_lossy(&data).into_owned();
-            handler.push_tool_text(
-                request_id,
-                format!("[{request_id}] tool #{call_id} output: {text}"),
-            );
+            handler.append_tool_result_chunk(request_id, &call_id, &data);
+            Ok(())
+        }
+        DaemonMessage::ToolResultChunk {
+            request_id,
+            call_id,
+            data,
+        } => {
+            handler.append_tool_result_chunk(request_id, &call_id, &data);
             Ok(())
         }
         DaemonMessage::ToolCallGenerationStarted {
@@ -413,6 +444,7 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
         | DaemonMessage::ToolCallOutput { .. }
         | DaemonMessage::ToolCallGenerationStarted { .. }
         | DaemonMessage::ToolCallArgDelta { .. }
+        | DaemonMessage::ToolResultChunk { .. }
         | DaemonMessage::Done { .. }
         | DaemonMessage::Failed { .. }
         | DaemonMessage::Cancelled { .. }) => dispatch_stream_lifecycle(handler, m),
@@ -1020,7 +1052,6 @@ mod tests {
                 request_id: 7,
                 call_id: "c1".into(),
                 tool_name: "ls".into(),
-                output: "file.txt".into(),
             },
         )
         .unwrap();

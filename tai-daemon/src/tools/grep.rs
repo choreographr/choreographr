@@ -1,9 +1,11 @@
-use super::{ToolError, truncate_tool_output};
+use super::{Tool, ToolError, context::ToolContext, truncate_tool_output};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use tai_keystore::ServiceCredential;
 use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
 use zlob::{ZlobFlags, ZlobPattern};
 
@@ -35,26 +37,31 @@ pub struct GrepArgs {
 /// Respects `.gitignore`, hidden files, and binary files by default.
 pub struct Grep;
 
-pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
-    // Resolve the search root — use the provided path or default to working_dir
-    let path = args.path.as_deref().unwrap_or(".");
-    let resolved = super::confine_path(path, working_dir)?;
-
-    // Build the pattern matcher: literal text or regex depending on flags
-    let matcher: RegexMatcher = if args.regex {
-        RegexMatcher::new(&args.pattern)
+/// Run the grep walk with the given parameters, optionally streaming each
+/// match to `output_tx` in real time for incremental client display.
+fn run_grep_walk(
+    resolved: &Path,
+    pattern: &str,
+    regex: bool,
+    include: Option<&str>,
+    max_results: u32,
+    output_tx: Option<mpsc::Sender<Vec<u8>>>,
+) -> Result<String, ToolError> {
+    // Build the pattern matcher: literal text or regex depending on flags.
+    let matcher: RegexMatcher = if regex {
+        RegexMatcher::new(pattern)
             .map_err(|e| ToolError::Other(format!("invalid regex pattern: {e}")))?
     } else {
         // `fixed_string(true)` escapes all regex metacharacters so the
         // pattern is matched as a literal substring.
         RegexMatcherBuilder::new()
             .fixed_strings(true)
-            .build(&args.pattern)
+            .build(pattern)
             .map_err(|e| ToolError::Other(format!("invalid pattern: {e}")))?
     };
 
     // Optionally compile an include glob pattern for file filtering.
-    let include_pattern: Option<ZlobPattern> = if let Some(ref include) = args.include {
+    let include_pattern: Option<ZlobPattern> = if let Some(include) = include {
         Some(
             ZlobPattern::compile(include, ZlobFlags::empty())
                 .map_err(|e| ToolError::Other(format!("invalid include glob: {e}")))?,
@@ -65,31 +72,29 @@ pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<
 
     // Clamp max_results to the configured bounds so the caller can't
     // request an unbounded or absurdly large result set.
-    let max_results = args
-        .max_results
-        .unwrap_or(DEFAULT_MAX_RESULTS)
-        .clamp(1, MAX_RESULTS_CAP) as usize;
+    let max_results = max_results.clamp(1, MAX_RESULTS_CAP) as usize;
 
-    // Shared sink collects matches across all visited files. The
-    // `current_path` field is updated before each file so the sink
-    // knows which file a match belongs to (SinkMatch does not carry
-    // path information in grep-searcher 0.1.x).
+    // When streaming is active, capture the search root for computing
+    // relative paths in the streaming output.
+    let search_root = output_tx.is_some().then(|| resolved.to_path_buf());
     let mut sink = GrepSink {
         max_results,
         results: Vec::new(),
         done: false,
         current_path: PathBuf::new(),
+        output_tx,
+        search_root,
     };
 
     let mut searcher = SearcherBuilder::new().build();
 
     // Walk the directory tree with gitignore-aware traversal.
     // WalkFlags::RECOMMENDED skips hidden files and respects .gitignore rules.
-    WalkBuilder::new(&resolved)
+    WalkBuilder::new(resolved)
         .map_err(|e| ToolError::Other(format!("failed to create walker: {e}")))?
         .options(WalkFlags::RECOMMENDED)
         .run_serial(|entry| {
-            // Skip non-file entries (directories, symlinks, etc.)
+            // Skip non-file entries (directories, symlinks, etc.).
             if !entry.is_file() {
                 return WalkState::Continue;
             }
@@ -117,7 +122,7 @@ pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<
                 );
             }
 
-            // Stop early once we've accumulated enough results
+            // Stop early once we've accumulated enough results.
             if sink.done {
                 WalkState::Quit
             } else {
@@ -136,13 +141,11 @@ pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<
         return Ok(String::new());
     }
 
-    // Format each match as "relative_path:line_number:content" — the same
-    // format used by traditional grep, which LLMs parse reliably.
     let lines: Vec<String> = sink
         .results
         .iter()
         .map(|(path, line_num, content)| {
-            let rel = path.strip_prefix(&resolved).unwrap_or(path);
+            let rel = path.strip_prefix(resolved).unwrap_or(path);
             format!("{}:{}:{}", rel.display(), line_num, content)
         })
         .collect();
@@ -150,14 +153,69 @@ pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<
     Ok(truncate_tool_output(&lines.join("\n")))
 }
 
-define_tool!(
-    Grep,
-    "grep",
-    "Search file contents for a pattern. Respects .gitignore, hidden, and binary files. Results in file:line:content format.",
-    GrepArgs,
-    execute_grep_tool,
-    "core"
-);
+pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
+    let path = args.path.as_deref().unwrap_or(".");
+    let resolved = super::confine_path(path, working_dir)?;
+    run_grep_walk(
+        &resolved,
+        &args.pattern,
+        args.regex,
+        args.include.as_deref(),
+        args.max_results.unwrap_or(DEFAULT_MAX_RESULTS),
+        None,
+    )
+}
+
+impl Tool for Grep {
+    type Args = GrepArgs;
+    type Return = String;
+
+    fn name(&self) -> &'static str {
+        "grep"
+    }
+
+    fn group(&self) -> &'static str {
+        "core"
+    }
+
+    fn description(&self) -> &'static str {
+        "Search file contents for a pattern. Respects .gitignore, hidden, and binary files. Results in file:line:content format."
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        execute_grep_tool(&args, working_dir)
+    }
+
+    fn execute_streaming(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        let path = args.path.as_deref().unwrap_or(".");
+        let resolved = super::confine_path(path, working_dir)?;
+        run_grep_walk(
+            &resolved,
+            &args.pattern,
+            args.regex,
+            args.include.as_deref(),
+            args.max_results.unwrap_or(DEFAULT_MAX_RESULTS),
+            Some(output_tx),
+        )
+    }
+
+    fn output_content(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+}
 
 /// Custom Sink that collects matching lines up to a configured limit.
 ///
@@ -167,6 +225,9 @@ define_tool!(
 /// Note: `SinkMatch` in grep-searcher 0.1.x does not expose the file path,
 /// so we set `current_path` on the sink from the outer walk loop before
 /// each `search_path` call.
+///
+/// When `output_tx` is `Some`, each match is also streamed to the channel
+/// in real time for incremental display.
 struct GrepSink {
     /// Maximum number of results to collect.
     max_results: usize,
@@ -177,25 +238,37 @@ struct GrepSink {
     done: bool,
     /// Path of the file currently being searched (set by the outer loop).
     current_path: PathBuf,
+    /// Optional streaming channel — when set, each match is sent here as
+    /// a `path:line:content` line in real time.
+    output_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Search root for computing relative paths in streaming output.
+    search_root: Option<PathBuf>,
 }
 
 impl Sink for GrepSink {
     type Error = std::io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
-        // Already reached the global limit — tell the searcher to stop
-        // searching the current file immediately.
         if self.done {
             return Ok(false);
         }
 
-        // Extract match metadata. The path comes from `self.current_path`
-        // (set by the outer loop) since `SinkMatch` in grep-searcher 0.1.x
-        // doesn't carry path information. Line number defaults to 0 when
-        // line counting is disabled (though we enable it by default).
         let path = self.current_path.clone();
         let line_number = mat.line_number().unwrap_or(0);
         let content = String::from_utf8_lossy(mat.bytes()).to_string();
+
+        // Stream the match line if a sender is configured, so the client
+        // can display results incrementally rather than waiting for the
+        // entire walk to finish.
+        if let Some(ref tx) = self.output_tx {
+            let rel = self
+                .search_root
+                .as_ref()
+                .and_then(|root| path.strip_prefix(root).ok())
+                .unwrap_or(&path);
+            let line = format!("{}:{}:{}\n", rel.display(), line_number, content);
+            let _ = tx.send(line.into_bytes());
+        }
 
         self.results.push((path, line_number, content));
 

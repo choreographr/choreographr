@@ -1,10 +1,16 @@
 use super::{
-    ToolError,
-    shell_util::{format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
+    Tool, ToolError,
+    context::ToolContext,
+    shell_util::{
+        format_shell_output, resolve_and_confine, run_shell_streaming, setup_child,
+        spawn_with_watchdog,
+    },
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::mpsc;
+use tai_keystore::ServiceCredential;
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,14 +57,62 @@ pub struct ShArgs {
 
 pub(crate) struct Sh;
 
-define_tool!(
-    Sh,
-    "sh",
-    "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified.",
-    ShArgs,
-    execute_sh_tool,
-    "shell"
-);
+impl Tool for Sh {
+    type Args = ShArgs;
+    type Return = String;
+
+    fn name(&self) -> &'static str {
+        "sh"
+    }
+
+    fn group(&self) -> &'static str {
+        "shell"
+    }
+
+    fn description(&self) -> &'static str {
+        "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified."
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        execute_sh_tool(&args, working_dir)
+    }
+
+    fn execute_streaming(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        let shell_str = match args.shell {
+            Shell::Bash => "bash",
+            Shell::Dash => "dash",
+            Shell::Zsh => "zsh",
+        };
+        let command = &args.command;
+        let timeout_ms = args.timeout.unwrap_or(30000);
+        let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
+
+        let mut cmd = std::process::Command::new(shell_str);
+        cmd.args(["-c", command])
+            .current_dir(&resolved)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        run_shell_streaming(&mut cmd, command, timeout_ms, output_tx)
+    }
+
+    fn output_content(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+}
 
 pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
     let shell_str = match args.shell {

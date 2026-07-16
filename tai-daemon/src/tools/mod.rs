@@ -77,7 +77,7 @@ pub(crate) mod nu;
 pub(crate) mod random;
 pub(crate) mod series;
 pub(crate) mod sh;
-pub(crate) mod shell_util;
+pub mod shell_util;
 pub mod subsession;
 pub(crate) mod time;
 pub(crate) mod vm;

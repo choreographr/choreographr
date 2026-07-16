@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tai_client_core::{
     ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
-    MAX_HISTORY_ITEMS, broken_pipe,
+    MAX_HISTORY_ITEMS, ToolResultStreamData, broken_pipe,
 };
 use tai_proto::{
     AccountInfo, ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionMessageKind,
@@ -566,6 +566,12 @@ pub(crate) struct App {
     /// would otherwise be absent because `dispatch_stream_lifecycle` is not
     /// invoked during replay.
     pub(crate) replaying_history: bool,
+    /// Maps tool `call_id` → history index for `ToolResultStream` entries
+    /// that have been finalized (stream is done) but haven't yet been
+    /// replaced by the canonical `SessionMessage(ToolResult)` from the
+    /// daemon's post-request snapshot.  Populated by
+    /// `finalize_tool_result_stream`, consumed by `push_session_message`.
+    pub(crate) pending_tool_result_replacement: HashMap<String, usize>,
     /// Descending counter for synthetic request IDs used during replay.
     /// Starts at `u32::MAX` to avoid collision with live request IDs
     /// (which count up from 1).
@@ -669,6 +675,18 @@ impl HistoryViewport {
                 // scroll / click logic always sees the same value so that
                 // find_history_item_at_row does not shift after encoding.
                 (self.height / 2).max(1) as usize
+            }
+            HistoryItem::ToolResultStream(data) => {
+                // Same layout as ToolResult: margin styling with red bar.
+                let content_width = self.width.saturating_sub(9);
+                let msg = SessionMessage::now(SessionMessageKind::ToolResult {
+                    call_id: data.call_id.clone(),
+                    name: data.tool_name.clone(),
+                    content: data.accumulated_text.clone(),
+                    is_error: data.is_error,
+                });
+                let lines = session_message_lines(&msg, content_width);
+                lines.len() + STRUCTURAL_ROWS
             }
             HistoryItem::Diff(diffs) => diff_display_height(diffs) + 2,
         }
@@ -1197,6 +1215,7 @@ impl App {
             attached_context_window: None,
             attached_last_prompt_tokens: None,
             progress_dirty: false,
+            pending_tool_result_replacement: HashMap::new(),
             replaying_history: false,
             next_replay_request_id: u32::MAX,
             replay_call_id_to_rid: HashMap::new(),
@@ -1507,19 +1526,30 @@ impl App {
                 let img = RenderedImage::new_placeholder(record.metadata, Arc::from(record.data));
                 self.push_image(img);
             }
-            other => {
-                // During live execution, `push_tool_text` (Path A) already
-                // promotes diff text to `HistoryItem::Diff`.  Keep the
-                // `ToolResult` session message as-is to avoid a duplicate
-                // rendered diff.  During replay, `push_replay_tool_text`
-                // handles the `ToolResult` (it returns `true` above), so
-                // we never reach this branch in replay mode.
-                let item = if matches!(other.kind, SessionMessageKind::ToolResult { .. }) {
-                    HistoryItem::SessionMessage(other)
+            SessionMessage {
+                kind: SessionMessageKind::ToolResult { ref call_id, .. },
+                ..
+            } => {
+                // During live execution the ToolResultStream was created
+                // by begin_tool_result_stream and populated by
+                // ToolCallOutput / ToolResultChunk.  When the canonical
+                // SessionMessage(ToolResult) arrives from the daemon's
+                // post-request snapshot, replace the ToolResultStream
+                // in-place instead of appending a duplicate.
+                if let Some(&index) = self.pending_tool_result_replacement.get(call_id)
+                    && index < self.client.history.len()
+                {
+                    self.client.history[index] = Self::classify_session_message(&message);
+                    self.pending_tool_result_replacement.remove(call_id);
+                    if let Some(cached) = self.render_cache.get_mut(index) {
+                        *cached = None;
+                    }
                 } else {
-                    Self::classify_session_message(&other)
-                };
-                self.push_history_item(item);
+                    self.push_history_item(Self::classify_session_message(&message));
+                }
+            }
+            other => {
+                self.push_history_item(Self::classify_session_message(&other));
             }
         }
     }
@@ -1730,6 +1760,83 @@ impl App {
 
     pub(crate) fn finalize_stream(&mut self, request_id: u32) {
         self.client.in_progress.remove(&request_id);
+    }
+
+    pub(crate) fn begin_tool_result_stream(
+        &mut self,
+        request_id: u32,
+        call_id: String,
+        tool_name: String,
+    ) {
+        if self.client.tool_streams.contains_key(&request_id) {
+            return;
+        }
+        let item = HistoryItem::ToolResultStream(ToolResultStreamData {
+            request_id,
+            call_id: call_id.clone(),
+            tool_name: tool_name.clone(),
+            accumulated_text: String::new(),
+            is_error: false,
+        });
+        let added_height = self.history_viewport.item_height(&item);
+        let trimmed_height = self.trimmed_height_on_append();
+        self.client
+            .begin_tool_result_stream(request_id, call_id, tool_name);
+        self.ensure_cache_synced();
+        self.history_scroll
+            .on_item_appended(added_height, self.max_scroll_offset());
+        self.account_for_trimmed_height(trimmed_height);
+        self.clamp_scroll_state();
+    }
+
+    pub(crate) fn append_tool_result_chunk(
+        &mut self,
+        request_id: u32,
+        _call_id: &str,
+        data: &[u8],
+    ) {
+        if !self.client.tool_streams.contains_key(&request_id) {
+            // This should not normally happen — chunk should arrive after a
+            // ToolCallStarted message that calls begin_tool_result_stream.
+            // As a safety net, treat this as a drop and rely on the final
+            // SessionMessage(ToolResult) to deliver the complete content.
+            return;
+        }
+        if let Some(&index) = self.client.tool_streams.get(&request_id) {
+            let old_height = self
+                .client
+                .history
+                .get(index)
+                .map(|item| self.history_viewport.item_height(item))
+                .unwrap_or(0);
+            let text = String::from_utf8_lossy(data);
+            self.client.append_tool_result(request_id, &text);
+            if let Some(cached) = self.render_cache.get_mut(index) {
+                *cached = None;
+            }
+            let new_height = self
+                .client
+                .history
+                .get(index)
+                .map(|item| self.history_viewport.item_height(item))
+                .unwrap_or(old_height);
+            self.preserve_scroll_for_growth(old_height, new_height);
+        }
+    }
+
+    pub(crate) fn finalize_tool_result_stream(&mut self, request_id: u32, call_id: &str) {
+        if let Some(&index) = self.client.tool_streams.get(&request_id)
+            && index < self.client.history.len()
+        {
+            // The canonical SessionMessage(ToolResult) comes later via
+            // SessionMessageAppended — we'll replace in-place then.
+            self.pending_tool_result_replacement
+                .insert(call_id.to_string(), index);
+            self.client.tool_streams.remove(&request_id);
+            if let Some(cached) = self.render_cache.get_mut(index) {
+                *cached = None;
+            }
+        }
     }
 
     pub(crate) fn scroll_up(&mut self, amount: usize) {
@@ -2172,6 +2279,18 @@ impl DaemonMessageHandler for App {
 
     fn finalize_stream(&mut self, request_id: u32) {
         self.finalize_stream(request_id);
+    }
+
+    fn begin_tool_result_stream(&mut self, request_id: u32, call_id: &str, tool_name: &str) {
+        self.begin_tool_result_stream(request_id, call_id.to_string(), tool_name.to_string());
+    }
+
+    fn append_tool_result_chunk(&mut self, request_id: u32, call_id: &str, data: &[u8]) {
+        self.append_tool_result_chunk(request_id, call_id, data);
+    }
+
+    fn finalize_tool_result_stream(&mut self, request_id: u32, call_id: &str) {
+        self.finalize_tool_result_stream(request_id, call_id);
     }
 
     fn drop_request(&mut self, request_id: u32) {
@@ -2930,7 +3049,7 @@ mod tests {
     // ── live execution path tests (not replaying) ────────────────────
 
     #[test]
-    fn live_tool_result_with_diff_stays_session_message() {
+    fn live_tool_result_with_diff_becomes_diff() {
         let mut app = test_app("/tmp/tai.sock");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
@@ -2944,35 +3063,174 @@ mod tests {
         });
         app.push_session_message(msg);
 
-        // Live path skips classify_session_message for ToolResult
-        // (push_tool_text already handled diff promotion).
+        // Live path now classifies ToolResult content, so diff text gets
+        // promoted to HistoryItem::Diff (ToolCallOutput no longer goes through
+        // push_tool_text, so no duplicate).
         assert!(matches!(
             app.client.history.last().unwrap(),
-            HistoryItem::SessionMessage(_)
+            HistoryItem::Diff(_)
         ));
     }
 
+    // ── tool result stream methods (live) ───────────────────────────
+
     #[test]
-    fn live_non_tool_result_gets_classified() {
+    fn begin_tool_result_stream_creates_stream_item() {
         let mut app = test_app("/tmp/tai.sock");
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
-        // AssistantText is not a ToolResult, so it goes through classify_session_message.
-        let msg = SessionMessage::now(SessionMessageKind::AssistantText {
-            content: "some response".into(),
-            reasoning: None,
-            token_usage: None,
-        });
-        app.push_session_message(msg);
+        let history_len = app.client.history.len();
+        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+
+        assert!(
+            app.client.tool_streams.contains_key(&1),
+            "should track request_id"
+        );
+        assert_eq!(
+            app.client.history.len(),
+            history_len + 1,
+            "should add one item"
+        );
+        assert!(matches!(
+            app.client.history.last().unwrap(),
+            HistoryItem::ToolResultStream(data) if data.call_id == "call_1" && data.tool_name == "read_file" && data.accumulated_text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn begin_tool_result_stream_is_idempotent() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        let history_len = app.client.history.len();
+        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+        assert_eq!(app.client.history.len(), history_len + 1);
+
+        // Second call with same request_id should be a no-op.
+        app.begin_tool_result_stream(1, "call_2".into(), "write_file".into());
+        assert_eq!(app.client.history.len(), history_len + 1, "no duplicate");
 
         assert!(matches!(
             app.client.history.last().unwrap(),
-            HistoryItem::SessionMessage(SessionMessage {
-                kind: SessionMessageKind::AssistantText { .. },
-                ..
-            })
+            HistoryItem::ToolResultStream(data) if data.call_id == "call_1"
         ));
+    }
+
+    #[test]
+    fn append_tool_result_chunk_updates_accumulated_text() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        app.begin_tool_result_stream(1, "call_1".into(), "grep".into());
+        app.append_tool_result_chunk(1, "call_1", b"hello\n");
+        app.append_tool_result_chunk(1, "call_1", b"world");
+
+        let index = app.client.tool_streams[&1];
+        assert!(
+            matches!(&app.client.history[index], HistoryItem::ToolResultStream(data) if data.accumulated_text == "hello\nworld"),
+            "expected ToolResultStream with accumulated_text 'hello\\nworld'"
+        );
+    }
+
+    #[test]
+    fn append_tool_result_chunk_unknown_request_is_noop() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        // No stream started for this request — should be a silent no-op.
+        app.append_tool_result_chunk(99, "unknown", b"data");
+    }
+
+    #[test]
+    fn finalize_tool_result_stream_registers_replacement() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+        let idx = app.client.tool_streams[&1];
+
+        app.finalize_tool_result_stream(1, "call_1");
+
+        // The stream index should be recorded for later replacement.
+        assert!(
+            !app.client.tool_streams.contains_key(&1),
+            "stream tracking removed"
+        );
+        assert_eq!(
+            app.pending_tool_result_replacement.get("call_1"),
+            Some(&idx),
+            "pending replacement registered"
+        );
+    }
+
+    #[test]
+    fn finalize_tool_result_stream_unknown_request_is_noop() {
+        let mut app = test_app("/tmp/tai.sock");
+        // Should not panic.
+        app.finalize_tool_result_stream(99, "unknown");
+        assert!(app.pending_tool_result_replacement.is_empty());
+    }
+
+    #[test]
+    fn tool_result_stream_replaced_by_session_message() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+        app.append_tool_result_chunk(1, "call_1", b"file contents");
+        app.finalize_tool_result_stream(1, "call_1");
+
+        let idx = *app.pending_tool_result_replacement.get("call_1").unwrap();
+
+        // Now push the canonical SessionMessage(ToolResult).
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
+            call_id: "call_1".into(),
+            name: "read_file".into(),
+            content: "file contents".into(),
+            is_error: false,
+        });
+        app.push_session_message(msg);
+
+        // The ToolResultStream should be replaced in-place.
+        assert!(
+            !app.pending_tool_result_replacement.contains_key("call_1"),
+            "replacement consumed"
+        );
+        assert!(
+            matches!(&app.client.history[idx], HistoryItem::SessionMessage(_)),
+            "expected SessionMessage after replacement"
+        );
+    }
+
+    #[test]
+    fn tool_result_stream_without_replacement_appends_session_message() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        let history_len = app.client.history.len();
+
+        // Push a ToolResult without a prior stream.
+        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
+            call_id: "call_1".into(),
+            name: "read_file".into(),
+            content: "data".into(),
+            is_error: false,
+        });
+        app.push_session_message(msg);
+
+        // Should append a new item, not crash.
+        assert_eq!(
+            app.client.history.len(),
+            history_len + 1,
+            "should append new item"
+        );
     }
 
     // ── reset_for_session_switch ──

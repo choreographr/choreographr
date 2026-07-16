@@ -1,11 +1,13 @@
 use super::{ToolError, truncate_tool_output};
 use std::{
+    io::{BufRead, BufReader, Read},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Output},
     sync::mpsc,
     time::Duration,
 };
+use tracing::warn;
 
 /// Check whether a binary with the given name exists somewhere in PATH.
 pub(crate) fn binary_exists(name: &str) -> bool {
@@ -103,6 +105,132 @@ pub(crate) fn spawn_with_watchdog(
     let _ = watchdog.join();
 
     Ok((output, killed_rx.try_recv().is_ok()))
+}
+
+/// Spawn the command with piped stdout/stderr and stream stdout lines
+/// through `output_tx` in real time as the process produces them.
+/// Enforces a timeout via watchdog and returns the collected output
+/// along with a was-killed flag.
+///
+/// The caller is responsible for calling `setup_child` and setting
+/// `Stdio::piped()` on both stdout and stderr before calling this.
+///
+/// IMPORTANT: Both stdout and stderr are drained in background threads
+/// so that the child process can never block on a full pipe buffer
+/// (the classic pipe deadlock).  stderr is not streamed — it is only
+/// accumulated and returned in the final `Output`.
+pub fn spawn_with_streaming(
+    cmd: &mut Command,
+    timeout_ms: u64,
+    output_tx: mpsc::Sender<Vec<u8>>,
+) -> Result<(Output, bool), ToolError> {
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+
+    // Take stdout so wait_with_output cannot grab it — we read it
+    // incrementally in a background thread.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("stdout not piped"))?;
+
+    // Thread: read stdout line by line, forward each line (with its
+    // newline restored) to output_tx, and accumulate the full output.
+    let (full_buf_tx, full_buf_rx) = mpsc::channel::<Vec<u8>>();
+    let stdout_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        let mut full_buf: Vec<u8> = Vec::new();
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    warn!(error = %e, "error reading stdout from child process");
+                    break;
+                }
+            };
+            let mut line_bytes: Vec<u8> = line.into_bytes();
+            line_bytes.push(b'\n');
+            let _ = output_tx.send(line_bytes.clone());
+            full_buf.extend_from_slice(&line_bytes);
+        }
+        let _ = full_buf_tx.send(full_buf);
+    });
+
+    // Thread: drain stderr concurrently so the child can never block on
+    // a full stderr pipe buffer (classic pipe deadlock).  Not streamed —
+    // just accumulated and returned in the final Output struct.
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("stderr not piped"))?;
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    // Watchdog thread: enforce timeout.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let (killed_tx, killed_rx) = mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx
+            .recv_timeout(Duration::from_millis(timeout_ms))
+            .is_err()
+            && nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .is_ok()
+        {
+            let _ = killed_tx.send(());
+        }
+    });
+
+    // Wait for the process to finish (both background threads drain the
+    // pipes concurrently, preventing any blocking deadlock).
+    let status = child.wait()?;
+    let _ = done_tx.send(());
+
+    if let Err(e) = stdout_thread.join() {
+        warn!("stdout reader thread panicked: {:?}", e);
+    }
+    let stderr_buf = stderr_thread.join().unwrap_or_default();
+    if let Err(e) = watchdog.join() {
+        warn!("watchdog thread panicked: {:?}", e);
+    }
+    let full_buf = full_buf_rx.recv().unwrap_or_default();
+    let was_killed = killed_rx.try_recv().is_ok();
+
+    Ok((
+        Output {
+            stdout: full_buf,
+            stderr: stderr_buf,
+            status,
+        },
+        was_killed,
+    ))
+}
+
+/// Convenience wrapper that combines `setup_child`, `spawn_with_streaming`,
+/// and `format_shell_output` into a single call — used by shell tool
+/// `execute_streaming` implementations to avoid repeating the same 4-line
+/// pattern across `sh`, `fish`, `nu`, and `exec`.
+///
+/// The caller must have set `Stdio::piped()` on both stdout and stderr.
+pub fn run_shell_streaming(
+    cmd: &mut Command,
+    display_cmd: &str,
+    timeout_ms: u64,
+    output_tx: mpsc::Sender<Vec<u8>>,
+) -> Result<String, ToolError> {
+    setup_child(cmd);
+    let (output, was_killed) = spawn_with_streaming(cmd, timeout_ms, output_tx)?;
+    Ok(format_shell_output(
+        display_cmd,
+        &output,
+        timeout_ms,
+        was_killed,
+    ))
 }
 
 /// Format the tool output string for a shell-style command.

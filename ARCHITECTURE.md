@@ -102,7 +102,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 `DaemonMessage` variants:
 - Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionStatusChanged`, `SessionMessageAppended`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`
 - Request lifecycle: `Started`, `OutputChunk`, `Done`, `Failed`, `Cancelled`
-- Tool lifecycle: `ToolCallStarted`, `ToolCallFinished`, `ToolCallFailed`, `ToolCallOutput`
+- Tool lifecycle: `ToolCallStarted`, `ToolCallFinished` (output removed — content delivered via `ToolResultChunk`), `ToolCallFailed`, `ToolCallOutput`, `ToolResultChunk`
 - **Tool call streaming** (real-time argument deltas during generation): `ToolCallGenerationStarted { request_id, call_id, tool_name, index, arguments_delta }`, `ToolCallArgDelta { request_id, call_id, index, arguments_delta }`
 - Model management: `Models`, `ModelsFailed`, `ModelSelected`, `ModelSelectionFailed`
 - Locking: `Unlocked`, `Locked`, `LockedError`

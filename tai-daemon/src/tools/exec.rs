@@ -1,10 +1,16 @@
 use super::{
-    ToolError,
-    shell_util::{format_shell_output, resolve_and_confine, setup_child, spawn_with_watchdog},
+    Tool, ToolError,
+    context::ToolContext,
+    shell_util::{
+        format_shell_output, resolve_and_confine, run_shell_streaming, setup_child,
+        spawn_with_watchdog,
+    },
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::mpsc;
+use tai_keystore::ServiceCredential;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecArgs {
@@ -21,14 +27,63 @@ pub struct ExecArgs {
 
 pub(crate) struct Exec;
 
-define_tool!(
-    Exec,
-    "exec",
-    "Execute a program directly without a shell. The command is not parsed by a shell — no pipes, redirects, glob expansion, or environment variable interpolation. Prefer this over `sh` when you only need to run a single program with arguments (lower risk of shell-injection issues).",
-    ExecArgs,
-    execute_exec_tool,
-    "shell"
-);
+impl Tool for Exec {
+    type Args = ExecArgs;
+    type Return = String;
+
+    fn name(&self) -> &'static str {
+        "exec"
+    }
+
+    fn group(&self) -> &'static str {
+        "shell"
+    }
+
+    fn description(&self) -> &'static str {
+        "Execute a program directly without a shell. The command is not parsed by a shell — no pipes, redirects, glob expansion, or environment variable interpolation. Prefer this over `sh` when you only need to run a single program with arguments (lower risk of shell-injection issues)."
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        execute_exec_tool(&args, working_dir)
+    }
+
+    fn execute_streaming(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        let program = &args.command;
+        let prog_args = &args.args;
+        let timeout_ms = args.timeout.unwrap_or(30000);
+        let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
+
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(prog_args)
+            .current_dir(&resolved)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let display_cmd = if prog_args.is_empty() {
+            program.to_string()
+        } else {
+            format!("{} {}", program, prog_args.join(" "))
+        };
+
+        run_shell_streaming(&mut cmd, &display_cmd, timeout_ms, output_tx)
+    }
+
+    fn output_content(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+}
 
 pub fn execute_exec_tool(args: &ExecArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
     let program = &args.command;

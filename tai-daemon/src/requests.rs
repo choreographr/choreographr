@@ -801,6 +801,24 @@ fn finish_tool_call(
         );
     }
 
+    let content = &output.result.content;
+    const CHUNK_SIZE: usize = 4096;
+    for chunk in content.as_bytes().chunks(CHUNK_SIZE) {
+        let _ = ctx
+            .cmd_tx
+            .send(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk {
+                request_id,
+                call_id: tool_call.id.clone(),
+                data: chunk.to_vec(),
+            }));
+        // broadcast() uses try_send so the session thread never blocks
+        // on a backed-up subscriber.  The bounded channel (128 slots ~
+        // 512 KiB) absorbs short bursts; if the TUI falls behind the
+        // chunk is dropped.  This is acceptable because the final
+        // ToolCallFinished + post-request-snapshot deliver the complete
+        // content.
+    }
+
     let event = if output.result.is_error {
         DaemonMessage::ToolCallFailed {
             request_id,
@@ -813,7 +831,6 @@ fn finish_tool_call(
             request_id,
             call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            output: output.result.content.clone(),
         }
     };
     let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(event));

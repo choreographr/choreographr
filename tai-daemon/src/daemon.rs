@@ -38,7 +38,7 @@ pub struct DaemonState {
     pub tool_registry: Arc<crate::tools::ToolRegistry>,
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
     pub client_streams: Vec<UnixStream>,
-    pub summary_subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>,
+    pub summary_subscribers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
     pub model_cache: HashMap<String, (Vec<String>, Instant)>,
     pub mcp_manager: McpManager,
 }
@@ -98,7 +98,7 @@ pub enum DaemonCommand {
     },
     RegisterSummarySubscriber {
         client_id: u64,
-        writer: std::sync::mpsc::Sender<DaemonMessage>,
+        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
     },
     UnregisterSummarySubscriber {
         client_id: u64,
@@ -691,7 +691,7 @@ impl DaemonState {
     fn handle_register_summary_subscriber(
         &mut self,
         client_id: u64,
-        writer: std::sync::mpsc::Sender<DaemonMessage>,
+        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
     ) {
         self.summary_subscribers.insert(client_id, writer);
     }
@@ -1025,6 +1025,7 @@ fn handle_list_models_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::connection::SUBSCRIBER_CHANNEL_CAPACITY;
     use crate::sessions::SessionMetadata;
     use std::collections::HashMap;
     use std::sync::mpsc;
@@ -1179,7 +1180,7 @@ mod tests {
     #[test]
     fn handle_register_unregister_subscriber() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, _rx_sub) = mpsc::channel();
+        let (tx, _rx_sub) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         assert!(!state.summary_subscribers.contains_key(&42));
         state.handle_command(DaemonCommand::RegisterSummarySubscriber {
             client_id: 42,
@@ -1193,7 +1194,7 @@ mod tests {
     #[test]
     fn handle_broadcast_session_status() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         state.handle_command(DaemonCommand::RegisterSummarySubscriber {
             client_id: 1,
             writer: tx,
@@ -1262,7 +1263,7 @@ mod tests {
     #[test]
     fn broadcast_sends_to_subscriber() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         state.summary_subscribers.insert(1, tx);
         let msg = DaemonMessage::SessionDeleted { session_id: 42 };
         state.broadcast(msg.clone());
@@ -1275,7 +1276,7 @@ mod tests {
     #[test]
     fn broadcast_removes_disconnected_subscriber() {
         let (mut state, _rx) = make_daemon_state();
-        let (tx, rx) = mpsc::channel::<DaemonMessage>();
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
         state.summary_subscribers.insert(1, tx);
         drop(rx); // Disconnect the receiver
         state.broadcast(DaemonMessage::SessionDeleted { session_id: 42 });

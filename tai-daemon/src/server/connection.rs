@@ -3,17 +3,25 @@ use crate::sessions::SessionCommand;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
+use std::sync::mpsc::SyncSender;
 use tai_proto::{
     ClientMessage, ContextConfig, DaemonMessage, ProtoError, ThinkingEffort, read_message,
     write_message,
 };
 use tracing::{debug, error, info, warn};
 
+/// Per-subscriber channel capacity for session message broadcast.
+/// Limits how many messages the session thread can enqueue before the
+/// client's writer thread drains them.  Creates natural backpressure
+/// from the TUI event loop back to the daemon session thread, replacing
+/// the previous thread::sleep() pacing for tool result chunks.
+pub(crate) const SUBSCRIBER_CHANNEL_CAPACITY: usize = 128;
+
 /// Shared per-client context passed through the dispatch and handler functions.
 /// Bundles the channels and mutable per-connection state into one struct so
 /// the call sites don't pass 5–6 individual arguments to every function.
 struct ClientCtx<'a> {
-    writer_tx: &'a mpsc::Sender<DaemonMessage>,
+    writer_tx: &'a SyncSender<DaemonMessage>,
     daemon_tx: &'a mpsc::Sender<DaemonCommand>,
     attached_session_id: &'a mut Option<u64>,
     attached_session_tx: &'a mut Option<mpsc::Sender<SessionCommand>>,
@@ -27,7 +35,7 @@ fn cleanup_client(
     attached_session_tx: Option<mpsc::Sender<SessionCommand>>,
     client_id: u64,
     daemon_tx: &mpsc::Sender<DaemonCommand>,
-    writer_tx: mpsc::Sender<DaemonMessage>,
+    writer_tx: SyncSender<DaemonMessage>,
     writer_handle: std::thread::JoinHandle<()>,
 ) {
     if let Some(ref tx) = attached_session_tx {
@@ -283,7 +291,7 @@ pub(crate) fn client_thread(
     let reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
 
-    let (writer_tx, writer_rx) = mpsc::channel::<DaemonMessage>();
+    let (writer_tx, writer_rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
     let writer_handle = std::thread::spawn(move || {
         for msg in writer_rx {
             if write_message(&mut writer, &msg).is_err() {
@@ -345,7 +353,7 @@ pub(crate) fn tcp_client_thread(
     noise: tai_transport::noise::NoiseStream,
     daemon_tx: mpsc::Sender<DaemonCommand>,
 ) -> io::Result<()> {
-    let (writer_tx, writer_rx) = mpsc::channel::<DaemonMessage>();
+    let (writer_tx, writer_rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
 
     // Writer thread: blocks on writer_rx, sends via NoiseStream encryption.
     let mut writer = noise.try_clone()?;
@@ -692,7 +700,7 @@ mod tests {
     #[test]
     fn handle_unlock_sync_ok() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
@@ -715,7 +723,7 @@ mod tests {
     #[test]
     fn handle_unlock_sync_err() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
@@ -741,7 +749,7 @@ mod tests {
     #[test]
     fn handle_unlock_sync_disconnected() {
         let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
@@ -759,7 +767,7 @@ mod tests {
     #[test]
     fn handle_list_models_sync_ok() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
@@ -785,7 +793,7 @@ mod tests {
     #[test]
     fn handle_list_models_sync_err() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
@@ -811,7 +819,7 @@ mod tests {
     #[test]
     fn handle_get_credential_sync_some() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
@@ -839,7 +847,7 @@ mod tests {
     #[test]
     fn handle_get_credential_sync_none() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
@@ -868,7 +876,8 @@ mod tests {
     fn switch_session_to_different_sends_detach_to_old() {
         let (old_tx, old_rx) = mpsc::channel();
         let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
-        let (writer_tx, _writer_rx) = mpsc::channel::<DaemonMessage>();
+        let (writer_tx, _writer_rx) =
+            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
         let (daemon_tx, _daemon_rx) = mpsc::channel();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(old_tx);
@@ -900,7 +909,8 @@ mod tests {
     fn switch_session_same_skips_detach() {
         let (old_tx, old_rx) = mpsc::channel();
         let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
-        let (writer_tx, _writer_rx) = mpsc::channel::<DaemonMessage>();
+        let (writer_tx, _writer_rx) =
+            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
         let (daemon_tx, _daemon_rx) = mpsc::channel();
         let mut attached_id = Some(1u64);
         let mut attached_tx = Some(old_tx);
@@ -928,7 +938,7 @@ mod tests {
     #[test]
     fn handle_delete_session_sync_success_no_message_sent() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
@@ -951,7 +961,7 @@ mod tests {
     #[test]
     fn handle_delete_session_sync_error() {
         let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
@@ -978,7 +988,7 @@ mod tests {
     #[test]
     fn handle_delete_session_sync_disconnected() {
         let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_tx, writer_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         let mut none_id = None;
         let mut none_tx = None;
         let mut ctx = ClientCtx {
@@ -996,7 +1006,8 @@ mod tests {
     #[test]
     fn switch_session_from_none_no_detach() {
         let (new_tx, new_rx) = mpsc::channel::<SessionCommand>();
-        let (writer_tx, _writer_rx) = mpsc::channel::<DaemonMessage>();
+        let (writer_tx, _writer_rx) =
+            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
         let (daemon_tx, _daemon_rx) = mpsc::channel();
         let mut attached_id: Option<u64> = None;
         let mut attached_tx: Option<mpsc::Sender<SessionCommand>> = None;

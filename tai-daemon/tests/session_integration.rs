@@ -5,6 +5,8 @@ use tai_proto::DaemonMessage;
 
 mod common;
 
+const CHANNEL_CAPACITY: usize = 128;
+
 fn spawn_session(
     db: Arc<redb::Database>,
     session_id: u64,
@@ -41,7 +43,7 @@ fn session_starts_and_accepts_commands() {
     let db = Arc::new(common::test_db());
     let (session_tx, _handle) = spawn_session(db, 1);
 
-    let (writer_tx, writer_rx) = mpsc::channel();
+    let (writer_tx, writer_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let client_id = 42;
 
     session_tx
@@ -98,7 +100,7 @@ fn session_cancel_nonexistent_request_does_not_panic() {
         .unwrap();
 
     // Session should still be functional afterwards.
-    let (writer_tx, _writer_rx) = mpsc::channel();
+    let (writer_tx, _writer_rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
     session_tx
         .send(SessionCommand::Attach {
             client_id: 10,

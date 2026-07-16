@@ -1,7 +1,9 @@
-use super::{ToolError, truncate_tool_output};
+use super::{Tool, ToolError, context::ToolContext, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::mpsc;
+use tai_keystore::ServiceCredential;
 use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
 use zlob::{ZlobFlags, ZlobPattern};
 
@@ -32,16 +34,20 @@ pub struct FindArgs {
 /// gitignore-aware walker.
 pub struct Find;
 
-pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
-    // Resolve the search root — use the provided path or default to "."
-    let path = args.path.as_deref().unwrap_or(".");
-    let resolved = super::confine_path(path, working_dir)?;
-
-    // Build an optional glob matcher when the caller wants glob matching.
+/// Run the find walk with the given parameters, optionally streaming each
+/// match to `output_tx` as it is found (for incremental client display).
+fn run_find_walk(
+    resolved: &Path,
+    pattern: &str,
+    glob: bool,
+    max_results: u32,
+    output_tx: Option<&mpsc::Sender<Vec<u8>>>,
+) -> Result<String, ToolError> {
+    // Build an optional glob matcher when the caller wants glob mode.
     // For substring mode we don't need a matcher — we do simple contains().
-    let glob_matcher: Option<ZlobPattern> = if args.glob {
+    let glob_matcher: Option<ZlobPattern> = if glob {
         Some(
-            ZlobPattern::compile(&args.pattern, ZlobFlags::RECOMMENDED)
+            ZlobPattern::compile(pattern, ZlobFlags::RECOMMENDED)
                 .map_err(|e| ToolError::Other(format!("invalid glob pattern: {e}")))?,
         )
     } else {
@@ -50,38 +56,34 @@ pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<
 
     // Pre-lowercase the pattern so we only pay the cost once for
     // case-insensitive substring matching on every entry's name.
-    let pattern_lower = args.pattern.to_lowercase();
+    let pattern_lower = pattern.to_lowercase();
 
     // Clamp max_results to the configured bounds so the caller can't
     // request an unbounded or absurdly large result set.
-    let max_results = args
-        .max_results
-        .unwrap_or(DEFAULT_MAX_RESULTS)
-        .clamp(1, MAX_RESULTS_CAP) as usize;
+    let max_results = max_results.clamp(1, MAX_RESULTS_CAP) as usize;
+    let mut results: Vec<String> = Vec::new();
 
     // Walk the directory tree with gitignore-aware traversal.
     // WalkFlags::RECOMMENDED skips hidden files and respects .gitignore rules.
-    let mut results: Vec<String> = Vec::new();
-
-    WalkBuilder::new(&resolved)
+    WalkBuilder::new(resolved)
         .map_err(|e| ToolError::Other(format!("failed to create walker: {e}")))?
         .options(WalkFlags::RECOMMENDED)
         .run_serial(|entry| {
             // Get the file or directory name for matching against the pattern.
-            // Convert to OsStr → Cow<str> so non-UTF-8 filenames are
-            // handled via replacement characters (like the old ignore crate).
+            // Use to_string_lossy so non-UTF-8 filenames are handled via
+            // replacement characters rather than silently skipped.
             let name = entry
                 .path()
                 .file_name()
                 .map(|n| n.to_string_lossy())
                 .unwrap_or_default();
 
-            // Check whether the entry's name matches the search pattern
+            // Check whether the entry's name matches the search pattern.
             let matched = if let Some(ref matcher) = glob_matcher {
-                // Glob mode: delegate to zlob's compiled matcher
+                // Glob mode: delegate to zlob's compiled matcher.
                 matcher.matches_default(&name)
             } else {
-                // Substring mode: case-insensitive contains check
+                // Substring mode: case-insensitive contains check.
                 name.to_lowercase().contains(&pattern_lower)
             };
 
@@ -91,19 +93,22 @@ pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<
 
             // Compute the relative path from the search root via zlob's
             // built-in relative_path() method — avoids a strip_prefix roundtrip.
-            let rel = entry.relative_path().to_string_lossy().to_string();
-
+            let mut rel = entry.relative_path().to_string_lossy().to_string();
             // Append a trailing slash for directories — a visual cue that the
             // entry is a directory, matching common ls/find conventions.
-            let rel = if entry.is_dir() {
-                format!("{rel}/")
-            } else {
-                rel
-            };
+            if entry.is_dir() {
+                rel.push('/');
+            }
 
+            // Stream the result if a sender is configured so the client can
+            // display matches incrementally rather than waiting for the
+            // entire walk to complete.
+            if let Some(tx) = output_tx {
+                let _ = tx.send(format!("{rel}\n").into_bytes());
+            }
             results.push(rel);
 
-            // Stop early once we've accumulated enough results
+            // Stop early once we've accumulated enough results.
             if results.len() >= max_results {
                 WalkState::Quit
             } else {
@@ -125,14 +130,67 @@ pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<
     Ok(truncate_tool_output(&results.join("\n")))
 }
 
-define_tool!(
-    Find,
-    "find",
-    "Find files and directories by name. Respects .gitignore and hidden files.",
-    FindArgs,
-    execute_find_tool,
-    "core"
-);
+pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
+    let path = args.path.as_deref().unwrap_or(".");
+    let resolved = super::confine_path(path, working_dir)?;
+    run_find_walk(
+        &resolved,
+        &args.pattern,
+        args.glob,
+        args.max_results.unwrap_or(DEFAULT_MAX_RESULTS),
+        None,
+    )
+}
+
+impl Tool for Find {
+    type Args = FindArgs;
+    type Return = String;
+
+    fn name(&self) -> &'static str {
+        "find"
+    }
+
+    fn group(&self) -> &'static str {
+        "core"
+    }
+
+    fn description(&self) -> &'static str {
+        "Find files and directories by name. Respects .gitignore and hidden files."
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        execute_find_tool(&args, working_dir)
+    }
+
+    fn execute_streaming(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        _ctx: Option<&ToolContext>,
+    ) -> Result<String, ToolError> {
+        let path = args.path.as_deref().unwrap_or(".");
+        let resolved = super::confine_path(path, working_dir)?;
+        run_find_walk(
+            &resolved,
+            &args.pattern,
+            args.glob,
+            args.max_results.unwrap_or(DEFAULT_MAX_RESULTS),
+            Some(&output_tx),
+        )
+    }
+
+    fn output_content(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+}
 
 #[cfg(test)]
 mod tests {

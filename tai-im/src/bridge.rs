@@ -76,10 +76,13 @@ impl DaemonBridge {
             let mut reader = reader;
             let mut assembler = ImageAssembler::new();
             let mut buffers: HashMap<u32, StreamingText> = HashMap::new();
+            let mut tool_buffers: HashMap<u32, String> = HashMap::new();
 
             let result = tai_client_core::run_daemon_reader(&mut reader, |msg| {
                 debug!(?msg, "received daemon message");
-                if let Some(event) = daemon_to_bridge_events(msg, &mut assembler, &mut buffers) {
+                if let Some(event) =
+                    daemon_to_bridge_events(msg, &mut assembler, &mut buffers, &mut tool_buffers)
+                {
                     let _ = event_tx.send(event);
                 }
             });
@@ -107,6 +110,7 @@ fn daemon_to_bridge_events(
     msg: DaemonMessage,
     assembler: &mut ImageAssembler,
     buffers: &mut HashMap<u32, StreamingText>,
+    tool_buffers: &mut HashMap<u32, String>,
 ) -> Option<BridgeEvent> {
     match msg {
         DaemonMessage::OutputChunk {
@@ -143,6 +147,7 @@ fn daemon_to_bridge_events(
         }
         DaemonMessage::Cancelled { request_id } => {
             buffers.remove(&request_id);
+            tool_buffers.remove(&request_id);
             Some(BridgeEvent::Error("cancelled".into()))
         }
         DaemonMessage::ToolCallStarted {
@@ -154,15 +159,22 @@ fn daemon_to_bridge_events(
             arguments_json,
         }),
         DaemonMessage::ToolCallFinished {
+            request_id,
             tool_name: name,
-            output,
             ..
-        } => Some(BridgeEvent::ToolCallFinished { name, output }),
+        } => {
+            let output = tool_buffers.remove(&request_id).unwrap_or_default();
+            Some(BridgeEvent::ToolCallFinished { name, output })
+        }
         DaemonMessage::ToolCallFailed {
+            request_id,
             tool_name: name,
             error,
             ..
-        } => Some(BridgeEvent::ToolCallFailed { name, error }),
+        } => {
+            tool_buffers.remove(&request_id);
+            Some(BridgeEvent::ToolCallFailed { name, error })
+        }
         DaemonMessage::ImageStart {
             request_id,
             metadata,
@@ -229,6 +241,14 @@ fn daemon_to_bridge_events(
             warn!(?msg, "unhandled daemon message variant in bridge");
             None
         }
+        DaemonMessage::ToolResultChunk {
+            request_id, data, ..
+        } => {
+            if let Ok(text) = String::from_utf8(data) {
+                tool_buffers.entry(request_id).or_default().push_str(&text);
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -244,6 +264,7 @@ mod tests {
     fn test_output_chunk_buffering() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
         let events1 = daemon_to_bridge_events(
             DaemonMessage::OutputChunk {
@@ -253,6 +274,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events1.is_none());
 
@@ -264,6 +286,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events2.is_none());
 
@@ -275,6 +298,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events3.is_some());
         match &events3.unwrap() {
@@ -287,6 +311,7 @@ mod tests {
     fn test_done_no_chunks() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Done {
@@ -296,6 +321,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events.is_none());
     }
@@ -304,6 +330,7 @@ mod tests {
     fn test_failed_clears_buffer() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
         daemon_to_bridge_events(
             DaemonMessage::OutputChunk {
@@ -313,6 +340,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
 
         let events = daemon_to_bridge_events(
@@ -322,6 +350,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events.is_some());
         assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Error(msg) if msg == "oops"));
@@ -334,6 +363,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events2.is_none());
     }
@@ -342,6 +372,7 @@ mod tests {
     fn test_cancelled_clears_buffer() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
         daemon_to_bridge_events(
             DaemonMessage::OutputChunk {
@@ -351,12 +382,14 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Cancelled { request_id: 2 },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events.is_some());
         assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Error(msg) if msg == "cancelled"));
@@ -369,6 +402,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events2.is_none());
     }
@@ -377,6 +411,7 @@ mod tests {
     fn test_tool_call_events() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
             DaemonMessage::ToolCallStarted {
@@ -387,6 +422,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events.is_some());
         match events.unwrap() {
@@ -405,16 +441,29 @@ mod tests {
     fn test_tool_call_finished() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
+
+        // First send a chunk so the buffer has content
+        daemon_to_bridge_events(
+            DaemonMessage::ToolResultChunk {
+                request_id: 1,
+                call_id: "call_1".into(),
+                data: b"file contents".to_vec(),
+            },
+            &mut assembler,
+            &mut buffers,
+            &mut tool_buffers,
+        );
 
         let events = daemon_to_bridge_events(
             DaemonMessage::ToolCallFinished {
                 request_id: 1,
                 call_id: "call_1".into(),
                 tool_name: "read".into(),
-                output: "file contents".into(),
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events.is_some());
         match events.unwrap() {
@@ -430,6 +479,7 @@ mod tests {
     fn test_tool_call_failed() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
             DaemonMessage::ToolCallFailed {
@@ -440,6 +490,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events.is_some());
         match events.unwrap() {
@@ -455,6 +506,7 @@ mod tests {
     fn test_image_stream() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
         let metadata = ImageMetadata {
             image_id: 1,
@@ -472,6 +524,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events1.is_none());
 
@@ -483,6 +536,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events2.is_none());
 
@@ -493,6 +547,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events3.is_some());
         match events3.unwrap() {
@@ -508,6 +563,7 @@ mod tests {
     fn test_models_event() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Models {
@@ -516,6 +572,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events.is_some());
         match events.unwrap() {
@@ -531,6 +588,7 @@ mod tests {
     fn test_models_failed_event() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
         let events = daemon_to_bridge_events(
             DaemonMessage::ModelsFailed {
@@ -538,6 +596,7 @@ mod tests {
             },
             &mut assembler,
             &mut buffers,
+            &mut tool_buffers,
         );
         assert!(events.is_some());
         match events.unwrap() {
@@ -550,8 +609,14 @@ mod tests {
     fn test_pong_event() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
-        let events = daemon_to_bridge_events(DaemonMessage::Pong, &mut assembler, &mut buffers);
+        let events = daemon_to_bridge_events(
+            DaemonMessage::Pong,
+            &mut assembler,
+            &mut buffers,
+            &mut tool_buffers,
+        );
         assert!(events.is_some());
         assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Pong));
     }
@@ -560,6 +625,7 @@ mod tests {
     fn test_error_variants() {
         let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
+        let mut tool_buffers = HashMap::new();
 
         let cases = vec![
             DaemonMessage::SessionFailed {
@@ -576,7 +642,8 @@ mod tests {
         ];
 
         for msg in cases {
-            let events = daemon_to_bridge_events(msg, &mut assembler, &mut buffers);
+            let events =
+                daemon_to_bridge_events(msg, &mut assembler, &mut buffers, &mut tool_buffers);
             assert!(events.is_some());
             assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Error(_)));
         }

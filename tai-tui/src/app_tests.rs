@@ -21,7 +21,8 @@ fn app_push_text_trims_history_to_limit() {
         HistoryItem::SessionMessage(_)
         | HistoryItem::Streaming(_)
         | HistoryItem::Image(_)
-        | HistoryItem::Diff(_) => {
+        | HistoryItem::Diff(_)
+        | HistoryItem::ToolResultStream(_) => {
             panic!("expected text history item")
         }
     }

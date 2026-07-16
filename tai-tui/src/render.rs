@@ -17,6 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
+use tai_client_core::history::ToolResultStreamData;
 use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
 use tai_proto::{ImageMetadata, SessionMessage, SessionMessageKind, SessionStatus, ThinkingEffort};
 
@@ -466,6 +467,17 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     &mut y,
                     &mut rows_to_skip,
                     app,
+                );
+            }
+            HistoryItem::ToolResultStream(data) => {
+                render_item_tool_result_stream(
+                    frame,
+                    area,
+                    data,
+                    &mut rows_remaining,
+                    &mut y,
+                    &mut rows_to_skip,
+                    user_content_width,
                 );
             }
             HistoryItem::Diff(diffs) => {
@@ -921,6 +933,39 @@ fn render_image_frame(
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     Some((inner, fully_visible))
+}
+
+/// Render a `HistoryItem::ToolResultStream` — progressive tool result content
+/// that changes every frame (never cached). Uses the same red margin styling
+/// as the final `ToolResult`.
+fn render_item_tool_result_stream(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    data: &ToolResultStreamData,
+    rows_remaining: &mut usize,
+    y: &mut u16,
+    rows_to_skip: &mut usize,
+    user_content_width: u16,
+) {
+    let msg = SessionMessage::now(SessionMessageKind::ToolResult {
+        call_id: data.call_id.clone(),
+        name: data.tool_name.clone(),
+        content: data.accumulated_text.clone(),
+        is_error: data.is_error,
+    });
+    let lines = session_message_lines(&msg, user_content_width);
+    render_margin_lines(
+        frame,
+        area,
+        lines,
+        rows_remaining,
+        y,
+        rows_to_skip,
+        user_content_width,
+        Style::default().bg(BG_SHADE),
+        add_tool_result_margin_lines as MarginFn,
+        None,
+    );
 }
 
 /// Render a `HistoryItem::Image`, clipped to the visible scroll area.

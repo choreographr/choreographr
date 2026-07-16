@@ -417,7 +417,11 @@ pub enum DaemonMessage {
         request_id: u32,
         call_id: String,
         tool_name: String,
-        output: String,
+    },
+    ToolResultChunk {
+        request_id: u32,
+        call_id: String,
+        data: Vec<u8>,
     },
     ToolCallFailed {
         request_id: u32,
