@@ -123,7 +123,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
                 // ignored — the terminal thread has already begun tearing
                 // down the UI, so there is no consumer left to process this
                 // event and no point in propagating the error.
-                if let Err(e) = connection_ui_tx.try_send(UiEvent::Daemon(message))
+                if let Err(e) = connection_ui_tx.try_send(UiEvent::Daemon(Box::new(message)))
                     && e.is_full()
                 {
                     tracing::warn!(
@@ -1268,7 +1268,7 @@ fn handle_ui_event(
 ) -> Result<bool, ClientError> {
     match event {
         UiEvent::Daemon(message) => {
-            handle_daemon_message(message, app, client_tx)?;
+            handle_daemon_message(*message, app, client_tx)?;
             Ok(true)
         }
         UiEvent::ReaderClosed => {
@@ -1374,7 +1374,7 @@ pub(crate) fn handle_daemon_message(
             // currently-attached session; stale messages from a previous
             // session that the daemon is still draining should be ignored.
             if app.attached_session_id == Some(*session_id) {
-                app.attached_token_usage = token_usage.clone();
+                app.attached_token_usage = *token_usage;
                 app.attached_context_window = *context_window;
                 app.attached_last_prompt_tokens = *last_prompt_tokens;
                 app.attached_working_dir = working_dir.clone();
@@ -1392,7 +1392,7 @@ pub(crate) fn handle_daemon_message(
             // This lacks a session_id, so we trust it belongs to the
             // attached session (the daemon only sends Done for active
             // requests on the session the client subscribed to).
-            app.attached_token_usage = Some(usage.clone());
+            app.attached_token_usage = Some(*usage);
             app.attached_last_prompt_tokens = *last_prompt_tokens;
             app.progress_dirty = true;
             // Fall through to dispatch_daemon_message.

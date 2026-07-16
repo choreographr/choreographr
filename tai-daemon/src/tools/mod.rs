@@ -1,6 +1,6 @@
 pub(crate) use crate::openai::AllowedCaller;
-use crate::openai::ChatToolCall;
 use crate::openai::ChatToolDefinition;
+use crate::providers::types::ChatToolCall;
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;

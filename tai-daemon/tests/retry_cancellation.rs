@@ -6,9 +6,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tai_daemon::openai::{
-    ChatRequestMessage, ChatTurnResult, OpenAiClient, OpenAiError, RetryCallback, ServiceConfig,
+    ChatRequestMessage, OpenAiClient, OpenAiError, RetryCallback, ServiceConfig,
 };
 use tai_daemon::providers::ChatTurnRequest;
+use tai_daemon::providers::ChatTurnResult;
 use tai_proto::ThinkingEffort;
 
 // ── Helpers ───────────────────────────────────────────────────────

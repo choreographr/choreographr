@@ -103,6 +103,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 - Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionStatusChanged`, `SessionMessageAppended`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`
 - Request lifecycle: `Started`, `OutputChunk`, `Done`, `Failed`, `Cancelled`
 - Tool lifecycle: `ToolCallStarted`, `ToolCallFinished`, `ToolCallFailed`, `ToolCallOutput`
+- **Tool call streaming** (real-time argument deltas during generation): `ToolCallGenerationStarted { request_id, call_id, tool_name, index, arguments_delta }`, `ToolCallArgDelta { request_id, call_id, index, arguments_delta }`
 - Model management: `Models`, `ModelsFailed`, `ModelSelected`, `ModelSelectionFailed`
 - Locking: `Unlocked`, `Locked`, `LockedError`
 - Credential management: `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`
@@ -191,6 +192,7 @@ Used by `tai-tui`, `tai-gui`, and `tai-im`.
 | `image.rs` | `ImageAssembler` — kept for legacy `tai-im` use. No longer used by TUI/Dioxus (images delivered mid-turn as `DisplayedImage` via `SessionMessageAppended`). |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text, structured diffs) |
 | `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
+| `dispatch.rs` | `DaemonMessageHandler` trait + `dispatch_daemon_message()` — categorizes incoming `DaemonMessage` variants into sub-dispatchers (`dispatch_session`, `dispatch_stream_lifecycle`, `dispatch_model`, `dispatch_keystore`, `dispatch_credential`, `dispatch_account`, `dispatch_reasoning`, `dispatch_misc`). Used by all UI clients to avoid duplicating the routing logic. Includes 50+ unit tests covering every message variant. |
 | `connection.rs` | Daemon connection helpers: `run_daemon_connection()` (Unix socket), `run_daemon_tcp_connection()` (Noise IK), `run_daemon_connection_with_mode()` (dispatch), `run_daemon_reader()` (blocking reader). `ConnectionMode` enum (`UnixSocket` | `Tcp`) selects the transport. |
 
 `DaemonMessageHandler` trait uses `ClientError` (thiserror enum) — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `PrivateKeyEncRead`, `PrivateKeyDecrypt`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Postcard`, `Encryption`.
@@ -225,7 +227,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. |
 | `providers/` | `ProviderClient` trait + `ProviderCatalog` system. `InferenceProvider` struct wraps `Arc<dyn ProviderClient>`. Static `PROVIDER_CATALOG` maps ~31 slugs to protocol type, default base URL, and default model. Dispatches to the correct client based on protocol. |
-| `providers/shared.rs` | Shared provider infrastructure: `ProviderError` (unified error type used by all providers), `build_agent()` (ureq Agent construction with timeouts), `error_type_label()`, `provider_error_to_inference()`, `timed_result()` (metrics instrumentation wrapper). Eliminates duplicated error types, `From<ProviderHttpError>` impls, and error conversion functions across provider implementations. |
+| `providers/shared.rs` | Shared provider infrastructure: `ProviderError` (unified error type used by all providers), `build_agent()` (ureq Agent construction with timeouts), `error_type_label()`, `provider_error_to_inference()`, `timed_result()` (metrics instrumentation wrapper), `emit_non_streaming_events()` (converts a non-streaming `ChatTurnResult` into `StreamEvent` callbacks so non-streaming configurations reuse the same event-driven path). Eliminates duplicated error types, `From<ProviderHttpError>` impls, and error conversion functions across provider implementations. |
 | `anthropic/` | Anthropic Messages API client (`AnthropicClient`). Implements `ProviderClient`. |
 | `google/` | Google Gemini API client (`GoogleClient`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
 | `mistral/` | Mistral API client (`MistralClient`). Implements `ProviderClient`. Uses OpenAI-compatible SSE reader for streaming. |
@@ -263,7 +265,7 @@ pub struct ChatTurnRequest<'a> {
 pub trait ProviderClient: Debug + Send + Sync {
     fn provider_slug(&self) -> &'static str;
     fn chat_completion_turn(&self, params: ChatTurnRequest<'_>) -> Result<ChatTurnResult, InferenceError>;
-    fn chat_completion_turn_streaming(&self, params: ChatTurnRequest<'_>, on_chunk: &mut dyn FnMut(...)) -> Result<ChatTurnResult, InferenceError>;
+    fn chat_completion_turn_streaming(&self, params: ChatTurnRequest<'_>, on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>) -> Result<ChatTurnResult, InferenceError>;
     fn list_models(&self) -> Result<Vec<String>, InferenceError>;
     fn supports_programmatic_tool_calling(&self, model: &str) -> bool;
     fn context_window_for_model(&self, model: &str) -> Option<u32>;
@@ -288,6 +290,29 @@ pub struct InferenceProvider {
 }
 ```
 Created via `from_account_config()` which looks up the provider slug in the catalog and dispatches to the appropriate client constructor by protocol type.
+
+**3. Provider Catalog (`providers/catalog.rs`):**
+```rust
+pub enum ProviderProtocol {
+    OpenAiCompatible,
+    AnthropicMessages,
+    GoogleGenerativeAi,
+    Mistral,
+}
+```
+
+**`StreamEvent`** (`providers/mod.rs`) replaces the old `(CompletionChunkKind, String)` callback tuple:
+```rust
+pub enum StreamEvent {
+    Answer(String),
+    Reasoning(String),
+    ToolCallArg { index: u32, call_id: String, tool_name: String, delta: String },
+}
+```
+Each variant carries its data inline so the streaming callback is self-describing and extensible.
+`emit_non_streaming_events()` in `providers/shared.rs` converts a `ChatTurnResult` into the
+equivalent sequence of `StreamEvent`s, allowing non-streaming configurations to reuse the
+same event-driven path as streaming ones without duplication across providers.
 
 **3. Provider Catalog (`providers/catalog.rs`):**
 ```rust

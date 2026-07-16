@@ -7,11 +7,12 @@ use tracing::debug;
 
 use serde::{Deserialize, Serialize};
 
-use crate::openai::{
-    ChatAssistantToolUse, ChatRequestMessage, ChatToolCall, ChatToolDefinition, ChatTurnResult,
-    CompletionChunkKind, FinalTextResult,
-};
+use crate::openai::{ChatRequestMessage, ChatToolDefinition};
 use crate::providers::ChatTurnRequest;
+use crate::providers::StreamEvent;
+use crate::providers::types::{
+    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult,
+};
 use tai_proto::TokenUsage;
 
 const DEFAULT_BASE_URL: &str = "https://api.mistral.ai/v1";
@@ -107,11 +108,11 @@ impl ProviderClient for MistralClient {
     fn chat_completion_turn_streaming(
         &self,
         params: ChatTurnRequest<'_>,
-        on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
+        on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
         let model = params.model;
-        let result = self.chat_completion_turn_streaming(params, on_chunk);
+        let result = self.chat_completion_turn_streaming(params, on_event);
         crate::providers::shared::timed_result(api_start, model, "mistral", result)
     }
 
@@ -180,36 +181,16 @@ impl MistralClient {
     pub fn chat_completion_turn_streaming<F>(
         &self,
         params: ChatTurnRequest<'_>,
-        on_chunk: F,
+        mut on_event: F,
     ) -> Result<ChatTurnResult, MistralError>
     where
-        F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+        F: FnMut(StreamEvent) -> io::Result<()>,
     {
         debug!(?params.thinking_effort, "mistral chat_completion_turn_streaming");
         if !self.config.streaming {
-            let mut on_chunk = on_chunk;
             let result = self.chat_completion_turn(params)?;
-            match &result {
-                ChatTurnResult::FinalText(final_text) => {
-                    if !final_text.content.is_empty() {
-                        on_chunk(CompletionChunkKind::Answer, final_text.content.clone())?;
-                    }
-                    if let Some(reasoning) = final_text.reasoning.as_ref().filter(|r| !r.is_empty())
-                    {
-                        on_chunk(CompletionChunkKind::Reasoning, reasoning.clone())?;
-                    }
-                }
-                ChatTurnResult::ToolUse(tool_use) => {
-                    if let Some(ref content) = tool_use.content
-                        && !content.is_empty()
-                    {
-                        on_chunk(CompletionChunkKind::Answer, content.clone())?;
-                    }
-                    if let Some(reasoning) = tool_use.reasoning.as_ref().filter(|r| !r.is_empty()) {
-                        on_chunk(CompletionChunkKind::Reasoning, reasoning.clone())?;
-                    }
-                }
-            }
+            let result =
+                crate::providers::shared::emit_non_streaming_events(result, &mut on_event)?;
             return Ok(result);
         }
 
@@ -223,7 +204,7 @@ impl MistralClient {
             params.thinking_effort,
             params.on_retry,
             params.cancel_rx,
-            on_chunk,
+            on_event,
         )
     }
 }

@@ -597,7 +597,10 @@ pub(crate) type HistoryItem = SharedHistoryItem<Box<RenderedImage>>;
 pub(crate) type StreamingTextItem = StreamingText;
 
 pub(crate) enum UiEvent {
-    Daemon(tai_proto::DaemonMessage),
+    /// Boxed because DaemonMessage (~208 B) dwarfs the 0-sized ReaderClosed
+    /// variant.  Boxing puts the payload on the heap so the enum stays small
+    /// and clippy::large_enum_variant stays quiet.
+    Daemon(Box<tai_proto::DaemonMessage>),
     ReaderClosed,
 }
 
@@ -853,7 +856,7 @@ impl SessionManagerState {
                 status: s.status.clone(),
                 active_tool_groups: s.active_tool_groups.clone(),
                 account_name: s.account_name.clone(),
-                accumulated_usage: s.token_usage.clone(),
+                accumulated_usage: s.token_usage,
                 context_window: s.context_window,
                 last_prompt_tokens: s.last_prompt_tokens,
             }
@@ -1942,7 +1945,7 @@ impl App {
             .iter()
             .find(|s| s.session_id == session_id)
         {
-            self.attached_token_usage = s.token_usage.clone();
+            self.attached_token_usage = s.token_usage;
             self.attached_context_window = s.context_window;
             self.attached_last_prompt_tokens = s.last_prompt_tokens;
             self.attached_account_name = s.account_name.clone();

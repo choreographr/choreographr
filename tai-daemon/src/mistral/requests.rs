@@ -4,9 +4,12 @@ use std::sync::mpsc;
 use serde::Deserialize;
 use tai_proto::ThinkingEffort;
 use tai_proto::TokenUsage;
-use tracing::debug;
+use tracing::{debug, trace};
 
-use crate::openai::{ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind};
+use crate::openai::{ChatRequestMessage, ChatToolDefinition};
+use crate::providers::StreamEvent;
+use crate::providers::shared::MAX_TOOL_CALLS;
+use crate::providers::types::ChatTurnResult;
 use crate::retry;
 
 use super::{
@@ -154,10 +157,10 @@ pub(super) fn chat_completion_request_streaming<F>(
     thinking_effort: ThinkingEffort,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
-    mut on_chunk: F,
+    mut on_event: F,
 ) -> Result<ChatTurnResult, MistralError>
 where
-    F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let url = endpoint_url(&config.base_url, CHAT_COMPLETIONS_PATH)?;
     let retry_cfg = retry::RetryConfig {
@@ -251,22 +254,67 @@ where
                                 && !content.is_empty()
                             {
                                 text_accumulated.push_str(&content);
-                                on_chunk(CompletionChunkKind::Answer, content)?;
+                                on_event(StreamEvent::Answer(content))?;
                             }
                             // Merge tool call deltas by their index field.
                             if let Some(delta_tool_calls) = choice.delta.tool_calls {
                                 for dtc in delta_tool_calls {
-                                    let idx = dtc.index;
+                                    // tx from dtc.index is u64; convert to u32 for the event.
+                                    // u32::MAX would cause a Vec allocation of 4B+ entries below,
+                                    // so reject anything that doesn't fit in u32.
+                                    let safe_index = u32::try_from(dtc.index).map_err(|e| {
+                                        MistralError::Io(io::Error::other(format!(
+                                            "tool call index {} exceeds u32::MAX: {e}",
+                                            dtc.index
+                                        )))
+                                    })?;
+
+                                    // Reject indices beyond the safety limit to prevent
+                                    // an attacker from causing an oversized Vec allocation.
+                                    let acc_idx = safe_index as usize;
+                                    if acc_idx >= MAX_TOOL_CALLS {
+                                        return Err(MistralError::Io(io::Error::other(format!(
+                                            "tool call index {acc_idx} exceeds maximum ({MAX_TOOL_CALLS})"
+                                        ))));
+                                    }
+
+                                    // Move fields out upfront so we extract values
+                                    // once for both the event and the accumulator.
+                                    let dtc_id = dtc.id;
+                                    let dtc_function = dtc.function;
+
+                                    let call_id = dtc_id.clone().unwrap_or_default();
+                                    let tool_name = dtc_function
+                                        .as_ref()
+                                        .and_then(|f| f.name.clone())
+                                        .unwrap_or_default();
+                                    let args_delta = dtc_function
+                                        .as_ref()
+                                        .and_then(|f| f.arguments.clone())
+                                        .unwrap_or_default();
+
+                                    trace!(
+                                        index = safe_index,
+                                        delta_len = args_delta.len(),
+                                        "mistral: tool call arg delta",
+                                    );
+                                    on_event(StreamEvent::ToolCallArg {
+                                        index: safe_index,
+                                        call_id,
+                                        tool_name,
+                                        delta: args_delta,
+                                    })?;
+
                                     // Ensure the accumulator vector is large enough.
-                                    while tool_calls_accumulated.len() <= idx as usize {
+                                    while tool_calls_accumulated.len() <= acc_idx {
                                         tool_calls_accumulated
                                             .push(super::StreamToolCallDelta::default());
                                     }
-                                    let entry = &mut tool_calls_accumulated[idx as usize];
-                                    if let Some(id) = dtc.id {
-                                        entry.id = Some(id);
+                                    let entry = &mut tool_calls_accumulated[acc_idx];
+                                    if let Some(id_val) = dtc_id {
+                                        entry.id = Some(id_val);
                                     }
-                                    if let Some(func) = dtc.function {
+                                    if let Some(func) = dtc_function {
                                         let f = entry.function.get_or_insert_default();
                                         if let Some(name) = func.name {
                                             f.name = Some(name);
@@ -285,7 +333,7 @@ where
                             if let Some(finish_reason) = choice._finish_reason
                                 && finish_reason == "tool_calls"
                             {
-                                let calls: Vec<crate::openai::ChatToolCall> =
+                                let calls: Vec<crate::providers::types::ChatToolCall> =
                                     tool_calls_accumulated
                                         .iter()
                                         .filter_map(|tc| {
@@ -297,7 +345,7 @@ where
                                                 .as_ref()
                                                 .cloned()
                                                 .unwrap_or_default();
-                                            Some(crate::openai::ChatToolCall {
+                                            Some(crate::providers::types::ChatToolCall {
                                                 id: id.clone(),
                                                 name: name.clone(),
                                                 arguments_json: args,
@@ -307,7 +355,7 @@ where
                                         .collect();
                                 if !calls.is_empty() {
                                     return Ok(ChatTurnResult::ToolUse(
-                                        crate::openai::ChatAssistantToolUse {
+                                        crate::providers::types::ChatAssistantToolUse {
                                             content: if text_accumulated.is_empty() {
                                                 None
                                             } else {
@@ -315,7 +363,7 @@ where
                                             },
                                             tool_calls: calls,
                                             reasoning: None,
-                                            usage: stream_usage.clone(),
+                                            usage: stream_usage,
                                             response_id: None,
                                         },
                                     ));
@@ -341,14 +389,14 @@ where
     // This handles edge cases where the finish_reason is in a different
     // chunk or the API omits it.
     if !tool_calls_accumulated.is_empty() {
-        let calls: Vec<crate::openai::ChatToolCall> = tool_calls_accumulated
+        let calls: Vec<crate::providers::types::ChatToolCall> = tool_calls_accumulated
             .iter()
             .filter_map(|tc| {
                 let id = tc.id.as_ref()?;
                 let func = tc.function.as_ref()?;
                 let name = func.name.as_ref()?;
                 let args = func.arguments.as_ref().cloned().unwrap_or_default();
-                Some(crate::openai::ChatToolCall {
+                Some(crate::providers::types::ChatToolCall {
                     id: id.clone(),
                     name: name.clone(),
                     arguments_json: args,
@@ -358,7 +406,7 @@ where
             .collect();
         if !calls.is_empty() {
             return Ok(ChatTurnResult::ToolUse(
-                crate::openai::ChatAssistantToolUse {
+                crate::providers::types::ChatAssistantToolUse {
                     content: if text_accumulated.is_empty() {
                         None
                     } else {
@@ -366,7 +414,7 @@ where
                     },
                     tool_calls: calls,
                     reasoning: None,
-                    usage: stream_usage.clone(),
+                    usage: stream_usage,
                     response_id: None,
                 },
             ));
@@ -377,12 +425,14 @@ where
         return Err(MistralError::EmptyResponse);
     }
 
-    Ok(ChatTurnResult::FinalText(crate::openai::FinalTextResult {
-        content: text_accumulated,
-        reasoning: None,
-        usage: stream_usage,
-        response_id: None,
-    }))
+    Ok(ChatTurnResult::FinalText(
+        crate::providers::types::FinalTextResult {
+            content: text_accumulated,
+            reasoning: None,
+            usage: stream_usage,
+            response_id: None,
+        },
+    ))
 }
 
 /// Map an HTTP status code to a MistralError variant.

@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use tai_proto::{ThinkingEffort, TokenUsage};
-use tracing::debug;
+use tracing::{debug, trace};
 
-use crate::openai::{
-    ChatAssistantToolUse, ChatRequestMessage, ChatToolCall, ChatToolDefinition, ChatTurnResult,
-    CompletionChunkKind, FinalTextResult,
+use crate::openai::{ChatRequestMessage, ChatToolDefinition};
+use crate::providers::StreamEvent;
+use crate::providers::shared::MAX_TOOL_CALLS;
+use crate::providers::types::{
+    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult,
 };
 use crate::retry;
 
@@ -150,10 +152,10 @@ pub(super) fn messages_request_streaming<F>(
     thinking_effort: ThinkingEffort,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
-    mut on_chunk: F,
+    mut on_event: F,
 ) -> Result<ChatTurnResult, AnthropicError>
 where
-    F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let url = endpoint_url(&config.base_url, MESSAGES_PATH)?;
     let retry_cfg = retry::RetryConfig {
@@ -204,7 +206,7 @@ where
 
     // Parse the SSE stream using an Anthropic-specific reader.
     let mut reader = AnthropicSseReader::from_reader(response.into_body().into_reader());
-    let mut saw_text = false;
+    let mut has_any_output = false;
     let mut full_text = String::new();
     let mut full_reasoning = String::new();
     // Accumulates tool call fields across content_block_delta chunks keyed
@@ -222,15 +224,19 @@ where
                 match start.content_block {
                     StreamContentBlock::Text { text } => {
                         if !text.is_empty() {
-                            saw_text = true;
+                            has_any_output = true;
                             full_text.push_str(&text);
-                            on_chunk(CompletionChunkKind::Answer, text)?;
+                            on_event(StreamEvent::Answer(text))?;
                         }
                     }
                     StreamContentBlock::ToolUse { id, name, input } => {
-                        saw_text = true;
-                        // Ensure the vector is large enough.
+                        has_any_output = true;
                         let idx = start.index as usize;
+                        if idx >= MAX_TOOL_CALLS {
+                            return Err(AnthropicError::Io(io::Error::other(format!(
+                                "tool call index {idx} exceeds maximum ({MAX_TOOL_CALLS})"
+                            ))));
+                        }
                         while pending_tool_calls.len() <= idx {
                             pending_tool_calls.push(StreamToolCall {
                                 id: String::new(),
@@ -238,15 +244,29 @@ where
                                 arguments: String::new(),
                             });
                         }
-                        pending_tool_calls[idx].id = id;
-                        pending_tool_calls[idx].name = name;
-                        pending_tool_calls[idx].arguments = input.to_string();
+                        let input_str = input.to_string();
+                        pending_tool_calls[idx].id = id.clone();
+                        pending_tool_calls[idx].name = name.clone();
+                        pending_tool_calls[idx].arguments = input_str.clone();
+                        // Emit initial tool call args
+                        trace!(
+                            index = start.index,
+                            tool_name = %name,
+                            input_len = input_str.len(),
+                            "anthropic: tool call content block start",
+                        );
+                        on_event(StreamEvent::ToolCallArg {
+                            index: start.index,
+                            call_id: id,
+                            tool_name: name,
+                            delta: input_str,
+                        })?;
                     }
                     StreamContentBlock::Thinking { thinking } => {
                         if !thinking.is_empty() {
-                            saw_text = true;
+                            has_any_output = true;
                             full_reasoning.push_str(&thinking);
-                            on_chunk(CompletionChunkKind::Reasoning, thinking)?;
+                            on_event(StreamEvent::Reasoning(thinking))?;
                         }
                     }
                     StreamContentBlock::RedactedThinking { .. } => {}
@@ -258,24 +278,44 @@ where
                 match delta.delta {
                     StreamDelta::TextDelta { text } => {
                         if !text.is_empty() {
-                            saw_text = true;
+                            has_any_output = true;
                             full_text.push_str(&text);
-                            on_chunk(CompletionChunkKind::Answer, text)?;
+                            on_event(StreamEvent::Answer(text))?;
                         }
                     }
                     StreamDelta::InputJsonDelta { partial_json } => {
-                        saw_text = true;
+                        has_any_output = true;
                         let idx = delta.index as usize;
+                        if idx >= MAX_TOOL_CALLS {
+                            return Err(AnthropicError::Io(io::Error::other(format!(
+                                "tool call index {idx} exceeds maximum ({MAX_TOOL_CALLS})"
+                            ))));
+                        }
                         while pending_tool_calls.len() <= idx {
                             pending_tool_calls.push(StreamToolCall::default());
                         }
                         pending_tool_calls[idx].arguments.push_str(&partial_json);
+                        // Emit tool call arg delta
+                        let known_id = pending_tool_calls[idx].id.clone();
+                        let known_name = pending_tool_calls[idx].name.clone();
+                        trace!(
+                            index = delta.index,
+                            call_id = %known_id,
+                            partial_len = partial_json.len(),
+                            "anthropic: tool call arg delta",
+                        );
+                        on_event(StreamEvent::ToolCallArg {
+                            index: delta.index,
+                            call_id: known_id,
+                            tool_name: known_name,
+                            delta: partial_json,
+                        })?;
                     }
                     StreamDelta::ThinkingDelta { thinking } => {
                         if !thinking.is_empty() {
-                            saw_text = true;
+                            has_any_output = true;
                             full_reasoning.push_str(&thinking);
-                            on_chunk(CompletionChunkKind::Reasoning, thinking)?;
+                            on_event(StreamEvent::Reasoning(thinking))?;
                         }
                     }
                 }
@@ -320,7 +360,7 @@ where
         _ => None,
     };
 
-    if !saw_text {
+    if !has_any_output {
         return Err(AnthropicError::EmptyResponse);
     }
 

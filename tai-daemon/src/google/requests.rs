@@ -4,9 +4,11 @@ use std::time::Duration;
 
 use tai_proto::ThinkingEffort;
 use tai_proto::TokenUsage;
-use tracing::debug;
+use tracing::{debug, trace};
 
-use crate::openai::{ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind};
+use crate::openai::{ChatRequestMessage, ChatToolDefinition};
+use crate::providers::StreamEvent;
+use crate::providers::types::ChatTurnResult;
 use crate::retry;
 
 use super::{
@@ -14,6 +16,8 @@ use super::{
     build_message_payloads, build_tool_payloads, model_url, response_to_turn_result,
     thinking_config_payload,
 };
+
+use crate::providers::shared::MAX_TOOL_CALLS;
 
 /// Endpoint action for non-streaming content generation.
 const GENERATE_CONTENT: &str = "generateContent";
@@ -150,10 +154,10 @@ pub(super) fn generate_content_request_streaming<F>(
     thinking_effort: ThinkingEffort,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
-    mut on_chunk: F,
+    mut on_event: F,
 ) -> Result<ChatTurnResult, GoogleError>
 where
-    F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let url = model_url(&config.base_url, model, STREAM_GENERATE_CONTENT)?;
     let retry_cfg = retry::RetryConfig {
@@ -206,10 +210,11 @@ where
     }
 
     let mut reader = GeminiSseReader::from_reader(response.into_body().into_reader());
-    let mut has_content = false;
+    let mut has_any_output = false;
     let mut full_text = String::new();
     let mut full_reasoning = String::new();
     let mut pending_tool_calls: Vec<super::ChatToolCall> = Vec::new();
+    let mut next_tool_index: u32 = 0;
     let mut stream_usage: Option<TokenUsage> = None;
 
     while let Some(data) = reader.next_event()? {
@@ -237,34 +242,56 @@ where
             match part {
                 super::ResponsePart::Text { text } => {
                     if !text.is_empty() {
-                        has_content = true;
+                        has_any_output = true;
                         full_text.push_str(&text);
-                        on_chunk(CompletionChunkKind::Answer, text)?;
+                        on_event(StreamEvent::Answer(text))?;
                     }
                 }
                 super::ResponsePart::FunctionCall { function_call } => {
-                    has_content = true;
+                    has_any_output = true;
+                    if pending_tool_calls.len() >= MAX_TOOL_CALLS {
+                        return Err(GoogleError::Io(io::Error::other(format!(
+                            "too many tool calls (max {MAX_TOOL_CALLS})"
+                        ))));
+                    }
+                    let idx = next_tool_index;
+                    next_tool_index += 1;
                     let id = format!("fc_{}", function_call.name);
                     let args_json = function_call.args.to_string();
+                    let name = function_call.name;
+                    trace!(
+                        tool_name = %name,
+                        args_len = args_json.len(),
+                        "google: function call",
+                    );
+                    // Emit the event first with cloned data, then move the
+                    // originals into the accumulator so the accumulator avoids
+                    // an extra allocation per field.
+                    on_event(StreamEvent::ToolCallArg {
+                        index: idx,
+                        call_id: id.clone(),
+                        tool_name: name.clone(),
+                        delta: args_json.clone(),
+                    })?;
                     pending_tool_calls.push(super::ChatToolCall {
                         id,
-                        name: function_call.name,
+                        name,
                         arguments_json: args_json,
                         caller: None,
                     });
                 }
                 super::ResponsePart::Thinking { thinking, .. } => {
                     if !thinking.is_empty() {
-                        has_content = true;
+                        has_any_output = true;
                         full_reasoning.push_str(&thinking);
-                        on_chunk(CompletionChunkKind::Reasoning, thinking)?;
+                        on_event(StreamEvent::Reasoning(thinking))?;
                     }
                 }
             }
         }
     }
 
-    if !has_content {
+    if !has_any_output {
         return Err(GoogleError::EmptyResponse);
     }
 
@@ -282,7 +309,7 @@ where
                 } else {
                     Some(full_reasoning)
                 },
-                usage: stream_usage.clone(),
+                usage: stream_usage,
                 response_id: None,
             },
         ));

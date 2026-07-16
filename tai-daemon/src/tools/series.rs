@@ -1,5 +1,5 @@
 use super::{Tool, ToolRegistry, context::ToolContext, error::ToolError};
-use crate::openai::ChatToolCall;
+use crate::providers::types::ChatToolCall;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;

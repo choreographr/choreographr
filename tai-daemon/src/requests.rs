@@ -1,11 +1,10 @@
 use crate::context;
 use crate::db::{SessionRecord, write_message_retry, write_session_retry};
-use crate::openai::{
-    AssistantToolCall, AssistantToolFunction, ChatAssistantToolUse, ChatRequestMessage,
-    ChatToolCall, ChatTurnResult, CompletionChunkKind,
-};
+use crate::openai::{AssistantToolCall, AssistantToolFunction, ChatRequestMessage};
+use crate::providers::shared::MAX_TOOL_CALLS;
+use crate::providers::types::{ChatAssistantToolUse, ChatToolCall, ChatTurnResult};
 use crate::providers::{
-    ChatTurnRequest, InferenceProvider, ReasoningSupport, ToolResultItem,
+    ChatTurnRequest, InferenceProvider, ReasoningSupport, StreamEvent, ToolResultItem,
     effective_reasoning_support, lookup_provider,
 };
 use crate::sessions::{RequestContext, SessionCommand, SessionMetadata, SessionState};
@@ -25,7 +24,7 @@ use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream,
     SessionMessage, SessionMessageKind, SessionStatus, ThinkingEffort, TokenUsage,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Persist a `PreparedImage` to the database as a `DisplayedImage` message,
 /// push it into the session's in-memory message list, and broadcast it to
@@ -399,6 +398,7 @@ pub(crate) fn run_agent_loop(
             }
         }));
 
+        let mut tool_call_seen: Vec<bool> = vec![false; MAX_TOOL_CALLS];
         match client.chat_completion_turn_streaming(
             ChatTurnRequest {
                 model,
@@ -411,18 +411,89 @@ pub(crate) fn run_agent_loop(
                 tool_results: &tool_results,
                 programmatic_tool_calling: client.supports_programmatic_tool_calling(model),
             },
-            &mut |kind, text| {
-                let stream = match kind {
-                    CompletionChunkKind::Answer => OutputStream::Answer,
-                    CompletionChunkKind::Reasoning => OutputStream::Reasoning,
-                };
-                let _ = ctx
-                    .cmd_tx
-                    .send(SessionCommand::Broadcast(DaemonMessage::OutputChunk {
-                        request_id,
-                        stream,
-                        data: text.into_bytes(),
-                    }));
+            &mut |event| {
+                match event {
+                    StreamEvent::Answer(text) => {
+                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                            DaemonMessage::OutputChunk {
+                                request_id,
+                                stream: OutputStream::Answer,
+                                data: text.into_bytes(),
+                            },
+                        ));
+                    }
+                    StreamEvent::Reasoning(text) => {
+                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                            DaemonMessage::OutputChunk {
+                                request_id,
+                                stream: OutputStream::Reasoning,
+                                data: text.into_bytes(),
+                            },
+                        ));
+                    }
+                    // Track which tool call indices have already been announced
+                    // via ToolCallGenerationStarted, so subsequent deltas are
+                    // emitted as ToolCallArgDelta instead.
+                    StreamEvent::ToolCallArg {
+                        index,
+                        call_id,
+                        tool_name,
+                        delta,
+                    } => {
+                        let call_id_opt = if call_id.is_empty() {
+                            None
+                        } else {
+                            Some(call_id)
+                        };
+                        let seen_idx = index as usize;
+                        if seen_idx >= tool_call_seen.len() {
+                            warn!(
+                                request_id, index, max = MAX_TOOL_CALLS,
+                                "tool call index out of bounds, dropping",
+                            );
+                            return Ok(());
+                        }
+                        // Vec<bool> returns false if already true.
+                        if !std::mem::replace(&mut tool_call_seen[seen_idx], true) {
+                            trace!(
+                                request_id,
+                                index,
+                                ?tool_name,
+                                delta_len = delta.len(),
+                                "tool call generation started",
+                            );
+                            let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                                DaemonMessage::ToolCallGenerationStarted {
+                                    request_id,
+                                    call_id: call_id_opt,
+                                    tool_name: if tool_name.is_empty() {
+                                        None
+                                    } else {
+                                        Some(tool_name)
+                                    },
+                                    index,
+                                    arguments_delta: delta,
+                                },
+                            ));
+                        } else {
+                            trace!(
+                                request_id,
+                                index,
+                                call_id = call_id_opt.as_deref().unwrap_or("?"),
+                                delta_len = delta.len(),
+                                "tool call arg delta",
+                            );
+                            let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                                DaemonMessage::ToolCallArgDelta {
+                                    request_id,
+                                    call_id: call_id_opt,
+                                    index,
+                                    arguments_delta: delta,
+                                },
+                            ));
+                        }
+                    }
+                }
                 Ok(())
             },
         ) {
@@ -450,7 +521,7 @@ pub(crate) fn run_agent_loop(
                 return Ok(false);
             }
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
-                let token_usage = tool_use.usage.clone();
+                let token_usage = tool_use.usage;
                 accumulate_token_usage(session, &token_usage, turn, ctx);
                 persist_assistant_tool_use_sync(session, &tool_use, token_usage, ctx);
                 // Store response_id for chaining tool results back to this turn
@@ -748,7 +819,7 @@ fn finish_tool_call(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_tool_with_timeout(
-    tool_call: &crate::openai::ChatToolCall,
+    tool_call: &crate::providers::types::ChatToolCall,
     x_credentials: Option<&ServiceCredential>,
     working_dir: Option<&Path>,
     timeout_dur: Duration,
@@ -1364,7 +1435,7 @@ mod tests {
         registry.register(tool);
         let registry = registry.build();
 
-        let tool_call = crate::openai::ChatToolCall {
+        let tool_call = crate::providers::types::ChatToolCall {
             id: "call_test".into(),
             name: tool_name.into(),
             arguments_json: tool_args.into(),
@@ -1777,7 +1848,7 @@ mod tests {
 
         let mut session = SessionState::empty();
 
-        let tool_call = crate::openai::ChatToolCall {
+        let tool_call = crate::providers::types::ChatToolCall {
             id: "call_set_wd".into(),
             name: "set_working_dir".into(),
             arguments_json: serde_json::json!({"path": dir.path().display().to_string()})
@@ -1837,7 +1908,7 @@ mod tests {
 
         let mut session = SessionState::empty();
 
-        let tool_call = crate::openai::ChatToolCall {
+        let tool_call = crate::providers::types::ChatToolCall {
             id: "call_set_wd_bad".into(),
             name: "set_working_dir".into(),
             arguments_json: r#"{"path": "/nonexistent_path_abcxyz_12345"}"#.to_string(),
@@ -1891,7 +1962,7 @@ mod tests {
 
         let mut session = SessionState::empty();
 
-        let tool_call = crate::openai::ChatToolCall {
+        let tool_call = crate::providers::types::ChatToolCall {
             id: "call_set_wd_rel".into(),
             name: "set_working_dir".into(),
             arguments_json: r#"{"path": "subdir"}"#.to_string(),

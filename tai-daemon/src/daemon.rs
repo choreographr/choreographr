@@ -468,7 +468,7 @@ impl DaemonState {
                 status: meta.status.clone(),
                 active_tool_groups: meta.active_tool_groups.clone(),
                 account_name: meta.account_name.clone(),
-                token_usage: Some(meta.accumulated_usage.clone()),
+                token_usage: Some(meta.accumulated_usage),
                 context_window: meta.context_window,
                 last_prompt_tokens: meta.last_prompt_tokens,
             })
@@ -500,7 +500,7 @@ impl DaemonState {
                 status: meta.status.clone(),
                 active_tool_groups: meta.active_tool_groups.clone(),
                 account_name: meta.account_name.clone(),
-                token_usage: Some(meta.accumulated_usage.clone()),
+                token_usage: Some(meta.accumulated_usage),
                 context_window: meta.context_window,
                 last_prompt_tokens: meta.last_prompt_tokens,
             });

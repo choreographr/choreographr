@@ -2,9 +2,9 @@ use std::fmt::Debug;
 use std::io;
 use std::sync::mpsc;
 
-use crate::openai::{
-    CallerInfo, ChatRequestMessage, ChatToolDefinition, ChatTurnResult, CompletionChunkKind,
-};
+use crate::openai::{ChatRequestMessage, ChatToolDefinition};
+use crate::providers::StreamEvent;
+use crate::providers::types::{CallerInfo, ChatTurnResult};
 use crate::retry::RetryCallback;
 use tai_proto::{InferenceError, ThinkingEffort};
 
@@ -46,7 +46,7 @@ pub trait ProviderClient: Debug + Send + Sync {
     fn chat_completion_turn_streaming(
         &self,
         params: ChatTurnRequest<'_>,
-        on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
+        on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError>;
 
     fn list_models(&self) -> Result<Vec<String>, InferenceError>;

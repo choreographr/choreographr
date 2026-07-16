@@ -243,7 +243,7 @@ impl From<&SessionConfig> for SessionMetadata {
             status: config.status.clone(),
             active_tool_groups: config.active_tool_groups.iter().cloned().collect(),
             account_name: config.account_name.clone(),
-            accumulated_usage: config.accumulated_usage.clone(),
+            accumulated_usage: config.accumulated_usage,
             context_window: config.context_window,
             last_prompt_tokens: config.last_prompt_tokens,
         }
@@ -435,7 +435,7 @@ pub fn session_main(
         account_name,
         accumulated_usage: init_record
             .as_ref()
-            .map(|r| r.accumulated_usage.clone())
+            .map(|r| r.accumulated_usage)
             .unwrap_or_default(),
         context_window: init_record.as_ref().and_then(|r| r.context_window),
         last_prompt_tokens: init_record.as_ref().and_then(|r| r.last_prompt_tokens),
@@ -848,7 +848,7 @@ fn handle_attach(
         max_turns: state.config.max_turns,
         messages: state.messages.clone(),
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
-        token_usage: Some(state.config.accumulated_usage.clone()),
+        token_usage: Some(state.config.accumulated_usage),
         context_window: state.config.context_window,
         last_prompt_tokens: state.config.last_prompt_tokens,
         status: state.config.status.clone(),
@@ -895,7 +895,7 @@ fn handle_get_summary(
         status: state.config.status.clone(),
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
         account_name: state.config.account_name.clone(),
-        token_usage: Some(state.config.accumulated_usage.clone()),
+        token_usage: Some(state.config.accumulated_usage),
         context_window: state.config.context_window,
         last_prompt_tokens: state.config.last_prompt_tokens,
     });
@@ -1156,7 +1156,7 @@ fn run_request_worker(
                 .cmd_tx
                 .send(SessionCommand::Broadcast(DaemonMessage::Done {
                     request_id,
-                    token_usage: Some(usage.clone()),
+                    token_usage: Some(*usage),
                     last_prompt_tokens: session.config.last_prompt_tokens,
                 }));
         }

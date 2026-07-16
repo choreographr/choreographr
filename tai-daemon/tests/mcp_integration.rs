@@ -73,7 +73,7 @@ fn mcp_server_everything_tools_are_discovered_and_callable() {
     );
 
     // ── 6. Call the echo tool through the registry ──
-    let tool_call = tai_daemon::openai::ChatToolCall {
+    let tool_call = tai_daemon::providers::ChatToolCall {
         id: "call_1".to_string(),
         name: echo_name.to_string(),
         arguments_json: r#"{"message": "hello from tai"}"#.to_string(),

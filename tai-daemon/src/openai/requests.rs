@@ -1,15 +1,19 @@
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use super::ServiceConfig;
 use super::retry;
 use super::{
-    ChatAssistantToolUse, ChatCompletionsRequest, ChatCompletionsResponse,
-    ChatCompletionsStreamOptions, ChatCompletionsStreamResponse, ChatRequestMessage, ChatToolCall,
-    ChatToolDefinition, ChatTurnResult, CompletionChunkKind, FinalTextResult, ModelListResponse,
+    ChatCompletionsRequest, ChatCompletionsResponse, ChatCompletionsStreamOptions,
+    ChatCompletionsStreamResponse, ChatRequestMessage, ChatToolDefinition, ModelListResponse,
     OpenAiClient, RequestFormat, ResponseOutputItem, ResponsesInputItem, ResponsesRequest,
     ResponsesResponse, ResponsesStreamEvent, ResponsesTool, SseReader, StreamToolCallDelta,
     endpoint_url, messages_to_responses_input, parse_responses_stream_event,
     reasoning_effort_api_value,
+};
+use crate::providers::StreamEvent;
+use crate::providers::shared::MAX_TOOL_CALLS;
+use crate::providers::types::{
+    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult,
 };
 use crate::providers::{ChatTurnRequest, ToolResultItem};
 use std::collections::HashMap;
@@ -47,15 +51,15 @@ impl OpenAiClient {
         &self,
         model: &str,
         prompt: &str,
-        mut on_chunk: F,
+        mut on_event: F,
     ) -> Result<(), super::OpenAiError>
     where
-        F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+        F: FnMut(StreamEvent) -> io::Result<()>,
     {
         if !self.config.streaming {
             let content = self.completion(model, prompt)?;
             if !content.is_empty() {
-                on_chunk(CompletionChunkKind::Answer, content)?;
+                on_event(StreamEvent::Answer(content))?;
             }
             return Ok(());
         }
@@ -67,7 +71,7 @@ impl OpenAiClient {
                 &self.api_key,
                 model,
                 prompt,
-                &mut on_chunk,
+                &mut on_event,
             ),
             RequestFormat::ChatCompletions => chat_completions_request_streaming(
                 &self.http,
@@ -76,7 +80,7 @@ impl OpenAiClient {
                 model,
                 prompt,
                 None, // No reasoning_effort for simple completion
-                &mut on_chunk,
+                &mut on_event,
             ),
         }
     }
@@ -117,10 +121,10 @@ impl OpenAiClient {
     pub fn chat_completion_turn_streaming<F>(
         &self,
         params: ChatTurnRequest<'_>,
-        on_chunk: F,
+        mut on_event: F,
     ) -> Result<ChatTurnResult, super::OpenAiError>
     where
-        F: FnMut(super::CompletionChunkKind, String) -> io::Result<()>,
+        F: FnMut(StreamEvent) -> io::Result<()>,
     {
         let reasoning_effort = reasoning_effort_api_value(params.thinking_effort);
         debug!(
@@ -129,36 +133,9 @@ impl OpenAiClient {
             "chat_completion_turn_streaming"
         );
         if !self.config.streaming {
-            // Fall back to non-streaming, deliver the full response as a single
-            // chunk through the callback so the caller's broadcasting path
-            // stays uniform regardless of the streaming setting.
-            let mut on_chunk = on_chunk;
             let result = self.chat_completion_turn(params)?;
-            match &result {
-                ChatTurnResult::FinalText(final_text) => {
-                    if !final_text.content.is_empty() {
-                        on_chunk(
-                            super::CompletionChunkKind::Answer,
-                            final_text.content.clone(),
-                        )?;
-                    }
-                    if let Some(reasoning) = final_text.reasoning.as_ref().filter(|r| !r.is_empty())
-                    {
-                        on_chunk(super::CompletionChunkKind::Reasoning, reasoning.clone())?;
-                    }
-                }
-                ChatTurnResult::ToolUse(tool_use) => {
-                    if let Some(ref content) = tool_use.content
-                        && !content.is_empty()
-                    {
-                        on_chunk(super::CompletionChunkKind::Answer, content.clone())?;
-                    }
-                    // Send reasoning through whichever field the model populated.
-                    if let Some(reasoning) = tool_use.reasoning.as_ref().filter(|r| !r.is_empty()) {
-                        on_chunk(super::CompletionChunkKind::Reasoning, reasoning.clone())?;
-                    }
-                }
-            }
+            let result =
+                crate::providers::shared::emit_non_streaming_events(result, &mut on_event)?;
             return Ok(result);
         }
 
@@ -176,7 +153,7 @@ impl OpenAiClient {
                 params.on_retry,
                 params.cancel_rx,
                 params.programmatic_tool_calling,
-                on_chunk,
+                on_event,
             ),
             RequestFormat::ChatCompletions => chat_completions_request_streaming_with_tools(
                 &self.http,
@@ -188,7 +165,7 @@ impl OpenAiClient {
                 reasoning_effort,
                 params.on_retry,
                 params.cancel_rx,
-                on_chunk,
+                on_event,
             ),
         }
     }
@@ -388,10 +365,10 @@ fn chat_completions_request_streaming<F>(
     model: &str,
     prompt: &str,
     reasoning_effort: Option<&'static str>,
-    on_chunk: &mut F,
+    on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
-    F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
@@ -417,7 +394,7 @@ where
     .map_err(io::Error::other)?;
     let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
-    let mut saw_text = false;
+    let mut has_any_output = false;
     while let Some(data) = reader.next_event()? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
@@ -427,8 +404,8 @@ where
             };
 
             if let Some(content) = delta.content.filter(|content| !content.is_empty()) {
-                saw_text = true;
-                on_chunk(CompletionChunkKind::Answer, content)?;
+                has_any_output = true;
+                on_event(StreamEvent::Answer(content))?;
             }
             for reasoning in [
                 delta.reasoning_content,
@@ -439,13 +416,13 @@ where
             .flatten()
             .filter(|content| !content.is_empty())
             {
-                saw_text = true;
-                on_chunk(CompletionChunkKind::Reasoning, reasoning)?;
+                has_any_output = true;
+                on_event(StreamEvent::Reasoning(reasoning))?;
             }
         }
     }
 
-    if !saw_text {
+    if !has_any_output {
         return Err(super::OpenAiError::EmptyResponse);
     }
 
@@ -458,10 +435,10 @@ fn responses_request_streaming<F>(
     api_key: &str,
     model: &str,
     prompt: &str,
-    on_chunk: &mut F,
+    on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
-    F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let (url, body) = build_simple_responses_body(config, model, prompt, true)?;
     let retry = retry::retry_config_from_config(config);
@@ -473,7 +450,7 @@ where
         match event {
             Some(ResponsesStreamEvent::TextDelta(text)) => {
                 has_any_output = true;
-                on_chunk(CompletionChunkKind::Answer, text)?;
+                on_event(StreamEvent::Answer(text))?;
             }
             Some(ResponsesStreamEvent::TextDone) => {
                 // Text output is complete; continue waiting for completion event.
@@ -829,10 +806,28 @@ struct AccumulatingToolCall {
 
 /// Accumulator for Responses API tool call arguments keyed by call_id.
 /// Used in `responses_request_streaming_with_tools` to merge delta chunks.
-#[derive(Debug, Default)]
 struct AccCall {
     name: Option<String>,
     arguments: String,
+    /// True once at least one FunctionCallArgumentsDelta has been received.
+    /// When false, the subsequent FunctionCallArgumentsDone event emits
+    /// ToolCallArg (which the consumer treats as ToolCallGenerationStarted).
+    deltas_sent: bool,
+    /// Monotonically increasing index assigned to this tool call, used as
+    /// the ToolCallArg index (Responses API does not provide server-side
+    /// indices like Chat Completions does).
+    index: u32,
+}
+
+impl AccCall {
+    fn new(index: u32) -> Self {
+        Self {
+            name: None,
+            arguments: String::new(),
+            deltas_sent: false,
+            index,
+        }
+    }
 }
 
 /// Accumulate tool call deltas from streaming SSE chunks into ordered tool
@@ -886,10 +881,10 @@ fn chat_completions_request_streaming_with_tools<F>(
     reasoning_effort: Option<&'static str>,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
-    mut on_chunk: F,
+    mut on_event: F,
 ) -> Result<ChatTurnResult, super::OpenAiError>
 where
-    F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
@@ -960,7 +955,7 @@ where
             if let Some(content) = delta.content.filter(|c| !c.is_empty()) {
                 has_any_output = true;
                 full_content.push_str(&content);
-                on_chunk(CompletionChunkKind::Answer, content)?;
+                on_event(StreamEvent::Answer(content))?;
             }
 
             // Reasoning chunks — use references to avoid partial moves.
@@ -975,7 +970,7 @@ where
             {
                 has_any_output = true;
                 full_reasoning.push_str(reasoning);
-                on_chunk(CompletionChunkKind::Reasoning, reasoning.clone())?;
+                on_event(StreamEvent::Reasoning(reasoning.clone()))?;
             }
 
             // Collect raw tool call deltas — the shared accumulator
@@ -983,7 +978,42 @@ where
             // and produce sorted ChatToolCall output after the stream ends.
             if let Some(ref tcs) = delta.tool_calls {
                 has_any_output = true;
-                raw_tool_call_deltas.extend(tcs.iter().cloned());
+                for tc in tcs.iter() {
+                    if raw_tool_call_deltas.len() >= MAX_TOOL_CALLS {
+                        return Err(super::OpenAiError::Io(io::Error::other(format!(
+                            "too many tool call deltas (max {MAX_TOOL_CALLS})"
+                        ))));
+                    }
+                    if (tc.index as usize) >= MAX_TOOL_CALLS {
+                        return Err(super::OpenAiError::Io(io::Error::other(format!(
+                            "tool call index {} out of bounds (max {})",
+                            tc.index, MAX_TOOL_CALLS - 1,
+                        ))));
+                    }
+                    let call_id = tc.id.clone().unwrap_or_default();
+                    let tool_name = tc
+                        .function
+                        .as_ref()
+                        .and_then(|f| f.name.clone())
+                        .unwrap_or_default();
+                    let args_delta = tc
+                        .function
+                        .as_ref()
+                        .and_then(|f| f.arguments.clone())
+                        .unwrap_or_default();
+                    trace!(
+                        index = tc.index,
+                        delta_len = args_delta.len(),
+                        "openai chat: tool call arg delta",
+                    );
+                    on_event(StreamEvent::ToolCallArg {
+                        index: tc.index,
+                        call_id,
+                        tool_name,
+                        delta: args_delta,
+                    })?;
+                    raw_tool_call_deltas.push(tc.clone());
+                }
             }
         }
     }
@@ -1044,10 +1074,10 @@ fn responses_request_streaming_with_tools<F>(
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
     programmatic_tool_calling: bool,
-    mut on_chunk: F,
+    mut on_event: F,
 ) -> Result<ChatTurnResult, super::OpenAiError>
 where
-    F: FnMut(CompletionChunkKind, String) -> io::Result<()>,
+    F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let (url, body) = build_responses_request_body(
         config,
@@ -1079,6 +1109,7 @@ where
     let mut response_id: Option<String> = None;
 
     let mut acc_calls: HashMap<String, AccCall> = HashMap::new();
+    let mut next_tool_index: u32 = 0;
 
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     while let Some(data) = reader.next_event()? {
@@ -1087,7 +1118,7 @@ where
             Some(ResponsesStreamEvent::TextDelta(text)) => {
                 has_any_output = true;
                 full_content.push_str(&text);
-                on_chunk(CompletionChunkKind::Answer, text)?;
+                on_event(StreamEvent::Answer(text))?;
             }
             Some(ResponsesStreamEvent::TextDone) => {
                 // Text output is complete — continue listening for the
@@ -1097,13 +1128,32 @@ where
                 if let Some(text) = extract_reasoning_text(&summary) {
                     has_any_output = true;
                     full_reasoning.push_str(&text);
-                    on_chunk(CompletionChunkKind::Reasoning, text)?;
+                    on_event(StreamEvent::Reasoning(text))?;
                 }
             }
             Some(ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta }) => {
                 has_any_output = true;
-                let entry = acc_calls.entry(call_id).or_default();
+                if acc_calls.len() >= MAX_TOOL_CALLS {
+                    return Err(super::OpenAiError::Io(io::Error::other(format!(
+                        "too many tool calls (max {MAX_TOOL_CALLS})"
+                    ))));
+                }
+                let entry = acc_calls.entry(call_id.clone()).or_insert_with(|| {
+                    let i = next_tool_index;
+                    next_tool_index += 1;
+                    AccCall::new(i)
+                });
                 entry.arguments.push_str(&delta);
+                entry.deltas_sent = true;
+                // Emit ToolCallArg — tool_name unknown until Done event.
+                // The consumer (requests.rs run_agent_loop) tracks per-index
+                // state to emit ToolCallGenerationStarted on first sight.
+                on_event(StreamEvent::ToolCallArg {
+                    index: entry.index,
+                    call_id,
+                    tool_name: String::new(),
+                    delta,
+                })?;
             }
             Some(ResponsesStreamEvent::FunctionCallArgumentsDone {
                 call_id,
@@ -1111,11 +1161,37 @@ where
                 arguments,
             }) => {
                 has_any_output = true;
-                let entry = acc_calls.entry(call_id).or_default();
-                entry.name = Some(name);
-                // The done event carries the full arguments; replace any
-                // partial arguments accumulated from delta events.
-                entry.arguments = arguments;
+                let entry = acc_calls.entry(call_id.clone()).or_insert_with(|| {
+                    let i = next_tool_index;
+                    next_tool_index += 1;
+                    AccCall::new(i)
+                });
+                entry.name = Some(name.clone());
+                // Replace partial arguments with the complete final payload.
+                entry.arguments.clone_from(&arguments);
+                if !entry.deltas_sent {
+                    // No prior delta was streamed — emit the full payload
+                    // so the consumer sees ToolCallGenerationStarted.
+                    trace!(
+                        call_id = %call_id,
+                        tool_name = %name,
+                        args_len = arguments.len(),
+                        "openai responses: function call args done (no prior delta)",
+                    );
+                    on_event(StreamEvent::ToolCallArg {
+                        index: entry.index,
+                        call_id,
+                        tool_name: name,
+                        delta: arguments,
+                    })?;
+                } else {
+                    trace!(
+                        call_id = %call_id,
+                        tool_name = %name,
+                        args_len = arguments.len(),
+                        "openai responses: function call args done (deltas already sent, skipping)",
+                    );
+                }
             }
             Some(ResponsesStreamEvent::ResponseCompleted { id, usage }) => {
                 response_id = id;
@@ -1186,7 +1262,9 @@ where
     }
 
     if !acc_calls.is_empty() {
-        let tool_calls: Vec<ChatToolCall> = acc_calls
+        let mut sorted: Vec<(String, AccCall)> = acc_calls.into_iter().collect();
+        sorted.sort_by_key(|(_, acc)| acc.index);
+        let tool_calls: Vec<ChatToolCall> = sorted
             .into_iter()
             .map(|(call_id, acc)| ChatToolCall {
                 id: call_id,
@@ -1233,7 +1311,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openai::{AllowedCaller, CallerInfo, StreamToolCallFunctionDelta};
+    use crate::openai::{AllowedCaller, StreamToolCallFunctionDelta};
+    use crate::providers::types::CallerInfo;
     use std::time::Duration;
     use tai_proto::ThinkingEffort;
 

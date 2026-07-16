@@ -3,13 +3,14 @@ use std::sync::Arc;
 
 use crate::anthropic::AnthropicClient;
 use crate::mistral::MistralClient;
-use crate::openai::{ChatTurnResult, CompletionChunkKind, OpenAiClient};
+use crate::openai::OpenAiClient;
 use tai_proto::InferenceError;
 
 mod catalog;
 pub(crate) mod context_window;
 pub(crate) mod shared;
 mod traits;
+pub(crate) mod types;
 
 pub use catalog::{
     ModelWindowEntry, PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, ReasoningSupport,
@@ -18,6 +19,7 @@ pub use catalog::{
 };
 pub use context_window::ContextWindowConfig;
 pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
+pub use types::{CallerInfo, ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult};
 
 #[derive(Clone, Debug)]
 pub struct InferenceProvider {
@@ -137,9 +139,9 @@ impl InferenceProvider {
     pub fn chat_completion_turn_streaming(
         &self,
         params: ChatTurnRequest<'_>,
-        on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
+        on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        self.client.chat_completion_turn_streaming(params, on_chunk)
+        self.client.chat_completion_turn_streaming(params, on_event)
     }
 
     /// Return the provider slug (e.g. "openai", "anthropic").
@@ -162,6 +164,26 @@ impl InferenceProvider {
     pub fn supports_programmatic_tool_calling(&self, model: &str) -> bool {
         self.client.supports_programmatic_tool_calling(model)
     }
+}
+
+/// A single event emitted during a streaming LLM response.
+///
+/// Replaces the old `(CompletionChunkKind, String)` tuple with a self-describing
+/// enum so each variant carries its data inline.  The consumer receives these
+/// through the `on_event` callback of [`chat_completion_turn_streaming`] and can
+/// use them for real-time UI updates.  Tool-call completion is signalled by the
+/// returned [`ChatTurnResult`], not by a dedicated event — the consumer must
+/// wait for the turn result to know when tool-call streaming is finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEvent {
+    Answer(String),
+    Reasoning(String),
+    ToolCallArg {
+        index: u32,
+        call_id: String,
+        tool_name: String,
+        delta: String,
+    },
 }
 
 /// Try to list models via the API; fall back to the static known list on any

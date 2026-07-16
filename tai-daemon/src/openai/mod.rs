@@ -5,6 +5,8 @@ mod sse;
 #[cfg(test)]
 mod tests;
 pub use crate::providers::shared::MaxTokensField;
+use crate::providers::types::CallerInfo;
+use crate::providers::{ChatTurnResult, StreamEvent};
 
 pub(crate) use config::endpoint_url;
 // Re-export deprecated load_service_config for backward compatibility
@@ -29,7 +31,6 @@ pub use retry::RetryCallback;
 
 use serde::{Deserialize, Serialize};
 use std::io;
-use tai_proto::TokenUsage;
 
 /// Re-export the shared provider error type so all OpenAI code continues to
 /// use `super::OpenAiError` without structural changes.
@@ -47,13 +48,6 @@ pub enum RequestFormat {
 pub enum AllowedCaller {
     Direct,
     Programmatic,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CallerInfo {
-    #[serde(rename = "type")]
-    pub(crate) kind: String,
-    pub(crate) caller_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -353,37 +347,6 @@ impl AssistantMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments_json: String,
-    pub caller: Option<CallerInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChatAssistantToolUse {
-    pub content: Option<String>,
-    pub tool_calls: Vec<ChatToolCall>,
-    pub reasoning: Option<String>,
-    pub usage: Option<TokenUsage>,
-    pub response_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FinalTextResult {
-    pub content: String,
-    pub reasoning: Option<String>,
-    pub usage: Option<TokenUsage>,
-    pub response_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ChatTurnResult {
-    FinalText(FinalTextResult),
-    ToolUse(ChatAssistantToolUse),
-}
-
 #[derive(Debug, Deserialize)]
 struct ChatCompletionsStreamResponse {
     choices: Vec<StreamChoice>,
@@ -421,12 +384,6 @@ struct StreamToolCallDelta {
 struct StreamToolCallFunctionDelta {
     name: Option<String>,
     arguments: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionChunkKind {
-    Answer,
-    Reasoning,
 }
 
 impl ChatToolDefinition {
@@ -589,11 +546,11 @@ impl ProviderClient for OpenAiClient {
     fn chat_completion_turn_streaming(
         &self,
         params: ChatTurnRequest<'_>,
-        on_chunk: &mut dyn FnMut(CompletionChunkKind, String) -> io::Result<()>,
+        on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let api_start = std::time::Instant::now();
         let model = params.model;
-        let result = self.chat_completion_turn_streaming(params, on_chunk);
+        let result = self.chat_completion_turn_streaming(params, on_event);
         crate::providers::shared::timed_result(api_start, model, "openai", result)
     }
 
