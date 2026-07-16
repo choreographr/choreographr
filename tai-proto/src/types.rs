@@ -197,10 +197,10 @@ pub enum SessionMessageKind {
 impl SessionMessageKind {
     /// Returns `true` for variants rendered with a vertical accent bar and
     /// shaded background ("margin styling"): `AssistantText`,
-    /// `AssistantToolUse`, and `UserText`.
+    /// `AssistantToolUse`, `ToolResult`, and `UserText`.
     ///
-    /// Non-margin variants (`SystemText`, `ToolResult`, `DisplayedImage`)
-    /// render as plain text blocks without the bar.
+    /// Non-margin variants (`SystemText`, `DisplayedImage`) render as plain
+    /// text blocks without the bar.
     ///
     /// Both `tai-tui::state::HistoryViewport::item_height` and
     /// `tai-tui::render::render_item_session_message` use this so that the
@@ -210,6 +210,7 @@ impl SessionMessageKind {
             self,
             SessionMessageKind::AssistantText { .. }
                 | SessionMessageKind::AssistantToolUse { .. }
+                | SessionMessageKind::ToolResult { .. }
                 | SessionMessageKind::UserText { .. }
         )
     }

@@ -696,6 +696,14 @@ fn add_user_margin_lines(
     add_margin_lines(lines, content_width, Color::Green, timestamp_ms)
 }
 
+fn add_tool_result_margin_lines(
+    lines: Vec<Line<'static>>,
+    content_width: u16,
+    timestamp_ms: Option<i64>,
+) -> (Vec<Line<'static>>, usize) {
+    add_margin_lines(lines, content_width, Color::Red, timestamp_ms)
+}
+
 pub(crate) fn render_history_lines(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -812,10 +820,13 @@ fn render_item_session_message(
             message.kind,
             SessionMessageKind::AssistantText { .. } | SessionMessageKind::AssistantToolUse { .. }
         );
+        let is_tool_result = matches!(message.kind, SessionMessageKind::ToolResult { .. });
         let lines = cached_or_compute_lines(cache, idx, widths.user_content_width, || {
             session_message_lines(message, widths.user_content_width)
         });
-        let (margin_fn, timestamp_ms) = if is_assistant {
+        let (margin_fn, timestamp_ms) = if is_tool_result {
+            (add_tool_result_margin_lines as MarginFn, None)
+        } else if is_assistant {
             (add_assistant_margin_lines as MarginFn, None)
         } else {
             (

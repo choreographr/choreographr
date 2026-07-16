@@ -2436,7 +2436,7 @@ mod tests {
     }
 
     #[test]
-    fn item_height_tool_result_uses_single_separator() {
+    fn item_height_tool_result_uses_margin_styling() {
         let vp = HistoryViewport {
             width: 80,
             height: 24,
@@ -2451,8 +2451,9 @@ mod tests {
         let item = HistoryItem::SessionMessage(msg);
         assert_eq!(
             vp.item_height(&item),
-            content_h + 1,
-            "ToolResult height should be content + 1 separator row",
+            content_h + STRUCTURAL_ROWS,
+            "ToolResult height should be content + {} structural rows (margin styling)",
+            STRUCTURAL_ROWS,
         );
     }
 
