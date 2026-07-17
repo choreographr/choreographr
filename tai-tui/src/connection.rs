@@ -666,7 +666,7 @@ fn handle_chat_event(
                 KeyCode::Enter => {
                     let line = app.input.text.trim().to_string();
                     app.input.clear();
-                    app.commit_to_history(line.clone());
+                    app.commit_to_history();
                     match parse_input_line(&line, &mut app.next_request_id, app.attached_session_id)
                     {
                         ShellCommand::Empty => {}

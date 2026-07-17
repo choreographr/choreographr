@@ -1,6 +1,5 @@
 mod cache;
 mod connection;
-mod db;
 mod diff_render;
 mod markdown_render;
 mod render;
@@ -36,7 +35,8 @@ fn main() -> anyhow::Result<()> {
         tai_client_core::ConnectionMode::UnixSocket(tai_proto::socket_path())
     };
 
-    let log_file = std::fs::File::create("/tmp/tai-tui.log")?;
+    let log_path = format!("/tmp/tai-tui-{}.log", std::process::id());
+    let log_file = std::fs::File::create(&log_path)?;
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(log_file)
         .with_ansi(false);

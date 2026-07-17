@@ -14,7 +14,6 @@ use tai_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
 use tai_tui::{RenderedImage, StreamingText};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::db::{self, CommandEntry};
 use crate::diff_render::{diff_display_height, is_diff_text, parse_diff};
 use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
 use ratatui::text::Line;
@@ -528,10 +527,6 @@ pub(crate) struct App {
     pub(crate) terminal_resized: bool,
 
     // ── Command history ─────────────────────────────────────────
-    /// Command history entries, newest first.  Loaded from redb on startup
-    /// and kept in memory so that Up/Down navigation is instant.
-    pub(crate) command_history: Vec<String>,
-
     /// Current position when navigating history with Up/Down.
     /// `None` = not navigating.  `Some(0)` = most recent entry.
     pub(crate) history_index: Option<usize>,
@@ -539,11 +534,6 @@ pub(crate) struct App {
     /// A copy of the input text taken the moment the user first presses Up.
     /// Restored when pressing Down past the newest entry.
     pub(crate) saved_draft: String,
-
-    /// Optional handle to the redb database.  `None` if the database
-    /// could not be opened (history is still usable in-memory during
-    /// the session, it just won't persist).
-    pub(crate) db: Option<redb::Database>,
 
     /// Per-item render cache, indexed in lockstep with `client.history`.
     ///
@@ -1176,22 +1166,6 @@ impl InputBuffer {
 
 impl App {
     pub(crate) fn new(socket_path: String) -> Self {
-        let (db, command_history) = match db::open_db() {
-            Ok(database) => {
-                let history = db::load_recent_commands(&database, 100)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|e| e.command)
-                    .collect();
-                (Some(database), history)
-            }
-            Err(_) => {
-                #[cfg(not(test))]
-                tracing::error!("[tai-tui] failed to open command history db");
-                (None, Vec::new())
-            }
-        };
-
         let initial_items = vec![HistoryItem::Text(format!(
             "Connected to tai-daemon at {socket_path}"
         ))];
@@ -1230,10 +1204,8 @@ impl App {
             scroll_accumulator: 0,
             scrollbar_dragging: false,
             markers: Vec::new(),
-            command_history,
             history_index: None,
             saved_draft: String::new(),
-            db,
             fullscreen_image_idx: None,
             attached_token_usage: None,
             attached_context_window: None,
@@ -1953,23 +1925,40 @@ impl App {
 
     // ── Command history navigation ──────────────────────────────
 
+    /// Collect `UserText` contents from the session history, newest first.
+    pub(crate) fn user_texts(&self) -> Vec<String> {
+        self.client
+            .history
+            .iter()
+            .rev()
+            .filter_map(|item| {
+                if let SharedHistoryItem::SessionMessage(msg) = item
+                    && let SessionMessageKind::UserText { content } = &msg.kind
+                {
+                    return Some(content.clone());
+                }
+                None
+            })
+            .collect()
+    }
+
     /// Navigate backward (older) in command history.
     ///
     /// On first invocation saves the current input as a draft.
     pub(crate) fn navigate_history_up(&mut self) {
-        if self.command_history.is_empty() {
+        let texts = self.user_texts();
+        if texts.is_empty() {
             return;
         }
         if self.history_index.is_none() {
-            // First Up press: save the current input as draft.
             self.saved_draft = self.input.text.clone();
             self.history_index = Some(0);
-            self.input.text = self.command_history[0].clone();
+            self.input.text = texts[0].to_string();
         } else if let Some(idx) = self.history_index {
             let next = idx + 1;
-            if next < self.command_history.len() {
+            if next < texts.len() {
                 self.history_index = Some(next);
-                self.input.text = self.command_history[next].clone();
+                self.input.text = texts[next].to_string();
             }
         }
         self.input.cursor = self.input.text.len();
@@ -1980,12 +1969,12 @@ impl App {
     /// Restores the saved draft when moving past the newest entry.
     pub(crate) fn navigate_history_down(&mut self) {
         if let Some(idx) = self.history_index {
+            let texts = self.user_texts();
             if idx > 0 {
                 let prev = idx - 1;
                 self.history_index = Some(prev);
-                self.input.text = self.command_history[prev].clone();
+                self.input.text = texts[prev].to_string();
             } else {
-                // Past the newest entry: restore draft.
                 self.history_index = None;
                 self.input.text = self.saved_draft.clone();
                 self.saved_draft.clear();
@@ -1994,34 +1983,8 @@ impl App {
         }
     }
 
-    /// Save a command to the history (DB + in-memory list).
-    pub(crate) fn commit_to_history(&mut self, command: String) {
-        if command.is_empty() {
-            return;
-        }
-        // Avoid saving a duplicate of the most recent entry.
-        if self.command_history.first() == Some(&command) {
-            return;
-        }
-
-        // Prepend to in-memory list.
-        self.command_history.insert(0, command.clone());
-
-        // Persist to redb (best-effort).
-        if let Some(ref database) = self.db {
-            let entry = CommandEntry {
-                command,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-            };
-            if let Err(e) = db::save_command(database, &entry) {
-                tracing::error!("[tai-tui] failed to save command history: {e}");
-            }
-        }
-
-        // Reset navigation state.
+    /// Reset navigation state after a command submission.
+    pub(crate) fn commit_to_history(&mut self) {
         self.history_index = None;
         self.saved_draft.clear();
     }

@@ -6,12 +6,10 @@ edition = "2024"
 [dependencies]
 anstyle-progress = "0.1.0"
 anyhow.workspace = true
-postcard.workspace = true
 clap.workspace = true
 crossterm = "0.29"
 dirs.workspace = true
 image.workspace = true
-redb.workspace = true
 serde.workspace = true
 ratatui = "0.30"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
