@@ -27,7 +27,7 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 
 ## Workspace topology
 
-Ten crates in a single Cargo workspace (resolver = "3"):
+Eleven crates in a single Cargo workspace (resolver = "3"):
 
 ```
 tai (workspace)
@@ -39,8 +39,12 @@ tai (workspace)
 ├── tai-mcp             MCP (Model Context Protocol) client — spawns subprocess servers,
 │                       discovers tools, and dispatches tool calls over JSON-RPC stdio
 ├── tai-daemon          Unix socket server — the core engine
-├── tai-tui              Terminal UI client (ratatui + crossterm)
-├── tai-gui              Desktop GUI client (Dioxus)
+├── tai-acp             ACP bridge — translates the Agent Communication Protocol
+│                       (JSON-RPC over stdin/stdout) into tai-proto messages over the
+│                       daemon's Unix socket, enabling ACP-compatible editors (Claude
+│                       Code, Cline, etc.) to interact with tai sessions
+├── tai-tui             Terminal UI client (ratatui + crossterm)
+├── tai-gui             Desktop GUI client (Dioxus)
 └── tai-im              IM platform bridge (Telegram)
 ```
 
@@ -62,12 +66,12 @@ tai (workspace)
       └────┬───────┬────┘   │       └───────────────┬──────────┘
            │       │        │                       │
            │  ┌────▼────────▼────┐                  │
-            │  │  tai-transport   │◄─────────────────┐
-            │  └────────┬────────┘                  │
-            │           │                   ┌───────▼──────┐
-       ┌────▼───┐ ┌────▼────┐ ┌────▼───┐   │   tai-mcp    │
-       │tai-tui  │ │tai-gui   │ │tai-im  │   │ (MCP client)│
-       └────────┘ └─────────┘ └────────┘   └──────────────┘
+           │  │  tai-transport   │◄─────────────────│───────────┐
+           │  └────────┬────────┘                  │           │
+           │           │                   ┌───────▼──────┐ ┌──▼────────┐
+      ┌────▼───┐ ┌────▼────┐ ┌────▼───┐   │   tai-mcp    │ │  tai-acp  │
+      │tai-tui  │ │tai-gui   │ │tai-im  │   │ (MCP client)│ │(ACP bridge)│
+      └────────┘ └─────────┘ └────────┘   └──────────────┘ └───────────┘
 ```
 
 ---
@@ -208,6 +212,58 @@ Used by `tai-daemon` to spawn external MCP servers and register their tools.
 | `protocol.rs` | JSON-RPC 2.0 wire types (`JsonRpcRequest`, `JsonRpcResponse`) and MCP protocol types (`McpTool`, `CallToolResult`, `McpContent`) |
 | `transport.rs` | `StdioTransport` — manages a subprocess stdin/stdout, routes incoming JSON-RPC lines to response/notification channels |
 | `error.rs` | `McpError` enum — `SpawnFailed`, `InitializeFailed`, `JsonRpcError`, `ProtocolError`, `Timeout`, `Io`, `ServerShutdown`, `ToolNotFound`, `InvalidParams` |
+
+
+### `tai-acp` — ACP bridge (Agent Communication Protocol)
+
+Entry point: `src/main.rs` → initializes logging, connects to the daemon's Unix socket,
+spawns I/O threads, runs the main event loop.
+
+The ACP bridge translates the **Agent Communication Protocol** (JSON-RPC 2.0 over
+stdin/stdout) into `tai-proto` messages sent to the daemon over its Unix socket.
+This allows ACP-compatible editors (Claude Code, Cline, etc.) to manage tai sessions,
+send prompts, and receive streaming responses as if they were native tai clients.
+
+**Thread topology:**
+
+```
+main()
+├── acp-reader thread: reads newline-delimited JSON-RPC lines from stdin,
+│   parses them, sends parsed RpcMessage into the shared event channel
+├── daemon-reader thread: reads DaemonMessages from the daemon socket,
+│   forwards them into the shared event channel
+├── daemon-writer thread: receives ClientMessages via mpsc and writes
+│   length-prefixed postcard frames to the daemon socket
+└── main thread: event loop — receives from the shared event channel
+    and dispatches to the appropriate handler
+```
+
+**Modules:**
+
+| Module | Purpose |
+|---|---|
+| `main.rs` | CLI arg parsing (socket path, log file), thread spawning, logging setup |
+| `acp_jsonrpc.rs` | JSON-RPC 2.0 wire types (`JsonRpcRequest`, `JsonRpcResponse`, `JsonRpcNotification`, `RpcMessage`) and ACP protocol payload types (`InitializeResult`, `ConfigOption`, `ContentBlock`, `SessionUpdateParams`, etc.) |
+| `acp_reader.rs` | Blocking stdin reader thread with 1 MiB line-length limit |
+| `acp_handler.rs` | Event loop dispatch — routes `RpcMessage` to ACP method handlers (`session/new`, `session/prompt`, `session/delete`, etc.), routes `DaemonMessage` to streaming or sync response handlers |
+| `daemon_client.rs` | Unix socket connection, daemon reader/writer thread spawning, shared `Event` enum |
+| `sessions.rs` | `SessionManager` — bidirectional map (ACP session ID ↔ daemon session ID), active-prompt guard, request ID counter |
+| `pending.rs` | `PendingRequests` — tracks in-flight sync requests and streaming prompts |
+| `config.rs` | Builds ACP `ConfigOption` objects from daemon state (model list, reasoning effort, tool groups) |
+| `streaming.rs` | Translates daemon `OutputChunk`/`ToolCallStarted`/etc. into ACP `session/update` notifications |
+| `client_capabilities.rs` | Stores editor-declared capabilities from the `initialize` handshake |
+| `error.rs` | `AcpError` enum — JSON-RPC errors, daemon connection, session errors, I/O, proto, serde |
+
+**Key behaviors:**
+
+- **Concurrency:** Pure OS threads with `mpsc` message passing. No `Arc<Mutex>` shared state.
+  Threads communicate exclusively through a single shared event channel (`mpsc::Receiver<Event>`).
+- **Session lifecycle:** Sessions are created on the daemon via `CreateSession` and tracked locally
+  in `SessionManager`. `session/close` cleans up local state only (the daemon keeps sessions alive
+  until explicitly deleted). `session/delete` sends `DeleteSession` to the daemon and waits for
+  confirmation before removing local state.
+- **Streaming:** Prompt responses are streamed from the daemon as `OutputChunk` events, translated
+  to ACP `session/update` notifications, and finalized with a JSON-RPC response on `Done`/`Failed`/`Cancelled`.
 
 
 ### `tai-daemon` — Core server

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "tai-acp",
     "tai-client-core",
     "tai-daemon",
     "tai-keystore",

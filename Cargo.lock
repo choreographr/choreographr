@@ -7680,6 +7680,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tai-acp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tai-proto",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tai-client-core"
 version = "0.1.0"
 dependencies = [
