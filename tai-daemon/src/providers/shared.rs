@@ -181,18 +181,6 @@ pub(crate) fn emit_non_streaming_events(
             {
                 on_event(StreamEvent::Reasoning(reasoning.clone()))?;
             }
-            // Emit the complete payload for each tool call so the consumer's
-            // event-driven path sees ToolCallGenerationStarted even in
-            // non-streaming mode.
-            for (idx, tc) in tool_use.tool_calls.iter().enumerate() {
-                let idx = idx as u32;
-                on_event(StreamEvent::ToolCallArg {
-                    index: idx,
-                    call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    delta: tc.arguments_json.clone(),
-                })?;
-            }
             Ok(ChatTurnResult::ToolUse(tool_use))
         }
     }

@@ -214,7 +214,6 @@ where
     let mut full_text = String::new();
     let mut full_reasoning = String::new();
     let mut pending_tool_calls: Vec<super::ChatToolCall> = Vec::new();
-    let mut next_tool_index: u32 = 0;
     let mut stream_usage: Option<TokenUsage> = None;
 
     while let Some(data) = reader.next_event()? {
@@ -254,25 +253,14 @@ where
                             "too many tool calls (max {MAX_TOOL_CALLS})"
                         ))));
                     }
-                    let idx = next_tool_index;
-                    next_tool_index += 1;
                     let id = format!("fc_{}", function_call.name);
-                    let args_json = function_call.args.to_string();
                     let name = function_call.name;
+                    let args_json = function_call.args.to_string();
                     trace!(
                         tool_name = %name,
                         args_len = args_json.len(),
                         "google: function call",
                     );
-                    // Emit the event first with cloned data, then move the
-                    // originals into the accumulator so the accumulator avoids
-                    // an extra allocation per field.
-                    on_event(StreamEvent::ToolCallArg {
-                        index: idx,
-                        call_id: id.clone(),
-                        tool_name: name.clone(),
-                        delta: args_json.clone(),
-                    })?;
                     pending_tool_calls.push(super::ChatToolCall {
                         id,
                         name,

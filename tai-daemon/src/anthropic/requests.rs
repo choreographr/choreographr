@@ -248,19 +248,12 @@ where
                         pending_tool_calls[idx].id = id.clone();
                         pending_tool_calls[idx].name = name.clone();
                         pending_tool_calls[idx].arguments = input_str.clone();
-                        // Emit initial tool call args
                         trace!(
                             index = start.index,
                             tool_name = %name,
                             input_len = input_str.len(),
                             "anthropic: tool call content block start",
                         );
-                        on_event(StreamEvent::ToolCallArg {
-                            index: start.index,
-                            call_id: id,
-                            tool_name: name,
-                            delta: input_str,
-                        })?;
                     }
                     StreamContentBlock::Thinking { thinking } => {
                         if !thinking.is_empty() {
@@ -295,21 +288,11 @@ where
                             pending_tool_calls.push(StreamToolCall::default());
                         }
                         pending_tool_calls[idx].arguments.push_str(&partial_json);
-                        // Emit tool call arg delta
-                        let known_id = pending_tool_calls[idx].id.clone();
-                        let known_name = pending_tool_calls[idx].name.clone();
                         trace!(
                             index = delta.index,
-                            call_id = %known_id,
                             partial_len = partial_json.len(),
                             "anthropic: tool call arg delta",
                         );
-                        on_event(StreamEvent::ToolCallArg {
-                            index: delta.index,
-                            call_id: known_id,
-                            tool_name: known_name,
-                            delta: partial_json,
-                        })?;
                     }
                     StreamDelta::ThinkingDelta { thinking } => {
                         if !thinking.is_empty() {

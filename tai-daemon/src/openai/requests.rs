@@ -809,13 +809,9 @@ struct AccumulatingToolCall {
 struct AccCall {
     name: Option<String>,
     arguments: String,
-    /// True once at least one FunctionCallArgumentsDelta has been received.
-    /// When false, the subsequent FunctionCallArgumentsDone event emits
-    /// ToolCallArg (which the consumer treats as ToolCallGenerationStarted).
-    deltas_sent: bool,
-    /// Monotonically increasing index assigned to this tool call, used as
-    /// the ToolCallArg index (Responses API does not provide server-side
-    /// indices like Chat Completions does).
+    /// Monotonically increasing index assigned to this tool call, used to
+    /// preserve insertion order since the Responses API does not provide
+    /// server-side indices like Chat Completions does.
     index: u32,
 }
 
@@ -824,7 +820,6 @@ impl AccCall {
         Self {
             name: None,
             arguments: String::new(),
-            deltas_sent: false,
             index,
         }
     }
@@ -991,28 +986,6 @@ where
                             MAX_TOOL_CALLS - 1,
                         ))));
                     }
-                    let call_id = tc.id.clone().unwrap_or_default();
-                    let tool_name = tc
-                        .function
-                        .as_ref()
-                        .and_then(|f| f.name.clone())
-                        .unwrap_or_default();
-                    let args_delta = tc
-                        .function
-                        .as_ref()
-                        .and_then(|f| f.arguments.clone())
-                        .unwrap_or_default();
-                    trace!(
-                        index = tc.index,
-                        delta_len = args_delta.len(),
-                        "openai chat: tool call arg delta",
-                    );
-                    on_event(StreamEvent::ToolCallArg {
-                        index: tc.index,
-                        call_id,
-                        tool_name,
-                        delta: args_delta,
-                    })?;
                     raw_tool_call_deltas.push(tc.clone());
                 }
             }
@@ -1139,22 +1112,12 @@ where
                         "too many tool calls (max {MAX_TOOL_CALLS})"
                     ))));
                 }
-                let entry = acc_calls.entry(call_id.clone()).or_insert_with(|| {
+                let entry = acc_calls.entry(call_id).or_insert_with(|| {
                     let i = next_tool_index;
                     next_tool_index += 1;
                     AccCall::new(i)
                 });
                 entry.arguments.push_str(&delta);
-                entry.deltas_sent = true;
-                // Emit ToolCallArg — tool_name unknown until Done event.
-                // The consumer (requests.rs run_agent_loop) tracks per-index
-                // state to emit ToolCallGenerationStarted on first sight.
-                on_event(StreamEvent::ToolCallArg {
-                    index: entry.index,
-                    call_id,
-                    tool_name: String::new(),
-                    delta,
-                })?;
             }
             Some(ResponsesStreamEvent::FunctionCallArgumentsDone {
                 call_id,
@@ -1162,37 +1125,18 @@ where
                 arguments,
             }) => {
                 has_any_output = true;
-                let entry = acc_calls.entry(call_id.clone()).or_insert_with(|| {
+                let entry = acc_calls.entry(call_id).or_insert_with(|| {
                     let i = next_tool_index;
                     next_tool_index += 1;
                     AccCall::new(i)
                 });
-                entry.name = Some(name.clone());
-                // Replace partial arguments with the complete final payload.
-                entry.arguments.clone_from(&arguments);
-                if !entry.deltas_sent {
-                    // No prior delta was streamed — emit the full payload
-                    // so the consumer sees ToolCallGenerationStarted.
-                    trace!(
-                        call_id = %call_id,
-                        tool_name = %name,
-                        args_len = arguments.len(),
-                        "openai responses: function call args done (no prior delta)",
-                    );
-                    on_event(StreamEvent::ToolCallArg {
-                        index: entry.index,
-                        call_id,
-                        tool_name: name,
-                        delta: arguments,
-                    })?;
-                } else {
-                    trace!(
-                        call_id = %call_id,
-                        tool_name = %name,
-                        args_len = arguments.len(),
-                        "openai responses: function call args done (deltas already sent, skipping)",
-                    );
-                }
+                entry.name = Some(name);
+                entry.arguments = arguments;
+                trace!(
+                    tool_name = ?entry.name,
+                    args_len = entry.arguments.len(),
+                    "openai responses: function call args done",
+                );
             }
             Some(ResponsesStreamEvent::ResponseCompleted { id, usage }) => {
                 response_id = id;

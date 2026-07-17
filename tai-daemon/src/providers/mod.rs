@@ -171,19 +171,11 @@ impl InferenceProvider {
 /// Replaces the old `(CompletionChunkKind, String)` tuple with a self-describing
 /// enum so each variant carries its data inline.  The consumer receives these
 /// through the `on_event` callback of [`chat_completion_turn_streaming`] and can
-/// use them for real-time UI updates.  Tool-call completion is signalled by the
-/// returned [`ChatTurnResult`], not by a dedicated event — the consumer must
-/// wait for the turn result to know when tool-call streaming is finished.
+/// use them for real-time UI updates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     Answer(String),
     Reasoning(String),
-    ToolCallArg {
-        index: u32,
-        call_id: String,
-        tool_name: String,
-        delta: String,
-    },
 }
 
 /// Try to list models via the API; fall back to the static known list on any

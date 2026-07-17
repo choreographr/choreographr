@@ -434,29 +434,6 @@ pub enum DaemonMessage {
         call_id: String,
         data: Vec<u8>,
     },
-    /// The LLM has started generating arguments for a tool call.
-    /// `call_id` and `tool_name` are `None` on the first delta from
-    /// providers that send id/name only on the first chunk (e.g. Chat
-    /// Completions) or only after the fact (e.g. Responses API). The
-    /// client tracks the latest known values.
-    ToolCallGenerationStarted {
-        request_id: u32,
-        call_id: Option<String>,
-        tool_name: Option<String>,
-        /// The index of this tool call within the response (0-based).
-        index: u32,
-        /// The first chunk of JSON arguments (may be empty).
-        arguments_delta: String,
-    },
-    /// A chunk of tool call arguments from the LLM's streaming response.
-    /// The client accumulates these to build the full JSON.
-    ToolCallArgDelta {
-        request_id: u32,
-        call_id: Option<String>,
-        /// The index of this tool call within the response (0-based).
-        index: u32,
-        arguments_delta: String,
-    },
     OutputChunk {
         request_id: u32,
         stream: OutputStream,

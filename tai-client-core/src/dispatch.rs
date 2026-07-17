@@ -195,26 +195,6 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
             handler.append_tool_result_chunk(request_id, &call_id, &data);
             Ok(())
         }
-        DaemonMessage::ToolCallGenerationStarted {
-            request_id,
-            call_id,
-            tool_name,
-            index: _index,
-            arguments_delta: _,
-        } => {
-            let call = call_id.as_deref().unwrap_or("?");
-            let tool = tool_name.as_deref().unwrap_or("?");
-            handler.push_tool_text(
-                request_id,
-                format!("[{request_id}] tool {tool}#{call} generating"),
-            );
-            Ok(())
-        }
-        DaemonMessage::ToolCallArgDelta { .. } => {
-            // Suppressed — tool call argument deltas are internal LLM wire
-            // details and are not useful to display in the TUI.
-            Ok(())
-        }
         DaemonMessage::Done { request_id, .. } => {
             handler.push_text(format!("[{request_id}] done"));
             handler.drop_request(request_id);
@@ -442,8 +422,6 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
         | DaemonMessage::ToolCallFinished { .. }
         | DaemonMessage::ToolCallFailed { .. }
         | DaemonMessage::ToolCallOutput { .. }
-        | DaemonMessage::ToolCallGenerationStarted { .. }
-        | DaemonMessage::ToolCallArgDelta { .. }
         | DaemonMessage::ToolResultChunk { .. }
         | DaemonMessage::Done { .. }
         | DaemonMessage::Failed { .. }
@@ -1118,84 +1096,6 @@ mod tests {
                 .any(|e| matches!(e, TestEvent::PushText(t) if t.contains('\u{FFFD}')))
         );
     }
-
-    #[test]
-    fn tool_call_generation_started_pushes_tool_text() {
-        let mut h = TestHandler::new();
-        dispatch_daemon_message(
-            &mut h,
-            DaemonMessage::ToolCallGenerationStarted {
-                request_id: 7,
-                call_id: Some("call_1".into()),
-                tool_name: Some("read_file".into()),
-                index: 0,
-                arguments_delta: r#"{"path":""#.into(),
-            },
-        )
-        .unwrap();
-        let events = h.collect_events();
-        assert!(
-            events.iter().any(|e| matches!(e, TestEvent::PushText(t) if t.contains("tool read_file#call_1 generating")))
-        );
-    }
-
-    #[test]
-    fn tool_call_generation_started_with_unknown_fields_uses_placeholder() {
-        let mut h = TestHandler::new();
-        dispatch_daemon_message(
-            &mut h,
-            DaemonMessage::ToolCallGenerationStarted {
-                request_id: 7,
-                call_id: None,
-                tool_name: None,
-                index: 0,
-                arguments_delta: "{}".into(),
-            },
-        )
-        .unwrap();
-        let events = h.collect_events();
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, TestEvent::PushText(t) if t.contains("tool ?#? generating")))
-        );
-    }
-
-    #[test]
-    fn tool_call_arg_delta_is_suppressed() {
-        let mut h = TestHandler::new();
-        dispatch_daemon_message(
-            &mut h,
-            DaemonMessage::ToolCallArgDelta {
-                request_id: 7,
-                call_id: Some("call_1".into()),
-                index: 0,
-                arguments_delta: r#""/home/jbrown/tai/src/main.rs""#.into(),
-            },
-        )
-        .unwrap();
-        let events = h.collect_events();
-        assert!(events.is_empty(), "ToolCallArgDelta should be suppressed");
-    }
-
-    #[test]
-    fn tool_call_arg_delta_with_unknown_id_is_suppressed() {
-        let mut h = TestHandler::new();
-        dispatch_daemon_message(
-            &mut h,
-            DaemonMessage::ToolCallArgDelta {
-                request_id: 7,
-                call_id: None,
-                index: 0,
-                arguments_delta: "some_delta".into(),
-            },
-        )
-        .unwrap();
-        let events = h.collect_events();
-        assert!(events.is_empty(), "ToolCallArgDelta should be suppressed");
-    }
-
-    // ── Pong ─────────────────────────────────────────────────────────────
 
     #[test]
     fn pong_pushes_text() {

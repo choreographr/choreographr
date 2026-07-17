@@ -1,7 +1,6 @@
 use crate::context;
 use crate::db::{SessionRecord, write_message_retry, write_session_retry};
 use crate::openai::{AssistantToolCall, AssistantToolFunction, ChatRequestMessage};
-use crate::providers::shared::MAX_TOOL_CALLS;
 use crate::providers::types::{ChatAssistantToolUse, ChatToolCall, ChatTurnResult};
 use crate::providers::{
     ChatTurnRequest, InferenceProvider, ReasoningSupport, StreamEvent, ToolResultItem,
@@ -24,7 +23,7 @@ use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream,
     SessionMessage, SessionMessageKind, SessionStatus, ThinkingEffort, TokenUsage,
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
 /// Persist a `PreparedImage` to the database as a `DisplayedImage` message,
 /// push it into the session's in-memory message list, and broadcast it to
@@ -398,7 +397,6 @@ pub(crate) fn run_agent_loop(
             }
         }));
 
-        let mut tool_call_seen: Vec<bool> = vec![false; MAX_TOOL_CALLS];
         match client.chat_completion_turn_streaming(
             ChatTurnRequest {
                 model,
@@ -430,70 +428,6 @@ pub(crate) fn run_agent_loop(
                                 data: text.into_bytes(),
                             },
                         ));
-                    }
-                    // Track which tool call indices have already been announced
-                    // via ToolCallGenerationStarted, so subsequent deltas are
-                    // emitted as ToolCallArgDelta instead.
-                    StreamEvent::ToolCallArg {
-                        index,
-                        call_id,
-                        tool_name,
-                        delta,
-                    } => {
-                        let call_id_opt = if call_id.is_empty() {
-                            None
-                        } else {
-                            Some(call_id)
-                        };
-                        let seen_idx = index as usize;
-                        if seen_idx >= tool_call_seen.len() {
-                            warn!(
-                                request_id,
-                                index,
-                                max = MAX_TOOL_CALLS,
-                                "tool call index out of bounds, dropping",
-                            );
-                            return Ok(());
-                        }
-                        // Vec<bool> returns false if already true.
-                        if !std::mem::replace(&mut tool_call_seen[seen_idx], true) {
-                            trace!(
-                                request_id,
-                                index,
-                                ?tool_name,
-                                delta_len = delta.len(),
-                                "tool call generation started",
-                            );
-                            let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                                DaemonMessage::ToolCallGenerationStarted {
-                                    request_id,
-                                    call_id: call_id_opt,
-                                    tool_name: if tool_name.is_empty() {
-                                        None
-                                    } else {
-                                        Some(tool_name)
-                                    },
-                                    index,
-                                    arguments_delta: delta,
-                                },
-                            ));
-                        } else {
-                            trace!(
-                                request_id,
-                                index,
-                                call_id = call_id_opt.as_deref().unwrap_or("?"),
-                                delta_len = delta.len(),
-                                "tool call arg delta",
-                            );
-                            let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                                DaemonMessage::ToolCallArgDelta {
-                                    request_id,
-                                    call_id: call_id_opt,
-                                    index,
-                                    arguments_delta: delta,
-                                },
-                            ));
-                        }
                     }
                 }
                 Ok(())

@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use serde::Deserialize;
 use tai_proto::ThinkingEffort;
 use tai_proto::TokenUsage;
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition};
 use crate::providers::StreamEvent;
@@ -259,7 +259,7 @@ where
                             // Merge tool call deltas by their index field.
                             if let Some(delta_tool_calls) = choice.delta.tool_calls {
                                 for dtc in delta_tool_calls {
-                                    // tx from dtc.index is u64; convert to u32 for the event.
+                                    // dtc.index is u64; convert to u32.
                                     // u32::MAX would cause a Vec allocation of 4B+ entries below,
                                     // so reject anything that doesn't fit in u32.
                                     let safe_index = u32::try_from(dtc.index).map_err(|e| {
@@ -278,43 +278,16 @@ where
                                         ))));
                                     }
 
-                                    // Move fields out upfront so we extract values
-                                    // once for both the event and the accumulator.
-                                    let dtc_id = dtc.id;
-                                    let dtc_function = dtc.function;
-
-                                    let call_id = dtc_id.clone().unwrap_or_default();
-                                    let tool_name = dtc_function
-                                        .as_ref()
-                                        .and_then(|f| f.name.clone())
-                                        .unwrap_or_default();
-                                    let args_delta = dtc_function
-                                        .as_ref()
-                                        .and_then(|f| f.arguments.clone())
-                                        .unwrap_or_default();
-
-                                    trace!(
-                                        index = safe_index,
-                                        delta_len = args_delta.len(),
-                                        "mistral: tool call arg delta",
-                                    );
-                                    on_event(StreamEvent::ToolCallArg {
-                                        index: safe_index,
-                                        call_id,
-                                        tool_name,
-                                        delta: args_delta,
-                                    })?;
-
                                     // Ensure the accumulator vector is large enough.
                                     while tool_calls_accumulated.len() <= acc_idx {
                                         tool_calls_accumulated
                                             .push(super::StreamToolCallDelta::default());
                                     }
                                     let entry = &mut tool_calls_accumulated[acc_idx];
-                                    if let Some(id_val) = dtc_id {
+                                    if let Some(id_val) = dtc.id {
                                         entry.id = Some(id_val);
                                     }
-                                    if let Some(func) = dtc_function {
+                                    if let Some(func) = dtc.function {
                                         let f = entry.function.get_or_insert_default();
                                         if let Some(name) = func.name {
                                             f.name = Some(name);
