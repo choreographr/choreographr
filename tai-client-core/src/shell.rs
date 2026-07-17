@@ -73,6 +73,8 @@ fn parse_session_subcommand(rest: &str, attached_session_id: Option<u64>) -> Opt
                 max_turns: None,
                 context_config: None,
                 account_name: None,
+                selected_model: None,
+                reasoning_effort: None,
             }));
         }
         if sub == "new" {
@@ -83,6 +85,8 @@ fn parse_session_subcommand(rest: &str, attached_session_id: Option<u64>) -> Opt
                 max_turns: None,
                 context_config: None,
                 account_name: None,
+                selected_model: None,
+                reasoning_effort: None,
             }));
         }
         if sub == "list" {

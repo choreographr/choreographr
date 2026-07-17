@@ -51,6 +51,7 @@ pub enum DaemonCommand {
         working_dir: Option<PathBuf>,
         max_turns: Option<u32>,
         reasoning_effort: Option<ThinkingEffort>,
+        selected_model: Option<String>,
         context_config: Option<ContextConfig>,
         account_name: Option<String>,
         active_tool_groups: Vec<String>,
@@ -152,6 +153,7 @@ impl DaemonState {
                 working_dir,
                 max_turns,
                 reasoning_effort,
+                selected_model,
                 context_config,
                 account_name,
                 active_tool_groups,
@@ -162,6 +164,7 @@ impl DaemonState {
                 working_dir,
                 max_turns,
                 reasoning_effort,
+                selected_model,
                 context_config,
                 account_name,
                 active_tool_groups,
@@ -336,6 +339,7 @@ impl DaemonState {
         working_dir: Option<PathBuf>,
         max_turns: Option<u32>,
         reasoning_effort: Option<ThinkingEffort>,
+        selected_model: Option<String>,
         context_config: Option<ContextConfig>,
         account_name: Option<String>,
         active_tool_groups: Vec<String>,
@@ -358,7 +362,7 @@ impl DaemonState {
         };
         let record = SessionRecord {
             title: title.clone(),
-            selected_model: None,
+            selected_model,
             reasoning_effort,
             parent_session_id,
             working_dir: cwd_str.clone(),
@@ -382,7 +386,7 @@ impl DaemonState {
 
         let metadata = SessionMetadata {
             title: title.clone(),
-            selected_model: None,
+            selected_model: record.selected_model.clone(),
             reasoning_effort,
             parent_session_id,
             working_dir: cwd_str.clone(),
@@ -1226,6 +1230,7 @@ mod tests {
             working_dir: None,
             max_turns: None,
             reasoning_effort: None,
+            selected_model: None,
             context_config: None,
             account_name: None,
             active_tool_groups: Vec::new(),

@@ -59,6 +59,8 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             max_turns,
             context_config,
             account_name,
+            selected_model,
+            reasoning_effort,
         } => {
             if !handle_client_create_session(
                 title,
@@ -67,6 +69,8 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 max_turns,
                 context_config,
                 account_name,
+                selected_model,
+                reasoning_effort,
                 ctx,
             ) {
                 return Err(io::Error::new(
@@ -450,6 +454,8 @@ fn handle_client_create_session(
     max_turns: Option<u32>,
     context_config: Option<ContextConfig>,
     account_name: Option<String>,
+    selected_model: Option<String>,
+    reasoning_effort: Option<ThinkingEffort>,
     ctx: &mut ClientCtx,
 ) -> bool {
     info!("client {}: CreateSession", ctx.client_id);
@@ -460,7 +466,8 @@ fn handle_client_create_session(
         parent_session_id,
         working_dir: working_dir.map(std::path::PathBuf::from),
         max_turns,
-        reasoning_effort: None,
+        reasoning_effort,
+        selected_model,
         context_config,
         account_name,
         active_tool_groups: Vec::new(),

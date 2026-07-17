@@ -68,6 +68,7 @@ impl Tool for SpawnSubsession {
                 working_dir: child_working_dir.clone(),
                 max_turns: args.max_turns,
                 reasoning_effort: ctx.reasoning_effort,
+                selected_model: ctx.selected_model.clone(),
                 context_config: None,
                 account_name: None,
                 active_tool_groups: categories,

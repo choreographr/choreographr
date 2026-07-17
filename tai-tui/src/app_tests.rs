@@ -1314,6 +1314,8 @@ mod session_manager_key_tests {
                 max_turns: None,
                 context_config: None,
                 account_name: None,
+                selected_model: None,
+                reasoning_effort: None,
             }
         );
     }

@@ -33,6 +33,7 @@ fn spawn_subsession_happy_path() {
                 working_dir,
                 max_turns,
                 reasoning_effort,
+                selected_model,
                 context_config: _,
                 account_name,
                 active_tool_groups,
@@ -44,6 +45,7 @@ fn spawn_subsession_happy_path() {
                 assert_eq!(working_dir, None);
                 assert_eq!(max_turns, Some(5));
                 assert_eq!(reasoning_effort, None);
+                assert_eq!(selected_model, None);
                 assert_eq!(account_name, None);
                 // With no explicit categories, the tool inherits from
                 // ToolContext.active_tool_groups (empty in this test).
@@ -95,6 +97,7 @@ fn spawn_subsession_happy_path() {
         daemon_tx,
         active_tool_groups: HashSet::new(),
         reasoning_effort: None,
+        selected_model: None,
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
@@ -152,6 +155,7 @@ fn spawn_subsession_daemon_rejects_creation() {
         daemon_tx,
         active_tool_groups: HashSet::new(),
         reasoning_effort: None,
+        selected_model: None,
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
@@ -197,6 +201,7 @@ fn spawn_subsession_daemon_disconnected() {
         daemon_tx,
         active_tool_groups: HashSet::new(),
         reasoning_effort: None,
+        selected_model: None,
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
@@ -309,6 +314,7 @@ fn spawn_subsession_inherits_categories() {
         daemon_tx,
         active_tool_groups: ["core", "shell"].into_iter().map(String::from).collect(),
         reasoning_effort: None,
+        selected_model: None,
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
@@ -380,6 +386,7 @@ fn spawn_subsession_overrides_categories() {
         daemon_tx,
         active_tool_groups: ["core", "shell"].into_iter().map(String::from).collect(),
         reasoning_effort: None,
+        selected_model: None,
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
@@ -390,6 +397,78 @@ fn spawn_subsession_overrides_categories() {
             title: None,
             max_turns: None,
             categories: Some(vec!["db".into()]),
+        },
+        None,
+        None,
+        Some(&tool_ctx),
+    );
+
+    assert!(result.is_ok(), "expected success: {result:?}");
+    daemon_handle.join().unwrap();
+}
+
+/// Verify that selected_model is inherited from ToolContext when creating a
+/// child session.
+#[ignore]
+#[test]
+fn spawn_subsession_inherits_selected_model() {
+    let db = Arc::new(common::test_db());
+    let (daemon_tx, daemon_rx) = mpsc::channel::<DaemonCommand>();
+
+    let daemon_handle = thread::spawn(move || {
+        match daemon_rx.recv().unwrap() {
+            DaemonCommand::CreateSession {
+                selected_model,
+                reply,
+                ..
+            } => {
+                // Should have inherited from ToolContext.
+                assert_eq!(
+                    selected_model.as_deref(),
+                    Some("gpt-4o"),
+                    "should inherit selected_model from ToolContext",
+                );
+
+                let (child_tx, child_rx) = mpsc::channel::<SessionCommand>();
+                reply.send(Ok((1u64, child_tx))).unwrap();
+
+                match child_rx.recv().unwrap() {
+                    SessionCommand::AppendMessage { .. } => {}
+                    _ => panic!("expected AppendMessage"),
+                }
+                match child_rx.recv().unwrap() {
+                    SessionCommand::RunChildInput { reply, .. } => {
+                        reply
+                            .send(Ok(ChildResult {
+                                output: "ok".into(),
+                                is_error: false,
+                            }))
+                            .unwrap();
+                    }
+                    _ => panic!("expected RunChildInput"),
+                }
+            }
+            _ => panic!("expected CreateSession"),
+        }
+    });
+
+    let tool_ctx = ToolContext {
+        session_id: 1,
+        db,
+        daemon_tx,
+        active_tool_groups: HashSet::new(),
+        reasoning_effort: None,
+        selected_model: Some("gpt-4o".into()),
+        working_dir: None,
+        cancelled: Arc::new(AtomicBool::new(false)),
+    };
+
+    let result = SpawnSubsession.execute(
+        SpawnSubsessionArgs {
+            prompt: "work".into(),
+            title: None,
+            max_turns: None,
+            categories: None,
         },
         None,
         None,

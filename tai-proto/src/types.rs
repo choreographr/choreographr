@@ -270,6 +270,8 @@ pub enum ClientMessage {
         max_turns: Option<u32>,
         context_config: Option<ContextConfig>,
         account_name: Option<String>,
+        selected_model: Option<String>,
+        reasoning_effort: Option<ThinkingEffort>,
     },
     ListSessions,
     SubscribeSessionsSummary,

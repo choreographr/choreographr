@@ -585,6 +585,7 @@ pub(crate) fn run_agent_loop(
                         daemon_tx: ctx.daemon_tx.clone(),
                         active_tool_groups: session.config.active_tool_groups.clone(),
                         reasoning_effort: session.config.reasoning_effort,
+                        selected_model: session.config.selected_model.clone(),
                         working_dir: session.config.working_dir.clone(),
                         cancelled: Arc::clone(&cancel_flag),
                     };
@@ -967,6 +968,7 @@ fn execute_tool_with_timeout(
         daemon_tx: ctx.daemon_tx.clone(),
         active_tool_groups: session.config.active_tool_groups.clone(),
         reasoning_effort: session.config.reasoning_effort,
+        selected_model: session.config.selected_model.clone(),
         working_dir: working_dir.map(|p| p.to_path_buf()),
         cancelled: Arc::new(AtomicBool::new(false)),
     };
@@ -1670,6 +1672,7 @@ mod tests {
             daemon_tx: _daemon_tx,
             active_tool_groups: std::collections::HashSet::new(),
             reasoning_effort: None,
+            selected_model: None,
             working_dir: None,
             cancelled: Arc::new(AtomicBool::new(false)),
         };

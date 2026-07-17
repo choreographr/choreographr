@@ -274,6 +274,8 @@ fn continue_new_session_after_models(
         max_turns: None,
         context_config: None,
         account_name,
+        selected_model: None,
+        reasoning_effort: None,
     };
     send_to_daemon(daemon_writer, msg)?;
     pending.insert_sync(PendingKind::CreateSession, jsonrpc_id);

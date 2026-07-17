@@ -205,6 +205,8 @@ fn session_new_with_title() {
             max_turns: None,
             context_config: None,
             account_name: None,
+            selected_model: None,
+            reasoning_effort: None,
         })
     );
     assert_eq!(next, 3);
@@ -222,6 +224,8 @@ fn session_new_without_title() {
             max_turns: None,
             context_config: None,
             account_name: None,
+            selected_model: None,
+            reasoning_effort: None,
         })
     );
     assert_eq!(next, 3);

@@ -675,6 +675,34 @@ fn handle_chat_event(
                         }
                         ShellCommand::UnknownCommand(error) => app.push_text(error),
                         ShellCommand::Send(message) => {
+                            let message = match message {
+                                ClientMessage::CreateSession {
+                                    title,
+                                    parent_session_id,
+                                    working_dir,
+                                    max_turns,
+                                    context_config,
+                                    account_name,
+                                    selected_model,
+                                    reasoning_effort,
+                                } => ClientMessage::CreateSession {
+                                    title,
+                                    parent_session_id,
+                                    // Inherit fields from the currently attached session
+                                    // when not explicitly provided by the user.
+                                    working_dir: working_dir
+                                        .or_else(|| app.attached_working_dir.clone()),
+                                    max_turns,
+                                    context_config,
+                                    account_name: account_name
+                                        .or_else(|| app.attached_account_name.clone()),
+                                    selected_model: selected_model
+                                        .or_else(|| app.attached_model.clone()),
+                                    reasoning_effort: reasoning_effort
+                                        .or(app.attached_reasoning_effort),
+                                },
+                                other => other,
+                            };
                             if let Some(echo) =
                                 shell_command_echo(&ShellCommand::Send(message.clone()))
                             {
@@ -918,10 +946,13 @@ fn handle_session_list_key(
                 .send(ClientMessage::CreateSession {
                     title: None,
                     parent_session_id: None,
-                    working_dir: None,
+                    // Inherit fields from the currently attached session.
+                    working_dir: app.attached_working_dir.clone(),
                     max_turns: None,
                     context_config: None,
-                    account_name: None,
+                    account_name: app.attached_account_name.clone(),
+                    selected_model: app.attached_model.clone(),
+                    reasoning_effort: app.attached_reasoning_effort,
                 })
                 .map_err(broken_pipe)?;
         }

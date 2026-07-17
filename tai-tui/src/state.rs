@@ -2027,8 +2027,9 @@ impl App {
             // user can accumulate multiple sessions.
             let _ = client_tx.send(ClientMessage::ListSessions);
         } else {
-            // Chat page (auto-create flow): attach so the user can type
-            // immediately.
+            // Chat page (auto-create flow): clear the current session's
+            // history and attach so the user can type immediately.
+            self.reset_for_session_switch();
             self.attached_session_id = Some(session_id);
             client_tx
                 .send(ClientMessage::AttachSession { session_id })
@@ -2215,6 +2216,8 @@ impl App {
                             max_turns: None,
                             context_config: None,
                             account_name: None,
+                            selected_model: None,
+                            reasoning_effort: None,
                         })
                         .map_err(broken_pipe)?;
                 }
@@ -4050,6 +4053,134 @@ mod tests {
             find_history_item_at_row(&app, 25).is_none(),
             "screen_row > viewport height → None"
         );
+    }
+
+    // ── handle_session_created ──
+
+    #[test]
+    fn handle_session_created_on_chat_page_clears_history_and_attaches() {
+        let mut app = test_app("/tmp/tai.sock");
+        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        app.page = Page::Chat;
+
+        // Populate state as if we were in an active session.
+        app.client
+            .history
+            .push(HistoryItem::Text("old message".into()));
+        app.render_cache.push(None);
+        app.rebuild_height_prefix();
+        app.active.insert(1);
+        app.client.in_progress.insert(1, 0);
+        app.session_mgr
+            .sessions
+            .push(make_session(42, "new-session"));
+
+        app.handle_session_created(42, &tx)
+            .expect("handle_session_created");
+
+        // History should be cleared (reset_for_session_switch was called).
+        assert!(
+            app.client.history.is_empty(),
+            "history should be cleared on Chat page"
+        );
+        assert!(
+            app.render_cache.is_empty(),
+            "render_cache should be cleared"
+        );
+        assert!(app.active.is_empty(), "active requests should be cleared");
+        assert!(
+            app.client.in_progress.is_empty(),
+            "in_progress should be cleared"
+        );
+        assert_eq!(app.attached_session_id, Some(42));
+
+        // Should send AttachSession, not ListSessions.
+        let msg = rx.recv().expect("should send a message");
+        assert_eq!(msg, ClientMessage::AttachSession { session_id: 42 });
+        // No second message.
+        assert!(rx.try_recv().is_err(), "should not send ListSessions");
+    }
+
+    #[test]
+    fn handle_session_created_on_session_manager_page_does_not_clear_history() {
+        let mut app = test_app("/tmp/tai.sock");
+        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        app.page = Page::SessionManager;
+
+        // Populate some history (should be preserved).
+        app.client
+            .history
+            .push(HistoryItem::Text("old message".into()));
+        app.render_cache.push(None);
+        app.rebuild_height_prefix();
+        let history_len = app.client.history.len();
+
+        app.handle_session_created(42, &tx)
+            .expect("handle_session_created");
+
+        // History should NOT be cleared on SessionManager page.
+        assert_eq!(
+            app.client.history.len(),
+            history_len,
+            "history preserved on SessionManager"
+        );
+        assert!(
+            app.attached_session_id.is_none(),
+            "should NOT auto-attach on SessionManager"
+        );
+
+        // Should send ListSessions, not AttachSession.
+        let msg = rx.recv().expect("should send a message");
+        assert_eq!(msg, ClientMessage::ListSessions);
+        assert!(rx.try_recv().is_err(), "should not send AttachSession");
+    }
+
+    #[test]
+    fn handle_session_created_skips_unknown_session() {
+        // handle_session_created doesn't validate that the session exists in
+        // session_mgr — it trusts the daemon. Verify it still works even if
+        // the session isn't in the local list yet.
+        let mut app = test_app("/tmp/tai.sock");
+        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        app.page = Page::Chat;
+
+        app.client.history.push(HistoryItem::Text("old".into()));
+        app.render_cache.push(None);
+
+        app.handle_session_created(99, &tx)
+            .expect("handle_session_created");
+
+        assert!(
+            app.client.history.is_empty(),
+            "history cleared even for unknown session"
+        );
+        assert_eq!(app.attached_session_id, Some(99));
+
+        let msg = rx.recv().expect("should send AttachSession");
+        assert_eq!(msg, ClientMessage::AttachSession { session_id: 99 });
+    }
+
+    #[test]
+    fn handle_session_created_on_other_pages_behaves_like_chat() {
+        // Pages other than SessionManager should also auto-attach.
+        let mut app = test_app("/tmp/tai.sock");
+        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
+        app.page = Page::Home;
+
+        app.client.history.push(HistoryItem::Text("old".into()));
+        app.render_cache.push(None);
+
+        app.handle_session_created(42, &tx)
+            .expect("handle_session_created");
+
+        assert!(
+            app.client.history.is_empty(),
+            "history cleared on Home page"
+        );
+        assert_eq!(app.attached_session_id, Some(42));
+
+        let msg = rx.recv().expect("should send AttachSession");
+        assert_eq!(msg, ClientMessage::AttachSession { session_id: 42 });
     }
 
     // ── mark_terminal_resized ──

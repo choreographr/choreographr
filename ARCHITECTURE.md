@@ -101,7 +101,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 `TestImage`, `Cancel`, `Ping`, `GetCredential`, `ListModels`, `SetModel`, `Unlock`,
 `Lock`, `AddCredential`, `RemoveCredential`, `AddAccount`, `RemoveAccount`,
 `ListAccounts`, `SetSessionAccount`, `SetReasoningEffort`, `GetReasoningEffort`
-- `CreateSession` now carries optional `context_config` and `account_name` fields
+- `CreateSession` now carries optional `context_config`, `account_name`, `selected_model`, and `reasoning_effort` fields
 
 `DaemonMessage` variants:
 - Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionStatusChanged`, `SessionMessageAppended`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`
@@ -293,7 +293,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading, programmatic tool calling (Responses API). |
 | `tools/` | `Tool` trait (with `output_schema` for programmatic tool calling, `allowed_callers` for caller-level gating), `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 30+ registered tools (including `list_sessions`, `get_session`, `load_skill` via `admin.rs`). |
-| `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, working directory) passed to tools that need DB or daemon access or parent config for sub-sessions. |
+| `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, selected model, working directory) passed to tools that need DB or daemon access or parent config for sub-sessions. |
 | `tools/db.rs` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
 | `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json`, spawns subprocesses via `McpClient`, wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) and registers them in the `ToolRegistry` under a `mcp/<slug>` group. |
