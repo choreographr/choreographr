@@ -8,12 +8,12 @@ use crate::requests::run_agent_loop;
 use crate::tools::ToolRegistry;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tai_proto::{
     ContextConfig, DaemonMessage, SessionMessage, SessionMessageKind, SessionStatus,
-    SessionSummary, ThinkingEffort, TokenUsage,
+    SessionSummary, ThinkingEffort, TimestampMs, TokenUsage,
 };
 use tracing::{debug, error, info, warn};
 
@@ -63,6 +63,8 @@ pub enum SessionCommand {
     GetReasoningEffort {
         reply: mpsc::Sender<ThinkingEffort>,
     },
+    Undo,
+    Redo,
     Shutdown,
 }
 
@@ -280,6 +282,8 @@ pub struct ActiveSessionEntry {
 
 pub struct SessionState {
     pub config: SessionConfig,
+    pub next_message_id: u32,
+    last_undo_ids: Option<Vec<u32>>,
     messages: Vec<SessionMessage>,
     subscribers: HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
     pub(crate) active_requests: HashMap<u32, ActiveRequest>,
@@ -317,18 +321,16 @@ impl SessionState {
         snapshot: SessionSnapshot,
         subscribers: HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
     ) -> Self {
+        let msg_count = snapshot.messages.len() as u32;
         Self {
             config: snapshot.config,
+            next_message_id: msg_count,
+            last_undo_ids: None,
             messages: snapshot.messages,
             subscribers,
             active_requests: HashMap::new(),
             provider: None,
         }
-    }
-
-    fn apply_snapshot(&mut self, snapshot: SessionSnapshot) {
-        self.config = snapshot.config;
-        self.messages = snapshot.messages;
     }
 
     /// Read-only access to messages.
@@ -353,16 +355,179 @@ impl SessionState {
         self.messages[idx] = msg;
     }
 
+    /// Find the parent message that a new message of this `kind` should link
+    /// to.  The parent is the most recent non-deleted ancestor in the
+    /// conversation tree: UserText for assistant messages, the originating
+    /// AssistantToolUse for tool results and displayed images.
+    fn resolve_parent_id(&self, kind: &SessionMessageKind) -> Option<u32> {
+        match kind {
+            SessionMessageKind::SystemText { .. } | SessionMessageKind::UserText { .. } => None,
+            SessionMessageKind::AssistantText { .. }
+            | SessionMessageKind::AssistantToolUse { .. } => {
+                self.messages.iter().rev().find_map(|m| {
+                    if !m.deleted && matches!(m.kind, SessionMessageKind::UserText { .. }) {
+                        Some(m.message_id)
+                    } else {
+                        None
+                    }
+                })
+            }
+            SessionMessageKind::ToolResult { call_id, .. } => {
+                self.messages.iter().rev().find_map(|m| {
+                    if !m.deleted
+                        && let SessionMessageKind::AssistantToolUse { tool_calls, .. } = &m.kind
+                        && tool_calls.iter().any(|tc| tc.call_id == *call_id)
+                    {
+                        Some(m.message_id)
+                    } else {
+                        None
+                    }
+                })
+            }
+            SessionMessageKind::DisplayedImage(record) => {
+                if let Some(call_id) = &record.tool_call_id {
+                    self.messages.iter().rev().find_map(|m| {
+                        if !m.deleted
+                            && let SessionMessageKind::AssistantToolUse { tool_calls, .. } = &m.kind
+                            && tool_calls.iter().any(|tc| tc.call_id == *call_id)
+                        {
+                            Some(m.message_id)
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Push a message with a monotonically increasing id and resolved parent.
+    /// Returns the assigned `message_id` and the message so callers can
+    /// persist and broadcast without re-indexing into `self.messages`.
+    ///
+    /// Appending a `UserText` resets the redo stack — new user input after
+    /// an undo starts a fresh editing session.
+    pub fn append_message(&mut self, kind: SessionMessageKind) -> (u32, SessionMessage) {
+        // New user input after an undo clears the redo opportunity.
+        if matches!(&kind, SessionMessageKind::UserText { .. }) {
+            self.last_undo_ids = None;
+        }
+        let parent_id = self.resolve_parent_id(&kind);
+        let id = self.next_message_id;
+        self.next_message_id += 1;
+        let msg = SessionMessage {
+            message_id: id,
+            parent_id,
+            created_at: TimestampMs::now(),
+            kind,
+            deleted: false,
+        };
+        self.messages.push(msg.clone());
+        (id, msg)
+    }
+
+    /// Push a message at a caller-specified id, used to keep ToolResult ids in
+    /// sync with the `ToolCallStarted` predictions that clients already received.
+    /// Returns the message so callers can persist without re-indexing.
+    pub fn append_message_with_id(&mut self, kind: SessionMessageKind, id: u32) -> SessionMessage {
+        let parent_id = self.resolve_parent_id(&kind);
+        let msg = SessionMessage {
+            message_id: id,
+            parent_id,
+            created_at: TimestampMs::now(),
+            kind,
+            deleted: false,
+        };
+        self.messages.push(msg.clone());
+        self.next_message_id = self.next_message_id.max(id + 1);
+        msg
+    }
+
+    /// Undo the most recent user turn: mark the subtree as deleted and record
+    /// which message IDs were removed so that `/redo` can restore exactly them.
+    /// Uses a HashSet for O(1) membership checks instead of O(n) per ID.
+    pub fn undo(&mut self) -> Option<Vec<u32>> {
+        let user_idx = self
+            .messages
+            .iter()
+            .rposition(|m| !m.deleted && matches!(m.kind, SessionMessageKind::UserText { .. }))?;
+        let root_id = self.messages[user_idx].message_id;
+        // Build the children map once and reuse across traversal so we don't
+        // scan all messages again inside collect_subtree.
+        let children = build_children_map(&self.messages);
+        let ids = collect_subtree(&children, root_id);
+        // One pass through messages + O(1) set lookups beats O(n) per ID.
+        let delete_set: HashSet<u32> = ids.iter().copied().collect();
+        for msg in self.messages.iter_mut() {
+            if delete_set.contains(&msg.message_id) {
+                msg.deleted = true;
+            }
+        }
+        self.last_undo_ids = Some(ids.clone());
+        Some(ids)
+    }
+
+    /// Redo the most recent `/undo`, restoring exactly the message IDs that
+    /// were removed.  Returns `None` if there is nothing to redo (either no
+    /// prior undo, or a new UserText was appended after the undo).
+    pub fn redo(&mut self) -> Option<Vec<SessionMessage>> {
+        let ids = self.last_undo_ids.take()?;
+        // One pass through messages + O(1) set lookups beats O(n) per ID.
+        let redo_set: HashSet<u32> = ids.iter().copied().collect();
+        let mut restored = Vec::new();
+        for msg in self.messages.iter_mut() {
+            if redo_set.contains(&msg.message_id) {
+                msg.deleted = false;
+                restored.push(msg.clone());
+            }
+        }
+        Some(restored)
+    }
+
     /// Create an empty session state.
     pub fn empty() -> Self {
         Self {
             config: SessionConfig::default(),
+            next_message_id: 0,
+            last_undo_ids: None,
             messages: Vec::new(),
             subscribers: HashMap::new(),
             active_requests: HashMap::new(),
             provider: None,
         }
     }
+}
+
+/// Index the message list into a parent→children map so that
+/// subtree traversal (used by undo) is O(n) rather than O(n²).
+fn build_children_map(messages: &[SessionMessage]) -> HashMap<u32, Vec<u32>> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for msg in messages {
+        if let Some(pid) = msg.parent_id {
+            children.entry(pid).or_default().push(msg.message_id);
+        }
+    }
+    children
+}
+
+/// Walk the message tree breadth-first from `root_id` returning every
+/// descendant's message ID.  The caller supplies a pre-built adjacency
+/// map (from `build_children_map`) so that each edge is followed exactly
+/// once — O(n) overall.
+fn collect_subtree(children: &HashMap<u32, Vec<u32>>, root_id: u32) -> Vec<u32> {
+    let mut result = vec![root_id];
+    let mut i = 0;
+    while i < result.len() {
+        let pid = result[i];
+        if let Some(kids) = children.get(&pid) {
+            result.extend(kids);
+        }
+        i += 1;
+    }
+    result
 }
 
 fn broadcast(
@@ -395,7 +560,13 @@ fn fail_request(
     request_id: u32,
     error: impl Into<String>,
 ) -> bool {
-    broadcast(subscribers, DaemonMessage::Started { request_id });
+    broadcast(
+        subscribers,
+        DaemonMessage::Started {
+            request_id,
+            message_id: 0,
+        },
+    );
     broadcast(
         subscribers,
         DaemonMessage::Failed {
@@ -456,10 +627,8 @@ pub fn session_main(
     };
     let mut state = SessionState {
         config,
-        messages: Vec::new(),
-        subscribers: HashMap::new(),
-        active_requests: HashMap::new(),
         provider,
+        ..SessionState::empty()
     };
 
     // Re-resolve context window from the catalog when loading an existing
@@ -468,7 +637,10 @@ pub fn session_main(
     state.resolve_context_window_if_missing(ctx.session_id);
 
     match db::read_messages(&ctx.db, ctx.session_id) {
-        Ok(msgs) => state.messages = msgs,
+        Ok(msgs) => {
+            state.messages = msgs;
+            state.next_message_id = state.messages.len() as u32;
+        }
         Err(e) => warn!(ctx.session_id, error = %e, "failed to load messages from DB"),
     }
 
@@ -476,26 +648,22 @@ pub fn session_main(
         let effective_working_dir = state
             .config
             .working_dir
-            .as_deref()
-            .unwrap_or_else(|| Path::new("."));
-        let skills = context::discover_skills(effective_working_dir);
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
+        let skills = context::discover_skills(&effective_working_dir);
         let base_prompt = context::build_base_prompt(&skills, &ctx.tool_registry.groups());
-        state
-            .messages
-            .push(SessionMessage::now(SessionMessageKind::SystemText {
-                content: base_prompt,
-            }));
-        write_message_retry(&ctx.db, ctx.session_id, 0, &state.messages[0]).ok();
+        let (id0, msg0) = state.append_message(SessionMessageKind::SystemText {
+            content: base_prompt,
+        });
+        write_message_retry(&ctx.db, ctx.session_id, id0, &msg0).ok();
 
-        if let Ok(bundle) = context::discover_context(effective_working_dir, &Default::default()) {
+        if let Ok(bundle) = context::discover_context(&effective_working_dir, &Default::default()) {
             let context_str = context::assemble_context(&bundle);
             if !context_str.is_empty() {
-                state
-                    .messages
-                    .push(SessionMessage::now(SessionMessageKind::SystemText {
-                        content: context_str,
-                    }));
-                write_message_retry(&ctx.db, ctx.session_id, 1, &state.messages[1]).ok();
+                let (id1, msg1) = state.append_message(SessionMessageKind::SystemText {
+                    content: context_str,
+                });
+                write_message_retry(&ctx.db, ctx.session_id, id1, &msg1).ok();
                 state.config.context_fingerprint = Some(bundle.fingerprint);
                 state.config.context_file_paths =
                     bundle.files.iter().map(|f| f.path.clone()).collect();
@@ -556,6 +724,8 @@ fn process_command(
         SessionCommand::GetReasoningEffort { reply } => {
             handle_get_reasoning_effort(reply, state, ctx)
         }
+        SessionCommand::Undo => handle_undo(state, ctx),
+        SessionCommand::Redo => handle_redo(state, ctx),
         SessionCommand::Shutdown => handle_shutdown(state, shutdown_requested),
     }
 }
@@ -582,7 +752,7 @@ fn handle_run_input(
         return fail_request(&mut state.subscribers, request_id, "empty input");
     }
     let provider = if let Some(p) = state.provider.as_ref() {
-        p
+        p.clone()
     } else if let Some(ref name) = state.config.account_name {
         // No cached provider yet — try lazy resolution via the daemon.
         let (reply, rx) = mpsc::channel();
@@ -603,7 +773,7 @@ fn handle_run_input(
                         "internal error: provider not set after resolution".to_string(),
                     );
                 };
-                p
+                p.clone()
             }
             _ => {
                 return fail_request(
@@ -643,12 +813,10 @@ fn handle_run_input(
         );
     }
 
-    let user_msg = SessionMessage::now(SessionMessageKind::UserText {
+    let (msg_id, user_msg) = state.append_message(SessionMessageKind::UserText {
         content: text.clone(),
     });
-    let msg_idx = state.messages.len() as u32;
-    state.messages.push(user_msg.clone());
-    write_message_retry(&ctx.db, ctx.session_id, msg_idx, &user_msg).ok();
+    write_message_retry(&ctx.db, ctx.session_id, msg_id, &user_msg).ok();
     broadcast(
         &mut state.subscribers,
         DaemonMessage::SessionMessageAppended { message: user_msg },
@@ -656,7 +824,10 @@ fn handle_run_input(
 
     broadcast(
         &mut state.subscribers,
-        DaemonMessage::Started { request_id },
+        DaemonMessage::Started {
+            request_id,
+            message_id: state.next_message_id,
+        },
     );
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     state
@@ -668,7 +839,6 @@ fn handle_run_input(
     // session thread which holds the live subscriber set.
     let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
     let ctx = ctx.clone();
-    let provider = provider.clone();
     std::thread::spawn(move || {
         let _ = run_request_worker(
             request_id,
@@ -713,7 +883,10 @@ fn handle_run_child_input(
     }
     broadcast(
         &mut state.subscribers,
-        DaemonMessage::Started { request_id },
+        DaemonMessage::Started {
+            request_id,
+            message_id: state.next_message_id,
+        },
     );
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     state
@@ -929,19 +1102,40 @@ fn handle_get_summary(
     false
 }
 
-/// Append a message to the session and persist it.
+/// Persist an incoming message.
+///
+/// When the caller supplies a fully-formed `SessionMessage` (message_id != 0)
+/// its metadata — timestamps and ids from the ACP layer — are kept intact and
+/// only the parent_id is re-resolved into the live tree so that undo can
+/// navigate the parent→child chain.  Otherwise a fresh id is assigned.
 fn handle_append_message(
     message: SessionMessage,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
-    let idx = state.messages.len() as u32;
-    state.messages.push(message.clone());
-    write_message_retry(&ctx.db, ctx.session_id, idx, &message).ok();
+    // Use the caller-provided message_id if non-zero, otherwise assign one.
+    // This preserves caller metadata (e.g. timestamps from ACP) while still
+    // integrating with the daemon's message_id ordering scheme.
+    let msg = if message.message_id != 0 {
+        // Re-parent the caller-supplied message into the live tree so that
+        // undo can navigate the parent → child chain correctly.
+        let parent_id = state.resolve_parent_id(&message.kind);
+        let msg = SessionMessage {
+            parent_id,
+            ..message
+        };
+        state.messages.push(msg.clone());
+        state.next_message_id = state.next_message_id.max(msg.message_id + 1);
+        msg
+    } else {
+        let (_id, msg) = state.append_message(message.kind);
+        msg
+    };
+    write_message_retry(&ctx.db, ctx.session_id, msg.message_id, &msg).ok();
     false
 }
 
-/// Apply the worker's snapshot and broadcast inactive status.
+/// Apply the worker's snapshot (config only) and append any new messages.
 fn handle_request_finished(
     request_id: u32,
     snapshot: SessionSnapshot,
@@ -949,27 +1143,52 @@ fn handle_request_finished(
     shutdown_requested: &bool,
     ctx: &RequestContext,
 ) -> bool {
-    // Record how many messages were in the session before the worker's
-    // snapshot is merged.  Everything past this point was created by the
-    // agent loop (AssistantToolUse, ToolResult, DisplayedImage, AssistantText)
-    // and must be broadcast to subscribers now — they were never delivered
-    // during streaming.
     let pre_len = state.messages.len();
-    state.apply_snapshot(snapshot);
 
-    // Deliver new messages the worker added during the agent loop.
-    // DisplayedImage entries were already broadcast mid-turn by
-    // emit_and_persist_image, so skip them to avoid duplicates.
-    let Some(new_msgs) = state.messages.get(pre_len..) else {
+    // Apply config changes from worker (accumulated usage, etc.)
+    state.config = snapshot.config;
+
+    // Refresh pre-existing messages that may have been updated by the worker
+    // (e.g. context refresh replacing a system message in-place)
+    for (idx, snap_msg) in snapshot.messages.iter().enumerate().take(pre_len) {
+        if idx < state.messages.len() && state.messages[idx] != *snap_msg {
+            state.messages[idx] = snap_msg.clone();
+        }
+    }
+
+    // Append new messages preserving the worker's message_ids so that
+    // the client's message_id-based ordering remains consistent with the
+    // ToolCallStarted predictions that were already broadcast.
+    let snapshot_msg_count = snapshot.messages.len();
+    if snapshot_msg_count < pre_len {
         warn!(
-            "handle_request_finished: snapshot had fewer messages ({}) than expected ({})",
-            state.messages.len(),
+            session_id = ctx.session_id,
             pre_len,
+            snapshot_msg_count,
+            "handle_request_finished: snapshot had fewer messages than expected",
         );
-        return false;
-    };
-    for msg in new_msgs {
-        if matches!(msg.kind, SessionMessageKind::DisplayedImage(_)) {
+    }
+    for i in pre_len..snapshot_msg_count {
+        let msg = snapshot.messages[i].clone();
+        let id = msg.message_id;
+        if !matches!(msg.kind, SessionMessageKind::AssistantToolUse { .. }) {
+            write_message_retry(&ctx.db, ctx.session_id, id, &msg).ok();
+        }
+        state.messages.push(msg);
+        state.next_message_id = state.next_message_id.max(id + 1);
+    }
+
+    // Broadcast new messages to subscribers (skip DisplayedImage and
+    // AssistantToolUse — already broadcast mid-turn).
+    for i in pre_len..snapshot_msg_count {
+        if i >= state.messages.len() {
+            break;
+        }
+        let msg = &state.messages[i];
+        if matches!(
+            msg.kind,
+            SessionMessageKind::DisplayedImage(_) | SessionMessageKind::AssistantToolUse { .. }
+        ) {
             continue;
         }
         broadcast(
@@ -1124,6 +1343,61 @@ fn handle_get_reasoning_effort(
     false
 }
 
+/// Handle Undo: mark the most recent user turn's subtree as deleted.
+/// Uses a quick-reference HashMap to avoid an O(n) scan per ID.
+fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
+    let Some(message_ids) = state.undo() else {
+        debug!(
+            session_id = ctx.session_id,
+            "undo requested but no user turn to undo",
+        );
+        return false;
+    };
+    info!(
+        session_id = ctx.session_id,
+        msg_count = message_ids.len(),
+        "undo: marked subtree as deleted",
+    );
+    // Build a single-pass index so persistence lookups are O(1) per ID.
+    let msg_map: HashMap<u32, &SessionMessage> =
+        state.messages.iter().map(|m| (m.message_id, m)).collect();
+    for &id in &message_ids {
+        if let Some(msg) = msg_map.get(&id) {
+            write_message_retry(&ctx.db, ctx.session_id, id, msg).ok();
+        }
+    }
+    broadcast(
+        &mut state.subscribers,
+        DaemonMessage::SessionMessagesUndone { message_ids },
+    );
+    false
+}
+
+/// Reinstate the subtree that was hidden by the preceding undo,
+/// persisting the restored state so it survives daemon restart.
+fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
+    let Some(messages) = state.redo() else {
+        debug!(
+            session_id = ctx.session_id,
+            "redo requested but nothing to redo (no prior undo, or new input after undo)",
+        );
+        return false;
+    };
+    info!(
+        session_id = ctx.session_id,
+        msg_count = messages.len(),
+        "redo: restored previously-undone messages",
+    );
+    for msg in &messages {
+        write_message_retry(&ctx.db, ctx.session_id, msg.message_id, msg).ok();
+    }
+    broadcast(
+        &mut state.subscribers,
+        DaemonMessage::SessionMessagesRedone { messages },
+    );
+    false
+}
+
 /// Signal shutdown: cancel all active requests and check if the loop should exit.
 fn handle_shutdown(state: &mut SessionState, shutdown_requested: &mut bool) -> bool {
     *shutdown_requested = true;
@@ -1275,7 +1549,8 @@ mod tests {
     use crate::tools::ToolRegistry;
     use std::collections::HashMap;
     use tai_proto::{
-        DisplayedImageRecord, ImageMetadata, OutputStream, SessionMessage, SessionStatus,
+        AssistantToolCallRecord, DisplayedImageRecord, ImageMetadata, OutputStream, SessionMessage,
+        SessionStatus,
     };
     use tempfile::tempdir;
 
@@ -1319,6 +1594,7 @@ mod tests {
                 context_window: None,
                 last_prompt_tokens: None,
             },
+            next_message_id: 3,
             messages: vec![
                 SessionMessage::now(SessionMessageKind::SystemText {
                     content: "prompt".into(),
@@ -1333,6 +1609,7 @@ mod tests {
                 }),
             ],
             subscribers: HashMap::new(),
+            last_undo_ids: None,
             active_requests: HashMap::new(),
             provider: None,
         }
@@ -1597,6 +1874,7 @@ mod tests {
                     alt: None,
                 },
                 data: vec![0u8; 64],
+                tool_call_id: None,
             },
         )));
         snap_msgs.push(SessionMessage::now(SessionMessageKind::ToolResult {
@@ -1993,5 +2271,312 @@ mod tests {
 
         drop(ctx);
         daemon.join().unwrap();
+    }
+
+    // ── Undo / Redo tests ────────────────────────────────────────────────
+
+    #[test]
+    fn append_message_assigns_increasing_ids() {
+        let mut state = SessionState::empty();
+        let (id0, _) = state.append_message(SessionMessageKind::UserText {
+            content: "first".into(),
+        });
+        let (id1, _) = state.append_message(SessionMessageKind::UserText {
+            content: "second".into(),
+        });
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        assert_eq!(state.messages.len(), 2);
+    }
+
+    #[test]
+    fn append_message_with_id_uses_explicit_id_and_bumps_next() {
+        let mut state = SessionState::empty();
+        state.append_message_with_id(
+            SessionMessageKind::UserText {
+                content: "skip".into(),
+            },
+            42,
+        );
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].message_id, 42);
+        // next_message_id should advance past the explicit id
+        let (id2, _) = state.append_message(SessionMessageKind::UserText {
+            content: "after".into(),
+        });
+        assert_eq!(id2, 43, "next_message_id advanced past explicit id");
+    }
+
+    #[test]
+    fn append_message_resolves_parent_id_for_assistant_messages() {
+        let mut state = SessionState::empty();
+        let (uid, _) = state.append_message(SessionMessageKind::UserText {
+            content: "hi".into(),
+        });
+        let (aid, msg) = state.append_message(SessionMessageKind::AssistantText {
+            content: "hello".into(),
+            reasoning: None,
+            token_usage: None,
+        });
+        assert_eq!(
+            msg.parent_id,
+            Some(uid),
+            "assistant text gets user as parent"
+        );
+        assert!(aid > uid);
+        let (aid2, msg2) = state.append_message(SessionMessageKind::AssistantText {
+            content: "reply 2".into(),
+            reasoning: None,
+            token_usage: None,
+        });
+        // Second assistant message should also parent to the last non-deleted user
+        assert_eq!(msg2.parent_id, Some(uid));
+        assert!(aid2 > aid);
+    }
+
+    #[test]
+    fn append_message_resolves_parent_id_for_tool_result() {
+        let mut state = SessionState::empty();
+        let (_uid, _) = state.append_message(SessionMessageKind::UserText {
+            content: "run tool".into(),
+        });
+        let (atu_id, atu) = state.append_message(SessionMessageKind::AssistantToolUse {
+            content: None,
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: "call_1".into(),
+                name: "echo".into(),
+                arguments_json: "{}".into(),
+            }],
+            reasoning: None,
+            token_usage: None,
+        });
+        assert_eq!(atu.parent_id, Some(_uid));
+        let (_tr_id, tr) = state.append_message(SessionMessageKind::ToolResult {
+            call_id: "call_1".into(),
+            name: "echo".into(),
+            content: "done".into(),
+            is_error: false,
+        });
+        assert_eq!(
+            tr.parent_id,
+            Some(atu_id),
+            "tool result parent is the assistant tool use message"
+        );
+    }
+
+    #[test]
+    fn undo_marks_subtree_deleted_and_returns_ids() {
+        let mut state = SessionState::empty();
+        let (uid, _) = state.append_message(SessionMessageKind::UserText {
+            content: "draw a cat".into(),
+        });
+        let (atu_id, _) = state.append_message(SessionMessageKind::AssistantToolUse {
+            content: None,
+            tool_calls: vec![AssistantToolCallRecord {
+                call_id: "c1".into(),
+                name: "svg".into(),
+                arguments_json: "{}".into(),
+            }],
+            reasoning: None,
+            token_usage: None,
+        });
+        let (tr_id, _) = state.append_message(SessionMessageKind::ToolResult {
+            call_id: "c1".into(),
+            name: "svg".into(),
+            content: "<svg/>".into(),
+            is_error: false,
+        });
+        let (_aid, _) = state.append_message(SessionMessageKind::AssistantText {
+            content: "done".into(),
+            reasoning: None,
+            token_usage: None,
+        });
+
+        assert!(
+            state.messages.iter().all(|m| !m.deleted),
+            "no messages deleted before undo",
+        );
+
+        let ids = state.undo().expect("undo should find a user turn");
+        // Should include the user message and its entire subtree.
+        assert!(ids.contains(&uid), "user message id in undo set");
+        assert!(ids.contains(&atu_id), "assistant tool use id in undo set");
+        assert!(ids.contains(&tr_id), "tool result id in undo set");
+
+        assert!(
+            state.messages.iter().all(|m| m.deleted),
+            "all messages marked deleted after undo",
+        );
+    }
+
+    #[test]
+    fn undo_returns_none_when_no_user_turn() {
+        let mut state = SessionState::empty();
+        // Only system messages — no user turn to undo.
+        state.append_message(SessionMessageKind::SystemText {
+            content: "prompt".into(),
+        });
+        assert!(state.undo().is_none(), "no user turn to undo");
+    }
+
+    #[test]
+    fn undo_skips_already_deleted_messages() {
+        let mut state = SessionState::empty();
+        // Two user turns, each with an assistant reply.
+        let (u0, _) = state.append_message(SessionMessageKind::UserText {
+            content: "first".into(),
+        });
+        let (a0, _) = state.append_message(SessionMessageKind::AssistantText {
+            content: "reply1".into(),
+            reasoning: None,
+            token_usage: None,
+        });
+        let (u1, _) = state.append_message(SessionMessageKind::UserText {
+            content: "second".into(),
+        });
+        let (a1, _) = state.append_message(SessionMessageKind::AssistantText {
+            content: "reply2".into(),
+            reasoning: None,
+            token_usage: None,
+        });
+
+        // Undo the most recent user turn (the "second" one and its subtree).
+        let ids = state.undo().expect("undo should find a user turn");
+        assert!(ids.contains(&u1), "second user turn in undo set");
+        assert!(ids.contains(&a1), "assistant reply in undo set");
+        // First turn messages should remain non-deleted.
+        assert!(
+            !state
+                .messages
+                .iter()
+                .find(|m| m.message_id == u0)
+                .unwrap()
+                .deleted
+        );
+        assert!(
+            !state
+                .messages
+                .iter()
+                .find(|m| m.message_id == a0)
+                .unwrap()
+                .deleted
+        );
+        assert!(
+            state
+                .messages
+                .iter()
+                .find(|m| m.message_id == u1)
+                .unwrap()
+                .deleted
+        );
+        assert!(
+            state
+                .messages
+                .iter()
+                .find(|m| m.message_id == a1)
+                .unwrap()
+                .deleted
+        );
+
+        // Undo again — there's still the first user turn.
+        let ids2 = state.undo().expect("undo second turn");
+        assert!(ids2.contains(&u0), "first user turn in undo set");
+    }
+
+    #[test]
+    fn redo_restores_undo_subtree() {
+        let mut state = SessionState::empty();
+        state.append_message(SessionMessageKind::UserText {
+            content: "hi".into(),
+        });
+        let ids = state.undo().expect("undo succeeds");
+        assert!(!ids.is_empty());
+
+        let restored = state.redo().expect("redo succeeds");
+        assert_eq!(restored.len(), ids.len());
+        assert!(
+            state.messages.iter().all(|m| !m.deleted),
+            "all messages restored after redo",
+        );
+    }
+
+    #[test]
+    fn redo_returns_none_when_nothing_to_redo() {
+        let mut state = SessionState::empty();
+        state.append_message(SessionMessageKind::UserText {
+            content: "hi".into(),
+        });
+        // No undo was performed — nothing to redo.
+        assert!(state.redo().is_none());
+    }
+
+    #[test]
+    fn redo_returns_none_after_new_user_input() {
+        let mut state = SessionState::empty();
+        state.append_message(SessionMessageKind::UserText {
+            content: "first".into(),
+        });
+        state.undo();
+        // New user input should clear the redo stack.
+        state.append_message(SessionMessageKind::UserText {
+            content: "second".into(),
+        });
+        assert!(state.redo().is_none(), "redo cleared after new user input");
+    }
+
+    #[test]
+    fn collect_subtree_gathers_all_descendants() {
+        // Manually construct a tree: 0 (root) → 1, 2 (children), 1 → 3 (grandchild)
+        let messages = vec![
+            SessionMessage {
+                message_id: 0,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::UserText {
+                    content: "root".into(),
+                },
+                deleted: false,
+            },
+            SessionMessage {
+                message_id: 1,
+                parent_id: Some(0),
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::AssistantText {
+                    content: "child1".into(),
+                    reasoning: None,
+                    token_usage: None,
+                },
+                deleted: false,
+            },
+            SessionMessage {
+                message_id: 2,
+                parent_id: Some(0),
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::AssistantText {
+                    content: "child2".into(),
+                    reasoning: None,
+                    token_usage: None,
+                },
+                deleted: false,
+            },
+            SessionMessage {
+                message_id: 3,
+                parent_id: Some(1),
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::AssistantText {
+                    content: "grandchild".into(),
+                    reasoning: None,
+                    token_usage: None,
+                },
+                deleted: false,
+            },
+        ];
+        let children = build_children_map(&messages);
+        let ids = collect_subtree(&children, 0);
+        assert_eq!(ids.len(), 4, "all four messages in subtree");
+        assert!(ids.contains(&0));
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
     }
 }

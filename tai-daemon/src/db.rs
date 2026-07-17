@@ -307,10 +307,13 @@ pub fn read_messages(db: &redb::Database, session_id: u64) -> io::Result<Vec<Ses
                     messages.push((
                         idx,
                         SessionMessage {
+                            message_id: idx,
+                            parent_id: None,
                             created_at: TimestampMs::ZERO,
                             kind: SessionMessageKind::UserText {
                                 content: String::new(),
                             },
+                            deleted: false,
                         },
                     ));
                 }

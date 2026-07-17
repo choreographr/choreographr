@@ -130,6 +130,8 @@ In `tai-tui`:
 - `/reasoning` — show current reasoning effort
 - `/reasoning off|low|medium|high` — set reasoning/thinking effort for the session
 - `/account <name>` — set the session's AI provider account
+- `/undo` — undo the most recent user turn and its entire assistant response subtree
+- `/redo` — redo the most recently undone turn (cleared if new input is sent)
 - any other input — sent as a prompt
 
 Account names must be lowercase alphanumeric with hyphens or underscores (`[a-z0-9_-]`).

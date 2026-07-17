@@ -1536,13 +1536,72 @@ impl App {
                     }
                     self.rebuild_height_prefix();
                 } else {
-                    self.push_history_item(Self::classify_session_message(&message));
+                    self.insert_session_message_ordered(message);
                 }
             }
             other => {
-                self.push_history_item(Self::classify_session_message(&other));
+                self.insert_session_message_ordered(other);
             }
         }
+    }
+
+    /// Insert a `SessionMessage` at the position in history that preserves
+    /// `message_id` ordering.  `ToolResultStream` entries are ordered by
+    /// their own `message_id` (which matches the subsequent `ToolResult`),
+    /// and `Streaming` entries are treated as boundaries for
+    /// `AssistantToolUse` so the tool declaration always appears above the
+    /// answer stream.
+    fn insert_session_message_ordered(&mut self, message: SessionMessage) {
+        let mid = message.message_id;
+        let is_atu = matches!(message.kind, SessionMessageKind::AssistantToolUse { .. });
+        let insert_at = self
+            .client
+            .history
+            .iter()
+            .position(|item| {
+                match item {
+                    // AssistantToolUse goes before matching ToolResultStream,
+                    // before the answer stream, or before a higher message_id.
+                    HistoryItem::ToolResultStream(data) if is_atu || data.message_id > mid => true,
+                    HistoryItem::Streaming(_) if is_atu => true,
+                    HistoryItem::SessionMessage(m) => m.message_id > mid,
+                    _ => false,
+                }
+            })
+            .unwrap_or(self.client.history.len());
+        let item = Self::classify_session_message(&message);
+        self.client.insert_at(insert_at, item);
+        // Adjust replacement and tracking indices that point at-or-after
+        // the insertion point so subsequent operations find the right slot.
+        for idx in self.client.in_progress.values_mut() {
+            if *idx >= insert_at {
+                *idx += 1;
+            }
+        }
+        for idx in self.client.tool_streams.values_mut() {
+            if *idx >= insert_at {
+                *idx += 1;
+            }
+        }
+        self.pending_tool_result_replacement
+            .values_mut()
+            .for_each(|idx| {
+                if *idx >= insert_at {
+                    *idx += 1;
+                }
+            });
+        // If the committed assistant message displaced a Streaming item with
+        // the same message_id, clear the stale streaming content and its mid
+        // so only the committed message shows `mid:N`.
+        if (is_atu || matches!(message.kind, SessionMessageKind::AssistantText { .. }))
+            && let Some(HistoryItem::Streaming(stream)) = self.client.history.get_mut(insert_at + 1)
+            && stream.message_id == mid
+        {
+            stream.message_id = 0;
+            stream.reasoning.clear();
+            stream.answer.clear();
+        }
+        self.rebuild_height_prefix();
     }
 
     pub(crate) fn push_image(&mut self, image: RenderedImage) {
@@ -1706,14 +1765,19 @@ impl App {
         self.clamp_scroll_state();
     }
 
-    pub(crate) fn begin_stream(&mut self, request_id: u32) {
+    pub(crate) fn begin_stream(&mut self, request_id: u32, message_id: u32) {
         if self.client.in_progress.contains_key(&request_id) {
             return;
         }
-        let item = HistoryItem::Streaming(StreamingTextItem::new(request_id));
+        let item = HistoryItem::Streaming(StreamingTextItem {
+            message_id,
+            request_id,
+            reasoning: String::new(),
+            answer: String::new(),
+        });
         let added_height = self.history_viewport.item_height(&item);
         let trimmed_height = self.trimmed_height_on_append();
-        self.client.begin_stream(request_id);
+        self.client.begin_stream(request_id, message_id);
         self.ensure_cache_synced();
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
@@ -1729,7 +1793,7 @@ impl App {
         chunk: &str,
     ) {
         if !self.client.in_progress.contains_key(&request_id) {
-            self.begin_stream(request_id);
+            self.begin_stream(request_id, 0);
         }
         if let Some(&index) = self.client.in_progress.get(&request_id) {
             let old_height = self
@@ -1768,11 +1832,13 @@ impl App {
         request_id: u32,
         call_id: String,
         tool_name: String,
+        message_id: u32,
     ) {
         if self.client.tool_streams.contains_key(&request_id) {
             return;
         }
         let item = HistoryItem::ToolResultStream(ToolResultStreamData {
+            message_id,
             request_id,
             call_id: call_id.clone(),
             tool_name: tool_name.clone(),
@@ -1782,7 +1848,7 @@ impl App {
         let added_height = self.history_viewport.item_height(&item);
         let trimmed_height = self.trimmed_height_on_append();
         self.client
-            .begin_tool_result_stream(request_id, call_id, tool_name);
+            .begin_tool_result_stream(request_id, call_id, tool_name, message_id);
         self.ensure_cache_synced();
         self.history_scroll
             .on_item_appended(added_height, self.max_scroll_offset());
@@ -2268,8 +2334,8 @@ impl DaemonMessageHandler for App {
         self.insert_item_before_stream(request_id, App::classify_session_message(&message));
     }
 
-    fn begin_stream(&mut self, request_id: u32) {
-        self.begin_stream(request_id);
+    fn begin_stream(&mut self, request_id: u32, message_id: u32) {
+        self.begin_stream(request_id, message_id);
     }
 
     fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
@@ -2280,8 +2346,19 @@ impl DaemonMessageHandler for App {
         self.finalize_stream(request_id);
     }
 
-    fn begin_tool_result_stream(&mut self, request_id: u32, call_id: &str, tool_name: &str) {
-        self.begin_tool_result_stream(request_id, call_id.to_string(), tool_name.to_string());
+    fn begin_tool_result_stream(
+        &mut self,
+        request_id: u32,
+        call_id: &str,
+        tool_name: &str,
+        message_id: u32,
+    ) {
+        self.begin_tool_result_stream(
+            request_id,
+            call_id.to_string(),
+            tool_name.to_string(),
+            message_id,
+        );
     }
 
     fn append_tool_result_chunk(&mut self, request_id: u32, call_id: &str, data: &[u8]) {
@@ -2295,6 +2372,14 @@ impl DaemonMessageHandler for App {
     fn drop_request(&mut self, request_id: u32) {
         self.active.remove(&request_id);
         self.client.drop_request(request_id);
+    }
+
+    fn remove_messages_by_id(&mut self, message_ids: &[u32]) {
+        self.client.remove_messages_by_id(message_ids);
+    }
+
+    fn restore_messages(&mut self, messages: Vec<SessionMessage>) {
+        self.client.restore_messages(messages);
     }
 }
 
@@ -2339,7 +2424,7 @@ pub(crate) fn find_history_item_at_row(app: &App, screen_row: u16) -> Option<usi
 mod tests {
     use super::*;
     use crate::test_util::test_app;
-    use tai_proto::{AssistantToolCallRecord, DisplayedImageRecord};
+    use tai_proto::{AssistantToolCallRecord, DisplayedImageRecord, TimestampMs};
 
     fn make_session(id: u64, title: &str) -> SessionSummary {
         SessionSummary {
@@ -2815,6 +2900,7 @@ mod tests {
                 alt: None,
             },
             data: vec![],
+            tool_call_id: None,
         }));
         app.push_session_message(msg);
 
@@ -2842,6 +2928,7 @@ mod tests {
                 alt: Some("red rect".into()),
             },
             data: svg.to_vec(),
+            tool_call_id: None,
         }));
         app.push_session_message(msg);
 
@@ -3082,7 +3169,7 @@ mod tests {
         app.history_viewport.height = 10;
 
         let history_len = app.client.history.len();
-        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
 
         assert!(
             app.client.tool_streams.contains_key(&1),
@@ -3106,11 +3193,11 @@ mod tests {
         app.history_viewport.height = 10;
 
         let history_len = app.client.history.len();
-        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
         assert_eq!(app.client.history.len(), history_len + 1);
 
         // Second call with same request_id should be a no-op.
-        app.begin_tool_result_stream(1, "call_2".into(), "write_file".into());
+        app.begin_tool_result_stream(1, "call_2".into(), "write_file".into(), 2);
         assert_eq!(app.client.history.len(), history_len + 1, "no duplicate");
 
         assert!(matches!(
@@ -3125,7 +3212,7 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
-        app.begin_tool_result_stream(1, "call_1".into(), "grep".into());
+        app.begin_tool_result_stream(1, "call_1".into(), "grep".into(), 1);
         app.append_tool_result_chunk(1, "call_1", b"hello\n");
         app.append_tool_result_chunk(1, "call_1", b"world");
 
@@ -3152,7 +3239,7 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
-        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
         let idx = app.client.tool_streams[&1];
 
         app.finalize_tool_result_stream(1, "call_1");
@@ -3183,7 +3270,7 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
-        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
         app.append_tool_result_chunk(1, "call_1", b"file contents");
         app.finalize_tool_result_stream(1, "call_1");
 
@@ -4197,5 +4284,215 @@ mod tests {
         // invariant is that the getter/setter work correctly.
         app.update_viewport_from_terminal_size();
         // No assertion here — we just verify no crash.
+    }
+
+    // ── insert_session_message_ordered tests ──────────────────────────────
+
+    #[test]
+    fn insert_session_message_ordered_places_at_correct_position() {
+        let mut app = test_app("/tmp/tai.sock");
+        // Start with some existing messages at id 5 and 10.
+        app.client
+            .history
+            .push(HistoryItem::SessionMessage(SessionMessage {
+                message_id: 5,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::UserText {
+                    content: "first".into(),
+                },
+                deleted: false,
+            }));
+        app.client
+            .history
+            .push(HistoryItem::SessionMessage(SessionMessage {
+                message_id: 10,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::AssistantText {
+                    content: "second".into(),
+                    reasoning: None,
+                    token_usage: None,
+                },
+                deleted: false,
+            }));
+        app.render_cache.resize(app.client.history.len(), None);
+
+        // Insert a message with message_id 7 — should go between 5 and 10.
+        app.insert_session_message_ordered(SessionMessage {
+            message_id: 7,
+            parent_id: None,
+            created_at: TimestampMs::now(),
+            kind: SessionMessageKind::AssistantText {
+                content: "middle".into(),
+                reasoning: None,
+                token_usage: None,
+            },
+            deleted: false,
+        });
+
+        let ids: Vec<u32> = app
+            .client
+            .history
+            .iter()
+            .filter_map(|item| {
+                if let HistoryItem::SessionMessage(m) = item {
+                    Some(m.message_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(ids, vec![5, 7, 10], "inserted in message_id order");
+    }
+
+    #[test]
+    fn insert_session_message_ordered_atu_goes_before_tool_result_stream() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.client.history.clear();
+        app.render_cache.clear();
+        // Simulate a ToolResultStream at message_id 10 in history.
+        app.client
+            .history
+            .push(HistoryItem::ToolResultStream(ToolResultStreamData {
+                message_id: 10,
+                request_id: 1,
+                call_id: "c1".into(),
+                tool_name: "read".into(),
+                accumulated_text: String::new(),
+                is_error: false,
+            }));
+        app.render_cache.resize(app.client.history.len(), None);
+
+        // AssistantToolUse with message_id 8 should insert before the stream.
+        app.insert_session_message_ordered(SessionMessage {
+            message_id: 8,
+            parent_id: None,
+            created_at: TimestampMs::now(),
+            kind: SessionMessageKind::AssistantToolUse {
+                content: None,
+                tool_calls: vec![AssistantToolCallRecord {
+                    call_id: "c1".into(),
+                    name: "read".into(),
+                    arguments_json: "{}".into(),
+                }],
+                reasoning: None,
+                token_usage: None,
+            },
+            deleted: false,
+        });
+
+        assert_eq!(app.client.history.len(), 2, "two items in history");
+        assert!(
+            matches!(&app.client.history[0], HistoryItem::SessionMessage(m) if m.message_id == 8),
+            "ATU at index 0"
+        );
+        assert!(
+            matches!(&app.client.history[1], HistoryItem::ToolResultStream(d) if d.message_id == 10),
+            "ToolResultStream at index 1"
+        );
+    }
+
+    #[test]
+    fn insert_session_message_ordered_atu_goes_before_streaming_item() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.client.history.clear();
+        app.render_cache.clear();
+        // A streaming item should not block ATU insertion.
+        app.client
+            .history
+            .push(HistoryItem::Streaming(StreamingTextItem {
+                message_id: 0,
+                request_id: 1,
+                reasoning: String::new(),
+                answer: String::new(),
+            }));
+        app.client.in_progress.insert(1, 0);
+        app.render_cache.resize(app.client.history.len(), None);
+
+        app.insert_session_message_ordered(SessionMessage {
+            message_id: 3,
+            parent_id: None,
+            created_at: TimestampMs::now(),
+            kind: SessionMessageKind::AssistantToolUse {
+                content: None,
+                tool_calls: vec![],
+                reasoning: None,
+                token_usage: None,
+            },
+            deleted: false,
+        });
+
+        assert_eq!(app.client.history.len(), 2);
+        assert!(
+            matches!(&app.client.history[0], HistoryItem::SessionMessage(m) if m.message_id == 3),
+            "ATU inserted before streaming"
+        );
+        assert!(
+            matches!(&app.client.history[1], HistoryItem::Streaming(_)),
+            "streaming item at index 1"
+        );
+    }
+
+    #[test]
+    fn insert_session_message_ordered_adjusts_tracking_indices() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.client.history.clear();
+        app.render_cache.clear();
+        // Simulate an active stream at index 1.
+        app.client
+            .history
+            .push(HistoryItem::Text("existing".into()));
+        app.client
+            .history
+            .push(HistoryItem::Streaming(StreamingTextItem {
+                message_id: 0,
+                request_id: 5,
+                reasoning: String::new(),
+                answer: String::new(),
+            }));
+        app.client.in_progress.insert(5, 1);
+        app.render_cache.resize(app.client.history.len(), None);
+
+        // Inserting an ATU before the streaming item should shift the index.
+        app.insert_session_message_ordered(SessionMessage {
+            message_id: 2,
+            parent_id: None,
+            created_at: TimestampMs::now(),
+            kind: SessionMessageKind::AssistantToolUse {
+                content: None,
+                tool_calls: vec![],
+                reasoning: None,
+                token_usage: None,
+            },
+            deleted: false,
+        });
+
+        // ATU is inserted before the streaming item, shifting it from 1 to 2.
+        assert_eq!(
+            app.client.in_progress.get(&5),
+            Some(&2),
+            "in_progress index shifted after ATU insertion before stream"
+        );
+    }
+
+    #[test]
+    fn insert_session_message_ordered_handles_empty_history() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.client.history.clear();
+        app.render_cache.clear();
+        app.insert_session_message_ordered(SessionMessage {
+            message_id: 1,
+            parent_id: None,
+            created_at: TimestampMs::now(),
+            kind: SessionMessageKind::UserText {
+                content: "first".into(),
+            },
+            deleted: false,
+        });
+        assert_eq!(app.client.history.len(), 1);
+        assert!(
+            matches!(&app.client.history[0], HistoryItem::SessionMessage(m) if m.message_id == 1),
+        );
     }
 }

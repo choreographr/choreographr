@@ -59,6 +59,7 @@ pub fn translate_message(
             call_id,
             tool_name,
             arguments_json,
+            ..
         } => {
             let kind = tool_kind_from_name(tool_name);
             Some(vec![SessionUpdateParams {
@@ -240,6 +241,7 @@ mod tests {
             call_id: call_id.into(),
             tool_name: tool_name.into(),
             arguments_json: args.into(),
+            message_id: 1,
         }
     }
 

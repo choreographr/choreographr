@@ -88,7 +88,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 |---|---|
 | `ClientMessage` | Enum of all messages a client can send |
 | `DaemonMessage` | Enum of all messages the daemon can send |
-| `SessionMessage` | A single turn in a conversation with a `created_at: TimestampMs` field and a `kind: SessionMessageKind` enum. Variants (`SessionMessageKind`): `SystemText`, `UserText`, `AssistantText`, `AssistantToolUse`, `ToolResult`, `DisplayedImage` (persisted image replay) |
+| `SessionMessage` | A single turn in a conversation with `message_id: u32` (monotonically increasing per-session), `parent_id: Option<u32>` (links to the triggering user/ATU message for undo subtree traversal), `deleted: bool` (soft-delete for undo), a `created_at: TimestampMs` field and a `kind: SessionMessageKind` enum. Variants (`SessionMessageKind`): `SystemText`, `UserText`, `AssistantText`, `AssistantToolUse`, `ToolResult`, `DisplayedImage` (persisted image replay) |
 | `ImageMetadata` | Mime type, dimensions, byte length for streamed images |
 | `DisplayedImageRecord` | Binary image data + `ImageMetadata` for persisted image replay (carried inside `SessionMessageKind::DisplayedImage`) |
 | `ThinkingEffort` | Enum controlling how much reasoning/thinking the model performs: `Off`, `Low`, `Medium`, `High`. Stored per-session and passed through to each provider's wire format. |
@@ -100,13 +100,15 @@ Defines all shared message types and framing. No dependencies on other workspace
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
 `TestImage`, `Cancel`, `Ping`, `GetCredential`, `ListModels`, `SetModel`, `Unlock`,
 `Lock`, `AddCredential`, `RemoveCredential`, `AddAccount`, `RemoveAccount`,
-`ListAccounts`, `SetSessionAccount`, `SetReasoningEffort`, `GetReasoningEffort`
+`ListAccounts`, `SetSessionAccount`, `SetReasoningEffort`, `GetReasoningEffort`,
+`Undo`, `Redo`
 - `CreateSession` now carries optional `context_config`, `account_name`, `selected_model`, and `reasoning_effort` fields
 
 `DaemonMessage` variants:
 - Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionStatusChanged`, `SessionMessageAppended`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`
-- Request lifecycle: `Started`, `OutputChunk`, `Done`, `Failed`, `Cancelled`
-- Tool lifecycle: `ToolCallStarted`, `ToolCallFinished` (output removed — content delivered via `ToolResultChunk`), `ToolCallFailed`, `ToolCallOutput`, `ToolResultChunk`
+- Undo/Redo: `SessionMessagesUndone { message_ids }`, `SessionMessagesRedone { messages }`
+- Request lifecycle: `Started` (now carries `message_id: u32` for client-side ordering), `OutputChunk`, `Done`, `Failed`, `Cancelled`
+- Tool lifecycle: `ToolCallStarted` (now carries `message_id: u32` matching the subsequent `ToolResult`), `ToolCallFinished` (output removed — content delivered via `ToolResultChunk`), `ToolCallFailed`, `ToolCallOutput`, `ToolResultChunk`
 - Model management: `Models`, `ModelsFailed`, `ModelSelected`, `ModelSelectionFailed`
 - Locking: `Unlocked`, `Locked`, `LockedError`
 - Credential management: `CredentialAdded`, `CredentialAddFailed`, `CredentialRemoved`, `CredentialRemoveFailed`, `Credential`
@@ -1018,6 +1020,8 @@ across snapshot/restore, metadata conversion, and record persistence:
 - `subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>` — attached clients
 - `active_requests: HashMap<u32, ActiveRequest>` — running request cancel flags
 - `provider: Option<InferenceProvider>` — resolved inference provider for the account
+- `next_message_id: u32` — monotonically increasing counter for `SessionMessage::message_id`; initialized from `messages.len()` on session load, bumped on every `append_message()` / `append_message_with_id()`
+- `last_undo_ids: Option<Vec<u32>>` — stores the subtree message IDs from the most recent undo, enabling `/redo` to restore exactly those messages; cleared when new user input is appended after an undo
 
 ### Hierarchy and working directory inheritance
 
@@ -1042,6 +1046,44 @@ in the same directory as their parent with a default iteration cap.
 Multiple sessions can be active at the same time. Each session control thread stays
 responsive while at most one request worker runs for that session. Request workers own a
 snapshot of the session state and use cooperative cancellation via an `AtomicBool`.
+
+### Undo/Redo
+
+Sessions support undo/redo via a soft-delete tree model:
+
+**Message tree:** Each `SessionMessage` carries:
+- `message_id: u32` — monotonically increasing, assigned by `SessionState::append_message()`.
+- `parent_id: Option<u32>` — the `message_id` of the triggering message (UserText for assistant
+  replies, AssistantToolUse for tool results). This forms a parent→child tree enabling subtree
+  traversal during undo.
+- `deleted: bool` — soft-delete flag; set to `true` on undo, back to `false` on redo.
+
+**Undo flow (`/undo` → `ClientMessage::Undo` → `SessionCommand::Undo` → `handle_undo`):**
+1. `SessionState::undo()` finds the most recent non-deleted `UserText` via reverse scan.
+2. Builds a children adjacency map from `parent_id` fields and walks the tree BFS to collect
+   the user message and all its descendants (assistant replies, tool uses, tool results, images).
+3. Sets `deleted = true` on every message in the collected subtree.
+4. Persists each updated message to the database.
+5. Broadcasts `DaemonMessage::SessionMessagesUndone { message_ids }` to all subscribers.
+6. The client removes the messages from its local history view (`remove_messages_by_id`).
+
+**Redo flow** (`/redo` → `ClientMessage::Redo` → `SessionCommand::Redo` → `handle_redo`):
+1. `SessionState::redo()` restores the message IDs stored in `last_undo_ids` from the prior undo.
+2. Sets `deleted = false` on those messages.
+3. Persists each restored message.
+4. Broadcasts `DaemonMessage::SessionMessagesRedone { messages }` with full `SessionMessage`
+   objects so the client can re-insert them in message_id order.
+5. The client inserts restored messages at the correct position in history
+   (`restore_messages`).
+
+**Redo invalidation:** Appending a new `UserText` after an undo clears `last_undo_ids`,
+making the redo unavailable — new user input starts a fresh editing session.
+
+**Message ID ordering on the client:** The `Started` and `ToolCallStarted` daemon messages
+now carry a `message_id` that predicts the ID of the subsequent `SessionMessage`. The client
+uses `message_id` to maintain a globally ordered history: committed `SessionMessage` entries
+are inserted at the correct position regardless of arrival order, and the streaming header
+shows `mid:N` instead of `[request_id]` for messages with a known ID.
 
 ---
 

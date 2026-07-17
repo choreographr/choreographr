@@ -774,6 +774,18 @@ fn handle_chat_event(
                                 service: service.clone(),
                             });
                         }
+                        ShellCommand::Undo => {
+                            if let Some(echo) = shell_command_echo(&ShellCommand::Undo) {
+                                app.push_text(echo);
+                            }
+                            let _ = client_tx.send(ClientMessage::Undo);
+                        }
+                        ShellCommand::Redo => {
+                            if let Some(echo) = shell_command_echo(&ShellCommand::Redo) {
+                                app.push_text(echo);
+                            }
+                            let _ = client_tx.send(ClientMessage::Redo);
+                        }
                     }
                 }
                 KeyCode::Backspace

@@ -133,6 +133,7 @@ pub struct AccountInfo {
 pub struct DisplayedImageRecord {
     pub metadata: ImageMetadata,
     pub data: Vec<u8>,
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -219,16 +220,22 @@ impl SessionMessageKind {
 /// A session message with a creation timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMessage {
+    pub message_id: u32,
+    pub parent_id: Option<u32>,
     pub created_at: TimestampMs,
     pub kind: SessionMessageKind,
+    pub deleted: bool,
 }
 
 impl SessionMessage {
     /// Create a new session message with the current timestamp.
     pub fn now(kind: SessionMessageKind) -> Self {
         Self {
+            message_id: 0,
+            parent_id: None,
             created_at: TimestampMs::now(),
             kind,
+            deleted: false,
         }
     }
 }
@@ -335,6 +342,8 @@ pub enum ClientMessage {
         effort: ThinkingEffort,
     },
     GetReasoningEffort,
+    Undo,
+    Redo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -408,12 +417,14 @@ pub enum DaemonMessage {
     },
     Started {
         request_id: u32,
+        message_id: u32,
     },
     ToolCallStarted {
         request_id: u32,
         call_id: String,
         tool_name: String,
         arguments_json: String,
+        message_id: u32,
     },
     ToolCallFinished {
         request_id: u32,
@@ -510,6 +521,12 @@ pub enum DaemonMessage {
     SessionDeleteFailed {
         session_id: u64,
         error: String,
+    },
+    SessionMessagesUndone {
+        message_ids: Vec<u32>,
+    },
+    SessionMessagesRedone {
+        messages: Vec<SessionMessage>,
     },
     Credential {
         service: String,

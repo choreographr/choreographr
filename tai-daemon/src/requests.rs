@@ -33,20 +33,23 @@ use tracing::{debug, info, warn};
 fn emit_and_persist_image(
     cmd_tx: &mpsc::Sender<SessionCommand>,
     image: PreparedImage,
+    tool_call_id: Option<String>,
     session: &mut SessionState,
     ctx: &RequestContext,
 ) {
-    let persisted = SessionMessage::now(SessionMessageKind::DisplayedImage(DisplayedImageRecord {
-        metadata: ImageMetadata {
-            image_id: 0,
-            mime_type: image.mime_type,
-            width: image.width,
-            height: image.height,
-            byte_len: image.data.len() as u64,
-            alt: image.alt,
-        },
-        data: image.data,
-    }));
+    let (msg_id, persisted) =
+        session.append_message(SessionMessageKind::DisplayedImage(DisplayedImageRecord {
+            metadata: ImageMetadata {
+                image_id: 0,
+                mime_type: image.mime_type,
+                width: image.width,
+                height: image.height,
+                byte_len: image.data.len() as u64,
+                alt: image.alt,
+            },
+            data: image.data,
+            tool_call_id,
+        }));
 
     // Broadcast to live subscribers mid-turn so subscribers see the image
     // immediately, not just at request completion.
@@ -56,14 +59,12 @@ fn emit_and_persist_image(
         },
     ));
 
-    let img_idx = session.messages().len() as u32;
-    if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, img_idx, &persisted) {
+    if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, msg_id, &persisted) {
         tracing::warn!(
             session_id = ctx.session_id, error = %e,
             "failed to persist displayed image",
         );
     }
-    session.push_message(persisted);
 }
 
 /// Spawn a forwarding thread that relays streaming output chunks to session
@@ -443,13 +444,12 @@ pub(crate) fn run_agent_loop(
                 );
                 let token_usage = final_text.usage;
                 accumulate_token_usage(session, &token_usage, turn, ctx);
-                let msg = SessionMessage::now(SessionMessageKind::AssistantText {
+                let (msg_id, msg) = session.append_message(SessionMessageKind::AssistantText {
                     content: final_text.content,
                     reasoning: final_text.reasoning,
                     token_usage,
                 });
-                let idx = session.push_message(msg.clone());
-                if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, idx, &msg) {
+                if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, msg_id, &msg) {
                     tracing::warn!(session_id = ctx.session_id, error = %e, "failed to persist assistant text");
                 }
                 // FinalText ends the agent loop — no next turn to chain to.
@@ -459,7 +459,7 @@ pub(crate) fn run_agent_loop(
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 let token_usage = tool_use.usage;
                 accumulate_token_usage(session, &token_usage, turn, ctx);
-                persist_assistant_tool_use_sync(session, &tool_use, token_usage, ctx);
+                let base = persist_assistant_tool_use_sync(session, &tool_use, token_usage, ctx);
                 // Store response_id for chaining tool results back to this turn
                 prev_resp_id = tool_use.response_id;
                 tool_results.clear();
@@ -479,18 +479,22 @@ pub(crate) fn run_agent_loop(
                         )
                     });
 
+                let total_mutators = mutators.len();
+
                 // ── Phase 1: Session-mutating tools (serial) ────────
-                for tool_call in mutators {
+                for (i, tool_call) in mutators.into_iter().enumerate() {
                     if is_cancelled_once(cancel_rx) {
                         return Ok(true);
                     }
 
+                    let tool_msg_id = base + 1 + i as u32;
                     let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
                         DaemonMessage::ToolCallStarted {
                             request_id,
                             call_id: tool_call.id.clone(),
                             tool_name: tool_call.name.clone(),
                             arguments_json: tool_call.arguments_json.clone(),
+                            message_id: tool_msg_id,
                         },
                     ));
 
@@ -533,10 +537,23 @@ pub(crate) fn run_agent_loop(
 
                     // Drain any image emitted by the tool.
                     if let Ok(image) = image_rx.try_recv() {
-                        emit_and_persist_image(&ctx.cmd_tx, image, session, ctx);
+                        emit_and_persist_image(
+                            &ctx.cmd_tx,
+                            image,
+                            Some(tool_call.id.clone()),
+                            session,
+                            ctx,
+                        );
                     }
 
-                    finish_tool_call(request_id, session, &tool_call, &mut output, ctx);
+                    finish_tool_call(
+                        request_id,
+                        session,
+                        &tool_call,
+                        &mut output,
+                        ctx,
+                        tool_msg_id,
+                    );
                     tool_results.push(ToolResultItem {
                         call_id: tool_call.id.clone(),
                         output: output.result.content.clone(),
@@ -548,13 +565,15 @@ pub(crate) fn run_agent_loop(
                 if !concurrent.is_empty() {
                     // Broadcast all ToolCallStarted events before any tool
                     // begins execution so subscribers see the full batch.
-                    for tc in &concurrent {
+                    for (j, tc) in concurrent.iter().enumerate() {
+                        let tool_msg_id = base + 1 + total_mutators as u32 + j as u32;
                         let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::ToolCallStarted {
                                 request_id,
                                 call_id: tc.id.clone(),
                                 tool_name: tc.name.clone(),
                                 arguments_json: tc.arguments_json.clone(),
+                                message_id: tool_msg_id,
                             },
                         ));
                     }
@@ -632,7 +651,9 @@ pub(crate) fn run_agent_loop(
                     if is_cancelled_once(cancel_rx) {
                         cancel_flag.store(true, Ordering::Relaxed);
                     }
-                    for ((call_id, tool_name, arguments_json, tool_start), handle) in handles {
+                    for (j, ((call_id, tool_name, arguments_json, tool_start), handle)) in
+                        handles.into_iter().enumerate()
+                    {
                         // Re-check cancellation before each join so the
                         // flag is set as early as possible for tools that
                         // haven't finished yet.
@@ -665,6 +686,7 @@ pub(crate) fn run_agent_loop(
                             }
                         });
 
+                        let tool_msg_id = base + 1 + total_mutators as u32 + j as u32;
                         let elapsed = tool_start.elapsed();
 
                         debug!(
@@ -679,10 +701,23 @@ pub(crate) fn run_agent_loop(
 
                         // Emit and persist any image the tool produced.
                         if let Some(image) = image {
-                            emit_and_persist_image(&ctx.cmd_tx, image, session, ctx);
+                            emit_and_persist_image(
+                                &ctx.cmd_tx,
+                                image,
+                                Some(tool_call.id.clone()),
+                                session,
+                                ctx,
+                            );
                         }
 
-                        finish_tool_call(request_id, session, &tool_call, &mut output, ctx);
+                        finish_tool_call(
+                            request_id,
+                            session,
+                            &tool_call,
+                            &mut output,
+                            ctx,
+                            tool_msg_id,
+                        );
                         tool_results.push(ToolResultItem {
                             call_id: tool_call.id.clone(),
                             output: output.result.content.clone(),
@@ -712,6 +747,7 @@ fn finish_tool_call(
     tool_call: &ChatToolCall,
     output: &mut ToolExecutionOutput,
     ctx: &RequestContext,
+    msg_id: u32,
 ) {
     if let Some(hint) = context::subdirectory_hints(
         &tool_call.name,
@@ -722,14 +758,16 @@ fn finish_tool_call(
         output.result.content = format!("{}\n\n---\n{}", output.result.content, hint);
     }
 
-    let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-        call_id: tool_call.id.clone(),
-        name: tool_call.name.clone(),
-        content: output.result.content.clone(),
-        is_error: output.result.is_error,
-    });
-    let idx = session.push_message(msg.clone());
-    if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, idx, &msg) {
+    let msg = session.append_message_with_id(
+        SessionMessageKind::ToolResult {
+            call_id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            content: output.result.content.clone(),
+            is_error: output.result.is_error,
+        },
+        msg_id,
+    );
+    if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, msg_id, &msg) {
         tracing::warn!(
             session_id = ctx.session_id, tool_name = %tool_call.name, error = %e,
             "failed to persist tool result",
@@ -1058,8 +1096,8 @@ fn persist_assistant_tool_use_sync(
     tool_use: &ChatAssistantToolUse,
     token_usage: Option<TokenUsage>,
     ctx: &RequestContext,
-) {
-    let msg = SessionMessage::now(SessionMessageKind::AssistantToolUse {
+) -> u32 {
+    let (msg_id, message) = session.append_message(SessionMessageKind::AssistantToolUse {
         content: tool_use.content.clone(),
         tool_calls: tool_use
             .tool_calls
@@ -1073,15 +1111,22 @@ fn persist_assistant_tool_use_sync(
         reasoning: tool_use.reasoning.clone(),
         token_usage,
     });
-    let idx = session.push_message(msg.clone());
-    if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, idx, &msg) {
+    if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, msg_id, &message) {
         tracing::warn!(session_id = ctx.session_id, error = %e, "failed to persist assistant tool use");
     }
+
+    // Broadcast to live subscribers mid-turn so subscribers see the
+    // tool-use header before the streaming tool output begins.
+    let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+        DaemonMessage::SessionMessageAppended { message },
+    ));
+    msg_id
 }
 
 fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMessage> {
     messages
         .iter()
+        .filter(|m| !m.deleted)
         .filter_map(|message| match &message.kind {
             // DisplayedImage records are not part of the LLM conversation —
             // they are purely a display-side artifact for replayed images.
@@ -1256,6 +1301,7 @@ mod tests {
                     alt: None,
                 },
                 data: vec![],
+                tool_call_id: None,
             })),
             SessionMessage::now(SessionMessageKind::AssistantText {
                 content: "hi".into(),
@@ -1757,7 +1803,7 @@ mod tests {
             alt: Some("test image".into()),
         };
 
-        emit_and_persist_image(&ctx.cmd_tx, image, &mut session, &ctx);
+        emit_and_persist_image(&ctx.cmd_tx, image, None, &mut session, &ctx);
 
         // Session should have one message: a DisplayedImage.
         assert_eq!(session.messages().len(), 1);

@@ -5,7 +5,7 @@ use tai_proto::{DaemonMessage, ImageMetadata, OutputStream, SessionMessage, Sess
 #[test]
 fn app_state_stream_updates_history() {
     let mut state = AppState::new("/tmp/tai.sock".to_string());
-    state.client.begin_stream(7);
+    state.client.begin_stream(7, 0);
     state
         .client
         .append_stream(7, OutputStream::Reasoning, "thinking");
@@ -53,6 +53,7 @@ fn apply_daemon_image_message_pushes_displayed_image() {
                 tai_proto::DisplayedImageRecord {
                     metadata: metadata.clone(),
                     data: png,
+                    tool_call_id: None,
                 },
             )),
         },

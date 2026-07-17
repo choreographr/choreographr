@@ -127,6 +127,18 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let _ = tx.send(SessionCommand::Cancel { request_id });
             }
         }
+        ClientMessage::Undo => {
+            debug!("client {}: Undo", ctx.client_id);
+            if let Some(tx) = ctx.attached_session_tx {
+                let _ = tx.send(SessionCommand::Undo);
+            }
+        }
+        ClientMessage::Redo => {
+            debug!("client {}: Redo", ctx.client_id);
+            if let Some(tx) = ctx.attached_session_tx {
+                let _ = tx.send(SessionCommand::Redo);
+            }
+        }
         ClientMessage::Ping => {
             debug!("client {}: Ping", ctx.client_id);
             let _ = ctx.writer_tx.send(DaemonMessage::Pong);

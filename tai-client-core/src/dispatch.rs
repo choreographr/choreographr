@@ -14,13 +14,21 @@ pub trait DaemonMessageHandler {
     /// answer text that follows them.
     fn insert_session_message_before_stream(&mut self, request_id: u32, message: SessionMessage);
 
-    fn begin_stream(&mut self, request_id: u32);
+    fn begin_stream(&mut self, request_id: u32, message_id: u32);
     fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str);
     fn finalize_stream(&mut self, request_id: u32);
 
     /// Begin a tool result stream for the given tool call.
+    /// `message_id` is the anticipated message_id of the subsequent
+    /// `ToolResult` — the stream shares this id for ordering.
     /// Default implementation falls back to push_tool_text.
-    fn begin_tool_result_stream(&mut self, request_id: u32, call_id: &str, tool_name: &str) {
+    fn begin_tool_result_stream(
+        &mut self,
+        request_id: u32,
+        call_id: &str,
+        tool_name: &str,
+        _message_id: u32,
+    ) {
         self.push_tool_text(
             request_id,
             format!("[{request_id}] tool {tool_name}#{call_id} streaming"),
@@ -43,6 +51,14 @@ pub trait DaemonMessageHandler {
     fn drop_request(&mut self, request_id: u32) {
         self.finalize_stream(request_id);
     }
+
+    /// Remove messages by their message_id from the client's history view.
+    /// Used by undo to hide messages without removing them from the server.
+    fn remove_messages_by_id(&mut self, message_ids: &[u32]);
+
+    /// Insert restored messages back into the client's history view.
+    /// Used by redo to re-display messages that were previously hidden.
+    fn restore_messages(&mut self, messages: Vec<SessionMessage>);
 }
 
 // ── Session lifecycle ─────────────────────────────────────────
@@ -130,6 +146,14 @@ fn dispatch_session<H: DaemonMessageHandler>(
             // handler just acknowledges it so the match is exhaustive.
             Ok(())
         }
+        DaemonMessage::SessionMessagesUndone { message_ids } => {
+            handler.remove_messages_by_id(&message_ids);
+            Ok(())
+        }
+        DaemonMessage::SessionMessagesRedone { messages } => {
+            handler.restore_messages(messages);
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -141,8 +165,11 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
     msg: DaemonMessage,
 ) -> Result<(), ClientError> {
     match msg {
-        DaemonMessage::Started { request_id } => {
-            handler.begin_stream(request_id);
+        DaemonMessage::Started {
+            request_id,
+            message_id,
+        } => {
+            handler.begin_stream(request_id, message_id);
             Ok(())
         }
         DaemonMessage::ToolCallStarted {
@@ -150,8 +177,9 @@ fn dispatch_stream_lifecycle<H: DaemonMessageHandler>(
             call_id,
             tool_name,
             arguments_json,
+            message_id,
         } => {
-            handler.begin_tool_result_stream(request_id, &call_id, &tool_name);
+            handler.begin_tool_result_stream(request_id, &call_id, &tool_name, message_id);
             handler.push_tool_text(
                 request_id,
                 format!("[{request_id}] tool {tool_name}#{call_id} start {arguments_json}"),
@@ -414,7 +442,9 @@ pub fn dispatch_daemon_message<H: DaemonMessageHandler>(
         | DaemonMessage::SessionFailed { .. }
         | DaemonMessage::SessionMessageAppended { .. }
         | DaemonMessage::SessionDeleted { .. }
-        | DaemonMessage::SessionDeleteFailed { .. }) => dispatch_session(handler, m),
+        | DaemonMessage::SessionDeleteFailed { .. }
+        | DaemonMessage::SessionMessagesUndone { .. }
+        | DaemonMessage::SessionMessagesRedone { .. }) => dispatch_session(handler, m),
 
         // Stream lifecycle (start, finish, tool calls)
         m @ (DaemonMessage::Started { .. }
@@ -530,7 +560,7 @@ mod tests {
                     request_id, message,
                 ));
         }
-        fn begin_stream(&mut self, request_id: u32) {
+        fn begin_stream(&mut self, request_id: u32, _message_id: u32) {
             self.events.push_back(TestEvent::BeginStream(request_id));
         }
         fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
@@ -542,6 +572,12 @@ mod tests {
         }
         fn finalize_stream(&mut self, request_id: u32) {
             self.events.push_back(TestEvent::FinalizeStream(request_id));
+        }
+        fn remove_messages_by_id(&mut self, _message_ids: &[u32]) {
+            // No-op in tests; the session dispatcher just calls through.
+        }
+        fn restore_messages(&mut self, _messages: Vec<SessionMessage>) {
+            // No-op in tests; the session dispatcher just calls through.
         }
     }
 
@@ -918,9 +954,17 @@ mod tests {
     #[test]
     fn started_begins_stream() {
         let mut h = TestHandler::new();
-        dispatch_daemon_message(&mut h, DaemonMessage::Started { request_id: 7 }).unwrap();
+        dispatch_daemon_message(
+            &mut h,
+            DaemonMessage::Started {
+                request_id: 7,
+                message_id: 7,
+            },
+        )
+        .unwrap();
         let events = h.collect_events();
         assert!(events.contains(&TestEvent::BeginStream(7)));
+        // TestEvent doesn't carry message_id; just verify no crash with non-zero.
     }
 
     #[test]
@@ -1012,6 +1056,7 @@ mod tests {
                 call_id: "call_1".into(),
                 tool_name: "read_file".into(),
                 arguments_json: r#"{"path": "/tmp/x"}"#.into(),
+                message_id: 7,
             },
         )
         .unwrap();

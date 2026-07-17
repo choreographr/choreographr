@@ -419,6 +419,7 @@ mod tests {
                 call_id: "call_1".into(),
                 tool_name: "read".into(),
                 arguments_json: r#"{"path":"/tmp"}"#.into(),
+                message_id: 1,
             },
             &mut assembler,
             &mut buffers,

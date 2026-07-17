@@ -79,8 +79,8 @@ impl DaemonMessageHandler for AppState {
             .insert_before_stream(request_id, HistoryItem::SessionMessage(message));
     }
 
-    fn begin_stream(&mut self, request_id: u32) {
-        self.client.begin_stream(request_id);
+    fn begin_stream(&mut self, request_id: u32, _message_id: u32) {
+        self.client.begin_stream(request_id, 0);
     }
 
     fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
@@ -93,5 +93,13 @@ impl DaemonMessageHandler for AppState {
 
     fn drop_request(&mut self, request_id: u32) {
         self.client.drop_request(request_id);
+    }
+
+    fn remove_messages_by_id(&mut self, message_ids: &[u32]) {
+        self.client.remove_messages_by_id(message_ids);
+    }
+
+    fn restore_messages(&mut self, messages: Vec<SessionMessage>) {
+        self.client.restore_messages(messages);
     }
 }

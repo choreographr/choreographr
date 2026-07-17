@@ -27,6 +27,8 @@ pub enum ShellCommand {
     RemoveCredential {
         service: String,
     },
+    Undo,
+    Redo,
     InvalidCancel(String),
     UnknownCommand(String),
     Empty,
@@ -319,6 +321,13 @@ fn parse_command(
         return ShellCommand::Send(ClientMessage::Lock);
     }
 
+    if rest == "undo" {
+        return ShellCommand::Undo;
+    }
+    if rest == "redo" {
+        return ShellCommand::Redo;
+    }
+
     if rest == "image" {
         let request_id = *next_request_id;
         *next_request_id = next_request_id.wrapping_add(1);
@@ -371,6 +380,8 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
             Some(format!("> /add-key {service}{suffix}"))
         }
         ShellCommand::RemoveCredential { service } => Some(format!("> /remove-key {service}")),
+        ShellCommand::Undo => Some("> undo".to_string()),
+        ShellCommand::Redo => Some("> redo".to_string()),
         _ => None,
     }
 }

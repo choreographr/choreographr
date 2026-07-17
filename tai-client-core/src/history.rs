@@ -7,6 +7,7 @@ pub const MAX_HISTORY_ITEMS: usize = 500;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamingText {
+    pub message_id: u32,
     pub request_id: u32,
     pub reasoning: String,
     pub answer: String,
@@ -15,6 +16,7 @@ pub struct StreamingText {
 impl StreamingText {
     pub fn new(request_id: u32) -> Self {
         Self {
+            message_id: 0,
             request_id,
             reasoning: String::new(),
             answer: String::new(),
@@ -38,6 +40,7 @@ impl StreamingText {
 /// daemon's post-request snapshot arrives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultStreamData {
+    pub message_id: u32,
     pub request_id: u32,
     pub call_id: String,
     pub tool_name: String,
@@ -95,6 +98,12 @@ impl<TImage> ClientHistory<TImage> {
         self.trim_history();
     }
 
+    /// Insert an item at a specific index, trimming excess history afterward.
+    pub fn insert_at(&mut self, index: usize, item: HistoryItem<TImage>) {
+        self.history.insert(index, item);
+        self.trim_history();
+    }
+
     pub fn insert_before_stream(&mut self, request_id: u32, item: HistoryItem<TImage>) {
         if let Some(&index) = self.in_progress.get(&request_id) {
             self.history.insert(index, item);
@@ -114,14 +123,18 @@ impl<TImage> ClientHistory<TImage> {
         self.insert_before_stream(request_id, HistoryItem::Text(text.into()));
     }
 
-    pub fn begin_stream(&mut self, request_id: u32) {
+    pub fn begin_stream(&mut self, request_id: u32, message_id: u32) {
         trace!("begin stream for request {request_id}");
         if self.in_progress.contains_key(&request_id) {
             return;
         }
         let index = self.history.len();
-        self.history
-            .push(HistoryItem::Streaming(StreamingText::new(request_id)));
+        self.history.push(HistoryItem::Streaming(StreamingText {
+            message_id,
+            request_id,
+            reasoning: String::new(),
+            answer: String::new(),
+        }));
         self.in_progress.insert(request_id, index);
         self.trim_history();
     }
@@ -129,7 +142,7 @@ impl<TImage> ClientHistory<TImage> {
     pub fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
         trace!("append stream for request {request_id}: {stream:?}");
         if !self.in_progress.contains_key(&request_id) {
-            self.begin_stream(request_id);
+            self.begin_stream(request_id, 0);
         }
         if let Some(&index) = self.in_progress.get(&request_id)
             && let Some(HistoryItem::Streaming(entry)) = self.history.get_mut(index)
@@ -182,11 +195,13 @@ impl<TImage> ClientHistory<TImage> {
         request_id: u32,
         call_id: String,
         tool_name: String,
+        message_id: u32,
     ) {
         if self.tool_streams.contains_key(&request_id) {
             return;
         }
         let item = HistoryItem::ToolResultStream(ToolResultStreamData {
+            message_id,
             request_id,
             call_id,
             tool_name,
@@ -244,6 +259,56 @@ impl<TImage> ClientHistory<TImage> {
         }
     }
 
+    /// Remove messages by their message_id from history.
+    /// Used by undo to hide messages without removing them from the server.
+    pub fn remove_messages_by_id(&mut self, message_ids: &[u32]) {
+        let ids: std::collections::HashSet<&u32> = message_ids.iter().collect();
+        self.history.retain(|item| {
+            if let HistoryItem::SessionMessage(msg) = item {
+                !ids.contains(&msg.message_id)
+            } else {
+                // Don't remove non-session-message items (streaming, text, etc.)
+                true
+            }
+        });
+    }
+
+    /// Insert restored messages back into the client's history view in
+    /// `message_id` order at the correct position so that history remains
+    /// sorted by `message_id` at all times.
+    /// Used by redo to re-display messages that were previously hidden.
+    pub fn restore_messages(&mut self, messages: Vec<SessionMessage>) {
+        let mut pending: Vec<_> = messages
+            .into_iter()
+            .filter(|msg| {
+                !self.history.iter().any(|item| {
+                    matches!(item, HistoryItem::SessionMessage(m) if m.message_id == msg.message_id)
+                })
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        pending.sort_by_key(|m| m.message_id);
+
+        // Find the position where the first restored message belongs (before
+        // the first existing SessionMessage with a larger message_id).
+        let first_id = pending[0].message_id;
+        let insert_at = self
+            .history
+            .iter()
+            .position(
+                |item| matches!(item, HistoryItem::SessionMessage(m) if m.message_id > first_id),
+            )
+            .unwrap_or(self.history.len());
+
+        for (i, msg) in pending.into_iter().enumerate() {
+            self.history
+                .insert(insert_at + i, HistoryItem::SessionMessage(msg));
+        }
+        self.trim_history();
+    }
+
     /// Remove a tool result stream without finalizing it (cleanup).
     fn drop_tool_result_stream(&mut self, request_id: u32) {
         if let Some(index) = self.tool_streams.remove(&request_id)
@@ -298,6 +363,7 @@ impl<TImage> ClientHistory<TImage> {
 mod tests {
     use super::*;
     use crate::DiffHunk;
+    use tai_proto::{SessionMessageKind, TimestampMs};
 
     fn sample_diffs() -> Vec<FileDiff> {
         vec![FileDiff {
@@ -342,7 +408,7 @@ mod tests {
     fn insert_diff_before_stream_inserts_in_middle() {
         let mut hist: ClientHistory<()> =
             ClientHistory::new(vec![HistoryItem::Text("before".into())]);
-        hist.begin_stream(7);
+        hist.begin_stream(7, 0);
         assert_eq!(hist.history.len(), 2);
         assert_eq!(hist.in_progress.get(&7), Some(&1));
 
@@ -373,7 +439,7 @@ mod tests {
     fn begin_tool_result_stream_creates_entry_and_tracks_index() {
         let mut hist: ClientHistory<()> =
             ClientHistory::new(vec![HistoryItem::Text("before".into())]);
-        hist.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+        hist.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
 
         assert!(
             hist.tool_streams.contains_key(&1),
@@ -396,11 +462,11 @@ mod tests {
     #[test]
     fn begin_tool_result_stream_is_idempotent() {
         let mut hist: ClientHistory<()> = ClientHistory::new(vec![]);
-        hist.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+        hist.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
         assert_eq!(hist.history.len(), 1);
 
         // Calling again with the same request_id should be a no-op.
-        hist.begin_tool_result_stream(1, "call_2".into(), "write_file".into());
+        hist.begin_tool_result_stream(1, "call_2".into(), "write_file".into(), 2);
         assert_eq!(hist.history.len(), 1, "should not add a second entry");
         match &hist.history[0] {
             HistoryItem::ToolResultStream(data) => {
@@ -414,8 +480,8 @@ mod tests {
     #[test]
     fn begin_tool_result_stream_inserts_before_streaming_item() {
         let mut hist: ClientHistory<()> = ClientHistory::new(vec![]);
-        hist.begin_stream(1); // Streaming item at index 0
-        hist.begin_tool_result_stream(1, "call_1".into(), "grep".into());
+        hist.begin_stream(1, 0); // Streaming item at index 0
+        hist.begin_tool_result_stream(1, "call_1".into(), "grep".into(), 1);
 
         // Tool result stream should be inserted BEFORE the streaming item.
         let stream_idx = hist.in_progress[&1];
@@ -429,7 +495,7 @@ mod tests {
     #[test]
     fn append_tool_result_updates_accumulated_text() {
         let mut hist: ClientHistory<()> = ClientHistory::new(vec![]);
-        hist.begin_tool_result_stream(1, "call_1".into(), "grep".into());
+        hist.begin_tool_result_stream(1, "call_1".into(), "grep".into(), 1);
 
         hist.append_tool_result(1, "hello\n");
         hist.append_tool_result(1, "world");
@@ -453,7 +519,7 @@ mod tests {
     #[test]
     fn finalize_tool_result_stream_marks_error_and_returns_content() {
         let mut hist: ClientHistory<()> = ClientHistory::new(vec![]);
-        hist.begin_tool_result_stream(1, "call_1".into(), "read_file".into());
+        hist.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
         hist.append_tool_result(1, "error: not found");
 
         let result = hist.finalize_tool_result_stream(1, true);
@@ -481,8 +547,8 @@ mod tests {
     fn drop_request_removes_both_stream_and_tool_stream() {
         let mut hist: ClientHistory<()> =
             ClientHistory::new(vec![HistoryItem::Text("keep".into())]);
-        hist.begin_stream(1); // index 1
-        hist.begin_tool_result_stream(1, "call_1".into(), "ls".into()); // index 1 (before stream)
+        hist.begin_stream(1, 0); // index 1
+        hist.begin_tool_result_stream(1, "call_1".into(), "ls".into(), 1); // index 1 (before stream)
 
         assert!(hist.in_progress.contains_key(&1));
         assert!(hist.tool_streams.contains_key(&1));
@@ -504,7 +570,7 @@ mod tests {
                 .collect(),
         );
         // The tool stream is appended at the end.
-        hist.begin_tool_result_stream(1, "call_1".into(), "grep".into());
+        hist.begin_tool_result_stream(1, "call_1".into(), "grep".into(), 1);
         let before_idx = hist.tool_streams[&1];
         assert_eq!(before_idx, MAX_HISTORY_ITEMS - 1);
 
@@ -529,7 +595,7 @@ mod tests {
                 .map(|i| HistoryItem::Text(format!("line {i}")))
                 .collect(),
         );
-        hist.begin_tool_result_stream(1, "c1".into(), "grep".into());
+        hist.begin_tool_result_stream(1, "c1".into(), "grep".into(), 1);
         assert!(hist.tool_streams.contains_key(&1));
 
         // drop_request removes the tool result stream.
@@ -552,7 +618,7 @@ mod tests {
             HistoryItem::Text("survivor".into()),
         ]);
         // Insert tool stream at index 2 (after two text items).
-        hist.begin_tool_result_stream(1, "c1".into(), "grep".into());
+        hist.begin_tool_result_stream(1, "c1".into(), "grep".into(), 1);
         assert_eq!(hist.tool_streams[&1], 2);
 
         // Push enough items to trigger trimming of the first item (index 0).
@@ -580,6 +646,7 @@ mod tests {
             .collect();
         // Replace the first item with a ToolResultStream.
         items[0] = HistoryItem::ToolResultStream(ToolResultStreamData {
+            message_id: 0,
             request_id: 1,
             call_id: "c1".into(),
             tool_name: "grep".into(),
@@ -603,5 +670,185 @@ mod tests {
         );
         // The new item should be at the back.
         assert!(matches!(hist.history.last().unwrap(), HistoryItem::Text(t) if t == "new item"));
+    }
+
+    // ── remove_messages_by_id / restore_messages tests ────────────────────
+
+    #[test]
+    fn remove_messages_by_id_removes_matching_session_messages() {
+        let mut hist: ClientHistory<()> = ClientHistory::new(vec![
+            HistoryItem::Text("keep".into()),
+            HistoryItem::SessionMessage(SessionMessage {
+                message_id: 10,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::UserText {
+                    content: "remove".into(),
+                },
+                deleted: false,
+            }),
+            HistoryItem::SessionMessage(SessionMessage {
+                message_id: 11,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::AssistantText {
+                    content: "keep".into(),
+                    reasoning: None,
+                    token_usage: None,
+                },
+                deleted: false,
+            }),
+        ]);
+        assert_eq!(hist.history.len(), 3);
+
+        hist.remove_messages_by_id(&[10]);
+
+        assert_eq!(hist.history.len(), 2, "only the user text removed");
+        assert!(matches!(&hist.history[0], HistoryItem::Text(_)));
+        assert!(matches!(&hist.history[1], HistoryItem::SessionMessage(m) if m.message_id == 11));
+    }
+
+    #[test]
+    fn remove_messages_by_id_preserves_non_session_items() {
+        let mut hist: ClientHistory<()> = ClientHistory::new(vec![
+            HistoryItem::Text("txt".into()),
+            HistoryItem::Streaming(StreamingText::new(1)),
+            HistoryItem::ToolResultStream(ToolResultStreamData {
+                message_id: 5,
+                request_id: 1,
+                call_id: "c1".into(),
+                tool_name: "grep".into(),
+                accumulated_text: String::new(),
+                is_error: false,
+            }),
+        ]);
+        // The message_ids [5] won't match any HistoryItem::SessionMessage.
+        hist.remove_messages_by_id(&[5]);
+        assert_eq!(hist.history.len(), 3, "non-session items preserved");
+    }
+
+    #[test]
+    fn remove_messages_by_id_handles_empty_list() {
+        let mut hist: ClientHistory<()> =
+            ClientHistory::new(vec![HistoryItem::SessionMessage(SessionMessage {
+                message_id: 1,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::UserText {
+                    content: "hi".into(),
+                },
+                deleted: false,
+            })]);
+        // Empty message_ids list — nothing should change.
+        hist.remove_messages_by_id(&[]);
+        assert_eq!(hist.history.len(), 1);
+    }
+
+    #[test]
+    fn restore_messages_inserts_in_message_id_order() {
+        let mut hist: ClientHistory<()> =
+            ClientHistory::new(vec![HistoryItem::SessionMessage(SessionMessage {
+                message_id: 10,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::UserText {
+                    content: "existing".into(),
+                },
+                deleted: true,
+            })]);
+
+        let to_restore = vec![
+            SessionMessage {
+                message_id: 5,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::AssistantText {
+                    content: "a".into(),
+                    reasoning: None,
+                    token_usage: None,
+                },
+                deleted: false,
+            },
+            SessionMessage {
+                message_id: 8,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::AssistantText {
+                    content: "b".into(),
+                    reasoning: None,
+                    token_usage: None,
+                },
+                deleted: false,
+            },
+        ];
+
+        hist.restore_messages(to_restore);
+
+        assert_eq!(hist.history.len(), 3, "two restored + one existing");
+        // Order should be message_id 5, 8, 10
+        assert_eq!(
+            hist.history
+                .iter()
+                .filter_map(|item| match item {
+                    HistoryItem::SessionMessage(m) => Some(m.message_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![5, 8, 10],
+        );
+    }
+
+    #[test]
+    fn restore_messages_skips_ids_already_present() {
+        let mut hist: ClientHistory<()> =
+            ClientHistory::new(vec![HistoryItem::SessionMessage(SessionMessage {
+                message_id: 5,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::UserText {
+                    content: "present".into(),
+                },
+                deleted: false,
+            })]);
+
+        let to_restore = vec![
+            SessionMessage {
+                message_id: 5,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::UserText {
+                    content: "duplicate".into(),
+                },
+                deleted: false,
+            },
+            SessionMessage {
+                message_id: 10,
+                parent_id: None,
+                created_at: TimestampMs::now(),
+                kind: SessionMessageKind::AssistantText {
+                    content: "new".into(),
+                    reasoning: None,
+                    token_usage: None,
+                },
+                deleted: false,
+            },
+        ];
+
+        hist.restore_messages(to_restore);
+
+        // Only the new id 10 should be inserted (id 5 already exists).
+        assert_eq!(hist.history.len(), 2);
+        assert!(
+            hist.history
+                .iter()
+                .any(|item| matches!(item, HistoryItem::SessionMessage(m) if m.message_id == 10))
+        );
+    }
+
+    #[test]
+    fn restore_messages_empty_pending_is_noop() {
+        let mut hist: ClientHistory<()> = ClientHistory::new(vec![]);
+        hist.restore_messages(vec![]);
+        assert!(hist.history.is_empty());
     }
 }

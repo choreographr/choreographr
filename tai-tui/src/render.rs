@@ -19,7 +19,9 @@ use ratatui::{
 use ratatui_image::StatefulImage;
 use tai_client_core::history::ToolResultStreamData;
 use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
-use tai_proto::{ImageMetadata, SessionMessage, SessionMessageKind, SessionStatus, ThinkingEffort};
+use tai_proto::{
+    ImageMetadata, SessionMessage, SessionMessageKind, SessionStatus, ThinkingEffort, TimestampMs,
+};
 
 use tui_prompts::{
     Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
@@ -947,12 +949,18 @@ fn render_item_tool_result_stream(
     rows_to_skip: &mut usize,
     user_content_width: u16,
 ) {
-    let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-        call_id: data.call_id.clone(),
-        name: data.tool_name.clone(),
-        content: data.accumulated_text.clone(),
-        is_error: data.is_error,
-    });
+    let msg = SessionMessage {
+        message_id: data.message_id,
+        parent_id: None,
+        created_at: TimestampMs::now(),
+        kind: SessionMessageKind::ToolResult {
+            call_id: data.call_id.clone(),
+            name: data.tool_name.clone(),
+            content: data.accumulated_text.clone(),
+            is_error: data.is_error,
+        },
+        deleted: false,
+    };
     let lines = session_message_lines(&msg, user_content_width);
     render_margin_lines(
         frame,

@@ -46,7 +46,7 @@ fn app_push_text_trims_history_to_limit() {
 fn drop_request_removes_active_request() {
     let mut app = test_app("/tmp/tai.sock");
     app.active.insert(42);
-    app.begin_stream(42);
+    app.begin_stream(42, 0);
     app.drop_request(42);
     assert!(!app.active.contains(&42));
     assert!(!app.client.in_progress.contains_key(&42));
@@ -55,7 +55,7 @@ fn drop_request_removes_active_request() {
 #[test]
 fn append_stream_text_updates_mutable_history_entry() {
     let mut app = test_app("/tmp/tai.sock");
-    app.begin_stream(7);
+    app.begin_stream(7, 0);
     app.append_stream_text(7, OutputStream::Reasoning, "thinking");
     app.append_stream_text(7, OutputStream::Answer, "hello");
     app.append_stream_text(7, OutputStream::Answer, " world");
@@ -78,7 +78,7 @@ fn append_stream_text_preserves_manual_scroll_position() {
     app.history_viewport.height = 1;
     app.push_text("older");
     app.push_text("older still");
-    app.begin_stream(7);
+    app.begin_stream(7, 0);
     app.scroll_up(3);
 
     app.append_stream_text(7, OutputStream::Answer, "hello");
@@ -95,7 +95,7 @@ fn append_stream_text_preserves_manual_scroll_position() {
 #[test]
 fn append_stream_text_keeps_following_when_at_bottom() {
     let mut app = test_app("/tmp/tai.sock");
-    app.begin_stream(7);
+    app.begin_stream(7, 0);
 
     app.append_stream_text(7, OutputStream::Answer, "hello");
 
@@ -130,6 +130,7 @@ fn wrapped_line_height_uses_terminal_display_width() {
 fn streaming_text_lines_include_reasoning_and_answer() {
     let lines = streaming_text_lines(
         &StreamingTextItem {
+            message_id: 9,
             request_id: 9,
             reasoning: "step by step".to_string(),
             answer: "final".to_string(),
@@ -137,8 +138,8 @@ fn streaming_text_lines_include_reasoning_and_answer() {
         80,
     );
 
-    assert_eq!(lines[0].to_string(), "[9]");
-    // Indices: [9], "", "Reasoning:", "step by step", "", "Response:", "final"
+    assert_eq!(lines[0].to_string(), "mid:9");
+    // Indices: "mid:9", "", "Reasoning:", "step by step", "", "Response:", "final"
     assert_eq!(lines[3].to_string(), "step by step");
     assert_eq!(lines[6].to_string(), "final");
 }
@@ -147,6 +148,7 @@ fn streaming_text_lines_include_reasoning_and_answer() {
 fn streaming_text_lines_preserve_newlines() {
     let lines = streaming_text_lines(
         &StreamingTextItem {
+            message_id: 3,
             request_id: 3,
             reasoning: "line one\nline two".to_string(),
             answer: "final one\nfinal two".to_string(),
@@ -154,7 +156,7 @@ fn streaming_text_lines_preserve_newlines() {
         80,
     );
 
-    assert_eq!(lines[0].to_string(), "[3]");
+    assert_eq!(lines[0].to_string(), "mid:3");
     // Indices: [3], "", "Reasoning:", "line one", "line two", "", "Response:", "final one", "final two"
     assert_eq!(lines[3].to_string(), "line one");
     assert_eq!(lines[4].to_string(), "line two");
@@ -918,7 +920,7 @@ fn streaming_growth_above_viewport_preserves_visible_content_offset() {
     app.history_viewport.height = 1;
     app.push_text("older history");
     app.push_text("older history two");
-    app.begin_stream(7);
+    app.begin_stream(7, 0);
     app.scroll_up(2);
 
     app.append_stream_text(7, OutputStream::Answer, "123456");

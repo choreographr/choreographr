@@ -212,6 +212,7 @@ fn session_message_all_variants_round_trip() {
                 alt: None,
             },
             data: vec![],
+            tool_call_id: None,
         }),
     ];
     for kind in variants {

@@ -81,6 +81,12 @@ pub(crate) fn handle_shell_command(
                 ClientMessage::RemoveCredential { service },
             );
         }
+        ShellCommand::Undo => {
+            send_client_message(state, daemon_tx, ClientMessage::Undo);
+        }
+        ShellCommand::Redo => {
+            send_client_message(state, daemon_tx, ClientMessage::Redo);
+        }
     }
 }
 

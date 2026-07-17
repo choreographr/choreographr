@@ -161,6 +161,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: crate::tg_api::Message)
             }
         }
         ShellCommand::Empty | ShellCommand::InvalidCancel(_) => {}
+        ShellCommand::Undo | ShellCommand::Redo => {}
     }
 }
 

@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use tai_proto::{SessionMessage, SessionMessageKind};
@@ -95,7 +95,13 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
 }
 
 pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec<Line<'static>> {
-    match &message.kind {
+    let mut prefix = vec![Line::from(vec![Span::styled(
+        format!("mid:{}", message.message_id),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )])];
+    let body = match &message.kind {
         SessionMessageKind::SystemText { content } => {
             labeled_text_lines("system", content, Color::DarkGray)
         }
@@ -184,13 +190,22 @@ pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec
         // be reached at runtime — it exists only for exhaustive matching.
         SessionMessageKind::DisplayedImage(_) => vec![],
         _ => vec![],
-    }
+    };
+    prefix.extend(body);
+    prefix
 }
 
 pub(crate) fn streaming_text_lines(text: &StreamingText, width: u16) -> Vec<Line<'static>> {
+    let header = if text.message_id > 0 {
+        format!("mid:{}", text.message_id)
+    } else {
+        format!("[{}]", text.request_id)
+    };
     let mut lines = vec![Line::from(Span::styled(
-        format!("[{}]", text.request_id),
-        Style::default().fg(Color::DarkGray),
+        header,
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
     ))];
 
     if !text.reasoning.is_empty() {
@@ -1350,13 +1365,15 @@ mod tests {
             is_error: false,
         });
         let lines = session_message_lines(&msg, 80);
-        // Line 0: header "tool result: run_riscv"
-        assert_eq!(lines[0].to_string(), "tool result: run_riscv");
-        // Line 1: blank separator; Line 2: ```rust
+        // Line 0: mid prefix
+        assert_eq!(lines[0].to_string(), "mid:0");
+        // Line 1: header "tool result: run_riscv"
+        assert_eq!(lines[1].to_string(), "tool result: run_riscv");
+        // Line 2: blank separator; Line 3: ```rust
         assert!(
-            lines[2].to_string().contains("```rust"),
+            lines[3].to_string().contains("```rust"),
             "{}",
-            lines[2].to_string()
+            lines[3].to_string()
         );
         // The highlighted line for "fn main() {}" should have colour spans
         let has_colour = lines
@@ -1389,9 +1406,10 @@ mod tests {
             is_error: false,
         });
         let lines = session_message_lines(&msg, 80);
-        assert_eq!(lines[0].to_string(), "tool result: echo");
-        assert!(lines.len() >= 2, "should have body line");
-        let body: String = lines[1..]
+        assert_eq!(lines[0].to_string(), "mid:0");
+        assert_eq!(lines[1].to_string(), "tool result: echo");
+        assert!(lines.len() >= 3, "mid + header + body");
+        let body: String = lines[2..]
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
@@ -1408,7 +1426,8 @@ mod tests {
             is_error: true,
         });
         let lines = session_message_lines(&msg, 80);
-        assert_eq!(lines[0].to_string(), "tool error: run_riscv");
+        assert_eq!(lines[0].to_string(), "mid:0");
+        assert_eq!(lines[1].to_string(), "tool error: run_riscv");
         // Error results should NOT have syntax highlighting — they should
         // render the content verbatim (no colour spans from syntect).
         let has_syntax_colour = lines
@@ -1419,7 +1438,7 @@ mod tests {
             !has_syntax_colour,
             "error tool result should not have coloured spans"
         );
-        let body: String = lines[1..]
+        let body: String = lines[2..]
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
@@ -1435,12 +1454,14 @@ mod tests {
             token_usage: None,
         });
         let lines = session_message_lines(&msg, 80);
+        // Line 0: mid prefix
+        assert_eq!(lines[0].to_string(), "mid:0");
         // The "Reasoning" heading should be on its own line
         assert_eq!(
-            lines[0].to_string(),
+            lines[1].to_string(),
             "Reasoning:",
-            "first line should be the Reasoning heading: {:?}",
-            lines[0].to_string()
+            "second line should be the Reasoning heading: {:?}",
+            lines[1].to_string()
         );
         // The reasoning body should be present
         let all_text: String = lines
@@ -1472,9 +1493,10 @@ mod tests {
             content: "hello world".into(),
         });
         let lines = session_message_lines(&msg, 80);
-        assert_eq!(lines.len(), 1, "plain text should produce one line");
+        assert_eq!(lines.len(), 2, "mid prefix + plain text");
+        assert_eq!(lines[0].to_string(), "mid:0");
         assert_eq!(
-            lines[0].to_string(),
+            lines[1].to_string(),
             "hello world",
             "content should be preserved verbatim"
         );
@@ -1486,15 +1508,17 @@ mod tests {
             content: "```rust\nfn main() {}\n```".into(),
         });
         let lines = session_message_lines(&msg, 80);
-        // Should have: ```rust, highlighted code line, ```
+        // Line 0: mid prefix
+        assert_eq!(lines[0].to_string(), "mid:0");
+        // Should have: mid, ```rust, highlighted code line, ```
         assert!(
-            lines.len() >= 3,
-            "code block should produce at least 3 lines, got {}",
+            lines.len() >= 4,
+            "code block should produce at least 4 lines, got {}",
             lines.len()
         );
         assert!(
-            lines[0].to_string().contains("```rust"),
-            "first line should be the opening fence"
+            lines[1].to_string().contains("```rust"),
+            "second line should be the opening fence"
         );
         // The highlighted line should have colour spans from syntect
         let has_syntax_colour = lines
@@ -1516,7 +1540,8 @@ mod tests {
         let msg = SessionMessage::now(SessionMessageKind::UserText { content: "".into() });
         let lines = session_message_lines(&msg, 80);
         assert!(!lines.is_empty(), "should not return empty vec");
-        assert_eq!(lines[0].width(), 0, "empty input → empty line");
+        assert_eq!(lines[0].to_string(), "mid:0");
+        assert_eq!(lines[1].width(), 0, "empty input → empty line");
     }
 
     #[test]
@@ -1544,12 +1569,14 @@ mod tests {
             token_usage: None,
         });
         let lines = session_message_lines(&msg, 80);
-        // First line should be the "Response" heading
+        // First line should be the mid prefix
+        assert_eq!(lines[0].to_string(), "mid:0");
+        // Second line should be the "Response" heading
         assert_eq!(
-            lines[0].to_string(),
+            lines[1].to_string(),
             "Response:",
-            "first line should be the Response heading: {:?}",
-            lines[0].to_string()
+            "second line should be the Response heading: {:?}",
+            lines[1].to_string()
         );
         let all_text: String = lines
             .iter()
