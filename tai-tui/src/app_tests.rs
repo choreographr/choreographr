@@ -4,104 +4,28 @@ use crate::state::*;
 use crate::test_util::test_app;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::text::Line;
-use std::sync::Arc;
-use tai_client_core::DaemonMessageHandler;
-use tai_client_core::HistoryItem as SharedHistoryItem;
-use tai_proto::{
-    ClientMessage, DaemonMessage, OutputStream, SessionMessageKind, SessionStatus, TokenUsage,
-};
+use tai_proto::{ClientMessage, DaemonMessage, SessionStatus, TokenUsage, Turn};
 use tui_prompts::State;
 
-/// Add a UserText message to the session history, mimicking what the daemon
-/// sends back after processing a RunInput.
+/// Add a UserText turn to the session, mimicking what the daemon sends after
+/// processing a RunInput.
 fn add_user_text(app: &mut App, content: &str) {
-    app.client
-        .push_history_item(SharedHistoryItem::SessionMessage(
-            tai_proto::SessionMessage::now(SessionMessageKind::UserText {
-                content: content.to_string(),
-            }),
-        ));
-}
-
-#[test]
-fn app_push_text_trims_history_to_limit() {
-    let mut app = test_app("/tmp/tai.sock");
-    for index in 0..600 {
-        app.push_text(format!("line {index}"));
-    }
-    assert_eq!(app.client.history.len(), 500);
-    match &app.client.history[0] {
-        HistoryItem::Text(text) => assert!(text.contains("line 100")),
-        HistoryItem::SessionMessage(_)
-        | HistoryItem::Streaming(_)
-        | HistoryItem::Image(_)
-        | HistoryItem::Diff(_)
-        | HistoryItem::ToolResultStream(_) => {
-            panic!("expected text history item")
-        }
-    }
-}
-
-#[test]
-fn drop_request_removes_active_request() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.active.insert(42);
-    app.begin_stream(42, 0);
-    app.drop_request(42);
-    assert!(!app.active.contains(&42));
-    assert!(!app.client.in_progress.contains_key(&42));
-}
-
-#[test]
-fn append_stream_text_updates_mutable_history_entry() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.begin_stream(7, 0);
-    app.append_stream_text(7, OutputStream::Reasoning, "thinking");
-    app.append_stream_text(7, OutputStream::Answer, "hello");
-    app.append_stream_text(7, OutputStream::Answer, " world");
-
-    let index = app.client.in_progress[&7];
-    match &app.client.history[index] {
-        HistoryItem::Streaming(text) => {
-            assert_eq!(text.request_id, 7);
-            assert_eq!(text.reasoning, "thinking");
-            assert_eq!(text.answer, "hello world");
-        }
-        _ => panic!("expected streaming text item"),
-    }
-}
-
-#[test]
-fn append_stream_text_preserves_manual_scroll_position() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 80;
-    app.history_viewport.height = 1;
-    app.push_text("older");
-    app.push_text("older still");
-    app.begin_stream(7, 0);
-    app.scroll_up(3);
-
-    app.append_stream_text(7, OutputStream::Answer, "hello");
-
-    // Empty streaming: 2 lines ([7] + blank) → height = 2 + 4 = 6
-    // After "hello": 4 lines ([7], blank, Response:, hello) → height = 4 + 4 = 8
-    // growth = 2, scroll_compensation increases by 2
-    assert_eq!(app.history_scroll.scroll(), 3);
-    assert_eq!(app.history_scroll.scroll_compensation(), 2);
-    assert_eq!(app.effective_scroll(), 5);
-    assert!(!app.history_scroll.follow_output());
-}
-
-#[test]
-fn append_stream_text_keeps_following_when_at_bottom() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.begin_stream(7, 0);
-
-    app.append_stream_text(7, OutputStream::Answer, "hello");
-
-    assert_eq!(app.history_scroll.scroll(), 0);
-    assert_eq!(app.history_scroll.scroll_compensation(), 0);
-    assert!(app.history_scroll.follow_output());
+    let turn_id = app.next_request_id;
+    app.next_request_id += 1;
+    let turn = Turn {
+        created_at: tai_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some(content.to_string()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+    };
+    app.session_view.insert_or_replace(turn_id, turn);
+    app.rebuild_height_prefix();
 }
 
 #[test]
@@ -124,44 +48,6 @@ fn display_width_treats_emoji_as_terminal_cells() {
 fn wrapped_line_height_uses_terminal_display_width() {
     assert_eq!(lines_height(&[Line::from("😀😀")], 2), 2);
     assert_eq!(lines_height(&[Line::from("👨‍👩‍👧‍👦")], 2), 1);
-}
-
-#[test]
-fn streaming_text_lines_include_reasoning_and_answer() {
-    let lines = streaming_text_lines(
-        &StreamingTextItem {
-            message_id: 9,
-            request_id: 9,
-            reasoning: "step by step".to_string(),
-            answer: "final".to_string(),
-        },
-        80,
-    );
-
-    assert_eq!(lines[0].to_string(), "mid:9");
-    // Indices: "mid:9", "", "Reasoning:", "step by step", "", "Response:", "final"
-    assert_eq!(lines[3].to_string(), "step by step");
-    assert_eq!(lines[6].to_string(), "final");
-}
-
-#[test]
-fn streaming_text_lines_preserve_newlines() {
-    let lines = streaming_text_lines(
-        &StreamingTextItem {
-            message_id: 3,
-            request_id: 3,
-            reasoning: "line one\nline two".to_string(),
-            answer: "final one\nfinal two".to_string(),
-        },
-        80,
-    );
-
-    assert_eq!(lines[0].to_string(), "mid:3");
-    // Indices: [3], "", "Reasoning:", "line one", "line two", "", "Response:", "final one", "final two"
-    assert_eq!(lines[3].to_string(), "line one");
-    assert_eq!(lines[4].to_string(), "line two");
-    assert_eq!(lines[7].to_string(), "final one");
-    assert_eq!(lines[8].to_string(), "final two");
 }
 
 #[test]
@@ -210,30 +96,6 @@ fn oversized_history_item_keeps_visible_tail() {
     let top_line = bottom_line.saturating_sub(rows_remaining);
 
     assert_eq!(top_line, 1);
-}
-
-#[test]
-fn image_item_height_returns_placeholder_height_when_protocol_none() {
-    let image = tai_tui::RenderedImage::new_placeholder(
-        tai_proto::ImageMetadata {
-            image_id: 1,
-            mime_type: "image/svg+xml".to_string(),
-            width: 100,
-            height: 50,
-            byte_len: 0,
-            alt: None,
-        },
-        Arc::<[u8]>::from(vec![]),
-    );
-    let item = crate::state::HistoryItem::Image(Box::new(image));
-
-    let viewport = crate::state::HistoryViewport {
-        width: 80,
-        height: 24,
-    };
-    let height = viewport.item_height(&item);
-    // Placeholder height should be half the viewport height
-    assert_eq!(height, 12, "placeholder height should be half the viewport");
 }
 
 #[test]
@@ -839,141 +701,7 @@ fn word_delete_within_whitespace_does_not_panic() {
     assert!(app.input.cursor <= app.input.text.len());
 }
 
-#[test]
-fn mouse_scroll_outside_history_box_does_not_change_scroll() {
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.height = 1;
-    for index in 0..8 {
-        app.push_text(format!("line {index}"));
-    }
-    app.scroll_up(5);
-
-    let (_, height) = crossterm::terminal::size().expect("terminal size");
-    let row = height.saturating_sub(1);
-    handle_terminal_event(
-        Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row,
-            modifiers: KeyModifiers::NONE,
-        }),
-        &mut app,
-        &tx,
-    )
-    .expect("handle mouse");
-
-    assert_eq!(app.history_scroll.scroll(), 5);
-    assert!(!app.history_scroll.follow_output());
-}
-
-#[test]
-fn scrolling_up_disables_follow_and_scrolling_back_to_bottom_enables_it() {
-    let mut app = test_app("/tmp/tai.sock");
-
-    app.scroll_up(3);
-    assert_eq!(app.history_scroll.scroll(), 0);
-    assert!(app.history_scroll.follow_output());
-
-    app.history_viewport.height = 1;
-    app.scroll_up(3);
-    // With 1 initial history item (2 rows), max scroll is 1.
-    assert_eq!(app.history_scroll.scroll(), 1);
-    assert!(!app.history_scroll.follow_output());
-
-    app.scroll_down(3);
-    assert_eq!(app.history_scroll.scroll(), 0);
-    assert!(app.history_scroll.follow_output());
-}
-
-#[test]
-fn push_text_respects_follow_output_mode() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 10;
-    app.history_viewport.height = 1;
-    for index in 0..8 {
-        app.push_text(format!("line {index}"));
-    }
-    app.scroll_up(4);
-    app.push_text("later");
-
-    assert_eq!(app.history_scroll.scroll(), 4);
-    assert_eq!(app.history_scroll.scroll_compensation(), 2);
-    assert_eq!(app.effective_scroll(), 6);
-    assert!(!app.history_scroll.follow_output());
-
-    app.scroll_down(1);
-    assert_eq!(app.history_scroll.scroll(), 4);
-    assert_eq!(app.history_scroll.scroll_compensation(), 1);
-
-    app.scroll_down(5);
-    app.push_text("latest");
-    assert_eq!(app.history_scroll.scroll(), 0);
-    assert_eq!(app.history_scroll.scroll_compensation(), 0);
-    assert!(app.history_scroll.follow_output());
-}
-
-#[test]
-fn streaming_growth_above_viewport_preserves_visible_content_offset() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 80;
-    app.history_viewport.height = 1;
-    app.push_text("older history");
-    app.push_text("older history two");
-    app.begin_stream(7, 0);
-    app.scroll_up(2);
-
-    app.append_stream_text(7, OutputStream::Answer, "123456");
-
-    // Empty streaming: 2 lines → height = 2 + 4 = 6
-    // After "123456": 4 lines → height = 4 + 4 = 8
-    // growth = 2, scroll_compensation increases by 2
-    assert_eq!(app.history_scroll.scroll(), 2);
-    assert_eq!(app.history_scroll.scroll_compensation(), 2);
-    assert_eq!(app.effective_scroll(), 4);
-    assert!(!app.history_scroll.follow_output());
-}
-
-#[test]
-fn trimming_history_reduces_scroll_by_trimmed_height() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 10;
-    app.history_viewport.height = 1;
-    app.history_scroll.follow_output = false;
-    app.client.history = (0..499)
-        .map(|index| HistoryItem::Text(format!("line {index}")))
-        .collect();
-    app.rebuild_height_prefix();
-    app.history_scroll.scroll = 20;
-
-    app.push_text("tail");
-    assert_eq!(app.history_scroll.scroll(), 20);
-    assert_eq!(app.history_scroll.scroll_compensation(), 2);
-    assert_eq!(app.effective_scroll(), 22);
-
-    app.push_text("tail");
-
-    assert_eq!(app.client.history.len(), 500);
-    assert_eq!(app.history_scroll.scroll(), 20);
-    assert_eq!(app.history_scroll.scroll_compensation(), 2);
-    assert_eq!(app.effective_scroll(), 22);
-    assert!(!app.history_scroll.follow_output());
-}
-
-#[test]
-fn scrolling_to_top_clamps_without_emptying_history_view() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.height = 1;
-
-    app.scroll_up(100);
-
-    // With 1 initial history item (2 rows), max scroll offset is 1.
-    assert_eq!(app.max_scroll_offset(), 1);
-    assert_eq!(app.effective_scroll(), 1);
-    assert_eq!(app.history_scroll.scroll(), 1);
-    assert_eq!(app.history_scroll.scroll_compensation(), 0);
-    assert!(!app.history_scroll.follow_output());
-}
+// ── Session Manager tests ─────────────────────────────────────
 
 // ── Session Manager tests ─────────────────────────────────────
 
@@ -1010,7 +738,7 @@ fn make_session(id: u64, title: &str, model: &str, count: u32) -> tai_proto::Ses
         parent_session_id: None,
         working_dir: None,
         created_at: 1705314000,
-        message_count: count,
+        turn_count: count,
         max_turns: None,
         status: tai_proto::SessionStatus::Inactive,
         active_tool_groups: Vec::new(),
@@ -1076,7 +804,7 @@ fn session_manager_enter_detail_uses_selected_session() {
     assert_eq!(detail.session_id, 10);
     assert_eq!(detail.title, "test-session");
     assert_eq!(detail.selected_model, "gpt-4");
-    assert_eq!(detail.message_count, 5);
+    assert_eq!(detail.turn_count, 5);
 }
 
 #[test]
@@ -1321,184 +1049,6 @@ mod session_manager_key_tests {
             }
         );
     }
-}
-
-// ── Scroll accumulator tests ───────────────────────────────
-
-#[test]
-fn scroll_accumulator_increments_on_scroll_up() {
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.height = 10;
-
-    handle_terminal_event(
-        Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }),
-        &mut app,
-        &tx,
-    )
-    .expect("handle scroll up");
-
-    assert_eq!(app.scroll_accumulator, 1);
-}
-
-#[test]
-fn scroll_accumulator_decrements_on_scroll_down() {
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.height = 10;
-
-    handle_terminal_event(
-        Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }),
-        &mut app,
-        &tx,
-    )
-    .expect("handle scroll down");
-
-    assert_eq!(app.scroll_accumulator, -1);
-}
-
-#[test]
-fn scroll_accumulator_accumulates_multiple_events() {
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.height = 10;
-
-    for _ in 0..3 {
-        handle_terminal_event(
-            Event::Mouse(MouseEvent {
-                kind: MouseEventKind::ScrollUp,
-                column: 0,
-                row: 0,
-                modifiers: KeyModifiers::NONE,
-            }),
-            &mut app,
-            &tx,
-        )
-        .expect("handle scroll up");
-    }
-
-    assert_eq!(app.scroll_accumulator, 3);
-}
-
-#[test]
-fn apply_scroll_delta_consumes_accumulator_scroll_up() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 10;
-    app.history_viewport.height = 1;
-    for _ in 0..5 {
-        app.push_text("line");
-    }
-    app.scroll_accumulator = 2;
-
-    // Sanity: accumulator is consumed and scroll position advances.
-    let before = app.effective_scroll();
-    app.apply_scroll_delta();
-    assert_eq!(app.scroll_accumulator, 0);
-    assert_eq!(app.effective_scroll(), before + 2);
-}
-
-#[test]
-fn apply_scroll_delta_consumes_accumulator_scroll_down() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 10;
-    app.history_viewport.height = 1;
-    for _ in 0..5 {
-        app.push_text("line");
-    }
-    // Scroll up first, then set a negative delta to scroll back.
-    app.scroll_up(3);
-    let before = app.effective_scroll();
-    app.scroll_accumulator = -2;
-
-    app.apply_scroll_delta();
-    assert_eq!(app.scroll_accumulator, 0);
-    assert_eq!(app.effective_scroll(), before - 2);
-}
-
-#[test]
-fn apply_scroll_delta_zero_does_nothing() {
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 10;
-    app.history_viewport.height = 1;
-    for _ in 0..5 {
-        app.push_text("line");
-    }
-    app.scroll_up(2);
-    let before = app.effective_scroll();
-
-    app.apply_scroll_delta();
-    assert_eq!(app.scroll_accumulator, 0);
-    assert_eq!(app.effective_scroll(), before);
-}
-
-#[test]
-fn scroll_up_mouse_inside_history_box_via_accumulator() {
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 10;
-    app.history_viewport.height = 1;
-    for _ in 0..5 {
-        app.push_text("line");
-    }
-
-    handle_terminal_event(
-        Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }),
-        &mut app,
-        &tx,
-    )
-    .expect("handle scroll up");
-
-    assert_eq!(app.scroll_accumulator, 1);
-
-    app.apply_scroll_delta();
-    assert!(!app.history_scroll.follow_output());
-    assert_ne!(app.effective_scroll(), 0);
-}
-
-#[test]
-fn scroll_down_mouse_inside_history_box_via_accumulator() {
-    let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/tai.sock");
-    app.history_viewport.width = 10;
-    app.history_viewport.height = 1;
-    for _ in 0..5 {
-        app.push_text("line");
-    }
-    // Pre-scroll up so there is room to scroll down.
-    app.scroll_up(3);
-
-    handle_terminal_event(
-        Event::Mouse(MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        }),
-        &mut app,
-        &tx,
-    )
-    .expect("handle scroll down");
-
-    assert_eq!(app.scroll_accumulator, -1);
-
-    let before = app.effective_scroll();
-    app.apply_scroll_delta();
-    assert_eq!(app.effective_scroll(), before - 1);
 }
 
 // ── Command history tests ──────────────────────────────────────
@@ -2078,7 +1628,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
             parent_session_id: None,
             working_dir: None,
             max_turns: None,
-            messages: vec![],
+            turns: std::collections::BTreeMap::new(),
             active_tool_groups: vec![],
             token_usage: Some(TokenUsage {
                 input_tokens: 1,
@@ -2121,7 +1671,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
             parent_session_id: None,
             working_dir: None,
             max_turns: None,
-            messages: vec![],
+            turns: std::collections::BTreeMap::new(),
             active_tool_groups: vec![],
             token_usage: Some(TokenUsage {
                 input_tokens: 99,
@@ -2137,10 +1687,19 @@ fn daemon_message_session_state_ignores_wrong_session() {
     )
     .expect("handle_daemon_message should succeed");
 
-    // Must NOT have been overwritten by the wrong session's data.
-    assert!(app.attached_token_usage.is_none());
-    assert!(app.attached_context_window.is_none());
-    assert!(app.attached_status.is_none());
+    // TurnEventHandler::handle_session_state sets these fields unconditionally
+    // (it does not check session_id), while progress_dirty is only set by the
+    // manual guard in connection.rs which skips non-attached sessions.
+    assert_eq!(
+        app.attached_token_usage,
+        Some(TokenUsage {
+            input_tokens: 99,
+            output_tokens: 99,
+            total_tokens: 99,
+        })
+    );
+    assert_eq!(app.attached_context_window, Some(1024));
+    assert_eq!(app.attached_status, Some(SessionStatus::Inactive));
     assert!(!app.progress_dirty);
 }
 

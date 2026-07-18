@@ -1,55 +1,31 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Rect, Size};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tai_client_core::{
-    ClientError, ClientHistory, DaemonMessageHandler, HistoryItem as SharedHistoryItem,
-    MAX_HISTORY_ITEMS, ToolResultStreamData, broken_pipe,
-};
+use tai_client_core::dispatch::ToolCallEvent;
+use tai_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
 use tai_proto::{
-    AccountInfo, ClientMessage, ImageMetadata, OutputStream, SessionMessage, SessionMessageKind,
-    SessionStatus, SessionSummary, ThinkingEffort, TokenUsage,
+    AccountInfo, ClientMessage, OutputStream, SessionStatus, SessionSummary, ThinkingEffort,
+    TokenUsage, Turn,
 };
+use tai_tui::RenderedImage;
 use tai_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
-use tai_tui::{RenderedImage, StreamingText};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::diff_render::{diff_display_height, is_diff_text, parse_diff};
-use crate::markdown_render::{lines_height, session_message_lines, streaming_text_lines};
+use crate::markdown_render::{lines_height, render_turn_lines};
 use ratatui::text::Line;
-use tai_client_core::FileDiff;
 use tui_prompts::{SelectState, State, TextState};
-
-/// If the text looks like a unified diff and can be parsed successfully,
-/// return the structured diffs. Otherwise return `None`.
-fn try_parse_as_diff(text: &str) -> Option<Vec<FileDiff>> {
-    if is_diff_text(text) {
-        let diffs = parse_diff(text);
-        if !diffs.is_empty() {
-            return Some(diffs);
-        }
-    }
-    None
-}
 
 pub(crate) const INPUT_BAR_HEIGHT: u16 = 3;
 pub(crate) const STATUS_BAR_HEIGHT: u16 = 2;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
-/// Number of terminal lines occupied by one AI provider account entry in the
-/// list view (3 content lines + 1 blank separator).
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
 
-/// Structural rows added by `add_margin_lines` in the renderer around
-/// assistant/user messages: top separator, top padding, bottom padding,
-/// bottom separator.
-///
-/// Defined here (rather than in `render.rs`) because `item_height` in
-/// `HistoryViewport` must mirror the layout that `render` produces, and
-/// state should not depend on the render module.
 pub(crate) const STRUCTURAL_ROWS: usize = 4;
 
-/// A menu item on the Home page.
+pub(crate) const IMAGE_BLOCK_HEIGHT: u16 = 10;
+pub(crate) const STATUS_ERROR_BAR_HEIGHT: u16 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HomeMenuItem {
     Sessions,
@@ -106,12 +82,6 @@ pub(crate) enum AIProvidersView {
     NewForm,
 }
 
-/// A provider entry in the new-account form dropdown.
-///
-/// Note: This list must be kept in sync with `tai-daemon/src/providers/catalog.rs`.
-/// There is no compile-time cross-crate sharing, so the daemon catalog is the
-/// source of truth and this list should be updated whenever providers are added
-/// or removed there.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProviderInfo {
     pub(crate) slug: &'static str,
@@ -119,7 +89,6 @@ pub(crate) struct ProviderInfo {
 }
 
 pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
-    // Core providers first
     ProviderInfo {
         slug: "openai",
         display_name: "OpenAI",
@@ -132,7 +101,6 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
         slug: "google",
         display_name: "Google Gemini",
     },
-    // OpenAI-compatible, roughly alphabetical
     ProviderInfo {
         slug: "cerebras",
         display_name: "Cerebras",
@@ -233,7 +201,6 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
         slug: "zai",
         display_name: "Z.ai (GLM)",
     },
-    // Anthropic-compatible
     ProviderInfo {
         slug: "minimax",
         display_name: "MiniMax",
@@ -244,25 +211,17 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
     },
 ];
 
-/// State for the AI Provider Accounts page.
 pub(crate) struct AIProvidersState {
     pub(crate) accounts: Vec<AccountInfo>,
     pub(crate) view: AIProvidersView,
     pub(crate) selection: Option<usize>,
     pub(crate) scroll: usize,
     pub(crate) confirm_remove: Option<String>,
-    /// State for the account name text prompt.
     pub(crate) new_name_state: TextState<'static>,
-    /// State for the provider select prompt.
     pub(crate) new_provider_state: SelectState,
-    /// State for the API key password prompt.
     pub(crate) new_api_key_state: TextState<'static>,
-    /// When set, the user is typing a credential (API key) for this account name.
     pub(crate) credential_target: Option<String>,
-    /// Input buffer for typing a credential value.
     pub(crate) credential_input: InputBuffer,
-    /// Whether the last add operation failed — stored here so the renderer
-    /// can show it without interfering with the history.
     pub(crate) add_error: Option<String>,
 }
 
@@ -335,7 +294,6 @@ impl AIProvidersState {
         if self.accounts.len() == old_len {
             return;
         }
-        // Adjust selection
         if let Some(sel) = self.selection
             && sel >= self.accounts.len()
         {
@@ -345,41 +303,34 @@ impl AIProvidersState {
                 Some(self.accounts.len().saturating_sub(1))
             };
         }
-        // Clamp scroll
         let max_scroll = self.accounts.len().saturating_sub(1);
         self.scroll = self.scroll.min(max_scroll);
-        // Clear confirmation
         if self.confirm_remove.as_deref() == Some(name) {
             self.confirm_remove = None;
         }
     }
 
-    /// Enter the new-account form and reset all form fields.
     pub(crate) fn enter_new_form(&mut self) {
         self.view = AIProvidersView::NewForm;
         self.new_name_state = TextState::default();
         self.new_provider_state = SelectState::default();
         self.new_api_key_state = TextState::default();
         self.add_error = None;
-        // Focus the name field so key events are routed there.
         self.new_name_state.focus();
     }
 
-    /// Enter credential-input mode for a specific account.
     pub(crate) fn enter_credential(&mut self, account_name: String) {
         self.credential_target = Some(account_name);
         self.credential_input = InputBuffer::new();
         self.add_error = None;
     }
 
-    /// Leave credential-input mode.
     pub(crate) fn leave_credential(&mut self) {
         self.credential_target = None;
         self.credential_input = InputBuffer::new();
         self.add_error = None;
     }
 
-    /// Leave the new-account form back to the list view.
     pub(crate) fn leave_new_form(&mut self) {
         self.view = AIProvidersView::List;
         self.new_name_state = TextState::default();
@@ -397,18 +348,13 @@ pub(crate) struct SessionDetailData {
     pub(crate) parent_session_id: Option<u64>,
     pub(crate) working_dir: String,
     pub(crate) created_at: i64,
-    pub(crate) message_count: u32,
+    pub(crate) turn_count: u32,
     pub(crate) max_turns: Option<u32>,
     pub(crate) status: SessionStatus,
     pub(crate) active_tool_groups: Vec<String>,
-    /// The AI provider account associated with this session, if any.
     pub(crate) account_name: Option<String>,
-    /// Accumulated token usage for this session, if tracked.
     pub(crate) accumulated_usage: Option<TokenUsage>,
-    /// Model context window size for this session, if known.
     pub(crate) context_window: Option<u32>,
-    /// The prompt_tokens from the most recent API response (the actual
-    /// context size being sent to the model), if available.
     pub(crate) last_prompt_tokens: Option<u32>,
 }
 
@@ -419,33 +365,18 @@ pub(crate) struct SessionManagerState {
     pub(crate) scroll: usize,
     pub(crate) detail_data: Option<SessionDetailData>,
     pub(crate) confirm_delete: Option<(u64, String)>,
-    /// Error message to display on the session manager page (e.g.
-    /// daemon-locked, create failure). Cleared on next successful
-    /// session list refresh.
     pub(crate) error: Option<String>,
 }
 
-/// A user-text marker on the scrollbar track, indicating the position
-/// of a `UserText` message in the chat history.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Marker {
-    /// 0-based content-line position in the full history (oldest-first).
     pub content_line: usize,
-    /// Virtual-track slot position, pre-computed at render time so the
-    /// click handler does not need to recompute it with a potentially
-    /// different total_height (which changes as streaming content grows).
     pub virtual_slot: usize,
 }
 
-/// Cached rendering of a history item whose content does not change between
-/// frames.  Stored alongside the item in `App::render_cache` to avoid
-/// re-running markdown parsing and syntect highlighting on every render.
 #[derive(Clone)]
 pub(crate) struct RenderedCache {
-    /// The rendered styled lines at `width`.
     pub lines: Vec<Line<'static>>,
-    /// Terminal width at which `lines` were computed. When the terminal is
-    /// resized the next render will detect the mismatch and recompute.
     pub width: u16,
 }
 
@@ -453,144 +384,44 @@ pub(crate) struct App {
     pub(crate) input: InputBuffer,
     pub(crate) next_request_id: u32,
     pub(crate) active: HashSet<u32>,
-    pub(crate) client: ClientHistory<Box<RenderedImage>>,
+    pub(crate) session_view: SessionView,
+    pub(crate) rendered_images: HashMap<u32, HashMap<usize, RenderedImage>>,
     pub(crate) history_scroll: HistoryScrollState,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
     pub(crate) image_job_tx: Option<crossbeam::channel::Sender<ImageJob>>,
-    /// Maps in-flight job IDs to their history index for O(1) result
-    /// dispatch.  Entries are inserted when a job is submitted and removed
-    /// when the result arrives or the image is trimmed from history.
-    pub(crate) pending_job_idx: HashMap<ImageId, usize>,
     pub(crate) attached_session_id: Option<u64>,
-    /// Cached account name for the attached session — populated by
-    /// `handle_session_attached` so the status bar can render without
-    /// iterating the session list each frame.
     pub(crate) attached_account_name: Option<String>,
-    /// Cached model name for the attached session.
     pub(crate) attached_model: Option<String>,
-    /// Cached reasoning effort for the attached session.
     pub(crate) attached_reasoning_effort: Option<ThinkingEffort>,
-    /// Cached provider slug for the attached session, resolved from the
-    /// account name against `ai_providers.accounts`.
     pub(crate) attached_provider_slug: Option<String>,
-    /// Cached working directory for the attached session.
     pub(crate) attached_working_dir: Option<String>,
-    /// Cached status for the attached session, updated live from
-    /// `SessionStatusChanged` so the chat toolbar can render it
-    /// without iterating the session list each frame.
     pub(crate) attached_status: Option<SessionStatus>,
     pub(crate) page: Page,
-    /// The page the user was on before opening the Home menu.  `Esc` on the
-    /// Home page returns to this page.
     pub(crate) previous_page: Page,
-    pub(crate) home_selection: usize, // index into HOME_MENU_ITEMS
+    pub(crate) home_selection: usize,
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
-    /// Accumulated scroll-wheel delta consumed each frame.
-    ///
-    /// Mouse scroll events increment/decrement this counter instead of
-    /// adjusting the scroll position immediately.  Once per frame
-    /// `apply_scroll_delta` reads it, resets it to zero, and applies
-    /// the total delta in one batch.  This coalesces multiple events
-    /// that arrive between frames into a single operation, making fast
-    /// trackpad scrolling smooth while ensuring scrolling stops
-    /// instantly when the finger lifts (no momentum carry-over).
     pub(crate) scroll_accumulator: isize,
-    /// `true` while the user is dragging the scrollbar thumb with
-    /// the mouse button held.  While active, `Drag` events update
-    /// the scroll position even when the cursor moves outside the
-    /// narrow scrollbar column.  Cleared on mouse-up or any mouse
-    /// event that is not a drag.
     pub(crate) scrollbar_dragging: bool,
-
-    /// User-text marker positions on the scrollbar track, recomputed each
-    /// frame during rendering.  Used by the scrollbar click handler to
-    /// jump to the corresponding UserText.
     pub(crate) markers: Vec<Marker>,
-
-    /// Prefix-sum array of history item heights for O(1) total height
-    /// and O(log n) item lookup via binary search.
-    /// `height_prefix[i]` = cumulative height of items 0 through i (inclusive).
     pub(crate) height_prefix: Vec<usize>,
-
-    /// When true, the marker cache is stale and will be
-    /// recomputed on the next call to `compute_total_height_and_markers`.
     pub(crate) markers_dirty: bool,
-
-    /// Last terminal size queried from crossterm, cached to avoid a syscall
-    /// every frame.
     pub(crate) last_terminal_size: Option<(u16, u16)>,
-    /// Set to `true` when a SIGWINCH / terminal-resize event is received.
-    /// The next call to `update_viewport_from_terminal_size` will re-query
-    /// the terminal size and clear this flag.
     pub(crate) terminal_resized: bool,
-
-    // ── Command history ─────────────────────────────────────────
-    /// Current position when navigating history with Up/Down.
-    /// `None` = not navigating.  `Some(0)` = most recent entry.
     pub(crate) history_index: Option<usize>,
-
-    /// A copy of the input text taken the moment the user first presses Up.
-    /// Restored when pressing Down past the newest entry.
     pub(crate) saved_draft: String,
-
-    /// Per-item render cache, indexed in lockstep with `client.history`.
-    ///
-    /// Each entry caches the rendered `Vec<Line>` and height for history
-    /// items whose content never changes (`SessionMessage`, `Text`, `Diff`).
-    /// `None` means the item has not been rendered yet, is stale after a
-    /// resize, or is a `Streaming` item that is never cached.
-    ///
-    /// The cache is rebuilt from scratch (all `None`s) whenever the history
-    /// vector grows or shrinks — this is O(n) but only happens on mutation,
-    /// never during scrolling.
     pub(crate) render_cache: Vec<Option<RenderedCache>>,
-
-    /// Index into `client.history` of the image currently displayed
-    /// fullscreen.  `None` means no fullscreen overlay is active.
-    /// The existing `StatefulProtocol` is rendered directly (no re-decode).
-    pub(crate) fullscreen_image_idx: Option<usize>,
-
-    /// Token usage for the currently-attached session, updated from
-    /// `SessionState` and `Done` messages.
+    pub(crate) fullscreen_image_target: Option<(u32, usize)>,
     pub(crate) attached_token_usage: Option<TokenUsage>,
-    /// Context window size for the currently-attached session's model.
     pub(crate) attached_context_window: Option<u32>,
-    /// The prompt_tokens from the most recent API response (the actual
-    /// context size being sent to the model) for the attached session.
     pub(crate) attached_last_prompt_tokens: Option<u32>,
-    /// Set to `true` when the terminal-native progress bar data or current
-    /// page changes.  The render loop checks and clears this once per frame
-    /// instead of emitting the OSC sequence unconditionally.
     pub(crate) progress_dirty: bool,
-
-    // ── Session replay state ──────────────────────────────────────
-    /// Set to `true` while `SessionState` messages are being replayed
-    /// (initial load or session switch).  During replay, `push_session_message`
-    /// generates synthetic tool-call lifecycle text entries (`[N] tool
-    /// start/output/done`) that match the live `push_tool_text` format but
-    /// would otherwise be absent because `dispatch_stream_lifecycle` is not
-    /// invoked during replay.
-    pub(crate) replaying_history: bool,
-    /// Maps tool `call_id` → history index for `ToolResultStream` entries
-    /// that have been finalized (stream is done) but haven't yet been
-    /// replaced by the canonical `SessionMessage(ToolResult)` from the
-    /// daemon's post-request snapshot.  Populated by
-    /// `finalize_tool_result_stream`, consumed by `push_session_message`.
-    pub(crate) pending_tool_result_replacement: HashMap<String, usize>,
-    /// Descending counter for synthetic request IDs used during replay.
-    /// Starts at `u32::MAX` to avoid collision with live request IDs
-    /// (which count up from 1).
-    pub(crate) next_replay_request_id: u32,
-    /// During replay, maps each tool `call_id` to the synthetic request ID
-    /// assigned by `push_replay_tool_text` so that the corresponding
-    /// `ToolResult` can emit `[N] done` under the same ID.
-    pub(crate) replay_call_id_to_rid: HashMap<String, u32>,
-    /// Tracks how many outstanding `ToolResult` messages are still expected
-    /// per synthetic request ID.  `[N] done` is emitted only after the final
-    /// result arrives (handles parallel tool calls correctly).
-    pub(crate) replay_rid_pending: HashMap<u32, usize>,
+    pub(crate) status: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) visible_turn_ids: Vec<u32>,
+    /// Maps in-flight job IDs to their (turn_id, img_idx) for O(1) result dispatch.
+    pub(crate) pending_job_idx: HashMap<ImageId, (u32, usize)>,
 }
 
 #[derive(Clone, Copy)]
@@ -606,13 +437,7 @@ pub(crate) struct HistoryScrollState {
     pub(crate) follow_output: bool,
 }
 
-pub(crate) type HistoryItem = SharedHistoryItem<Box<RenderedImage>>;
-pub(crate) type StreamingTextItem = StreamingText;
-
 pub(crate) enum UiEvent {
-    /// Boxed because DaemonMessage (~208 B) dwarfs the 0-sized ReaderClosed
-    /// variant.  Boxing puts the payload on the heap so the enum stays small
-    /// and clippy::large_enum_variant stays quiet.
     Daemon(Box<tai_proto::DaemonMessage>),
     ReaderClosed,
 }
@@ -628,75 +453,6 @@ impl HistoryViewport {
     pub(crate) fn update(&mut self, area: Rect) {
         self.width = area.width.max(1);
         self.height = area.height;
-    }
-
-    pub(crate) fn item_height(&self, item: &HistoryItem) -> usize {
-        match item {
-            HistoryItem::Text(text) => {
-                history_text_height(text, self.width.saturating_sub(2)).max(1) + 1
-            }
-            HistoryItem::SessionMessage(message) => {
-                // Margin-styled variants (AssistantText, AssistantToolUse,
-                // UserText) reserve 9 columns for the accent bar + padding,
-                // and add 4 structural rows (top sep, top pad, bottom pad,
-                // bottom sep).  See add_margin_lines in render.rs.
-                //
-                // Non-margin variants use a 2-column indent and a single
-                // blank-line separator.  Both must match the height that
-                // the renderer actually produces — keep in sync with
-                // render_item_session_message and helpers in render.rs.
-                let content_width = if message.kind.is_margin_message() {
-                    self.width.saturating_sub(9)
-                } else {
-                    self.width.saturating_sub(2)
-                };
-                let lines = session_message_lines(message, content_width);
-                let content_height = lines_height(&lines, content_width).max(1);
-                if message.kind.is_margin_message() {
-                    // 4 structural rows: top separator, top padding,
-                    // bottom padding, bottom separator.
-                    // Use unwrapped line count to match add_margin_lines
-                    // in render.rs — lines_height would overcount when
-                    // lines wrap across terminal rows.
-                    lines.len() + STRUCTURAL_ROWS
-                } else {
-                    // 1 blank-line separator below the content block.
-                    content_height + 1
-                }
-            }
-            HistoryItem::Streaming(text) => {
-                // Use the same layout as AssistantText: 9 columns for the
-                // accent bar + padding, and STRUCTURAL_ROWS (top sep, top
-                // pad, bottom pad, bottom sep).  Must stay in sync with
-                // render_item_streaming in render.rs.
-                let content_width = self.width.saturating_sub(9);
-                let lines = streaming_text_lines(text, content_width);
-                // Use unwrapped line count to match add_margin_lines in
-                // render.rs — lines_height would overcount when lines wrap.
-                lines.len() + STRUCTURAL_ROWS
-            }
-            HistoryItem::Image(_) => {
-                // Use a stable height for layout and click-target calculations
-                // regardless of encoding state.  The actual rendered height
-                // in render_item_image uses the protocol dimensions, but the
-                // scroll / click logic always sees the same value so that
-                // find_history_item_at_row does not shift after encoding.
-                (self.height / 2).max(1) as usize
-            }
-            HistoryItem::ToolResultStream(data) => {
-                // Same layout as ToolResult: margin styling with red bar.
-                let content_width = self.width.saturating_sub(9);
-                let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-                    call_id: data.call_id.clone(),
-                    name: data.tool_name.clone(),
-                    content: data.accumulated_text.clone(),
-                    is_error: data.is_error,
-                });
-                let lines = session_message_lines(&msg, content_width);
-                lines.len() + STRUCTURAL_ROWS
-            }
-            HistoryItem::Diff(diffs) => diff_display_height(diffs) + 2,
-        }
     }
 }
 
@@ -732,7 +488,6 @@ impl HistoryScrollState {
         if effective <= max_scroll {
             return;
         }
-
         let overflow = effective - max_scroll;
         let compensation_reduction = self.scroll_compensation.min(overflow);
         self.scroll_compensation -= compensation_reduction;
@@ -866,7 +621,7 @@ impl SessionManagerState {
             let parent_session_id = s.parent_session_id;
             let working_dir = s.working_dir.clone().unwrap_or_else(|| "-".to_string());
             let created_at = s.created_at;
-            let message_count = s.message_count;
+            let turn_count = s.turn_count;
             let max_turns = s.max_turns;
             SessionDetailData {
                 session_id,
@@ -876,7 +631,7 @@ impl SessionManagerState {
                 parent_session_id,
                 working_dir,
                 created_at,
-                message_count,
+                turn_count,
                 max_turns,
                 status: s.status.clone(),
                 active_tool_groups: s.active_tool_groups.clone(),
@@ -896,8 +651,6 @@ impl SessionManagerState {
         self.detail_data = None;
     }
 
-    /// Remove a session by ID from the list, adjusting selection and scroll
-    /// state.  Safe to call even when the session is not in the list.
     pub(crate) fn remove_session(&mut self, id: u64) {
         let old_len = self.sessions.len();
         self.sessions.retain(|s| s.session_id != id);
@@ -905,7 +658,6 @@ impl SessionManagerState {
         if removed == 0 {
             return;
         }
-        // Adjust selection
         if let Some(sel) = self.selection
             && sel >= self.sessions.len()
         {
@@ -915,10 +667,8 @@ impl SessionManagerState {
                 Some(self.sessions.len().saturating_sub(1))
             };
         }
-        // Clamp scroll to valid range after removal
         let max_scroll = self.sessions.len().saturating_sub(1);
         self.scroll = self.scroll.min(max_scroll);
-        // If detail view was showing this session, go back to list
         if self
             .detail_data
             .as_ref()
@@ -927,14 +677,11 @@ impl SessionManagerState {
             self.view = SessionManagerView::List;
             self.detail_data = None;
         }
-        // Clear any pending confirmation
         if self.confirm_delete.as_ref().map(|(sid, _)| *sid) == Some(id) {
             self.confirm_delete = None;
         }
     }
 
-    /// Set an error message to display on the session manager page.
-    /// Cleared automatically on the next successful `set_sessions` call.
     pub(crate) fn set_error(&mut self, msg: impl Into<String>) {
         self.error = Some(msg.into());
     }
@@ -967,8 +714,6 @@ impl InputBuffer {
         self.cursor = 0;
     }
 
-    // ── Cursor movement ────────────────────────────────────────
-
     pub(crate) fn cursor_left(&mut self) {
         let prefix = &self.text[..self.cursor];
         if let Some((start, _)) = prefix.grapheme_indices(true).next_back() {
@@ -994,9 +739,6 @@ impl InputBuffer {
         self.cursor = self.text.len();
     }
 
-    // ── Word movement ──────────────────────────────────────────
-
-    /// Returns the byte position of the word boundary before current cursor.
     fn word_left_boundary(&self) -> usize {
         let s = &self.text[..self.cursor];
         let trimmed = s.trim_end();
@@ -1009,15 +751,12 @@ impl InputBuffer {
             .unwrap_or(0)
     }
 
-    /// Returns the byte position of the word boundary after current cursor.
     fn word_right_boundary(&self) -> usize {
         let s = &self.text[self.cursor..];
         if s.is_empty() {
             return self.cursor;
         }
         let mut chars = s.char_indices().peekable();
-
-        // Skip past the current word if not at whitespace
         if chars.peek().is_some_and(|&(_, c)| !c.is_whitespace()) {
             for (_, c) in chars.by_ref() {
                 if c.is_whitespace() {
@@ -1025,12 +764,9 @@ impl InputBuffer {
                 }
             }
         }
-
-        // Skip whitespace to find the start of the next word
         while chars.peek().is_some_and(|&(_, c)| c.is_whitespace()) {
             chars.next();
         }
-
         self.cursor + chars.next().map(|(pos, _)| pos).unwrap_or(s.len())
     }
 
@@ -1041,8 +777,6 @@ impl InputBuffer {
     pub(crate) fn word_right(&mut self) {
         self.cursor = self.word_right_boundary();
     }
-
-    // ── Editing ────────────────────────────────────────────────
 
     pub(crate) fn insert_char_at_cursor(&mut self, c: char) {
         self.text.insert(self.cursor, c);
@@ -1093,14 +827,6 @@ impl InputBuffer {
         self.cursor = 0;
     }
 
-    /// Map a `KeyEvent` to an edit operation on the buffer.
-    ///
-    /// Returns `true` if the key was consumed by the buffer (character input,
-    /// cursor movement, text editing).  Returns `false` for keys the caller
-    /// should handle itself (Enter, Tab, Esc, and any unrecognised key).
-    ///
-    /// The key-event-kind check (`Press` only) is left to the caller so that
-    /// repeat and release events can be filtered in one place.
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1155,35 +881,21 @@ impl InputBuffer {
                 self.insert_char_at_cursor(c);
                 true
             }
-            // Enter, Tab, and Esc are not editing operations — the caller
-            // must handle them (submit, focus-change, quit, etc.).
             KeyCode::Enter | KeyCode::Tab | KeyCode::Esc => false,
-            // Everything else is unrecognised.
             _ => false,
         }
     }
 }
 
 impl App {
-    pub(crate) fn new(socket_path: String) -> Self {
-        let initial_items = vec![HistoryItem::Text(format!(
-            "Connected to tai-daemon at {socket_path}"
-        ))];
-        let render_cache = vec![None; initial_items.len()];
-
-        let mut prefix = Vec::with_capacity(initial_items.len());
-        let mut total = 0usize;
-        for item in &initial_items {
-            total += HistoryViewport::new().item_height(item);
-            prefix.push(total);
-        }
-
+    pub(crate) fn new(_socket_path: String) -> Self {
         Self {
             input: InputBuffer::new(),
             next_request_id: 1,
             active: HashSet::new(),
-            client: ClientHistory::new(initial_items),
-            render_cache,
+            session_view: SessionView::new(),
+            rendered_images: HashMap::new(),
+            render_cache: Vec::new(),
             history_scroll: HistoryScrollState::new(),
             history_viewport: HistoryViewport::new(),
             should_quit: false,
@@ -1206,20 +918,18 @@ impl App {
             markers: Vec::new(),
             history_index: None,
             saved_draft: String::new(),
-            fullscreen_image_idx: None,
+            fullscreen_image_target: None,
             attached_token_usage: None,
             attached_context_window: None,
             attached_last_prompt_tokens: None,
             progress_dirty: false,
-            pending_tool_result_replacement: HashMap::new(),
-            replaying_history: false,
-            next_replay_request_id: u32::MAX,
-            replay_call_id_to_rid: HashMap::new(),
-            replay_rid_pending: HashMap::new(),
-            height_prefix: prefix,
+            status: None,
+            error: None,
+            height_prefix: Vec::new(),
             markers_dirty: true,
             last_terminal_size: None,
             terminal_resized: false,
+            visible_turn_ids: Vec::new(),
         }
     }
 
@@ -1227,89 +937,47 @@ impl App {
         self.height_prefix.last().copied().unwrap_or(0)
     }
 
-    /// Rebuild the entire height prefix from scratch (O(n)) and mark all
-    /// marker / total-height caches as dirty so they are recomputed on the
-    /// next call to [`compute_total_height_and_markers`].
+    /// Rebuild height_prefix, markers, visible_turn_ids, and render_cache from
+    /// the current session_view.turns.  Called whenever turns change.
     pub(crate) fn rebuild_height_prefix(&mut self) {
         self.height_prefix.clear();
+        self.visible_turn_ids.clear();
+        self.markers.clear();
         let mut total = 0usize;
-        for item in &self.client.history {
-            total += self.history_viewport.item_height(item);
+        let viewport_height = self.history_viewport.height as usize;
+        let virtual_track = 2 * viewport_height;
+        // Iterate turns in order (oldest first).
+        for (&turn_id, turn) in self.session_view.turns.iter() {
+            if turn.undone {
+                continue;
+            }
+            // Compute height for this turn.
+            let content_width = self.history_viewport.width.saturating_sub(9);
+            let text_lines = render_turn_lines(turn, content_width);
+            let text_height = lines_height(&text_lines, content_width).max(1);
+            let img_height = turn.displayed_images.len() * IMAGE_BLOCK_HEIGHT as usize;
+            let turn_height = text_height + img_height;
+            total += turn_height;
             self.height_prefix.push(total);
+            self.visible_turn_ids.push(turn_id);
+            // Marker for turns with user_text.
+            if turn.user_text.is_some() {
+                let content_line = self.height_prefix.last().copied().unwrap_or(0);
+                let slot = content_line * virtual_track / total.max(1);
+                self.markers.push(Marker {
+                    content_line,
+                    virtual_slot: slot,
+                });
+            }
         }
-        self.markers_dirty = true;
+        // Ensure render_cache matches visible_turn_ids count.
+        self.ensure_cache_synced();
+        self.markers_dirty = false;
     }
 
-    /// Append a new item's height to the prefix-sum array (O(1) when no items
-    /// were trimmed from the front; falls back to full rebuild when trimming
-    /// occurs, which is rare — only when MAX_HISTORY_ITEMS is exceeded).
-    fn push_height_prefix(&mut self, trimmed_count: usize, added_height: usize) {
-        self.markers_dirty = true;
-        if trimmed_count == 0 {
-            let prev = self.height_prefix.last().copied().unwrap_or(0);
-            self.height_prefix.push(prev + added_height);
-        } else {
-            // Items were trimmed from the front — full rebuild is simpler
-            // than shifting and subtracting the prefix entries.
-            self.rebuild_height_prefix();
-        }
-    }
-
-    /// Add `delta` to the height prefix from `from_index` onward.
-    fn add_to_height_prefix(&mut self, from_index: usize, delta: usize) {
-        for p in self.height_prefix.iter_mut().skip(from_index) {
-            *p = p.saturating_add(delta);
-        }
-    }
-
-    /// Subtract `delta` from the height prefix from `from_index` onward.
-    fn sub_from_height_prefix(&mut self, from_index: usize, delta: usize) {
-        for p in self.height_prefix.iter_mut().skip(from_index) {
-            *p = p.saturating_sub(delta);
-        }
-    }
-
-    /// Compute the total history height and build user-text marker
-    /// positions into `self.markers`.  Returns the total height so the
-    /// caller can render the scrollbar track.
-    ///
-    /// Results are cached internally; the cache is invalidated whenever
-    /// history changes (via `rebuild_height_prefix` or the incremental
-    /// `add_to_height_prefix`).
     pub(crate) fn compute_total_height_and_markers(&mut self) -> usize {
         if self.markers_dirty {
-            let viewport_height = self.history_viewport.height as usize;
-            let virtual_track = 2 * viewport_height;
-            let total = self.total_history_height().max(1);
-            self.markers = self
-                .client
-                .history
-                .iter()
-                .enumerate()
-                .filter_map(|(i, item)| {
-                    if matches!(
-                        item,
-                        HistoryItem::SessionMessage(SessionMessage {
-                            kind: SessionMessageKind::UserText { .. },
-                            ..
-                        })
-                    ) {
-                        let content_line = i
-                            .checked_sub(1)
-                            .and_then(|j| self.height_prefix.get(j))
-                            .copied()
-                            .unwrap_or(0);
-                        let slot = content_line * virtual_track / total;
-                        Some(Marker {
-                            content_line,
-                            virtual_slot: slot,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            self.markers_dirty = false;
+            self.rebuild_height_prefix();
         }
         self.total_history_height().max(1)
     }
@@ -1324,16 +992,8 @@ impl App {
         self.history_scroll.clamp(self.max_scroll_offset());
     }
 
-    /// Query the terminal size and update the history viewport to match,
-    /// reserving `INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT` rows for the input
-    /// bar and the status bar.
-    ///
-    /// When the width changes, all cached renderings are stale — entries are
-    /// invalidated so the next frame recomputes at the new width.
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
-        let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT;
-        // Use the cached terminal size unless a resize event arrived or
-        // we have never queried the size yet.
+        let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT + STATUS_ERROR_BAR_HEIGHT;
         let size = if self.terminal_resized || self.last_terminal_size.is_none() {
             if let Ok(size) = crossterm::terminal::size() {
                 self.last_terminal_size = Some(size);
@@ -1357,21 +1017,15 @@ impl App {
                 width: width - 1,
                 height: height - bottom_height,
             });
-            // All cached entries were computed at the old width and are
-            // now stale — invalidate every entry so the next render
-            // recomputes at the current terminal width.
             if old_width != width {
                 for cached in &mut self.render_cache {
                     *cached = None;
                 }
-                self.rebuild_height_prefix();
+                self.markers_dirty = true;
             }
         }
     }
 
-    /// Signal that a terminal-resize event (SIGWINCH) was received so the
-    /// next call to `update_viewport_from_terminal_size` re-queries the
-    /// terminal size instead of using the cached value.
     pub(crate) fn mark_terminal_resized(&mut self) {
         self.terminal_resized = true;
     }
@@ -1386,260 +1040,46 @@ impl App {
             .preserve_for_growth(old_height, new_height, self.max_scroll_offset());
     }
 
-    pub(crate) fn push_text(&mut self, line: impl Into<String>) {
-        self.push_history_item(HistoryItem::Text(line.into()));
-    }
-
-    /// Insert a `HistoryItem` before the active stream for `request_id`,
-    /// updating the render cache and scroll state.
-    fn insert_item_before_stream(&mut self, request_id: u32, item: HistoryItem) {
-        let added_height = self.history_viewport.item_height(&item);
-        let trimmed_height = self.trimmed_height_on_append();
-        let old_hist_len = self.client.history.len();
-        let insert_at = self.client.in_progress.get(&request_id).copied();
-        self.client.insert_before_stream(request_id, item);
-        let new_hist_len = self.client.history.len();
-        let trimmed = (old_hist_len + 1).saturating_sub(new_hist_len);
-        if trimmed > 0 {
-            self.render_cache.drain(0..trimmed);
-        }
-        if let Some(index) = insert_at {
-            let adjusted = index.saturating_sub(trimmed);
-            self.render_cache.insert(adjusted, None);
-        } else {
-            self.render_cache.push(None);
-        }
-        if self.render_cache.len() != new_hist_len {
-            self.render_cache.clear();
-            self.render_cache.resize(new_hist_len, None);
-        }
-        self.history_scroll
-            .on_item_appended(added_height, self.max_scroll_offset());
-        self.account_for_trimmed_height(trimmed_height);
-        self.rebuild_height_prefix();
-        self.clamp_scroll_state();
-    }
-
-    pub(crate) fn push_tool_text(&mut self, request_id: u32, text: impl Into<String>) {
-        let text = text.into();
-        let item: HistoryItem = match try_parse_as_diff(&text) {
-            Some(diffs) => HistoryItem::Diff(diffs),
-            None => HistoryItem::Text(text),
-        };
-        self.insert_item_before_stream(request_id, item);
-    }
-
-    /// Classify a `SessionMessage` into a `HistoryItem`, promoting non-error
-    /// `ToolResult`s that look like unified diffs to `HistoryItem::Diff`.
-    fn classify_session_message(message: &SessionMessage) -> HistoryItem {
-        if let SessionMessageKind::ToolResult {
-            content, is_error, ..
-        } = &message.kind
-            && !is_error
-            && let Some(diffs) = try_parse_as_diff(content)
-        {
-            return HistoryItem::Diff(diffs);
-        }
-        HistoryItem::SessionMessage(message.clone())
-    }
-
-    /// During session replay: inject synthetic tool-call lifecycle text
-    /// entries before the corresponding `SessionMessage` so the visual
-    /// layout matches the live execution path (which uses `push_tool_text`
-    /// from `dispatch_stream_lifecycle`).
-    ///
-    /// Returns `true` when the message was fully consumed (e.g. `ToolResult`
-    /// whose content is emitted as diff / text + `[N] done`).  The caller
-    /// should skip the normal `push_session_message` path in that case.
-    fn push_replay_tool_text(&mut self, message: &SessionMessage) -> bool {
-        tracing::trace!(?message, "replay: processing message");
-        match &message.kind {
-            SessionMessageKind::AssistantToolUse { tool_calls, .. } if !tool_calls.is_empty() => {
-                let rid = self.next_replay_request_id;
-                self.next_replay_request_id = self.next_replay_request_id.wrapping_sub(1);
-                for tc in tool_calls {
-                    self.push_history_item(HistoryItem::Text(format!(
-                        "[{rid}] tool {}#{} start {}",
-                        tc.name, tc.call_id, tc.arguments_json
-                    )));
-                    self.replay_call_id_to_rid.insert(tc.call_id.clone(), rid);
-                }
-                self.replay_rid_pending.insert(rid, tool_calls.len());
-                // Keep the AssistantToolUse session message in history too
-                // (renders the `tool-call:` line below the start lines).
-                false
-            }
-            SessionMessageKind::ToolResult { call_id, .. } => {
-                // Push the classified item (HistoryItem::Diff for diff
-                // content, HistoryItem::SessionMessage otherwise) in place
-                // of the normal push_session_message call.
-                let item = Self::classify_session_message(message);
-                self.push_history_item(item);
-
-                // Inject [N] done when the last ToolResult for this
-                // synthetic request ID arrives.
-                if let Some(rid) = self.replay_call_id_to_rid.remove(call_id)
-                    && let Some(count) = self.replay_rid_pending.get_mut(&rid)
-                {
-                    *count -= 1;
-                    if *count == 0 {
-                        self.push_history_item(HistoryItem::Text(format!("[{rid}] done")));
-                        self.replay_rid_pending.remove(&rid);
-                    }
-                }
-                true // consumed — skip the normal push_session_message path
-            }
-            _ => false,
-        }
-    }
-
-    /// Feed a `SessionMessage` into history.
-    ///
-    /// `DisplayedImage` messages (persisted images) are decoded into
-    /// `RenderedImage` objects and pushed as `HistoryItem::Image`, preserving
-    /// them across session switches and daemon restarts.  All other message
-    /// types go through the normal diff-classification path.
-    ///
-    /// During session replay (`self.replaying_history == true`), tool-call
-    /// lifecycle text entries (`[N] tool start …`, `[N] done`) are injected
-    /// by `push_replay_tool_text` to match the live `push_tool_text` format.
-    pub(crate) fn push_session_message(&mut self, message: SessionMessage) {
-        tracing::trace!(replaying = self.replaying_history, "push_session_message");
-        if self.replaying_history && self.push_replay_tool_text(&message) {
+    pub(crate) fn ensure_cache_synced(&mut self) {
+        let turns_len = self.visible_turn_ids.len();
+        let cache_len = self.render_cache.len();
+        if cache_len == turns_len {
             return;
         }
-        match message {
-            SessionMessage {
-                kind: SessionMessageKind::DisplayedImage(record),
-                ..
-            } => {
-                let img = RenderedImage::new_placeholder(record.metadata, Arc::from(record.data));
-                self.push_image(img);
-            }
-            SessionMessage {
-                kind: SessionMessageKind::ToolResult { ref call_id, .. },
-                ..
-            } => {
-                // During live execution the ToolResultStream was created
-                // by begin_tool_result_stream and populated by
-                // ToolCallOutput / ToolResultChunk.  When the canonical
-                // SessionMessage(ToolResult) arrives from the daemon's
-                // post-request snapshot, replace the ToolResultStream
-                // in-place instead of appending a duplicate.
-                if let Some(&index) = self.pending_tool_result_replacement.get(call_id)
-                    && index < self.client.history.len()
-                {
-                    self.client.history[index] = Self::classify_session_message(&message);
-                    self.pending_tool_result_replacement.remove(call_id);
-                    if let Some(cached) = self.render_cache.get_mut(index) {
-                        *cached = None;
-                    }
-                    self.rebuild_height_prefix();
-                } else {
-                    self.insert_session_message_ordered(message);
-                }
-            }
-            other => {
-                self.insert_session_message_ordered(other);
-            }
+        if cache_len > turns_len {
+            self.render_cache.drain(0..(cache_len - turns_len));
+            return;
         }
+        self.render_cache.resize(turns_len, None);
     }
 
-    /// Insert a `SessionMessage` at the position in history that preserves
-    /// `message_id` ordering.  `ToolResultStream` entries are ordered by
-    /// their own `message_id` (which matches the subsequent `ToolResult`),
-    /// and `Streaming` entries are treated as boundaries for
-    /// `AssistantToolUse` so the tool declaration always appears above the
-    /// answer stream.
-    fn insert_session_message_ordered(&mut self, message: SessionMessage) {
-        let mid = message.message_id;
-        let is_atu = matches!(message.kind, SessionMessageKind::AssistantToolUse { .. });
-        let insert_at = self
-            .client
-            .history
-            .iter()
-            .position(|item| {
-                match item {
-                    // AssistantToolUse goes before matching ToolResultStream,
-                    // before the answer stream, or before a higher message_id.
-                    HistoryItem::ToolResultStream(data) if is_atu || data.message_id > mid => true,
-                    HistoryItem::Streaming(_) if is_atu => true,
-                    HistoryItem::SessionMessage(m) => m.message_id > mid,
-                    _ => false,
-                }
-            })
-            .unwrap_or(self.client.history.len());
-        let item = Self::classify_session_message(&message);
-        self.client.insert_at(insert_at, item);
-        // Adjust replacement and tracking indices that point at-or-after
-        // the insertion point so subsequent operations find the right slot.
-        for idx in self.client.in_progress.values_mut() {
-            if *idx >= insert_at {
-                *idx += 1;
-            }
-        }
-        for idx in self.client.tool_streams.values_mut() {
-            if *idx >= insert_at {
-                *idx += 1;
-            }
-        }
-        self.pending_tool_result_replacement
-            .values_mut()
-            .for_each(|idx| {
-                if *idx >= insert_at {
-                    *idx += 1;
-                }
-            });
-        // If the committed assistant message displaced a Streaming item with
-        // the same message_id, clear the stale streaming content and its mid
-        // so only the committed message shows `mid:N`.
-        if (is_atu || matches!(message.kind, SessionMessageKind::AssistantText { .. }))
-            && let Some(HistoryItem::Streaming(stream)) = self.client.history.get_mut(insert_at + 1)
-            && stream.message_id == mid
-        {
-            stream.message_id = 0;
-            stream.reasoning.clear();
-            stream.answer.clear();
-        }
-        self.rebuild_height_prefix();
-    }
-
-    pub(crate) fn push_image(&mut self, image: RenderedImage) {
-        let item = HistoryItem::Image(Box::new(image));
-        self.push_history_item(item);
-    }
-
-    /// Apply a completed [`ImageResult`] to the corresponding placeholder in
-    /// history using an O(1) job-id → history-index map.  Stale results
-    /// (image already trimmed or replaced) are silently dropped.
+    /// Apply a completed ImageResult to the corresponding rendered_images entry.
     pub(crate) fn apply_image_result(&mut self, result: ImageResult) {
-        let idx = match self.pending_job_idx.remove(&result.id) {
-            Some(idx) if idx < self.client.history.len() => idx,
-            _ => return,
+        let (turn_id, img_idx) = match self.pending_job_idx.remove(&result.id) {
+            Some(key) => key,
+            None => return,
         };
-        if let Some(HistoryItem::Image(img)) = self.client.history.get_mut(idx)
+        if let Some(images) = self.rendered_images.get_mut(&turn_id)
+            && let Some(img) = images.get_mut(&img_idx)
             && img.pending_job == Some(result.id)
         {
             tracing::trace!(
-                "[tai-tui] image job {} completed for history idx {} ({} {}x{})",
+                "[tai-tui] image job {} completed for turn {} img {}",
                 result.id,
-                idx,
-                img.metadata.mime_type,
-                img.metadata.width,
-                img.metadata.height,
+                turn_id,
+                img_idx,
             );
             img.apply_result(result);
         }
     }
 
-    /// Submit an encoding job for the image at `history_idx` and record the
-    /// mapping so the result can be dispatched in O(1) time.  Returns the
-    /// assigned job ID, or `None` if the worker sender is missing.
+    /// Submit an encoding job for a turn-displayed image.
     pub(crate) fn submit_image_job(
         &mut self,
-        history_idx: usize,
-        data: Arc<[u8]>,
-        metadata: ImageMetadata,
+        turn_id: u32,
+        img_idx: usize,
+        data: std::sync::Arc<[u8]>,
+        metadata: tai_proto::ImageMetadata,
         cell_size: Size,
         resize: ratatui_image::Resize,
     ) -> Option<ImageId> {
@@ -1647,9 +1087,10 @@ impl App {
         let id = next_job_id();
 
         tracing::trace!(
-            "[tai-tui] submitting image job {} for history idx {} ({} {}x{} @ {}x{})",
+            "[tai-tui] submitting image job {} for turn {} img {} ({} {}x{} @ {}x{})",
             id,
-            history_idx,
+            turn_id,
+            img_idx,
             metadata.mime_type,
             metadata.width,
             metadata.height,
@@ -1657,13 +1098,11 @@ impl App {
             cell_size.height,
         );
 
-        // Record the mapping before the worker picks up the job so that
-        // apply_image_result is always ready.
-        self.pending_job_idx.insert(id, history_idx);
+        self.pending_job_idx.insert(id, (turn_id, img_idx));
 
-        // Update the RenderedImage's pending_job so duplicate submissions
-        // are prevented.
-        if let Some(HistoryItem::Image(img)) = self.client.history.get_mut(history_idx) {
+        if let Some(images) = self.rendered_images.get_mut(&turn_id)
+            && let Some(img) = images.get_mut(&img_idx)
+        {
             img.pending_job = Some(id);
         }
 
@@ -1678,240 +1117,20 @@ impl App {
     }
 
     /// Clear all per-session state when switching to a different session.
-    ///
-    /// Called from the Enter-key handlers in `connection.rs` before sending
-    /// `AttachSession`, so that the incoming `SessionState` response populates
-    /// a clean view of the target session.
     pub(crate) fn reset_for_session_switch(&mut self) {
-        self.client.history.clear();
+        self.session_view = SessionView::new();
+        self.rendered_images.clear();
         self.render_cache.clear();
+        self.visible_turn_ids.clear();
         self.history_scroll = HistoryScrollState::new();
         self.pending_job_idx.clear();
         self.active.clear();
-        self.client.in_progress.clear();
-        self.replay_call_id_to_rid.clear();
-        self.replay_rid_pending.clear();
         self.markers.clear();
         self.height_prefix.clear();
         self.markers_dirty = true;
-    }
-
-    /// Ensure the render cache is aligned with the history vector.
-    ///
-    /// Items appended to the back of the history get a `None` appended to
-    /// the cache.  Items trimmed from the front are drained from the cache
-    /// front.  Existing cache entries are preserved so that
-    /// `total_history_height` can use cached heights instead of re-rendering
-    /// all items after every mutation.
-    pub(crate) fn ensure_cache_synced(&mut self) {
-        let hist_len = self.client.history.len();
-        let cache_len = self.render_cache.len();
-        if cache_len == hist_len {
-            return;
-        }
-        // Items trimmed from front (e.g. when history exceeds MAX_HISTORY_ITEMS).
-        if cache_len > hist_len {
-            self.render_cache.drain(0..(cache_len - hist_len));
-            return;
-        }
-        // Items appended at the back.
-        self.render_cache.resize(hist_len, None);
-    }
-
-    pub(crate) fn push_history_item(&mut self, item: HistoryItem) {
-        // Capture the job ID before moving the item.
-        let job_id = match &item {
-            HistoryItem::Image(img) => img.pending_job,
-            _ => None,
-        };
-
-        let old_len = self.client.history.len();
-        let added_height = self.history_viewport.item_height(&item);
-        let trimmed_height = self.trimmed_height_on_append();
-        self.client.push_history_item(item);
-
-        // Compute how many items were trimmed from the front.
-        // `push_history_item` on `ClientHistory` trims down to
-        // `MAX_HISTORY_ITEMS`, so the number removed is:
-        //   (old_len + 1) - new_len
-        let trimmed = old_len
-            .saturating_add(1)
-            .saturating_sub(self.client.history.len());
-
-        // Shift pending_job_idx entries to account for items trimmed from
-        // the front of the history ring buffer.
-        if trimmed > 0 {
-            self.pending_job_idx.retain(|_, idx| {
-                if *idx < trimmed {
-                    false // trimmed away
-                } else {
-                    *idx -= trimmed;
-                    true
-                }
-            });
-        }
-
-        // Record the mapping for images that already carry a pending job.
-        if let Some(id) = job_id {
-            self.pending_job_idx
-                .insert(id, self.client.history.len().saturating_sub(1));
-        }
-
-        self.ensure_cache_synced();
-        self.history_scroll
-            .on_item_appended(added_height, self.max_scroll_offset());
-        self.account_for_trimmed_height(trimmed_height);
-        self.push_height_prefix(trimmed, added_height);
-        self.clamp_scroll_state();
-    }
-
-    pub(crate) fn begin_stream(&mut self, request_id: u32, message_id: u32) {
-        if self.client.in_progress.contains_key(&request_id) {
-            return;
-        }
-        let item = HistoryItem::Streaming(StreamingTextItem {
-            message_id,
-            request_id,
-            reasoning: String::new(),
-            answer: String::new(),
-        });
-        let added_height = self.history_viewport.item_height(&item);
-        let trimmed_height = self.trimmed_height_on_append();
-        self.client.begin_stream(request_id, message_id);
-        self.ensure_cache_synced();
-        self.history_scroll
-            .on_item_appended(added_height, self.max_scroll_offset());
-        self.account_for_trimmed_height(trimmed_height);
-        self.push_height_prefix(0, added_height);
-        self.clamp_scroll_state();
-    }
-
-    pub(crate) fn append_stream_text(
-        &mut self,
-        request_id: u32,
-        stream: OutputStream,
-        chunk: &str,
-    ) {
-        if !self.client.in_progress.contains_key(&request_id) {
-            self.begin_stream(request_id, 0);
-        }
-        if let Some(&index) = self.client.in_progress.get(&request_id) {
-            let old_height = self
-                .client
-                .history
-                .get(index)
-                .map(|item| self.history_viewport.item_height(item))
-                .unwrap_or(0);
-            self.client.append_stream(request_id, stream, chunk);
-            // Streaming content changed — invalidate any stale cache entry
-            if let Some(cached) = self.render_cache.get_mut(index) {
-                *cached = None;
-            }
-            let new_height = self
-                .client
-                .history
-                .get(index)
-                .map(|item| self.history_viewport.item_height(item))
-                .unwrap_or(old_height);
-            self.preserve_scroll_for_growth(old_height, new_height);
-            if new_height > old_height {
-                self.add_to_height_prefix(index, new_height - old_height);
-            } else if old_height > new_height {
-                self.sub_from_height_prefix(index, old_height - new_height);
-            }
-            self.markers_dirty = true;
-        }
-    }
-
-    pub(crate) fn finalize_stream(&mut self, request_id: u32) {
-        self.client.in_progress.remove(&request_id);
-    }
-
-    pub(crate) fn begin_tool_result_stream(
-        &mut self,
-        request_id: u32,
-        call_id: String,
-        tool_name: String,
-        message_id: u32,
-    ) {
-        if self.client.tool_streams.contains_key(&request_id) {
-            return;
-        }
-        let item = HistoryItem::ToolResultStream(ToolResultStreamData {
-            message_id,
-            request_id,
-            call_id: call_id.clone(),
-            tool_name: tool_name.clone(),
-            accumulated_text: String::new(),
-            is_error: false,
-        });
-        let added_height = self.history_viewport.item_height(&item);
-        let trimmed_height = self.trimmed_height_on_append();
-        self.client
-            .begin_tool_result_stream(request_id, call_id, tool_name, message_id);
-        self.ensure_cache_synced();
-        self.history_scroll
-            .on_item_appended(added_height, self.max_scroll_offset());
-        self.account_for_trimmed_height(trimmed_height);
-        self.push_height_prefix(0, added_height);
-        self.clamp_scroll_state();
-    }
-
-    pub(crate) fn append_tool_result_chunk(
-        &mut self,
-        request_id: u32,
-        _call_id: &str,
-        data: &[u8],
-    ) {
-        if !self.client.tool_streams.contains_key(&request_id) {
-            // This should not normally happen — chunk should arrive after a
-            // ToolCallStarted message that calls begin_tool_result_stream.
-            // As a safety net, treat this as a drop and rely on the final
-            // SessionMessage(ToolResult) to deliver the complete content.
-            return;
-        }
-        if let Some(&index) = self.client.tool_streams.get(&request_id) {
-            let old_height = self
-                .client
-                .history
-                .get(index)
-                .map(|item| self.history_viewport.item_height(item))
-                .unwrap_or(0);
-            let text = String::from_utf8_lossy(data);
-            self.client.append_tool_result(request_id, &text);
-            if let Some(cached) = self.render_cache.get_mut(index) {
-                *cached = None;
-            }
-            let new_height = self
-                .client
-                .history
-                .get(index)
-                .map(|item| self.history_viewport.item_height(item))
-                .unwrap_or(old_height);
-            self.preserve_scroll_for_growth(old_height, new_height);
-            if new_height > old_height {
-                self.add_to_height_prefix(index, new_height - old_height);
-            } else if old_height > new_height {
-                self.sub_from_height_prefix(index, old_height - new_height);
-            }
-            self.markers_dirty = true;
-        }
-    }
-
-    pub(crate) fn finalize_tool_result_stream(&mut self, request_id: u32, call_id: &str) {
-        if let Some(&index) = self.client.tool_streams.get(&request_id)
-            && index < self.client.history.len()
-        {
-            // The canonical SessionMessage(ToolResult) comes later via
-            // SessionMessageAppended — we'll replace in-place then.
-            self.pending_tool_result_replacement
-                .insert(call_id.to_string(), index);
-            self.client.tool_streams.remove(&request_id);
-            if let Some(cached) = self.render_cache.get_mut(index) {
-                *cached = None;
-            }
-            self.markers_dirty = true;
-        }
+        self.status = None;
+        self.error = None;
+        self.fullscreen_image_target = None;
     }
 
     pub(crate) fn scroll_up(&mut self, amount: usize) {
@@ -1924,7 +1143,6 @@ impl App {
             .scroll_down(amount, self.max_scroll_offset());
     }
 
-    /// Jump directly to a specific scroll row (used by scrollbar clicks).
     pub(crate) fn scroll_to(&mut self, row: usize) {
         let max_scroll = self.max_scroll_offset();
         let amount = row.min(max_scroll);
@@ -1933,9 +1151,6 @@ impl App {
         self.history_scroll.follow_output = amount == 0;
     }
 
-    /// Map a mouse row within the scrollbar track to a scroll position
-    /// and jump there.  The row is clamped to the track so that clicks
-    /// or drags beyond the last row still behave correctly.
     pub(crate) fn scroll_to_track_row(&mut self, mouse_row: u16, track_height: u16) {
         let track_height = track_height as usize;
         if track_height > 1 {
@@ -1943,42 +1158,24 @@ impl App {
             let max_scroll = self.max_scroll_offset();
             let ratio = row as f64 / track_height.saturating_sub(1) as f64;
             let target = (ratio * max_scroll as f64).round() as usize;
-            // The scrollbar coordinate system has 0 at the top, but
-            // our effective_scroll is 0 at the bottom, so invert.
             self.scroll_to(max_scroll.saturating_sub(target.min(max_scroll)));
         }
     }
 
-    /// Scroll so that the given content line appears at the top of the
-    /// viewport.  If the content line is too close to the bottom to fill
-    /// the viewport, scroll to the bottom instead.
-    ///
-    /// Returns immediately if the content line is already visible within
-    /// the current viewport.
     pub(crate) fn scroll_to_content_line(&mut self, content_line: usize) {
         let total = self.total_history_height();
         let viewport = self.history_viewport.height as usize;
         let effective = self.effective_scroll();
-
-        // Fast path: the content line is already visible.
-        let scroll_bottom = effective; // 0 at the bottom, positive when scrolled up
+        let scroll_bottom = effective;
         let visible_start = total.saturating_sub(scroll_bottom + viewport);
         let visible_end = total.saturating_sub(scroll_bottom);
         if content_line >= visible_start && content_line < visible_end {
             return;
         }
-
         let target = total.saturating_sub(content_line + viewport);
         self.scroll_to(target.min(self.max_scroll_offset()));
     }
 
-    /// Consume the frame-accumulated scroll delta and apply it as a
-    /// single scroll operation.
-    ///
-    /// Read-then-reset is atomic within the frame so that no delta
-    /// carries forward to the next frame — this is what makes
-    /// trackpad scrolling stop immediately on finger lift rather than
-    /// coasting.
     pub(crate) fn apply_scroll_delta(&mut self) {
         let delta = self.scroll_accumulator;
         self.scroll_accumulator = 0;
@@ -1989,28 +1186,16 @@ impl App {
         }
     }
 
-    // ── Command history navigation ──────────────────────────────
-
-    /// Collect `UserText` contents from the session history, newest first.
+    /// Collect user_text contents from session_view.turns, newest first.
     pub(crate) fn user_texts(&self) -> Vec<String> {
-        self.client
-            .history
+        self.session_view
+            .turns
             .iter()
             .rev()
-            .filter_map(|item| {
-                if let SharedHistoryItem::SessionMessage(msg) = item
-                    && let SessionMessageKind::UserText { content } = &msg.kind
-                {
-                    return Some(content.clone());
-                }
-                None
-            })
+            .filter_map(|(_, turn)| turn.user_text.clone())
             .collect()
     }
 
-    /// Navigate backward (older) in command history.
-    ///
-    /// On first invocation saves the current input as a draft.
     pub(crate) fn navigate_history_up(&mut self) {
         let texts = self.user_texts();
         if texts.is_empty() {
@@ -2030,9 +1215,6 @@ impl App {
         self.input.cursor = self.input.text.len();
     }
 
-    /// Navigate forward (newer) in command history.
-    ///
-    /// Restores the saved draft when moving past the newest entry.
     pub(crate) fn navigate_history_down(&mut self) {
         if let Some(idx) = self.history_index {
             let texts = self.user_texts();
@@ -2049,52 +1231,26 @@ impl App {
         }
     }
 
-    /// Reset navigation state after a command submission.
     pub(crate) fn commit_to_history(&mut self) {
         self.history_index = None;
         self.saved_draft.clear();
     }
 
-    fn trimmed_height_on_append(&self) -> usize {
-        if self.client.history.len() < MAX_HISTORY_ITEMS || self.history_scroll.follow_output() {
-            return 0;
-        }
-        self.height_prefix.first().copied().unwrap_or(0)
-    }
-
-    fn account_for_trimmed_height(&mut self, trimmed_height: usize) {
-        self.history_scroll
-            .account_for_trimmed_height(trimmed_height, self.max_scroll_offset());
-    }
-
-    // ── Navigation helpers ───────────────────────────────────────
-
-    /// Navigate to a new page and mark the terminal-native progress bar
-    /// dirty so it gets re-evaluated on the next frame.
     pub(crate) fn set_page(&mut self, page: Page) {
         self.page = page;
         self.progress_dirty = true;
     }
 
-    // ── Daemon message handlers ──────────────────────────────────
+    // ── Legacy per-session daemon message handlers ─────────────────────
 
-    /// Handle `SessionCreated`: if on the session-manager page, request a
-    /// list refresh so the new session appears; otherwise attach to the new
-    /// session on the chat page so the user can send input immediately.
     pub(crate) fn handle_session_created(
         &mut self,
         session_id: u64,
         client_tx: &std::sync::mpsc::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         if self.page == Page::SessionManager {
-            // Stay on the session manager — the new session will appear
-            // when the list refreshes.  The daemon no longer auto-attaches
-            // on CreateSession, so the old session stays alive and the
-            // user can accumulate multiple sessions.
             let _ = client_tx.send(ClientMessage::ListSessions);
         } else {
-            // Chat page (auto-create flow): clear the current session's
-            // history and attach so the user can type immediately.
             self.reset_for_session_switch();
             self.attached_session_id = Some(session_id);
             client_tx
@@ -2104,11 +1260,8 @@ impl App {
         Ok(())
     }
 
-    /// Handle `SessionAttached`: record the attached session ID.
     pub(crate) fn handle_session_attached(&mut self, session_id: u64) {
         self.attached_session_id = Some(session_id);
-        // Seed token usage / context window / status-bar data from the
-        // session manager so UI has values even before SessionState arrives.
         if let Some(s) = self
             .session_mgr
             .sessions
@@ -2128,8 +1281,6 @@ impl App {
         self.progress_dirty = true;
     }
 
-    /// Resolve the provider slug for the attached session from the accounts
-    /// list and cache it in `attached_provider_slug`.
     pub(crate) fn refresh_attached_provider_slug(&mut self) {
         self.attached_provider_slug = self.attached_account_name.as_ref().and_then(|name| {
             self.ai_providers
@@ -2140,8 +1291,6 @@ impl App {
         });
     }
 
-    /// Shortcut: return a mutable reference to the session-manager entry
-    /// for the currently-attached session, if any.
     fn attached_session_mut(&mut self) -> Option<&mut SessionSummary> {
         self.session_mgr
             .sessions
@@ -2149,9 +1298,6 @@ impl App {
             .find(|s| Some(s.session_id) == self.attached_session_id)
     }
 
-    /// Handle `ModelSelected`: cache the model name on `App` and sync it
-    /// into the session-manager list entry so the status bar and Session
-    /// Manager detail page are both up to date.
     pub(crate) fn handle_model_selected(&mut self, model: &str) {
         if self.attached_session_id.is_some() {
             self.attached_model = Some(model.to_owned());
@@ -2161,8 +1307,6 @@ impl App {
         }
     }
 
-    /// Handle `ReasoningEffortSet`: cache the effort on `App` and sync it
-    /// into the session-manager list entry.
     pub(crate) fn handle_reasoning_effort_set(&mut self, effort: ThinkingEffort) {
         if self.attached_session_id.is_some() {
             self.attached_reasoning_effort = Some(effort);
@@ -2172,9 +1316,6 @@ impl App {
         }
     }
 
-    /// Handle `SessionWorkingDirSet`: cache the working directory on `App`,
-    /// sync it into the session-manager list entry, and flag the progress
-    /// bar as dirty so the status bar updates immediately.
     pub(crate) fn handle_session_working_dir_set(
         &mut self,
         session_id: u64,
@@ -2189,9 +1330,6 @@ impl App {
         }
     }
 
-    /// Handle `SessionAccountSet`: cache the account name on `App`,
-    /// re-resolve the provider slug, and sync into the session-manager
-    /// list entry.
     pub(crate) fn handle_session_account_set(&mut self, account: &str) {
         if self.attached_session_id.is_some() {
             self.attached_account_name = Some(account.to_owned());
@@ -2202,11 +1340,6 @@ impl App {
         }
     }
 
-    /// Handle `SessionStatusChanged`: propagate the new status into the
-    /// session list, the detail view (if open for this session), and the
-    /// attached-status cache.  All three need updating because the toolbar
-    /// reads from the cache, the session list reads from `session_mgr`, and
-    /// the detail view reads from `detail_data`.
     pub(crate) fn handle_session_status_changed(
         &mut self,
         session_id: u64,
@@ -2230,11 +1363,8 @@ impl App {
         }
     }
 
-    /// Handle `Sessions`: update the session list, show summaries on the
-    /// chat page, and auto-attach or auto-create when no session is attached.
     pub(crate) fn handle_accounts(&mut self, accounts: &[AccountInfo]) {
         self.ai_providers.set_accounts(accounts.to_vec());
-        // Re-resolve the provider slug with the now-current accounts list.
         self.refresh_attached_provider_slug();
     }
 
@@ -2246,9 +1376,9 @@ impl App {
         self.session_mgr.set_sessions(sessions.to_vec());
         if self.page == Page::Chat {
             if sessions.is_empty() {
-                self.push_text("[daemon] no sessions");
+                self.status = Some("[daemon] no sessions".to_string());
             } else {
-                self.push_text(format!("[daemon] sessions ({})", sessions.len()));
+                self.status = Some(format!("[daemon] sessions ({})", sessions.len()));
                 for session in sessions {
                     let prefix = if Some(session.session_id) == self.attached_session_id {
                         "*"
@@ -2257,15 +1387,12 @@ impl App {
                     };
                     let title = session.title.as_deref().unwrap_or("untitled");
                     let model = session.selected_model.as_deref().unwrap_or("-");
-                    self.push_text(format!(
-                        "{} {}: \"{title}\" ({model}) — {} messages",
-                        prefix, session.session_id, session.message_count,
+                    self.status = Some(format!(
+                        "{} {}: \"{title}\" ({model}) — {} turns",
+                        prefix, session.session_id, session.turn_count,
                     ));
                 }
             }
-            // Auto-attach/auto-create only on the chat page — the
-            // session-manager page doesn't need an attached session,
-            // and triggering one would bounce the user back to chat.
             if self.attached_session_id.is_none() {
                 if let Some(first) = sessions.first() {
                     client_tx
@@ -2292,11 +1419,7 @@ impl App {
         Ok(())
     }
 
-    /// Handle `SessionDeleted`: remove the session from the local list and
-    /// clear the attachment if it was the attached session.
     pub(crate) fn handle_session_deleted(&mut self, session_id: u64) {
-        // The session was removed on the daemon side.  Remove from the
-        // local session list and clear the attachment if needed.
         self.session_mgr.remove_session(session_id);
         if self.attached_session_id == Some(session_id) {
             self.attached_session_id = None;
@@ -2308,78 +1431,181 @@ impl App {
         }
     }
 
-    /// Handle `SessionDeleteFailed`: report the failure in the history.
     pub(crate) fn handle_session_delete_failed(&mut self, session_id: u64, error: &str) {
-        self.push_text(format!(
+        self.status = Some(format!(
             "failed to delete session {}: {}",
-            session_id, error,
+            session_id, error
         ));
     }
 }
 
-impl DaemonMessageHandler for App {
-    fn push_text(&mut self, text: String) {
-        self.push_text(text);
+// ── TurnEventHandler implementation ──────────────────────────────────
+
+impl TurnEventHandler for App {
+    fn handle_turn_appended(&mut self, turn_id: u32, turn: Turn) {
+        tracing::trace!(%turn_id, "handle_turn_appended");
+        self.session_view.insert_or_replace(turn_id, turn);
+        self.markers_dirty = true;
     }
 
-    fn push_tool_text(&mut self, request_id: u32, text: String) {
-        self.push_tool_text(request_id, text);
+    fn handle_turn_finalized(&mut self, turn_id: u32, turn: Turn) {
+        tracing::trace!(%turn_id, "handle_turn_finalized");
+        self.session_view.insert_or_replace(turn_id, turn);
+        self.markers_dirty = true;
     }
 
-    fn push_session_message(&mut self, message: SessionMessage) {
-        self.push_session_message(message);
+    fn handle_turns_undone(&mut self, turn_ids: &[u32]) {
+        tracing::trace!(?turn_ids, "handle_turns_undone");
+        for tid in turn_ids {
+            if let Some(turn) = self.session_view.turns.get_mut(tid) {
+                turn.undone = true;
+            }
+        }
+        self.markers_dirty = true;
     }
 
-    fn insert_session_message_before_stream(&mut self, request_id: u32, message: SessionMessage) {
-        self.insert_item_before_stream(request_id, App::classify_session_message(&message));
+    fn handle_turns_redone(&mut self, turns: std::collections::BTreeMap<u32, Turn>) {
+        tracing::trace!(?turns, "handle_turns_redone");
+        for (tid, turn) in turns {
+            self.session_view.insert_or_replace(tid, turn);
+        }
+        self.markers_dirty = true;
     }
 
-    fn begin_stream(&mut self, request_id: u32, message_id: u32) {
-        self.begin_stream(request_id, message_id);
+    fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: String) {
+        self.session_view.stream_chunk(request_id, stream, &data);
+        self.markers_dirty = true;
     }
 
-    fn append_stream(&mut self, request_id: u32, stream: OutputStream, chunk: &str) {
-        self.append_stream_text(request_id, stream, chunk);
+    fn handle_started(&mut self, request_id: u32, turn_id: u32) {
+        tracing::trace!(%request_id, %turn_id, "handle_started");
+        self.session_view
+            .request_to_turn
+            .insert(request_id, turn_id);
+        self.active.insert(request_id);
     }
 
-    fn finalize_stream(&mut self, request_id: u32) {
-        self.finalize_stream(request_id);
-    }
-
-    fn begin_tool_result_stream(
+    fn handle_done(
         &mut self,
         request_id: u32,
-        call_id: &str,
-        tool_name: &str,
-        message_id: u32,
+        token_usage: Option<TokenUsage>,
+        last_prompt_tokens: Option<u32>,
     ) {
-        self.begin_tool_result_stream(
-            request_id,
-            call_id.to_string(),
-            tool_name.to_string(),
-            message_id,
-        );
-    }
-
-    fn append_tool_result_chunk(&mut self, request_id: u32, call_id: &str, data: &[u8]) {
-        self.append_tool_result_chunk(request_id, call_id, data);
-    }
-
-    fn finalize_tool_result_stream(&mut self, request_id: u32, call_id: &str) {
-        self.finalize_tool_result_stream(request_id, call_id);
-    }
-
-    fn drop_request(&mut self, request_id: u32) {
+        tracing::trace!(%request_id, "handle_done");
+        self.session_view.request_to_turn.remove(&request_id);
         self.active.remove(&request_id);
-        self.client.drop_request(request_id);
+        if let Some(usage) = token_usage {
+            self.attached_token_usage = Some(usage);
+        }
+        if let Some(tokens) = last_prompt_tokens {
+            self.attached_last_prompt_tokens = Some(tokens);
+        }
+        self.markers_dirty = true;
     }
 
-    fn remove_messages_by_id(&mut self, message_ids: &[u32]) {
-        self.client.remove_messages_by_id(message_ids);
+    fn handle_failed(&mut self, request_id: u32, error: String) {
+        tracing::trace!(%request_id, %error, "handle_failed");
+        self.error = Some(error);
+        self.session_view.request_to_turn.remove(&request_id);
+        self.active.remove(&request_id);
+        self.markers_dirty = true;
     }
 
-    fn restore_messages(&mut self, messages: Vec<SessionMessage>) {
-        self.client.restore_messages(messages);
+    fn handle_tool_call_event(&mut self, request_id: u32, event: ToolCallEvent) {
+        match event {
+            ToolCallEvent::Started {
+                call_id,
+                tool_name,
+                arguments_json,
+            } => {
+                self.session_view
+                    .tool_call_started(request_id, call_id, tool_name, arguments_json);
+                self.markers_dirty = true;
+            }
+            ToolCallEvent::Finished { .. } => {
+                // Finished events are informational — tool results arrive via
+                // TurnAppended/TurnFinalized.
+            }
+            ToolCallEvent::Failed { .. } => {
+                // Failed events are informational — is_error will be set in
+                // the Turn's tool_results via TurnAppended/TurnFinalized.
+            }
+        }
+    }
+
+    fn handle_tool_result_chunk(&mut self, request_id: u32, call_id: String, data: Vec<u8>) {
+        let text = String::from_utf8_lossy(&data).into_owned();
+        self.session_view
+            .tool_result_chunk(request_id, &call_id, &text);
+        self.markers_dirty = true;
+    }
+
+    fn handle_session_state(
+        &mut self,
+        _session_id: u64,
+        turns: std::collections::BTreeMap<u32, Turn>,
+        title: Option<String>,
+        selected_model: Option<String>,
+        _active_tool_groups: Vec<String>,
+        token_usage: Option<TokenUsage>,
+        context_window: Option<u32>,
+        last_prompt_tokens: Option<u32>,
+        status: SessionStatus,
+    ) {
+        tracing::debug!(
+            turn_count = %turns.len(),
+            ?title,
+            ?selected_model,
+            ?status,
+            "handle_session_state"
+        );
+        self.session_view.turns = turns;
+        self.attached_model = selected_model;
+        self.attached_token_usage = token_usage;
+        self.attached_context_window = context_window;
+        self.attached_last_prompt_tokens = last_prompt_tokens;
+        self.attached_status = Some(status);
+        self.markers_dirty = true;
+    }
+
+    fn handle_status_text(&mut self, text: String) {
+        self.status = Some(text);
+    }
+
+    fn handle_error(&mut self, error: String) {
+        self.error = Some(error);
+    }
+
+    fn handle_session_attached(&mut self, session_id: u64) {
+        self.attached_session_id = Some(session_id);
+    }
+
+    fn handle_session_created(
+        &mut self,
+        _session_id: u64,
+        _title: Option<String>,
+        _working_dir: Option<String>,
+        _max_turns: Option<u32>,
+    ) {
+    }
+
+    fn handle_session_status_changed(&mut self, session_id: u64, status: SessionStatus) {
+        if let Some(session) = self
+            .session_mgr
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == session_id)
+        {
+            session.status = status.clone();
+        }
+        if let Some(ref mut detail) = self.session_mgr.detail_data
+            && detail.session_id == session_id
+        {
+            detail.status = status.clone();
+        }
+        if self.attached_session_id == Some(session_id) {
+            self.attached_status = Some(status);
+        }
     }
 }
 
@@ -2387,12 +1613,10 @@ pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
     lines_height(&crate::markdown_render::plain_text_lines(text), width)
 }
 
-/// Use the `height_prefix` array (binary search, O(log n)) to find the
-/// history item whose vertical span contains `screen_row` (0 = top of the
-/// history viewport), accounting for the current scroll offset.
-///
-/// Returns `None` when `screen_row` is out of bounds or the history is empty.
-pub(crate) fn find_history_item_at_row(app: &App, screen_row: u16) -> Option<usize> {
+/// Find the visible turn index by screen row, using binary search on
+/// height_prefix.  Returns the index into visible_turn_ids (and thus
+/// into render_cache / height_prefix).
+pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<usize> {
     let vh = app.history_viewport.height;
     if screen_row >= vh {
         return None;
@@ -2401,7 +1625,6 @@ pub(crate) fn find_history_item_at_row(app: &App, screen_row: u16) -> Option<usi
     let effective_scroll = app.effective_scroll();
     let total_height = app.total_history_height();
 
-    // Convert screen row to a 0-from-top content line (0 = oldest line).
     let content_line = total_height
         .saturating_sub(effective_scroll + vh as usize)
         .saturating_add(screen_row as usize);
@@ -2410,8 +1633,7 @@ pub(crate) fn find_history_item_at_row(app: &App, screen_row: u16) -> Option<usi
         return None;
     }
 
-    // Binary search on the prefix-sum array to find the item containing
-    // this content line.
+    // Binary search on the prefix-sum array.
     let i = app.height_prefix.partition_point(|&p| p <= content_line);
     if i < app.height_prefix.len() {
         Some(i)
@@ -2424,7 +1646,6 @@ pub(crate) fn find_history_item_at_row(app: &App, screen_row: u16) -> Option<usi
 mod tests {
     use super::*;
     use crate::test_util::test_app;
-    use tai_proto::{AssistantToolCallRecord, DisplayedImageRecord, TimestampMs};
 
     fn make_session(id: u64, title: &str) -> SessionSummary {
         SessionSummary {
@@ -2435,7 +1656,7 @@ mod tests {
             parent_session_id: None,
             working_dir: None,
             created_at: 1000,
-            message_count: 0,
+            turn_count: 0,
             max_turns: None,
             status: SessionStatus::Inactive,
             active_tool_groups: vec!["core".into()],
@@ -2455,7 +1676,7 @@ mod tests {
             parent_session_id: None,
             working_dir: String::new(),
             created_at: 0,
-            message_count: 0,
+            turn_count: 0,
             max_turns: None,
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
@@ -2502,7 +1723,7 @@ mod tests {
     fn remove_session_clamps_selection_to_new_len() {
         let mut mgr = SessionManagerState::new();
         mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
-        mgr.selection = Some(1); // pointing at session 2
+        mgr.selection = Some(1);
         mgr.remove_session(2);
         assert_eq!(mgr.sessions.len(), 1);
         assert_eq!(mgr.selection, Some(0));
@@ -2538,161 +1759,9 @@ mod tests {
         ];
         mgr.selection = Some(2);
         mgr.scroll = 1;
-        // Remove the first item; scroll of 1 should stay valid
         mgr.remove_session(1);
         assert_eq!(mgr.scroll, 1);
         assert_eq!(mgr.sessions.len(), 2);
-    }
-
-    // ── try_parse_as_diff ──
-
-    #[test]
-    fn try_parse_returns_some_for_diff_text() {
-        let text = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
-        assert!(try_parse_as_diff(text).is_some());
-    }
-
-    #[test]
-    fn try_parse_returns_some_for_diff_with_metadata_prefix() {
-        let text = "repository: /repo\nmode: working tree\n\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n";
-        assert!(try_parse_as_diff(text).is_some());
-    }
-
-    #[test]
-    fn try_parse_returns_none_for_plain_text() {
-        assert!(try_parse_as_diff("hello").is_none());
-    }
-
-    #[test]
-    fn try_parse_returns_none_for_empty_string() {
-        assert!(try_parse_as_diff("").is_none());
-    }
-
-    // ── HistoryViewport::item_height ──
-
-    /// Compute the content-height portion of `item_height` for a
-    /// `SessionMessage` at the viewport width, so we can assert on the
-    /// structural-row contribution independently of the exact output from
-    /// `session_message_lines` / `lines_height`.
-    fn content_height_for_msg(msg: &SessionMessage, viewport_width: u16) -> usize {
-        let content_width = if msg.kind.is_margin_message() {
-            viewport_width.saturating_sub(9)
-        } else {
-            viewport_width.saturating_sub(2)
-        };
-        let lines = session_message_lines(msg, content_width);
-        lines_height(&lines, content_width).max(1)
-    }
-
-    #[test]
-    fn item_height_margin_message_includes_structural_rows() {
-        let vp = HistoryViewport {
-            width: 80,
-            height: 24,
-        };
-        let msg = SessionMessage::now(SessionMessageKind::AssistantText {
-            content: "Hello".into(),
-            reasoning: None,
-            token_usage: None,
-        });
-        let content_h = content_height_for_msg(&msg, vp.width);
-        let item = HistoryItem::SessionMessage(msg);
-        assert_eq!(
-            vp.item_height(&item),
-            content_h + STRUCTURAL_ROWS,
-            "margin message height should be content + {} structural rows",
-            STRUCTURAL_ROWS,
-        );
-    }
-
-    #[test]
-    fn item_height_margin_message_user_text_includes_structural_rows() {
-        let vp = HistoryViewport {
-            width: 80,
-            height: 24,
-        };
-        let msg = SessionMessage::now(SessionMessageKind::UserText {
-            content: "Hi".into(),
-        });
-        let content_h = content_height_for_msg(&msg, vp.width);
-        let item = HistoryItem::SessionMessage(msg);
-        assert_eq!(
-            vp.item_height(&item),
-            content_h + STRUCTURAL_ROWS,
-            "user text height should be content + {} structural rows",
-            STRUCTURAL_ROWS,
-        );
-    }
-
-    #[test]
-    fn item_height_non_margin_message_uses_single_separator() {
-        let vp = HistoryViewport {
-            width: 80,
-            height: 24,
-        };
-        let msg = SessionMessage::now(SessionMessageKind::SystemText {
-            content: "System message".into(),
-        });
-        let content_h = content_height_for_msg(&msg, vp.width);
-        let item = HistoryItem::SessionMessage(msg);
-        assert_eq!(
-            vp.item_height(&item),
-            content_h + 1,
-            "non-margin height should be content + 1 separator row",
-        );
-    }
-
-    #[test]
-    fn item_height_tool_result_uses_margin_styling() {
-        let vp = HistoryViewport {
-            width: 80,
-            height: 24,
-        };
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "c1".into(),
-            name: "read_file".into(),
-            content: "file content".into(),
-            is_error: false,
-        });
-        let content_h = content_height_for_msg(&msg, vp.width);
-        let item = HistoryItem::SessionMessage(msg);
-        assert_eq!(
-            vp.item_height(&item),
-            content_h + STRUCTURAL_ROWS,
-            "ToolResult height should be content + {} structural rows (margin styling)",
-            STRUCTURAL_ROWS,
-        );
-    }
-
-    // ── push_tool_text ──
-
-    #[test]
-    fn push_tool_text_with_diff_creates_diff_item() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        let text = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n";
-        app.push_tool_text(1, text);
-
-        assert!(matches!(
-            app.client.history.last().unwrap(),
-            HistoryItem::Diff(_)
-        ));
-    }
-
-    #[test]
-    fn push_tool_text_with_plain_text_creates_text_item() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        app.push_tool_text(1, "just some output");
-
-        match &app.client.history.last().unwrap() {
-            HistoryItem::Text(t) => assert!(t.contains("just some output")),
-            _ => panic!("expected Text"),
-        }
     }
 
     // ── scroll_to_content_line ──
@@ -2703,1796 +1772,35 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
-        // Fill with enough content to need scrolling.
-        for i in 0..20 {
-            app.push_history_item(HistoryItem::Text(format!("line {i}")));
+        // Fill with enough turn content.
+        for i in 0..5u32 {
+            let turn = Turn {
+                created_at: tai_proto::TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some(format!("user text {i}")),
+                assistant_text: Some(format!("assistant text {i}")),
+                assistant_reasoning: None,
+                tool_calls: vec![],
+                token_usage: None,
+                tool_results: vec![],
+                displayed_images: vec![],
+            };
+            app.session_view.insert_or_replace(i, turn);
         }
+        app.rebuild_height_prefix();
 
-        // test_app starts with a "Connected" Text item (2 rows), then 20 more
-        // Text items each at 2 rows = 40, total = 42.  Viewport=5.
-        // scroll=0 → bottom (latest message visible).
-        // content_line=0 → first item → target=42-(0+5)=37 → scroll to top.
+        // content_line=0 → first visible turn
         app.scroll_to_content_line(0);
-        assert_eq!(app.history_scroll.scroll, 37, "should scroll to top");
-        assert!(!app.history_scroll.follow_output, "not following output");
+        // Should scroll to top (max scroll)
+        assert_eq!(app.effective_scroll(), app.max_scroll_offset());
     }
 
-    #[test]
-    fn scroll_to_content_line_fast_path_skips_when_already_visible() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        for i in 0..10 {
-            app.push_history_item(HistoryItem::Text(format!("line {i}")));
-        }
-        // Total ~20, viewport=10 → max_scroll=10.
-        // At bottom (scroll=0), visible range: items 10..20 → content lines 20..40.
-        // content_line=30 is in the visible range → fast-path should skip.
-        let scroll_before = app.history_scroll.scroll;
-        app.scroll_to_content_line(30);
-        assert_eq!(
-            app.history_scroll.scroll, scroll_before,
-            "scroll should not change when content_line is already visible"
-        );
-    }
-
-    #[test]
-    fn scroll_to_content_line_clamps_to_bottom_when_line_too_close() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        for i in 0..5 {
-            app.push_history_item(HistoryItem::Text(format!("line {i}")));
-        }
-        // Total ~10, viewport=10 → max_scroll=0.
-        // content_line=18 > total → target=saturating_sub(10-(18+10)) = 0
-        app.scroll_to_content_line(18);
-        assert_eq!(
-            app.history_scroll.scroll, 0,
-            "should clamp to bottom (0) when line is beyond content end"
-        );
-    }
-
-    // ── compute_total_height_and_markers ──
-
-    #[test]
-    fn compute_total_height_and_markers_produces_markers_for_user_text() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        // Add some history items including UserText messages.
-        app.push_history_item(HistoryItem::Text("hello".into()));
-        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::now(
-            SessionMessageKind::UserText {
-                content: "user message 1".into(),
-            },
-        )));
-        app.push_history_item(HistoryItem::Text("world".into()));
-        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::now(
-            SessionMessageKind::UserText {
-                content: "user message 2".into(),
-            },
-        )));
-        app.push_history_item(HistoryItem::SessionMessage(SessionMessage::now(
-            SessionMessageKind::AssistantText {
-                content: "assistant reply".into(),
-                reasoning: None,
-                token_usage: None,
-            },
-        )));
-
-        let total = app.compute_total_height_and_markers();
-
-        assert!(
-            total > 0,
-            "total height should be positive with history items"
-        );
-        assert_eq!(app.markers.len(), 2, "should have 2 user-text markers");
-        // Both markers should have valid virtual slots within range.
-        for marker in &app.markers {
-            assert!(
-                marker.virtual_slot <= 2 * app.history_viewport.height as usize,
-                "virtual slot {} should be within track range",
-                marker.virtual_slot
-            );
-        }
-    }
-
-    #[test]
-    fn compute_total_height_and_markers_empty_history() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        let total = app.compute_total_height_and_markers();
-
-        assert!(total > 0, "total height should be positive");
-        assert!(
-            app.markers.is_empty(),
-            "no markers for empty history (test_app has no UserText)"
-        );
-    }
-
-    // ── push_session_message ──
-
-    #[test]
-    fn push_session_message_tool_result_with_diff_creates_diff_item() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: String::new(),
-            name: "edit_file".into(),
-            content: "edit_file: f (1 replacement, +3 chars)\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@
--old\n+new\n".into(),
-            is_error: false,
-        });
-        // Diff promotion from ToolResult only happens during replay
-        // (live execution uses push_tool_text for that).
-        app.replaying_history = true;
-        app.push_session_message(msg);
-
-        assert!(matches!(
-            app.client.history.last().unwrap(),
-            HistoryItem::Diff(_)
-        ));
-    }
-
-    #[test]
-    fn push_session_message_tool_result_with_error_stays_session_message() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: String::new(),
-            name: "edit_file".into(),
-            content: "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
-            is_error: true,
-        });
-        app.push_session_message(msg);
-
-        assert!(matches!(
-            app.client.history.last().unwrap(),
-            HistoryItem::SessionMessage(_)
-        ));
-    }
-
-    #[test]
-    fn push_session_message_plain_text_stays_session_message() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: String::new(),
-            name: "read_file".into(),
-            content: "hello world".into(),
-            is_error: false,
-        });
-        app.push_session_message(msg);
-
-        assert!(matches!(
-            app.client.history.last().unwrap(),
-            HistoryItem::SessionMessage(_)
-        ));
-    }
-
-    // ── push_session_message with DisplayedImage ──
-
-    #[test]
-    fn push_session_message_displayed_image_creates_placeholder() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        let msg = SessionMessage::now(SessionMessageKind::DisplayedImage(DisplayedImageRecord {
-            metadata: ImageMetadata {
-                image_id: 0,
-                mime_type: "image/png".into(),
-                width: 1,
-                height: 1,
-                byte_len: 0,
-                alt: None,
-            },
-            data: vec![],
-            tool_call_id: None,
-        }));
-        app.push_session_message(msg);
-
-        let last = app.client.history.last().unwrap();
-        assert!(
-            matches!(last, HistoryItem::Image(_)),
-            "DisplayedImage should create a placeholder Image"
-        );
-    }
-
-    #[test]
-    fn push_session_message_displayed_image_svg_creates_placeholder() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='red'/></svg>"#;
-        let msg = SessionMessage::now(SessionMessageKind::DisplayedImage(DisplayedImageRecord {
-            metadata: ImageMetadata {
-                image_id: 0,
-                mime_type: "image/svg+xml".into(),
-                width: 4,
-                height: 3,
-                byte_len: svg.len() as u64,
-                alt: Some("red rect".into()),
-            },
-            data: svg.to_vec(),
-            tool_call_id: None,
-        }));
-        app.push_session_message(msg);
-
-        let last = app.client.history.last().unwrap();
-        assert!(
-            matches!(last, HistoryItem::Image(_)),
-            "expected Image placeholder"
-        );
-    }
-
-    // ── replay path tests ────────────────────────────────────────────
-
-    #[test]
-    fn replay_assistant_tool_use_injects_start_text_and_keeps_message() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-        app.replaying_history = true;
-
-        let tc = AssistantToolCallRecord {
-            call_id: "call_1".into(),
-            name: "read_file".into(),
-            arguments_json: r#"{"path": "x"}"#.into(),
-        };
-        let msg = SessionMessage::now(SessionMessageKind::AssistantToolUse {
-            content: None,
-            tool_calls: vec![tc],
-            reasoning: None,
-            token_usage: None,
-        });
-
-        // push_replay_tool_text only injects the start text; it returns
-        // false so push_session_message also pushes the message itself.
-        let consumed = app.push_replay_tool_text(&msg);
-        assert!(!consumed, "AssistantToolUse should NOT be consumed");
-
-        // Start text injected as a history item.
-        let hist = &app.client.history;
-        assert!(!hist.is_empty());
-        assert!(matches!(
-            hist.last().unwrap(),
-            HistoryItem::Text(t) if t.contains("tool read_file#call_1 start")
-        ));
-    }
-
-    #[test]
-    fn replay_tool_result_injects_done_and_consumes() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-        app.replaying_history = true;
-
-        // Pre-register the synthetic request/ call_id so the done mechanism
-        // fires (simulating a prior AssistantToolUse).
-        let rid = 100;
-        app.replay_call_id_to_rid.insert("call_1".into(), rid);
-        app.replay_rid_pending.insert(rid, 1);
-
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "call_1".into(),
-            name: "read_file".into(),
-            content: "file contents".into(),
-            is_error: false,
-        });
-
-        let consumed = app.push_replay_tool_text(&msg);
-        assert!(consumed, "ToolResult should be consumed");
-
-        // Two items pushed: ToolResult classified + [100] done
-        let hist = &app.client.history;
-        let second_last = &hist[hist.len() - 2];
-        let last = hist.last().unwrap();
-        assert!(matches!(second_last, HistoryItem::SessionMessage(_)));
-        assert!(matches!(last, HistoryItem::Text(t) if t == "[100] done"));
-        // The pending slot should be cleaned up.
-        assert!(app.replay_rid_pending.get(&rid).is_none());
-    }
-
-    #[test]
-    fn replay_tool_result_unknown_call_id_no_done() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-        app.replaying_history = true;
-
-        // No call_id registered — the done mechanism should be a no-op.
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "unknown".into(),
-            name: "read_file".into(),
-            content: "data".into(),
-            is_error: false,
-        });
-
-        let hist_len_before = app.client.history.len();
-        let consumed = app.push_replay_tool_text(&msg);
-        assert!(consumed, "ToolResult should be consumed");
-        // Exactly one item added (the classified item, no [N] done).
-        assert_eq!(app.client.history.len(), hist_len_before + 1);
-        assert!(matches!(
-            app.client.history.last().unwrap(),
-            HistoryItem::SessionMessage(_)
-        ));
-    }
-
-    #[test]
-    fn replay_tool_result_with_diff_creates_diff_item() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-        app.replaying_history = true;
-
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "c1".into(),
-            name: "edit_file".into(),
-            content: "edit_file: f (1 replacement, +3 chars)\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
-            is_error: false,
-        });
-        let consumed = app.push_replay_tool_text(&msg);
-        assert!(consumed);
-        assert!(matches!(
-            app.client.history.last().unwrap(),
-            HistoryItem::Diff(_)
-        ));
-    }
-
-    #[test]
-    fn replay_other_messages_not_consumed() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.replaying_history = true;
-
-        let msg = SessionMessage::now(SessionMessageKind::AssistantText {
-            content: "hello".into(),
-            reasoning: None,
-            token_usage: None,
-        });
-
-        let consumed = app.push_replay_tool_text(&msg);
-        assert!(!consumed, "non-tool messages should NOT be consumed");
-    }
-
-    #[test]
-    fn replay_full_tool_cycle_injects_lifecycle_text() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-        app.replaying_history = true;
-
-        let tc = AssistantToolCallRecord {
-            call_id: "c1".into(),
-            name: "grep".into(),
-            arguments_json: r#"{"pattern": "foo"}"#.into(),
-        };
-        let tool_use = SessionMessage::now(SessionMessageKind::AssistantToolUse {
-            content: None,
-            tool_calls: vec![tc],
-            reasoning: None,
-            token_usage: None,
-        });
-
-        // Push the AssistantToolUse — injects [N] tool start, keeps the message.
-        let consumed = app.push_replay_tool_text(&tool_use);
-        assert!(!consumed);
-
-        let tool_result = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "c1".into(),
-            name: "grep".into(),
-            content: "match".into(),
-            is_error: false,
-        });
-
-        // Push the ToolResult — injects classified item + [N] done.
-        let consumed = app.push_replay_tool_text(&tool_result);
-        assert!(consumed);
-
-        // History items: [N] tool start, ToolResult/Done (AssistantToolUse
-        // is NOT pushed by push_replay_tool_text since it returns false).
-        let hist = &app.client.history;
-        // The rid assigned is u32::MAX since next_replay_request_id starts
-        // at u32::MAX and is decremented once.
-        let first_rid = u32::MAX;
-        let text_items: Vec<&str> = hist
-            .iter()
-            .filter_map(|item| match item {
-                HistoryItem::Text(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            text_items
-                .iter()
-                .any(|t| t.contains(&format!("[{first_rid}] tool grep#c1 start")))
-        );
-        assert!(
-            text_items
-                .iter()
-                .any(|t| t.contains(&format!("[{first_rid}] done")))
-        );
-        // The ToolResult itself (classified as SessionMessage since content
-        // is plain text, not a diff).
-        assert!(
-            hist.iter()
-                .any(|item| matches!(item, HistoryItem::SessionMessage(_)))
-        );
-    }
-
-    // ── live execution path tests (not replaying) ────────────────────
-
-    #[test]
-    fn live_tool_result_with_diff_becomes_diff() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-        // Not setting replaying_history — live path.
-
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: String::new(),
-            name: "edit_file".into(),
-            content: "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n".into(),
-            is_error: false,
-        });
-        app.push_session_message(msg);
-
-        // Live path now classifies ToolResult content, so diff text gets
-        // promoted to HistoryItem::Diff (ToolCallOutput no longer goes through
-        // push_tool_text, so no duplicate).
-        assert!(matches!(
-            app.client.history.last().unwrap(),
-            HistoryItem::Diff(_)
-        ));
-    }
-
-    // ── tool result stream methods (live) ───────────────────────────
-
-    #[test]
-    fn begin_tool_result_stream_creates_stream_item() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        let history_len = app.client.history.len();
-        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
-
-        assert!(
-            app.client.tool_streams.contains_key(&1),
-            "should track request_id"
-        );
-        assert_eq!(
-            app.client.history.len(),
-            history_len + 1,
-            "should add one item"
-        );
-        assert!(matches!(
-            app.client.history.last().unwrap(),
-            HistoryItem::ToolResultStream(data) if data.call_id == "call_1" && data.tool_name == "read_file" && data.accumulated_text.is_empty()
-        ));
-    }
-
-    #[test]
-    fn begin_tool_result_stream_is_idempotent() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        let history_len = app.client.history.len();
-        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
-        assert_eq!(app.client.history.len(), history_len + 1);
-
-        // Second call with same request_id should be a no-op.
-        app.begin_tool_result_stream(1, "call_2".into(), "write_file".into(), 2);
-        assert_eq!(app.client.history.len(), history_len + 1, "no duplicate");
-
-        assert!(matches!(
-            app.client.history.last().unwrap(),
-            HistoryItem::ToolResultStream(data) if data.call_id == "call_1"
-        ));
-    }
-
-    #[test]
-    fn append_tool_result_chunk_updates_accumulated_text() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        app.begin_tool_result_stream(1, "call_1".into(), "grep".into(), 1);
-        app.append_tool_result_chunk(1, "call_1", b"hello\n");
-        app.append_tool_result_chunk(1, "call_1", b"world");
-
-        let index = app.client.tool_streams[&1];
-        assert!(
-            matches!(&app.client.history[index], HistoryItem::ToolResultStream(data) if data.accumulated_text == "hello\nworld"),
-            "expected ToolResultStream with accumulated_text 'hello\\nworld'"
-        );
-    }
-
-    #[test]
-    fn append_tool_result_chunk_unknown_request_is_noop() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        // No stream started for this request — should be a silent no-op.
-        app.append_tool_result_chunk(99, "unknown", b"data");
-    }
-
-    #[test]
-    fn finalize_tool_result_stream_registers_replacement() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
-        let idx = app.client.tool_streams[&1];
-
-        app.finalize_tool_result_stream(1, "call_1");
-
-        // The stream index should be recorded for later replacement.
-        assert!(
-            !app.client.tool_streams.contains_key(&1),
-            "stream tracking removed"
-        );
-        assert_eq!(
-            app.pending_tool_result_replacement.get("call_1"),
-            Some(&idx),
-            "pending replacement registered"
-        );
-    }
-
-    #[test]
-    fn finalize_tool_result_stream_unknown_request_is_noop() {
-        let mut app = test_app("/tmp/tai.sock");
-        // Should not panic.
-        app.finalize_tool_result_stream(99, "unknown");
-        assert!(app.pending_tool_result_replacement.is_empty());
-    }
-
-    #[test]
-    fn tool_result_stream_replaced_by_session_message() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        app.begin_tool_result_stream(1, "call_1".into(), "read_file".into(), 1);
-        app.append_tool_result_chunk(1, "call_1", b"file contents");
-        app.finalize_tool_result_stream(1, "call_1");
-
-        let idx = *app.pending_tool_result_replacement.get("call_1").unwrap();
-
-        // Now push the canonical SessionMessage(ToolResult).
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "call_1".into(),
-            name: "read_file".into(),
-            content: "file contents".into(),
-            is_error: false,
-        });
-        app.push_session_message(msg);
-
-        // The ToolResultStream should be replaced in-place.
-        assert!(
-            !app.pending_tool_result_replacement.contains_key("call_1"),
-            "replacement consumed"
-        );
-        assert!(
-            matches!(&app.client.history[idx], HistoryItem::SessionMessage(_)),
-            "expected SessionMessage after replacement"
-        );
-    }
-
-    #[test]
-    fn tool_result_stream_without_replacement_appends_session_message() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        let history_len = app.client.history.len();
-
-        // Push a ToolResult without a prior stream.
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "call_1".into(),
-            name: "read_file".into(),
-            content: "data".into(),
-            is_error: false,
-        });
-        app.push_session_message(msg);
-
-        // Should append a new item, not crash.
-        assert_eq!(
-            app.client.history.len(),
-            history_len + 1,
-            "should append new item"
-        );
-    }
-
-    // ── reset_for_session_switch ──
-
-    #[test]
-    fn reset_for_session_switch_clears_state() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        // Populate state as if we were in an active session.
-        app.client.history.push(HistoryItem::Text("old".into()));
-        app.render_cache.push(None);
-        app.rebuild_height_prefix();
-        app.active.insert(1);
-        app.client.in_progress.insert(1, 0);
-        // Populate replay state.
-        app.replay_call_id_to_rid.insert("c1".into(), 1);
-        app.replay_rid_pending.insert(1, 2);
-        app.next_replay_request_id = 42;
-
-        app.reset_for_session_switch();
-
-        assert!(app.client.history.is_empty(), "history not cleared");
-        assert!(app.render_cache.is_empty(), "render_cache not cleared");
-        assert_eq!(app.history_scroll.scroll, 0);
-        assert_eq!(app.history_scroll.scroll_compensation, 0);
-        assert!(app.history_scroll.follow_output);
-        assert!(app.active.is_empty(), "active not cleared");
-        assert!(app.client.in_progress.is_empty(), "in_progress not cleared");
-        assert!(
-            app.replay_call_id_to_rid.is_empty(),
-            "replay_call_id_to_rid not cleared"
-        );
-        assert!(
-            app.replay_rid_pending.is_empty(),
-            "replay_rid_pending not cleared"
-        );
-    }
-
-    // ── image job lifecycle ──
-
-    #[test]
-    fn submit_image_job_returns_none_when_no_tx() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.image_job_tx = None;
-
-        let id = app.submit_image_job(
-            0,
-            Arc::<[u8]>::from(vec![]),
-            ImageMetadata {
-                image_id: 1,
-                mime_type: "image/png".into(),
-                width: 1,
-                height: 1,
-                byte_len: 0,
-                alt: None,
-            },
-            Size::new(20, 16),
-            tai_tui::IMAGE_RESIZE,
-        );
-        assert!(id.is_none(), "no job should be submitted when tx is None");
-    }
-
-    #[test]
-    fn submit_image_job_sends_job_and_records_mapping() {
-        let picker = ratatui_image::picker::Picker::halfblocks();
-        let worker = tai_tui::image_worker::ImageWorker::spawn(picker);
-
-        let mut app = test_app("/tmp/tai.sock");
-        app.image_job_tx = Some(worker.job_tx);
-
-        // The app starts with 1 text item at index 0.  Push an image
-        // placeholder so there is an image at index 1.
-        let img = tai_tui::RenderedImage::new_placeholder(
-            ImageMetadata {
-                image_id: 1,
-                mime_type: "image/png".into(),
-                width: 4,
-                height: 3,
-                byte_len: 0,
-                alt: None,
-            },
-            Arc::<[u8]>::from(vec![]),
-        );
-        app.push_image(img);
-
-        let id = app
-            .submit_image_job(
-                1,
-                Arc::<[u8]>::from(vec![]),
-                ImageMetadata {
-                    image_id: 1,
-                    mime_type: "image/png".into(),
-                    width: 4,
-                    height: 3,
-                    byte_len: 0,
-                    alt: None,
-                },
-                Size::new(20, 16),
-                tai_tui::IMAGE_RESIZE,
-            )
-            .expect("job should be submitted");
-
-        // pending_job_idx should contain the mapping.
-        assert_eq!(
-            app.pending_job_idx.get(&id),
-            Some(&1),
-            "pending_job_idx should map job id to history index"
-        );
-
-        // The RenderedImage's pending_job should be set.
-        let HistoryItem::Image(image) = &app.client.history[1] else {
-            panic!("expected Image history item");
-        };
-        assert_eq!(
-            image.pending_job,
-            Some(id),
-            "pending_job should be set on the image"
-        );
-
-        // Drop the sender so the worker thread can shut down before join.
-        app.image_job_tx = None;
-        let _ = worker.handle.join();
-    }
-
-    #[test]
-    fn apply_image_result_updates_image_protocol() {
-        let mut app = test_app("/tmp/tai.sock");
-
-        // The app starts with 1 text item at index 0.  Push an image
-        // placeholder so there is an image at index 1.
-        let img = tai_tui::RenderedImage::new_placeholder(
-            ImageMetadata {
-                image_id: 1,
-                mime_type: "image/png".into(),
-                width: 4,
-                height: 3,
-                byte_len: 0,
-                alt: None,
-            },
-            Arc::<[u8]>::from(vec![]),
-        );
-        app.push_image(img);
-
-        // Simulate an in-flight job at index 1.
-        let job_id = 42usize;
-        app.pending_job_idx.insert(job_id, 1);
-        let HistoryItem::Image(image) = &mut app.client.history[1] else {
-            panic!("expected Image");
-        };
-        image.pending_job = Some(job_id);
-
-        // Apply a successful result.
-        let cell_size = Size::new(20, 16);
-        app.apply_image_result(tai_tui::image_worker::ImageResult {
-            id: job_id,
-            protocol: None, // protocol encoding not needed for this test
-            cell_size,
-        });
-
-        // The image should have pending_job cleared and marked as failed
-        // (since protocol was None, the worker signalled failure).
-        let HistoryItem::Image(image) = &app.client.history[1] else {
-            panic!("expected Image");
-        };
-        assert!(
-            image.failed_sizes.contains(&cell_size),
-            "image should have failed_sizes when protocol is None"
-        );
-        assert!(image.pending_job.is_none(), "pending_job should be cleared");
-        assert!(
-            app.pending_job_idx.get(&job_id).is_none(),
-            "job id should be removed from pending_job_idx"
-        );
-    }
-
-    #[test]
-    fn apply_image_result_drops_stale_job() {
-        let mut app = test_app("/tmp/tai.sock");
-
-        // Job ID 99 is not in pending_job_idx — result should be silently dropped.
-        app.apply_image_result(tai_tui::image_worker::ImageResult {
-            id: 99,
-            protocol: None,
-            cell_size: Size::new(20, 16),
-        });
-        // No panic = pass.
-    }
-
-    #[test]
-    fn apply_image_result_drops_result_for_trimmed_index() {
-        let mut app = test_app("/tmp/tai.sock");
-
-        // Register a job that maps to an out-of-bounds index.
-        app.pending_job_idx.insert(7, 999);
-
-        // Should not panic — the result is silently dropped.
-        app.apply_image_result(tai_tui::image_worker::ImageResult {
-            id: 7,
-            protocol: None,
-            cell_size: Size::new(20, 16),
-        });
-    }
-
-    #[test]
-    fn push_history_item_shifts_pending_job_idx_on_trim() {
-        use tai_client_core::MAX_HISTORY_ITEMS;
-
-        let mut app = test_app("/tmp/tai.sock");
-        app.image_job_tx = None;
-
-        // Fill history so the next push triggers trimming.  The app starts
-        // with 1 text item ("Connected to …"), so we fill MAX - 1 items
-        // to reach a total of 1 + (MAX - 1) = MAX.
-        for i in 0..MAX_HISTORY_ITEMS - 1 {
-            app.client
-                .history
-                .push(HistoryItem::Text(format!("line {i}")));
-        }
-        // Register a pending job for the initial text at index 0.
-        let job_id = next_job_id();
-        app.pending_job_idx.insert(job_id, 0);
-
-        // Push one more item.  The initial text at old index 0 will be trimmed.
-        app.push_history_item(HistoryItem::Text("new item".into()));
-
-        // The stale mapping should be removed.
-        assert!(
-            app.pending_job_idx.get(&job_id).is_none(),
-            "stale job mapping should be removed on trim"
-        );
-    }
-
-    #[test]
-    fn push_history_item_adjusts_pending_job_idx_for_surviving_items() {
-        use tai_client_core::MAX_HISTORY_ITEMS;
-
-        let mut app = test_app("/tmp/tai.sock");
-
-        // App starts with 1 text item at index 0.  Fill so total exceeds MAX.
-        // Fill MAX items + 2 extra survivors: total = 1 + MAX + 2 = MAX + 3.
-        for i in 0..MAX_HISTORY_ITEMS + 2 {
-            app.client
-                .history
-                .push(HistoryItem::Text(format!("line {i}")));
-        }
-
-        // After fill: index 0 = initial text, index 1 = "line 0", …
-        // index 500 = "line 499", index 501 = "line 500", index 502 = "line 501"
-        // total = 1 + 503 = 504 items.
-        //
-        // After push: old_len = 503, push → 504, trim → 500.
-        // trimmed = 503 + 1 - 500 = 4 items removed from front.
-
-        // A job at old index 0 will be trimmed (0 < 4).
-        let trimmed_job = next_job_id();
-        // A job at old index 6 survives and shifts to new index 2 (6 - 4 = 2).
-        let surviving_job = next_job_id();
-        app.pending_job_idx.insert(trimmed_job, 0);
-        app.pending_job_idx.insert(surviving_job, 6);
-
-        app.push_history_item(HistoryItem::Text("new item".into()));
-
-        assert_eq!(
-            app.pending_job_idx.get(&surviving_job),
-            Some(&2),
-            "surviving job should be shifted by trimmed count (6 - 4 = 2)"
-        );
-        assert!(
-            app.pending_job_idx.get(&trimmed_job).is_none(),
-            "trimmed job should be removed"
-        );
-    }
-
-    #[test]
-    fn reset_for_session_switch_clears_pending_job_idx() {
-        let mut app = test_app("/tmp/tai.sock");
-
-        app.pending_job_idx.insert(1, 0);
-        app.pending_job_idx.insert(2, 1);
-        assert!(!app.pending_job_idx.is_empty());
-
-        app.reset_for_session_switch();
-
-        assert!(
-            app.pending_job_idx.is_empty(),
-            "pending_job_idx should be cleared on session switch"
-        );
-    }
-
-    // ── scroll_to ──
-
-    #[test]
-    fn scroll_to_sets_scroll_and_disables_follow() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        for i in 0..10 {
-            app.push_text(format!("line {i}"));
-        }
-
-        let max_scroll = app.max_scroll_offset();
-        assert!(max_scroll > 0, "should have scrollable content");
-
-        app.scroll_to(max_scroll);
-        assert_eq!(app.history_scroll.scroll, max_scroll);
-        assert_eq!(app.history_scroll.scroll_compensation, 0);
-        assert!(!app.history_scroll.follow_output);
-    }
-
-    #[test]
-    fn scroll_to_zero_enables_follow() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        app.push_text("hello");
-        app.scroll_to(0);
-        assert!(app.history_scroll.follow_output);
-    }
-
-    #[test]
-    fn scroll_to_clamps_to_max() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 10;
-
-        app.push_text("hello");
-        let max_scroll = app.max_scroll_offset();
-        app.scroll_to(max_scroll + 100);
-        assert_eq!(app.history_scroll.scroll, max_scroll);
-    }
-
-    // ── SessionManagerState scroll page ──
-
-    #[test]
-    fn session_list_scroll_up_page() {
-        let mut mgr = SessionManagerState::new();
-        mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
-        mgr.scroll = 5;
-
-        mgr.scroll_up_page();
-        assert_eq!(mgr.scroll, 2);
-    }
-
-    #[test]
-    fn session_list_scroll_up_page_clamps_at_zero() {
-        let mut mgr = SessionManagerState::new();
-        mgr.scroll = 1;
-
-        mgr.scroll_up_page();
-        assert_eq!(mgr.scroll, 0);
-    }
-
-    #[test]
-    fn session_list_scroll_down_page() {
-        let mut mgr = SessionManagerState::new();
-        mgr.sessions = vec![
-            make_session(1, "a"),
-            make_session(2, "b"),
-            make_session(3, "c"),
-        ];
-
-        mgr.scroll_down_page();
-        assert_eq!(mgr.scroll, 2);
-    }
-
-    #[test]
-    fn session_list_scroll_down_page_clamps_to_max() {
-        let mut mgr = SessionManagerState::new();
-        mgr.sessions = vec![make_session(1, "a"), make_session(2, "b")];
-
-        mgr.scroll_down_page();
-        assert_eq!(mgr.scroll, 1);
-    }
-
-    #[test]
-    fn session_list_scroll_down_page_on_empty_list_is_noop() {
-        let mut mgr = SessionManagerState::new();
-        mgr.scroll_down_page();
-        assert_eq!(mgr.scroll, 0);
-    }
-
-    // ── AIProvidersState scroll page ──
-
-    #[test]
-    fn ai_providers_scroll_up_page() {
-        let mut mgr = AIProvidersState::new();
-        mgr.accounts = vec![AccountInfo {
-            name: "a".into(),
-            provider: "o".into(),
-            has_credential: false,
-        }];
-        mgr.scroll = 1;
-
-        mgr.scroll_up_page();
-        assert_eq!(mgr.scroll, 0);
-    }
-
-    #[test]
-    fn ai_providers_scroll_up_page_clamps_at_zero() {
-        let mut mgr = AIProvidersState::new();
-        mgr.scroll = 0;
-
-        mgr.scroll_up_page();
-        assert_eq!(mgr.scroll, 0);
-    }
-
-    #[test]
-    fn ai_providers_scroll_down_page() {
-        let mut mgr = AIProvidersState::new();
-        mgr.accounts = vec![
-            AccountInfo {
-                name: "a".into(),
-                provider: "o".into(),
-                has_credential: false,
-            },
-            AccountInfo {
-                name: "b".into(),
-                provider: "o".into(),
-                has_credential: false,
-            },
-        ];
-
-        mgr.scroll_down_page();
-        assert_eq!(mgr.scroll, 1);
-    }
-
-    #[test]
-    fn ai_providers_scroll_down_page_on_empty_list_is_noop() {
-        let mut mgr = AIProvidersState::new();
-        mgr.scroll_down_page();
-        assert_eq!(mgr.scroll, 0);
-    }
-
-    #[test]
-    fn ai_providers_scroll_down_page_clamps_to_max() {
-        let mut mgr = AIProvidersState::new();
-        mgr.accounts = vec![AccountInfo {
-            name: "a".into(),
-            provider: "o".into(),
-            has_credential: false,
-        }];
-
-        mgr.scroll_down_page();
-        assert_eq!(mgr.scroll, 0); // only 1 item → max_scroll = 0
-    }
-
-    // ── set_page ──
-
-    #[test]
-    fn set_page_sets_page_and_dirty_flag() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.progress_dirty = false;
-        app.set_page(Page::Settings);
-        assert_eq!(app.page, Page::Settings);
-        assert!(app.progress_dirty);
-    }
-
-    // ── handle_session_attached progress seeding ──
-
-    #[test]
-    fn handle_session_attached_seeds_progress_from_session_manager() {
-        let mut app = test_app("/tmp/tai.sock");
-        let mut s = make_session(42, "test");
-        s.token_usage = Some(TokenUsage {
-            input_tokens: 10,
-            output_tokens: 20,
-            total_tokens: 30,
-        });
-        s.context_window = Some(4096);
-        s.account_name = Some("my-account".into());
-        s.selected_model = Some("gpt-4o".into());
-        s.reasoning_effort = Some(ThinkingEffort::Medium);
-        app.session_mgr.sessions.push(s);
-
-        app.handle_session_attached(42);
-
-        assert_eq!(app.attached_session_id, Some(42));
-        assert_eq!(
-            app.attached_token_usage,
-            Some(TokenUsage {
-                input_tokens: 10,
-                output_tokens: 20,
-                total_tokens: 30,
-            })
-        );
-        assert_eq!(app.attached_context_window, Some(4096));
-        assert_eq!(app.attached_account_name.as_deref(), Some("my-account"),);
-        assert_eq!(app.attached_model.as_deref(), Some("gpt-4o"));
-        assert_eq!(app.attached_reasoning_effort, Some(ThinkingEffort::Medium),);
-        assert!(app.progress_dirty);
-    }
-
-    #[test]
-    fn handle_session_attached_ignores_unknown_session() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.handle_session_attached(99);
-        assert_eq!(app.attached_session_id, Some(99));
-        assert!(app.attached_token_usage.is_none());
-        assert!(app.attached_context_window.is_none());
-        assert!(app.attached_account_name.is_none());
-        assert!(app.attached_model.is_none());
-        assert!(app.attached_reasoning_effort.is_none());
-        assert!(app.progress_dirty);
-    }
-
-    // ── handle_model_selected ──
-
-    #[test]
-    fn handle_model_selected_updates_cached_value_and_session_entry() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.session_mgr.sessions.push(make_session(1, "s1"));
-        app.handle_session_attached(1);
-
-        app.handle_model_selected("gpt-4o");
-
-        assert_eq!(
-            app.attached_model.as_deref(),
-            Some("gpt-4o"),
-            "cached model should be set",
-        );
-        assert_eq!(
-            app.session_mgr.sessions[0].selected_model.as_deref(),
-            Some("gpt-4o"),
-            "session-manager entry should be updated",
-        );
-    }
-
-    #[test]
-    fn handle_model_selected_skipped_when_no_attached_session() {
-        let mut app = test_app("/tmp/tai.sock");
-        let saved = app.attached_model.clone();
-        app.handle_model_selected("gpt-4o");
-        assert_eq!(app.attached_model, saved, "should be a no-op");
-    }
-
-    // ── handle_reasoning_effort_set ──
-
-    #[test]
-    fn handle_reasoning_effort_set_updates_cached_value_and_session_entry() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.session_mgr.sessions.push(make_session(1, "s1"));
-        app.handle_session_attached(1);
-
-        app.handle_reasoning_effort_set(ThinkingEffort::High);
-
-        assert_eq!(app.attached_reasoning_effort, Some(ThinkingEffort::High),);
-        assert_eq!(
-            app.session_mgr.sessions[0].reasoning_effort,
-            Some(ThinkingEffort::High),
-        );
-    }
-
-    #[test]
-    fn handle_reasoning_effort_set_skipped_when_no_attached_session() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.handle_reasoning_effort_set(ThinkingEffort::Low);
-        assert!(app.attached_reasoning_effort.is_none());
-    }
-
-    // ── handle_session_account_set ──
-
-    #[test]
-    fn handle_session_account_set_updates_cached_value_and_session_entry() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.ai_providers.set_accounts(vec![tai_proto::AccountInfo {
-            name: "my-acc".into(),
-            provider: "openai".into(),
-            has_credential: true,
-        }]);
-        app.session_mgr.sessions.push(make_session(1, "s1"));
-        app.handle_session_attached(1);
-
-        app.handle_session_account_set("my-acc");
-
-        assert_eq!(app.attached_account_name.as_deref(), Some("my-acc"));
-        assert_eq!(app.attached_provider_slug.as_deref(), Some("openai"));
-        assert_eq!(
-            app.session_mgr.sessions[0].account_name.as_deref(),
-            Some("my-acc"),
-        );
-    }
-
-    #[test]
-    fn handle_session_account_set_skipped_when_no_attached_session() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.handle_session_account_set("my-acc");
-        assert!(app.attached_account_name.is_none());
-        assert!(app.attached_provider_slug.is_none());
-    }
-
-    // ── handle_session_working_dir_set ──
-
-    #[test]
-    fn handle_session_working_dir_set_updates_cached_field_and_session_entry() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.session_mgr.sessions.push(make_session(1, "s1"));
-        app.handle_session_attached(1);
-
-        app.handle_session_working_dir_set(1, &Some("/home/user/project".into()));
-
-        assert_eq!(
-            app.attached_working_dir.as_deref(),
-            Some("/home/user/project"),
-        );
-        assert_eq!(
-            app.session_mgr.sessions[0].working_dir.as_deref(),
-            Some("/home/user/project"),
-        );
-        assert!(app.progress_dirty);
-    }
-
-    #[test]
-    fn handle_session_working_dir_set_skipped_for_non_attached_session() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.session_mgr.sessions.push(make_session(1, "s1"));
-        app.handle_session_attached(1);
-
-        // Send a message for a different session ID.
-        app.handle_session_working_dir_set(42, &Some("/other".into()));
-
-        assert!(app.attached_working_dir.is_none());
-    }
-
-    #[test]
-    fn handle_session_working_dir_set_clears_field_when_path_is_none() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.session_mgr.sessions.push(make_session(1, "s1"));
-        app.handle_session_attached(1);
-        app.attached_working_dir = Some("/old".into());
-        app.session_mgr.sessions[0].working_dir = Some("/old".into());
-
-        app.handle_session_working_dir_set(1, &None);
-
-        assert!(app.attached_working_dir.is_none());
-        assert!(app.session_mgr.sessions[0].working_dir.is_none());
-    }
-
-    // ── attached_session_mut ──
-
-    #[test]
-    fn attached_session_mut_returns_none_when_not_attached() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.session_mgr.sessions.push(make_session(1, "s1"));
-        assert!(app.attached_session_mut().is_none());
-    }
-
-    #[test]
-    fn attached_session_mut_returns_the_attached_session() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.session_mgr.sessions.push(make_session(1, "s1"));
-        app.handle_session_attached(1);
-
-        let entry = app.attached_session_mut();
-        assert!(entry.is_some());
-        assert_eq!(entry.unwrap().session_id, 1);
-    }
-
-    #[test]
-    fn attached_session_mut_allows_mutation() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.session_mgr.sessions.push(make_session(1, "s1"));
-        app.handle_session_attached(1);
-
-        if let Some(s) = app.attached_session_mut() {
-            s.title = Some("mutated".into());
-        }
-        assert_eq!(
-            app.session_mgr.sessions[0].title.as_deref(),
-            Some("mutated"),
-        );
-    }
-
-    // ── height_prefix ──
-
-    #[test]
-    fn rebuild_height_prefix_after_push_history_item() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-
-        // Rebuild should be called automatically by push_history_item;
-        // verify the prefix matches expected cumulative heights.
-        app.push_history_item(HistoryItem::Text("a".into()));
-        let h1 = app.history_viewport.item_height(&app.client.history[0]);
-        let h2 = app.history_viewport.item_height(&app.client.history[1]);
-        assert_eq!(app.height_prefix.len(), 2);
-        assert_eq!(app.height_prefix[0], h1, "prefix[0] = height of first item");
-        assert_eq!(app.height_prefix[1], h1 + h2, "prefix[1] = sum of both");
-    }
-
-    #[test]
-    fn add_to_height_prefix_increments_from_index_onward() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        // 3 items, each height=2 → prefix = [2, 4, 6]
-        for i in 0..3 {
-            app.push_history_item(HistoryItem::Text(format!("line {i}")));
-        }
-        // We now have 4 items (including the initial one).
-        // Rebuild prefix to get a clean baseline for the incremental test.
-        app.rebuild_height_prefix();
-        let before: Vec<usize> = app.height_prefix.clone();
-        // Item at index 1 grew by 3 lines.
-        app.add_to_height_prefix(1, 3);
-        assert_eq!(app.height_prefix[0], before[0], "prefix[0] unchanged");
-        assert_eq!(
-            app.height_prefix[1],
-            before[1] + 3,
-            "prefix[1] increased by 3"
-        );
-        assert_eq!(
-            app.height_prefix[2],
-            before[2] + 3,
-            "prefix[2] increased by 3"
-        );
-        assert_eq!(
-            app.height_prefix[3],
-            before[3] + 3,
-            "prefix[3] increased by 3"
-        );
-    }
-
-    #[test]
-    fn sub_from_height_prefix_decrements_from_index_onward() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        for _ in 0..3 {
-            app.push_history_item(HistoryItem::Text("short".into()));
-        }
-        app.rebuild_height_prefix();
-        let before: Vec<usize> = app.height_prefix.clone();
-        // Item at index 1 shrank by 1 line.
-        app.sub_from_height_prefix(1, 1);
-        assert_eq!(app.height_prefix[0], before[0], "prefix[0] unchanged");
-        assert_eq!(
-            app.height_prefix[1],
-            before[1] - 1,
-            "prefix[1] decreased by 1"
-        );
-        assert_eq!(
-            app.height_prefix[2],
-            before[2] - 1,
-            "prefix[2] decreased by 1"
-        );
-        assert_eq!(
-            app.height_prefix[3],
-            before[3] - 1,
-            "prefix[3] decreased by 1"
-        );
-    }
-
-    // ── find_history_item_at_row ──
-
-    #[test]
-    fn find_history_item_at_row_maps_screen_row_to_correct_item() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 20;
-
-        // 3 Text items, each height = 2.
-        for i in 0..3 {
-            app.push_history_item(HistoryItem::Text(format!("line {i}")));
-        }
-        // 4 items total (incl. initial).  total_height = 4 × 2 = 8.
-        // viewport = 20 > total, so max_scroll = 0 at bottom.
-        assert_eq!(app.effective_scroll(), 0);
-        assert_eq!(app.total_history_height(), 8);
-
-        // At scroll=0 (bottom), content_line = total - vh + screen_row.
-        // screen_row 0 → content_line = 0 → item 0 (prefix[0]=2, 2 <= 0 false → partition_point returns 0)
-        assert_eq!(
-            find_history_item_at_row(&app, 0),
-            Some(0),
-            "top of viewport at scroll=0 → first item"
-        );
-        // screen_row 2 → content_line = 2 → item 1 (prefix[0]=2, 2<=2 true; prefix[1]=4, 4<=2 false → i=1)
-        assert_eq!(
-            find_history_item_at_row(&app, 2),
-            Some(1),
-            "content_line 2 → second item"
-        );
-        // screen_row 4 → content_line = 4 → item 2
-        assert_eq!(
-            find_history_item_at_row(&app, 4),
-            Some(2),
-            "content_line 4 → third item"
-        );
-        // screen_row 6 → content_line = 6 → item 3 (last)
-        assert_eq!(
-            find_history_item_at_row(&app, 6),
-            Some(3),
-            "content_line 6 → fourth item"
-        );
-    }
-
-    #[test]
-    fn find_history_item_at_row_returns_none_for_out_of_bounds() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.history_viewport.width = 80;
-        app.history_viewport.height = 20;
-
-        // Empty out the history.
-        app.client.history.clear();
-        app.height_prefix.clear();
-        assert!(
-            find_history_item_at_row(&app, 0).is_none(),
-            "empty history → None"
-        );
-
-        // screen_row >= viewport height
-        assert!(
-            find_history_item_at_row(&app, 20).is_none(),
-            "screen_row == viewport height → None"
-        );
-        assert!(
-            find_history_item_at_row(&app, 25).is_none(),
-            "screen_row > viewport height → None"
-        );
-    }
-
-    // ── handle_session_created ──
-
-    #[test]
-    fn handle_session_created_on_chat_page_clears_history_and_attaches() {
-        let mut app = test_app("/tmp/tai.sock");
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
-        app.page = Page::Chat;
-
-        // Populate state as if we were in an active session.
-        app.client
-            .history
-            .push(HistoryItem::Text("old message".into()));
-        app.render_cache.push(None);
-        app.rebuild_height_prefix();
-        app.active.insert(1);
-        app.client.in_progress.insert(1, 0);
-        app.session_mgr
-            .sessions
-            .push(make_session(42, "new-session"));
-
-        app.handle_session_created(42, &tx)
-            .expect("handle_session_created");
-
-        // History should be cleared (reset_for_session_switch was called).
-        assert!(
-            app.client.history.is_empty(),
-            "history should be cleared on Chat page"
-        );
-        assert!(
-            app.render_cache.is_empty(),
-            "render_cache should be cleared"
-        );
-        assert!(app.active.is_empty(), "active requests should be cleared");
-        assert!(
-            app.client.in_progress.is_empty(),
-            "in_progress should be cleared"
-        );
-        assert_eq!(app.attached_session_id, Some(42));
-
-        // Should send AttachSession, not ListSessions.
-        let msg = rx.recv().expect("should send a message");
-        assert_eq!(msg, ClientMessage::AttachSession { session_id: 42 });
-        // No second message.
-        assert!(rx.try_recv().is_err(), "should not send ListSessions");
-    }
-
-    #[test]
-    fn handle_session_created_on_session_manager_page_does_not_clear_history() {
-        let mut app = test_app("/tmp/tai.sock");
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
-        app.page = Page::SessionManager;
-
-        // Populate some history (should be preserved).
-        app.client
-            .history
-            .push(HistoryItem::Text("old message".into()));
-        app.render_cache.push(None);
-        app.rebuild_height_prefix();
-        let history_len = app.client.history.len();
-
-        app.handle_session_created(42, &tx)
-            .expect("handle_session_created");
-
-        // History should NOT be cleared on SessionManager page.
-        assert_eq!(
-            app.client.history.len(),
-            history_len,
-            "history preserved on SessionManager"
-        );
-        assert!(
-            app.attached_session_id.is_none(),
-            "should NOT auto-attach on SessionManager"
-        );
-
-        // Should send ListSessions, not AttachSession.
-        let msg = rx.recv().expect("should send a message");
-        assert_eq!(msg, ClientMessage::ListSessions);
-        assert!(rx.try_recv().is_err(), "should not send AttachSession");
-    }
-
-    #[test]
-    fn handle_session_created_skips_unknown_session() {
-        // handle_session_created doesn't validate that the session exists in
-        // session_mgr — it trusts the daemon. Verify it still works even if
-        // the session isn't in the local list yet.
-        let mut app = test_app("/tmp/tai.sock");
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
-        app.page = Page::Chat;
-
-        app.client.history.push(HistoryItem::Text("old".into()));
-        app.render_cache.push(None);
-
-        app.handle_session_created(99, &tx)
-            .expect("handle_session_created");
-
-        assert!(
-            app.client.history.is_empty(),
-            "history cleared even for unknown session"
-        );
-        assert_eq!(app.attached_session_id, Some(99));
-
-        let msg = rx.recv().expect("should send AttachSession");
-        assert_eq!(msg, ClientMessage::AttachSession { session_id: 99 });
-    }
-
-    #[test]
-    fn handle_session_created_on_other_pages_behaves_like_chat() {
-        // Pages other than SessionManager should also auto-attach.
-        let mut app = test_app("/tmp/tai.sock");
-        let (tx, rx) = std::sync::mpsc::channel::<ClientMessage>();
-        app.page = Page::Home;
-
-        app.client.history.push(HistoryItem::Text("old".into()));
-        app.render_cache.push(None);
-
-        app.handle_session_created(42, &tx)
-            .expect("handle_session_created");
-
-        assert!(
-            app.client.history.is_empty(),
-            "history cleared on Home page"
-        );
-        assert_eq!(app.attached_session_id, Some(42));
-
-        let msg = rx.recv().expect("should send AttachSession");
-        assert_eq!(msg, ClientMessage::AttachSession { session_id: 42 });
-    }
-
-    // ── mark_terminal_resized ──
-
-    #[test]
-    fn mark_terminal_resized_sets_flag() {
-        let mut app = test_app("/tmp/tai.sock");
-        assert!(!app.terminal_resized, "flag starts false");
-        app.mark_terminal_resized();
-        assert!(app.terminal_resized, "flag set after mark_terminal_resized");
-        // Calling update_viewport will try to query the real terminal size.
-        // If it succeeds, the flag is cleared.  If not (e.g. no terminal in CI),
-        // the flag stays true.  Either outcome is acceptable — the important
-        // invariant is that the getter/setter work correctly.
-        app.update_viewport_from_terminal_size();
-        // No assertion here — we just verify no crash.
-    }
-
-    // ── insert_session_message_ordered tests ──────────────────────────────
-
-    #[test]
-    fn insert_session_message_ordered_places_at_correct_position() {
-        let mut app = test_app("/tmp/tai.sock");
-        // Start with some existing messages at id 5 and 10.
-        app.client
-            .history
-            .push(HistoryItem::SessionMessage(SessionMessage {
-                message_id: 5,
-                parent_id: None,
-                created_at: TimestampMs::now(),
-                kind: SessionMessageKind::UserText {
-                    content: "first".into(),
-                },
-                deleted: false,
-            }));
-        app.client
-            .history
-            .push(HistoryItem::SessionMessage(SessionMessage {
-                message_id: 10,
-                parent_id: None,
-                created_at: TimestampMs::now(),
-                kind: SessionMessageKind::AssistantText {
-                    content: "second".into(),
-                    reasoning: None,
-                    token_usage: None,
-                },
-                deleted: false,
-            }));
-        app.render_cache.resize(app.client.history.len(), None);
-
-        // Insert a message with message_id 7 — should go between 5 and 10.
-        app.insert_session_message_ordered(SessionMessage {
-            message_id: 7,
-            parent_id: None,
-            created_at: TimestampMs::now(),
-            kind: SessionMessageKind::AssistantText {
-                content: "middle".into(),
-                reasoning: None,
-                token_usage: None,
-            },
-            deleted: false,
-        });
-
-        let ids: Vec<u32> = app
-            .client
-            .history
-            .iter()
-            .filter_map(|item| {
-                if let HistoryItem::SessionMessage(m) = item {
-                    Some(m.message_id)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(ids, vec![5, 7, 10], "inserted in message_id order");
-    }
-
-    #[test]
-    fn insert_session_message_ordered_atu_goes_before_tool_result_stream() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.client.history.clear();
-        app.render_cache.clear();
-        // Simulate a ToolResultStream at message_id 10 in history.
-        app.client
-            .history
-            .push(HistoryItem::ToolResultStream(ToolResultStreamData {
-                message_id: 10,
-                request_id: 1,
-                call_id: "c1".into(),
-                tool_name: "read".into(),
-                accumulated_text: String::new(),
-                is_error: false,
-            }));
-        app.render_cache.resize(app.client.history.len(), None);
-
-        // AssistantToolUse with message_id 8 should insert before the stream.
-        app.insert_session_message_ordered(SessionMessage {
-            message_id: 8,
-            parent_id: None,
-            created_at: TimestampMs::now(),
-            kind: SessionMessageKind::AssistantToolUse {
-                content: None,
-                tool_calls: vec![AssistantToolCallRecord {
-                    call_id: "c1".into(),
-                    name: "read".into(),
-                    arguments_json: "{}".into(),
-                }],
-                reasoning: None,
-                token_usage: None,
-            },
-            deleted: false,
-        });
-
-        assert_eq!(app.client.history.len(), 2, "two items in history");
-        assert!(
-            matches!(&app.client.history[0], HistoryItem::SessionMessage(m) if m.message_id == 8),
-            "ATU at index 0"
-        );
-        assert!(
-            matches!(&app.client.history[1], HistoryItem::ToolResultStream(d) if d.message_id == 10),
-            "ToolResultStream at index 1"
-        );
-    }
-
-    #[test]
-    fn insert_session_message_ordered_atu_goes_before_streaming_item() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.client.history.clear();
-        app.render_cache.clear();
-        // A streaming item should not block ATU insertion.
-        app.client
-            .history
-            .push(HistoryItem::Streaming(StreamingTextItem {
-                message_id: 0,
-                request_id: 1,
-                reasoning: String::new(),
-                answer: String::new(),
-            }));
-        app.client.in_progress.insert(1, 0);
-        app.render_cache.resize(app.client.history.len(), None);
-
-        app.insert_session_message_ordered(SessionMessage {
-            message_id: 3,
-            parent_id: None,
-            created_at: TimestampMs::now(),
-            kind: SessionMessageKind::AssistantToolUse {
-                content: None,
-                tool_calls: vec![],
-                reasoning: None,
-                token_usage: None,
-            },
-            deleted: false,
-        });
-
-        assert_eq!(app.client.history.len(), 2);
-        assert!(
-            matches!(&app.client.history[0], HistoryItem::SessionMessage(m) if m.message_id == 3),
-            "ATU inserted before streaming"
-        );
-        assert!(
-            matches!(&app.client.history[1], HistoryItem::Streaming(_)),
-            "streaming item at index 1"
-        );
-    }
-
-    #[test]
-    fn insert_session_message_ordered_adjusts_tracking_indices() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.client.history.clear();
-        app.render_cache.clear();
-        // Simulate an active stream at index 1.
-        app.client
-            .history
-            .push(HistoryItem::Text("existing".into()));
-        app.client
-            .history
-            .push(HistoryItem::Streaming(StreamingTextItem {
-                message_id: 0,
-                request_id: 5,
-                reasoning: String::new(),
-                answer: String::new(),
-            }));
-        app.client.in_progress.insert(5, 1);
-        app.render_cache.resize(app.client.history.len(), None);
-
-        // Inserting an ATU before the streaming item should shift the index.
-        app.insert_session_message_ordered(SessionMessage {
-            message_id: 2,
-            parent_id: None,
-            created_at: TimestampMs::now(),
-            kind: SessionMessageKind::AssistantToolUse {
-                content: None,
-                tool_calls: vec![],
-                reasoning: None,
-                token_usage: None,
-            },
-            deleted: false,
-        });
-
-        // ATU is inserted before the streaming item, shifting it from 1 to 2.
-        assert_eq!(
-            app.client.in_progress.get(&5),
-            Some(&2),
-            "in_progress index shifted after ATU insertion before stream"
-        );
-    }
+    // ── find_turn_at_row ──
 
     #[test]
-    fn insert_session_message_ordered_handles_empty_history() {
-        let mut app = test_app("/tmp/tai.sock");
-        app.client.history.clear();
-        app.render_cache.clear();
-        app.insert_session_message_ordered(SessionMessage {
-            message_id: 1,
-            parent_id: None,
-            created_at: TimestampMs::now(),
-            kind: SessionMessageKind::UserText {
-                content: "first".into(),
-            },
-            deleted: false,
-        });
-        assert_eq!(app.client.history.len(), 1);
-        assert!(
-            matches!(&app.client.history[0], HistoryItem::SessionMessage(m) if m.message_id == 1),
-        );
+    fn find_turn_at_row_returns_none_out_of_bounds() {
+        let app = test_app("/tmp/tai.sock");
+        assert!(find_turn_at_row(&app, 999).is_none());
     }
 }

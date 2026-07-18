@@ -4,7 +4,6 @@ pub mod diff;
 pub mod dispatch;
 pub mod error;
 pub mod history;
-pub mod image;
 pub mod shell;
 
 pub use connection::{
@@ -13,13 +12,11 @@ pub use connection::{
 };
 pub use credentials::{build_add_credential_message, read_public_key_bytes, resolve_private_key};
 pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
-pub use dispatch::{DaemonMessageHandler, dispatch_daemon_message};
+pub use dispatch::{ToolCallEvent, TurnEventHandler, dispatch_daemon_message};
 pub use error::{ClientError, broken_pipe};
-pub use history::{ClientHistory, HistoryItem, MAX_HISTORY_ITEMS, ToolResultStreamData};
-pub use image::{ImageAssembler, PendingImage};
+pub use history::SessionView;
 pub use shell::{
-    ShellCommand, StreamingText, UnlockMethod, is_valid_account_name, parse_input_line,
-    shell_command_echo,
+    ShellCommand, UnlockMethod, is_valid_account_name, parse_input_line, shell_command_echo,
 };
 pub use tai_transport::key::read_server_pk;
 

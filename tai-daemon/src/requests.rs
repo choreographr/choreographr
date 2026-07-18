@@ -1,7 +1,7 @@
 use crate::context;
-use crate::db::{SessionRecord, write_message_retry, write_session_retry};
+use crate::db::{SessionRecord, write_session_retry};
 use crate::openai::{AssistantToolCall, AssistantToolFunction, ChatRequestMessage};
-use crate::providers::types::{ChatAssistantToolUse, ChatToolCall, ChatTurnResult};
+use crate::providers::types::{ChatToolCall, ChatTurnResult};
 use crate::providers::{
     ChatTurnRequest, InferenceProvider, ReasoningSupport, StreamEvent, ToolResultItem,
     effective_reasoning_support, lookup_provider,
@@ -21,49 +21,39 @@ use std::time::Instant;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
     AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream,
-    SessionMessage, SessionMessageKind, SessionStatus, ThinkingEffort, TokenUsage,
+    SessionStatus, ThinkingEffort, TokenUsage,
 };
 use tracing::{debug, info, warn};
 
-/// Persist a `PreparedImage` to the database as a `DisplayedImage` message,
-/// push it into the session's in-memory message list, and broadcast it to
-/// live subscribers immediately (mid-turn) so the image appears as soon as
-/// the tool finishes rather than waiting for request completion.
-/// Used by both the serial and concurrent tool paths.
-fn emit_and_persist_image(
+/// Persist a `PreparedImage` to the session's current active turn and
+/// broadcast it to live subscribers immediately (mid-turn) so the image
+/// appears as soon as the tool finishes rather than waiting for request
+/// completion.  Used by both the serial and concurrent tool paths.
+fn emit_image(
     cmd_tx: &mpsc::Sender<SessionCommand>,
     image: PreparedImage,
     tool_call_id: Option<String>,
     session: &mut SessionState,
-    ctx: &RequestContext,
+    turn_id: u32,
 ) {
-    let (msg_id, persisted) =
-        session.append_message(SessionMessageKind::DisplayedImage(DisplayedImageRecord {
-            metadata: ImageMetadata {
-                image_id: 0,
-                mime_type: image.mime_type,
-                width: image.width,
-                height: image.height,
-                byte_len: image.data.len() as u64,
-                alt: image.alt,
-            },
-            data: image.data,
-            tool_call_id,
-        }));
-
-    // Broadcast to live subscribers mid-turn so subscribers see the image
-    // immediately, not just at request completion.
-    let _ = cmd_tx.send(SessionCommand::Broadcast(
-        DaemonMessage::SessionMessageAppended {
-            message: persisted.clone(),
+    let record = DisplayedImageRecord {
+        metadata: ImageMetadata {
+            mime_type: image.mime_type,
+            width: image.width,
+            height: image.height,
+            byte_len: image.data.len() as u64,
+            alt: image.alt,
         },
-    ));
-
-    if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, msg_id, &persisted) {
-        tracing::warn!(
-            session_id = ctx.session_id, error = %e,
-            "failed to persist displayed image",
-        );
+        data: image.data,
+        tool_call_id,
+    };
+    session.add_displayed_image(turn_id, record.clone());
+    // Broadcast TurnAppended so subscribers see the image mid-turn.
+    if let Some(turn) = session.turns.get(&turn_id) {
+        let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
+            turn_id,
+            turn: turn.clone(),
+        }));
     }
 }
 
@@ -83,7 +73,7 @@ fn spawn_forwarding_thread(
             match output_rx.recv_timeout(check_interval) {
                 Ok(data) => {
                     if cmd_tx
-                        .send(SessionCommand::Broadcast(DaemonMessage::ToolCallOutput {
+                        .send(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk {
                             request_id,
                             call_id: call_id.clone(),
                             data,
@@ -135,30 +125,6 @@ fn accumulate_token_usage(
             accumulated_output = session.config.accumulated_usage.output_tokens,
             "accumulated token usage"
         );
-    }
-}
-
-fn refresh_session_context(
-    session: &mut SessionState,
-    working_dir: &Path,
-    context_config: &tai_proto::ContextConfig,
-) {
-    if let Some(old_fp) = session.config.context_fingerprint
-        && let Some(idx) = session.config.context_message_index
-        && let Ok(Some(new_bundle)) = context::recheck_context(working_dir, context_config, old_fp)
-    {
-        let new_content = context::assemble_context(&new_bundle);
-        if !new_content.is_empty() {
-            session.set_message(
-                idx,
-                SessionMessage::now(SessionMessageKind::SystemText {
-                    content: new_content,
-                }),
-            );
-        }
-        session.config.context_fingerprint = Some(new_bundle.fingerprint);
-        session.config.context_file_paths =
-            new_bundle.files.iter().map(|f| f.path.clone()).collect();
     }
 }
 
@@ -323,23 +289,41 @@ pub(crate) fn run_agent_loop(
     request_id: u32,
     cancel_rx: &mpsc::Receiver<()>,
     ctx: &RequestContext,
+    user_text: Option<String>,
 ) -> io::Result<bool> {
     let max_turns = session.config.max_turns.unwrap_or(ctx.max_turns_default);
 
     let mut prev_resp_id: Option<String> = None;
     let mut tool_results: Vec<ToolResultItem> = Vec::new();
 
-    for turn in 0..max_turns {
+    // Build system prompt and context at request time.
+    let system_content = if let Some(ref working_dir) = session.config.working_dir {
+        let skills = context::discover_skills(working_dir);
+        let base_prompt = context::build_base_prompt(&skills, &ctx.tool_registry.groups());
+        let mut content = base_prompt;
+        if let Ok(bundle) = context::discover_context(working_dir, &session.config.context_config) {
+            let context_str = context::assemble_context(&bundle);
+            if !context_str.is_empty() {
+                content.push_str("\n\n");
+                content.push_str(&context_str);
+            }
+        }
+        Some(content)
+    } else {
+        None
+    };
+
+    for turn_iter in 0..max_turns {
         let mut thinking_effort = session
             .config
             .reasoning_effort
             .unwrap_or(ThinkingEffort::Off);
-        debug!(session_id = ctx.session_id, turn, "agent loop turn");
+        debug!(
+            session_id = ctx.session_id,
+            turn = turn_iter,
+            "agent loop turn"
+        );
         if thinking_effort != ThinkingEffort::Off {
-            // Validate that the current model actually supports the requested
-            // reasoning effort at inference time.  The set-time check in
-            // sessions.rs accepts the effort when no model is selected yet,
-            // so we must re-validate here with the concrete model.
             let slug = client.provider_slug();
             let catalog_entry = lookup_provider(slug);
             let reasoning_support = catalog_entry
@@ -348,14 +332,14 @@ pub(crate) fn run_agent_loop(
             let effective = effective_reasoning_support(model, reasoning_support);
             if effective == ReasoningSupport::None {
                 warn!(
-                    session_id = ctx.session_id, turn, model,
+                    session_id = ctx.session_id, turn = turn_iter, model,
                     effort = %thinking_effort.as_label(),
                     "model does not support reasoning effort, disabling",
                 );
                 thinking_effort = ThinkingEffort::Off;
             } else {
                 debug!(
-                    session_id = ctx.session_id, turn,
+                    session_id = ctx.session_id, turn = turn_iter,
                     effort = %thinking_effort.as_label(),
                     "reasoning effort active in agent loop",
                 );
@@ -369,10 +353,25 @@ pub(crate) fn run_agent_loop(
             return Ok(true);
         }
 
-        if let Some(session_working_dir) = session.config.working_dir.clone() {
-            let context_config = session.config.context_config.clone();
-            refresh_session_context(session, &session_working_dir, &context_config);
-        }
+        // Start a new turn for this agent loop iteration.
+        let turn_user_text = if turn_iter == 0 {
+            user_text.clone()
+        } else {
+            None
+        };
+        let (current_turn_id, current_turn) = session.start_turn(turn_user_text);
+        let _ = ctx
+            .cmd_tx
+            .send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
+                turn_id: current_turn_id,
+                turn: current_turn,
+            }));
+        let _ = ctx
+            .cmd_tx
+            .send(SessionCommand::Broadcast(DaemonMessage::Started {
+                request_id,
+                turn_id: current_turn_id,
+            }));
 
         if ctx
             .cmd_tx
@@ -382,11 +381,8 @@ pub(crate) fn run_agent_loop(
             return Ok(false);
         }
 
-        let messages = build_chat_request_messages(session.messages());
+        let messages = build_chat_request_messages(session, system_content.as_deref());
 
-        // Build a retry-notification callback that forwards status updates
-        // through the session command channel so the TUI can display the
-        // retry progress and the user can cancel during backoff.
         let mut retry_cb: Option<crate::openai::RetryCallback> = Some(Box::new({
             let cmd_tx = ctx.cmd_tx.clone();
             move |attempt, max_attempts, delay| {
@@ -437,40 +433,65 @@ pub(crate) fn run_agent_loop(
             Ok(ChatTurnResult::FinalText(final_text)) => {
                 debug!(
                     session_id = ctx.session_id,
-                    turn,
+                    turn = turn_iter,
                     response_len = final_text.content.len(),
                     reasoning = final_text.reasoning.as_deref().unwrap_or_default(),
                     "model returned final text",
                 );
                 let token_usage = final_text.usage;
-                accumulate_token_usage(session, &token_usage, turn, ctx);
-                let (msg_id, msg) = session.append_message(SessionMessageKind::AssistantText {
-                    content: final_text.content,
-                    reasoning: final_text.reasoning,
+                accumulate_token_usage(session, &token_usage, turn_iter, ctx);
+                session.set_assistant_response(
+                    current_turn_id,
+                    Some(final_text.content),
+                    final_text.reasoning,
+                    Vec::new(),
                     token_usage,
-                });
-                if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, msg_id, &msg) {
-                    tracing::warn!(session_id = ctx.session_id, error = %e, "failed to persist assistant text");
+                );
+                // Persist and broadcast the finalized turn.
+                session.finalize_turn(&ctx.db, current_turn_id)?;
+                if let Some(turn) = session.turns.get(&current_turn_id) {
+                    let _ =
+                        ctx.cmd_tx
+                            .send(SessionCommand::Broadcast(DaemonMessage::TurnFinalized {
+                                turn_id: current_turn_id,
+                                turn: turn.clone(),
+                            }));
                 }
-                // FinalText ends the agent loop — no next turn to chain to.
                 tool_results.clear();
                 return Ok(false);
             }
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 let token_usage = tool_use.usage;
-                accumulate_token_usage(session, &token_usage, turn, ctx);
-                let base = persist_assistant_tool_use_sync(session, &tool_use, token_usage, ctx);
+                accumulate_token_usage(session, &token_usage, turn_iter, ctx);
+                session.set_assistant_response(
+                    current_turn_id,
+                    tool_use.content.clone(),
+                    tool_use.reasoning.clone(),
+                    tool_use
+                        .tool_calls
+                        .iter()
+                        .map(|tc| AssistantToolCallRecord {
+                            call_id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            arguments_json: tc.arguments_json.clone(),
+                        })
+                        .collect(),
+                    token_usage,
+                );
+                // Broadcast the updated turn with assistant tool use info.
+                if let Some(turn) = session.turns.get(&current_turn_id) {
+                    let _ =
+                        ctx.cmd_tx
+                            .send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
+                                turn_id: current_turn_id,
+                                turn: turn.clone(),
+                            }));
+                }
                 // Store response_id for chaining tool results back to this turn
                 prev_resp_id = tool_use.response_id;
                 tool_results.clear();
 
-                // Partition tool calls into two groups:
-                //   mutators  — tools that need &mut SessionState or deep
-                //               coupling with the agent loop (load_tools,
-                //               unload_tools).
-                //   concurrent — everything else (run_riscv, shell,
-                //               filesystem, etc.) that can run on
-                //               independent OS threads.
+                // Partition tool calls into mutators and concurrent.
                 let (mutators, concurrent): (Vec<_>, Vec<_>) =
                     tool_use.tool_calls.into_iter().partition(|tc| {
                         matches!(
@@ -479,26 +500,23 @@ pub(crate) fn run_agent_loop(
                         )
                     });
 
-                let total_mutators = mutators.len();
+                let _total_mutators = mutators.len();
 
                 // ── Phase 1: Session-mutating tools (serial) ────────
-                for (i, tool_call) in mutators.into_iter().enumerate() {
+                for tool_call in mutators.into_iter() {
                     if is_cancelled_once(cancel_rx) {
                         return Ok(true);
                     }
 
-                    let tool_msg_id = base + 1 + i as u32;
                     let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
                         DaemonMessage::ToolCallStarted {
                             request_id,
                             call_id: tool_call.id.clone(),
                             tool_name: tool_call.name.clone(),
                             arguments_json: tool_call.arguments_json.clone(),
-                            message_id: tool_msg_id,
                         },
                     ));
 
-                    // Meta-tools always have a timeout (load/unload are fast).
                     let tool_timeout =
                         determine_tool_timeout(&tool_call.name).unwrap_or(Duration::from_secs(60));
 
@@ -514,7 +532,7 @@ pub(crate) fn run_agent_loop(
 
                     debug!(
                         session_id = ctx.session_id,
-                        turn,
+                        turn = turn_iter,
                         tool_name = %tool_call.name,
                         tool_call_id = %tool_call.id,
                         args_preview = %(&tool_call.arguments_json[..tool_call.arguments_json.len().min(200)]),
@@ -535,14 +553,13 @@ pub(crate) fn run_agent_loop(
                         Some(image_tx),
                     );
 
-                    // Drain any image emitted by the tool.
                     if let Ok(image) = image_rx.try_recv() {
-                        emit_and_persist_image(
+                        emit_image(
                             &ctx.cmd_tx,
                             image,
                             Some(tool_call.id.clone()),
                             session,
-                            ctx,
+                            current_turn_id,
                         );
                     }
 
@@ -552,7 +569,7 @@ pub(crate) fn run_agent_loop(
                         &tool_call,
                         &mut output,
                         ctx,
-                        tool_msg_id,
+                        current_turn_id,
                     );
                     tool_results.push(ToolResultItem {
                         call_id: tool_call.id.clone(),
@@ -563,17 +580,13 @@ pub(crate) fn run_agent_loop(
 
                 // ── Phase 2: All remaining tools (concurrent) ───────
                 if !concurrent.is_empty() {
-                    // Broadcast all ToolCallStarted events before any tool
-                    // begins execution so subscribers see the full batch.
-                    for (j, tc) in concurrent.iter().enumerate() {
-                        let tool_msg_id = base + 1 + total_mutators as u32 + j as u32;
+                    for tc in concurrent.iter() {
                         let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::ToolCallStarted {
                                 request_id,
                                 call_id: tc.id.clone(),
                                 tool_name: tc.name.clone(),
                                 arguments_json: tc.arguments_json.clone(),
-                                message_id: tool_msg_id,
                             },
                         ));
                     }
@@ -590,7 +603,7 @@ pub(crate) fn run_agent_loop(
 
                     debug!(
                         session_id = ctx.session_id,
-                        turn,
+                        turn = turn_iter,
                         count = concurrent.len(),
                         "dispatching {} tools concurrently",
                         concurrent.len(),
@@ -612,9 +625,6 @@ pub(crate) fn run_agent_loop(
                     let cmd_tx = ctx.cmd_tx.clone();
                     let reg = Arc::clone(&ctx.tool_registry);
 
-                    // Pair each tool's identifying info with its thread handle
-                    // so we can reconstruct a meaningful error if the thread
-                    // panics (avoiding expect() in production code per AGENTS.md).
                     let handles: Vec<_> = concurrent
                         .into_iter()
                         .map(|tool_call| {
@@ -639,24 +649,12 @@ pub(crate) fn run_agent_loop(
                         })
                         .collect();
 
-                    // Collect results in source-call order so the LLM sees
-                    // a deterministic conversation history.
-                    //
-                    // Between each join we check the parent cancellation
-                    // channel.  If cancelled we propagate to all in-flight
-                    // tools via the shared AtomicBool — the flag is cheap
-                    // and requires no lock.  We do NOT return early because
-                    // the remaining JoinHandles must be drained to avoid
-                    // leaking threads.
                     if is_cancelled_once(cancel_rx) {
                         cancel_flag.store(true, Ordering::Relaxed);
                     }
-                    for (j, ((call_id, tool_name, arguments_json, tool_start), handle)) in
-                        handles.into_iter().enumerate()
+                    for ((call_id, tool_name, arguments_json, tool_start), handle) in
+                        handles.into_iter()
                     {
-                        // Re-check cancellation before each join so the
-                        // flag is set as early as possible for tools that
-                        // haven't finished yet.
                         if is_cancelled_once(cancel_rx) {
                             cancel_flag.store(true, Ordering::Relaxed);
                         }
@@ -665,33 +663,27 @@ pub(crate) fn run_agent_loop(
                             tool_call,
                             mut output,
                             image,
-                        } = handle.join().unwrap_or_else(|_| {
-                            // Thread panicked — create a fallback result
-                            // so the agent loop can continue with the other
-                            // concurrent tool outputs.
-                            ToolHandle {
-                                tool_call: ChatToolCall {
-                                    id: call_id,
-                                    name: tool_name.clone(),
-                                    arguments_json,
-                                    caller: None,
+                        } = handle.join().unwrap_or_else(|_| ToolHandle {
+                            tool_call: ChatToolCall {
+                                id: call_id,
+                                name: tool_name.clone(),
+                                arguments_json,
+                                caller: None,
+                            },
+                            output: ToolExecutionOutput {
+                                result: ToolResult {
+                                    content: "tool thread panicked".to_string(),
+                                    is_error: true,
                                 },
-                                output: ToolExecutionOutput {
-                                    result: ToolResult {
-                                        content: "tool thread panicked".to_string(),
-                                        is_error: true,
-                                    },
-                                },
-                                image: None,
-                            }
+                            },
+                            image: None,
                         });
 
-                        let tool_msg_id = base + 1 + total_mutators as u32 + j as u32;
                         let elapsed = tool_start.elapsed();
 
                         debug!(
                             session_id = ctx.session_id,
-                            turn,
+                            turn = turn_iter,
                             tool_name = %tool_call.name,
                             elapsed_ms = elapsed.as_millis(),
                             result_len = output.result.content.len(),
@@ -699,14 +691,13 @@ pub(crate) fn run_agent_loop(
                             "tool finished (concurrent)",
                         );
 
-                        // Emit and persist any image the tool produced.
                         if let Some(image) = image {
-                            emit_and_persist_image(
+                            emit_image(
                                 &ctx.cmd_tx,
                                 image,
                                 Some(tool_call.id.clone()),
                                 session,
-                                ctx,
+                                current_turn_id,
                             );
                         }
 
@@ -716,7 +707,7 @@ pub(crate) fn run_agent_loop(
                             &tool_call,
                             &mut output,
                             ctx,
-                            tool_msg_id,
+                            current_turn_id,
                         );
                         tool_results.push(ToolResultItem {
                             call_id: tool_call.id.clone(),
@@ -727,8 +718,6 @@ pub(crate) fn run_agent_loop(
                 }
             }
             Err(tai_proto::InferenceError::Cancelled) => {
-                // The user cancelled during a retry backoff —
-                // treat this as a clean cancellation, not a failure.
                 return Ok(true);
             }
             Err(e) => return Err(e.into()),
@@ -747,34 +736,29 @@ fn finish_tool_call(
     tool_call: &ChatToolCall,
     output: &mut ToolExecutionOutput,
     ctx: &RequestContext,
-    msg_id: u32,
+    turn_id: u32,
 ) {
-    if let Some(hint) = context::subdirectory_hints(
-        &tool_call.name,
-        &tool_call.arguments_json,
-        session.config.working_dir.as_deref(),
-        &session.config.context_file_paths,
-    ) {
-        output.result.content = format!("{}\n\n---\n{}", output.result.content, hint);
-    }
+    let content = output.result.content.clone();
+    let is_error = output.result.is_error;
 
-    let msg = session.append_message_with_id(
-        SessionMessageKind::ToolResult {
-            call_id: tool_call.id.clone(),
-            name: tool_call.name.clone(),
-            content: output.result.content.clone(),
-            is_error: output.result.is_error,
-        },
-        msg_id,
+    session.add_tool_result(
+        turn_id,
+        tool_call.id.clone(),
+        tool_call.name.clone(),
+        content.clone(),
+        is_error,
     );
-    if let Err(e) = write_message_retry(ctx.db.as_ref(), ctx.session_id, msg_id, &msg) {
-        tracing::warn!(
-            session_id = ctx.session_id, tool_name = %tool_call.name, error = %e,
-            "failed to persist tool result",
-        );
+
+    // Broadcast TurnAppended so subscribers see the updated turn.
+    if let Some(turn) = session.turns.get(&turn_id) {
+        let _ = ctx
+            .cmd_tx
+            .send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
+                turn_id,
+                turn: turn.clone(),
+            }));
     }
 
-    let content = &output.result.content;
     const CHUNK_SIZE: usize = 4096;
     for chunk in content.as_bytes().chunks(CHUNK_SIZE) {
         let _ = ctx
@@ -784,20 +768,14 @@ fn finish_tool_call(
                 call_id: tool_call.id.clone(),
                 data: chunk.to_vec(),
             }));
-        // broadcast() uses try_send so the session thread never blocks
-        // on a backed-up subscriber.  The bounded channel (128 slots ~
-        // 512 KiB) absorbs short bursts; if the TUI falls behind the
-        // chunk is dropped.  This is acceptable because the final
-        // ToolCallFinished + post-request-snapshot deliver the complete
-        // content.
     }
 
-    let event = if output.result.is_error {
+    let event = if is_error {
         DaemonMessage::ToolCallFailed {
             request_id,
             call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
-            error: output.result.content.clone(),
+            error: content,
         }
     } else {
         DaemonMessage::ToolCallFinished {
@@ -1091,103 +1069,69 @@ fn execute_tool_with_timeout(
     }
 }
 
-fn persist_assistant_tool_use_sync(
-    session: &mut SessionState,
-    tool_use: &ChatAssistantToolUse,
-    token_usage: Option<TokenUsage>,
-    ctx: &RequestContext,
-) -> u32 {
-    let (msg_id, message) = session.append_message(SessionMessageKind::AssistantToolUse {
-        content: tool_use.content.clone(),
-        tool_calls: tool_use
-            .tool_calls
-            .iter()
-            .map(|tool_call| AssistantToolCallRecord {
-                call_id: tool_call.id.clone(),
-                name: tool_call.name.clone(),
-                arguments_json: tool_call.arguments_json.clone(),
-            })
-            .collect(),
-        reasoning: tool_use.reasoning.clone(),
-        token_usage,
-    });
-    if let Err(e) = write_message_retry(&ctx.db, ctx.session_id, msg_id, &message) {
-        tracing::warn!(session_id = ctx.session_id, error = %e, "failed to persist assistant tool use");
+fn build_chat_request_messages(
+    session: &SessionState,
+    system_prompt: Option<&str>,
+) -> Vec<ChatRequestMessage> {
+    let mut messages = Vec::new();
+
+    // Prepend system prompt and context if provided.
+    if let Some(prompt) = system_prompt {
+        messages.push(ChatRequestMessage::simple("system", prompt.to_string()));
     }
 
-    // Broadcast to live subscribers mid-turn so subscribers see the
-    // tool-use header before the streaming tool output begins.
-    let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-        DaemonMessage::SessionMessageAppended { message },
-    ));
-    msg_id
-}
-
-fn build_chat_request_messages(messages: &[SessionMessage]) -> Vec<ChatRequestMessage> {
-    messages
-        .iter()
-        .filter(|m| !m.deleted)
-        .filter_map(|message| match &message.kind {
-            // DisplayedImage records are not part of the LLM conversation —
-            // they are purely a display-side artifact for replayed images.
-            SessionMessageKind::DisplayedImage(_) => None,
-            SessionMessageKind::SystemText { content } => {
-                Some(ChatRequestMessage::simple("system", content.clone()))
-            }
-            SessionMessageKind::UserText { content } => {
-                Some(ChatRequestMessage::simple("user", content.clone()))
-            }
-            SessionMessageKind::AssistantText {
-                content, reasoning, ..
-            } => Some(ChatRequestMessage {
-                role: "assistant",
-                content: Some(content.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning_content: reasoning.clone(),
-                reasoning: None,
-                reasoning_text: None,
-            }),
-            SessionMessageKind::AssistantToolUse {
-                content,
-                tool_calls,
-                reasoning,
-                ..
-            } => Some(ChatRequestMessage {
-                role: "assistant",
-                content: content.clone(),
-                tool_call_id: None,
-                tool_calls: Some(
-                    tool_calls
+    for turn in session.turns.values() {
+        if turn.undone {
+            continue;
+        }
+        // User message
+        if let Some(text) = &turn.user_text {
+            messages.push(ChatRequestMessage::simple("user", text.clone()));
+        }
+        // Assistant message (text or tool calls)
+        let has_tool_calls = !turn.tool_calls.is_empty();
+        if turn.assistant_text.is_some() || has_tool_calls || turn.assistant_reasoning.is_some() {
+            let tool_calls = if has_tool_calls {
+                Some(
+                    turn.tool_calls
                         .iter()
-                        .map(|tool_call| AssistantToolCall {
-                            id: tool_call.call_id.clone(),
+                        .map(|tc| AssistantToolCall {
+                            id: tc.call_id.clone(),
                             kind: "function".to_string(),
                             function: AssistantToolFunction {
-                                name: tool_call.name.clone(),
-                                arguments: tool_call.arguments_json.clone(),
+                                name: tc.name.clone(),
+                                arguments: tc.arguments_json.clone(),
                             },
                         })
                         .collect(),
-                ),
-                reasoning_content: reasoning.clone(),
+                )
+            } else {
+                None
+            };
+            messages.push(ChatRequestMessage {
+                role: "assistant",
+                content: turn.assistant_text.clone(),
+                tool_call_id: None,
+                tool_calls,
+                reasoning_content: turn.assistant_reasoning.clone(),
                 reasoning: None,
                 reasoning_text: None,
-            }),
-            SessionMessageKind::ToolResult {
-                call_id, content, ..
-            } => Some(ChatRequestMessage {
+            });
+        }
+        // Tool result messages
+        for tr in &turn.tool_results {
+            messages.push(ChatRequestMessage {
                 role: "tool",
-                content: Some(content.clone()),
-                tool_call_id: Some(call_id.clone()),
+                content: Some(tr.content.clone()),
+                tool_call_id: Some(tr.call_id.clone()),
                 tool_calls: None,
                 reasoning_content: None,
                 reasoning: None,
                 reasoning_text: None,
-            }),
-            _ => None,
-        })
-        .collect()
+            });
+        }
+    }
+    messages
 }
 
 pub const REQUEST_IMAGE_BYTES: &[u8] = include_bytes!("../assets/dua.jpg");
@@ -1203,116 +1147,81 @@ mod tests {
     use crate::tools::{Tool, ToolError, ToolRegistry};
     use std::sync::mpsc;
 
+    fn make_session_with_turns() -> SessionState {
+        let mut session = SessionState::empty();
+        let (tid0, _) = session.start_turn(Some("hello".into()));
+        session.set_assistant_response(tid0, Some("hi".into()), None, vec![], None);
+        session
+    }
+
     #[test]
     fn build_chat_request_messages_empty() {
-        let result = build_chat_request_messages(&[]);
+        let session = SessionState::empty();
+        let result = build_chat_request_messages(&session, None);
         assert!(result.is_empty());
     }
 
     #[test]
-    fn build_chat_request_messages_system_text() {
-        let msgs = [SessionMessage::now(SessionMessageKind::SystemText {
-            content: "system prompt".into(),
-        })];
-        let result = build_chat_request_messages(&msgs);
+    fn build_chat_request_messages_with_system_prompt() {
+        let session = SessionState::empty();
+        let result = build_chat_request_messages(&session, Some("system prompt"));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].role, "system");
         assert_eq!(result[0].content.as_deref(), Some("system prompt"));
     }
 
     #[test]
-    fn build_chat_request_messages_user_text() {
-        let msgs = [SessionMessage::now(SessionMessageKind::UserText {
-            content: "hello".into(),
-        })];
-        let result = build_chat_request_messages(&msgs);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].role, "user");
-        assert_eq!(result[0].content.as_deref(), Some("hello"));
-    }
-
-    #[test]
-    fn build_chat_request_messages_assistant_text() {
-        let msgs = [SessionMessage::now(SessionMessageKind::AssistantText {
-            content: "hi".into(),
-            reasoning: Some("thinking".into()),
-            token_usage: None,
-        })];
-        let result = build_chat_request_messages(&msgs);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].role, "assistant");
-        assert_eq!(result[0].content.as_deref(), Some("hi"));
-        assert_eq!(result[0].reasoning_content.as_deref(), Some("thinking"));
-    }
-
-    #[test]
-    fn build_chat_request_messages_assistant_tool_use() {
-        let msgs = [SessionMessage::now(SessionMessageKind::AssistantToolUse {
-            content: Some("thinking".into()),
-            tool_calls: vec![AssistantToolCallRecord {
-                call_id: "call_1".into(),
-                name: "read_file".into(),
-                arguments_json: r#"{"path": "/tmp/test"}"#.into(),
-            }],
-            reasoning: None,
-            token_usage: None,
-        })];
-        let result = build_chat_request_messages(&msgs);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].role, "assistant");
-        assert_eq!(result[0].content.as_deref(), Some("thinking"));
-        let tool_calls = result[0].tool_calls.as_ref().unwrap();
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].id, "call_1");
-        assert_eq!(tool_calls[0].kind, "function");
-        assert_eq!(tool_calls[0].function.name, "read_file");
-        assert_eq!(tool_calls[0].function.arguments, r#"{"path": "/tmp/test"}"#);
-    }
-
-    #[test]
-    fn build_chat_request_messages_tool_result() {
-        let msgs = [SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "call_1".into(),
-            name: "read_file".into(),
-            content: "file content".into(),
-            is_error: false,
-        })];
-        let result = build_chat_request_messages(&msgs);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].role, "tool");
-        assert_eq!(result[0].content.as_deref(), Some("file content"));
-        assert_eq!(result[0].tool_call_id.as_deref(), Some("call_1"));
-        assert!(result[0].tool_calls.is_none());
-    }
-
-    #[test]
-    fn build_chat_request_messages_skips_displayed_image() {
-        let msgs = [
-            SessionMessage::now(SessionMessageKind::UserText {
-                content: "hello".into(),
-            }),
-            SessionMessage::now(SessionMessageKind::DisplayedImage(DisplayedImageRecord {
-                metadata: ImageMetadata {
-                    image_id: 0,
-                    mime_type: "image/png".into(),
-                    width: 1,
-                    height: 1,
-                    byte_len: 0,
-                    alt: None,
-                },
-                data: vec![],
-                tool_call_id: None,
-            })),
-            SessionMessage::now(SessionMessageKind::AssistantText {
-                content: "hi".into(),
-                reasoning: None,
-                token_usage: None,
-            }),
-        ];
-        let result = build_chat_request_messages(&msgs);
+    fn build_chat_request_messages_user_and_assistant() {
+        let session = make_session_with_turns();
+        let result = build_chat_request_messages(&session, None);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].role, "user");
+        assert_eq!(result[0].content.as_deref(), Some("hello"));
         assert_eq!(result[1].role, "assistant");
+        assert_eq!(result[1].content.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn build_chat_request_messages_with_tool_calls() {
+        let mut session = SessionState::empty();
+        let (tid, _) = session.start_turn(Some("list files".into()));
+        session.set_assistant_response(
+            tid,
+            Some("thinking".into()),
+            None,
+            vec![AssistantToolCallRecord {
+                call_id: "call_1".into(),
+                name: "ls".into(),
+                arguments_json: r#"{"path": "."}"#.into(),
+            }],
+            None,
+        );
+        session.add_tool_result(tid, "call_1".into(), "ls".into(), "file.txt".into(), false);
+
+        let result = build_chat_request_messages(&session, None);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].role, "user");
+        assert_eq!(result[1].role, "assistant");
+        assert!(result[1].tool_calls.is_some());
+        assert_eq!(result[2].role, "tool");
+        assert_eq!(result[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn build_chat_request_messages_skips_undone_turns() {
+        let mut session = SessionState::empty();
+        let (tid0, _) = session.start_turn(Some("visible".into()));
+        session.set_assistant_response(tid0, Some("ok".into()), None, vec![], None);
+        let (tid1, _) = session.start_turn(Some("hidden".into()));
+        session.set_assistant_response(tid1, Some("nope".into()), None, vec![], None);
+        if let Some(turn) = session.turns.get_mut(&tid1) {
+            turn.undone = true;
+        }
+
+        let result = build_chat_request_messages(&session, None);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].role, "user");
+        assert_eq!(result[0].content.as_deref(), Some("visible"));
     }
 
     // -- Cancellation helper tests -----------------------------------------
@@ -1331,11 +1240,7 @@ mod tests {
     }
 
     // -- execute_tool_with_timeout tests -----------------------------------
-    //
-    // These exercise the streaming execution path with cancellation and
-    // timeout handling.
 
-    /// A tool that completes immediately.
     struct FastTestTool;
 
     impl Tool for FastTestTool {
@@ -1365,8 +1270,6 @@ mod tests {
         }
     }
 
-    /// A tool that blocks in `execute_streaming` until a proceed signal is
-    /// received (to simulate a long-running tool for timeout / cancel tests).
     struct BlockingTestTool {
         proceed: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
     }
@@ -1404,8 +1307,6 @@ mod tests {
             _output_tx: mpsc::Sender<Vec<u8>>,
             _ctx: Option<&ToolContext>,
         ) -> Result<String, ToolError> {
-            // Block until the proceed signal arrives or the sender is
-            // dropped (which unblocks on test teardown).
             if let Some(rx) = self.proceed.lock().unwrap().take() {
                 let _ = rx.recv();
             }
@@ -1413,10 +1314,6 @@ mod tests {
         }
     }
 
-    /// Helper: register a tool, build the registry, and call
-    /// `execute_tool_with_timeout` with minimal ceremony.
-    /// Returns the tool result and the cmd channel receiver (for verifying
-    /// streaming output).
     fn run_exec_tool(
         tool: impl Tool + 'static,
         tool_name: &str,
@@ -1453,14 +1350,14 @@ mod tests {
         };
         let result = execute_tool_with_timeout(
             &tool_call,
-            None, // x_credentials
-            None, // working_dir
+            None,
+            None,
             timeout_dur,
-            1, // request_id
+            1,
             &mut session,
             &cancel_rx,
             &ctx,
-            None, // image_tx
+            None,
         );
         (result, cmd_rx)
     }
@@ -1538,44 +1435,9 @@ mod tests {
             result.result.content
         );
 
-        // Unblock the tool execution thread so it can exit cleanly.
         drop(proceed_tx);
     }
 
-    #[test]
-    fn execute_tool_disconnected_channel() {
-        // When the tool thread panics or exits without sending on result_tx,
-        // the result channel is disconnected and we should get a panic error.
-        // We can simulate this by registering a tool that returns normally
-        // (fast path), but that will send on result_tx.  The disconnected
-        // case is exercised when the tool execution thread itself panics.
-        //
-        // Since we can't easily force a panic inside the spawned tool thread
-        // through the Tool trait, this test at least verifies the error
-        // message matches what execute_tool_with_timeout produces.
-        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let (result, _cmd_rx) = run_exec_tool(
-            FastTestTool,
-            "_test_fast",
-            "{}",
-            Duration::from_millis(10),
-            cancel_rx,
-        );
-        // With a 10ms timeout and an instant tool, we might get either the
-        // result (fast tool wins) or a timeout.  Neither is wrong — the
-        // disconnected case is exercised elsewhere.
-        if result.result.is_error {
-            assert!(
-                result.result.content.contains("panicked")
-                    || result.result.content.contains("timed out"),
-                "unexpected error: {}",
-                result.result.content
-            );
-        }
-    }
-
-    /// A tool that sends data on the output channel during streaming
-    /// execution (used to verify the forwarding thread).
     struct StreamingTestTool;
 
     impl Tool for StreamingTestTool {
@@ -1611,8 +1473,6 @@ mod tests {
             output_tx: mpsc::Sender<Vec<u8>>,
             _ctx: Option<&ToolContext>,
         ) -> Result<String, ToolError> {
-            // Send some output before returning so the forwarding thread
-            // has data to forward.
             let _ = output_tx.send(b"streamed payload".to_vec());
             Ok("streaming done".into())
         }
@@ -1640,14 +1500,11 @@ mod tests {
             result.result.content
         );
 
-        // Verify the streaming payload was forwarded to cmd_tx.
-        // The forwarding thread sends the payload before the tool result is
-        // delivered, so the message is already in the channel by this point.
         match cmd_rx.recv() {
-            Ok(SessionCommand::Broadcast(DaemonMessage::ToolCallOutput { data, .. })) => {
+            Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
                 assert_eq!(data, b"streamed payload");
             }
-            Ok(_other) => panic!("expected ToolCallOutput, got unexpected SessionCommand"),
+            Ok(_other) => panic!("expected ToolResultChunk, got unexpected SessionCommand"),
             Err(e) => panic!("channel disconnected while waiting for streaming output: {e}"),
         }
     }
@@ -1689,7 +1546,6 @@ mod tests {
 
     // -- spawn_single_tool tests ---------------------------------------
 
-    /// Helper: create a ToolRegistry with a test tool and spawn a single tool call.
     fn run_spawn_single_tool(
         tool: impl Tool + 'static,
         tool_name: &str,
@@ -1755,12 +1611,11 @@ mod tests {
             "{}",
             handle.output.result.content
         );
-        assert!(handle.image.is_none(), "expected no image from fast tool",);
+        assert!(handle.image.is_none(), "expected no image from fast tool");
     }
 
     #[test]
     fn spawn_single_tool_no_timeout_still_completes() {
-        // Even with None timeout, a fast tool should complete successfully.
         let handle = run_spawn_single_tool(FastTestTool, "_test_fast", "{}", None);
         assert!(
             !handle.output.result.is_error,
@@ -1771,243 +1626,6 @@ mod tests {
             handle.output.result.content.contains("fast result"),
             "{}",
             handle.output.result.content
-        );
-    }
-
-    // -- emit_and_persist_image tests -----------------------------------
-
-    #[test]
-    fn emit_and_persist_image_broadcasts_and_persists() {
-        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = redb::Database::create(dir.path().join("test.redb")).expect("Database");
-        let registry = ToolRegistry::new().build();
-
-        let mut session = SessionState::empty();
-
-        let ctx = RequestContext {
-            cmd_tx,
-            session_id: 42,
-            db: Arc::new(db),
-            tool_registry: registry,
-            daemon_tx,
-            max_turns_default: 25,
-        };
-
-        let image = PreparedImage {
-            mime_type: "image/png".into(),
-            data: b"fakedata".to_vec(),
-            width: 100,
-            height: 200,
-            alt: Some("test image".into()),
-        };
-
-        emit_and_persist_image(&ctx.cmd_tx, image, None, &mut session, &ctx);
-
-        // Session should have one message: a DisplayedImage.
-        assert_eq!(session.messages().len(), 1);
-        match &session.messages()[0].kind {
-            SessionMessageKind::DisplayedImage(record) => {
-                assert_eq!(record.metadata.mime_type, "image/png");
-                assert_eq!(record.metadata.width, 100);
-                assert_eq!(record.metadata.height, 200);
-                assert_eq!(record.data, b"fakedata");
-                assert_eq!(record.metadata.alt.as_deref(), Some("test image"));
-            }
-            other => panic!("expected DisplayedImage, got {other:?}"),
-        }
-
-        // Should have received a mid-turn broadcast of the DisplayedImage.
-        match cmd_rx.try_recv() {
-            Ok(SessionCommand::Broadcast(DaemonMessage::SessionMessageAppended {
-                message:
-                    SessionMessage {
-                        kind: SessionMessageKind::DisplayedImage(record),
-                        ..
-                    },
-            })) => {
-                assert_eq!(record.metadata.mime_type, "image/png");
-                assert_eq!(record.data, b"fakedata");
-            }
-            Ok(_) => panic!(
-                "expected SessionCommand::Broadcast with SessionMessageAppended, got Broadcast with something else"
-            ),
-            Err(e) => panic!("expected broadcast, got {e:?}"),
-        }
-    }
-
-    // -- set_working_dir meta-tool tests ------------------------------------
-
-    #[test]
-    fn set_working_dir_valid_path_updates_session_config() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
-        let db_dir = tempfile::tempdir().expect("tempdir");
-        let db = redb::Database::create(db_dir.path().join("test.redb")).expect("Database");
-        let registry = ToolRegistry::new().build();
-
-        let mut session = SessionState::empty();
-
-        let tool_call = crate::providers::types::ChatToolCall {
-            id: "call_set_wd".into(),
-            name: "set_working_dir".into(),
-            arguments_json: serde_json::json!({"path": dir.path().display().to_string()})
-                .to_string(),
-            caller: None,
-        };
-
-        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let ctx = RequestContext {
-            cmd_tx,
-            session_id: 1,
-            db: Arc::new(db),
-            tool_registry: registry,
-            daemon_tx,
-            max_turns_default: 25,
-        };
-
-        let result = execute_tool_with_timeout(
-            &tool_call,
-            None,
-            None, // working_dir (not needed for absolute path)
-            Duration::from_secs(10),
-            1,
-            &mut session,
-            &cancel_rx,
-            &ctx,
-            None,
-        );
-
-        assert!(
-            !result.result.is_error,
-            "unexpected error: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("Working directory changed"),
-            "result: {}",
-            result.result.content
-        );
-        assert_eq!(
-            session
-                .config
-                .working_dir
-                .map(|p| p.to_string_lossy().to_string()),
-            Some(dir.path().to_string_lossy().to_string()),
-        );
-    }
-
-    #[test]
-    fn set_working_dir_nonexistent_path_returns_error() {
-        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
-        let db_dir = tempfile::tempdir().expect("tempdir");
-        let db = redb::Database::create(db_dir.path().join("test.redb")).expect("Database");
-        let registry = ToolRegistry::new().build();
-
-        let mut session = SessionState::empty();
-
-        let tool_call = crate::providers::types::ChatToolCall {
-            id: "call_set_wd_bad".into(),
-            name: "set_working_dir".into(),
-            arguments_json: r#"{"path": "/nonexistent_path_abcxyz_12345"}"#.to_string(),
-            caller: None,
-        };
-
-        let ctx = RequestContext {
-            cmd_tx,
-            session_id: 1,
-            db: Arc::new(db),
-            tool_registry: registry,
-            daemon_tx,
-            max_turns_default: 25,
-        };
-
-        let result = execute_tool_with_timeout(
-            &tool_call,
-            None,
-            None,
-            Duration::from_secs(10),
-            1,
-            &mut session,
-            &cancel_rx,
-            &ctx,
-            None,
-        );
-
-        assert!(
-            result.result.is_error,
-            "expected error, got: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("does not exist"),
-            "result: {}",
-            result.result.content
-        );
-    }
-
-    #[test]
-    fn set_working_dir_relative_path_resolves_against_current_dir() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let subdir = dir.path().join("subdir");
-        std::fs::create_dir(&subdir).expect("create subdir");
-
-        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
-        let db_dir = tempfile::tempdir().expect("tempdir");
-        let db = redb::Database::create(db_dir.path().join("test.redb")).expect("Database");
-        let registry = ToolRegistry::new().build();
-
-        let mut session = SessionState::empty();
-
-        let tool_call = crate::providers::types::ChatToolCall {
-            id: "call_set_wd_rel".into(),
-            name: "set_working_dir".into(),
-            arguments_json: r#"{"path": "subdir"}"#.to_string(),
-            caller: None,
-        };
-
-        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>();
-        let ctx = RequestContext {
-            cmd_tx,
-            session_id: 1,
-            db: Arc::new(db),
-            tool_registry: registry,
-            daemon_tx,
-            max_turns_default: 25,
-        };
-
-        let result = execute_tool_with_timeout(
-            &tool_call,
-            None,
-            Some(dir.path()), // current working_dir for relative resolution
-            Duration::from_secs(10),
-            1,
-            &mut session,
-            &cancel_rx,
-            &ctx,
-            None,
-        );
-
-        assert!(
-            !result.result.is_error,
-            "unexpected error: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("Working directory changed"),
-            "result: {}",
-            result.result.content
-        );
-        let new_wd = session.config.working_dir.unwrap();
-        assert!(
-            new_wd.ends_with("subdir"),
-            "expected endswith subdir, got: {}",
-            new_wd.display()
         );
     }
 }

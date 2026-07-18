@@ -1,8 +1,9 @@
+use crate::markdown_render::{lines_height, render_turn_lines};
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, HomeMenuItem, InputBuffer,
-    PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent, find_history_item_at_row,
+    AIProvidersView, App, HOME_MENU_ITEMS, HomeMenuItem, IMAGE_BLOCK_HEIGHT, InputBuffer,
+    PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent, find_turn_at_row,
 };
 use crossbeam::channel;
 use crossbeam::select;
@@ -327,7 +328,7 @@ fn run_ui_loop(
     app.update_viewport_from_terminal_size();
     app.clamp_scroll_state();
     terminal.draw(|frame| render(frame, app))?;
-    if app.fullscreen_image_idx.is_none() {
+    if app.fullscreen_image_target.is_none() {
         terminal.show_cursor()?;
     }
     if app.page == Page::Chat && app.attached_session_id.is_some() {
@@ -424,14 +425,14 @@ fn run_ui_loop(
         app.clamp_scroll_state();
 
         // Hide the cursor while the fullscreen overlay is active.
-        if app.fullscreen_image_idx.is_some() {
+        if app.fullscreen_image_target.is_some() {
             terminal.hide_cursor()?;
         }
 
         terminal.draw(|frame| render(frame, app))?;
 
         // Re-show the cursor once the overlay is dismissed.
-        if app.fullscreen_image_idx.is_none() {
+        if app.fullscreen_image_target.is_none() {
             terminal.show_cursor()?;
         }
 
@@ -502,7 +503,7 @@ pub(crate) fn handle_terminal_event(
     }
 
     // Fullscreen image overlay takes priority over page content.
-    if app.fullscreen_image_idx.is_some() {
+    if app.fullscreen_image_target.is_some() {
         return handle_fullscreen_event(event, app, client_tx);
     }
     match app.page {
@@ -618,7 +619,7 @@ fn handle_fullscreen_event(
     }
     match key.code {
         KeyCode::Esc => {
-            app.fullscreen_image_idx = None;
+            app.fullscreen_image_target = None;
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
@@ -638,6 +639,9 @@ fn handle_chat_event(
             if key.kind != KeyEventKind::Press {
                 return Ok(());
             }
+            // Any keypress clears transient status/error messages.
+            app.status = None;
+            app.error = None;
             match key.code {
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.set_page(Page::SessionManager);
@@ -671,9 +675,9 @@ fn handle_chat_event(
                     {
                         ShellCommand::Empty => {}
                         ShellCommand::InvalidCancel(value) => {
-                            app.push_text(format!("invalid request id: {value}"))
+                            app.status = Some(format!("invalid request id: {value}"))
                         }
-                        ShellCommand::UnknownCommand(error) => app.push_text(error),
+                        ShellCommand::UnknownCommand(error) => app.status = Some(error),
                         ShellCommand::Send(message) => {
                             let message = match message {
                                 ClientMessage::CreateSession {
@@ -706,14 +710,10 @@ fn handle_chat_event(
                             if let Some(echo) =
                                 shell_command_echo(&ShellCommand::Send(message.clone()))
                             {
-                                app.push_text(echo);
+                                app.status = Some(echo);
                             }
-                            match &message {
-                                ClientMessage::RunInput { request_id, .. }
-                                | ClientMessage::TestImage { request_id } => {
-                                    app.active.insert(*request_id);
-                                }
-                                _ => {}
+                            if let ClientMessage::RunInput { request_id, .. } = &message {
+                                app.active.insert(*request_id);
                             }
                             client_tx.send(message).map_err(broken_pipe)?;
                         }
@@ -721,14 +721,14 @@ fn handle_chat_event(
                             if let Some(echo) = shell_command_echo(&ShellCommand::Unlock {
                                 method: method.clone(),
                             }) {
-                                app.push_text(echo);
+                                app.status = Some(echo);
                             }
                             match resolve_private_key(&method) {
                                 Ok(private_key) => {
                                     let _ = client_tx.send(ClientMessage::Unlock { private_key });
                                 }
                                 Err(e) => {
-                                    app.push_text(format!("[error] {e}"));
+                                    app.error = Some(format!("[error] {e}"));
                                     return Ok(());
                                 }
                             }
@@ -745,7 +745,7 @@ fn handle_chat_event(
                                 fields: fields.clone(),
                                 unlock,
                             }) {
-                                app.push_text(echo);
+                                app.status = Some(echo);
                             }
                             match build_add_credential_message(
                                 service.clone(),
@@ -757,7 +757,7 @@ fn handle_chat_event(
                                     let _ = client_tx.send(msg);
                                 }
                                 Err(e) => {
-                                    app.push_text(format!("[error] {e}"));
+                                    app.error = Some(format!("[error] {e}"));
                                     return Ok(());
                                 }
                             }
@@ -768,7 +768,7 @@ fn handle_chat_event(
                                     service: service.clone(),
                                 })
                             {
-                                app.push_text(echo);
+                                app.status = Some(echo);
                             }
                             let _ = client_tx.send(ClientMessage::RemoveCredential {
                                 service: service.clone(),
@@ -776,13 +776,13 @@ fn handle_chat_event(
                         }
                         ShellCommand::Undo => {
                             if let Some(echo) = shell_command_echo(&ShellCommand::Undo) {
-                                app.push_text(echo);
+                                app.status = Some(echo);
                             }
                             let _ = client_tx.send(ClientMessage::Undo);
                         }
                         ShellCommand::Redo => {
                             if let Some(echo) = shell_command_echo(&ShellCommand::Redo) {
-                                app.push_text(echo);
+                                app.status = Some(echo);
                             }
                             let _ = client_tx.send(ClientMessage::Redo);
                         }
@@ -839,14 +839,36 @@ fn handle_chat_event(
                 MouseEventKind::ScrollDown => {
                     app.scroll_accumulator = app.scroll_accumulator.saturating_sub(1);
                 }
-                // Left-click on an image opens it fullscreen.  We render the
-                // existing `StatefulProtocol` directly by index (no re-decode
-                // of the raw image bytes).
+                // Left-click on an image opens it fullscreen.  We look up the
+                // turn at the clicked row and determine which displayed image
+                // (if any) the click landed on.
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(idx) = find_history_item_at_row(app, mouse.row)
-                        && matches!(&app.client.history[idx], HistoryItem::Image(_))
-                    {
-                        app.fullscreen_image_idx = Some(idx);
+                    if let Some(turn_idx) = find_turn_at_row(app, mouse.row) {
+                        let turn_id = app.visible_turn_ids[turn_idx];
+                        if let Some(turn) = app.session_view.turns.get(&turn_id)
+                            && !turn.displayed_images.is_empty()
+                        {
+                            let turn_start = app
+                                .height_prefix
+                                .get(turn_idx.wrapping_sub(1))
+                                .copied()
+                                .unwrap_or(0);
+                            let content_width = app.history_viewport.width.saturating_sub(9);
+                            let text_lines = render_turn_lines(turn, content_width);
+                            let text_height = lines_height(&text_lines, content_width).max(1);
+                            let total_height = app.total_history_height();
+                            let vh = app.history_viewport.height as usize;
+                            let content_line = total_height
+                                .saturating_sub(app.effective_scroll() + vh)
+                                .saturating_add(mouse.row as usize);
+                            let offset = content_line.saturating_sub(turn_start);
+                            if offset >= text_height {
+                                let img_idx = (offset - text_height) / IMAGE_BLOCK_HEIGHT as usize;
+                                if img_idx < turn.displayed_images.len() {
+                                    app.fullscreen_image_target = Some((turn_id, img_idx));
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -1149,12 +1171,12 @@ fn handle_ai_providers_credential_key(
             ) {
                 Ok(msg) => {
                     let _ = client_tx.send(msg);
-                    app.push_text(format!(
+                    app.status = Some(format!(
                         "[daemon] credential stored for account: {account_name}"
                     ));
                 }
                 Err(e) => {
-                    app.push_text(format!(
+                    app.status = Some(format!(
                         "[warning] failed to encrypt API key for {account_name}: {e}"
                     ));
                 }
@@ -1297,7 +1319,7 @@ fn submit_new_account(
                 let _ = client_tx.send(msg);
             }
             Err(e) => {
-                app.push_text(format!("[warning] failed to encrypt API key: {e}"));
+                app.status = Some(format!("[warning] failed to encrypt API key: {e}"));
             }
         }
     }
@@ -1373,8 +1395,7 @@ pub(crate) fn handle_daemon_message(
             app.handle_session_delete_failed(*session_id, error);
         }
         DaemonMessage::SessionFailed { operation, error } => {
-            // Push to chat history for the Chat page.
-            app.push_text(format!("[daemon] {operation} failed: {error}"));
+            app.error = Some(format!("[daemon] {operation} failed: {error}"));
             // If we're on the Session Manager page, also show the error
             // right on that page so the user has immediate feedback.
             if app.page == Page::SessionManager && operation == "create_session" {
@@ -1389,26 +1410,26 @@ pub(crate) fn handle_daemon_message(
             // user sees the response to their `/account` command.
         }
         DaemonMessage::AccountListFailed { error } => {
-            app.push_text(format!("[daemon] failed to list accounts: {error}"));
+            app.error = Some(format!("[daemon] failed to list accounts: {error}"));
             return Ok(());
         }
         DaemonMessage::AccountAdded { name } => {
-            app.push_text(format!("[daemon] account added: {name}"));
+            app.status = Some(format!("[daemon] account added: {name}"));
             let _ = client_tx.send(ClientMessage::ListAccounts);
         }
         DaemonMessage::AccountAddFailed { name, error } => {
             app.ai_providers.add_error = Some(format!("{name}: {error}"));
-            app.push_text(format!("[daemon] failed to add account {name}: {error}"));
+            app.error = Some(format!("[daemon] failed to add account {name}: {error}"));
             // Stay on the new-form page so the user can see the error
             // and fix it.
         }
         DaemonMessage::AccountRemoved { name } => {
-            app.push_text(format!("[daemon] account removed: {name}"));
+            app.status = Some(format!("[daemon] account removed: {name}"));
             app.ai_providers.remove_account(name);
             let _ = client_tx.send(ClientMessage::ListAccounts);
         }
         DaemonMessage::AccountRemoveFailed { name, error } => {
-            app.push_text(format!("[daemon] failed to remove account {name}: {error}"));
+            app.error = Some(format!("[daemon] failed to remove account {name}: {error}"));
         }
 
         DaemonMessage::SessionState {
@@ -1468,18 +1489,8 @@ pub(crate) fn handle_daemon_message(
         _ => {}
     }
 
-    // Flag replay mode so `push_session_message` injects synthetic tool-call
-    // lifecycle text entries (`[N] tool start …`, `[N] done`) that match
-    // the live `push_tool_text` format but are not sent during replay.
-    let was_replay = std::mem::replace(&mut app.replaying_history, false);
-    if matches!(&message, DaemonMessage::SessionState { .. }) {
-        tracing::debug!("replay: entering session-history replay mode");
-        app.replaying_history = true;
-    }
-    let result = dispatch_daemon_message(app, message);
-    app.replaying_history = was_replay;
-    tracing::trace!(replaying = was_replay, "replay: restored prior replay flag");
-    result?;
+    // Dispatch remaining variants through the generic turn-event handler.
+    dispatch_daemon_message(&message, app);
     Ok(())
 }
 

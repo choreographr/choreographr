@@ -1,28 +1,13 @@
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
-use tai_proto::{SessionMessage, SessionMessageKind};
-use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline, StreamingText};
+use tai_proto::Turn;
+use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 
 use crate::cache::GlobalLruCache;
 use crate::syntax::{highlight_theme, syntax_set, to_ratatui_color};
 
-/// Highlight a code snippet into styled ratatui lines.
-///
-/// * `language` – the language hint from the markdown fenced-code info string
-///   (e.g. `Some("rust")`).  `None` or an unrecognised token falls back to
-///   plain text (no highlighting).
-/// * `code` – the raw source code.
-///
-/// Results are memoized in a bounded global cache so that `total_history_height`
-/// (which re-renders every item after each mutation) does not trigger syntect's
-/// regex engine repeatedly for the same code block.  The cache has a fixed
-/// capacity; when full, new entries are dropped silently — the existing entries
-/// for the most common code blocks stay warm.
 fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
-    // Memoize highlighted results so re-rendering does not re-run syntect.
-    // LRU eviction naturally keeps the most frequently seen code blocks
-    // cached, replacing the old manual HashMap+cap approach.
     static CACHE: GlobalLruCache<(String, String), Vec<Line<'static>>, 200> = GlobalLruCache::new();
 
     let key = (language.unwrap_or("").to_string(), code.to_string());
@@ -30,9 +15,6 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
     CACHE.get_or_insert_with(&key, || {
         let ss = syntax_set();
 
-        // Look up the syntax definition by the language token.  If the
-        // token isn't recognised (or was omitted), use the built-in
-        // "Plain Text" syntax which emits a single unstyled span per line.
         let syntax = language
             .and_then(|lang| ss.find_syntax_by_token(lang))
             .unwrap_or_else(|| ss.find_syntax_plain_text());
@@ -43,7 +25,6 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
 
         for line in code.split('\n') {
             let Ok(ranges) = highlighter.highlight_line(line, ss) else {
-                // If highlighting fails for a line, emit it as plain text.
                 result.push(Line::from(Span::styled(line.to_string(), Style::default())));
                 continue;
             };
@@ -94,161 +75,209 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
         .max(1)
 }
 
-pub(crate) fn session_message_lines(message: &SessionMessage, width: u16) -> Vec<Line<'static>> {
-    let mut prefix = vec![Line::from(vec![Span::styled(
-        format!("mid:{}", message.message_id),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    )])];
-    let body = match &message.kind {
-        SessionMessageKind::SystemText { content } => {
-            labeled_text_lines("system", content, Color::DarkGray)
+/// Render a complete Turn as styled lines suitable for the chat history.
+/// Each section (user, assistant, tool results) is wrapped in the margin
+/// pattern (top separator, padding, content, padding, bottom separator)
+/// with role-specific accent colors.
+pub(crate) fn render_turn_lines(turn: &Turn, content_width: u16) -> Vec<Line<'static>> {
+    let mut all_lines: Vec<Line<'static>> = Vec::new();
+
+    // ── Error block ──────────────────────────────────────────
+    if let Some(ref err) = turn.error {
+        let header = format!("Error: {err}");
+        let lines = vec![Line::from(Span::styled(
+            header,
+            Style::default().fg(Color::Red),
+        ))];
+        all_lines.extend(lines);
+        return all_lines;
+    }
+
+    // ── User text block (green accent) ───────────────────────
+    if let Some(ref text) = turn.user_text {
+        let body = markdown_lines(text, content_width);
+        let timestamp_ms = Some(turn.created_at.as_millis());
+        let margin = add_margin_lines(body, content_width, Color::Green, timestamp_ms);
+        all_lines.extend(margin.0);
+    }
+
+    // ── Assistant response block (blue accent) ───────────────
+    let has_assistant = turn.assistant_text.is_some()
+        || turn.assistant_reasoning.is_some()
+        || !turn.tool_calls.is_empty();
+    if has_assistant {
+        let mut body: Vec<Line<'static>> = Vec::new();
+
+        // Reasoning sub-section
+        if let Some(ref reasoning) = turn.assistant_reasoning {
+            let trimmed = reasoning.trim();
+            if !trimmed.is_empty() {
+                heading_line(&mut body, "Reasoning", Color::DarkGray);
+                body.extend(plain_text_lines(trimmed));
+            }
         }
-        SessionMessageKind::UserText { content } => markdown_lines(content, width),
-        SessionMessageKind::AssistantText {
-            content, reasoning, ..
-        } => {
-            let mut lines = Vec::new();
-            if let Some(reasoning_text) = reasoning
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                heading_line(&mut lines, "Reasoning", Color::DarkGray);
-                lines.extend(markdown_lines(reasoning_text, width));
+
+        // Response sub-section
+        if let Some(ref text) = turn.assistant_text {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                heading_line(&mut body, "Response", Color::Cyan);
+                body.extend(markdown_lines(trimmed, content_width));
             }
-            heading_line(&mut lines, "Response", Color::Cyan);
-            lines.extend(markdown_lines(content, width));
-            lines
         }
-        SessionMessageKind::AssistantToolUse {
-            content,
-            tool_calls,
-            reasoning,
-            ..
-        } => {
-            let mut lines = Vec::new();
-            if let Some(reasoning_text) = reasoning
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
-                heading_line(&mut lines, "Reasoning", Color::DarkGray);
-                lines.extend(markdown_lines(reasoning_text, width));
-            }
-            if let Some(content) = content.as_deref().filter(|value| !value.trim().is_empty()) {
-                heading_line(&mut lines, "Response", Color::Cyan);
-                lines.extend(markdown_lines(content, width));
-            }
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "tool-call: {}",
-                    humfmt::list(
-                        &tool_calls
-                            .iter()
-                            .map(|call| format!("{}({})", call.name, call.arguments_json))
-                            .collect::<Vec<_>>(),
-                    )
-                ),
+
+        // Tool call labels
+        for tc in &turn.tool_calls {
+            body.push(Line::from(Span::styled(
+                format!("tool: {}({})", tc.name, tc.arguments_json),
                 Style::default().fg(Color::Yellow),
             )));
-            lines
         }
-        SessionMessageKind::ToolResult {
-            name,
-            content,
-            is_error,
-            ..
-        } => {
-            let (label, color) = if *is_error {
-                ("tool error", Color::Red)
+
+        // If we have content, wrap with margin lines (no timestamp).
+        if !body.is_empty() {
+            let margin = add_margin_lines(body, content_width, Color::Blue, None);
+            all_lines.extend(margin.0);
+        }
+    }
+
+    // ── Tool results block (red accent if error, gray otherwise) ─
+    for tr in &turn.tool_results {
+        let accent = if tr.is_error {
+            Color::Red
+        } else {
+            Color::Reset
+        };
+        let label = if tr.is_error {
+            "tool error"
+        } else {
+            "tool result"
+        };
+
+        let mut body: Vec<Line<'static>> = Vec::new();
+
+        // Header line
+        body.push(Line::from(Span::styled(
+            format!("{label}: {}", tr.name),
+            Style::default().fg(accent),
+        )));
+
+        if !tr.content.is_empty() {
+            body.push(Line::from(Span::styled(String::new(), Style::default())));
+            // Non-error results use markdown; errors stay plain text.
+            if tr.is_error {
+                body.extend(plain_text_lines(&tr.content));
             } else {
-                ("tool result", Color::Reset)
-            };
-            // Header line with the label and tool name.
-            let mut lines = vec![Line::from(Span::styled(
-                format!("{label}: {name}"),
-                Style::default().fg(color),
-            ))];
-            if !content.is_empty() {
-                // Separate the body from the header with a blank line.
-                lines.push(Line::from(Span::styled(String::new(), Style::default())));
-                // Non-error results are rendered as markdown so that code
-                // blocks produced by tools such as run_riscv (which wraps
-                // formatted Rust source in ```rust fences) get syntect-based
-                // syntax highlighting.  Errors remain plain text.
-                let body = if *is_error {
-                    plain_text_lines(content)
-                } else {
-                    markdown_lines(content, width)
-                };
-                lines.extend(body);
+                body.extend(markdown_lines(&tr.content, content_width));
             }
-            lines
         }
-        // DisplayedImage is intercepted by App::push_session_message and
-        // converted directly to HistoryItem::Image, so this arm should never
-        // be reached at runtime — it exists only for exhaustive matching.
-        SessionMessageKind::DisplayedImage(_) => vec![],
-        _ => vec![],
-    };
-    prefix.extend(body);
-    prefix
+
+        let margin = add_margin_lines(body, content_width, accent, None);
+        all_lines.extend(margin.0);
+    }
+
+    // If no sections produced output, emit a blank line.
+    if all_lines.is_empty() {
+        all_lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    }
+
+    all_lines
 }
 
-pub(crate) fn streaming_text_lines(text: &StreamingText, width: u16) -> Vec<Line<'static>> {
-    let header = if text.message_id > 0 {
-        format!("mid:{}", text.message_id)
+// ── Margin helpers (reused from current render system) ─────────────────
+
+/// Structural rows: top separator, top padding, bottom padding, bottom separator.
+pub(crate) const MARGIN_STRUCTURAL_ROWS: usize = 4;
+
+/// Wrap content lines with a vertical accent bar on the left and dark-gray
+/// background shading.
+fn add_margin_lines(
+    lines: Vec<Line<'static>>,
+    content_width: u16,
+    accent: Color,
+    timestamp_ms: Option<i64>,
+) -> (Vec<Line<'static>>, usize) {
+    let bg_shade = Color::Rgb(60, 60, 60);
+    let gray = Style::default().bg(bg_shade);
+    let no_shading = Style::default().bg(Color::Reset);
+    let accent_line = Style::default().fg(accent).bg(Color::Reset);
+    let total_width = content_width as usize + 9;
+    let shaded_content = content_width as usize + 4;
+
+    // Top separator: no shading
+    let separator = Line::from(vec![Span::styled(" ".repeat(total_width), no_shading)]);
+
+    // Padding row: shading on cols 3..W-3, no text
+    let padding = Line::from(vec![
+        Span::styled("  ", no_shading),
+        Span::styled("┃", accent_line),
+        Span::styled(" ".repeat(shaded_content), gray),
+        Span::styled("  ", no_shading),
+    ]);
+
+    let mut result = Vec::with_capacity(lines.len() + MARGIN_STRUCTURAL_ROWS);
+    result.push(separator);
+    result.push(padding.clone());
+
+    for line in lines {
+        let fill = (content_width as usize).saturating_sub(line.width());
+
+        let mut spans = vec![
+            Span::styled("  ", no_shading),
+            Span::styled("┃", accent_line),
+            Span::styled("  ", gray),
+        ];
+        spans.extend(line.spans);
+        spans.push(Span::styled(" ".repeat(fill), gray));
+        spans.push(Span::styled("  ", gray));
+        spans.push(Span::styled("  ", no_shading));
+
+        result.push(Line::from(spans));
+    }
+
+    result.push(padding);
+
+    // Bottom separator: right-aligned timestamp (user messages only).
+    if let Some(ms) = timestamp_ms {
+        let ts_text = format_timestamp(ms / 1000);
+        let ts_len = ts_text.len();
+        let left_fill = total_width.saturating_sub(ts_len + 4);
+        result.push(Line::from(vec![
+            Span::styled(" ".repeat(left_fill), no_shading),
+            Span::styled(ts_text, no_shading),
+            Span::styled(" ".repeat(4), no_shading),
+        ]));
     } else {
-        format!("[{}]", text.request_id)
+        result.push(Line::from(vec![Span::styled(
+            " ".repeat(total_width),
+            no_shading,
+        )]));
+    }
+
+    let total_rows = result.len();
+    (result, total_rows)
+}
+
+fn format_timestamp(ts_secs: i64) -> String {
+    if ts_secs <= 0 {
+        return "-".to_string();
+    }
+
+    use chrono::{Local, TimeZone};
+
+    let dt = match Local.timestamp_opt(ts_secs, 0) {
+        chrono::LocalResult::Single(dt) => dt,
+        _ => return "-".to_string(),
     };
-    let mut lines = vec![Line::from(Span::styled(
-        header,
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    ))];
 
-    if !text.reasoning.is_empty() {
-        heading_line(&mut lines, "Reasoning", Color::DarkGray);
-        lines.extend(plain_text_lines(&text.reasoning));
+    let now = Local::now();
+    if dt.date_naive() == now.date_naive() {
+        dt.format("%H:%M").to_string()
+    } else {
+        dt.format("%Y-%m-%d %H:%M").to_string()
     }
-
-    if !text.answer.is_empty() {
-        heading_line(&mut lines, "Response", Color::Cyan);
-        lines.extend(markdown_lines(&text.answer, width));
-    }
-
-    if text.reasoning.is_empty() && text.answer.is_empty() {
-        lines.push(Line::from(Span::styled(String::new(), Style::default())));
-    }
-
-    lines
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────
-
-fn labeled_text_lines(label: &'static str, text: &str, color: Color) -> Vec<Line<'static>> {
-    prefixed_lines(label, plain_text_lines(text), color)
-}
-
-fn prefixed_lines(
-    label: &'static str,
-    body: Vec<Line<'static>>,
-    color: Color,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    append_section(&mut lines, label, body, color);
-    lines
-}
-
-/// Push a standalone heading line (e.g. "Reasoning:" or "Response:") with a
-/// blank separator before it if there is already content above.
-///
-/// Why a standalone heading instead of the old `append_section` approach
-/// (which prefixed the label to the first content line)?  Because the new
-/// assistant-message visual style renders headings on their own row, and
-/// streaming text should match the non-streaming layout so that section
-/// headers look consistent whether or not the stream has finished.
 fn heading_line(lines: &mut Vec<Line<'static>>, heading: &'static str, color: Color) {
     if !lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
@@ -259,33 +288,6 @@ fn heading_line(lines: &mut Vec<Line<'static>>, heading: &'static str, color: Co
     )));
 }
 
-fn append_section(
-    lines: &mut Vec<Line<'static>>,
-    label: &'static str,
-    body: Vec<Line<'static>>,
-    color: Color,
-) {
-    // Add a blank line to separate this section from the previous content.
-    if !lines.is_empty() {
-        lines.push(Line::from(Span::styled(String::new(), Style::default())));
-    }
-    let mut body_iter = body.into_iter();
-    if let Some(first) = body_iter.next() {
-        let label_text = format!("{label}: ");
-        // Move spans out of `first` instead of cloning — body is consumed
-        // by into_iter() so no other code needs the original.
-        let mut first_spans = first.spans;
-        first_spans.insert(0, Span::styled(label_text, Style::default().fg(color)));
-        lines.push(Line::from(first_spans));
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!("{label}:"),
-            Style::default().fg(color),
-        )));
-    }
-    lines.extend(body_iter);
-}
-
 pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     let document = MarkdownDocument::parse(markdown);
     let mut lines = Vec::new();
@@ -293,7 +295,6 @@ pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
     }
-    // Trim trailing empty lines
     while matches!(lines.last(), Some(line) if line.width() == 0) {
         lines.pop();
     }
@@ -332,14 +333,12 @@ fn render_markdown_block(
             lines.extend(inlines_to_lines(content, indent, prefix, width));
         }
         MarkdownBlock::CodeBlock { language, code } => {
-            // Opening fence with language hint
             let header = language
                 .as_deref()
                 .map(|value| format!("```{value}"))
                 .unwrap_or_else(|| "```".to_string());
             lines.push(indented_line(indent, header));
 
-            // Syntax-highlighted code lines
             let highlighted = highlight_code(language.as_deref(), code);
             for hl_line in highlighted {
                 if indent > 0 {
@@ -351,7 +350,6 @@ fn render_markdown_block(
                 }
             }
 
-            // Closing fence
             lines.push(indented_line(indent, "```".to_string()));
         }
         MarkdownBlock::BlockQuote(blocks) => {
@@ -359,7 +357,6 @@ fn render_markdown_block(
             render_markdown_blocks(blocks, &mut quoted, 0, width);
             for line in quoted {
                 let mut spans = line.spans.clone();
-                // Prepend "> " to the first span of the quoted line
                 spans.insert(0, Span::styled("> ".to_string(), Style::default()));
                 lines.push(indented_line_as_spans(indent, spans));
             }
@@ -744,8 +741,6 @@ fn append_inline_plain_text(inlines: &[MarkdownInline], text: &mut String) {
 
 // ── Line-building helpers ─────────────────────────────────────────────────
 
-/// Create a `Line` with an indentation prefix made of spaces, followed by
-/// the given text as a default-styled span.
 fn indented_line(indent: usize, text: String) -> Line<'static> {
     let mut spans = Vec::new();
     if indent > 0 {
@@ -755,8 +750,6 @@ fn indented_line(indent: usize, text: String) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Create a `Line` by prepending an indentation prefix (in spaces) to an
-/// existing set of spans.
 fn indented_line_as_spans(indent: usize, mut spans: Vec<Span<'static>>) -> Line<'static> {
     if indent > 0 {
         spans.insert(0, Span::styled(" ".repeat(indent), Style::default()));
@@ -940,13 +933,9 @@ fn render_text_inline(
 
         if projected > width && *current_width > indent {
             flush_line(lines, current, current_width, indent);
-            // After a flush, we're on a fresh line so no separator needed
-            // unless this is not the first word.
             *needs_separator = i > 0;
         }
 
-        // Re-check: if the word itself doesn't fit on a fresh line,
-        // split it grapheme-by-grapheme.
         if *current_width + word_width > width && *current_width >= indent {
             flush_line(lines, current, current_width, indent);
             *needs_separator = false;
@@ -1049,18 +1038,16 @@ fn render_link_inline(
         if projected > width && *current_width > indent {
             flush_line(lines, current, current_width, indent);
         }
-        // Link destination appends without space (the format already has one).
         current.push(Span::styled(dest_text, Style::default()));
         *current_width += dest_width;
     }
     *needs_separator = true;
 }
+
 fn wrapped_line_height(line: &Line<'_>, width: usize) -> usize {
     if width == 0 {
         return 0;
     }
-    // Use Line::width() directly instead of line.to_string() + display_width
-    // to avoid allocating a temporary String from concatenating all spans.
     let line_width = line.width();
     if line_width == 0 {
         1
@@ -1083,7 +1070,6 @@ mod tests {
         let lines = highlight_code(Some("rust"), "fn main() {}");
         assert!(!lines.is_empty(), "should produce at least one line");
 
-        // At least one span should have a non-default foreground colour.
         let has_colour = lines
             .iter()
             .flat_map(|l| l.spans.iter())
@@ -1093,9 +1079,6 @@ mod tests {
 
     #[test]
     fn highlight_code_unknown_language_produces_output() {
-        // An unrecognised language token should still produce output lines
-        // without panicking.  syntect may apply a fallback syntax, so we
-        // merely verify that we get at least one line.
         let lines = highlight_code(Some("this-is-not-a-real-language"), "some text");
         assert!(!lines.is_empty(), "should still produce output");
     }
@@ -1161,14 +1144,12 @@ mod tests {
     fn lines_height_wrapping() {
         let text = "x".repeat(100);
         let lines = vec![Line::from(text)];
-        // At width 40, 100 chars → 3 wrapped rows (ceil(100/40))
         assert_eq!(lines_height(&lines, 40), 3);
     }
 
     #[test]
     fn lines_height_multiple_lines() {
         let lines = vec![Line::from("short"), Line::from("a".repeat(50))];
-        // width=30: short=1 row, 50 chars=2 rows → total 3
         assert_eq!(lines_height(&lines, 30), 3);
     }
 
@@ -1198,7 +1179,6 @@ mod tests {
     fn markdown_lines_code_block() {
         let md = "```rust\nfn main() {}\n```";
         let result = markdown_lines(md, 80);
-        // Should have: ```rust line, highlighted code line, ``` line
         assert!(result.len() >= 3, "code block should have at least 3 lines");
         assert_eq!(result[0].to_string(), "```rust");
         assert_eq!(result.last().unwrap().to_string(), "```");
@@ -1229,367 +1209,218 @@ mod tests {
         assert_eq!(display_width(""), 0);
     }
 
-    // ── inlines_to_lines ─────────────────────────────────────────────────
+    // ── render_turn_lines ────────────────────────────────────────────────
 
     #[test]
-    fn inlines_to_lines_simple_text() {
-        let inlines = vec![MarkdownInline::Text("hello".to_string())];
-        let result = inlines_to_lines(&inlines, 0, None, 80);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].to_string(), "hello");
-    }
-
-    #[test]
-    fn inlines_to_lines_with_indent_and_prefix() {
-        let inlines = vec![MarkdownInline::Text("world".to_string())];
-        let result = inlines_to_lines(&inlines, 2, Some("# ".to_string()), 80);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].to_string(), "  # world");
-    }
-
-    #[test]
-    fn inlines_to_lines_handles_line_break() {
-        let inlines = vec![
-            MarkdownInline::Text("a".to_string()),
-            MarkdownInline::LineBreak,
-            MarkdownInline::Text("b".to_string()),
-        ];
-        let result = inlines_to_lines(&inlines, 0, None, 80);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].to_string(), "a");
-        assert_eq!(result[1].to_string(), "b");
-    }
-
-    #[test]
-    fn inlines_to_lines_word_wraps_at_width() {
-        let inlines = vec![MarkdownInline::Text("hello world foo bar baz".to_string())];
-        // Width 10: each word fits individually but they wrap.
-        let result = inlines_to_lines(&inlines, 0, None, 10);
-        // "hello " (6) + "world" (5) = 11 > 10 → wrap after "hello"
-        // First line: "hello" (5), second line: "world" (5)
-        // But then "world " + "foo " = 10, fits. Then "bar" would need to check.
-        // Let me just verify there are multiple lines.
-        assert!(
-            result.len() > 1,
-            "should wrap at narrow width, got {} lines: {:?}",
-            result.len(),
-            result
-        );
-    }
-
-    #[test]
-    fn inlines_to_lines_code_block_does_not_wrap() {
-        let inlines = vec![MarkdownInline::Code("long_code_token".to_string())];
-        // Width 5: the single code token should still be emitted (it may overflow as
-        // a single word, but should not split at spaces).
-        let result = inlines_to_lines(&inlines, 0, None, 5);
-        assert_eq!(result.len(), 1);
-        assert!(result[0].to_string().contains("long_code_token"));
-    }
-
-    #[test]
-    fn inlines_to_lines_wraps_with_prefix_on_first_line_only() {
-        let inlines = vec![MarkdownInline::Text(
-            "aaa bbb ccc ddd eee fff ggg".to_string(),
-        )];
-        // Width 10, indent 2, prefix "# ". So first line has "  # " (4 chars)
-        // leaving 6 chars for content. Second (wrapped) line has "  " (2 chars)
-        // leaving 8 chars for content.
-        let result = inlines_to_lines(&inlines, 2, Some("# ".to_string()), 10);
-        assert!(
-            result.len() >= 2,
-            "should wrap, got {} lines: {:?}",
-            result.len(),
-            result
-        );
-        // First line starts with "  # " (prefix only on first line)
-        assert!(
-            result[0].to_string().starts_with("  # "),
-            "first line should have prefix: {:?}",
-            result[0].to_string()
-        );
-        // Subsequent lines start with indent-only (no prefix)
-        for line in result.iter().skip(1) {
-            let text = line.to_string();
-            assert!(
-                !text.starts_with("  # "),
-                "continuation line should not have prefix: {:?}",
-                text
-            );
-        }
-    }
-
-    // ── to_ratatui_color ─────────────────────────────────────────────────
-
-    #[test]
-    fn to_ratatui_color_opaque() {
-        let c = to_ratatui_color(syntect::highlighting::Color {
-            r: 255,
-            g: 0,
-            b: 0,
-            a: 255,
-        });
-        assert_eq!(c, Color::Rgb(255, 0, 0));
-    }
-
-    #[test]
-    fn to_ratatui_color_transparent() {
-        let c = to_ratatui_color(syntect::highlighting::Color {
-            r: 255,
-            g: 0,
-            b: 0,
-            a: 0,
-        });
-        assert_eq!(c, Color::Reset);
-    }
-
-    #[test]
-    fn to_ratatui_color_semi_transparent() {
-        let c = to_ratatui_color(syntect::highlighting::Color {
-            r: 255,
-            g: 0,
-            b: 0,
-            a: 100,
-        });
-        assert_eq!(c, Color::Reset, "alpha < 128 → Reset");
-    }
-
-    // ── ToolResult rendering (markdown support) ──────────────────────────
-
-    #[test]
-    fn tool_result_with_code_block_gets_syntax_highlighting() {
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "0".to_string(),
-            name: "run_riscv".to_string(),
-            content: "```rust\nfn main() {}\n```\n\nhello".to_string(),
-            is_error: false,
-        });
-        let lines = session_message_lines(&msg, 80);
-        // Line 0: mid prefix
-        assert_eq!(lines[0].to_string(), "mid:0");
-        // Line 1: header "tool result: run_riscv"
-        assert_eq!(lines[1].to_string(), "tool result: run_riscv");
-        // Line 2: blank separator; Line 3: ```rust
-        assert!(
-            lines[3].to_string().contains("```rust"),
-            "{}",
-            lines[3].to_string()
-        );
-        // The highlighted line for "fn main() {}" should have colour spans
-        let has_colour = lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
-        assert!(
-            has_colour,
-            "Rust code in tool result should have coloured spans"
-        );
-        // The closing fence and the output should be present
-        let all_text: String = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(all_text.contains("```"), "should contain closing fence");
-        assert!(
-            all_text.contains("hello"),
-            "should contain execution output"
-        );
-    }
-
-    #[test]
-    fn tool_result_plain_text_still_renders() {
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "0".to_string(),
-            name: "echo".to_string(),
-            content: "hello world".to_string(),
-            is_error: false,
-        });
-        let lines = session_message_lines(&msg, 80);
-        assert_eq!(lines[0].to_string(), "mid:0");
-        assert_eq!(lines[1].to_string(), "tool result: echo");
-        assert!(lines.len() >= 3, "mid + header + body");
-        let body: String = lines[2..]
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(body.contains("hello world"), "body should contain the text");
-    }
-
-    #[test]
-    fn tool_result_error_stays_plain_text() {
-        let msg = SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "0".to_string(),
-            name: "run_riscv".to_string(),
-            content: "```rust\nfn main() {}\n```\ncrash!".to_string(),
-            is_error: true,
-        });
-        let lines = session_message_lines(&msg, 80);
-        assert_eq!(lines[0].to_string(), "mid:0");
-        assert_eq!(lines[1].to_string(), "tool error: run_riscv");
-        // Error results should NOT have syntax highlighting — they should
-        // render the content verbatim (no colour spans from syntect).
-        let has_syntax_colour = lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
-        assert!(
-            !has_syntax_colour,
-            "error tool result should not have coloured spans"
-        );
-        let body: String = lines[2..]
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(body.contains("```rust"), "error body should be verbatim");
-    }
-
-    #[test]
-    fn assistant_text_with_reasoning_renders_reasoning_section() {
-        let msg = SessionMessage::now(SessionMessageKind::AssistantText {
-            content: "The answer is 42.".into(),
-            reasoning: Some("Let me think step by step.".into()),
+    fn render_turn_lines_error_shows_red_header() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: Some("something went wrong".into()),
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
             token_usage: None,
-        });
-        let lines = session_message_lines(&msg, 80);
-        // Line 0: mid prefix
-        assert_eq!(lines[0].to_string(), "mid:0");
-        // The "Reasoning" heading should be on its own line
-        assert_eq!(
-            lines[1].to_string(),
-            "Reasoning:",
-            "second line should be the Reasoning heading: {:?}",
-            lines[1].to_string()
-        );
-        // The reasoning body should be present
-        let all_text: String = lines
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        assert!(!lines.is_empty());
+        let text = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            all_text.contains("Let me think step by step."),
-            "reasoning text should appear"
-        );
-        // The "Response" heading should appear before the answer
-        assert!(
-            all_text.contains("Response:"),
-            "Response heading should appear"
-        );
-        // The answer text should appear after the Reasoning section
-        assert!(
-            all_text.contains("The answer is 42."),
-            "answer text should appear"
-        );
-    }
-
-    // ── UserText rendering (markdown) ──────────────────────────────────
-
-    #[test]
-    fn user_text_renders_plain_text_through_markdown_pipeline() {
-        let msg = SessionMessage::now(SessionMessageKind::UserText {
-            content: "hello world".into(),
-        });
-        let lines = session_message_lines(&msg, 80);
-        assert_eq!(lines.len(), 2, "mid prefix + plain text");
-        assert_eq!(lines[0].to_string(), "mid:0");
-        assert_eq!(
-            lines[1].to_string(),
-            "hello world",
-            "content should be preserved verbatim"
-        );
+        assert!(text.contains("Error: something went wrong"));
     }
 
     #[test]
-    fn user_text_renders_code_block_with_syntax_highlighting() {
-        let msg = SessionMessage::now(SessionMessageKind::UserText {
-            content: "```rust\nfn main() {}\n```".into(),
-        });
-        let lines = session_message_lines(&msg, 80);
-        // Line 0: mid prefix
-        assert_eq!(lines[0].to_string(), "mid:0");
-        // Should have: mid, ```rust, highlighted code line, ```
-        assert!(
-            lines.len() >= 4,
-            "code block should produce at least 4 lines, got {}",
-            lines.len()
-        );
-        assert!(
-            lines[1].to_string().contains("```rust"),
-            "second line should be the opening fence"
-        );
-        // The highlighted line should have colour spans from syntect
-        let has_syntax_colour = lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .any(|s| matches!(s.style.fg, Some(Color::Rgb(_, _, _))));
-        assert!(
-            has_syntax_colour,
-            "Rust code in user text should have coloured spans"
-        );
-        assert!(
-            lines.last().unwrap().to_string().contains("```"),
-            "last line should be the closing fence"
-        );
-    }
-
-    #[test]
-    fn user_text_empty_produces_single_empty_line() {
-        let msg = SessionMessage::now(SessionMessageKind::UserText { content: "".into() });
-        let lines = session_message_lines(&msg, 80);
-        assert!(!lines.is_empty(), "should not return empty vec");
-        assert_eq!(lines[0].to_string(), "mid:0");
-        assert_eq!(lines[1].width(), 0, "empty input → empty line");
-    }
-
-    #[test]
-    fn user_text_multi_line_markdown_renders_all_blocks() {
-        let msg = SessionMessage::now(SessionMessageKind::UserText {
-            content: "# heading\n\nparagraph\n\n- item1\n- item2".into(),
-        });
-        let lines = session_message_lines(&msg, 80);
-        let all_text: String = lines
-            .iter()
-            .map(|l| l.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(all_text.contains("# heading"), "should render heading");
-        assert!(all_text.contains("paragraph"), "should render paragraph");
-        assert!(all_text.contains("item1"), "should render list item");
-        assert!(all_text.contains("item2"), "should render second list item");
-    }
-
-    #[test]
-    fn assistant_text_without_reasoning_skips_reasoning_section() {
-        let msg = SessionMessage::now(SessionMessageKind::AssistantText {
-            content: "Just an answer.".into(),
-            reasoning: None,
+    fn render_turn_lines_user_text() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("hello world".into()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
             token_usage: None,
-        });
-        let lines = session_message_lines(&msg, 80);
-        // First line should be the mid prefix
-        assert_eq!(lines[0].to_string(), "mid:0");
-        // Second line should be the "Response" heading
-        assert_eq!(
-            lines[1].to_string(),
-            "Response:",
-            "second line should be the Response heading: {:?}",
-            lines[1].to_string()
-        );
-        let all_text: String = lines
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("hello world"), "user text should appear");
+    }
+
+    #[test]
+    fn render_turn_lines_assistant_text() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("The answer is 42.".into()),
+            assistant_reasoning: Some("Let me think...".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        let text = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            all_text.contains("Just an answer."),
-            "answer text should appear"
+            text.contains("Reasoning:"),
+            "reasoning header should appear"
         );
         assert!(
-            !all_text.contains("reasoning"),
-            "no reasoning section when reasoning is None"
+            text.contains("Let me think..."),
+            "reasoning body should appear"
         );
+        assert!(text.contains("Response:"), "response header should appear");
+        assert!(
+            text.contains("The answer is 42."),
+            "response body should appear"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_tool_calls() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![tai_proto::AssistantToolCallRecord {
+                call_id: "call1".into(),
+                name: "read_file".into(),
+                arguments_json: r#"{"path":"/tmp/x"}"#.into(),
+            }],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("tool: read_file"),
+            "tool call label should appear: {text}"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_tool_results() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![tai_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "read_file".into(),
+                content: "file contents".into(),
+                is_error: false,
+            }],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("tool result: read_file"));
+        assert!(text.contains("file contents"));
+    }
+
+    #[test]
+    fn render_turn_lines_tool_results_error() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![tai_proto::ToolResultRecord {
+                call_id: "call1".into(),
+                name: "run".into(),
+                content: "command failed".into(),
+                is_error: true,
+            }],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("tool error: run"));
+        assert!(text.contains("command failed"));
+    }
+
+    #[test]
+    fn render_turn_lines_empty_turn_produces_blank_line() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].width(), 0);
+    }
+
+    #[test]
+    fn render_turn_lines_user_with_assistant_renders_both_blocks() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("Hello".into()),
+            assistant_text: Some("Hi there!".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Hello"), "user block should appear");
+        assert!(text.contains("Hi there!"), "assistant block should appear");
     }
 }

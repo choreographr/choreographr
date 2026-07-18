@@ -603,7 +603,6 @@ fn handle_daemon_message(
     match &msg {
         DaemonMessage::OutputChunk { .. }
         | DaemonMessage::ToolCallStarted { .. }
-        | DaemonMessage::ToolCallOutput { .. }
         | DaemonMessage::ToolResultChunk { .. }
         | DaemonMessage::ToolCallFinished { .. }
         | DaemonMessage::ToolCallFailed { .. }
@@ -629,7 +628,6 @@ fn handle_streaming_message(
     let request_id = match msg {
         DaemonMessage::OutputChunk { request_id, .. }
         | DaemonMessage::ToolCallStarted { request_id, .. }
-        | DaemonMessage::ToolCallOutput { request_id, .. }
         | DaemonMessage::ToolResultChunk { request_id, .. }
         | DaemonMessage::ToolCallFinished { request_id, .. }
         | DaemonMessage::ToolCallFailed { request_id, .. }

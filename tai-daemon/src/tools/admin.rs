@@ -53,8 +53,8 @@ fn execute_list_sessions(
                 .unwrap_or_else(|| "none".to_string());
             let working_dir = s.working_dir.as_deref().unwrap_or("(none)");
             format!(
-                "Session {}: \"{}\" | model: {} | messages: {} | parent: {} | working_dir: {}",
-                s.session_id, title, model, s.message_count, parent, working_dir
+                "Session {}: \"{}\" | model: {} | turns: {} | parent: {} | working_dir: {}",
+                s.session_id, title, model, s.turn_count, parent, working_dir
             )
         })
         .collect();
@@ -113,7 +113,7 @@ fn execute_get_session(
             "Session {} ({}) has {} messages.",
             args.session_id,
             summary.title.as_deref().unwrap_or("untitled"),
-            summary.message_count
+            summary.turn_count
         )),
         None => Err(ToolError::Other(format!(
             "Session {} not found.",
@@ -214,7 +214,7 @@ mod tests {
                             parent_session_id: None,
                             working_dir: Some("/tmp".into()),
                             created_at: 1000,
-                            message_count: 5,
+                            turn_count: 5,
                             max_turns: None,
                             status: SessionStatus::Inactive,
                             active_tool_groups: vec!["core".into()],

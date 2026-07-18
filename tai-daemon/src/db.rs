@@ -7,14 +7,11 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
-use tai_proto::{
-    ContextConfig, SessionMessage, SessionMessageKind, ThinkingEffort, TimestampMs, TokenUsage,
-};
+use tai_proto::{ContextConfig, ThinkingEffort, TokenUsage, Turn};
 use tracing::{debug, error, info, warn};
 
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
-const SESSION_MESSAGES: TableDefinition<(u64, u32), &[u8]> =
-    TableDefinition::new("session_messages");
+const SESSION_TURNS: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("session_turns");
 const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credentials");
 #[cfg(test)]
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
@@ -44,7 +41,7 @@ pub struct SessionRecord {
     pub parent_session_id: Option<u64>,
     pub working_dir: Option<String>,
     pub max_turns: Option<u32>,
-    pub message_count: u32,
+    pub turn_count: u32,
     pub created_at: i64,
     pub active_tool_groups: Vec<String>,
     #[serde(default)]
@@ -206,12 +203,12 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
             .map_err(|e| db_err(format!("redb remove session: {e}")))?;
     }
     {
-        let mut messages = write_txn
-            .open_table(SESSION_MESSAGES)
-            .map_err(|e| db_err(format!("redb open messages: {e}")))?;
-        let keys_to_remove: Vec<(u64, u32)> = messages
+        let mut turns = write_txn
+            .open_table(SESSION_TURNS)
+            .map_err(|e| db_err(format!("redb open turns: {e}")))?;
+        let keys_to_remove: Vec<(u64, u32)> = turns
             .iter()
-            .map_err(|e| db_err(format!("redb iter messages: {e}")))?
+            .map_err(|e| db_err(format!("redb iter turns: {e}")))?
             .filter_map(|result| {
                 result.ok().and_then(|(key, _)| {
                     if key.value().0 == session_id {
@@ -223,9 +220,9 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
             })
             .collect();
         for key in keys_to_remove {
-            messages
+            turns
                 .remove(key)
-                .map_err(|e| db_err(format!("redb remove message: {e}")))?;
+                .map_err(|e| db_err(format!("redb remove turn: {e}")))?;
         }
     }
     {
@@ -250,91 +247,121 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
     Ok(())
 }
 
-pub fn write_message(
+pub fn write_turn(
     db: &redb::Database,
     session_id: u64,
-    index: u32,
-    message: &SessionMessage,
+    turn_id: u32,
+    turn: &Turn,
 ) -> io::Result<()> {
-    let payload = postcard::to_allocvec(message)
-        .map_err(|e| db_err(format!("postcard encode message: {e}")))?;
+    let payload =
+        postcard::to_allocvec(turn).map_err(|e| db_err(format!("postcard encode turn: {e}")))?;
     let write_txn = db
         .begin_write()
         .map_err(|e| db_err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn
-            .open_table(SESSION_MESSAGES)
-            .map_err(|e| db_err(format!("redb open messages: {e}")))?;
+            .open_table(SESSION_TURNS)
+            .map_err(|e| db_err(format!("redb open turns: {e}")))?;
         table
-            .insert((session_id, index), payload.as_slice())
-            .map_err(|e| db_err(format!("redb insert message: {e}")))?;
+            .insert((session_id, turn_id), payload.as_slice())
+            .map_err(|e| db_err(format!("redb insert turn: {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit message: {e}")))?;
+        .map_err(|e| db_err(format!("redb commit turn: {e}")))?;
     Ok(())
 }
 
-pub fn read_messages(db: &redb::Database, session_id: u64) -> io::Result<Vec<SessionMessage>> {
+pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, Turn)>> {
     let read_txn = db
         .begin_read()
         .map_err(|e| db_err(format!("redb read txn: {e}")))?;
     let table = read_txn
-        .open_table(SESSION_MESSAGES)
-        .map_err(|e| db_err(format!("redb open messages: {e}")))?;
-    let mut messages: Vec<(u32, SessionMessage)> = Vec::new();
+        .open_table(SESSION_TURNS)
+        .map_err(|e| db_err(format!("redb open turns: {e}")))?;
+    let mut turns: Vec<(u32, Turn)> = Vec::new();
     for result in table
         .iter()
-        .map_err(|e| db_err(format!("redb iter messages: {e}")))?
+        .map_err(|e| db_err(format!("redb iter turns: {e}")))?
     {
         let (key, value) = result.map_err(|e| db_err(format!("redb iter item: {e}")))?;
         let (sid, idx) = key.value();
         if sid == session_id {
-            match postcard::from_bytes::<SessionMessage>(value.value()) {
-                Ok(message) => {
-                    messages.push((idx, message));
-                }
+            match postcard::from_bytes::<Turn>(value.value()) {
+                Ok(turn) => turns.push((idx, turn)),
                 Err(e) => {
-                    // Schema may have evolved — insert a placeholder to
-                    // preserve message sequence integrity (otherwise orphaned
-                    // tool results can cause 400 errors from the API).
-                    warn!(
-                        session_id,
-                        message_idx = idx,
-                        error = %e,
-                        "undecodable message, inserting placeholder",
-                    );
-                    messages.push((
-                        idx,
-                        SessionMessage {
-                            message_id: idx,
-                            parent_id: None,
-                            created_at: TimestampMs::ZERO,
-                            kind: SessionMessageKind::UserText {
-                                content: String::new(),
-                            },
-                            deleted: false,
-                        },
-                    ));
+                    tracing::warn!(session_id, turn_id = idx, error = %e, "undecodable turn, skipping");
                 }
             }
         }
     }
-    messages.sort_by_key(|(idx, _)| *idx);
-    Ok(messages.into_iter().map(|(_, msg)| msg).collect())
+    turns.sort_by_key(|(idx, _)| *idx);
+    Ok(turns)
 }
 
-/// Retry a write_message on transient storage errors (e.g. I/O contention)
+/// Retry a write_turn on transient storage errors (e.g. I/O contention)
 /// with up to 3 retries and a 1ms backoff.
-pub fn write_message_retry(
+pub fn write_turn_retry(
     db: &redb::Database,
     session_id: u64,
-    index: u32,
-    message: &SessionMessage,
+    turn_id: u32,
+    turn: &Turn,
 ) -> io::Result<()> {
     let mut attempts = 0;
     loop {
-        match write_message(db, session_id, index, message) {
+        match write_turn(db, session_id, turn_id, turn) {
+            Ok(()) => return Ok(()),
+            Err(_e) if attempts < 3 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+pub fn delete_session_turns(db: &redb::Database, session_id: u64) -> io::Result<()> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+    {
+        let mut table = write_txn
+            .open_table(SESSION_TURNS)
+            .map_err(|e| db_err(format!("redb open turns: {e}")))?;
+        let keys_to_remove: Vec<(u64, u32)> = table
+            .iter()
+            .map_err(|e| db_err(format!("redb iter turns: {e}")))?
+            .filter_map(|result| match result {
+                Ok((key, _)) => {
+                    if key.value().0 == session_id {
+                        Some(key.value())
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    warn!("undecodable turn entry in session {session_id}: {e}");
+                    None
+                }
+            })
+            .collect();
+        for key in keys_to_remove {
+            table
+                .remove(key)
+                .map_err(|e| db_err(format!("redb remove turn: {e}")))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| db_err(format!("redb commit delete turns: {e}")))?;
+    Ok(())
+}
+
+pub fn delete_session_turns_retry(db: &redb::Database, session_id: u64) -> io::Result<()> {
+    let mut attempts = 0;
+    loop {
+        match delete_session_turns(db, session_id) {
             Ok(()) => return Ok(()),
             Err(_e) if attempts < 3 => {
                 attempts += 1;
@@ -679,7 +706,7 @@ pub fn write_session_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tai_proto::SessionMessage;
+    use tai_proto::Turn;
 
     /// Read the current `next_session_id` from the DB and atomically
     /// increment it.  Only used by tests — production code derives the
@@ -708,6 +735,21 @@ mod tests {
         Ok(current)
     }
 
+    fn dummy_turn() -> Turn {
+        Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("hello".into()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            token_usage: None,
+            tool_results: Vec::new(),
+            displayed_images: Vec::new(),
+        }
+    }
+
     #[test]
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -723,7 +765,7 @@ mod tests {
             parent_session_id: None,
             working_dir: Some("/tmp".into()),
             max_turns: None,
-            message_count: 1,
+            turn_count: 1,
             created_at: 1234567890,
             active_tool_groups: vec!["core".into(), "git".into()],
             context_config: ContextConfig::default(),
@@ -736,48 +778,44 @@ mod tests {
 
         let read = read_session(&db, id).unwrap().unwrap();
         assert_eq!(read.title, record.title);
-        assert_eq!(read.message_count, record.message_count);
+        assert_eq!(read.turn_count, record.turn_count);
 
         let all = read_all_sessions(&db).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].0, id);
 
-        let msg = SessionMessage::now(SessionMessageKind::UserText {
-            content: "hello".into(),
-        });
-        write_message(&db, id, 0, &msg).unwrap();
+        let turn = dummy_turn();
+        write_turn(&db, id, 0, &turn).unwrap();
 
-        let messages = read_messages(&db, id).unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0], msg);
+        let turns = read_turns(&db, id).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].1, turn);
 
         let id2 = next_session_id(&db).unwrap();
         assert_eq!(id2, 2);
 
         delete_session(&db, id).unwrap();
         assert!(read_session(&db, id).unwrap().is_none());
-        assert!(read_messages(&db, id).unwrap().is_empty());
+        assert!(read_turns(&db, id).unwrap().is_empty());
 
         drop(db);
     }
 
     #[test]
-    fn read_messages_skips_corrupt_entries() {
+    fn read_turns_skips_corrupt_entries() {
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
         let id = 1u64;
 
-        // Write a valid message at index 0
-        let valid_msg = SessionMessage::now(SessionMessageKind::UserText {
-            content: "valid".into(),
-        });
-        write_message(&db, id, 0, &valid_msg).unwrap();
+        // Write a valid turn at index 0
+        let valid_turn = dummy_turn();
+        write_turn(&db, id, 0, &valid_turn).unwrap();
 
         // Manually insert a corrupt blob at index 1 (not valid postcard)
         {
             let write_txn = db.begin_write().unwrap();
             {
-                let mut table = write_txn.open_table(SESSION_MESSAGES).unwrap();
+                let mut table = write_txn.open_table(SESSION_TURNS).unwrap();
                 table
                     .insert((id, 1u32), b"not valid postcard data".as_slice())
                     .unwrap();
@@ -785,27 +823,14 @@ mod tests {
             write_txn.commit().unwrap();
         }
 
-        // Write another valid message at index 2
-        let valid_msg2 = SessionMessage::now(SessionMessageKind::UserText {
-            content: "also valid".into(),
-        });
-        write_message(&db, id, 2, &valid_msg2).unwrap();
+        // Write another valid turn at index 2
+        let valid_turn2 = dummy_turn();
+        write_turn(&db, id, 2, &valid_turn2).unwrap();
 
-        // read_messages should insert a placeholder for the corrupt entry
-        let messages = read_messages(&db, id).unwrap();
-        assert_eq!(
-            messages.len(),
-            3,
-            "corrupt message should be replaced with placeholder"
-        );
-        assert_eq!(messages[0], valid_msg);
-        assert_eq!(
-            messages[1].kind,
-            SessionMessageKind::UserText {
-                content: String::new(),
-            },
-            "corrupt entry should be replaced with empty UserText placeholder"
-        );
-        assert_eq!(messages[2], valid_msg2);
+        // read_turns should skip the corrupt entry
+        let turns = read_turns(&db, id).unwrap();
+        assert_eq!(turns.len(), 2, "corrupt turn should be skipped");
+        assert_eq!(turns[0].1, valid_turn);
+        assert_eq!(turns[1].1, valid_turn2);
     }
 }

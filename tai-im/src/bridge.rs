@@ -2,9 +2,45 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
-use tai_client_core::{ImageAssembler, StreamingText};
-use tai_proto::{ClientMessage, DaemonMessage, ImageMetadata, write_message};
+use tai_proto::{ClientMessage, DaemonMessage, OutputStream, write_message};
 use tracing::{debug, error, info, warn};
+
+/// Local stand-in for the removed `StreamingText`. Accumulates reasoning and
+/// answer chunks emitted during a request and flattens them into a single
+/// text body on `Done`.
+struct StreamBuffer {
+    reasoning: String,
+    answer: String,
+}
+
+impl StreamBuffer {
+    fn new() -> Self {
+        Self {
+            reasoning: String::new(),
+            answer: String::new(),
+        }
+    }
+
+    fn append(&mut self, stream: OutputStream, data: &str) {
+        match stream {
+            OutputStream::Reasoning => self.reasoning.push_str(data),
+            OutputStream::Answer => self.answer.push_str(data),
+            _ => {}
+        }
+    }
+
+    /// Flatten reasoning + answer into a single trimmed string.
+    fn flatten(&self) -> String {
+        let mut text = String::new();
+        if !self.reasoning.is_empty() {
+            text.push_str("[reasoning]\n");
+            text.push_str(&self.reasoning);
+            text.push_str("\n\n");
+        }
+        text.push_str(&self.answer);
+        text.trim().to_string()
+    }
+}
 
 pub struct DaemonBridge {
     client_tx: mpsc::Sender<ClientMessage>,
@@ -72,17 +108,29 @@ impl DaemonBridge {
 
         // Reader thread: uses the shared run_daemon_reader loop from tai-client-core.
         // It handles EOF, connection reset, and protocol errors uniformly.
+        let image_event_tx = event_tx.clone();
         std::thread::spawn(move || {
             let mut reader = reader;
-            let mut assembler = ImageAssembler::new();
-            let mut buffers: HashMap<u32, StreamingText> = HashMap::new();
+            let mut buffers: HashMap<u32, StreamBuffer> = HashMap::new();
             let mut tool_buffers: HashMap<u32, String> = HashMap::new();
 
             let result = tai_client_core::run_daemon_reader(&mut reader, |msg| {
                 debug!(?msg, "received daemon message");
-                if let Some(event) =
-                    daemon_to_bridge_events(msg, &mut assembler, &mut buffers, &mut tool_buffers)
-                {
+                // Extract images from TurnAppended/TurnFinalized before passing
+                // to the standard handler.
+                match &msg {
+                    DaemonMessage::TurnAppended { turn, .. }
+                    | DaemonMessage::TurnFinalized { turn, .. } => {
+                        for record in &turn.displayed_images {
+                            let _ = image_event_tx.send(BridgeEvent::Image {
+                                _mime: record.metadata.mime_type.clone(),
+                                data: record.data.clone(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(event) = daemon_to_bridge_events(msg, &mut buffers, &mut tool_buffers) {
                     let _ = event_tx.send(event);
                 }
             });
@@ -108,8 +156,7 @@ impl DaemonBridge {
 
 fn daemon_to_bridge_events(
     msg: DaemonMessage,
-    assembler: &mut ImageAssembler,
-    buffers: &mut HashMap<u32, StreamingText>,
+    buffers: &mut HashMap<u32, StreamBuffer>,
     tool_buffers: &mut HashMap<u32, String>,
 ) -> Option<BridgeEvent> {
     match msg {
@@ -119,24 +166,15 @@ fn daemon_to_bridge_events(
             data,
         } => {
             let text = String::from_utf8_lossy(&data);
-            let entry = buffers
-                .entry(request_id)
-                .or_insert_with(|| StreamingText::new(request_id));
+            let entry = buffers.entry(request_id).or_insert_with(StreamBuffer::new);
             entry.append(stream, &text);
             None
         }
         DaemonMessage::Done { request_id, .. } => {
             if let Some(entry) = buffers.remove(&request_id) {
-                let mut text = String::new();
-                if !entry.reasoning.is_empty() {
-                    text.push_str("[reasoning]\n");
-                    text.push_str(&entry.reasoning);
-                    text.push_str("\n\n");
-                }
-                text.push_str(&entry.answer);
-                let trimmed = text.trim().to_string();
-                if !trimmed.is_empty() {
-                    return Some(BridgeEvent::Text(trimmed));
+                let text = entry.flatten();
+                if !text.is_empty() {
+                    return Some(BridgeEvent::Text(text));
                 }
             }
             None
@@ -175,35 +213,14 @@ fn daemon_to_bridge_events(
             tool_buffers.remove(&request_id);
             Some(BridgeEvent::ToolCallFailed { name, error })
         }
-        DaemonMessage::ImageStart {
-            request_id,
-            metadata,
-        } => {
-            if let Err(e) = assembler.start(request_id, metadata) {
-                warn!("failed to start image assembly: {e}");
-            }
+        DaemonMessage::TurnAppended { .. }
+        | DaemonMessage::TurnFinalized { .. }
+        | DaemonMessage::TurnsUndone { .. }
+        | DaemonMessage::TurnsRedone { .. } => {
+            // Images are extracted from turns in the reader thread callback.
+            // TurnsUndone/TurnsRedone don't carry image data.
             None
         }
-        DaemonMessage::ImageChunk {
-            request_id,
-            image_id,
-            data,
-        } => {
-            if let Err(e) = assembler.push_chunk(request_id, image_id, &data) {
-                warn!("failed to push image chunk: {e}");
-            }
-            None
-        }
-        DaemonMessage::ImageEnd {
-            request_id,
-            image_id,
-        } => match assembler.finish(request_id, image_id) {
-            Ok((ImageMetadata { mime_type, .. }, data)) => Some(BridgeEvent::Image {
-                _mime: mime_type,
-                data,
-            }),
-            Err(e) => Some(BridgeEvent::Error(format!("image assembly failed: {e}"))),
-        },
         DaemonMessage::Models {
             models,
             selected_model: selected,
@@ -228,11 +245,9 @@ fn daemon_to_bridge_events(
         | DaemonMessage::Sessions { .. }
         | DaemonMessage::SessionAttached { .. }
         | DaemonMessage::SessionState { .. }
-        | DaemonMessage::SessionMessageAppended { .. }
         | DaemonMessage::SessionStatusChanged { .. }
         | DaemonMessage::SessionDeleted { .. }
         | DaemonMessage::SessionDeleteFailed { .. }
-        | DaemonMessage::ToolCallOutput { .. }
         | DaemonMessage::CredentialAdded { .. }
         | DaemonMessage::CredentialAddFailed { .. }
         | DaemonMessage::CredentialRemoved { .. }
@@ -257,12 +272,10 @@ fn daemon_to_bridge_events(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use tai_client_core::ImageAssembler;
-    use tai_proto::{DaemonMessage, ImageMetadata, OutputStream};
+    use tai_proto::{DaemonMessage, OutputStream};
 
     #[test]
     fn test_output_chunk_buffering() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
@@ -272,7 +285,6 @@ mod tests {
                 stream: OutputStream::Answer,
                 data: b"hello ".to_vec(),
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -284,7 +296,6 @@ mod tests {
                 stream: OutputStream::Answer,
                 data: b"world".to_vec(),
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -296,7 +307,6 @@ mod tests {
                 token_usage: None,
                 last_prompt_tokens: None,
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -309,7 +319,6 @@ mod tests {
 
     #[test]
     fn test_done_no_chunks() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
@@ -319,7 +328,6 @@ mod tests {
                 token_usage: None,
                 last_prompt_tokens: None,
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -328,7 +336,6 @@ mod tests {
 
     #[test]
     fn test_failed_clears_buffer() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
@@ -338,7 +345,6 @@ mod tests {
                 stream: OutputStream::Answer,
                 data: b"data".to_vec(),
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -348,7 +354,6 @@ mod tests {
                 request_id: 1,
                 error: "oops".into(),
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -361,7 +366,6 @@ mod tests {
                 token_usage: None,
                 last_prompt_tokens: None,
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -370,7 +374,6 @@ mod tests {
 
     #[test]
     fn test_cancelled_clears_buffer() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
@@ -380,14 +383,12 @@ mod tests {
                 stream: OutputStream::Answer,
                 data: b"data".to_vec(),
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
 
         let events = daemon_to_bridge_events(
             DaemonMessage::Cancelled { request_id: 2 },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -400,7 +401,6 @@ mod tests {
                 token_usage: None,
                 last_prompt_tokens: None,
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -409,7 +409,6 @@ mod tests {
 
     #[test]
     fn test_tool_call_events() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
@@ -419,9 +418,7 @@ mod tests {
                 call_id: "call_1".into(),
                 tool_name: "read".into(),
                 arguments_json: r#"{"path":"/tmp"}"#.into(),
-                message_id: 1,
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -440,7 +437,6 @@ mod tests {
 
     #[test]
     fn test_tool_call_finished() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
@@ -451,7 +447,6 @@ mod tests {
                 call_id: "call_1".into(),
                 data: b"file contents".to_vec(),
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -462,7 +457,6 @@ mod tests {
                 call_id: "call_1".into(),
                 tool_name: "read".into(),
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -478,7 +472,6 @@ mod tests {
 
     #[test]
     fn test_tool_call_failed() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
@@ -489,7 +482,6 @@ mod tests {
                 tool_name: "read".into(),
                 error: "permission denied".into(),
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -504,65 +496,50 @@ mod tests {
     }
 
     #[test]
-    fn test_image_stream() {
-        let mut assembler = ImageAssembler::new();
+    fn test_turn_appended_images() {
+        // TurnAppended with displayed images should produce Image events
+        // when processed via the reader thread. The unit test checks that
+        // daemon_to_bridge_events returns None for turn messages (images
+        // are extracted in the reader callback instead).
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
-        let metadata = ImageMetadata {
-            image_id: 1,
-            mime_type: "image/png".into(),
-            width: 100,
-            height: 100,
-            byte_len: 5,
-            alt: None,
-        };
-
-        let events1 = daemon_to_bridge_events(
-            DaemonMessage::ImageStart {
-                request_id: 1,
-                metadata: metadata.clone(),
+        let events = daemon_to_bridge_events(
+            DaemonMessage::TurnAppended {
+                turn_id: 1,
+                turn: tai_proto::Turn {
+                    created_at: tai_proto::TimestampMs::now(),
+                    undone: false,
+                    error: None,
+                    user_text: Some("hello".into()),
+                    assistant_text: None,
+                    assistant_reasoning: None,
+                    tool_calls: vec![],
+                    token_usage: None,
+                    tool_results: vec![],
+                    displayed_images: vec![tai_proto::DisplayedImageRecord {
+                        metadata: tai_proto::ImageMetadata {
+                            mime_type: "image/png".into(),
+                            width: 100,
+                            height: 100,
+                            byte_len: 5,
+                            alt: None,
+                        },
+                        data: b"hello".to_vec(),
+                        tool_call_id: None,
+                    }],
+                },
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
-        assert!(events1.is_none());
-
-        let events2 = daemon_to_bridge_events(
-            DaemonMessage::ImageChunk {
-                request_id: 1,
-                image_id: 1,
-                data: b"hello".to_vec(),
-            },
-            &mut assembler,
-            &mut buffers,
-            &mut tool_buffers,
-        );
-        assert!(events2.is_none());
-
-        let events3 = daemon_to_bridge_events(
-            DaemonMessage::ImageEnd {
-                request_id: 1,
-                image_id: 1,
-            },
-            &mut assembler,
-            &mut buffers,
-            &mut tool_buffers,
-        );
-        assert!(events3.is_some());
-        match events3.unwrap() {
-            BridgeEvent::Image { _mime, data } => {
-                assert_eq!(_mime, "image/png");
-                assert_eq!(data, b"hello");
-            }
-            other => panic!("expected Image event, got {other:?}"),
-        }
+        // daemon_to_bridge_events returns None for TurnAppended;
+        // images are emitted via the reader thread callback.
+        assert!(events.is_none());
     }
 
     #[test]
     fn test_models_event() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
@@ -571,7 +548,6 @@ mod tests {
                 models: vec!["gpt-4".into(), "claude".into()],
                 selected_model: Some("claude".into()),
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -587,7 +563,6 @@ mod tests {
 
     #[test]
     fn test_models_failed_event() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
@@ -595,7 +570,6 @@ mod tests {
             DaemonMessage::ModelsFailed {
                 error: "network error".into(),
             },
-            &mut assembler,
             &mut buffers,
             &mut tool_buffers,
         );
@@ -608,23 +582,16 @@ mod tests {
 
     #[test]
     fn test_pong_event() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
-        let events = daemon_to_bridge_events(
-            DaemonMessage::Pong,
-            &mut assembler,
-            &mut buffers,
-            &mut tool_buffers,
-        );
+        let events = daemon_to_bridge_events(DaemonMessage::Pong, &mut buffers, &mut tool_buffers);
         assert!(events.is_some());
         assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Pong));
     }
 
     #[test]
     fn test_error_variants() {
-        let mut assembler = ImageAssembler::new();
         let mut buffers = HashMap::new();
         let mut tool_buffers = HashMap::new();
 
@@ -643,8 +610,7 @@ mod tests {
         ];
 
         for msg in cases {
-            let events =
-                daemon_to_bridge_events(msg, &mut assembler, &mut buffers, &mut tool_buffers);
+            let events = daemon_to_bridge_events(msg, &mut buffers, &mut tool_buffers);
             assert!(events.is_some());
             assert!(matches!(events.as_ref().unwrap(), BridgeEvent::Error(_)));
         }

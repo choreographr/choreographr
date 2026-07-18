@@ -201,7 +201,7 @@ pub fn parse_input_line(
 
 fn parse_command(
     rest: &str,
-    next_request_id: &mut u32,
+    _next_request_id: &mut u32,
     attached_session_id: Option<u64>,
 ) -> ShellCommand {
     // Try grouped sub-command parsers before falling through to the flat commands.
@@ -328,12 +328,6 @@ fn parse_command(
         return ShellCommand::Redo;
     }
 
-    if rest == "image" {
-        let request_id = *next_request_id;
-        *next_request_id = next_request_id.wrapping_add(1);
-        return ShellCommand::Send(ClientMessage::TestImage { request_id });
-    }
-
     if let Some(effort_s) = rest.strip_prefix("reasoning ") {
         let effort_s = effort_s.trim();
         let effort = match effort_s {
@@ -362,7 +356,6 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
             ClientMessage::RunInput { input, .. } => {
                 Some(format!("> {}", String::from_utf8_lossy(input)))
             }
-            ClientMessage::TestImage { .. } => Some("> /image".to_string()),
             ClientMessage::SetModel { model } => Some(format!("> set model: {model}")),
             ClientMessage::SetReasoningEffort { effort } => {
                 Some(format!("> set reasoning effort: {}", effort.as_label()))
@@ -385,5 +378,3 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
         _ => None,
     }
 }
-
-pub use crate::history::StreamingText;

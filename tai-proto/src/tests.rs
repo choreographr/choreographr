@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 use std::io::Cursor;
 
 #[test]
@@ -31,17 +32,7 @@ fn decode_rejects_wrong_version() {
 
 #[test]
 fn sync_read_write_round_trip() {
-    let expected = DaemonMessage::ImageStart {
-        request_id: 5,
-        metadata: ImageMetadata {
-            image_id: 1,
-            mime_type: "image/png".to_string(),
-            width: 1,
-            height: 1,
-            byte_len: 4,
-            alt: Some("chunk".to_string()),
-        },
-    };
+    let expected = DaemonMessage::Pong;
 
     let frame = encode_frame(&expected).expect("encode");
     let mut cursor = Cursor::new(&frame[..]);
@@ -97,7 +88,6 @@ fn session_status_retrying_serde_round_trip() {
 #[test]
 fn timestamp_ms_now_returns_recent() {
     let ts = TimestampMs::now();
-    // Must be after 2020-01-01 (well into the past as of 2026).
     assert!(
         ts.as_millis() > 1_577_836_800_000,
         "TimestampMs::now() should return a recent timestamp"
@@ -108,7 +98,6 @@ fn timestamp_ms_now_returns_recent() {
 fn timestamp_ms_serde_deterministic() {
     let ts = TimestampMs::now();
     let millis = ts.as_millis();
-    // Serialize and deserialize, then verify the value survives.
     let frame = encode_frame(&ts).expect("encode");
     let decoded: TimestampMs = decode_frame(&frame[4..]).expect("decode");
     assert_eq!(decoded.as_millis(), millis);
@@ -122,105 +111,70 @@ fn timestamp_ms_serde_round_trip() {
     assert_eq!(decoded, ts);
 }
 
-// ── SessionMessage tests ──────────────────────────────────────────────
+// ── Turn tests ─────────────────────────────────────────────────────────
 
 #[test]
-fn session_message_now_sets_timestamp() {
-    let before = TimestampMs::now();
-    let msg = SessionMessage::now(SessionMessageKind::SystemText {
-        content: "test".into(),
-    });
-    let after = TimestampMs::now();
-    // The created_at must be between before and after.
-    assert!(
-        msg.created_at.as_millis() >= before.as_millis(),
-        "created_at should be >= timestamp taken before construction"
-    );
-    assert!(
-        msg.created_at.as_millis() <= after.as_millis(),
-        "created_at should be <= timestamp taken after construction"
-    );
-}
-
-#[test]
-fn session_message_kind_round_trip() {
-    let msg = SessionMessage::now(SessionMessageKind::AssistantText {
-        content: "hello".into(),
-        reasoning: None,
+fn turn_serde_round_trip() {
+    let turn = Turn {
+        created_at: TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("hello".into()),
+        assistant_text: Some("hi".into()),
+        assistant_reasoning: None,
+        tool_calls: vec![],
         token_usage: None,
-    });
-    let frame = encode_frame(&msg).expect("encode");
-    let decoded: SessionMessage = decode_frame(&frame[4..]).expect("decode");
-    // Compare .kind only; .created_at may differ by a few ms.
-    assert_eq!(decoded.kind, msg.kind);
+        tool_results: vec![],
+        displayed_images: vec![],
+    };
+    let frame = encode_frame(&turn).expect("encode");
+    let decoded: Turn = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, turn);
 }
 
 #[test]
-fn session_message_assistant_text_fields() {
-    let msg = SessionMessage::now(SessionMessageKind::AssistantText {
-        content: "hello".into(),
-        reasoning: None,
-        token_usage: None,
-    });
-    match &msg.kind {
-        SessionMessageKind::AssistantText {
-            content,
-            reasoning,
-            token_usage,
-        } => {
-            assert_eq!(content, "hello");
-            assert_eq!(*reasoning, None);
-            assert_eq!(*token_usage, None);
-        }
-        _ => panic!("expected AssistantText"),
-    }
+fn tool_result_record_serde_round_trip() {
+    let record = ToolResultRecord {
+        call_id: "call_1".into(),
+        name: "ls".into(),
+        content: "file.txt".into(),
+        is_error: false,
+    };
+    let frame = encode_frame(&record).expect("encode");
+    let decoded: ToolResultRecord = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, record);
 }
 
 #[test]
-fn session_message_all_variants_round_trip() {
-    let variants: Vec<SessionMessageKind> = vec![
-        SessionMessageKind::SystemText {
-            content: "sys".into(),
-        },
-        SessionMessageKind::UserText {
-            content: "user".into(),
-        },
-        SessionMessageKind::AssistantText {
-            content: "assistant".into(),
-            reasoning: None,
-            token_usage: None,
-        },
-        SessionMessageKind::AssistantToolUse {
-            content: Some("thinking".into()),
-            tool_calls: vec![],
-            reasoning: None,
-            token_usage: None,
-        },
-        SessionMessageKind::ToolResult {
-            call_id: "c1".into(),
+fn turn_with_tool_results_round_trip() {
+    let turn = Turn {
+        created_at: TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("list files".into()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![AssistantToolCallRecord {
+            call_id: "call_1".into(),
+            name: "ls".into(),
+            arguments_json: "{}".into(),
+        }],
+        token_usage: Some(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            total_tokens: 30,
+        }),
+        tool_results: vec![ToolResultRecord {
+            call_id: "call_1".into(),
             name: "ls".into(),
             content: "file.txt".into(),
             is_error: false,
-        },
-        SessionMessageKind::DisplayedImage(DisplayedImageRecord {
-            metadata: ImageMetadata {
-                image_id: 0,
-                mime_type: "image/png".into(),
-                width: 1,
-                height: 1,
-                byte_len: 0,
-                alt: None,
-            },
-            data: vec![],
-            tool_call_id: None,
-        }),
-    ];
-    for kind in variants {
-        let msg = SessionMessage::now(kind);
-        let frame = encode_frame(&msg).expect("encode");
-        let decoded: SessionMessage = decode_frame(&frame[4..]).expect("decode");
-        assert_eq!(decoded.kind, msg.kind, "round-trip failed for variant");
-    }
+        }],
+        displayed_images: vec![],
+    };
+    let frame = encode_frame(&turn).expect("encode");
+    let decoded: Turn = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, turn);
 }
 
 // ── TokenUsage tests ──────────────────────────────────────────────────
@@ -247,8 +201,7 @@ fn token_usage_serde_round_trip() {
 
 #[test]
 fn token_usage_in_session_summary_backward_compat() {
-    // Old JSON (before token_usage was added to SessionSummary)
-    let json = r#"{"session_id":1,"title":null,"selected_model":null,"reasoning_effort":null,"parent_session_id":null,"working_dir":null,"created_at":0,"message_count":0,"max_turns":null,"status":"Inactive","active_tool_groups":[],"account_name":null}"#;
+    let json = r#"{"session_id":1,"title":null,"selected_model":null,"reasoning_effort":null,"parent_session_id":null,"working_dir":null,"created_at":0,"turn_count":0,"max_turns":null,"status":"Inactive","active_tool_groups":[],"account_name":null}"#;
     let summary: SessionSummary = serde_json::from_str(json).unwrap();
     assert_eq!(summary.session_id, 1);
     assert_eq!(summary.token_usage, None);
@@ -256,7 +209,6 @@ fn token_usage_in_session_summary_backward_compat() {
 
 #[test]
 fn token_usage_in_daemon_message_done_backward_compat() {
-    // Old JSON (before token_usage was added to Done)
     let json = r#"{"Done":{"request_id":42}}"#;
     let msg: DaemonMessage = serde_json::from_str(json).unwrap();
     match msg {
@@ -320,8 +272,6 @@ fn daemon_message_done_with_usage_round_trip() {
 }
 
 // ── Postcard round-trip with None optionals ─────────────────────────────
-// These verify that postcard handles trailing Option fields correctly when
-// they are None — a regression test for the skip_serializing_if bug.
 
 #[test]
 fn session_summary_none_optionals_round_trip() {
@@ -333,7 +283,7 @@ fn session_summary_none_optionals_round_trip() {
         parent_session_id: None,
         working_dir: None,
         created_at: 0,
-        message_count: 0,
+        turn_count: 0,
         max_turns: None,
         status: SessionStatus::Inactive,
         active_tool_groups: vec![],
@@ -362,7 +312,7 @@ fn session_summary_some_token_usage_round_trip() {
         parent_session_id: None,
         working_dir: None,
         created_at: 0,
-        message_count: 0,
+        turn_count: 0,
         max_turns: None,
         status: SessionStatus::Inactive,
         active_tool_groups: vec![],
@@ -377,31 +327,6 @@ fn session_summary_some_token_usage_round_trip() {
 }
 
 #[test]
-fn assistant_text_none_token_usage_round_trip() {
-    let msg = SessionMessage::now(SessionMessageKind::AssistantText {
-        content: "hello".into(),
-        reasoning: None,
-        token_usage: None,
-    });
-    let frame = encode_frame(&msg).expect("encode");
-    let decoded: SessionMessage = decode_frame(&frame[4..]).expect("decode");
-    assert_eq!(decoded.kind, msg.kind);
-}
-
-#[test]
-fn assistant_tool_use_none_token_usage_round_trip() {
-    let msg = SessionMessage::now(SessionMessageKind::AssistantToolUse {
-        content: None,
-        tool_calls: vec![],
-        reasoning: None,
-        token_usage: None,
-    });
-    let frame = encode_frame(&msg).expect("encode");
-    let decoded: SessionMessage = decode_frame(&frame[4..]).expect("decode");
-    assert_eq!(decoded.kind, msg.kind);
-}
-
-#[test]
 fn session_state_none_optionals_round_trip() {
     let state = DaemonMessage::SessionState {
         session_id: 1,
@@ -410,7 +335,7 @@ fn session_state_none_optionals_round_trip() {
         parent_session_id: None,
         working_dir: None,
         max_turns: None,
-        messages: vec![],
+        turns: BTreeMap::new(),
         active_tool_groups: vec![],
         token_usage: None,
         context_window: None,
@@ -424,8 +349,6 @@ fn session_state_none_optionals_round_trip() {
 
 #[test]
 fn sessions_with_none_optionals_round_trip() {
-    // DaemonMessage::Sessions wraps Vec<SessionSummary>; test that a
-    // session list containing summaries with None optionals round-trips.
     let summary = SessionSummary {
         session_id: 1,
         title: None,
@@ -434,7 +357,7 @@ fn sessions_with_none_optionals_round_trip() {
         parent_session_id: None,
         working_dir: None,
         created_at: 0,
-        message_count: 0,
+        turn_count: 0,
         max_turns: None,
         status: SessionStatus::Inactive,
         active_tool_groups: vec![],
@@ -467,4 +390,56 @@ fn thinking_effort_serialization() {
     assert_eq!(json, "\"medium\"");
     let deserialized: ThinkingEffort = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized, ThinkingEffort::Medium);
+}
+
+// ── TurnAppended / TurnFinalized round-trip tests ───────────────────────
+
+#[test]
+fn turn_appended_serde_round_trip() {
+    let turn = Turn {
+        created_at: TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("hello".into()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+    };
+    let msg = DaemonMessage::TurnAppended {
+        turn_id: 1,
+        turn: turn.clone(),
+    };
+    let frame = encode_frame(&msg).expect("encode");
+    let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, msg);
+}
+
+#[test]
+fn turn_finalized_serde_round_trip() {
+    let turn = Turn {
+        created_at: TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("hello".into()),
+        assistant_text: Some("response".into()),
+        assistant_reasoning: Some("thinking".into()),
+        tool_calls: vec![],
+        token_usage: Some(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            total_tokens: 30,
+        }),
+        tool_results: vec![],
+        displayed_images: vec![],
+    };
+    let msg = DaemonMessage::TurnFinalized {
+        turn_id: 2,
+        turn: turn.clone(),
+    };
+    let frame = encode_frame(&msg).expect("encode");
+    let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, msg);
 }

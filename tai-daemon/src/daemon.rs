@@ -367,7 +367,7 @@ impl DaemonState {
             parent_session_id,
             working_dir: cwd_str.clone(),
             max_turns,
-            message_count: 0,
+            turn_count: 0,
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -391,7 +391,7 @@ impl DaemonState {
             parent_session_id,
             working_dir: cwd_str.clone(),
             created_at: record.created_at,
-            message_count: 0,
+            turn_count: 0,
             max_turns,
             status: SessionStatus::Inactive,
             active_tool_groups: active_cats.clone(),
@@ -467,7 +467,7 @@ impl DaemonState {
                 parent_session_id: meta.parent_session_id,
                 working_dir: meta.working_dir.clone(),
                 created_at: meta.created_at,
-                message_count: meta.message_count,
+                turn_count: meta.turn_count,
                 max_turns: meta.max_turns,
                 status: meta.status.clone(),
                 active_tool_groups: meta.active_tool_groups.clone(),
@@ -499,7 +499,7 @@ impl DaemonState {
                 parent_session_id: meta.parent_session_id,
                 working_dir: meta.working_dir.clone(),
                 created_at: meta.created_at,
-                message_count: meta.message_count,
+                turn_count: meta.turn_count,
                 max_turns: meta.max_turns,
                 status: meta.status.clone(),
                 active_tool_groups: meta.active_tool_groups.clone(),
@@ -1083,7 +1083,7 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 created_at: 1000,
-                message_count: 3,
+                turn_count: 3,
                 max_turns: None,
                 status: SessionStatus::Inactive,
                 active_tool_groups: vec!["core".into()],
@@ -1125,7 +1125,7 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 created_at: 1000,
-                message_count: 0,
+                turn_count: 0,
                 max_turns: None,
                 status: SessionStatus::Inactive,
                 active_tool_groups: vec!["core".into()],
@@ -1142,7 +1142,7 @@ mod tests {
             parent_session_id: None,
             working_dir: None,
             created_at: 2000,
-            message_count: 5,
+            turn_count: 5,
             max_turns: None,
             status: SessionStatus::Inference,
             active_tool_groups: vec!["core".into(), "git".into()],
@@ -1158,7 +1158,7 @@ mod tests {
         let stored = state.session_metadata.get(&1).unwrap();
         assert_eq!(stored.title.as_deref(), Some("updated"));
         assert_eq!(stored.selected_model.as_deref(), Some("gpt-4"));
-        assert_eq!(stored.message_count, 5);
+        assert_eq!(stored.turn_count, 5);
         assert_eq!(stored.status, SessionStatus::Inference);
     }
 
@@ -1314,7 +1314,7 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 created_at: 1000,
-                message_count: 0,
+                turn_count: 0,
                 max_turns: None,
                 status: SessionStatus::Sleeping,
                 active_tool_groups: vec![],

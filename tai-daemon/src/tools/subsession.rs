@@ -1,14 +1,8 @@
-use crate::daemon::DaemonCommand;
-use crate::tools::context::ToolContext;
 use crate::tools::{Tool, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc;
-use std::sync::mpsc::RecvTimeoutError;
-use std::time::Duration;
-use tai_proto::{SessionMessage, SessionMessageKind};
+use tai_keystore::ServiceCredential;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SpawnSubsessionArgs {
@@ -42,93 +36,14 @@ impl Tool for SpawnSubsession {
 
     fn execute(
         &self,
-        args: Self::Args,
-        _x_credentials: Option<&tai_keystore::ServiceCredential>,
-        working_dir: Option<&Path>,
-        ctx: Option<&ToolContext>,
+        _args: Self::Args,
+        _x_credentials: Option<&ServiceCredential>,
+        _working_dir: Option<&Path>,
+        _ctx: Option<&crate::tools::context::ToolContext>,
     ) -> Result<String, ToolError> {
-        let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
-
-        // Determine child working_dir: prefer tool-level parameter, fall back to session context
-        let child_working_dir = working_dir
-            .or(ctx.working_dir.as_deref())
-            .map(|p| p.to_path_buf());
-
-        // Inherit or override tool groups
-        let categories = args
-            .categories
-            .unwrap_or_else(|| ctx.active_tool_groups.iter().cloned().collect());
-
-        // Create child session via the daemon command loop
-        let (reply_tx, reply_rx) = mpsc::channel();
-        ctx.daemon_tx
-            .send(DaemonCommand::CreateSession {
-                title: args.title,
-                parent_session_id: Some(ctx.session_id),
-                working_dir: child_working_dir.clone(),
-                max_turns: args.max_turns,
-                reasoning_effort: ctx.reasoning_effort,
-                selected_model: ctx.selected_model.clone(),
-                context_config: None,
-                account_name: None,
-                active_tool_groups: categories,
-                reply: reply_tx,
-            })
-            .map_err(|e| ToolError::Other(format!("daemon communication failed: {e}")))?;
-
-        let (child_id, child_tx) = match reply_rx.recv() {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => {
-                return Err(ToolError::Other(format!(
-                    "failed to create sub-session: {e}"
-                )));
-            }
-            Err(_) => return Err(ToolError::Other("daemon disconnected".into())),
-        };
-
-        // Push the prompt as the child's first message
-        let _ = child_tx.send(crate::sessions::SessionCommand::AppendMessage {
-            message: SessionMessage::now(SessionMessageKind::SystemText {
-                content: args.prompt,
-            }),
-        });
-
-        // Run the child session and wait for its result.
-        // Poll the parent cancellation flag every 200ms so we can abort
-        // early when the parent session is cancelled.
-        let (result_tx, result_rx) = mpsc::channel();
-        let _ = child_tx.send(crate::sessions::SessionCommand::RunChildInput {
-            request_id: 1,
-            reply: result_tx,
-        });
-
-        let check_interval = Duration::from_millis(200);
-        loop {
-            if ctx.cancelled.load(Ordering::Relaxed) {
-                let _ = child_tx.send(crate::sessions::SessionCommand::Cancel { request_id: 1 });
-                // Brief drain so the child can clean up its resources.
-                let _ = result_rx.recv_timeout(Duration::from_secs(5)).ok();
-                return Err(ToolError::Other("parent session cancelled".into()));
-            }
-
-            match result_rx.recv_timeout(check_interval) {
-                Ok(Ok(child_result)) => {
-                    return Ok(format!(
-                        "sub-session {child_id} result:\n{}",
-                        child_result.output
-                    ));
-                }
-                Ok(Err(e)) => {
-                    return Err(ToolError::Other(format!("child session error: {e}")));
-                }
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(ToolError::Other(format!(
-                        "sub-session {child_id} exited unexpectedly"
-                    )));
-                }
-            }
-        }
+        Err(ToolError::Other(
+            "spawn_subsession is not yet implemented in the turn-based refactor".into(),
+        ))
     }
 }
 

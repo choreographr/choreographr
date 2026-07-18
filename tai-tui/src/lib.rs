@@ -3,9 +3,7 @@ use ratatui::layout::Size;
 use ratatui_image::{Resize, picker::Picker, protocol::StatefulProtocol};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-pub use tai_client_core::{
-    ClientError, ImageAssembler, ShellCommand, StreamingText, parse_input_line,
-};
+pub use tai_client_core::{ClientError, ShellCommand, parse_input_line};
 pub use tai_markdown::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 use tai_proto::ImageMetadata;
 

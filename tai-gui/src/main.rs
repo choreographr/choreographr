@@ -94,19 +94,22 @@ fn App() -> Element {
                                 apply_daemon_message(&mut app_state, message, tx.clone())
                             };
                             if let Err(error) = result {
-                                state.write().client.push_text(format!(
+                                state.write().status_texts.push(format!(
                                     "[client] failed to process daemon message: {error}"
                                 ));
                             }
                         }
                         UiEvent::ReaderClosed => {
-                            state.write().client.push_text("daemon connection closed");
+                            state
+                                .write()
+                                .status_texts
+                                .push("daemon connection closed".to_string());
                         }
                         UiEvent::ReaderFailed(error) => {
                             state
                                 .write()
-                                .client
-                                .push_text(format!("[client] connection error: {error}"));
+                                .status_texts
+                                .push(format!("[client] connection error: {error}"));
                         }
                     }
                 }

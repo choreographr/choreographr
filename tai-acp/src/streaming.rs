@@ -78,16 +78,11 @@ pub fn translate_message(
         }
 
         // ------------------------------------------------------------------
-        // Tool output / result chunks → progress updates while the tool
-        // is running.  Both `ToolCallOutput` and `ToolResultChunk` carry
-        // opaque byte data that we surface as text.
+        // Tool result chunks → progress updates while the tool is running.
+        // The old `ToolCallOutput` variant has been removed; `ToolResultChunk`
+        // carries the opaque byte data that we surface as text.
         // ------------------------------------------------------------------
-        DaemonMessage::ToolCallOutput {
-            request_id: _,
-            call_id,
-            data,
-        }
-        | DaemonMessage::ToolResultChunk {
+        DaemonMessage::ToolResultChunk {
             request_id: _,
             call_id,
             data,
@@ -241,15 +236,6 @@ mod tests {
             call_id: call_id.into(),
             tool_name: tool_name.into(),
             arguments_json: args.into(),
-            message_id: 1,
-        }
-    }
-
-    fn tool_call_output(call_id: &str, data: &str) -> DaemonMessage {
-        DaemonMessage::ToolCallOutput {
-            request_id: 1,
-            call_id: call_id.into(),
-            data: data.as_bytes().to_vec(),
         }
     }
 
@@ -344,8 +330,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_output_translates_to_tool_call_update() {
-        let msg = tool_call_output("call_1", "progress data");
+    fn tool_result_chunk_translates_to_tool_call_update() {
+        let msg = tool_result_chunk("call_1", "progress data");
         let result = translate_message(&msg, &sess()).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0].variant {
@@ -363,13 +349,18 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_chunk_is_same_as_tool_call_output() {
+    fn tool_result_chunk_content_text() {
         let msg = tool_result_chunk("call_1", "result data");
         let result = translate_message(&msg, &sess()).unwrap();
-        assert_eq!(result.len(), 1);
         match &result[0].variant {
-            SessionUpdateVariant::ToolCallUpdate { status, .. } => {
-                assert_eq!(status, "running");
+            SessionUpdateVariant::ToolCallUpdate { content, .. } => {
+                let blocks = content.as_ref().unwrap();
+                assert_eq!(blocks.len(), 1);
+                if let ContentBlock::Text { text } = &blocks[0] {
+                    assert_eq!(text, "result data");
+                } else {
+                    panic!("expected Text block");
+                }
             }
             other => panic!("expected ToolCallUpdate, got {other:?}"),
         }

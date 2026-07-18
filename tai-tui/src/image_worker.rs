@@ -216,7 +216,6 @@ mod tests {
     fn decode_image_accepts_svg() {
         let svg = br#"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='red'/></svg>"#;
         let metadata = ImageMetadata {
-            image_id: 1,
             mime_type: "image/svg+xml".to_string(),
             width: 4,
             height: 3,
@@ -230,7 +229,6 @@ mod tests {
     #[test]
     fn decode_image_rejects_invalid_raster_bytes() {
         let metadata = ImageMetadata {
-            image_id: 1,
             mime_type: "image/png".to_string(),
             width: 1,
             height: 1,
@@ -259,7 +257,6 @@ mod tests {
                 id: 42,
                 data: Arc::from(svg.to_vec()),
                 metadata: ImageMetadata {
-                    image_id: 1,
                     mime_type: "image/svg+xml".to_string(),
                     width: 4,
                     height: 3,
@@ -297,7 +294,6 @@ mod tests {
                 id: 99,
                 data: Arc::from(vec![1, 2, 3]),
                 metadata: ImageMetadata {
-                    image_id: 1,
                     mime_type: "image/png".to_string(),
                     width: 1,
                     height: 1,

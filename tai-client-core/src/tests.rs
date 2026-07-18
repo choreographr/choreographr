@@ -1,5 +1,5 @@
 use super::*;
-use tai_proto::{ClientMessage, ImageMetadata, OutputStream, ThinkingEffort};
+use tai_proto::{ClientMessage, ThinkingEffort};
 
 #[test]
 fn parses_empty_line() {
@@ -75,16 +75,6 @@ fn parses_unlock_with_spaced_passphrase() {
         }
     );
     assert_eq!(next, 3);
-}
-
-#[test]
-fn parses_test_image_command() {
-    let mut next = 10;
-    assert_eq!(
-        parse_input_line("/image", &mut next, None),
-        ShellCommand::Send(ClientMessage::TestImage { request_id: 10 })
-    );
-    assert_eq!(next, 11);
 }
 
 #[test]
@@ -441,39 +431,6 @@ fn parses_run_input_and_increments_request_id() {
         })
     );
     assert_eq!(next, 11);
-}
-
-#[test]
-fn streaming_text_appends_to_matching_stream() {
-    let mut entry = StreamingText::new(7);
-    entry.append(OutputStream::Reasoning, "thinking");
-    entry.append(OutputStream::Answer, "hello");
-    entry.append(OutputStream::Answer, " world");
-
-    assert_eq!(entry.request_id, 7);
-    assert_eq!(entry.reasoning, "thinking");
-    assert_eq!(entry.answer, "hello world");
-}
-
-#[test]
-fn image_assembler_tracks_lifecycle() {
-    let mut assembler = ImageAssembler::new();
-    let metadata = ImageMetadata {
-        image_id: 11,
-        mime_type: "image/png".to_string(),
-        width: 1,
-        height: 1,
-        byte_len: 4,
-        alt: Some("tiny".to_string()),
-    };
-
-    assembler.start(7, metadata.clone()).expect("start");
-    assembler.push_chunk(7, 11, &[1, 2]).expect("chunk1");
-    assembler.push_chunk(7, 11, &[3, 4]).expect("chunk2");
-    let (actual_metadata, data) = assembler.finish(7, 11).expect("finish");
-
-    assert_eq!(actual_metadata, metadata);
-    assert_eq!(data, vec![1, 2, 3, 4]);
 }
 
 // ── Account sub-commands ──────────────────────────────────────────────────

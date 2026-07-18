@@ -53,16 +53,16 @@ pub(crate) fn handle_shell_command(
     match command {
         ShellCommand::Empty => {}
         ShellCommand::InvalidCancel(value) => state
-            .client
-            .push_text(format!("invalid request id: {value}")),
-        ShellCommand::UnknownCommand(error) => state.client.push_text(error),
+            .status_texts
+            .push(format!("invalid request id: {value}")),
+        ShellCommand::UnknownCommand(error) => state.status_texts.push(error),
         ShellCommand::Send(message) => send_client_message(state, daemon_tx, message),
         ShellCommand::Unlock { method } => match resolve_private_key(&method) {
             Ok(private_key) => {
                 send_client_message(state, daemon_tx, ClientMessage::Unlock { private_key });
             }
             Err(e) => {
-                state.client.push_text(format!("[error] {e}"));
+                state.status_texts.push(format!("[error] {e}"));
             }
         },
         ShellCommand::AddCredential {
@@ -72,7 +72,7 @@ pub(crate) fn handle_shell_command(
             unlock,
         } => match build_add_credential_message(service, credential_type, fields, unlock) {
             Ok(msg) => send_client_message(state, daemon_tx, msg),
-            Err(e) => state.client.push_text(format!("[error] {e}")),
+            Err(e) => state.status_texts.push(format!("[error] {e}")),
         },
         ShellCommand::RemoveCredential { service } => {
             send_client_message(
@@ -96,18 +96,20 @@ pub(crate) fn send_client_message(
     message: ClientMessage,
 ) {
     let Some(sender) = daemon_tx else {
-        state.client.push_text("[client] not connected");
+        state
+            .status_texts
+            .push("[client] not connected".to_string());
         return;
     };
 
     if let Some(echo) = shell_command_echo(&ShellCommand::Send(message.clone())) {
-        state.client.push_text(echo);
+        state.status_texts.push(echo);
     }
 
     if let Err(error) = sender.send(message) {
         state
-            .client
-            .push_text(format!("[client] failed to send command: {error}"));
+            .status_texts
+            .push(format!("[client] failed to send command: {error}"));
     }
 }
 
@@ -131,11 +133,11 @@ fn handle_session_message(
         }
         DaemonMessage::Sessions { sessions } => {
             if sessions.is_empty() {
-                state.client.push_text("[daemon] no sessions");
+                state.status_texts.push("[daemon] no sessions".to_string());
             } else {
                 state
-                    .client
-                    .push_text(format!("[daemon] sessions ({})", sessions.len()));
+                    .status_texts
+                    .push(format!("[daemon] sessions ({})", sessions.len()));
                 for session in sessions {
                     let prefix = if Some(session.session_id) == state.attached_session_id {
                         "*"
@@ -144,9 +146,9 @@ fn handle_session_message(
                     };
                     let title = session.title.as_deref().unwrap_or("untitled");
                     let model = session.selected_model.as_deref().unwrap_or("-");
-                    state.client.push_text(format!(
-                        "{} {}: \"{title}\" ({model}) — {} messages",
-                        prefix, session.session_id, session.message_count,
+                    state.status_texts.push(format!(
+                        "{} {}: \"{title}\" ({model}) — {} turns",
+                        prefix, session.session_id, session.turn_count,
                     ));
                 }
             }
@@ -189,6 +191,6 @@ pub(crate) fn apply_daemon_message(
         return Ok(());
     }
 
-    dispatch_daemon_message(state, message)?;
+    dispatch_daemon_message(&message, state);
     Ok(())
 }

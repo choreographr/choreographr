@@ -1,19 +1,18 @@
-use crate::context;
 use crate::daemon::DaemonCommand;
-use crate::db::{self, SessionRecord, write_message_retry, write_session_retry};
+use crate::db::{self, SessionRecord, write_session_retry, write_turn_retry};
 use crate::providers::{
     InferenceProvider, ReasoningSupport, effective_reasoning_support, lookup_provider,
 };
 use crate::requests::run_agent_loop;
 use crate::tools::ToolRegistry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tai_proto::{
-    ContextConfig, DaemonMessage, SessionMessage, SessionMessageKind, SessionStatus,
-    SessionSummary, ThinkingEffort, TimestampMs, TokenUsage,
+    AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, SessionStatus,
+    SessionSummary, ThinkingEffort, TimestampMs, TokenUsage, ToolResultRecord, Turn,
 };
 use tracing::{debug, error, info, warn};
 
@@ -42,9 +41,6 @@ pub enum SessionCommand {
     },
     GetSummary {
         reply: std::sync::mpsc::Sender<SessionSummary>,
-    },
-    AppendMessage {
-        message: SessionMessage,
     },
     RequestFinished {
         request_id: u32,
@@ -99,7 +95,7 @@ pub struct SessionMetadata {
     pub parent_session_id: Option<u64>,
     pub working_dir: Option<String>,
     pub created_at: i64,
-    pub message_count: u32,
+    pub turn_count: u32,
     pub max_turns: Option<u32>,
     pub status: SessionStatus,
     pub active_tool_groups: Vec<String>,
@@ -114,8 +110,6 @@ pub struct SessionMetadata {
 /// override if needed (e.g. `AttachSession` sets `Inactive`).
 impl From<SessionRecord> for SessionMetadata {
     fn from(record: SessionRecord) -> Self {
-        // Build a SessionConfig from the record, then delegate to the
-        // From<&SessionConfig> impl to avoid duplicating field mappings.
         let config = SessionConfig {
             title: record.title,
             selected_model: record.selected_model,
@@ -124,9 +118,6 @@ impl From<SessionRecord> for SessionMetadata {
             working_dir: record.working_dir.map(PathBuf::from),
             max_turns: record.max_turns,
             created_at: record.created_at,
-            context_fingerprint: None,
-            context_file_paths: Vec::new(),
-            context_message_index: None,
             status: SessionStatus::Sleeping,
             active_tool_groups: record.active_tool_groups.into_iter().collect(),
             context_config: record.context_config,
@@ -136,9 +127,7 @@ impl From<SessionRecord> for SessionMetadata {
             last_prompt_tokens: record.last_prompt_tokens,
         };
         let mut meta = SessionMetadata::from(&config);
-        // message_count is a runtime field not stored in SessionConfig,
-        // so patch it from the record after the delegate conversion.
-        meta.message_count = record.message_count;
+        meta.turn_count = record.turn_count;
         meta
     }
 }
@@ -153,7 +142,7 @@ impl From<SessionMetadata> for SessionRecord {
             parent_session_id: meta.parent_session_id,
             working_dir: meta.working_dir,
             max_turns: meta.max_turns,
-            message_count: meta.message_count,
+            turn_count: meta.turn_count,
             created_at: meta.created_at,
             active_tool_groups: meta.active_tool_groups,
             context_config: ContextConfig::default(),
@@ -169,13 +158,12 @@ impl From<SessionMetadata> for SessionRecord {
 /// in-memory index or for sending through the command channel.
 ///
 /// Fields that don't exist in [`SessionMetadata`] (subscribers, active
-/// requests, message contents, etc.) are dropped. The `PathBuf` working_dir is
+/// requests, turn contents, etc.) are dropped. The `PathBuf` working_dir is
 /// stringified.
 impl From<&SessionState> for SessionMetadata {
     fn from(state: &SessionState) -> Self {
-        // Build from SessionConfig first, then patch in the live message count.
         let mut meta = SessionMetadata::from(&state.config);
-        meta.message_count = state.messages.len() as u32;
+        meta.turn_count = state.turns.len() as u32;
         meta
     }
 }
@@ -192,9 +180,6 @@ pub struct SessionConfig {
     pub working_dir: Option<PathBuf>,
     pub max_turns: Option<u32>,
     pub created_at: i64,
-    pub context_fingerprint: Option<u64>,
-    pub context_file_paths: Vec<PathBuf>,
-    pub context_message_index: Option<usize>,
     pub status: SessionStatus,
     pub active_tool_groups: HashSet<String>,
     pub context_config: ContextConfig,
@@ -214,9 +199,6 @@ impl Default for SessionConfig {
             working_dir: None,
             max_turns: None,
             created_at: 0,
-            context_fingerprint: None,
-            context_file_paths: Vec::new(),
-            context_message_index: None,
             status: SessionStatus::Inactive,
             active_tool_groups: HashSet::new(),
             context_config: ContextConfig::default(),
@@ -240,7 +222,7 @@ impl From<&SessionConfig> for SessionMetadata {
             parent_session_id: config.parent_session_id,
             working_dir: config.working_dir.as_ref().map(|p| p.display().to_string()),
             created_at: config.created_at,
-            message_count: 0,
+            turn_count: 0,
             max_turns: config.max_turns,
             status: config.status.clone(),
             active_tool_groups: config.active_tool_groups.iter().cloned().collect(),
@@ -268,7 +250,7 @@ impl From<&SessionState> for SessionRecord {
 #[derive(Clone)]
 pub struct SessionSnapshot {
     pub config: SessionConfig,
-    pub messages: Vec<SessionMessage>,
+    pub turns: BTreeMap<u32, Turn>,
 }
 
 pub(crate) struct ActiveRequest {
@@ -282,9 +264,9 @@ pub struct ActiveSessionEntry {
 
 pub struct SessionState {
     pub config: SessionConfig,
-    pub next_message_id: u32,
-    last_undo_ids: Option<Vec<u32>>,
-    messages: Vec<SessionMessage>,
+    pub next_turn_id: u32,
+    last_undo_turn_ids: Option<Vec<u32>>,
+    pub turns: BTreeMap<u32, Turn>,
     subscribers: HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
     pub(crate) active_requests: HashMap<u32, ActiveRequest>,
     pub provider: Option<InferenceProvider>,
@@ -313,7 +295,7 @@ impl SessionState {
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             config: self.config.clone(),
-            messages: self.messages.clone(),
+            turns: self.turns.clone(),
         }
     }
 
@@ -321,167 +303,132 @@ impl SessionState {
         snapshot: SessionSnapshot,
         subscribers: HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
     ) -> Self {
-        let msg_count = snapshot.messages.len() as u32;
+        let turn_count = snapshot.turns.len() as u32;
         Self {
             config: snapshot.config,
-            next_message_id: msg_count,
-            last_undo_ids: None,
-            messages: snapshot.messages,
+            next_turn_id: turn_count,
+            last_undo_turn_ids: None,
+            turns: snapshot.turns,
             subscribers,
             active_requests: HashMap::new(),
             provider: None,
         }
     }
 
-    /// Read-only access to messages.
-    pub fn messages(&self) -> &[SessionMessage] {
-        &self.messages
-    }
-
-    /// Number of messages (convenience).
-    pub fn num_messages(&self) -> usize {
-        self.messages.len()
-    }
-
-    /// Append a message and return its index.
-    pub fn push_message(&mut self, msg: SessionMessage) -> u32 {
-        let idx = self.messages.len() as u32;
-        self.messages.push(msg);
-        idx
-    }
-
-    /// Replace a message at a given index (used for context refresh).
-    pub fn set_message(&mut self, idx: usize, msg: SessionMessage) {
-        self.messages[idx] = msg;
-    }
-
-    /// Find the parent message that a new message of this `kind` should link
-    /// to.  The parent is the most recent non-deleted ancestor in the
-    /// conversation tree: UserText for assistant messages, the originating
-    /// AssistantToolUse for tool results and displayed images.
-    fn resolve_parent_id(&self, kind: &SessionMessageKind) -> Option<u32> {
-        match kind {
-            SessionMessageKind::SystemText { .. } | SessionMessageKind::UserText { .. } => None,
-            SessionMessageKind::AssistantText { .. }
-            | SessionMessageKind::AssistantToolUse { .. } => {
-                self.messages.iter().rev().find_map(|m| {
-                    if !m.deleted && matches!(m.kind, SessionMessageKind::UserText { .. }) {
-                        Some(m.message_id)
-                    } else {
-                        None
-                    }
-                })
-            }
-            SessionMessageKind::ToolResult { call_id, .. } => {
-                self.messages.iter().rev().find_map(|m| {
-                    if !m.deleted
-                        && let SessionMessageKind::AssistantToolUse { tool_calls, .. } = &m.kind
-                        && tool_calls.iter().any(|tc| tc.call_id == *call_id)
-                    {
-                        Some(m.message_id)
-                    } else {
-                        None
-                    }
-                })
-            }
-            SessionMessageKind::DisplayedImage(record) => {
-                if let Some(call_id) = &record.tool_call_id {
-                    self.messages.iter().rev().find_map(|m| {
-                        if !m.deleted
-                            && let SessionMessageKind::AssistantToolUse { tool_calls, .. } = &m.kind
-                            && tool_calls.iter().any(|tc| tc.call_id == *call_id)
-                        {
-                            Some(m.message_id)
-                        } else {
-                            None
-                        }
-                    })
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// Push a message with a monotonically increasing id and resolved parent.
-    /// Returns the assigned `message_id` and the message so callers can
-    /// persist and broadcast without re-indexing into `self.messages`.
-    ///
-    /// Appending a `UserText` resets the redo stack — new user input after
-    /// an undo starts a fresh editing session.
-    pub fn append_message(&mut self, kind: SessionMessageKind) -> (u32, SessionMessage) {
+    /// Start a new turn, returning its turn_id.
+    /// If the turn has user text, the redo stack is cleared.
+    pub fn start_turn(&mut self, user_text: Option<String>) -> (u32, Turn) {
         // New user input after an undo clears the redo opportunity.
-        if matches!(&kind, SessionMessageKind::UserText { .. }) {
-            self.last_undo_ids = None;
+        if user_text.is_some() {
+            self.last_undo_turn_ids = None;
         }
-        let parent_id = self.resolve_parent_id(&kind);
-        let id = self.next_message_id;
-        self.next_message_id += 1;
-        let msg = SessionMessage {
-            message_id: id,
-            parent_id,
+        let turn_id = self.next_turn_id;
+        self.next_turn_id += 1;
+        let turn = Turn {
             created_at: TimestampMs::now(),
-            kind,
-            deleted: false,
+            undone: false,
+            error: None,
+            user_text,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: Vec::new(),
+            token_usage: None,
+            tool_results: Vec::new(),
+            displayed_images: Vec::new(),
         };
-        self.messages.push(msg.clone());
-        (id, msg)
+        self.turns.insert(turn_id, turn.clone());
+        (turn_id, turn)
     }
 
-    /// Push a message at a caller-specified id, used to keep ToolResult ids in
-    /// sync with the `ToolCallStarted` predictions that clients already received.
-    /// Returns the message so callers can persist without re-indexing.
-    pub fn append_message_with_id(&mut self, kind: SessionMessageKind, id: u32) -> SessionMessage {
-        let parent_id = self.resolve_parent_id(&kind);
-        let msg = SessionMessage {
-            message_id: id,
-            parent_id,
-            created_at: TimestampMs::now(),
-            kind,
-            deleted: false,
-        };
-        self.messages.push(msg.clone());
-        self.next_message_id = self.next_message_id.max(id + 1);
-        msg
+    /// Set the assistant response on a turn (text or tool-use).
+    pub fn set_assistant_response(
+        &mut self,
+        turn_id: u32,
+        text: Option<String>,
+        reasoning: Option<String>,
+        tool_calls: Vec<AssistantToolCallRecord>,
+        token_usage: Option<TokenUsage>,
+    ) {
+        if let Some(turn) = self.turns.get_mut(&turn_id) {
+            turn.assistant_text = text;
+            turn.assistant_reasoning = reasoning;
+            turn.tool_calls = tool_calls;
+            turn.token_usage = token_usage;
+        }
     }
 
-    /// Undo the most recent user turn: mark the subtree as deleted and record
-    /// which message IDs were removed so that `/redo` can restore exactly them.
-    /// Uses a HashSet for O(1) membership checks instead of O(n) per ID.
-    pub fn undo(&mut self) -> Option<Vec<u32>> {
-        let user_idx = self
-            .messages
+    /// Add a tool result to a turn.
+    pub fn add_tool_result(
+        &mut self,
+        turn_id: u32,
+        call_id: String,
+        name: String,
+        content: String,
+        is_error: bool,
+    ) {
+        if let Some(turn) = self.turns.get_mut(&turn_id) {
+            turn.tool_results.push(ToolResultRecord {
+                call_id,
+                name,
+                content,
+                is_error,
+            });
+        }
+    }
+
+    /// Add a displayed image to a turn.
+    pub fn add_displayed_image(&mut self, turn_id: u32, record: DisplayedImageRecord) {
+        if let Some(turn) = self.turns.get_mut(&turn_id) {
+            turn.displayed_images.push(record);
+        }
+    }
+
+    /// Set an error on a turn.
+    pub fn set_turn_error(&mut self, turn_id: u32, error: String) {
+        if let Some(turn) = self.turns.get_mut(&turn_id) {
+            turn.error = Some(error);
+        }
+    }
+
+    /// Finalize a turn and persist it to the database.
+    /// Returns an error if persistence fails after all retries.
+    pub fn finalize_turn(&mut self, db: &redb::Database, turn_id: u32) -> io::Result<()> {
+        if let Some(turn) = self.turns.get(&turn_id) {
+            write_turn_retry(db, 0, turn_id, turn)
+                .map_err(|e| io::Error::other(format!("failed to persist turn {turn_id}: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Undo the most recent user-initiated turns: find the most recent
+    /// non-undone turn with `user_text: Some(...)`, mark it and all
+    /// higher-id turns as `undone = true`, store turn_ids for redo.
+    pub fn undo_turns(&mut self) -> Option<Vec<u32>> {
+        let target = self
+            .turns
             .iter()
-            .rposition(|m| !m.deleted && matches!(m.kind, SessionMessageKind::UserText { .. }))?;
-        let root_id = self.messages[user_idx].message_id;
-        // Build the children map once and reuse across traversal so we don't
-        // scan all messages again inside collect_subtree.
-        let children = build_children_map(&self.messages);
-        let ids = collect_subtree(&children, root_id);
-        // One pass through messages + O(1) set lookups beats O(n) per ID.
-        let delete_set: HashSet<u32> = ids.iter().copied().collect();
-        for msg in self.messages.iter_mut() {
-            if delete_set.contains(&msg.message_id) {
-                msg.deleted = true;
+            .rev()
+            .find(|(_, t)| !t.undone && t.user_text.is_some())
+            .map(|(&id, _)| id)?;
+        let to_undo: Vec<u32> = self.turns.range(target..).map(|(&id, _)| id).collect();
+        for &id in &to_undo {
+            if let Some(turn) = self.turns.get_mut(&id) {
+                turn.undone = true;
             }
         }
-        self.last_undo_ids = Some(ids.clone());
-        Some(ids)
+        self.last_undo_turn_ids = Some(to_undo.clone());
+        Some(to_undo)
     }
 
-    /// Redo the most recent `/undo`, restoring exactly the message IDs that
-    /// were removed.  Returns `None` if there is nothing to redo (either no
-    /// prior undo, or a new UserText was appended after the undo).
-    pub fn redo(&mut self) -> Option<Vec<SessionMessage>> {
-        let ids = self.last_undo_ids.take()?;
-        // One pass through messages + O(1) set lookups beats O(n) per ID.
-        let redo_set: HashSet<u32> = ids.iter().copied().collect();
-        let mut restored = Vec::new();
-        for msg in self.messages.iter_mut() {
-            if redo_set.contains(&msg.message_id) {
-                msg.deleted = false;
-                restored.push(msg.clone());
+    /// Redo the most recent `/undo`, restoring exactly the turns that
+    /// were marked as undone.
+    pub fn redo_turns(&mut self) -> Option<BTreeMap<u32, Turn>> {
+        let ids = self.last_undo_turn_ids.take()?;
+        let mut restored = BTreeMap::new();
+        for &id in &ids {
+            if let Some(turn) = self.turns.get_mut(&id) {
+                turn.undone = false;
+                restored.insert(id, turn.clone());
             }
         }
         Some(restored)
@@ -491,43 +438,14 @@ impl SessionState {
     pub fn empty() -> Self {
         Self {
             config: SessionConfig::default(),
-            next_message_id: 0,
-            last_undo_ids: None,
-            messages: Vec::new(),
+            next_turn_id: 0,
+            last_undo_turn_ids: None,
+            turns: BTreeMap::new(),
             subscribers: HashMap::new(),
             active_requests: HashMap::new(),
             provider: None,
         }
     }
-}
-
-/// Index the message list into a parent→children map so that
-/// subtree traversal (used by undo) is O(n) rather than O(n²).
-fn build_children_map(messages: &[SessionMessage]) -> HashMap<u32, Vec<u32>> {
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for msg in messages {
-        if let Some(pid) = msg.parent_id {
-            children.entry(pid).or_default().push(msg.message_id);
-        }
-    }
-    children
-}
-
-/// Walk the message tree breadth-first from `root_id` returning every
-/// descendant's message ID.  The caller supplies a pre-built adjacency
-/// map (from `build_children_map`) so that each edge is followed exactly
-/// once — O(n) overall.
-fn collect_subtree(children: &HashMap<u32, Vec<u32>>, root_id: u32) -> Vec<u32> {
-    let mut result = vec![root_id];
-    let mut i = 0;
-    while i < result.len() {
-        let pid = result[i];
-        if let Some(kids) = children.get(&pid) {
-            result.extend(kids);
-        }
-        i += 1;
-    }
-    result
 }
 
 fn broadcast(
@@ -564,7 +482,7 @@ fn fail_request(
         subscribers,
         DaemonMessage::Started {
             request_id,
-            message_id: 0,
+            turn_id: 0,
         },
     );
     broadcast(
@@ -602,9 +520,6 @@ pub fn session_main(
                     .unwrap_or_default()
                     .as_secs() as i64
             }),
-        context_fingerprint: None,
-        context_file_paths: Vec::new(),
-        context_message_index: None,
         status: SessionStatus::Inactive,
         active_tool_groups: init_record
             .as_ref()
@@ -636,40 +551,14 @@ pub fn session_main(
     // before a model was added to the catalog).
     state.resolve_context_window_if_missing(ctx.session_id);
 
-    match db::read_messages(&ctx.db, ctx.session_id) {
-        Ok(msgs) => {
-            state.messages = msgs;
-            state.next_message_id = state.messages.len() as u32;
-        }
-        Err(e) => warn!(ctx.session_id, error = %e, "failed to load messages from DB"),
-    }
-
-    if init_record.is_none() || state.messages.is_empty() {
-        let effective_working_dir = state
-            .config
-            .working_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
-        let skills = context::discover_skills(&effective_working_dir);
-        let base_prompt = context::build_base_prompt(&skills, &ctx.tool_registry.groups());
-        let (id0, msg0) = state.append_message(SessionMessageKind::SystemText {
-            content: base_prompt,
-        });
-        write_message_retry(&ctx.db, ctx.session_id, id0, &msg0).ok();
-
-        if let Ok(bundle) = context::discover_context(&effective_working_dir, &Default::default()) {
-            let context_str = context::assemble_context(&bundle);
-            if !context_str.is_empty() {
-                let (id1, msg1) = state.append_message(SessionMessageKind::SystemText {
-                    content: context_str,
-                });
-                write_message_retry(&ctx.db, ctx.session_id, id1, &msg1).ok();
-                state.config.context_fingerprint = Some(bundle.fingerprint);
-                state.config.context_file_paths =
-                    bundle.files.iter().map(|f| f.path.clone()).collect();
-                state.config.context_message_index = Some(1);
+    match db::read_turns(&ctx.db, ctx.session_id) {
+        Ok(turns) => {
+            for (turn_id, turn) in turns {
+                state.turns.insert(turn_id, turn);
+                state.next_turn_id = state.next_turn_id.max(turn_id + 1);
             }
         }
+        Err(e) => warn!(ctx.session_id, error = %e, "failed to load turns from DB"),
     }
 
     let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
@@ -711,7 +600,6 @@ fn process_command(
             handle_detach(client_id, state, shutdown_requested, ctx)
         }
         SessionCommand::GetSummary { reply } => handle_get_summary(reply, state, ctx),
-        SessionCommand::AppendMessage { message } => handle_append_message(message, state, ctx),
         SessionCommand::RequestFinished {
             request_id,
             snapshot,
@@ -813,20 +701,11 @@ fn handle_run_input(
         );
     }
 
-    let (msg_id, user_msg) = state.append_message(SessionMessageKind::UserText {
-        content: text.clone(),
-    });
-    write_message_retry(&ctx.db, ctx.session_id, msg_id, &user_msg).ok();
-    broadcast(
-        &mut state.subscribers,
-        DaemonMessage::SessionMessageAppended { message: user_msg },
-    );
-
     broadcast(
         &mut state.subscribers,
         DaemonMessage::Started {
             request_id,
-            message_id: state.next_message_id,
+            turn_id: state.next_turn_id,
         },
     );
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
@@ -839,6 +718,7 @@ fn handle_run_input(
     // session thread which holds the live subscriber set.
     let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
     let ctx = ctx.clone();
+    let user_text = Some(text);
     std::thread::spawn(move || {
         let _ = run_request_worker(
             request_id,
@@ -848,6 +728,7 @@ fn handle_run_input(
             cancel_rx,
             ctx,
             None,
+            user_text,
         );
     });
     false
@@ -855,9 +736,8 @@ fn handle_run_input(
 
 /// Run the agent loop on a pre-populated child session and return the result.
 ///
-/// The caller is responsible for injecting any prompt into the session via
-/// [`SessionCommand::AppendMessage`] before sending this command — this
-/// command only triggers the agent loop on whatever messages are already
+/// The caller is responsible for injecting any prompt into the session — this
+/// command only triggers the agent loop on whatever turns are already
 /// queued. The response is delivered through the `reply` channel.
 fn handle_run_child_input(
     request_id: u32,
@@ -885,7 +765,7 @@ fn handle_run_child_input(
         &mut state.subscribers,
         DaemonMessage::Started {
             request_id,
-            message_id: state.next_message_id,
+            turn_id: state.next_turn_id,
         },
     );
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
@@ -904,6 +784,7 @@ fn handle_run_child_input(
             cancel_rx,
             ctx,
             Some(reply),
+            None,
         );
         let _ = result;
     });
@@ -1046,7 +927,7 @@ fn handle_attach(
             .as_ref()
             .map(|p| p.display().to_string()),
         max_turns: state.config.max_turns,
-        messages: state.messages.clone(),
+        turns: state.turns.clone(),
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
         token_usage: Some(state.config.accumulated_usage),
         context_window: state.config.context_window,
@@ -1090,7 +971,7 @@ fn handle_get_summary(
             .as_ref()
             .map(|p| p.display().to_string()),
         created_at: state.config.created_at,
-        message_count: state.messages.len() as u32,
+        turn_count: state.turns.len() as u32,
         max_turns: state.config.max_turns,
         status: state.config.status.clone(),
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
@@ -1102,40 +983,7 @@ fn handle_get_summary(
     false
 }
 
-/// Persist an incoming message.
-///
-/// When the caller supplies a fully-formed `SessionMessage` (message_id != 0)
-/// its metadata — timestamps and ids from the ACP layer — are kept intact and
-/// only the parent_id is re-resolved into the live tree so that undo can
-/// navigate the parent→child chain.  Otherwise a fresh id is assigned.
-fn handle_append_message(
-    message: SessionMessage,
-    state: &mut SessionState,
-    ctx: &RequestContext,
-) -> bool {
-    // Use the caller-provided message_id if non-zero, otherwise assign one.
-    // This preserves caller metadata (e.g. timestamps from ACP) while still
-    // integrating with the daemon's message_id ordering scheme.
-    let msg = if message.message_id != 0 {
-        // Re-parent the caller-supplied message into the live tree so that
-        // undo can navigate the parent → child chain correctly.
-        let parent_id = state.resolve_parent_id(&message.kind);
-        let msg = SessionMessage {
-            parent_id,
-            ..message
-        };
-        state.messages.push(msg.clone());
-        state.next_message_id = state.next_message_id.max(msg.message_id + 1);
-        msg
-    } else {
-        let (_id, msg) = state.append_message(message.kind);
-        msg
-    };
-    write_message_retry(&ctx.db, ctx.session_id, msg.message_id, &msg).ok();
-    false
-}
-
-/// Apply the worker's snapshot (config only) and append any new messages.
+/// Apply the worker's snapshot (config only) and merge turn state.
 fn handle_request_finished(
     request_id: u32,
     snapshot: SessionSnapshot,
@@ -1143,60 +991,35 @@ fn handle_request_finished(
     shutdown_requested: &bool,
     ctx: &RequestContext,
 ) -> bool {
-    let pre_len = state.messages.len();
-
     // Apply config changes from worker (accumulated usage, etc.)
     state.config = snapshot.config;
 
-    // Refresh pre-existing messages that may have been updated by the worker
-    // (e.g. context refresh replacing a system message in-place)
-    for (idx, snap_msg) in snapshot.messages.iter().enumerate().take(pre_len) {
-        if idx < state.messages.len() && state.messages[idx] != *snap_msg {
-            state.messages[idx] = snap_msg.clone();
+    // Merge turns from the worker snapshot into the main session state.
+    for (&turn_id, turn) in &snapshot.turns {
+        let is_new = !state.turns.contains_key(&turn_id);
+        state.turns.insert(turn_id, turn.clone());
+        if is_new {
+            // For newly created turns, persist and broadcast the finalized turn.
+            if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, turn_id, turn) {
+                tracing::warn!(turn_id, error = %e, "failed to persist turn");
+            }
+            broadcast(
+                &mut state.subscribers,
+                DaemonMessage::TurnFinalized {
+                    turn_id,
+                    turn: turn.clone(),
+                },
+            );
+        } else if turn != state.turns.get(&turn_id).cloned().as_ref().unwrap_or(turn) {
+            // Turn was updated — persist the latest state.
+            if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, turn_id, turn) {
+                tracing::warn!(turn_id, error = %e, "failed to persist updated turn");
+            }
         }
     }
-
-    // Append new messages preserving the worker's message_ids so that
-    // the client's message_id-based ordering remains consistent with the
-    // ToolCallStarted predictions that were already broadcast.
-    let snapshot_msg_count = snapshot.messages.len();
-    if snapshot_msg_count < pre_len {
-        warn!(
-            session_id = ctx.session_id,
-            pre_len,
-            snapshot_msg_count,
-            "handle_request_finished: snapshot had fewer messages than expected",
-        );
-    }
-    for i in pre_len..snapshot_msg_count {
-        let msg = snapshot.messages[i].clone();
-        let id = msg.message_id;
-        if !matches!(msg.kind, SessionMessageKind::AssistantToolUse { .. }) {
-            write_message_retry(&ctx.db, ctx.session_id, id, &msg).ok();
-        }
-        state.messages.push(msg);
-        state.next_message_id = state.next_message_id.max(id + 1);
-    }
-
-    // Broadcast new messages to subscribers (skip DisplayedImage and
-    // AssistantToolUse — already broadcast mid-turn).
-    for i in pre_len..snapshot_msg_count {
-        if i >= state.messages.len() {
-            break;
-        }
-        let msg = &state.messages[i];
-        if matches!(
-            msg.kind,
-            SessionMessageKind::DisplayedImage(_) | SessionMessageKind::AssistantToolUse { .. }
-        ) {
-            continue;
-        }
-        broadcast(
-            &mut state.subscribers,
-            DaemonMessage::SessionMessageAppended {
-                message: msg.clone(),
-            },
-        );
+    // Advance next_turn_id past any turns from the snapshot.
+    if let Some(max_id) = snapshot.turns.keys().max() {
+        state.next_turn_id = state.next_turn_id.max(max_id + 1);
     }
 
     state.active_requests.remove(&request_id);
@@ -1346,7 +1169,7 @@ fn handle_get_reasoning_effort(
 /// Handle Undo: mark the most recent user turn's subtree as deleted.
 /// Uses a quick-reference HashMap to avoid an O(n) scan per ID.
 fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
-    let Some(message_ids) = state.undo() else {
+    let Some(turn_ids) = state.undo_turns() else {
         debug!(
             session_id = ctx.session_id,
             "undo requested but no user turn to undo",
@@ -1355,28 +1178,28 @@ fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     };
     info!(
         session_id = ctx.session_id,
-        msg_count = message_ids.len(),
-        "undo: marked subtree as deleted",
+        turn_count = turn_ids.len(),
+        "undo: marked turns as undone",
     );
-    // Build a single-pass index so persistence lookups are O(1) per ID.
-    let msg_map: HashMap<u32, &SessionMessage> =
-        state.messages.iter().map(|m| (m.message_id, m)).collect();
-    for &id in &message_ids {
-        if let Some(msg) = msg_map.get(&id) {
-            write_message_retry(&ctx.db, ctx.session_id, id, msg).ok();
+    // Persist the updated turns.
+    for &id in &turn_ids {
+        if let Some(turn) = state.turns.get(&id)
+            && let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, id, turn)
+        {
+            tracing::warn!(turn_id = id, error = %e, "failed to persist undone turn");
         }
     }
     broadcast(
         &mut state.subscribers,
-        DaemonMessage::SessionMessagesUndone { message_ids },
+        DaemonMessage::TurnsUndone { turn_ids },
     );
     false
 }
 
-/// Reinstate the subtree that was hidden by the preceding undo,
+/// Reinstate the turns that were hidden by the preceding undo,
 /// persisting the restored state so it survives daemon restart.
 fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
-    let Some(messages) = state.redo() else {
+    let Some(turns) = state.redo_turns() else {
         debug!(
             session_id = ctx.session_id,
             "redo requested but nothing to redo (no prior undo, or new input after undo)",
@@ -1385,16 +1208,15 @@ fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     };
     info!(
         session_id = ctx.session_id,
-        msg_count = messages.len(),
-        "redo: restored previously-undone messages",
+        turn_count = turns.len(),
+        "redo: restored previously-undone turns",
     );
-    for msg in &messages {
-        write_message_retry(&ctx.db, ctx.session_id, msg.message_id, msg).ok();
+    for (&id, turn) in &turns {
+        if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, id, turn) {
+            tracing::warn!(turn_id = id, error = %e, "failed to persist redone turn");
+        }
     }
-    broadcast(
-        &mut state.subscribers,
-        DaemonMessage::SessionMessagesRedone { messages },
-    );
+    broadcast(&mut state.subscribers, DaemonMessage::TurnsRedone { turns });
     false
 }
 
@@ -1420,11 +1242,14 @@ fn run_request_worker(
     cancel_rx: mpsc::Receiver<()>,
     ctx: RequestContext,
     child_reply: Option<mpsc::Sender<io::Result<ChildResult>>>,
+    user_text: Option<String>,
 ) -> io::Result<()> {
     let request_start = std::time::Instant::now();
     let initial_snapshot = session.snapshot();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_agent_loop(&client, session, &model, request_id, &cancel_rx, &ctx)
+        run_agent_loop(
+            &client, session, &model, request_id, &cancel_rx, &ctx, user_text,
+        )
     }));
 
     let (outcome, snapshot) = match result {
@@ -1487,12 +1312,9 @@ fn run_request_worker(
         let child_result = match &outcome {
             RequestOutcome::Done => {
                 let output = session
-                    .messages
-                    .iter()
-                    .filter_map(|m| match &m.kind {
-                        SessionMessageKind::AssistantText { content, .. } => Some(content.clone()),
-                        _ => None,
-                    })
+                    .turns
+                    .values()
+                    .filter_map(|t| t.assistant_text.clone())
                     .collect::<Vec<_>>()
                     .join("\n");
                 Ok(ChildResult {
@@ -1544,36 +1366,29 @@ fn persist_and_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::SessionRecord;
     use crate::server::connection::SUBSCRIBER_CHANNEL_CAPACITY;
     use crate::tools::ToolRegistry;
     use std::collections::HashMap;
-    use tai_proto::{
-        AssistantToolCallRecord, DisplayedImageRecord, ImageMetadata, OutputStream, SessionMessage,
-        SessionStatus,
-    };
+    use tai_proto::SessionStatus;
     use tempfile::tempdir;
 
-    fn test_record() -> SessionRecord {
-        SessionRecord {
-            title: Some("test session".into()),
-            selected_model: Some("gpt-4".into()),
-            reasoning_effort: None,
-            parent_session_id: None,
-            working_dir: Some("/tmp".into()),
-            max_turns: Some(10),
-            message_count: 3,
-            created_at: 1000,
-            active_tool_groups: vec!["core".into(), "shell".into()],
-            context_config: ContextConfig::default(),
-            account_name: None,
-            accumulated_usage: TokenUsage::default(),
-            context_window: None,
-            last_prompt_tokens: None,
-        }
-    }
-
     fn test_state() -> SessionState {
+        let mut turns = BTreeMap::new();
+        turns.insert(
+            0,
+            Turn {
+                created_at: TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("hello".into()),
+                assistant_text: Some("hi".into()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                token_usage: None,
+                tool_results: Vec::new(),
+                displayed_images: Vec::new(),
+            },
+        );
         SessionState {
             config: SessionConfig {
                 title: Some("test session".into()),
@@ -1583,9 +1398,6 @@ mod tests {
                 working_dir: Some(std::path::PathBuf::from("/tmp")),
                 max_turns: Some(10),
                 created_at: 1000,
-                context_fingerprint: None,
-                context_file_paths: Vec::new(),
-                context_message_index: None,
                 status: SessionStatus::Inactive,
                 active_tool_groups: ["core".into(), "shell".into()].into(),
                 context_config: ContextConfig::default(),
@@ -1594,126 +1406,15 @@ mod tests {
                 context_window: None,
                 last_prompt_tokens: None,
             },
-            next_message_id: 3,
-            messages: vec![
-                SessionMessage::now(SessionMessageKind::SystemText {
-                    content: "prompt".into(),
-                }),
-                SessionMessage::now(SessionMessageKind::UserText {
-                    content: "hello".into(),
-                }),
-                SessionMessage::now(SessionMessageKind::AssistantText {
-                    content: "hi".into(),
-                    reasoning: None,
-                    token_usage: None,
-                }),
-            ],
+            next_turn_id: 1,
+            last_undo_turn_ids: None,
+            turns,
             subscribers: HashMap::new(),
-            last_undo_ids: None,
             active_requests: HashMap::new(),
             provider: None,
         }
     }
 
-    #[test]
-    fn session_record_to_metadata() {
-        let record = test_record();
-        let meta: SessionMetadata = record.clone().into();
-        // Default status should be Sleeping
-        assert_eq!(meta.status, SessionStatus::Sleeping);
-        assert_eq!(meta.title, record.title);
-        assert_eq!(meta.selected_model, record.selected_model);
-        assert_eq!(meta.working_dir, record.working_dir);
-        assert_eq!(meta.message_count, record.message_count);
-        let mut expected = record.active_tool_groups.clone();
-        let mut actual = meta.active_tool_groups.clone();
-        expected.sort();
-        actual.sort();
-        assert_eq!(expected, actual);
-    }
-
-    #[test]
-    fn session_metadata_to_record() {
-        let meta = SessionMetadata {
-            title: Some("meta title".into()),
-            selected_model: Some("claude-3".into()),
-            reasoning_effort: None,
-            parent_session_id: Some(42),
-            working_dir: Some("/home".into()),
-            created_at: 2000,
-            message_count: 7,
-            max_turns: Some(20),
-            status: SessionStatus::Inactive,
-            active_tool_groups: vec!["git".into()],
-            account_name: None,
-            accumulated_usage: TokenUsage::default(),
-            context_window: None,
-            last_prompt_tokens: None,
-        };
-        let record: SessionRecord = meta.clone().into();
-        // Status field does not exist in record
-        assert_eq!(record.title, meta.title);
-        assert_eq!(record.selected_model, meta.selected_model);
-        assert_eq!(record.active_tool_groups, meta.active_tool_groups);
-    }
-
-    #[test]
-    fn session_record_round_trip() {
-        let record = test_record();
-        let meta: SessionMetadata = record.clone().into();
-        let record2: SessionRecord = meta.into();
-        assert_eq!(record.title, record2.title);
-        assert_eq!(record.selected_model, record2.selected_model);
-        assert_eq!(record.parent_session_id, record2.parent_session_id);
-        assert_eq!(record.working_dir, record2.working_dir);
-        assert_eq!(record.max_turns, record2.max_turns);
-        assert_eq!(record.message_count, record2.message_count);
-        assert_eq!(record.created_at, record2.created_at);
-        let mut expected = record.active_tool_groups.clone();
-        let mut actual = record2.active_tool_groups.clone();
-        expected.sort();
-        actual.sort();
-        assert_eq!(expected, actual);
-    }
-
-    #[test]
-    fn session_state_to_metadata() {
-        let state = test_state();
-        let meta: SessionMetadata = (&state).into();
-        assert_eq!(meta.title, state.config.title);
-        assert_eq!(meta.selected_model, state.config.selected_model);
-        assert_eq!(meta.message_count, 3);
-        assert_eq!(meta.status, state.config.status);
-        assert_eq!(meta.working_dir, Some("/tmp".into()));
-        assert_eq!(meta.parent_session_id, state.config.parent_session_id);
-    }
-
-    #[test]
-    fn session_state_to_record() {
-        let state = test_state();
-        let record: SessionRecord = (&state).into();
-        assert_eq!(record.title, state.config.title);
-        assert_eq!(record.selected_model, state.config.selected_model);
-        assert_eq!(record.message_count, 3);
-        assert_eq!(record.working_dir, Some("/tmp".into()));
-    }
-
-    #[test]
-    fn record_round_trip_preserves_active_tool_groups() {
-        let record = test_record();
-        let meta: SessionMetadata = record.clone().into();
-        let record2: SessionRecord = meta.into();
-        let mut expected = record.active_tool_groups.clone();
-        let mut actual = record2.active_tool_groups.clone();
-        expected.sort();
-        actual.sort();
-        assert_eq!(expected, actual);
-        assert_eq!(record2.active_tool_groups.len(), 2);
-    }
-
-    // -- SessionCommand::Broadcast tests -----------------------------------
-
-    /// Build minimal stubs needed to call `process_command` with a Broadcast.
     fn broadcast_setup() -> (SessionState, RequestContext) {
         let dir = tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
@@ -1730,6 +1431,27 @@ mod tests {
         };
         (test_state(), ctx)
     }
+
+    #[test]
+    fn session_state_round_trip_metadata() {
+        let state = test_state();
+        let meta: SessionMetadata = (&state).into();
+        assert_eq!(meta.title, state.config.title);
+        assert_eq!(meta.selected_model, state.config.selected_model);
+        assert_eq!(meta.turn_count, 1);
+        assert_eq!(meta.status, state.config.status);
+    }
+
+    #[test]
+    fn session_state_to_record() {
+        let state = test_state();
+        let record: SessionRecord = (&state).into();
+        assert_eq!(record.title, state.config.title);
+        assert_eq!(record.selected_model, state.config.selected_model);
+        assert_eq!(record.turn_count, 1);
+    }
+
+    // -- SessionCommand::Broadcast tests -----------------------------------
 
     #[test]
     fn broadcast_delivers_message_to_all_subscribers() {
@@ -1771,51 +1493,8 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_does_not_deliver_to_detached_client() {
-        let (tx1, rx1) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        let (tx2, rx2) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        let (mut state, ctx) = broadcast_setup();
-        state.subscribers.insert(10, tx1);
-        state.subscribers.insert(20, tx2);
-
-        // Detach client 10
-        state.subscribers.remove(&10);
-
-        let mut shutdown = false;
-        process_command(
-            SessionCommand::Broadcast(DaemonMessage::OutputChunk {
-                request_id: 1,
-                stream: OutputStream::Answer,
-                data: b"hello".to_vec(),
-            }),
-            &mut state,
-            &mut shutdown,
-            &ctx,
-        );
-
-        // Client 20 (still attached) receives the message.
-        assert_eq!(
-            rx2.recv().unwrap(),
-            DaemonMessage::OutputChunk {
-                request_id: 1,
-                stream: OutputStream::Answer,
-                data: b"hello".to_vec(),
-            },
-        );
-
-        // Client 10 (detached) does not — the sender was removed and dropped,
-        // so the channel is disconnected.
-        match rx1.recv() {
-            Err(_) => {} // expected
-            Ok(msg) => panic!("detached client received: {msg:?}"),
-        }
-    }
-
-    #[test]
     fn broadcast_with_no_subscribers_does_not_panic() {
         let (mut state, ctx) = broadcast_setup();
-        // subscribers is already empty
-
         let mut shutdown = false;
         process_command(
             SessionCommand::Broadcast(DaemonMessage::Done {
@@ -1827,14 +1506,11 @@ mod tests {
             &mut shutdown,
             &ctx,
         );
-
         assert!(!shutdown);
     }
 
     #[test]
     fn broadcast_handles_disconnected_subscriber_gracefully() {
-        // A sender whose receiver has been dropped (simulating a client that
-        // disconnected without properly detaching) should not panic or crash.
         let (tx, _rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         drop(_rx);
         let (mut state, ctx) = broadcast_setup();
@@ -1847,68 +1523,7 @@ mod tests {
             &mut shutdown,
             &ctx,
         );
-
         assert!(!shutdown);
-    }
-
-    // -- handle_request_finished tests ------------------------------------
-
-    #[test]
-    fn request_finished_broadcasts_new_messages_skipping_displayed_images() {
-        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        let (mut state, ctx) = broadcast_setup();
-        state.subscribers.insert(10, sub_tx);
-
-        // Snapshot with additional messages: a DisplayedImage (should be
-        // skipped — already broadcast mid-turn) and a ToolResult (should
-        // be delivered via SessionMessageAppended).
-        let mut snap_msgs = state.messages.clone();
-        snap_msgs.push(SessionMessage::now(SessionMessageKind::DisplayedImage(
-            DisplayedImageRecord {
-                metadata: ImageMetadata {
-                    image_id: 1,
-                    mime_type: "image/png".into(),
-                    width: 100,
-                    height: 50,
-                    byte_len: 64,
-                    alt: None,
-                },
-                data: vec![0u8; 64],
-                tool_call_id: None,
-            },
-        )));
-        snap_msgs.push(SessionMessage::now(SessionMessageKind::ToolResult {
-            call_id: "call_1".into(),
-            name: "echo".into(),
-            content: "hello".into(),
-            is_error: false,
-        }));
-        let snapshot = SessionSnapshot {
-            config: state.config.clone(),
-            messages: snap_msgs,
-        };
-
-        let shutdown = false;
-        handle_request_finished(1, snapshot, &mut state, &shutdown, &ctx);
-
-        // Collect all broadcasts from the subscriber.
-        let mut saw_tool_result = false;
-        let mut saw_displayed_image = false;
-        while let Ok(msg) = sub_rx.try_recv() {
-            if let DaemonMessage::SessionMessageAppended { message } = &msg {
-                match &message.kind {
-                    SessionMessageKind::DisplayedImage(_) => saw_displayed_image = true,
-                    SessionMessageKind::ToolResult { .. } => saw_tool_result = true,
-                    _ => {}
-                }
-            }
-        }
-
-        assert!(saw_tool_result, "ToolResult should have been broadcast");
-        assert!(
-            !saw_displayed_image,
-            "DisplayedImage should have been skipped (broadcast mid-turn already)"
-        );
     }
 
     // -- Cancel / Shutdown tests -------------------------------------------
@@ -1927,47 +1542,7 @@ mod tests {
             &ctx,
         );
 
-        // The cancellation signal should be delivered on the channel.
         assert!(cancel_rx.try_recv().is_ok());
-        assert!(!shutdown);
-    }
-
-    #[test]
-    fn cancel_broadcasts_cancelled_to_subscribers() {
-        let (cancel_tx, _cancel_rx) = mpsc::channel::<()>();
-        let (mut state, ctx) = broadcast_setup();
-        state.active_requests.insert(1, ActiveRequest { cancel_tx });
-
-        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        state.subscribers.insert(42, sub_tx);
-
-        let mut shutdown = false;
-        process_command(
-            SessionCommand::Cancel { request_id: 1 },
-            &mut state,
-            &mut shutdown,
-            &ctx,
-        );
-
-        assert_eq!(
-            sub_rx.recv().unwrap(),
-            DaemonMessage::Cancelled { request_id: 1 },
-        );
-    }
-
-    #[test]
-    fn cancel_unknown_request_id_is_noop() {
-        let (mut state, ctx) = broadcast_setup();
-        // No active requests — cancel on a non-existent ID should not fail.
-
-        let mut shutdown = false;
-        process_command(
-            SessionCommand::Cancel { request_id: 99 },
-            &mut state,
-            &mut shutdown,
-            &ctx,
-        );
-
         assert!(!shutdown);
     }
 
@@ -1993,54 +1568,18 @@ mod tests {
         process_command(SessionCommand::Shutdown, &mut state, &mut shutdown, &ctx);
 
         assert!(shutdown);
-        // Both requests should have received cancellation signals.
         assert!(cancel_rx1.try_recv().is_ok());
         assert!(cancel_rx2.try_recv().is_ok());
     }
 
     #[test]
     fn shutdown_with_empty_active_requests_returns_true() {
-        // When there are no active requests, Shutdown should signal
-        // that the session loop can exit (return true).
         let (mut state, ctx) = broadcast_setup();
-        // active_requests is already empty.
-
         let mut shutdown = false;
         let should_exit =
             process_command(SessionCommand::Shutdown, &mut state, &mut shutdown, &ctx);
-
         assert!(shutdown);
         assert!(should_exit);
-    }
-
-    #[test]
-    fn shutdown_broadcasts_cancelled_for_each_active_request() {
-        let (cancel_tx1, _) = mpsc::channel::<()>();
-        let (cancel_tx2, _) = mpsc::channel::<()>();
-        let (mut state, ctx) = broadcast_setup();
-        state.active_requests.insert(
-            1,
-            ActiveRequest {
-                cancel_tx: cancel_tx1,
-            },
-        );
-        state.active_requests.insert(
-            2,
-            ActiveRequest {
-                cancel_tx: cancel_tx2,
-            },
-        );
-
-        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        state.subscribers.insert(10, sub_tx);
-
-        let mut shutdown = false;
-        process_command(SessionCommand::Shutdown, &mut state, &mut shutdown, &ctx);
-
-        // Should receive two Cancelled broadcasts (order not guaranteed).
-        let msgs: Vec<DaemonMessage> = (0..2).map(|_| sub_rx.recv().unwrap()).collect();
-        assert!(msgs.contains(&DaemonMessage::Cancelled { request_id: 1 }));
-        assert!(msgs.contains(&DaemonMessage::Cancelled { request_id: 2 }));
     }
 
     // ── Token accumulation tests ──────────────────────────────────────────
@@ -2051,45 +1590,6 @@ mod tests {
         assert_eq!(state.config.accumulated_usage.input_tokens, 0);
         assert_eq!(state.config.accumulated_usage.output_tokens, 0);
         assert_eq!(state.config.accumulated_usage.total_tokens, 0);
-    }
-
-    #[test]
-    fn accumulated_usage_persists_through_session_record_round_trip() {
-        let meta = SessionMetadata {
-            title: Some("test".into()),
-            selected_model: None,
-            reasoning_effort: None,
-            parent_session_id: None,
-            working_dir: Some("/tmp".into()),
-            max_turns: None,
-            created_at: 1000,
-            message_count: 0,
-            status: SessionStatus::Sleeping,
-            active_tool_groups: vec!["core".into()],
-            account_name: None,
-            accumulated_usage: TokenUsage {
-                input_tokens: 200,
-                output_tokens: 100,
-                total_tokens: 300,
-            },
-            context_window: None,
-            last_prompt_tokens: None,
-        };
-        // Round-trip through SessionRecord (persisted form)
-        let record: SessionRecord = meta.clone().into();
-        let restored: SessionMetadata = record.into();
-        assert_eq!(
-            restored.accumulated_usage.input_tokens, 200,
-            "input_tokens should survive round-trip"
-        );
-        assert_eq!(
-            restored.accumulated_usage.output_tokens, 100,
-            "output_tokens should survive round-trip"
-        );
-        assert_eq!(
-            restored.accumulated_usage.total_tokens, 300,
-            "total_tokens should survive round-trip"
-        );
     }
 
     #[test]
@@ -2108,8 +1608,6 @@ mod tests {
 
     #[test]
     fn accumulated_usage_in_session_summary() {
-        // The SessionSummary sent via GetSummary includes the accumulated
-        // token usage.
         let (mut state, ctx) = broadcast_setup();
         state.config.accumulated_usage = TokenUsage {
             input_tokens: 80,
@@ -2137,8 +1635,6 @@ mod tests {
 
     #[test]
     fn accumulated_usage_in_attach_snapshot() {
-        // When a client attaches, it receives a SessionState message that
-        // includes accumulated token usage.
         let (mut state, ctx) = broadcast_setup();
         state.config.accumulated_usage = TokenUsage {
             input_tokens: 30,
@@ -2170,413 +1666,65 @@ mod tests {
         }
     }
 
-    // -- SetModel validation tests ----------------------------------------
-
-    /// Spawn a daemon handler that replies to ValidateModel with either
-    /// Ok(()) or an error, then drains the rest of the channel.
-    fn spawn_daemon_handler(
-        daemon_rx: mpsc::Receiver<DaemonCommand>,
-        accept: bool,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            if let Ok(DaemonCommand::ValidateModel { reply, .. }) = daemon_rx.recv() {
-                if accept {
-                    let _ = reply.send(Ok(()));
-                } else {
-                    let _ = reply.send(Err("not available".into()));
-                }
-            }
-            // Drain remaining commands so the sender doesn't get
-            // disconnected errors (UpdateMetadata etc.).
-            while daemon_rx.recv().is_ok() {}
-        })
-    }
+    // -- start_turn / undo_turns / redo_turns tests -----------------------
 
     #[test]
-    fn handle_set_model_rejected_by_daemon_broadcasts_failure() {
-        let dir = tempdir().unwrap();
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
-        let tool_registry = ToolRegistry::new().build();
-        let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
-        let daemon = spawn_daemon_handler(daemon_rx, false);
-
-        let ctx = RequestContext {
-            cmd_tx,
-            session_id: 1,
-            db,
-            tool_registry,
-            daemon_tx,
-            max_turns_default: 25,
-        };
-
-        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        let mut state = test_state();
-        state.subscribers.insert(10, sub_tx);
-
-        handle_set_model("invalid-model".into(), &mut state, &ctx);
-
-        // Should broadcast ModelSelectionFailed
-        let msg = sub_rx.recv().unwrap();
-        match msg {
-            DaemonMessage::ModelSelectionFailed { model, error } => {
-                assert_eq!(model, "invalid-model");
-                assert_eq!(error, "not available");
-            }
-            other => panic!("expected ModelSelectionFailed, got {other:?}"),
-        }
-
-        // Model should NOT be changed from original
-        assert_eq!(state.config.selected_model.as_deref(), Some("gpt-4"));
-
-        drop(ctx);
-        daemon.join().unwrap();
-    }
-
-    #[test]
-    fn handle_set_model_accepted_by_daemon_updates_model() {
-        let dir = tempdir().unwrap();
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
-        let tool_registry = ToolRegistry::new().build();
-        let (daemon_tx, daemon_rx) = mpsc::channel();
-        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
-        let daemon = spawn_daemon_handler(daemon_rx, true);
-
-        let ctx = RequestContext {
-            cmd_tx,
-            session_id: 1,
-            db,
-            tool_registry,
-            daemon_tx,
-            max_turns_default: 25,
-        };
-
-        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
-        let mut state = test_state();
-        state.subscribers.insert(10, sub_tx);
-
-        handle_set_model("gpt-5".into(), &mut state, &ctx);
-
-        // Should broadcast ModelSelected
-        let msg = sub_rx.recv().unwrap();
-        match msg {
-            DaemonMessage::ModelSelected { model } => {
-                assert_eq!(model, "gpt-5");
-            }
-            other => panic!("expected ModelSelected, got {other:?}"),
-        }
-
-        // Model should be updated
-        assert_eq!(state.config.selected_model.as_deref(), Some("gpt-5"));
-
-        drop(ctx);
-        daemon.join().unwrap();
-    }
-
-    // ── Undo / Redo tests ────────────────────────────────────────────────
-
-    #[test]
-    fn append_message_assigns_increasing_ids() {
+    fn start_turn_assigns_increasing_ids() {
         let mut state = SessionState::empty();
-        let (id0, _) = state.append_message(SessionMessageKind::UserText {
-            content: "first".into(),
-        });
-        let (id1, _) = state.append_message(SessionMessageKind::UserText {
-            content: "second".into(),
-        });
+        let (id0, _) = state.start_turn(Some("first".into()));
+        let (id1, _) = state.start_turn(Some("second".into()));
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
-        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.turns.len(), 2);
     }
 
     #[test]
-    fn append_message_with_id_uses_explicit_id_and_bumps_next() {
+    fn undo_turns_marks_range_and_returns_ids() {
         let mut state = SessionState::empty();
-        state.append_message_with_id(
-            SessionMessageKind::UserText {
-                content: "skip".into(),
-            },
-            42,
-        );
-        assert_eq!(state.messages.len(), 1);
-        assert_eq!(state.messages[0].message_id, 42);
-        // next_message_id should advance past the explicit id
-        let (id2, _) = state.append_message(SessionMessageKind::UserText {
-            content: "after".into(),
-        });
-        assert_eq!(id2, 43, "next_message_id advanced past explicit id");
+        let _ = state.start_turn(Some("user 1".into()));
+        let _ = state.start_turn(Some("user 2".into()));
+        assert!(state.turns.values().all(|t| !t.undone));
+
+        let ids = state
+            .undo_turns()
+            .expect("undo_turns should find a user turn");
+        assert_eq!(ids.len(), 1, "only the most recent user turn");
+        assert!(state.turns.get(&1).unwrap().undone);
     }
 
     #[test]
-    fn append_message_resolves_parent_id_for_assistant_messages() {
+    fn undo_turns_returns_none_when_no_user_turn() {
         let mut state = SessionState::empty();
-        let (uid, _) = state.append_message(SessionMessageKind::UserText {
-            content: "hi".into(),
-        });
-        let (aid, msg) = state.append_message(SessionMessageKind::AssistantText {
-            content: "hello".into(),
-            reasoning: None,
-            token_usage: None,
-        });
-        assert_eq!(
-            msg.parent_id,
-            Some(uid),
-            "assistant text gets user as parent"
-        );
-        assert!(aid > uid);
-        let (aid2, msg2) = state.append_message(SessionMessageKind::AssistantText {
-            content: "reply 2".into(),
-            reasoning: None,
-            token_usage: None,
-        });
-        // Second assistant message should also parent to the last non-deleted user
-        assert_eq!(msg2.parent_id, Some(uid));
-        assert!(aid2 > aid);
+        let _ = state.start_turn(None); // No user_text, only system
+        assert!(state.undo_turns().is_none());
     }
 
     #[test]
-    fn append_message_resolves_parent_id_for_tool_result() {
+    fn redo_turns_restores_undone_turns() {
         let mut state = SessionState::empty();
-        let (_uid, _) = state.append_message(SessionMessageKind::UserText {
-            content: "run tool".into(),
-        });
-        let (atu_id, atu) = state.append_message(SessionMessageKind::AssistantToolUse {
-            content: None,
-            tool_calls: vec![AssistantToolCallRecord {
-                call_id: "call_1".into(),
-                name: "echo".into(),
-                arguments_json: "{}".into(),
-            }],
-            reasoning: None,
-            token_usage: None,
-        });
-        assert_eq!(atu.parent_id, Some(_uid));
-        let (_tr_id, tr) = state.append_message(SessionMessageKind::ToolResult {
-            call_id: "call_1".into(),
-            name: "echo".into(),
-            content: "done".into(),
-            is_error: false,
-        });
-        assert_eq!(
-            tr.parent_id,
-            Some(atu_id),
-            "tool result parent is the assistant tool use message"
-        );
-    }
-
-    #[test]
-    fn undo_marks_subtree_deleted_and_returns_ids() {
-        let mut state = SessionState::empty();
-        let (uid, _) = state.append_message(SessionMessageKind::UserText {
-            content: "draw a cat".into(),
-        });
-        let (atu_id, _) = state.append_message(SessionMessageKind::AssistantToolUse {
-            content: None,
-            tool_calls: vec![AssistantToolCallRecord {
-                call_id: "c1".into(),
-                name: "svg".into(),
-                arguments_json: "{}".into(),
-            }],
-            reasoning: None,
-            token_usage: None,
-        });
-        let (tr_id, _) = state.append_message(SessionMessageKind::ToolResult {
-            call_id: "c1".into(),
-            name: "svg".into(),
-            content: "<svg/>".into(),
-            is_error: false,
-        });
-        let (_aid, _) = state.append_message(SessionMessageKind::AssistantText {
-            content: "done".into(),
-            reasoning: None,
-            token_usage: None,
-        });
-
-        assert!(
-            state.messages.iter().all(|m| !m.deleted),
-            "no messages deleted before undo",
-        );
-
-        let ids = state.undo().expect("undo should find a user turn");
-        // Should include the user message and its entire subtree.
-        assert!(ids.contains(&uid), "user message id in undo set");
-        assert!(ids.contains(&atu_id), "assistant tool use id in undo set");
-        assert!(ids.contains(&tr_id), "tool result id in undo set");
-
-        assert!(
-            state.messages.iter().all(|m| m.deleted),
-            "all messages marked deleted after undo",
-        );
-    }
-
-    #[test]
-    fn undo_returns_none_when_no_user_turn() {
-        let mut state = SessionState::empty();
-        // Only system messages — no user turn to undo.
-        state.append_message(SessionMessageKind::SystemText {
-            content: "prompt".into(),
-        });
-        assert!(state.undo().is_none(), "no user turn to undo");
-    }
-
-    #[test]
-    fn undo_skips_already_deleted_messages() {
-        let mut state = SessionState::empty();
-        // Two user turns, each with an assistant reply.
-        let (u0, _) = state.append_message(SessionMessageKind::UserText {
-            content: "first".into(),
-        });
-        let (a0, _) = state.append_message(SessionMessageKind::AssistantText {
-            content: "reply1".into(),
-            reasoning: None,
-            token_usage: None,
-        });
-        let (u1, _) = state.append_message(SessionMessageKind::UserText {
-            content: "second".into(),
-        });
-        let (a1, _) = state.append_message(SessionMessageKind::AssistantText {
-            content: "reply2".into(),
-            reasoning: None,
-            token_usage: None,
-        });
-
-        // Undo the most recent user turn (the "second" one and its subtree).
-        let ids = state.undo().expect("undo should find a user turn");
-        assert!(ids.contains(&u1), "second user turn in undo set");
-        assert!(ids.contains(&a1), "assistant reply in undo set");
-        // First turn messages should remain non-deleted.
-        assert!(
-            !state
-                .messages
-                .iter()
-                .find(|m| m.message_id == u0)
-                .unwrap()
-                .deleted
-        );
-        assert!(
-            !state
-                .messages
-                .iter()
-                .find(|m| m.message_id == a0)
-                .unwrap()
-                .deleted
-        );
-        assert!(
-            state
-                .messages
-                .iter()
-                .find(|m| m.message_id == u1)
-                .unwrap()
-                .deleted
-        );
-        assert!(
-            state
-                .messages
-                .iter()
-                .find(|m| m.message_id == a1)
-                .unwrap()
-                .deleted
-        );
-
-        // Undo again — there's still the first user turn.
-        let ids2 = state.undo().expect("undo second turn");
-        assert!(ids2.contains(&u0), "first user turn in undo set");
-    }
-
-    #[test]
-    fn redo_restores_undo_subtree() {
-        let mut state = SessionState::empty();
-        state.append_message(SessionMessageKind::UserText {
-            content: "hi".into(),
-        });
-        let ids = state.undo().expect("undo succeeds");
+        let _ = state.start_turn(Some("user".into()));
+        let ids = state.undo_turns().expect("undo succeeds");
         assert!(!ids.is_empty());
 
-        let restored = state.redo().expect("redo succeeds");
+        let restored = state.redo_turns().expect("redo succeeds");
         assert_eq!(restored.len(), ids.len());
-        assert!(
-            state.messages.iter().all(|m| !m.deleted),
-            "all messages restored after redo",
-        );
+        assert!(state.turns.values().all(|t| !t.undone));
     }
 
     #[test]
-    fn redo_returns_none_when_nothing_to_redo() {
+    fn redo_turns_returns_none_when_nothing_to_redo() {
         let mut state = SessionState::empty();
-        state.append_message(SessionMessageKind::UserText {
-            content: "hi".into(),
-        });
-        // No undo was performed — nothing to redo.
-        assert!(state.redo().is_none());
+        let _ = state.start_turn(Some("user".into()));
+        assert!(state.redo_turns().is_none());
     }
 
     #[test]
-    fn redo_returns_none_after_new_user_input() {
+    fn redo_turns_cleared_by_new_turn_start() {
         let mut state = SessionState::empty();
-        state.append_message(SessionMessageKind::UserText {
-            content: "first".into(),
-        });
-        state.undo();
-        // New user input should clear the redo stack.
-        state.append_message(SessionMessageKind::UserText {
-            content: "second".into(),
-        });
-        assert!(state.redo().is_none(), "redo cleared after new user input");
-    }
-
-    #[test]
-    fn collect_subtree_gathers_all_descendants() {
-        // Manually construct a tree: 0 (root) → 1, 2 (children), 1 → 3 (grandchild)
-        let messages = vec![
-            SessionMessage {
-                message_id: 0,
-                parent_id: None,
-                created_at: TimestampMs::now(),
-                kind: SessionMessageKind::UserText {
-                    content: "root".into(),
-                },
-                deleted: false,
-            },
-            SessionMessage {
-                message_id: 1,
-                parent_id: Some(0),
-                created_at: TimestampMs::now(),
-                kind: SessionMessageKind::AssistantText {
-                    content: "child1".into(),
-                    reasoning: None,
-                    token_usage: None,
-                },
-                deleted: false,
-            },
-            SessionMessage {
-                message_id: 2,
-                parent_id: Some(0),
-                created_at: TimestampMs::now(),
-                kind: SessionMessageKind::AssistantText {
-                    content: "child2".into(),
-                    reasoning: None,
-                    token_usage: None,
-                },
-                deleted: false,
-            },
-            SessionMessage {
-                message_id: 3,
-                parent_id: Some(1),
-                created_at: TimestampMs::now(),
-                kind: SessionMessageKind::AssistantText {
-                    content: "grandchild".into(),
-                    reasoning: None,
-                    token_usage: None,
-                },
-                deleted: false,
-            },
-        ];
-        let children = build_children_map(&messages);
-        let ids = collect_subtree(&children, 0);
-        assert_eq!(ids.len(), 4, "all four messages in subtree");
-        assert!(ids.contains(&0));
-        assert!(ids.contains(&1));
-        assert!(ids.contains(&2));
-        assert!(ids.contains(&3));
+        let _ = state.start_turn(Some("first".into()));
+        state.undo_turns();
+        // New user turn clears redo stack
+        let _ = state.start_turn(Some("second".into()));
+        assert!(state.redo_turns().is_none());
     }
 }

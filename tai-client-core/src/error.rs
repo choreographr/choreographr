@@ -10,23 +10,7 @@ pub enum ClientError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Utf8(#[from] std::string::FromUtf8Error),
-    #[error("image byte length does not fit in memory")]
-    ImageTooLarge,
-    #[error("image {image_id} exceeded advertised size")]
-    ImageExceedsSize { image_id: u32 },
-    #[error("duplicate image {image_id} for request {request_id}")]
-    DuplicateImage { image_id: u32, request_id: u32 },
-    #[error("unknown image {image_id} for request {request_id}")]
-    UnknownImage { image_id: u32, request_id: u32 },
-    #[error(
-        "image {image_id} for request {request_id} ended with {actual} bytes, expected {expected}"
-    )]
-    ImageSizeMismatch {
-        image_id: u32,
-        request_id: u32,
-        expected: u64,
-        actual: u64,
-    },
+
     #[error("failed to read private key: {0}")]
     PrivateKeyRead(String),
     #[error("invalid private key file: expected 32 bytes")]
@@ -61,12 +45,7 @@ impl From<ClientError> for io::Error {
             ClientError::Proto(proto) => io::Error::from(proto),
             ClientError::Io(io) => io,
             ClientError::Utf8(e) => io::Error::new(io::ErrorKind::InvalidData, e),
-            ClientError::ImageTooLarge
-            | ClientError::ImageExceedsSize { .. }
-            | ClientError::DuplicateImage { .. }
-            | ClientError::UnknownImage { .. }
-            | ClientError::ImageSizeMismatch { .. }
-            | ClientError::PrivateKeyRead(_)
+            ClientError::PrivateKeyRead(_)
             | ClientError::PrivateKeyInvalid
             | ClientError::PrivateKeyEncRead(_)
             | ClientError::PrivateKeyDecrypt(_)

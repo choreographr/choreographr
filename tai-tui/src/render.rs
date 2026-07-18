@@ -1,13 +1,9 @@
-use crate::diff_render::build_diff_panes;
-use crate::markdown_render::{
-    display_width, lines_height, session_message_lines, streaming_text_lines,
-};
+use crate::markdown_render::{display_width, lines_height, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
-use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, HistoryItem, INPUT_BAR_HEIGHT,
-    Page, RenderedCache, STATUS_BAR_HEIGHT, STRUCTURAL_ROWS, SessionManagerView,
-    history_text_height,
+    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, IMAGE_BLOCK_HEIGHT,
+    INPUT_BAR_HEIGHT, PROVIDER_OPTIONS, Page, RenderedCache, STATUS_BAR_HEIGHT,
+    STATUS_ERROR_BAR_HEIGHT, SessionManagerView,
 };
 use ratatui::{
     Frame,
@@ -17,28 +13,19 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
-use tai_client_core::history::ToolResultStreamData;
-use tai_client_core::{DiffLineKind, FileDiff, StreamingText};
-use tai_proto::{
-    ImageMetadata, SessionMessage, SessionMessageKind, SessionStatus, ThinkingEffort, TimestampMs,
-};
+use tai_proto::{SessionStatus, ThinkingEffort};
 
 use tui_prompts::{
     Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
 };
 
-/// Dark-gray background shade used for highlighted message bodies and the
-/// scrollbar track.
 const BG_SHADE: Color = Color::Rgb(60, 60, 60);
 
-/// Terminal dimensions for the chat history page, excluding the input bar
-/// and status bar at the bottom. Returns `None` when the terminal is too
-/// small for the history area to be meaningful.
 fn history_area() -> Option<(u16, u16)> {
     let Ok((width, height)) = crossterm::terminal::size() else {
         return None;
     };
-    let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT;
+    let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT + STATUS_ERROR_BAR_HEIGHT;
     if width < 2 || height <= bottom_height {
         return None;
     }
@@ -50,12 +37,9 @@ pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
         Some(v) => v,
         None => return false,
     };
-    // Exclude the 1-column scrollbar on the right
     column < width.saturating_sub(1) && row < history_height
 }
 
-/// Returns `true` when the mouse position falls in the scrollbar column
-/// on the chat history page.
 pub(crate) fn mouse_in_scrollbar_column(column: u16, row: u16) -> bool {
     let (width, history_height) = match history_area() {
         Some(v) => v,
@@ -64,13 +48,6 @@ pub(crate) fn mouse_in_scrollbar_column(column: u16, row: u16) -> bool {
     column == width.saturating_sub(1) && row < history_height
 }
 
-/// Build a scrollbar widget with the shared style used across all
-/// list views.
-///
-/// Uses a light-gray thumb on a dark-gray track.  The thumb height
-/// is proportional to the fraction of content visible in the
-/// viewport, rendered with half-block Unicode characters for
-/// smooth sub-cell positioning.
 fn vertical_scrollbar() -> SmoothScrollbar {
     SmoothScrollbar::new()
         .thumb_fg(Color::DarkGray)
@@ -79,8 +56,6 @@ fn vertical_scrollbar() -> SmoothScrollbar {
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
-    // Fullscreen image overlay — submit encoding job if needed, show
-    // placeholder while pending, or render the encoded protocol directly.
     if render_fullscreen_only(frame, app) {
         return;
     }
@@ -94,25 +69,19 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-/// Look up the fullscreen image by index and render it.  Returns `true` if
-/// a valid image was found (or a placeholder is shown), `false` if the
-/// index was stale.
+/// Look up the fullscreen image by (turn_id, img_idx) and render it.
 pub(crate) fn render_fullscreen_only(frame: &mut Frame<'_>, app: &mut App) -> bool {
-    let Some(idx) = app.fullscreen_image_idx else {
+    let Some((turn_id, img_idx)) = app.fullscreen_image_target else {
         return false;
     };
-    if idx >= app.client.history.len() || !matches!(&app.client.history[idx], HistoryItem::Image(_))
-    {
-        // History mutated (trimmed from front); index no longer valid.
-        app.fullscreen_image_idx = None;
+    if !app.rendered_images.contains_key(&turn_id) {
+        app.fullscreen_image_target = None;
         return false;
     }
-    render_fullscreen_image(frame, idx, app);
+    render_fullscreen_image(frame, turn_id, img_idx, app);
     true
 }
 
-/// Draw a centered "Loading image …" placeholder that fills the terminal.
-/// Used as instant feedback while the worker encodes the image at full size.
 fn render_fullscreen_placeholder(frame: &mut Frame<'_>) {
     let area = frame.area();
     let block = Block::bordered()
@@ -121,86 +90,55 @@ fn render_fullscreen_placeholder(frame: &mut Frame<'_>) {
     frame.render_widget(block, area);
 }
 
-/// Render the fullscreen image overlay at the full terminal size with
-/// Lanczos3 quality.  If the protocol is not yet encoded, submit an
-/// encoding job and show a loading placeholder.
-fn render_fullscreen_image(frame: &mut Frame<'_>, idx: usize, app: &mut App) {
+fn render_fullscreen_image(frame: &mut Frame<'_>, turn_id: u32, img_idx: usize, app: &mut App) {
     let area = frame.area();
     let full = Size::new(area.width, area.height);
 
     // Fast path — already encoded at full size.
+    let should_submit = match app
+        .rendered_images
+        .get_mut(&turn_id)
+        .and_then(|images| images.get_mut(&img_idx))
     {
-        let HistoryItem::Image(ref mut rendered) = app.client.history[idx] else {
-            return;
-        };
-        if let Some(protocol) = rendered.protocols.get_mut(&full) {
-            let target = protocol.size_for(tai_tui::IMAGE_RESIZE, full);
-            let centered = Rect {
-                x: area.x + (area.width.saturating_sub(target.width)) / 2,
-                y: area.y + (area.height.saturating_sub(target.height)) / 2,
-                width: target.width.min(area.width),
-                height: target.height.min(area.height),
-            };
-            frame.render_stateful_widget(
-                StatefulImage::new().resize(tai_tui::IMAGE_RESIZE),
-                centered,
-                protocol,
-            );
-            return;
+        Some(img) => {
+            if let Some(protocol) = img.protocols.get_mut(&full) {
+                let target = protocol.size_for(tai_tui::IMAGE_RESIZE, full);
+                let centered = Rect {
+                    x: area.x + (area.width.saturating_sub(target.width)) / 2,
+                    y: area.y + (area.height.saturating_sub(target.height)) / 2,
+                    width: target.width.min(area.width),
+                    height: target.height.min(area.height),
+                };
+                frame.render_stateful_widget(
+                    StatefulImage::new().resize(tai_tui::IMAGE_RESIZE),
+                    centered,
+                    protocol,
+                );
+                return;
+            }
+            // Submit job if not pending/failed/cached.
+            img.pending_job.is_none()
+                && !img.failed_sizes.contains(&full)
+                && !img.protocols.contains_key(&full)
         }
-    }
-
-    submit_image_job_if_needed(app, idx, full);
-
-    render_fullscreen_placeholder(frame);
-}
-
-/// Submit an encoding job for the image at `history_idx` if it needs encoding,
-/// hasn't previously failed, and no job is already in-flight.
-/// Returns `true` when a job was submitted.
-fn submit_image_job_if_needed(app: &mut App, history_idx: usize, target_size: Size) -> bool {
-    let (needs_job, why_not, job_data, job_meta) = {
-        let HistoryItem::Image(ref image) = app.client.history[history_idx] else {
-            return false;
-        };
-        (
-            image.pending_job.is_none()
-                && !image.failed_sizes.contains(&target_size)
-                && !image.protocols.contains_key(&target_size),
-            if image.pending_job.is_some() {
-                "pending_job"
-            } else if image.failed_sizes.contains(&target_size) {
-                "failed_sizes"
-            } else if image.protocols.contains_key(&target_size) {
-                "already_cached"
-            } else {
-                ""
-            },
-            image.data.clone(),
-            image.metadata.clone(),
-        )
+        None => false,
     };
-    if needs_job {
+
+    if should_submit
+        && let Some(images) = app.rendered_images.get(&turn_id)
+        && let Some(img) = images.get(&img_idx)
+    {
         app.submit_image_job(
-            history_idx,
-            job_data,
-            job_meta,
-            target_size,
+            turn_id,
+            img_idx,
+            img.data.clone(),
+            img.metadata.clone(),
+            full,
             tai_tui::IMAGE_RESIZE,
         );
-        true
-    } else {
-        if !why_not.is_empty() {
-            tracing::trace!(
-                "[tai-tui] skipping image job for history idx {} @ {}x{}: {}",
-                history_idx,
-                target_size.width,
-                target_size.height,
-                why_not,
-            );
-        }
-        false
     }
+
+    render_fullscreen_placeholder(frame);
 }
 
 fn render_settings(frame: &mut Frame<'_>, _app: &mut App) {
@@ -217,7 +155,6 @@ fn render_settings(frame: &mut Frame<'_>, _app: &mut App) {
     frame.render_widget(status, chunks[1]);
 }
 
-/// Render the Home page with the Tai logo and a menu.
 fn render_home(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default()
@@ -229,7 +166,6 @@ fn render_home(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(area);
 
-    // ── Menu ────────────────────────────────────────────────────
     let menu_area = chunks[0];
     let menu_items: Vec<Line> = HOME_MENU_ITEMS
         .iter()
@@ -252,7 +188,6 @@ fn render_home(frame: &mut Frame<'_>, app: &mut App) {
     let menu = Paragraph::new(menu_items).alignment(Alignment::Center);
     frame.render_widget(menu, menu_area);
 
-    // ── Footer help bar ─────────────────────────────────────────
     let status = Paragraph::new(Line::from(
         " <j/k nav>  <Enter select>  <s sessions>  <p ai providers>  <t settings>  <q quit>  <Esc back>",
     ));
@@ -264,6 +199,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
+            Constraint::Length(STATUS_ERROR_BAR_HEIGHT),
             Constraint::Length(INPUT_BAR_HEIGHT),
             Constraint::Length(STATUS_BAR_HEIGHT),
         ])
@@ -281,8 +217,6 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let viewport_height = app.history_viewport.height as usize;
     let total_height = app.compute_total_height_and_markers();
     if total_height > viewport_height {
-        // Our effective_scroll is 0 at the bottom (auto-follow), but
-        // ScrollbarState expects position=0 at the top, so we invert.
         let position = app
             .max_scroll_offset()
             .saturating_sub(app.effective_scroll());
@@ -296,20 +230,37 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         );
     }
 
+    // ── Status/error bar (above command box) ──────────────────
+    if let Some(ref err) = app.error {
+        let err_para = Paragraph::new(Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red),
+        )))
+        .block(Block::default().borders(Borders::ALL).title("error"));
+        frame.render_widget(err_para, chunks[1]);
+    } else if let Some(ref status) = app.status {
+        let status_para = Paragraph::new(Line::from(Span::styled(
+            status.clone(),
+            Style::default().fg(Color::Cyan),
+        )))
+        .block(Block::default().borders(Borders::ALL).title("status"));
+        frame.render_widget(status_para, chunks[1]);
+    }
+
     // ── Command input box ──────────────────────────────────────
     let input = Paragraph::new(app.input.as_str())
         .block(Block::default().borders(Borders::ALL).title("command"))
         .wrap(Wrap { trim: false });
-    frame.render_widget(input, chunks[1]);
+    frame.render_widget(input, chunks[2]);
 
-    let cursor_x = chunks[1].x.saturating_add(
+    let cursor_x = chunks[2].x.saturating_add(
         1 + display_width(app.input.text.get(..app.input.cursor).unwrap_or("")) as u16,
     );
-    let cursor_y = chunks[1].y.saturating_add(1);
+    let cursor_y = chunks[2].y.saturating_add(1);
     frame.set_cursor_position((cursor_x, cursor_y));
 
     // ── Status bar ────────────────────────────────────────────
-    let status_area = chunks[2];
+    let status_area = chunks[3];
     let status_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
@@ -317,7 +268,6 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
     let has_session = app.attached_session_id.is_some();
 
-    // Row 1: working directory, provider, model, reasoning effort
     let status_line = if has_session {
         let wd = app.attached_working_dir.as_deref().unwrap_or("-");
         let provider = app.attached_provider_slug.as_deref().unwrap_or("-");
@@ -343,7 +293,6 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let status_bar = Paragraph::new(status_line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
     frame.render_widget(status_bar, status_rows[0]);
 
-    // Row 2: tokens (output↑ / input↓) and context window
     let tokens_line = if has_session {
         let tokens = match &app.attached_token_usage {
             Some(usage) => format!("↑{}  ↓{}", usage.output_tokens, usage.input_tokens),
@@ -397,121 +346,88 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         return;
     }
 
-    let content_width = area.width.saturating_sub(2);
-    let user_content_width = area.width.saturating_sub(9);
+    let content_width = area.width.saturating_sub(9);
 
-    // Ensure the render cache is aligned with the history vector before
-    // we start iterating.  If items were pushed/inserted/trimmed since the
-    // last frame, this rebuilds the cache from scratch (all Nones).
     app.ensure_cache_synced();
 
     let mut rows_remaining = area.height as usize;
     let mut y = area.y + area.height;
     let mut rows_to_skip = app.effective_scroll();
 
-    // Iterate by index so we can borrow the history and render_cache
-    // independently (they are separate fields of App).
-    let len = app.client.history.len();
+    let len = app.visible_turn_ids.len();
     for raw_i in 0..len {
         let i = len - 1 - raw_i;
-        let item = &mut app.client.history[i];
+        let turn_id = app.visible_turn_ids[i];
 
         if rows_remaining == 0 {
             break;
         }
 
-        match item {
-            HistoryItem::Text(text) => {
-                render_history_text(
-                    frame,
-                    area,
-                    text.as_str(),
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    content_width,
-                );
+        // Clone turn data before borrowing render_cache mutably.
+        let (text_lines, img_count) = {
+            let Some(turn) = app.session_view.turns.get(&turn_id) else {
+                continue;
+            };
+            if turn.undone {
+                continue;
             }
-            HistoryItem::SessionMessage(message) => {
-                let widths = RenderWidths {
-                    content_width,
-                    user_content_width,
+            let count = turn.displayed_images.len();
+            // ── Phase A: text content ──────────────────────────
+            let lines = cached_or_compute_lines(&mut app.render_cache, i, content_width, || {
+                render_turn_lines(turn, content_width)
+            });
+            (lines, count)
+        };
+
+        let text_height = lines_height(&text_lines, content_width).max(1);
+
+        if let Some((top_line, visible_height)) =
+            clipped_area(text_height, &mut rows_to_skip, &mut rows_remaining, &mut y)
+        {
+            render_margin_lines(
+                frame,
+                area,
+                text_lines,
+                top_line,
+                visible_height,
+                &mut y,
+                content_width,
+                Style::default().bg(BG_SHADE),
+            );
+        }
+
+        // ── Phase B: images ────────────────────────────────────
+        for img_idx in 0..img_count {
+            let img_height = IMAGE_BLOCK_HEIGHT as usize;
+            if let Some((_top_line, visible_height)) =
+                clipped_area(img_height, &mut rows_to_skip, &mut rows_remaining, &mut y)
+            {
+                let img_rect = Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: visible_height as u16,
                 };
-                render_item_session_message(
-                    frame,
-                    area,
-                    message,
-                    &mut app.render_cache,
-                    i,
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    &widths,
-                );
-            }
-            HistoryItem::Streaming(text) => {
-                render_item_streaming(
-                    frame,
-                    area,
-                    text,
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    user_content_width,
-                );
-            }
-            HistoryItem::Image(_) => {
-                render_item_image(
-                    frame,
-                    area,
-                    i,
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    app,
-                );
-            }
-            HistoryItem::ToolResultStream(data) => {
-                render_item_tool_result_stream(
-                    frame,
-                    area,
-                    data,
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                    user_content_width,
-                );
-            }
-            HistoryItem::Diff(diffs) => {
-                render_history_diff(
-                    frame,
-                    area,
-                    diffs,
-                    &mut rows_remaining,
-                    &mut y,
-                    &mut rows_to_skip,
-                );
+                render_turn_image(frame, img_rect, turn_id, img_idx, app);
             }
         }
     }
 }
 
-/// Return the cached rendered lines for a history item, or compute, cache,
-/// and return them.  Only caches items with stable content (not Streaming).
+/// Return the cached rendered lines for a turn at the given cache index,
+/// or compute, cache, and return them.
 fn cached_or_compute_lines(
     cache: &mut [Option<RenderedCache>],
     index: usize,
     width: u16,
     compute: impl FnOnce() -> Vec<Line<'static>>,
 ) -> Vec<Line<'static>> {
-    // Fast path: cache hit at the current width.
     if let Some(Some(cached)) = cache.get(index)
         && cached.width == width
     {
         return cached.lines.clone();
     }
 
-    // Cache miss: compute, store, and return.
     let lines = compute();
     if let Some(slot) = cache.get_mut(index) {
         *slot = Some(RenderedCache {
@@ -522,35 +438,25 @@ fn cached_or_compute_lines(
     lines
 }
 
-/// Compute the visible window for a scrollable content item.
-///
-/// Given the total height of an item and the current scroll/viewport state,
-/// returns `(top_line, visible_height)` if any portion of the item is visible,
-/// or `None` if the item is entirely outside the viewport.  Also updates
-/// `rows_to_skip`, `rows_remaining`, and `y` to reflect the consumed rows.
 fn clipped_area(
     full_height: usize,
     rows_to_skip: &mut usize,
     rows_remaining: &mut usize,
     y: &mut u16,
 ) -> Option<(usize, usize)> {
-    // Entire item is above the visible area — reduce skip counter and move on
     if *rows_to_skip >= full_height {
         *rows_to_skip -= full_height;
         return None;
     }
 
-    // How many rows of this item actually fit in the remaining viewport
     let visible_height = (full_height.saturating_sub(*rows_to_skip)).min(*rows_remaining);
     if visible_height == 0 {
         return None;
     }
 
-    // The index (within the item's content) of the first visible row
     let bottom_line = full_height.saturating_sub(*rows_to_skip);
     let top_line = bottom_line.saturating_sub(visible_height);
 
-    // Advance the vertical cursor by the visible portion
     *y = (*y).saturating_sub(visible_height as u16);
     *rows_remaining -= visible_height;
     *rows_to_skip = 0;
@@ -558,229 +464,17 @@ fn clipped_area(
     Some((top_line, visible_height))
 }
 
-pub(crate) fn render_history_text(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    text: &str,
-    rows_remaining: &mut usize,
-    y: &mut u16,
-    rows_to_skip: &mut usize,
-    content_width: u16,
-) {
-    let base_wrapped = history_text_height(text, content_width).max(1);
-    // +1 for the blank-line separator below each text block
-    let wrapped = base_wrapped + 1;
-
-    let Some((top_line, visible_height)) = clipped_area(wrapped, rows_to_skip, rows_remaining, y)
-    else {
-        return;
-    };
-
-    let rect = Rect {
-        x: area.x + 1,
-        y: *y,
-        width: content_width,
-        height: visible_height as u16,
-    };
-
-    // Prepend a blank line for 1-cell vertical margin.
-    let display_text = format!("\n{text}");
-
-    frame.render_widget(
-        Paragraph::new(display_text)
-            .wrap(Wrap { trim: false })
-            .scroll((top_line as u16, 0)),
-        rect,
-    );
-}
-
-/// Wrap content lines with a vertical accent bar on the left and dark-gray
-/// background shading, so assistant and user messages share the same layout
-/// but differ only in the bar colour.
-///
-/// Layout per text row (see also doc-comment on `add_user_margin_lines`):
-///   Col 0-1     empty, no shading
-///   Col 2       ┃ (heavy vertical, `accent` colour)
-///   Col 3-4     padding, shaded (`BG_SHADE`)
-///   Col 5..W-5  text content, shaded
-///   Col W-4..W-3  padding, shaded
-///   Col W-2..W-1  empty, no shading
-///
-/// The caller must apply `.style(Style::default().bg(BG_SHADE))` on the
-/// Paragraph so text spans inherit the background without per-span overrides.
-fn add_margin_lines(
-    lines: Vec<Line<'static>>,
-    content_width: u16,
-    accent: Color,
-    timestamp_ms: Option<i64>,
-) -> (Vec<Line<'static>>, usize) {
-    let gray = Style::default().bg(BG_SHADE);
-    let no_shading = Style::default().bg(Color::Reset);
-    let accent_line = Style::default().fg(accent).bg(Color::Reset);
-    let total_width = content_width as usize + 9; // full row width = area.width
-    let shaded_content = content_width as usize + 4; // cols 3..W-3 for padding rows
-
-    // Top separator: no shading
-    let separator = Line::from(vec![Span::styled(" ".repeat(total_width), no_shading)]);
-
-    // Padding row: shading on cols 3..W-3, no text
-    let padding = Line::from(vec![
-        Span::styled("  ", no_shading),
-        Span::styled("┃", accent_line),
-        Span::styled(" ".repeat(shaded_content), gray),
-        Span::styled("  ", no_shading),
-    ]);
-
-    let mut result = Vec::with_capacity(lines.len() + STRUCTURAL_ROWS);
-    result.push(separator);
-    result.push(padding.clone());
-
-    for line in lines {
-        let fill = (content_width as usize).saturating_sub(line.width());
-
-        let mut spans = vec![
-            Span::styled("  ", no_shading),
-            Span::styled("┃", accent_line),
-            Span::styled("  ", gray),
-        ];
-        spans.extend(line.spans);
-        spans.push(Span::styled(" ".repeat(fill), gray));
-        spans.push(Span::styled("  ", gray));
-        spans.push(Span::styled("  ", no_shading));
-
-        result.push(Line::from(spans));
-    }
-
-    result.push(padding);
-
-    // Bottom separator: right-aligned timestamp (user messages only)
-    // Pad to total_width so the paragraph background doesn't peek through.
-    if let Some(ms) = timestamp_ms {
-        let ts_text = format_timestamp(ms / 1000);
-        let ts_len = ts_text.len();
-        let left_fill = total_width.saturating_sub(ts_len + 4);
-        result.push(Line::from(vec![
-            Span::styled(" ".repeat(left_fill), no_shading),
-            Span::styled(ts_text, no_shading),
-            Span::styled(" ".repeat(4), no_shading),
-        ]));
-    } else {
-        result.push(Line::from(vec![Span::styled(
-            " ".repeat(total_width),
-            no_shading,
-        )]));
-    }
-
-    let total_rows = result.len();
-    (result, total_rows)
-}
-
-fn add_assistant_margin_lines(
-    lines: Vec<Line<'static>>,
-    content_width: u16,
-    timestamp_ms: Option<i64>,
-) -> (Vec<Line<'static>>, usize) {
-    add_margin_lines(lines, content_width, Color::Blue, timestamp_ms)
-}
-
-/// Wrap user-content lines with the user-message visual styling:
-///
-///   Row 0:          (empty, no shading)     ← separator
-///   Row 1:    ┃░░░░ (padding, shading)      ← first shading row, no text
-///   Row 2..N: ┃░░ text ░░                   ← text rows with shading
-///   Row N-1:  ┃░░░░ (padding, shading)      ← last shading row, no text
-///   Row N:          (empty, no shading)     ← separator
-///
-/// Left-to-right per text row:
-///   Col 0-1:   empty, no shading
-///   Col 2:     ┃ (heavy vertical, green)
-///   Col 3-4:   padding, shaded (dark gray)
-///   Col 5..W-5: text content, shaded
-///   Col W-4..W-3: padding, shaded
-///   Col W-2..W-1: empty, no shading
-///
-/// The caller must apply `.style(Style::default().bg(BG_SHADE))`
-/// on the Paragraph so text spans inherit the gray background without explicit
-/// per-span overrides.
-fn add_user_margin_lines(
-    lines: Vec<Line<'static>>,
-    content_width: u16,
-    timestamp_ms: Option<i64>,
-) -> (Vec<Line<'static>>, usize) {
-    add_margin_lines(lines, content_width, Color::Green, timestamp_ms)
-}
-
-fn add_tool_result_margin_lines(
-    lines: Vec<Line<'static>>,
-    content_width: u16,
-    timestamp_ms: Option<i64>,
-) -> (Vec<Line<'static>>, usize) {
-    add_margin_lines(lines, content_width, Color::Red, timestamp_ms)
-}
-
-pub(crate) fn render_history_lines(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    lines: Vec<Line<'static>>,
-    rows_remaining: &mut usize,
-    y: &mut u16,
-    rows_to_skip: &mut usize,
-    content_width: u16,
-) {
-    // +1 for the blank-line separator below each text block
-    let wrapped = lines_height(&lines, content_width).max(1) + 1;
-
-    let Some((top_line, visible_height)) = clipped_area(wrapped, rows_to_skip, rows_remaining, y)
-    else {
-        return;
-    };
-
-    let rect = Rect {
-        x: area.x + 1,
-        y: *y,
-        width: content_width,
-        height: visible_height as u16,
-    };
-
-    // Prepend a blank line for 1-cell vertical margin.
-    let mut display_lines = vec![Line::from(Span::styled(String::new(), Style::default()))];
-    display_lines.extend(lines);
-
-    frame.render_widget(
-        Paragraph::new(display_lines)
-            .wrap(Wrap { trim: false })
-            .scroll((top_line as u16, 0)),
-        rect,
-    );
-}
-
-/// Signature for margin-decoration callbacks passed to `render_margin_lines`.
-type MarginFn = fn(Vec<Line<'static>>, u16, Option<i64>) -> (Vec<Line<'static>>, usize);
-
-/// Render lines wrapped with margin decoration, clipped to the visible
-/// viewport.  The `margin_fn` callback produces the decorated lines;
-/// the caller provides the paragraph background style.
-#[allow(clippy::too_many_arguments)]
+/// Render pre-margin-decorated lines with viewport clipping.
 fn render_margin_lines(
     frame: &mut Frame<'_>,
     area: Rect,
     lines: Vec<Line<'static>>,
-    rows_remaining: &mut usize,
+    top_line: usize,
+    visible_height: usize,
     y: &mut u16,
-    rows_to_skip: &mut usize,
-    content_width: u16,
+    _content_width: u16,
     paragraph_style: Style,
-    margin_fn: MarginFn,
-    timestamp_ms: Option<i64>,
 ) {
-    let (display_lines, total_rows) = margin_fn(lines, content_width, timestamp_ms);
-
-    let Some((top_line, visible_height)) =
-        clipped_area(total_rows, rows_to_skip, rows_remaining, y)
-    else {
-        return;
-    };
-
     let rect = Rect {
         x: area.x,
         y: *y,
@@ -789,7 +483,7 @@ fn render_margin_lines(
     };
 
     frame.render_widget(
-        Paragraph::new(display_lines)
+        Paragraph::new(lines)
             .style(paragraph_style)
             .wrap(Wrap { trim: false })
             .scroll((top_line as u16, 0)),
@@ -797,249 +491,83 @@ fn render_margin_lines(
     );
 }
 
-/// Holds the three content-width values used when rendering a
-/// `SessionMessage`.  Each variant needs a different amount of
-/// horizontal margin, so the content area shrinks accordingly.
-#[derive(Clone, Copy)]
-struct RenderWidths {
-    /// Width for plain-text items (SystemText, ToolResult, etc.):
-    ///   area.width - 2  (1-cell left + 1-cell right padding)
-    content_width: u16,
-    /// Width for user and assistant messages (bar + left/right padding):
-    ///   area.width - 9
-    user_content_width: u16,
-}
-
-/// Render a `HistoryItem::SessionMessage`: retrieve cached lines (or compute
-/// on cache miss), then render via the appropriate helper (assistant margin
-/// for `AssistantText`, user styling for `UserText`, plain lines otherwise).
+/// Render a single turn-displayed image block.
 ///
-/// Must stay in sync with `HistoryViewport::item_height` in `state.rs` —
-/// the height returned for each variant must match the number of terminal
-/// rows this function produces.
-#[allow(clippy::too_many_arguments)]
-fn render_item_session_message(
+/// Height is always `IMAGE_BLOCK_HEIGHT` regardless of encoding state,
+/// so scroll positions remain stable.
+fn render_turn_image(
     frame: &mut Frame<'_>,
     area: Rect,
-    message: &SessionMessage,
-    cache: &mut [Option<RenderedCache>],
-    idx: usize,
-    rows_remaining: &mut usize,
-    y: &mut u16,
-    rows_to_skip: &mut usize,
-    widths: &RenderWidths,
-) {
-    if message.kind.is_margin_message() {
-        let is_assistant = matches!(
-            message.kind,
-            SessionMessageKind::AssistantText { .. } | SessionMessageKind::AssistantToolUse { .. }
-        );
-        let is_tool_result = matches!(message.kind, SessionMessageKind::ToolResult { .. });
-        let lines = cached_or_compute_lines(cache, idx, widths.user_content_width, || {
-            session_message_lines(message, widths.user_content_width)
-        });
-        let (margin_fn, timestamp_ms) = if is_tool_result {
-            (add_tool_result_margin_lines as MarginFn, None)
-        } else if is_assistant {
-            (add_assistant_margin_lines as MarginFn, None)
-        } else {
-            (
-                add_user_margin_lines as MarginFn,
-                Some(message.created_at.as_millis()),
-            )
-        };
-        render_margin_lines(
-            frame,
-            area,
-            lines,
-            rows_remaining,
-            y,
-            rows_to_skip,
-            widths.user_content_width,
-            Style::default().bg(BG_SHADE),
-            margin_fn,
-            timestamp_ms,
-        );
-    } else {
-        let lines = cached_or_compute_lines(cache, idx, widths.content_width, || {
-            session_message_lines(message, widths.content_width)
-        });
-        render_history_lines(
-            frame,
-            area,
-            lines,
-            rows_remaining,
-            y,
-            rows_to_skip,
-            widths.content_width,
-        );
-    }
-}
-
-/// Render a `HistoryItem::Streaming` — text that changes every frame (never cached).
-/// Renders with the assistant margin style (blue `┃` bar + dark-gray shading)
-/// so the user sees the same visual treatment during streaming as after the
-/// final `SessionMessageAppended` arrives.
-fn render_item_streaming(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    text: &StreamingText,
-    rows_remaining: &mut usize,
-    y: &mut u16,
-    rows_to_skip: &mut usize,
-    user_content_width: u16,
-) {
-    let lines = streaming_text_lines(text, user_content_width);
-    render_margin_lines(
-        frame,
-        area,
-        lines,
-        rows_remaining,
-        y,
-        rows_to_skip,
-        user_content_width,
-        Style::default().bg(BG_SHADE),
-        add_assistant_margin_lines,
-        None,
-    );
-}
-
-/// Render the common image-block frame (bordered title block) clipped to the
-/// visible viewport.  Returns the inner content area and whether the item is
-/// fully visible (no vertical clipping).
-///
-/// Takes a `&ImageMetadata` rather than a `&RenderedImage` so callers can
-/// use it while a mutable borrow on `protocol` is active.
-fn render_image_frame(
-    frame: &mut Frame<'_>,
-    meta: &ImageMetadata,
-    area: Rect,
-    full_height: usize,
-    rows_remaining: &mut usize,
-    y: &mut u16,
-    rows_to_skip: &mut usize,
-) -> Option<(Rect, bool)> {
-    let (_, visible_height) = clipped_area(full_height, rows_to_skip, rows_remaining, y)?;
-    let fully_visible = visible_height >= full_height;
-    let h = visible_height as u16;
-    let block = Block::default().title(format!(
-        "image {} ({} {}x{})",
-        meta.image_id, meta.mime_type, meta.width, meta.height
-    ));
-    let rect = Rect {
-        x: area.x,
-        y: *y,
-        width: area.width,
-        height: h,
-    };
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-    Some((inner, fully_visible))
-}
-
-/// Render a `HistoryItem::ToolResultStream` — progressive tool result content
-/// that changes every frame (never cached). Uses the same red margin styling
-/// as the final `ToolResult`.
-fn render_item_tool_result_stream(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    data: &ToolResultStreamData,
-    rows_remaining: &mut usize,
-    y: &mut u16,
-    rows_to_skip: &mut usize,
-    user_content_width: u16,
-) {
-    let msg = SessionMessage {
-        message_id: data.message_id,
-        parent_id: None,
-        created_at: TimestampMs::now(),
-        kind: SessionMessageKind::ToolResult {
-            call_id: data.call_id.clone(),
-            name: data.tool_name.clone(),
-            content: data.accumulated_text.clone(),
-            is_error: data.is_error,
-        },
-        deleted: false,
-    };
-    let lines = session_message_lines(&msg, user_content_width);
-    render_margin_lines(
-        frame,
-        area,
-        lines,
-        rows_remaining,
-        y,
-        rows_to_skip,
-        user_content_width,
-        Style::default().bg(BG_SHADE),
-        add_tool_result_margin_lines as MarginFn,
-        None,
-    );
-}
-
-/// Render a `HistoryItem::Image`, clipped to the visible scroll area.
-/// The block frame (title) is shown whenever visible; the actual image
-/// pixels are only rendered when the item is fully visible so that
-/// ratatui-image does not rescale the protocol to the clipped area.
-/// While encoding is pending, a placeholder block is shown instead.
-fn render_item_image(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    history_idx: usize,
-    rows_remaining: &mut usize,
-    y: &mut u16,
-    rows_to_skip: &mut usize,
+    turn_id: u32,
+    img_idx: usize,
     app: &mut App,
 ) {
-    let inline_size = Size::new(area.width, (area.height / 2).max(1));
+    let inline_size = Size::new(area.width, IMAGE_BLOCK_HEIGHT);
 
-    // Fast path — already encoded at target size.
+    // Extract data we need while the borrow is active.
+    let (needs_job, data, meta) = match app
+        .rendered_images
+        .get_mut(&turn_id)
+        .and_then(|images| images.get_mut(&img_idx))
     {
-        let HistoryItem::Image(ref mut image) = app.client.history[history_idx] else {
-            return;
-        };
-        if let Some(protocol) = image.protocols.get_mut(&inline_size) {
-            let rendered_at = protocol.size_for(tai_tui::IMAGE_RESIZE, inline_size);
-            let full_height = rendered_at.height.max(1) as usize;
-            if let Some((inner, fully_visible)) = render_image_frame(
-                frame,
-                &image.metadata,
-                area,
-                full_height,
-                rows_remaining,
-                y,
-                rows_to_skip,
-            ) {
-                // Only render the actual image pixels when the item is
-                // fully visible — partial visibility means the scroll
-                // clipped the area, and ratatui-image would rescale the
-                // protocol to the clipped size, causing visual reflow.
-                if fully_visible {
-                    frame.render_stateful_widget(
-                        StatefulImage::new().resize(tai_tui::IMAGE_RESIZE),
-                        inner,
-                        protocol,
-                    );
-                }
+        Some(img) => {
+            if let Some(protocol) = img.protocols.get_mut(&inline_size) {
+                let title = format!(
+                    "image {} ({} {}x{})",
+                    turn_id, img.metadata.mime_type, img.metadata.width, img.metadata.height,
+                );
+                let block = Block::default().title(title);
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+                frame.render_stateful_widget(
+                    StatefulImage::new().resize(tai_tui::IMAGE_RESIZE),
+                    inner,
+                    protocol,
+                );
+                return;
             }
+            (
+                img.pending_job.is_none()
+                    && !img.failed_sizes.contains(&inline_size)
+                    && !img.protocols.contains_key(&inline_size),
+                img.data.clone(),
+                img.metadata.clone(),
+            )
+        }
+        None => {
+            let block = Block::default().title(format!("image {turn_id}[{img_idx}] (pending)"));
+            frame.render_widget(block, area);
             return;
         }
+    };
+
+    if needs_job {
+        app.submit_image_job(
+            turn_id,
+            img_idx,
+            data,
+            meta,
+            inline_size,
+            tai_tui::IMAGE_RESIZE,
+        );
     }
 
-    submit_image_job_if_needed(app, history_idx, inline_size);
-
-    // Placeholder block while encoding is pending or failed.
-    let HistoryItem::Image(ref image) = app.client.history[history_idx] else {
-        return;
-    };
-    let _ = render_image_frame(
-        frame,
-        &image.metadata,
-        area,
-        inline_size.height.max(1) as usize,
-        rows_remaining,
-        y,
-        rows_to_skip,
-    );
+    // Render placeholder frame while encoding is pending.
+    // Reconstruct metadata fields from turn's displayed_images record.
+    let placeholder_title = app
+        .session_view
+        .turns
+        .get(&turn_id)
+        .and_then(|t| t.displayed_images.get(img_idx))
+        .map(|r| {
+            format!(
+                "image {} ({} {}x{})",
+                turn_id, r.metadata.mime_type, r.metadata.width, r.metadata.height,
+            )
+        })
+        .unwrap_or_else(|| format!("image {turn_id}[{img_idx}] (pending)"));
+    let block = Block::default().title(placeholder_title);
+    frame.render_widget(block, area);
 }
 
 // ── Session Manager ──────────────────────────────────────────
@@ -1064,7 +592,6 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     let inner = block.inner(chunks[0]);
     frame.render_widget(block, chunks[0]);
 
-    // Reserve 1 column on the right for the scrollbar
     let list_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -1074,7 +601,6 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     let max_rows = list_chunks[0].height as usize;
     let total_items = app.session_mgr.sessions.len();
 
-    // Show error message if one is set (e.g. daemon locked when creating).
     if let Some(ref err) = app.session_mgr.error {
         let err_style = Style::default().fg(Color::Red);
         let err_text = format!("Error: {err}");
@@ -1123,8 +649,8 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             };
             let status_style = status_color(&session.status);
             let row = format!(
-                "{sel}{att} {:>4}  \"{title}\"  {model_display}  — {} messages  [",
-                session.session_id, session.message_count,
+                "{sel}{att} {:>4}  \"{title}\"  {model_display}  — {} turns  [",
+                session.session_id, session.turn_count,
             );
 
             let style = if is_selected {
@@ -1143,7 +669,6 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_widget(paragraph, list_chunks[0]);
     }
 
-    // ── Scrollbar ────────────────────────────────────────────
     if total_items > max_rows {
         frame.render_stateful_widget(
             vertical_scrollbar(),
@@ -1155,7 +680,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let status = if let Some((_id, title)) = &app.session_mgr.confirm_delete {
-        Paragraph::new(Line::from(format!(" Delete “{title}”? (y/N)  ")))
+        Paragraph::new(Line::from(format!(" Delete \"{title}\"? (y/N)  ")))
     } else {
         Paragraph::new(Line::from(format!(
             " <j/k nav>  <Enter switch>  <i details>  <n new>  <d delete>  <Esc back>  —  {} sessions",
@@ -1202,7 +727,7 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                 "Created:       {}",
                 format_timestamp(detail.created_at)
             )),
-            Line::from(format!("Message Count: {}", detail.message_count)),
+            Line::from(format!("Turn Count:    {}", detail.turn_count)),
             Line::from(format!(
                 "Max Turns:     {}",
                 detail
@@ -1261,9 +786,6 @@ fn format_timestamp(ts_secs: i64) -> String {
 
     use chrono::{Local, TimeZone};
 
-    // timestamp_opt handles DST ambiguity and out-of-range inputs.
-    // If the result is ambiguous or invalid we fall back to a safe epoch
-    // display rather than panicking.
     let dt = match Local.timestamp_opt(ts_secs, 0) {
         chrono::LocalResult::Single(dt) => dt,
         _ => return "-".to_string(),
@@ -1280,7 +802,6 @@ fn format_timestamp(ts_secs: i64) -> String {
 // ── AI Provider Accounts ──────────────────────────────────
 
 fn render_ai_providers(frame: &mut Frame<'_>, app: &mut App) {
-    // If credential input is active, render that instead of the normal view.
     if app.ai_providers.credential_target.is_some() {
         render_ai_providers_credential(frame, app);
         return;
@@ -1304,7 +825,6 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
     let inner = block.inner(chunks[0]);
     frame.render_widget(block, chunks[0]);
 
-    // Reserve 1 column on the right for the scrollbar
     let list_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -1321,8 +841,6 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         let mut lines: Vec<Line> = Vec::new();
 
         for i in scroll..total_items {
-            // Each account takes 3 lines (name + provider + credential).
-            // If we would exceed the available rows, stop.
             if lines.len() + 3 > max_rows && i != scroll {
                 break;
             }
@@ -1337,12 +855,10 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
                 Style::default()
             };
 
-            // Line 1: name
             let name_line = format!("{sel} {} ", account.name);
             let name_spans = vec![ratatui::text::Span::styled(name_line, style)];
             lines.push(Line::from(name_spans));
 
-            // Line 2: provider (indented, dimmer style)
             let provider_label = format!("   Provider: {}", account.provider);
             let provider_style = if is_selected {
                 Style::default().bg(Color::Blue).fg(Color::White)
@@ -1354,7 +870,6 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
                 provider_style,
             )]));
 
-            // Line 3: credential status (indented, dimmer style)
             let cred_label = if account.has_credential {
                 "   Credential: yes".to_string()
             } else {
@@ -1371,7 +886,6 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
                 cred_label, cred_style,
             )]));
 
-            // Blank line separator between cards (but not after the last one)
             if lines.len() < max_rows && i + 1 < total_items {
                 lines.push(Line::from(Span::styled(String::new(), Style::default())));
             }
@@ -1381,9 +895,6 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_widget(paragraph, list_chunks[0]);
     }
 
-    // ── Scrollbar ────────────────────────────────────────────
-    // Each account entry takes AI_PROVIDER_ITEM_LINES terminal rows, so the
-    // number of items visible at once is max_rows / AI_PROVIDER_ITEM_LINES.
     let items_per_page = (max_rows / AI_PROVIDER_ITEM_LINES).max(1);
     if total_items > items_per_page {
         frame.render_stateful_widget(
@@ -1404,21 +915,6 @@ fn render_ai_providers_list(frame: &mut Frame<'_>, app: &mut App) {
         )))
     };
     frame.render_widget(status, chunks[1]);
-}
-
-/// Render the credential-input overlay for setting an API key on an account.
-/// Position the terminal cursor at the insertion point of a text field
-/// rendered inside a Paragraph at `area[line]`.
-fn set_input_cursor(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    line: u16,
-    prefix_width: u16,
-    text_before_cursor: &str,
-) {
-    let x = area.x + prefix_width + display_width(text_before_cursor) as u16;
-    let y = area.y + line;
-    frame.set_cursor_position((x, y));
 }
 
 fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
@@ -1454,7 +950,6 @@ fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
 
     let text = &app.ai_providers.credential_input.text;
     let cursor = app.ai_providers.credential_input.cursor;
-    // Mask the key: show first 4 + last 4 if long enough
     let masked = if text.is_empty() {
         String::new()
     } else if text.len() > 12 {
@@ -1481,7 +976,6 @@ fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);
 
-    // Set cursor position for the masked credential input
     let masked_before = if text.is_empty() {
         ""
     } else if cursor >= text.len() {
@@ -1510,28 +1004,22 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
     let inner = block.inner(chunks[0]);
     frame.render_widget(block, chunks[0]);
 
-    // ── Form layout ──────────────────────────────────────────
-    // Each bordered TextPrompt needs 3 lines. SelectPrompt takes
-    // the remaining space so it can scroll if the terminal is
-    // too short for all provider options.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Name field
-            Constraint::Min(3),    // Provider dropdown
-            Constraint::Length(3), // API Key field
-            Constraint::Length(1), // Error line
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
         ])
         .split(inner);
 
     let border_style = Style::default().fg(Color::Cyan);
 
-    // ── Name field ───────────────────────────────────────────
     let name_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("Name:"))
         .with_block(Block::bordered().border_style(border_style));
     (&name_prompt).draw(frame, rows[0], &mut app.ai_providers.new_name_state);
 
-    // ── Provider dropdown ────────────────────────────────────
     let options: SelectOptionList = PROVIDER_OPTIONS
         .iter()
         .map(|p| SelectOption::new(p.display_name))
@@ -1540,13 +1028,11 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
     let provider_prompt = SelectPrompt::new(std::borrow::Cow::Borrowed("Provider:"), options);
     provider_prompt.draw(frame, rows[1], &mut app.ai_providers.new_provider_state);
 
-    // ── API Key field ────────────────────────────────────────
     let key_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("API Key:"))
         .with_block(Block::bordered().border_style(border_style))
         .with_render_style(TextRenderStyle::Password);
     (&key_prompt).draw(frame, rows[2], &mut app.ai_providers.new_api_key_state);
 
-    // ── Error message ────────────────────────────────────────
     if let Some(ref err) = app.ai_providers.add_error {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -1557,9 +1043,20 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
         );
     }
 
-    // Footer
     let status = Paragraph::new(Line::from(" <Enter next>  <Esc cancel>"));
     frame.render_widget(status, chunks[1]);
+}
+
+fn set_input_cursor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    line: u16,
+    prefix_width: u16,
+    text_before_cursor: &str,
+) {
+    let x = area.x + prefix_width + display_width(text_before_cursor) as u16;
+    let y = area.y + line;
+    frame.set_cursor_position((x, y));
 }
 
 pub(crate) fn status_display(status: &SessionStatus) -> (String, Color) {
@@ -1589,496 +1086,4 @@ pub(crate) fn format_status(status: &SessionStatus) -> String {
 
 pub(crate) fn status_color(status: &SessionStatus) -> Color {
     status_display(status).1
-}
-
-// ── Diff rendering ─────────────────────────────────────────
-
-/// Render a side-by-side diff into the terminal frame.
-///
-/// The diff is first converted into aligned left/right pane rows via
-/// `build_diff_panes`, then clipped to the visible viewport through the
-/// `rows_to_skip` / `rows_remaining` scrolling mechanism (shared with text
-/// rendering). Each row is split into two panes separated by a `│` gutter.
-/// Deletions appear highlighted in red on the left; additions in green on the right.
-pub(crate) fn render_history_diff(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    diffs: &[FileDiff],
-    rows_remaining: &mut usize,
-    y: &mut u16,
-    rows_to_skip: &mut usize,
-) {
-    use crate::diff_render::diff_display_height;
-
-    let raw_height = diff_display_height(diffs);
-    let full_height = raw_height + 2; // +1 for leading blank, +1 for trailing blank
-
-    let Some((top_line, visible_height)) =
-        clipped_area(full_height, rows_to_skip, rows_remaining, y)
-    else {
-        return;
-    };
-
-    let rect = Rect {
-        x: area.x,
-        y: *y,
-        width: area.width,
-        height: visible_height as u16,
-    };
-
-    let pane_width = if area.width > 4 {
-        (area.width - 2) / 2
-    } else {
-        1
-    };
-
-    let rows = build_diff_panes(diffs);
-
-    let separator_style = Style::default().fg(Color::DarkGray);
-
-    // Build diff lines with leading and trailing blank lines for vertical spacing.
-    let mut diff_lines: Vec<Line> = Vec::with_capacity(rows.len() + 2);
-    // Leading blank line
-    diff_lines.push(Line::from(Span::styled(String::new(), Style::default())));
-    for row in &rows {
-        let mut spans = Vec::new();
-        spans.extend(diff_cell_spans(
-            &row.left_spans,
-            row.left_kind,
-            pane_width,
-            true,
-        ));
-        spans.push(ratatui::text::Span::styled(
-            "│".to_string(),
-            separator_style,
-        ));
-        spans.extend(diff_cell_spans(
-            &row.right_spans,
-            row.right_kind,
-            pane_width,
-            false,
-        ));
-        diff_lines.push(Line::from(spans));
-    }
-    // Trailing blank line
-    diff_lines.push(Line::from(Span::styled(String::new(), Style::default())));
-
-    let visible_lines: Vec<Line> = diff_lines
-        .into_iter()
-        .skip(top_line)
-        .take(visible_height)
-        .collect();
-
-    let paragraph = Paragraph::new(visible_lines);
-    frame.render_widget(paragraph, rect);
-}
-
-/// Return the diff foreground colour for a given line kind and side.
-/// Used as a fallback when no syntax highlighting is present.
-fn diff_fg(kind: DiffLineKind, is_left: bool) -> Option<Color> {
-    match (kind, is_left) {
-        (DiffLineKind::Deletion, true) => Some(Color::Red),
-        (DiffLineKind::Addition, false) => Some(Color::Green),
-        _ => None,
-    }
-}
-
-/// Apply diff background styling to pre-computed syntax-highlighted spans.
-///
-/// * Overlays the red (deletion) or green (addition) background on each span
-///   while preserving the syntax foreground colour from syntect.
-/// * Pads with spaces when the content is narrower than the pane so the
-///   background colour fills the entire cell.
-/// * Truncates content that exceeds the pane width, appending `…`.
-pub(crate) fn diff_cell_spans(
-    spans: &[ratatui::text::Span<'static>],
-    kind: DiffLineKind,
-    pane_width: u16,
-    is_left: bool,
-) -> Vec<ratatui::text::Span<'static>> {
-    let pane_width = pane_width as usize;
-
-    let diff_bg = match (kind, is_left) {
-        (DiffLineKind::Deletion, true) => Some(Color::Rgb(80, 0, 0)),
-        (DiffLineKind::Addition, false) => Some(Color::Rgb(0, 80, 0)),
-        _ => None,
-    };
-
-    // Apply background to each span while keeping the syntax foreground.
-    // When no syntax foreground is set (plain text), fall back to the diff
-    // foreground colour (red for deletions, green for additions) so that
-    // header / hunk-header rows and plain-text file types still get coloured.
-    let styled: Vec<ratatui::text::Span<'static>> = spans
-        .iter()
-        .map(|s| {
-            let style = match diff_bg {
-                Some(bg) => ratatui::style::Style {
-                    fg: s.style.fg.or_else(|| diff_fg(kind, is_left)),
-                    ..ratatui::style::Style::default()
-                }
-                .bg(bg),
-                None => s.style,
-            };
-            ratatui::text::Span::styled(s.content.clone(), style)
-        })
-        .collect();
-
-    let total: usize = styled.iter().map(|s| display_width(&s.content)).sum();
-
-    if total > pane_width {
-        // Truncate spans to fit pane_width, preserving syntax colours on
-        // the remaining content and appending `…` at the end.
-        let mut result = Vec::new();
-        let mut remaining = pane_width.saturating_sub(1);
-        for span in styled {
-            let w = display_width(&span.content);
-            if w <= remaining {
-                result.push(span);
-                remaining -= w;
-            } else if remaining > 0 {
-                // Walk characters by display width, not by scalar count,
-                // so CJK/emoji (width 2) are handled correctly.
-                let truncated: String = span
-                    .content
-                    .chars()
-                    .scan(remaining, |budget, c| {
-                        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-                        if *budget >= cw {
-                            *budget -= cw;
-                            Some(c)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                result.push(ratatui::text::Span::styled(truncated, span.style));
-                break;
-            } else {
-                break;
-            }
-        }
-        let ellipsis_style = diff_bg.map_or(Style::default(), |b| Style::default().bg(b));
-        result.push(ratatui::text::Span::styled("…".to_string(), ellipsis_style));
-        result
-    } else {
-        // Always pad to pane_width so the `│` separator stays at a fixed
-        // column (every row's left and right cells must have the same byte
-        // width).  The padding span uses the diff background when present,
-        // otherwise default style.
-        let mut result = styled;
-        let pad_style = diff_bg.map_or(Style::default(), |b| {
-            ratatui::style::Style {
-                fg: None,
-                ..ratatui::style::Style::default()
-            }
-            .bg(b)
-        });
-        result.push(ratatui::text::Span::styled(
-            " ".repeat(pane_width.saturating_sub(total)),
-            pad_style,
-        ));
-        result
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── add_user_margin_lines ─────────────────────────────────────────────
-
-    #[test]
-    fn user_margin_lines_structure() {
-        let cw: u16 = 20;
-        let content = vec![Line::from("hello")];
-        let (lines, total) = add_user_margin_lines(content, cw, None);
-
-        let total_width = cw as usize + 9;
-
-        // 2 separators + 2 padding + 1 content = 5 rows
-        assert_eq!(total, 5, "should have 2 sep + 2 pad + 1 content = 5 rows");
-        assert_eq!(lines.len(), 5);
-
-        // Row 0: separator (no shading, no green line)
-        assert!(
-            !lines[0].to_string().contains('┃'),
-            "separator should not have green line"
-        );
-
-        // Row 1: padding row (has ┃)
-        assert!(
-            lines[1].to_string().contains('┃'),
-            "padding row should have green line"
-        );
-
-        // Row 2: text row
-        assert!(
-            lines[2].to_string().contains('┃'),
-            "text row should have green line"
-        );
-        assert!(
-            lines[2].to_string().contains("hello"),
-            "text row should contain content"
-        );
-
-        // All rows should have the same total width
-        for (i, line) in lines.iter().enumerate() {
-            assert_eq!(
-                line.spans
-                    .iter()
-                    .map(|s| display_width(&s.content))
-                    .sum::<usize>(),
-                total_width,
-                "row {i} display width should be {total_width}"
-            );
-        }
-
-        // Row 3: padding row (same structure as row 1)
-        assert_eq!(
-            lines[3].spans.len(),
-            lines[1].spans.len(),
-            "padding rows should have same span count"
-        );
-
-        // Row 4: separator (same structure as row 0)
-        assert_eq!(
-            lines[4].spans.len(),
-            lines[0].spans.len(),
-            "separator rows should have same span count"
-        );
-    }
-
-    #[test]
-    fn user_margin_lines_style_spans() {
-        let content = vec![Line::from("text")];
-        let (lines, _) = add_user_margin_lines(content, 20, None);
-        let spans = &lines[2].spans; // text row
-
-        // Span 0: 2 chars, no shading (bg = Reset)
-        assert_eq!(spans[0].content, "  ");
-        assert_eq!(spans[0].style.bg, Some(Color::Reset));
-
-        // Span 1: ┃, green fg, no shading
-        assert_eq!(spans[1].content, "┃");
-        assert_eq!(spans[1].style.fg, Some(Color::Green));
-        assert_eq!(spans[1].style.bg, Some(Color::Reset));
-
-        // Span 2: 2 chars of left padding, shaded (bg explicitly set)
-        assert_eq!(spans[2].content, "  ");
-        assert_eq!(spans[2].style.bg, Some(BG_SHADE));
-
-        // Span 3: text content (bg inherited from Paragraph style at render time)
-        assert_eq!(spans[3].content, "text");
-
-        // Span 4: fill to content_width (bg explicitly set)
-        assert_eq!(spans[4].style.bg, Some(BG_SHADE));
-        assert_eq!(spans[4].content.len(), 16); // 20 - 4 text length
-
-        // Span 5: right padding 2 cols, shaded (bg explicitly set)
-        assert_eq!(spans[5].content, "  ");
-        assert_eq!(spans[5].style.bg, Some(BG_SHADE));
-
-        // Span 6: right margin 2 cols, no shading
-        assert_eq!(spans[6].content, "  ");
-        assert_eq!(spans[6].style.bg, Some(Color::Reset));
-    }
-
-    #[test]
-    fn user_margin_lines_multiple_content_lines() {
-        let content = vec![Line::from("line one"), Line::from("line two")];
-        let (lines, total) = add_user_margin_lines(content, 30, None);
-        // 2 sep + 2 pad + 2 content = 6
-        assert_eq!(total, 6);
-
-        assert!(lines[2].to_string().contains("line one"));
-        assert!(lines[3].to_string().contains("line two"));
-    }
-
-    #[test]
-    fn user_margin_lines_empty_content() {
-        let content = vec![Line::from(Span::styled(String::new(), Style::default()))];
-        let (lines, total) = add_user_margin_lines(content, 20, None);
-        // 2 sep + 2 pad + 1 content = 5
-        assert_eq!(total, 5);
-        // The text row should have the green line and shaded area but no text
-        let text_row = &lines[2];
-        assert!(text_row.to_string().contains('┃'));
-    }
-
-    // ── timestamp in bottom separator ───────────────────────────────────
-
-    #[test]
-    fn user_margin_lines_with_timestamp_renders_in_bottom_separator() {
-        // Use a deterministic timestamp: epoch second 1000000000 = 2001-09-09
-        let ts_ms = 1_000_000_000_000i64;
-        let cw: u16 = 30;
-        let content = vec![Line::from("test")];
-        let (lines, total) = add_user_margin_lines(content, cw, Some(ts_ms));
-
-        let total_width = cw as usize + 9; // 39
-
-        // 2 sep + 2 pad + 1 content = 5 rows
-        assert_eq!(total, 5);
-        assert_eq!(lines.len(), 5);
-
-        // Row 4 is the bottom separator — should contain a timestamp
-        let bottom = &lines[4];
-        let bottom_text = bottom.to_string().trim().to_string();
-        assert!(
-            !bottom_text.is_empty(),
-            "bottom separator should contain a formatted timestamp, got empty"
-        );
-        // Must contain a colon (HH:MM or YYYY-MM-DD HH:MM)
-        assert!(
-            bottom_text.contains(':'),
-            "bottom separator should contain formatted time with colon, got: {bottom_text:?}"
-        );
-
-        // Bottom separator should span the full width
-        let bottom_width: usize = bottom.spans.iter().map(|s| display_width(&s.content)).sum();
-        assert_eq!(
-            bottom_width, total_width,
-            "bottom separator should span total_width"
-        );
-
-        // First span is left fill (no shading)
-        assert_eq!(bottom.spans[0].style.bg, Some(Color::Reset));
-
-        // Timestamp span should also have no shading
-        assert_eq!(bottom.spans[1].style.bg, Some(Color::Reset));
-
-        // Trailing 4 columns of clean padding (no shading)
-        assert_eq!(bottom.spans[2].style.bg, Some(Color::Reset));
-        assert_eq!(bottom.spans[2].content, "    ");
-    }
-
-    #[test]
-    fn user_margin_lines_with_timestamp_same_day_shows_hhmm() {
-        use chrono::Local;
-        // Current time in ms — format_timestamp compares against its own
-        // Local::now() call, so the same-day branch is always taken.
-        let now_ms = Local::now().timestamp_millis();
-        let content = vec![Line::from("test")];
-        let (lines, _) = add_user_margin_lines(content, 30, Some(now_ms));
-
-        let bottom_text = lines[4].to_string();
-        // HH:MM is 5 chars (e.g. "14:30")
-        let ts_part = bottom_text.trim();
-        assert_eq!(
-            ts_part.len(),
-            5,
-            "same-day format should be HH:MM, got: {ts_part:?}"
-        );
-        assert!(
-            ts_part.contains(':'),
-            "HH:MM should contain a colon, got: {ts_part:?}"
-        );
-    }
-
-    #[test]
-    fn user_margin_lines_with_timestamp_previous_day_shows_date_time() {
-        use chrono::Local;
-        // 48 hours ago in ms — guaranteed different date from Local::now().
-        let two_days_ago_ms = Local::now().timestamp_millis() - 172_800_000;
-        let content = vec![Line::from("test")];
-        let (lines, _) = add_user_margin_lines(content, 30, Some(two_days_ago_ms));
-
-        let bottom_text = lines[4].to_string();
-        // YYYY-MM-DD HH:MM is 16 chars
-        let ts_part = bottom_text.trim();
-        assert_eq!(
-            ts_part.len(),
-            16,
-            "previous-day format should be YYYY-MM-DD HH:MM (16 chars), got: {ts_part:?}"
-        );
-        assert!(
-            ts_part.contains('-'),
-            "date should contain hyphens, got: {ts_part:?}"
-        );
-        assert!(
-            ts_part.contains(':'),
-            "time should contain a colon, got: {ts_part:?}"
-        );
-    }
-
-    #[test]
-    fn add_assistant_margin_lines_no_timestamp() {
-        // Assistant messages pass None — bottom separator should be blank
-        let content = vec![Line::from("test")];
-        let cw: u16 = 30;
-        let (lines, total) = add_assistant_margin_lines(content, cw, None);
-
-        let total_width = cw as usize + 9;
-        assert_eq!(total, 5);
-
-        // Bottom separator should have no timestamp — just blank
-        let bottom = &lines[4];
-        let bottom_width: usize = bottom.spans.iter().map(|s| display_width(&s.content)).sum();
-        assert_eq!(
-            bottom_width, total_width,
-            "blank bottom separator should span full width"
-        );
-        assert_eq!(
-            bottom.to_string().trim(),
-            "",
-            "assistant bottom separator should be blank"
-        );
-    }
-
-    #[test]
-    fn user_margin_lines_timestamp_edge_zero() {
-        // Zero / negative timestamps should render as "-"
-        let content = vec![Line::from("test")];
-        let (lines, _) = add_user_margin_lines(content, 30, Some(0));
-        let bottom_text = lines[4].to_string();
-        assert!(
-            bottom_text.contains('-'),
-            "zero timestamp should render as '-', got: {bottom_text:?}"
-        );
-    }
-
-    // ── format_timestamp ─────────────────────────────────────────────────
-
-    #[test]
-    fn format_timestamp_negative_or_zero_returns_dash() {
-        assert_eq!(format_timestamp(0), "-");
-        assert_eq!(format_timestamp(-1), "-");
-        assert_eq!(format_timestamp(-999), "-");
-    }
-
-    #[test]
-    fn format_timestamp_same_day_returns_hhmm() {
-        let now_secs = chrono::Local::now().timestamp();
-        let result = format_timestamp(now_secs);
-        assert_eq!(
-            result.len(),
-            5,
-            "same-day format should be HH:MM, got: {result:?}"
-        );
-        assert!(
-            result.contains(':'),
-            "HH:MM should contain a colon, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn format_timestamp_yesterday_returns_date_time() {
-        let yesterday_secs = chrono::Local::now().timestamp() - 86400;
-        let result = format_timestamp(yesterday_secs);
-        assert_eq!(
-            result.len(),
-            16,
-            "previous-day format should be YYYY-MM-DD HH:MM (16 chars), got: {result:?}"
-        );
-        assert!(
-            result.contains('-'),
-            "date should contain hyphens, got: {result:?}"
-        );
-        assert!(
-            result.contains(':'),
-            "time should contain a colon, got: {result:?}"
-        );
-    }
 }

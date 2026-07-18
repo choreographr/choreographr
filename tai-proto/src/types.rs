@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
-
-pub const MAX_IMAGE_CHUNK_SIZE: usize = 64 * 1024;
+use std::collections::BTreeMap;
 
 /// ThinkingEffort — controls how much reasoning/thinking the model performs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +142,28 @@ pub struct AssistantToolCallRecord {
     pub arguments_json: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolResultRecord {
+    pub call_id: String,
+    pub name: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Turn {
+    pub created_at: TimestampMs,
+    pub undone: bool,
+    pub error: Option<String>,
+    pub user_text: Option<String>,
+    pub assistant_text: Option<String>,
+    pub assistant_reasoning: Option<String>,
+    pub tool_calls: Vec<AssistantToolCallRecord>,
+    pub token_usage: Option<TokenUsage>,
+    pub tool_results: Vec<ToolResultRecord>,
+    pub displayed_images: Vec<DisplayedImageRecord>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SessionStatus {
@@ -163,84 +184,6 @@ pub enum SessionStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum SessionMessageKind {
-    SystemText {
-        content: String,
-    },
-    UserText {
-        content: String,
-    },
-    AssistantText {
-        content: String,
-        reasoning: Option<String>,
-        /// Token usage for this assistant response, if reported by the provider.
-        #[serde(default)]
-        token_usage: Option<TokenUsage>,
-    },
-    AssistantToolUse {
-        content: Option<String>,
-        tool_calls: Vec<AssistantToolCallRecord>,
-        reasoning: Option<String>,
-        /// Token usage for this assistant response, if reported by the provider.
-        #[serde(default)]
-        token_usage: Option<TokenUsage>,
-    },
-    ToolResult {
-        call_id: String,
-        name: String,
-        content: String,
-        is_error: bool,
-    },
-    DisplayedImage(DisplayedImageRecord),
-}
-
-impl SessionMessageKind {
-    /// Returns `true` for variants rendered with a vertical accent bar and
-    /// shaded background ("margin styling"): `AssistantText`,
-    /// `AssistantToolUse`, `ToolResult`, and `UserText`.
-    ///
-    /// Non-margin variants (`SystemText`, `DisplayedImage`) render as plain
-    /// text blocks without the bar.
-    ///
-    /// Both `tai-tui::state::HistoryViewport::item_height` and
-    /// `tai-tui::render::render_item_session_message` use this so that the
-    /// margin-variant set is defined in exactly one place.
-    pub fn is_margin_message(&self) -> bool {
-        matches!(
-            self,
-            SessionMessageKind::AssistantText { .. }
-                | SessionMessageKind::AssistantToolUse { .. }
-                | SessionMessageKind::ToolResult { .. }
-                | SessionMessageKind::UserText { .. }
-        )
-    }
-}
-
-/// A session message with a creation timestamp.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionMessage {
-    pub message_id: u32,
-    pub parent_id: Option<u32>,
-    pub created_at: TimestampMs,
-    pub kind: SessionMessageKind,
-    pub deleted: bool,
-}
-
-impl SessionMessage {
-    /// Create a new session message with the current timestamp.
-    pub fn now(kind: SessionMessageKind) -> Self {
-        Self {
-            message_id: 0,
-            parent_id: None,
-            created_at: TimestampMs::now(),
-            kind,
-            deleted: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSummary {
     pub session_id: u64,
     pub title: Option<String>,
@@ -249,7 +192,7 @@ pub struct SessionSummary {
     pub parent_session_id: Option<u64>,
     pub working_dir: Option<String>,
     pub created_at: i64,
-    pub message_count: u32,
+    pub turn_count: u32,
     pub max_turns: Option<u32>,
     pub status: SessionStatus,
     pub active_tool_groups: Vec<String>,
@@ -292,9 +235,6 @@ pub enum ClientMessage {
     RunInput {
         request_id: u32,
         input: Vec<u8>,
-    },
-    TestImage {
-        request_id: u32,
     },
     Cancel {
         request_id: u32,
@@ -355,9 +295,6 @@ pub enum OutputStream {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageMetadata {
-    /// Image identifier for the live streaming protocol (`ImageStart`/`Chunk`/`End`).
-    /// Meaningless for persisted `DisplayedImage` records (always set to `0`).
-    pub image_id: u32,
     pub mime_type: String,
     pub width: u32,
     pub height: u32,
@@ -388,7 +325,7 @@ pub enum DaemonMessage {
         parent_session_id: Option<u64>,
         working_dir: Option<String>,
         max_turns: Option<u32>,
-        messages: Vec<SessionMessage>,
+        turns: BTreeMap<u32, Turn>,
         active_tool_groups: Vec<String>,
         /// Accumulated token usage for this session, if available.
         #[serde(default)]
@@ -404,8 +341,13 @@ pub enum DaemonMessage {
         #[serde(default)]
         status: SessionStatus,
     },
-    SessionMessageAppended {
-        message: SessionMessage,
+    TurnAppended {
+        turn_id: u32,
+        turn: Turn,
+    },
+    TurnFinalized {
+        turn_id: u32,
+        turn: Turn,
     },
     SessionStatusChanged {
         session_id: u64,
@@ -417,14 +359,13 @@ pub enum DaemonMessage {
     },
     Started {
         request_id: u32,
-        message_id: u32,
+        turn_id: u32,
     },
     ToolCallStarted {
         request_id: u32,
         call_id: String,
         tool_name: String,
         arguments_json: String,
-        message_id: u32,
     },
     ToolCallFinished {
         request_id: u32,
@@ -442,28 +383,10 @@ pub enum DaemonMessage {
         tool_name: String,
         error: String,
     },
-    ToolCallOutput {
-        request_id: u32,
-        call_id: String,
-        data: Vec<u8>,
-    },
     OutputChunk {
         request_id: u32,
         stream: OutputStream,
         data: Vec<u8>,
-    },
-    ImageStart {
-        request_id: u32,
-        metadata: ImageMetadata,
-    },
-    ImageChunk {
-        request_id: u32,
-        image_id: u32,
-        data: Vec<u8>,
-    },
-    ImageEnd {
-        request_id: u32,
-        image_id: u32,
     },
     Done {
         request_id: u32,
@@ -522,11 +445,11 @@ pub enum DaemonMessage {
         session_id: u64,
         error: String,
     },
-    SessionMessagesUndone {
-        message_ids: Vec<u32>,
+    TurnsUndone {
+        turn_ids: Vec<u32>,
     },
-    SessionMessagesRedone {
-        messages: Vec<SessionMessage>,
+    TurnsRedone {
+        turns: BTreeMap<u32, Turn>,
     },
     Credential {
         service: String,

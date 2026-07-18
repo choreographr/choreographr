@@ -1,9 +1,7 @@
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
 use tai_im::bridge::{BridgeEvent, DaemonBridge};
-use tai_proto::{
-    ClientMessage, DaemonMessage, ImageMetadata, OutputStream, read_message, write_message,
-};
+use tai_proto::{ClientMessage, DaemonMessage, OutputStream, read_message, write_message};
 
 fn connected_bridge() -> (DaemonBridge, BufReader<UnixStream>, BufWriter<UnixStream>) {
     let (b_reader, my_writer) = UnixStream::pair().unwrap();
@@ -108,7 +106,6 @@ fn bridge_tool_call_events() {
             call_id: "call_1".into(),
             tool_name: "read_file".into(),
             arguments_json: r#"{"path":"/tmp"}"#.into(),
-            message_id: 1,
         },
     )
     .unwrap();
@@ -174,44 +171,36 @@ fn bridge_tool_call_failed() {
 
 #[ignore]
 #[test]
-fn bridge_image_streaming() {
+fn bridge_turn_images() {
     let (bridge, _daemon_reader, mut daemon_writer) = connected_bridge();
     let (_tx, rx) = bridge.into_parts();
 
-    let metadata = ImageMetadata {
-        image_id: 1,
-        mime_type: "image/png".into(),
-        width: 100,
-        height: 100,
-        byte_len: 4,
-        alt: None,
+    let turn = tai_proto::Turn {
+        created_at: tai_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("generate an image".into()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![tai_proto::DisplayedImageRecord {
+            metadata: tai_proto::ImageMetadata {
+                mime_type: "image/png".into(),
+                width: 100,
+                height: 100,
+                byte_len: 4,
+                alt: None,
+            },
+            data: b"abcd".to_vec(),
+            tool_call_id: None,
+        }],
     };
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::ImageStart {
-            request_id: 1,
-            metadata,
-        },
-    )
-    .unwrap();
-
-    write_message(
-        &mut daemon_writer,
-        &DaemonMessage::ImageChunk {
-            request_id: 1,
-            image_id: 1,
-            data: b"abcd".to_vec(),
-        },
-    )
-    .unwrap();
-
-    write_message(
-        &mut daemon_writer,
-        &DaemonMessage::ImageEnd {
-            request_id: 1,
-            image_id: 1,
-        },
+        &DaemonMessage::TurnAppended { turn_id: 1, turn },
     )
     .unwrap();
     use std::io::Write;

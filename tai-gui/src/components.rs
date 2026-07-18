@@ -1,5 +1,5 @@
 use crate::client::{send_client_message, submit_input};
-use crate::render::render_history_item;
+use crate::render::render_turn;
 use crate::state::AppState;
 use dioxus::prelude::*;
 use tai_proto::ClientMessage;
@@ -32,8 +32,8 @@ pub(crate) fn Toolbar(
             if request_id_text.is_empty() {
                 state
                     .write()
-                    .client
-                    .push_text("[client] enter a request id to cancel");
+                    .status_texts
+                    .push("[client] enter a request id to cancel".to_string());
                 return;
             }
             match request_id_text.parse::<u32>() {
@@ -50,8 +50,8 @@ pub(crate) fn Toolbar(
                 }
                 Err(_) => state
                     .write()
-                    .client
-                    .push_text(format!("invalid request id: {request_id_text}")),
+                    .status_texts
+                    .push(format!("invalid request id: {request_id_text}")),
             }
         }
     };
@@ -76,12 +76,23 @@ pub(crate) fn Toolbar(
 
 #[component]
 pub(crate) fn HistoryList(state: Signal<AppState>) -> Element {
-    let history = state.read().client.history.clone();
+    let guard = state.read();
+    let turns: Vec<(u32, tai_proto::Turn)> = guard
+        .session_view
+        .turns
+        .iter()
+        .map(|(&id, t)| (id, t.clone()))
+        .collect();
+    let status_texts = guard.status_texts.clone();
+    drop(guard);
 
     rsx! {
         div { class: "history",
-            for item in history {
-                {render_history_item(item)}
+            for text in status_texts {
+                div { class: "history-item text-item", key: "{text}", pre { "{text}" } }
+            }
+            for (turn_id, turn) in turns {
+                {render_turn(turn_id, &turn)}
             }
         }
     }

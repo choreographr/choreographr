@@ -1,35 +1,82 @@
 use super::*;
-use crate::state::HistoryItem;
-use tai_proto::{DaemonMessage, ImageMetadata, OutputStream, SessionMessage, SessionMessageKind};
+use std::collections::BTreeMap;
+use tai_client_core::dispatch_daemon_message;
+use tai_proto::{
+    DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream, TimestampMs, TokenUsage, Turn,
+};
 
 #[test]
 fn app_state_stream_updates_history() {
     let mut state = AppState::new("/tmp/tai.sock".to_string());
-    state.client.begin_stream(7, 0);
-    state
-        .client
-        .append_stream(7, OutputStream::Reasoning, "thinking");
-    state.client.append_stream(7, OutputStream::Answer, "hello");
-    state
-        .client
-        .append_stream(7, OutputStream::Answer, " world");
 
-    let index = state.client.in_progress[&7];
-    match &state.client.history[index] {
-        HistoryItem::Streaming(entry) => {
-            assert_eq!(entry.request_id, 7);
-            assert_eq!(entry.reasoning, "thinking");
-            assert_eq!(entry.answer, "hello world");
-        }
-        _ => panic!("expected streaming entry"),
-    }
+    // Simulate a Started message to set up request-to-turn mapping.
+    dispatch_daemon_message(
+        &DaemonMessage::Started {
+            request_id: 7,
+            turn_id: 1,
+        },
+        &mut state,
+    );
+
+    // The turn should have been created by the TurnAppended message (sent
+    // before Started in practice). We insert a stub turn manually.
+    state.session_view.turns.insert(
+        1,
+        Turn {
+            created_at: TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("hello".into()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        },
+    );
+
+    dispatch_daemon_message(
+        &DaemonMessage::OutputChunk {
+            request_id: 7,
+            stream: OutputStream::Reasoning,
+            data: b"thinking".to_vec(),
+        },
+        &mut state,
+    );
+
+    dispatch_daemon_message(
+        &DaemonMessage::OutputChunk {
+            request_id: 7,
+            stream: OutputStream::Answer,
+            data: b"hello".to_vec(),
+        },
+        &mut state,
+    );
+
+    dispatch_daemon_message(
+        &DaemonMessage::OutputChunk {
+            request_id: 7,
+            stream: OutputStream::Answer,
+            data: b" world".to_vec(),
+        },
+        &mut state,
+    );
+
+    let turn = state
+        .session_view
+        .turns
+        .get(&1)
+        .expect("turn 1 should exist");
+
+    assert_eq!(turn.assistant_reasoning.as_deref(), Some("thinking"));
+    assert_eq!(turn.assistant_text.as_deref(), Some("hello world"));
 }
 
 #[test]
-fn apply_daemon_image_message_pushes_displayed_image() {
+fn apply_daemon_turn_appended_with_image() {
     let mut state = AppState::new("/tmp/tai.sock".to_string());
     let metadata = ImageMetadata {
-        image_id: 5,
         mime_type: "image/png".to_string(),
         width: 1,
         height: 1,
@@ -44,28 +91,38 @@ fn apply_daemon_image_message_pushes_displayed_image() {
         0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
-    // DisplayedImage is now delivered as SessionMessageAppended after
-    // request completion, not streamed via ImageStart/Chunk/End.
-    apply_daemon_message(
-        &mut state,
-        DaemonMessage::SessionMessageAppended {
-            message: SessionMessage::now(SessionMessageKind::DisplayedImage(
-                tai_proto::DisplayedImageRecord {
-                    metadata: metadata.clone(),
-                    data: png,
-                    tool_call_id: None,
-                },
-            )),
-        },
-        None,
-    )
-    .expect("append");
+    let turn = Turn {
+        created_at: TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("generate an image".into()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: Some(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+        }),
+        tool_results: vec![],
+        displayed_images: vec![DisplayedImageRecord {
+            metadata: metadata.clone(),
+            data: png,
+            tool_call_id: None,
+        }],
+    };
 
-    match state.client.history.last().expect("image history item") {
-        HistoryItem::Image(image) => {
-            assert_eq!(image.metadata, metadata);
-            assert!(image.data_url.starts_with("data:image/png;base64,"));
-        }
-        other => panic!("expected image item, got {other:?}"),
-    }
+    dispatch_daemon_message(
+        &DaemonMessage::TurnFinalized { turn_id: 1, turn },
+        &mut state,
+    );
+
+    let stored = state
+        .session_view
+        .turns
+        .get(&1)
+        .expect("turn 1 should exist");
+
+    assert_eq!(stored.displayed_images.len(), 1);
+    assert_eq!(stored.displayed_images[0].metadata, metadata);
 }
