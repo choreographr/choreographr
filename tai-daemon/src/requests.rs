@@ -759,17 +759,6 @@ fn finish_tool_call(
             }));
     }
 
-    const CHUNK_SIZE: usize = 4096;
-    for chunk in content.as_bytes().chunks(CHUNK_SIZE) {
-        let _ = ctx
-            .cmd_tx
-            .send(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk {
-                request_id,
-                call_id: tool_call.id.clone(),
-                data: chunk.to_vec(),
-            }));
-    }
-
     let event = if is_error {
         DaemonMessage::ToolCallFailed {
             request_id,

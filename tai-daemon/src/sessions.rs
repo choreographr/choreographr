@@ -999,18 +999,12 @@ fn handle_request_finished(
         let is_new = !state.turns.contains_key(&turn_id);
         state.turns.insert(turn_id, turn.clone());
         if is_new {
-            // For newly created turns, persist and broadcast the finalized turn.
+            // Persist the newly created turn. The turn was already broadcast
+            // during the agent loop, so no need to re-broadcast here.
             if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, turn_id, turn) {
                 tracing::warn!(turn_id, error = %e, "failed to persist turn");
             }
-            broadcast(
-                &mut state.subscribers,
-                DaemonMessage::TurnFinalized {
-                    turn_id,
-                    turn: turn.clone(),
-                },
-            );
-        } else if turn != state.turns.get(&turn_id).cloned().as_ref().unwrap_or(turn) {
+        } else if state.turns.get(&turn_id).map_or(false, |t| t != turn) {
             // Turn was updated — persist the latest state.
             if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, turn_id, turn) {
                 tracing::warn!(turn_id, error = %e, "failed to persist updated turn");
