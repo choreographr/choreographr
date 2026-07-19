@@ -911,18 +911,18 @@ impl App {
             let text_height = lines_height(&text_lines, self.history_viewport.width).max(1);
             let img_height = turn.displayed_images.len() * IMAGE_BLOCK_HEIGHT as usize;
             let turn_height = text_height + img_height;
-            total += turn_height;
-            self.height_prefix.push(total);
-            self.visible_turn_ids.push(turn_id);
-            // Marker for turns with user_text.
+            // Marker for turns with user_text — points to the start of the turn.
             if turn.user_text.is_some() {
-                let content_line = self.height_prefix.last().copied().unwrap_or(0);
-                let slot = content_line * virtual_track / total.max(1);
+                let start_line = total;
+                let slot = start_line * virtual_track / (total + turn_height).max(1);
                 self.markers.push(Marker {
-                    content_line,
+                    content_line: start_line,
                     virtual_slot: slot,
                 });
             }
+            total += turn_height;
+            self.height_prefix.push(total);
+            self.visible_turn_ids.push(turn_id);
         }
         // Ensure render_cache matches visible_turn_ids count.
         self.ensure_cache_synced();
@@ -1113,15 +1113,45 @@ impl App {
     pub(crate) fn scroll_to_content_line(&mut self, content_line: usize) {
         let total = self.total_history_height();
         let viewport = self.history_viewport.height as usize;
-        let effective = self.effective_scroll();
-        let scroll_bottom = effective;
-        let visible_start = total.saturating_sub(scroll_bottom + viewport);
-        let visible_end = total.saturating_sub(scroll_bottom);
-        if content_line >= visible_start && content_line < visible_end {
-            return;
-        }
         let target = total.saturating_sub(content_line + viewport);
         self.scroll_to(target.min(self.max_scroll_offset()));
+    }
+
+    /// Scroll up by one scrollbar notch — the amount the viewport moves when
+    /// the user clicks or scroll-wheels one "row" on the scrollbar track.
+    /// Each notch is the smallest movement that visibly shifts the content:
+    /// `ceil(max_scroll / track_height)`, at least 1.
+    pub(crate) fn scrollbar_scroll_up(&mut self) {
+        let notch = self.scrollbar_notch();
+        self.scroll_up(notch);
+    }
+
+    /// Scroll down by one scrollbar notch.
+    pub(crate) fn scrollbar_scroll_down(&mut self) {
+        let notch = self.scrollbar_notch();
+        self.scroll_down(notch);
+    }
+
+    /// Compute the scrollbar notch size — the amount of content lines that
+    /// a single scrollbar-track row corresponds to.
+    fn scrollbar_notch(&self) -> usize {
+        let track = self.history_viewport.height as usize;
+        let max_scroll = self.max_scroll_offset();
+        if track > 0 {
+            // Integer ceiling division: ceil(max_scroll / track).
+            // checked_div is safe here because we've verified track > 0.
+            max_scroll
+                .saturating_add(track)
+                .saturating_sub(1)
+                .checked_div(track)
+                .unwrap_or(0)
+        } else {
+            // Degenerate case: viewport has zero height.  Just use
+            // max_scroll — the .max(1) below ensures we always move at
+            // least one line.
+            max_scroll
+        }
+        .max(1)
     }
 
     pub(crate) fn apply_scroll_delta(&mut self) {
@@ -1750,5 +1780,174 @@ mod tests {
     fn find_turn_at_row_returns_none_out_of_bounds() {
         let app = test_app("/tmp/tai.sock");
         assert!(find_turn_at_row(&app, 999).is_none());
+    }
+
+    // ── scrollbar_notch ──
+
+    #[test]
+    fn scrollbar_notch_no_content() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        // No content → total_height = 0 → max_scroll = 0 → notch clamps to 1
+        assert_eq!(app.scrollbar_notch(), 1);
+    }
+
+    #[test]
+    fn scrollbar_notch_track_one() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 1;
+        app.height_prefix.push(50);
+        // max_scroll = 50 - 1 = 49, notch = ceil(49 / 1) = 49
+        assert_eq!(app.scrollbar_notch(), 49);
+    }
+
+    #[test]
+    fn scrollbar_notch_ceiling_division() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 50;
+        app.height_prefix.push(150);
+        // max_scroll = 150 - 50 = 100, notch = ceil(100 / 50) = 2
+        assert_eq!(app.scrollbar_notch(), 2);
+    }
+
+    #[test]
+    fn scrollbar_notch_rounds_up() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 30;
+        app.height_prefix.push(105);
+        // max_scroll = 105 - 30 = 75, notch = ceil(75 / 30) = 3
+        assert_eq!(app.scrollbar_notch(), 3);
+    }
+
+    // ── scrollbar_scroll_up / scrollbar_scroll_down ──
+
+    #[test]
+    fn scrollbar_scroll_up_increases_scroll_by_notch() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.height_prefix.push(110);
+        // max_scroll = 100, notch = ceil(100 / 10) = 10
+
+        // Start at the bottom (scroll = 0).
+        app.history_scroll.scroll = 0;
+        let before = app.effective_scroll();
+
+        app.scrollbar_scroll_up();
+
+        assert_eq!(app.effective_scroll(), before + 10);
+    }
+
+    #[test]
+    fn scrollbar_scroll_up_clamps_at_max_scroll() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.height_prefix.push(110);
+        // max_scroll = 100, notch = 10
+
+        // Start at the top (scroll = 100) — already at max.
+        app.history_scroll.scroll = 100;
+
+        app.scrollbar_scroll_up();
+
+        // Should not exceed max_scroll.
+        assert_eq!(app.effective_scroll(), 100);
+    }
+
+    #[test]
+    fn scrollbar_scroll_down_decreases_scroll_by_notch() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.height_prefix.push(110);
+        // max_scroll = 100, notch = 10
+
+        // Start at the top (scroll = 100).
+        app.history_scroll.scroll = 100;
+        let before = app.effective_scroll();
+
+        app.scrollbar_scroll_down();
+
+        assert_eq!(app.effective_scroll(), before - 10);
+    }
+
+    #[test]
+    fn scrollbar_scroll_down_clamps_at_zero() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.height_prefix.push(110);
+        // max_scroll = 100, notch = 10
+
+        // Start at scroll = 5 — less than one notch from bottom.
+        app.history_scroll.scroll = 5;
+
+        app.scrollbar_scroll_down();
+
+        // Should clamp to 0 (not underflow).
+        assert_eq!(app.effective_scroll(), 0);
+    }
+
+    // ── scroll_to_content_line ──
+
+    #[test]
+    fn scroll_to_content_line_idempotent_when_already_visible() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 200;
+
+        // Single short turn that fits entirely in the viewport.
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("hello".into()),
+            assistant_text: Some("world".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.session_view.insert_or_replace(0, turn);
+        app.rebuild_height_prefix();
+        // total_height <= viewport_height → max_scroll = 0 → already at top.
+
+        let before = app.effective_scroll();
+        app.scroll_to_content_line(0);
+        assert_eq!(app.effective_scroll(), before);
+    }
+
+    #[test]
+    fn scroll_to_content_line_large_content_line_saturates() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 5;
+
+        for i in 0..5u32 {
+            let turn = Turn {
+                created_at: tai_proto::TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some(format!("user text {i}")),
+                assistant_text: Some(format!("assistant text {i}")),
+                assistant_reasoning: None,
+                tool_calls: vec![],
+                token_usage: None,
+                tool_results: vec![],
+                displayed_images: vec![],
+            };
+            app.session_view.insert_or_replace(i, turn);
+        }
+        app.rebuild_height_prefix();
+
+        // content_line larger than total height → should saturate to scroll=0.
+        app.scroll_to_content_line(9999);
+        assert_eq!(app.effective_scroll(), 0);
     }
 }
