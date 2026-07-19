@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Rect, Size};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use tai_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use tai_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
@@ -464,16 +465,6 @@ impl HistoryScrollState {
             scroll: 0,
             scroll_compensation: 0,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scroll(&self) -> usize {
-        self.scroll
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scroll_compensation(&self) -> usize {
-        self.scroll_compensation
     }
 
     fn unclamped_effective_scroll(&self) -> usize {
@@ -1483,7 +1474,7 @@ impl TurnEventHandler for App {
         self.markers_dirty = true;
     }
 
-    fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: String) {
+    fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: Cow<'_, str>) {
         self.session_view.stream_chunk(request_id, stream, &data);
         self.markers_dirty = true;
     }

@@ -1,6 +1,8 @@
 use crate::context;
 use crate::db::{SessionRecord, write_session_retry};
-use crate::openai::{AssistantToolCall, AssistantToolFunction, ChatRequestMessage};
+use crate::openai::{
+    AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
+};
 use crate::providers::types::{ChatToolCall, ChatTurnResult};
 use crate::providers::{
     ChatTurnRequest, InferenceProvider, ReasoningSupport, StreamEvent, ToolResultItem,
@@ -25,6 +27,23 @@ use tai_proto::{
 };
 use tracing::{debug, info, warn};
 
+/// Broadcast a TurnAppended message to all session subscribers, if the
+/// given turn_id exists in the session's turn map.
+fn broadcast_turn_appended(
+    cmd_tx: &mpsc::Sender<SessionCommand>,
+    session: &SessionState,
+    turn_id: u32,
+) {
+    if let Some(turn) = session.turns.get(&turn_id)
+        && let Err(e) = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
+            turn_id,
+            turn: turn.clone(),
+        }))
+    {
+        warn!(%turn_id, error = %e, "failed to broadcast TurnAppended");
+    }
+}
+
 /// Persist a `PreparedImage` to the session's current active turn and
 /// broadcast it to live subscribers immediately (mid-turn) so the image
 /// appears as soon as the tool finishes rather than waiting for request
@@ -48,13 +67,7 @@ fn emit_image(
         tool_call_id,
     };
     session.add_displayed_image(turn_id, record.clone());
-    // Broadcast TurnAppended so subscribers see the image mid-turn.
-    if let Some(turn) = session.turns.get(&turn_id) {
-        let _ = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
-            turn_id,
-            turn: turn.clone(),
-        }));
-    }
+    broadcast_turn_appended(cmd_tx, session, turn_id);
 }
 
 /// Spawn a forwarding thread that relays streaming output chunks to session
@@ -293,6 +306,100 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
     })
 }
 
+/// Resolve the effective reasoning effort for a turn, disabling it if the
+/// model/provider combination does not support it.
+fn resolve_reasoning_effort(
+    client: &InferenceProvider,
+    model: &str,
+    session_id: u64,
+    turn_iter: u32,
+    configured_effort: ThinkingEffort,
+) -> ThinkingEffort {
+    if configured_effort == ThinkingEffort::Off {
+        return ThinkingEffort::Off;
+    }
+    let slug = client.provider_slug();
+    let catalog_entry = lookup_provider(slug);
+    let reasoning_support = catalog_entry
+        .map(|e| e.reasoning)
+        .unwrap_or(ReasoningSupport::None);
+    let effective = effective_reasoning_support(model, reasoning_support);
+    if effective == ReasoningSupport::None {
+        warn!(
+            session_id, turn = turn_iter, model,
+            effort = %configured_effort.as_label(),
+            "model does not support reasoning effort, disabling",
+        );
+        ThinkingEffort::Off
+    } else {
+        debug!(
+            session_id, turn = turn_iter,
+            effort = %configured_effort.as_label(),
+            "reasoning effort active in agent loop",
+        );
+        configured_effort
+    }
+}
+
+/// Estimate the number of prompt tokens for the current request using
+/// tiktoken.  Returns a (encoding, estimated_tokens) pair so the caller
+/// can reuse the encoding for output-token counting during streaming.
+fn estimate_prompt_tokens(
+    model: &str,
+    messages: &[ChatRequestMessage],
+    tools: &[ChatToolDefinition],
+) -> (Option<&'static tiktoken::CoreBpe>, u32) {
+    let encoding =
+        tiktoken::encoding_for_model(model).or_else(|| tiktoken::get_encoding("cl100k_base"));
+    let estimated = match &encoding {
+        Some(enc) => {
+            let content_tokens: u32 = messages
+                .iter()
+                .filter_map(|m| m.content.as_deref())
+                .map(|text| enc.count(text) as u32)
+                .sum();
+
+            let reasoning_tokens: u32 = messages
+                .iter()
+                .filter_map(|m| m.reasoning_content.as_deref())
+                .map(|text| enc.count(text) as u32)
+                .sum();
+
+            let tool_call_tokens: u32 = messages
+                .iter()
+                .filter_map(|m| m.tool_calls.as_ref())
+                .flat_map(|calls| calls.iter())
+                .map(|tc| {
+                    enc.count(&tc.id) as u32
+                        + enc.count(&tc.kind) as u32
+                        + enc.count(&tc.function.name) as u32
+                        + enc.count(&tc.function.arguments) as u32
+                })
+                .sum();
+
+            let tool_def_tokens: u32 = tools
+                .iter()
+                .filter_map(|def| {
+                    match serde_json::to_string(def) {
+                        Ok(s) => Some(enc.count(&s) as u32),
+                        Err(e) => {
+                            warn!(error = %e, "failed to serialize tool definition for token estimation");
+                            None
+                        }
+                    }
+                })
+                .sum();
+
+            content_tokens + reasoning_tokens + tool_call_tokens + tool_def_tokens
+        }
+        None => {
+            tracing::warn!("no tiktoken encoding available for {model}");
+            0
+        }
+    };
+    (encoding, estimated)
+}
+
 pub(crate) fn run_agent_loop(
     client: &InferenceProvider,
     session: &mut SessionState,
@@ -325,37 +432,21 @@ pub(crate) fn run_agent_loop(
     };
 
     for turn_iter in 0..max_turns {
-        let mut thinking_effort = session
-            .config
-            .reasoning_effort
-            .unwrap_or(ThinkingEffort::Off);
         debug!(
             session_id = ctx.session_id,
             turn = turn_iter,
             "agent loop turn"
         );
-        if thinking_effort != ThinkingEffort::Off {
-            let slug = client.provider_slug();
-            let catalog_entry = lookup_provider(slug);
-            let reasoning_support = catalog_entry
-                .map(|e| e.reasoning)
-                .unwrap_or(ReasoningSupport::None);
-            let effective = effective_reasoning_support(model, reasoning_support);
-            if effective == ReasoningSupport::None {
-                warn!(
-                    session_id = ctx.session_id, turn = turn_iter, model,
-                    effort = %thinking_effort.as_label(),
-                    "model does not support reasoning effort, disabling",
-                );
-                thinking_effort = ThinkingEffort::Off;
-            } else {
-                debug!(
-                    session_id = ctx.session_id, turn = turn_iter,
-                    effort = %thinking_effort.as_label(),
-                    "reasoning effort active in agent loop",
-                );
-            }
-        }
+        let thinking_effort = resolve_reasoning_effort(
+            client,
+            model,
+            ctx.session_id,
+            turn_iter,
+            session
+                .config
+                .reasoning_effort
+                .unwrap_or(ThinkingEffort::Off),
+        );
         crate::metrics::record_turn(model);
         let tools = ctx
             .tool_registry
@@ -370,13 +461,8 @@ pub(crate) fn run_agent_loop(
         } else {
             None
         };
-        let (current_turn_id, current_turn) = session.start_turn(turn_user_text);
-        let _ = ctx
-            .cmd_tx
-            .send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
-                turn_id: current_turn_id,
-                turn: current_turn,
-            }));
+        let (current_turn_id, _) = session.start_turn(turn_user_text);
+        broadcast_turn_appended(&ctx.cmd_tx, session, current_turn_id);
         if ctx
             .cmd_tx
             .send(SessionCommand::StatusChanged(SessionStatus::Inference))
@@ -387,59 +473,7 @@ pub(crate) fn run_agent_loop(
 
         let messages = build_chat_request_messages(session, system_content.as_deref());
 
-        // Resolve the tiktoken encoding once so it can be used both for the
-        // prompt-token estimate (broadcast immediately) and for counting
-        // output tokens per stream chunk (inside the streaming closure).
-        let encoding =
-            tiktoken::encoding_for_model(model).or_else(|| tiktoken::get_encoding("cl100k_base"));
-
-        let estimated_prompt_tokens = match &encoding {
-            Some(enc) => {
-                // 1. Message content text
-                let content_tokens: u32 = messages
-                    .iter()
-                    .filter_map(|m| m.content.as_deref())
-                    .map(|text| enc.count(text) as u32)
-                    .sum();
-
-                // 2. Reasoning / thinking text from prior assistant turns
-                let reasoning_tokens: u32 = messages
-                    .iter()
-                    .filter_map(|m| m.reasoning_content.as_deref())
-                    .map(|text| enc.count(text) as u32)
-                    .sum();
-
-                // 3. Tool-call metadata on assistant messages
-                let tool_call_tokens: u32 = messages
-                    .iter()
-                    .filter_map(|m| m.tool_calls.as_ref())
-                    .flat_map(|calls| calls.iter())
-                    .map(|tc| {
-                        enc.count(&tc.id) as u32
-                            + enc.count(&tc.kind) as u32
-                            + enc.count(&tc.function.name) as u32
-                            + enc.count(&tc.function.arguments) as u32
-                    })
-                    .sum();
-
-                // 4. Tool definitions / schemas (serialized to JSON to capture
-                //    the exact wire-format overhead of keys, braces, etc.).
-                let tool_def_tokens: u32 = tools
-                    .iter()
-                    .filter_map(|def| {
-                        serde_json::to_string(def)
-                            .map(|s| enc.count(&s) as u32)
-                            .ok()
-                    })
-                    .sum();
-
-                content_tokens + reasoning_tokens + tool_call_tokens + tool_def_tokens
-            }
-            None => {
-                tracing::warn!("no tiktoken encoding available for {model}");
-                0
-            }
-        };
+        let (encoding, estimated_prompt_tokens) = estimate_prompt_tokens(model, &messages, &tools);
 
         let _ = ctx
             .cmd_tx
@@ -538,7 +572,7 @@ pub(crate) fn run_agent_loop(
                     token_usage,
                 );
                 // Persist and broadcast the finalized turn.
-                session.finalize_turn(&ctx.db, current_turn_id)?;
+                session.finalize_turn(&ctx.db, ctx.session_id, current_turn_id)?;
                 if let Some(turn) = session.turns.get(&current_turn_id) {
                     let _ =
                         ctx.cmd_tx
@@ -569,15 +603,7 @@ pub(crate) fn run_agent_loop(
                         .collect(),
                     token_usage,
                 );
-                // Broadcast the updated turn with assistant tool use info.
-                if let Some(turn) = session.turns.get(&current_turn_id) {
-                    let _ =
-                        ctx.cmd_tx
-                            .send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
-                                turn_id: current_turn_id,
-                                turn: turn.clone(),
-                            }));
-                }
+                broadcast_turn_appended(&ctx.cmd_tx, session, current_turn_id);
                 // Store response_id for chaining tool results back to this turn
                 prev_resp_id = tool_use.response_id;
                 tool_results.clear();
@@ -591,22 +617,23 @@ pub(crate) fn run_agent_loop(
                         )
                     });
 
-                let _total_mutators = mutators.len();
-
                 // ── Phase 1: Session-mutating tools (serial) ────────
                 for tool_call in mutators.into_iter() {
                     if is_cancelled_once(cancel_rx) {
                         return Ok(true);
                     }
 
-                    let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                        DaemonMessage::ToolCallStarted {
-                            request_id,
-                            call_id: tool_call.id.clone(),
-                            tool_name: tool_call.name.clone(),
-                            arguments_json: tool_call.arguments_json.clone(),
-                        },
-                    ));
+                    if let Err(e) =
+                        ctx.cmd_tx
+                            .send(SessionCommand::Broadcast(DaemonMessage::ToolCallStarted {
+                                request_id,
+                                call_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
+                                arguments_json: tool_call.arguments_json.clone(),
+                            }))
+                    {
+                        warn!(%request_id, call_id = %tool_call.id, error = %e, "failed to broadcast ToolCallStarted");
+                    }
 
                     let tool_timeout =
                         determine_tool_timeout(&tool_call.name).unwrap_or(Duration::from_secs(60));
@@ -672,14 +699,16 @@ pub(crate) fn run_agent_loop(
                 // ── Phase 2: All remaining tools (concurrent) ───────
                 if !concurrent.is_empty() {
                     for tc in concurrent.iter() {
-                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                        if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::ToolCallStarted {
                                 request_id,
                                 call_id: tc.id.clone(),
                                 tool_name: tc.name.clone(),
                                 arguments_json: tc.arguments_json.clone(),
                             },
-                        ));
+                        )) {
+                            warn!(%request_id, call_id = %tc.id, error = %e, "failed to broadcast ToolCallStarted");
+                        }
                     }
 
                     if ctx
@@ -829,8 +858,8 @@ fn finish_tool_call(
     ctx: &RequestContext,
     turn_id: u32,
 ) {
-    let content = output.result.content.clone();
     let is_error = output.result.is_error;
+    let content = output.result.content.clone();
 
     session.add_tool_result(
         turn_id,
@@ -840,15 +869,7 @@ fn finish_tool_call(
         is_error,
     );
 
-    // Broadcast TurnAppended so subscribers see the updated turn.
-    if let Some(turn) = session.turns.get(&turn_id) {
-        let _ = ctx
-            .cmd_tx
-            .send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
-                turn_id,
-                turn: turn.clone(),
-            }));
-    }
+    broadcast_turn_appended(&ctx.cmd_tx, session, turn_id);
 
     let event = if is_error {
         DaemonMessage::ToolCallFailed {
@@ -864,7 +885,9 @@ fn finish_tool_call(
             tool_name: tool_call.name.clone(),
         }
     };
-    let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(event));
+    if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(event)) {
+        warn!(%request_id, error = %e, "failed to broadcast tool call finished/failed event");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -991,21 +1014,26 @@ fn execute_tool_with_timeout(
                 path = %path_str,
                 "set_working_dir: broadcasting SessionWorkingDirSet",
             );
-            let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+            if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(
                 DaemonMessage::SessionWorkingDirSet {
                     session_id: ctx.session_id,
                     path: Some(path_str),
                 },
-            ));
+            )) {
+                warn!(session_id = ctx.session_id, error = %e, "failed to broadcast SessionWorkingDirSet");
+            }
 
             // Notify the daemon so the TUI/inspector can reflect the change
             // immediately without waiting for the next persist cycle.
-            let _ = ctx
+            if let Err(e) = ctx
                 .daemon_tx
                 .send(crate::daemon::DaemonCommand::UpdateMetadata {
                     session_id: ctx.session_id,
                     metadata: SessionMetadata::from(&*session),
-                });
+                })
+            {
+                warn!(session_id = ctx.session_id, error = %e, "failed to notify daemon of working dir change");
+            }
 
             // Persist the updated working_dir so it survives a daemon restart.
             // This is the same pattern used by load_tools/unload_tools.
@@ -1223,6 +1251,9 @@ pub const REQUEST_IMAGE_HEIGHT: u32 = 640;
 mod tests {
     use super::*;
     use crate::daemon::DaemonCommand;
+    use crate::openai::AssistantToolCall;
+    use crate::providers::InferenceProvider;
+    use crate::providers::test_util::make_test_provider;
     use crate::tools::context::ToolContext;
     use crate::tools::{Tool, ToolError, ToolRegistry};
     use std::sync::mpsc;
@@ -1317,6 +1348,181 @@ mod tests {
         let (tx, rx) = mpsc::channel::<()>();
         tx.send(()).unwrap();
         assert!(is_cancelled_once(&rx));
+    }
+
+    // -- broadcast_turn_appended tests -----------------------------------
+
+    #[test]
+    fn broadcast_turn_appended_sends_when_turn_exists() {
+        let (tx, rx) = mpsc::channel::<SessionCommand>();
+        let mut session = SessionState::empty();
+        let (turn_id, _) = session.start_turn(Some("hello".into()));
+
+        broadcast_turn_appended(&tx, &session, turn_id);
+
+        match rx.try_recv() {
+            Ok(SessionCommand::Broadcast(DaemonMessage::TurnAppended { turn_id: id, .. })) => {
+                assert_eq!(id, turn_id);
+            }
+            Ok(_) => panic!("expected TurnAppended broadcast, got different command"),
+            Err(e) => panic!("expected TurnAppended broadcast, got error: {e}"),
+        }
+    }
+
+    #[test]
+    fn broadcast_turn_appended_no_turn_no_broadcast() {
+        let (tx, rx) = mpsc::channel::<SessionCommand>();
+        let session = SessionState::empty();
+
+        broadcast_turn_appended(&tx, &session, 999);
+
+        assert!(rx.try_recv().is_err(), "expected no message");
+    }
+
+    #[test]
+    fn broadcast_turn_appended_disconnected_receiver_no_panic() {
+        let (tx, rx) = mpsc::channel::<SessionCommand>();
+        let mut session = SessionState::empty();
+        let (turn_id, _) = session.start_turn(Some("hello".into()));
+        drop(rx);
+
+        // Disconnected receiver should not panic — warn! is logged instead.
+        broadcast_turn_appended(&tx, &session, turn_id);
+    }
+
+    // -- resolve_reasoning_effort tests ------------------------------------
+
+    #[test]
+    fn resolve_reasoning_effort_off_returns_off() {
+        let provider = make_test_provider();
+        let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, ThinkingEffort::Off);
+        assert_eq!(result, ThinkingEffort::Off);
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_unknown_provider_disables() {
+        let provider = make_test_provider();
+        let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, ThinkingEffort::Low);
+        // "test-stub" slug is not in the catalog, so reasoning is unsupported.
+        assert_eq!(result, ThinkingEffort::Off);
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_openai_supported_model_preserves() {
+        let config = crate::openai::ServiceConfig::default();
+        let client = crate::openai::OpenAiClient::new(config, "test-key".into()).unwrap();
+        let provider = InferenceProvider::from_openai(client);
+
+        let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, ThinkingEffort::High);
+        assert_eq!(result, ThinkingEffort::High);
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_openai_unsupported_model_disables() {
+        let config = crate::openai::ServiceConfig::default();
+        let client = crate::openai::OpenAiClient::new(config, "test-key".into()).unwrap();
+        let provider = InferenceProvider::from_openai(client);
+
+        let result = resolve_reasoning_effort(&provider, "gpt-4.1", 1, 0, ThinkingEffort::Medium);
+        assert_eq!(result, ThinkingEffort::Off);
+    }
+
+    // -- estimate_prompt_tokens tests ------------------------------------
+
+    #[test]
+    fn estimate_prompt_tokens_empty() {
+        let (encoding, estimated) = estimate_prompt_tokens("gpt-4", &[], &[]);
+        assert!(encoding.is_some());
+        assert_eq!(estimated, 0);
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_counts_content() {
+        let messages = vec![
+            ChatRequestMessage::simple("user", "hello world".into()),
+            ChatRequestMessage::simple("assistant", "hi there".into()),
+        ];
+        let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[]);
+        assert!(
+            estimated > 0,
+            "expected positive token count, got {estimated}"
+        );
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_counts_reasoning_content() {
+        let messages = vec![
+            ChatRequestMessage::simple("user", "hello".into()),
+            ChatRequestMessage {
+                role: "assistant",
+                content: Some("visible".into()),
+                reasoning_content: Some("thinking deep...".into()),
+                tool_call_id: None,
+                tool_calls: None,
+                reasoning: None,
+                reasoning_text: None,
+            },
+        ];
+        let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[]);
+        assert!(
+            estimated > 0,
+            "expected positive token count, got {estimated}"
+        );
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_counts_tool_call_metadata() {
+        let messages = vec![ChatRequestMessage {
+            role: "assistant",
+            content: None,
+            tool_calls: Some(vec![AssistantToolCall {
+                id: "call_abc".into(),
+                kind: "function".into(),
+                function: AssistantToolFunction {
+                    name: "read_file".into(),
+                    arguments: r#"{"path": "/etc/hosts"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_text: None,
+        }];
+        let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[]);
+        assert!(
+            estimated > 0,
+            "expected positive token count, got {estimated}"
+        );
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_includes_tool_defs() {
+        let tools = vec![ChatToolDefinition::function(
+            "read_file",
+            "Read a file from disk",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                }
+            }),
+        )];
+        let messages = vec![ChatRequestMessage::simple("user", "read file".into())];
+        let (_, with_tools) = estimate_prompt_tokens("gpt-4", &messages, &tools);
+        let (_, without_tools) = estimate_prompt_tokens("gpt-4", &messages, &[]);
+        assert!(
+            with_tools > without_tools,
+            "tool defs should increase token count: {with_tools} <= {without_tools}",
+        );
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_unknown_model_falls_back() {
+        let messages = vec![ChatRequestMessage::simple("user", "hello".into())];
+        let (encoding, estimated) =
+            estimate_prompt_tokens("nonexistent-model-9000", &messages, &[]);
+        assert!(encoding.is_some(), "should fall back to cl100k_base");
+        assert!(estimated > 0);
     }
 
     // -- execute_tool_with_timeout tests -----------------------------------

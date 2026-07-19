@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use tai_client_core::{SessionStateData, SessionView, ToolCallEvent, TurnEventHandler};
 use tai_proto::{OutputStream, SessionStatus, TokenUsage, Turn};
@@ -60,7 +61,7 @@ impl TurnEventHandler for AppState {
         }
     }
 
-    fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: String) {
+    fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: Cow<'_, str>) {
         trace!(%request_id, ?stream, len = %data.len(), "handle_request_stream");
         self.session_view.stream_chunk(request_id, stream, &data);
     }
@@ -157,8 +158,13 @@ impl TurnEventHandler for AppState {
 
     fn handle_token_usage_update(
         &mut self,
-        _token_usage: TokenUsage,
-        _last_prompt_tokens: Option<u32>,
+        token_usage: TokenUsage,
+        last_prompt_tokens: Option<u32>,
     ) {
+        trace!(
+            ?token_usage,
+            ?last_prompt_tokens,
+            "handle_token_usage_update"
+        );
     }
 }

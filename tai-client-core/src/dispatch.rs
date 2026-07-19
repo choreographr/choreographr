@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use tai_proto::{DaemonMessage, OutputStream, SessionStatus, TokenUsage, Turn};
 use tracing::debug;
@@ -39,7 +40,7 @@ pub trait TurnEventHandler {
     fn handle_turn_finalized(&mut self, turn_id: u32, turn: Turn);
     fn handle_turns_undone(&mut self, turn_ids: &[u32]);
     fn handle_turns_redone(&mut self, turns: BTreeMap<u32, Turn>);
-    fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: String);
+    fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: Cow<'_, str>);
     fn handle_started(&mut self, request_id: u32, turn_id: u32, estimated_prompt_tokens: u32);
     fn handle_done(
         &mut self,
@@ -140,8 +141,11 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             stream,
             data,
         } => {
-            let text = String::from_utf8_lossy(data).into_owned();
-            handler.handle_request_stream(*request_id, stream.clone(), text);
+            handler.handle_request_stream(
+                *request_id,
+                stream.clone(),
+                String::from_utf8_lossy(data),
+            );
         }
         DaemonMessage::ToolCallStarted {
             request_id,

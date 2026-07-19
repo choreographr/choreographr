@@ -1,5 +1,4 @@
 use super::*;
-use std::collections::BTreeMap;
 use tai_client_core::dispatch_daemon_message;
 use tai_proto::{
     DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream, TimestampMs, TokenUsage, Turn,

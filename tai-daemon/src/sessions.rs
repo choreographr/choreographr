@@ -396,9 +396,14 @@ impl SessionState {
 
     /// Finalize a turn and persist it to the database.
     /// Returns an error if persistence fails after all retries.
-    pub fn finalize_turn(&mut self, db: &redb::Database, turn_id: u32) -> io::Result<()> {
+    pub fn finalize_turn(
+        &mut self,
+        db: &redb::Database,
+        session_id: u64,
+        turn_id: u32,
+    ) -> io::Result<()> {
         if let Some(turn) = self.turns.get(&turn_id) {
-            write_turn_retry(db, 0, turn_id, turn)
+            write_turn_retry(db, session_id, turn_id, turn)
                 .map_err(|e| io::Error::other(format!("failed to persist turn {turn_id}: {e}")))?;
         }
         Ok(())
