@@ -542,13 +542,71 @@ fn push_block(root: &mut Vec<MarkdownBlock>, stack: &mut [BlockContext], block: 
 }
 
 fn push_text(block_stack: &mut [BlockContext], inline_stack: &mut [InlineContext], text: &str) {
-    if !text.is_empty() {
-        push_inline(
-            block_stack,
-            inline_stack,
-            MarkdownInline::Text(text.to_string()),
-        );
+    if text.is_empty() {
+        return;
     }
+
+    // Route the text into the active context, trying to merge into an
+    // existing Text node before allocating a new String.  This mirrors
+    // the match arms in `push_inline` but uses `push_text_content`
+    // instead of `push_inline_content` so we can pass &str directly.
+    if let Some(context) = inline_stack.last_mut() {
+        match context {
+            InlineContext::Emphasis(content)
+            | InlineContext::Strong(content)
+            | InlineContext::Strikethrough(content)
+            | InlineContext::Link { content, .. }
+            | InlineContext::Image { alt: content, .. } => {
+                push_text_content(content, text);
+            }
+        }
+        return;
+    }
+
+    if let Some(context) = block_stack.last_mut() {
+        match context {
+            BlockContext::Paragraph(content)
+            | BlockContext::Heading { content, .. }
+            | BlockContext::TableCell(content) => push_text_content(content, text),
+            BlockContext::Item(blocks) => {
+                if !matches!(blocks.last(), Some(MarkdownBlock::Paragraph(_))) {
+                    blocks.push(MarkdownBlock::Paragraph(Vec::new()));
+                }
+                if let Some(MarkdownBlock::Paragraph(content)) = blocks.last_mut() {
+                    push_text_content(content, text);
+                }
+            }
+            BlockContext::CodeBlock { code, .. } => code.push_str(text),
+            BlockContext::Quote(_)
+            | BlockContext::List { .. }
+            | BlockContext::Table { .. }
+            | BlockContext::TableRow(_) => {}
+        }
+    }
+}
+
+/// Push a text slice into a content vector, merging with the last element
+/// if it is also a `Text` node — avoids allocating a new `String` when
+/// we can extend the existing one.
+fn push_text_content(content: &mut Vec<MarkdownInline>, text: &str) {
+    if let Some(MarkdownInline::Text(last)) = content.last_mut() {
+        last.push_str(text);
+    } else {
+        content.push(MarkdownInline::Text(text.to_string()));
+    }
+}
+
+/// Push an inline node into a content vector, merging adjacent Text nodes
+/// to avoid artifacts from pulldown-cmark's smart punctuation splitting
+/// (e.g. `I'll` being split into `Text("I")`, `Text("'")`, `Text("ll")`).
+fn push_inline_content(content: &mut Vec<MarkdownInline>, inline: MarkdownInline) {
+    if let MarkdownInline::Text(text) = &inline
+        && let Some(MarkdownInline::Text(last)) = content.last_mut()
+    {
+        last.push_str(text);
+        return;
+    }
+    content.push(inline);
 }
 
 fn push_inline(
@@ -563,7 +621,9 @@ fn push_inline(
             | InlineContext::Strong(content)
             | InlineContext::Strikethrough(content)
             | InlineContext::Link { content, .. }
-            | InlineContext::Image { alt: content, .. } => content.push(inline),
+            | InlineContext::Image { alt: content, .. } => {
+                push_inline_content(content, inline);
+            }
         }
         return;
     }
@@ -573,7 +633,7 @@ fn push_inline(
         match context {
             BlockContext::Paragraph(content)
             | BlockContext::Heading { content, .. }
-            | BlockContext::TableCell(content) => content.push(inline),
+            | BlockContext::TableCell(content) => push_inline_content(content, inline),
             BlockContext::Item(blocks) => {
                 // List items wrap inline content in a Paragraph block.
                 // Ensure one exists so we have somewhere to push.
@@ -582,7 +642,7 @@ fn push_inline(
                 }
                 // At this point the last block is guaranteed to be a Paragraph.
                 if let Some(MarkdownBlock::Paragraph(content)) = blocks.last_mut() {
-                    content.push(inline);
+                    push_inline_content(content, inline);
                 }
             }
             BlockContext::CodeBlock { code, .. } => match inline {
@@ -979,5 +1039,82 @@ mod tests {
         let input = "# Hello\n\nWorld.";
         let doc: MarkdownDocument = input.parse().unwrap();
         assert_eq!(doc.to_string(), input);
+    }
+
+    #[test]
+    fn push_text_content_merges_adjacent_text() {
+        let mut content: Vec<MarkdownInline> = Vec::new();
+        push_text_content(&mut content, "I");
+        push_text_content(&mut content, "'");
+        push_text_content(&mut content, "ll");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0], MarkdownInline::Text("I'll".to_string()));
+    }
+
+    #[test]
+    fn push_text_content_creates_new_text_when_last_is_not_text() {
+        let mut content: Vec<MarkdownInline> = Vec::new();
+        content.push(MarkdownInline::Code("x".to_string()));
+        push_text_content(&mut content, "hello");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[1], MarkdownInline::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn push_text_content_creates_new_text_when_empty() {
+        let mut content: Vec<MarkdownInline> = Vec::new();
+        push_text_content(&mut content, "hello");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0], MarkdownInline::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn smart_punctuation_merges_text_around_inline_boundary() {
+        // Smart punctuation triggers text splitting around inline
+        // boundaries (e.g. the ` before a code span).  The merging
+        // logic should reassemble adjacent text into single nodes.
+        let doc = MarkdownDocument::parse("I'll `code` there.");
+        let MarkdownBlock::Paragraph(content) = &doc.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        // With smart punctuation "I'll" becomes one text event
+        // containing the curly apostrophe.
+        assert_eq!(content[0], MarkdownInline::Text("I\u{2019}ll ".to_string()));
+        assert_eq!(content[1], MarkdownInline::Code("code".to_string()));
+        assert_eq!(content[2], MarkdownInline::Text(" there.".to_string()));
+        assert_eq!(content.len(), 3);
+    }
+
+    #[test]
+    fn smart_punctuation_round_trip() {
+        // Smart punctuation transforms straight quotes/apostrophes to
+        // their typographic equivalents, so the round-trip output
+        // contains curly quotes.
+        let input = "I'll be there.";
+        let doc = MarkdownDocument::parse(input);
+        assert_eq!(doc.to_markdown(), "I\u{2019}ll be there.");
+    }
+
+    #[test]
+    fn smart_quotes_round_trip() {
+        let input = "She said \"hello\" and left.";
+        let doc = MarkdownDocument::parse(input);
+        assert_eq!(
+            doc.to_markdown(),
+            "She said \u{201c}hello\u{201d} and left."
+        );
+    }
+
+    #[test]
+    fn text_never_adjacent_across_inline_boundary() {
+        // Code nodes should not merge with adjacent text.
+        let doc = MarkdownDocument::parse("a `code` b");
+        let MarkdownBlock::Paragraph(content) = &doc.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0], MarkdownInline::Text("a ".to_string()));
+        assert_eq!(content[1], MarkdownInline::Code("code".to_string()));
+        assert_eq!(content[2], MarkdownInline::Text(" b".to_string()));
     }
 }
