@@ -1,4 +1,4 @@
-use crate::context;
+use crate::context::{self, LoadedSkill, SkillMeta};
 use crate::db::{SessionRecord, write_session_retry};
 use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
@@ -22,10 +22,10 @@ use std::time::Duration;
 use std::time::Instant;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
-    AssistantToolCallRecord, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream,
-    SessionStatus, ThinkingEffort, TokenUsage,
+    AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
+    OutputStream, SessionStatus, ThinkingEffort, TokenUsage,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// Broadcast a TurnAppended message to all session subscribers, if the
 /// given turn_id exists in the session's turn map.
@@ -400,6 +400,161 @@ fn estimate_prompt_tokens(
     (encoding, estimated)
 }
 
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v.get(key)?.as_str().map(|s| s.to_string())
+}
+
+struct SystemContentParams<'a> {
+    working_dir: Option<&'a Path>,
+    context_config: &'a ContextConfig,
+    skills: &'a [SkillMeta],
+    loaded_skill_bodies: &'a [LoadedSkill],
+    tool_registry: &'a ToolRegistry,
+    pending_hints: &'a [String],
+}
+
+fn build_system_content(
+    params: SystemContentParams,
+    context_cache: &mut Option<(u64, Arc<String>)>,
+) -> Option<String> {
+    let working_dir = match params.working_dir {
+        Some(wd) => wd,
+        None => {
+            warn!("cannot build system content: no working directory on session");
+            return None;
+        }
+    };
+    let groups = params.tool_registry.groups();
+    let base_prompt =
+        context::build_base_prompt(params.skills, &groups, params.loaded_skill_bodies);
+    let mut content = base_prompt;
+
+    // Context files with fingerprint caching
+    if let Ok(bundle) = context::discover_context(working_dir, params.context_config) {
+        let context_str = match context_cache {
+            Some((fp, cached)) if *fp == bundle.fingerprint => {
+                debug!("context cache HIT (fp={})", fp);
+                cached.as_str().to_string()
+            }
+            _ => {
+                let s = context::assemble_context(&bundle);
+                debug!(
+                    "context cache MISS — rebuilt context ({} bytes from {} file(s))",
+                    s.len(),
+                    bundle.files.len()
+                );
+                *context_cache = Some((bundle.fingerprint, Arc::new(s.clone())));
+                s
+            }
+        };
+        if !context_str.is_empty() {
+            content.push_str("\n\n");
+            content.push_str(&context_str);
+        }
+    }
+
+    // Pending subdirectory hints
+    if !params.pending_hints.is_empty() {
+        content.push_str("\n\n## New context from project subdirectories\n");
+        for hint in params.pending_hints {
+            content.push('\n');
+            content.push_str(hint);
+        }
+    }
+
+    Some(content)
+}
+
+/// Detect a `load_skill` tool call and persist the loaded skill body into
+/// the session's loaded_skill_bodies accumulator so it appears in subsequent
+/// system prompts.
+fn persist_loaded_skill(session: &mut SessionState, tool_name: &str, arguments_json: &str) {
+    if tool_name != "load_skill" {
+        return;
+    }
+    let Some(name) = extract_json_string(arguments_json, "name") else {
+        warn!("load_skill tool call missing 'name' argument");
+        return;
+    };
+    if session.loaded_skill_bodies.iter().any(|ls| ls.name == name) {
+        debug!("skill '{}' already loaded, skipping", name);
+        return;
+    }
+    let Some(ref working_dir) = session.config.working_dir else {
+        warn!("cannot load skill '{}': no working directory", name);
+        return;
+    };
+    if let Some(body) = context::load_skill_body(&name, working_dir) {
+        info!("loaded skill body: '{}' ({} bytes)", name, body.len());
+        session.loaded_skill_bodies.push(LoadedSkill { name, body });
+    } else {
+        warn!("skill '{}' not found or has empty body", name);
+    }
+}
+
+/// Check whether a tool call touches a new subdirectory with an AGENTS.md /
+/// CLAUDE.md file and, if so, collect the hint text and newly discovered paths.
+fn check_subdirectory_hints(
+    working_dir: Option<&Path>,
+    tool_name: &str,
+    arguments_json: &str,
+    known_hint_paths: &mut Vec<PathBuf>,
+    pending_hints: &mut Vec<String>,
+) {
+    if let Some((hint_text, new_paths)) =
+        context::subdirectory_hints(tool_name, arguments_json, working_dir, known_hint_paths)
+    {
+        debug!(
+            "subdirectory hints for '{}': {} new path(s)",
+            tool_name,
+            new_paths.len()
+        );
+        known_hint_paths.extend(new_paths);
+        pending_hints.push(hint_text);
+    }
+}
+
+struct CollectToolResultParams<'a> {
+    tool_results: &'a mut Vec<ToolResultItem>,
+    session: &'a mut SessionState,
+    tool_call: &'a ChatToolCall,
+    output: &'a ToolExecutionOutput,
+    known_hint_paths: &'a mut Vec<PathBuf>,
+    pending_hints: &'a mut Vec<String>,
+}
+
+/// Collect tool execution output into the result accumulator, persist any
+/// `load_skill` call to the session, and check for new subdirectory hints.
+/// Called after every tool execution in both the serial and concurrent phases.
+fn collect_tool_result(params: CollectToolResultParams) {
+    let CollectToolResultParams {
+        tool_results,
+        session,
+        tool_call,
+        output,
+        known_hint_paths,
+        pending_hints,
+    } = params;
+    trace!(
+        "collecting tool result for call {} (tool: '{}')",
+        tool_call.id, tool_call.name
+    );
+    tool_results.push(ToolResultItem {
+        call_id: tool_call.id.clone(),
+        output: output.result.content.clone(),
+        caller: tool_call.caller.clone(),
+    });
+    persist_loaded_skill(session, &tool_call.name, &tool_call.arguments_json);
+    check_subdirectory_hints(
+        session.config.working_dir.as_deref(),
+        &tool_call.name,
+        &tool_call.arguments_json,
+        known_hint_paths,
+        pending_hints,
+    );
+}
+
 pub(crate) fn run_agent_loop(
     client: &InferenceProvider,
     session: &mut SessionState,
@@ -413,23 +568,15 @@ pub(crate) fn run_agent_loop(
 
     let mut prev_resp_id: Option<String> = None;
     let mut tool_results: Vec<ToolResultItem> = Vec::new();
+    let mut known_hint_paths: Vec<PathBuf> = Vec::new();
+    let mut pending_hints: Vec<String> = Vec::new();
 
-    // Build system prompt and context at request time.
-    let system_content = if let Some(ref working_dir) = session.config.working_dir {
-        let skills = context::discover_skills(working_dir);
-        let base_prompt = context::build_base_prompt(&skills, &ctx.tool_registry.groups());
-        let mut content = base_prompt;
-        if let Ok(bundle) = context::discover_context(working_dir, &session.config.context_config) {
-            let context_str = context::assemble_context(&bundle);
-            if !context_str.is_empty() {
-                content.push_str("\n\n");
-                content.push_str(&context_str);
-            }
-        }
-        Some(content)
-    } else {
-        None
-    };
+    // Lazily cache discovered skills — they don't change during a session
+    if session.discovered_skills.is_none()
+        && let Some(ref wd) = session.config.working_dir
+    {
+        session.discovered_skills = Some(context::discover_skills(wd));
+    }
 
     for turn_iter in 0..max_turns {
         debug!(
@@ -471,6 +618,23 @@ pub(crate) fn run_agent_loop(
             return Ok(false);
         }
 
+        let system_content = {
+            // Scope the immutable borrow on session so it ends before the
+            // mutable borrows that follow (start_turn, set_assistant_response, etc.).
+            let skills: &[SkillMeta] = session.discovered_skills.as_deref().unwrap_or_default();
+            build_system_content(
+                SystemContentParams {
+                    working_dir: session.config.working_dir.as_deref(),
+                    context_config: &session.config.context_config,
+                    skills,
+                    loaded_skill_bodies: &session.loaded_skill_bodies,
+                    tool_registry: &ctx.tool_registry,
+                    pending_hints: &pending_hints,
+                },
+                &mut session.context_cache,
+            )
+        };
+        pending_hints.clear();
         let messages = build_chat_request_messages(session, system_content.as_deref());
 
         let (encoding, estimated_prompt_tokens) = estimate_prompt_tokens(model, &messages, &tools);
@@ -689,10 +853,13 @@ pub(crate) fn run_agent_loop(
                         ctx,
                         current_turn_id,
                     );
-                    tool_results.push(ToolResultItem {
-                        call_id: tool_call.id.clone(),
-                        output: output.result.content.clone(),
-                        caller: tool_call.caller.clone(),
+                    collect_tool_result(CollectToolResultParams {
+                        tool_results: &mut tool_results,
+                        session,
+                        tool_call: &tool_call,
+                        output: &output,
+                        known_hint_paths: &mut known_hint_paths,
+                        pending_hints: &mut pending_hints,
                     });
                 }
 
@@ -829,10 +996,13 @@ pub(crate) fn run_agent_loop(
                             ctx,
                             current_turn_id,
                         );
-                        tool_results.push(ToolResultItem {
-                            call_id: tool_call.id.clone(),
-                            output: output.result.content.clone(),
-                            caller: tool_call.caller.clone(),
+                        collect_tool_result(CollectToolResultParams {
+                            tool_results: &mut tool_results,
+                            session,
+                            tool_call: &tool_call,
+                            output: &output,
+                            known_hint_paths: &mut known_hint_paths,
+                            pending_hints: &mut pending_hints,
                         });
                     }
                 }
@@ -1005,6 +1175,9 @@ fn execute_tool_with_timeout(
             );
 
             session.config.working_dir = Some(canonical.clone());
+            // Invalidating cached skills so they are re-discovered from
+            // the new working directory on the next agent-loop turn.
+            session.discovered_skills = None;
 
             // Notify session subscribers (e.g. TUI) so the status bar
             // updates to reflect the new working directory immediately.
@@ -1913,5 +2086,177 @@ mod tests {
             "{}",
             handle.output.result.content
         );
+    }
+
+    // -- extract_json_string tests ------------------------------------------
+
+    #[test]
+    fn extract_json_string_gets_value() {
+        let json = r#"{"name": "test-skill", "path": "src/main.rs"}"#;
+        assert_eq!(
+            extract_json_string(json, "name").as_deref(),
+            Some("test-skill")
+        );
+        assert_eq!(
+            extract_json_string(json, "path").as_deref(),
+            Some("src/main.rs")
+        );
+    }
+
+    #[test]
+    fn extract_json_string_missing_key() {
+        assert_eq!(extract_json_string(r#"{"other": "val"}"#, "name"), None);
+    }
+
+    #[test]
+    fn extract_json_string_invalid_json() {
+        assert_eq!(extract_json_string("not json", "name"), None);
+    }
+
+    // -- persist_loaded_skill tests -----------------------------------------
+
+    #[test]
+    fn persist_loaded_skill_adds_to_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join(".agents/skills/test-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "\
+---\n\
+name: test-skill\n\
+description: A test skill\n\
+---\n\
+Hello, this is the skill body.\n\
+---\n",
+        )
+        .unwrap();
+
+        let mut session = SessionState::empty();
+        session.config.working_dir = Some(dir.path().to_path_buf());
+        assert!(session.loaded_skill_bodies.is_empty());
+
+        persist_loaded_skill(&mut session, "load_skill", r#"{"name": "test-skill"}"#);
+
+        assert_eq!(session.loaded_skill_bodies.len(), 1);
+        assert_eq!(session.loaded_skill_bodies[0].name, "test-skill");
+        assert!(session.loaded_skill_bodies[0].body.contains("skill body"));
+    }
+
+    #[test]
+    fn persist_loaded_skill_skips_non_load_skill() {
+        let mut session = SessionState::empty();
+        persist_loaded_skill(&mut session, "read_file", r#"{"path": "Cargo.toml"}"#);
+        assert!(session.loaded_skill_bodies.is_empty());
+    }
+
+    #[test]
+    fn persist_loaded_skill_skips_missing_name() {
+        let mut session = SessionState::empty();
+        session.config.working_dir = Some(PathBuf::from("/tmp"));
+        persist_loaded_skill(&mut session, "load_skill", r#"{}"#);
+        assert!(session.loaded_skill_bodies.is_empty());
+    }
+
+    #[test]
+    fn persist_loaded_skill_skips_without_working_dir() {
+        let mut session = SessionState::empty();
+        persist_loaded_skill(&mut session, "load_skill", r#"{"name": "test-skill"}"#);
+        assert!(session.loaded_skill_bodies.is_empty());
+    }
+
+    // -- build_system_content tests -----------------------------------------
+
+    fn setup_build_system_content_session() -> (SessionState, Arc<ToolRegistry>, tempfile::TempDir)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "Project rules").unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(FastTestTool);
+        let registry = registry.build();
+
+        let mut session = SessionState::empty();
+        session.config.working_dir = Some(dir.path().to_path_buf());
+        (session, registry, dir)
+    }
+
+    /// Call build_system_content with standard defaults derived from the
+    /// session state and optional pending_hints overrides.
+    fn test_build_content(
+        session: &mut SessionState,
+        registry: &ToolRegistry,
+        pending_hints: &[String],
+    ) -> Option<String> {
+        build_system_content(
+            SystemContentParams {
+                working_dir: session.config.working_dir.as_deref(),
+                context_config: &session.config.context_config,
+                skills: &[],
+                loaded_skill_bodies: &session.loaded_skill_bodies,
+                tool_registry: registry,
+                pending_hints,
+            },
+            &mut session.context_cache,
+        )
+    }
+
+    #[test]
+    fn build_system_content_with_working_dir() {
+        let (mut session, registry, _dir) = setup_build_system_content_session();
+        let content = test_build_content(&mut session, &registry, &[]);
+        assert!(content.is_some());
+        let content = content.unwrap();
+        assert!(content.contains("Tool groups"));
+        assert!(content.contains("core"));
+        assert!(content.contains("Project rules"));
+    }
+
+    #[test]
+    fn build_system_content_without_working_dir() {
+        let mut session = SessionState::empty();
+        let registry = ToolRegistry::new().build();
+        let content = test_build_content(&mut session, &registry, &[]);
+        assert!(content.is_none());
+    }
+
+    #[test]
+    fn build_system_content_includes_loaded_skills() {
+        let (mut session, registry, _dir) = setup_build_system_content_session();
+        session.loaded_skill_bodies.push(LoadedSkill {
+            name: "loaded-test".to_string(),
+            body: "Loaded body text.".to_string(),
+        });
+        let content = test_build_content(&mut session, &registry, &[]);
+        assert!(content.is_some());
+        let content = content.unwrap();
+        assert!(content.contains("Loaded skills"));
+        assert!(content.contains("loaded-test"));
+        assert!(content.contains("Loaded body text."));
+    }
+
+    #[test]
+    fn build_system_content_populates_context_cache() {
+        let (mut session, registry, _dir) = setup_build_system_content_session();
+        assert!(session.context_cache.is_none());
+
+        let _ = test_build_content(&mut session, &registry, &[]);
+        assert!(
+            session.context_cache.is_some(),
+            "context_cache should be populated after first call"
+        );
+        let (fp, _) = session.context_cache.as_ref().unwrap();
+        assert!(*fp > 0, "fingerprint should be non-zero");
+    }
+
+    #[test]
+    fn build_system_content_includes_pending_hints() {
+        let (mut session, registry, _dir) = setup_build_system_content_session();
+        let pending_hints = vec!["Hint about subdirectory config.".to_string()];
+        let content = test_build_content(&mut session, &registry, &pending_hints);
+        assert!(content.is_some());
+        let content = content.unwrap();
+        assert!(content.contains("New context from project subdirectories"));
+        assert!(content.contains("Hint about subdirectory config."));
     }
 }

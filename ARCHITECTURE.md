@@ -433,10 +433,10 @@ RunInput received
   └► extract/validate session, check active requests
      └► if chat_completions + tools:
         └► tool-call loop (max configurable iterations, default 25):
-           0.5. re-check context fingerprint, rebuild volatile context if changed
+           0.5. build system content (skills + context with fingerprint cache + loaded skills + subdirectory hints)
            1. send messages + tools → model
            2. receive response
-           3. if tool_call → execute Tool → append subdirectory hints to ToolResult → goto 0.5
+           3. if tool_call → execute Tool → persist loaded skill bodies → collect subdirectory hints → goto 0.5
            4. else → emit final text, Done
      └► if responses or chat_completions (no tools):
         └► stream chunks via SSE → emit OutputChunk per token → Done
@@ -977,14 +977,13 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 | Table | Key | Value |
 |---|---|---|
 | `sessions` | `u64` session ID | postcard(`SessionRecord`) |
-| `session_messages` | `(u64, u32)` (session ID, index) | postcard(`SessionMessage`) |
+| `session_turns` | `(u64, u32)` (session ID, turn ID) | postcard(`Turn`) |
 | `credentials` | `&str` service name | encrypted blob |
 | `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
 | `meta` | `&str` | `u64` counter |
 
 `SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `working_dir`,
-`message_count`, `created_at`, `context_config`, `account_name`, `context_window`,
-`last_prompt_tokens`.
+`turn_count`, `created_at`, `context_config`, `account_name`.
 
 ### Session state (in-memory)
 
@@ -1001,9 +1000,6 @@ across snapshot/restore, metadata conversion, and record persistence:
 - `working_dir: Option<PathBuf>` — working directory for filesystem tools
 - `max_turns: Option<u32>` — per-session tool loop iteration cap (inherits from parent)
 - `created_at: i64` — Unix timestamp of creation
-- `context_fingerprint: Option<u64>` — fingerprint for context file refresh
-- `context_file_paths: Vec<PathBuf>` — tracked context file paths
-- `context_message_index: Option<usize>` — index of the context system message
 - `status: SessionStatus` — current status (Inactive, Inference, Retrying, Sleeping, …)
 - `active_tool_groups: HashSet<String>` — tool groups active for this session
 - `context_config: ContextConfig` — file discovery settings (context file names, max bytes)
@@ -1015,12 +1011,14 @@ across snapshot/restore, metadata conversion, and record persistence:
 
 **Runtime fields (not persisted directly):**
 
-- `messages: Vec<SessionMessage>` — conversation history (persisted to DB separately)
+- `turns: BTreeMap<u32, Turn>` — conversation turns (persisted to DB separately)
+- `next_turn_id: u32` — monotonically increasing counter for turn IDs
+- `last_undo_turn_ids: Option<Vec<u32>>` — stores the turn IDs from the most recent undo, enabling `/redo` to restore exactly those turns; cleared when new user input is appended after an undo
 - `subscribers: HashMap<u64, mpsc::Sender<DaemonMessage>>` — attached clients
 - `active_requests: HashMap<u32, ActiveRequest>` — running request cancel flags
 - `provider: Option<InferenceProvider>` — resolved inference provider for the account
-- `next_message_id: u32` — monotonically increasing counter for `SessionMessage::message_id`; initialized from `messages.len()` on session load, bumped on every `append_message()` / `append_message_with_id()`
-- `last_undo_ids: Option<Vec<u32>>` — stores the subtree message IDs from the most recent undo, enabling `/redo` to restore exactly those messages; cleared when new user input is appended after an undo
+- `loaded_skill_bodies: Vec<LoadedSkill>` — accumulated skill bodies from `load_skill` tool calls, injected into the system prompt on every turn
+- `context_cache: Option<(u64, String)>` — cached context bundle fingerprint and assembled text, avoiding re-reading context files from disk when unchanged
 
 ### Hierarchy and working directory inheritance
 
@@ -1048,41 +1046,35 @@ snapshot of the session state and use cooperative cancellation via an `AtomicBoo
 
 ### Undo/Redo
 
-Sessions support undo/redo via a soft-delete tree model:
+Sessions support undo/redo via an `undone` boolean flag on each `Turn`:
 
-**Message tree:** Each `SessionMessage` carries:
-- `message_id: u32` — monotonically increasing, assigned by `SessionState::append_message()`.
-- `parent_id: Option<u32>` — the `message_id` of the triggering message (UserText for assistant
-  replies, AssistantToolUse for tool results). This forms a parent→child tree enabling subtree
-  traversal during undo.
-- `deleted: bool` — soft-delete flag; set to `true` on undo, back to `false` on redo.
+**Turn model:** Each `Turn` carries:
+- `turn_id: u32` — monotonically increasing, assigned by `SessionState::start_turn()`.
+- `undone: bool` — soft-delete flag; set to `true` on undo, back to `false` on redo.
+- `user_text: Option<String>` — present for user-initiated turns, `None` for follow-up tool-loop turns.
+- `assistant_text`, `assistant_reasoning`, `tool_calls`, `tool_results`, `displayed_images` — the assistant response.
 
 **Undo flow (`/undo` → `ClientMessage::Undo` → `SessionCommand::Undo` → `handle_undo`):**
-1. `SessionState::undo()` finds the most recent non-deleted `UserText` via reverse scan.
-2. Builds a children adjacency map from `parent_id` fields and walks the tree BFS to collect
-   the user message and all its descendants (assistant replies, tool uses, tool results, images).
-3. Sets `deleted = true` on every message in the collected subtree.
-4. Persists each updated message to the database.
-5. Broadcasts `DaemonMessage::SessionMessagesUndone { message_ids }` to all subscribers.
-6. The client removes the messages from its local history view (`remove_messages_by_id`).
+1. `SessionState::undo_turns()` finds the most recent non-undone turn with `user_text: Some(...)` via reverse scan.
+2. Marks that turn and all higher-ID turns as `undone = true`.
+3. Stores the undone turn IDs in `last_undo_turn_ids` for potential redo.
+4. Persists each updated turn to the database.
+5. Broadcasts `DaemonMessage::TurnsUndone { turn_ids }` to all subscribers.
+6. The client removes the turns from its local history view.
 
 **Redo flow** (`/redo` → `ClientMessage::Redo` → `SessionCommand::Redo` → `handle_redo`):
-1. `SessionState::redo()` restores the message IDs stored in `last_undo_ids` from the prior undo.
-2. Sets `deleted = false` on those messages.
-3. Persists each restored message.
-4. Broadcasts `DaemonMessage::SessionMessagesRedone { messages }` with full `SessionMessage`
-   objects so the client can re-insert them in message_id order.
-5. The client inserts restored messages at the correct position in history
-   (`restore_messages`).
+1. `SessionState::redo_turns()` restores the turn IDs stored in `last_undo_turn_ids` from the prior undo.
+2. Sets `undone = false` on those turns.
+3. Returns the restored turns as a `BTreeMap<u32, Turn>`.
+4. Persists each restored turn.
+5. Broadcasts `DaemonMessage::TurnsRedone { turns }` with full `Turn` objects so the client re-inserts them.
 
-**Redo invalidation:** Appending a new `UserText` after an undo clears `last_undo_ids`,
-making the redo unavailable — new user input starts a fresh editing session.
+**Redo invalidation:** Starting a new turn with `user_text: Some(...)` after an undo clears
+`last_undo_turn_ids`, making the redo unavailable — new user input starts a fresh editing session.
 
-**Message ID ordering on the client:** The `Started` and `ToolCallStarted` daemon messages
-now carry a `message_id` that predicts the ID of the subsequent `SessionMessage`. The client
-uses `message_id` to maintain a globally ordered history: committed `SessionMessage` entries
-are inserted at the correct position regardless of arrival order, and the streaming header
-shows `mid:N` instead of `[request_id]` for messages with a known ID.
+**Turn ordering on the client:** The `Started` and `ToolCallStarted` daemon messages
+carry a `turn_id` that predicts the ID of the subsequent `Turn`. The client
+uses `turn_id` to maintain a globally ordered history.
 
 ---
 
@@ -1334,21 +1326,26 @@ User presses Enter on a session in the session manager
 
 The daemon automatically discovers and injects project-specific context files
 (`AGENTS.md`, `CLAUDE.md`) and skills at session creation, and refreshes them
-before every model call.
+before every model call (every turn of the tool-call loop).
 
-### Split-tier system prompt
+### System prompt construction
 
-Each session starts with two `SystemText` messages:
+Each turn in the agent loop calls `build_system_content()` which constructs the
+system prompt from four sources:
 
-```
-messages[0] = stable base prompt (identity, tool guidance, skill metadata)
-messages[1] = volatile project context (AGENTS.md, CLAUDE.md, etc.)
-```
+1. **Base prompt** — identity, tool group listing, available skill metadata, and
+   any loaded skill bodies (accumulated via `load_skill` calls).
+2. **Project context files** (`AGENTS.md`, `CLAUDE.md`, etc.) — discovered by
+   `discover_context()` and assembled by `assemble_context()`. Results are cached
+   on `SessionState::context_cache` (fingerprint + assembled text) and reused
+   when the fingerprint is unchanged.
+3. **Subdirectory hints** — hints accumulated from filesystem tool calls in the
+   previous turn, appended under "## New context from project subdirectories".
+4. **Loaded skills** — `<skill name="...">...</skill>` blocks injected after the
+   "Available skills" listing.
 
-- `messages[0]` never changes within a session — fully cacheable by the model provider.
-- `messages[1]` is re-checked before every tool-loop iteration. If any context file
-  changed on disk (new file, deletion, or modified mtime), it is rebuilt in-place
-  without touching the stable tier.
+The system prompt is rebuilt every turn so that newly loaded skills and newly
+discovered subdirectory hints are visible to the model immediately.
 
 ### Discovery algorithm
 
@@ -1385,10 +1382,11 @@ injected as a new `SystemText` message.
 
 ### Fingerprint-based refresh
 
-Before each turn in the tool-call loop, the daemon computes a SHA-256 fingerprint
-of all known context file paths and their mtimes. If the fingerprint matches the
-stored value, nothing changes. If it differs (file added, removed, or modified),
-`messages[1]` is rebuilt with the new content and the fingerprint is updated.
+Before each turn in the tool-call loop, the daemon computes a fingerprint via
+`compute_fingerprint()` of all known context file paths and their mtimes. If the
+fingerprint matches the cached value on `SessionState::context_cache`, the assembled
+context string is reused without re-reading files from disk. If it differs (file
+added, removed, or modified), the context is rebuilt and the cache is updated.
 
 ### Configuration
 
@@ -1416,22 +1414,26 @@ Implementation lives in `tai-daemon/src/context.rs`. Key entry points:
 | `discover_context(working_dir, config)` | Walk filesystem, return `ContextBundle` with all discovered files |
 | `discover_skills(working_dir)` | Scan Agent Skills directories, return `Vec<SkillMeta>` |
 | `assemble_context(bundle)` | Render discovered files into an XML-like format for injection |
-| `build_base_prompt(skills)` | Build the stable system prompt (identity + skill metadata) |
+| `build_base_prompt(skills, groups, loaded_skills)` | Build the stable system prompt (identity + tool groups + skill metadata + loaded skill bodies) |
 | `recheck_context(working_dir, config, old_fp)` | Re-discover and compare fingerprints |
-| `subdirectory_hints(tool_name, args, working_dir, known)` | Return subdirectory hint content for tool results |
+| `subdirectory_hints(tool_name, args, working_dir, known)` | Return `Option<(String, Vec<PathBuf>)>` — subdirectory hint text and newly discovered paths |
 | `load_skill_body(name, working_dir)` | Load the full body of a SKILL.md, stripping YAML frontmatter |
 
-### New tool: `load_skill`
+### Tool: `load_skill`
 
-Registered alongside other tools in the tool loop. When the model calls
+Registered alongside other tools in the tool loop (core group). When the model calls
 `load_skill(name)`, the daemon:
 
 1. Finds the matching `SKILL.md` from `~/.agents/skills/` or `.agents/skills/`
 2. Strips the YAML frontmatter
-3. Appends a `SystemText` message with the skill body to the session
-4. Returns `"Loaded skill: <name>"` as the tool result
+3. Returns `"Loaded skill: <name>"` as the tool result
 
-The skill body is available to the model on all subsequent turns.
+**Persistence:** After the tool result is collected, `run_agent_loop` detects the
+`load_skill` call and pushes a `LoadedSkill { name, body }` into
+`SessionState::loaded_skill_bodies`. On every subsequent turn, the
+`build_system_content` helper includes all loaded skill bodies in the system prompt,
+wrapped in `<skill name="...">` XML tags. This ensures skill instructions remain
+visible to the model even as tool results scroll out of the context window.
 
 ### `run_riscv` — RISC-V sandboxed code execution
 

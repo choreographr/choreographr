@@ -1,3 +1,4 @@
+use crate::context::{LoadedSkill, SkillMeta};
 use crate::daemon::DaemonCommand;
 use crate::db::{self, SessionRecord, write_session_retry, write_turn_retry};
 use crate::providers::{
@@ -248,6 +249,9 @@ impl From<&SessionState> for SessionRecord {
 pub struct SessionSnapshot {
     pub config: SessionConfig,
     pub turns: BTreeMap<u32, Turn>,
+    pub loaded_skill_bodies: Vec<LoadedSkill>,
+    pub context_cache: Option<(u64, Arc<String>)>,
+    pub discovered_skills: Option<Vec<SkillMeta>>,
 }
 
 pub(crate) struct ActiveRequest {
@@ -267,6 +271,9 @@ pub struct SessionState {
     subscribers: HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
     pub(crate) active_requests: HashMap<u32, ActiveRequest>,
     pub provider: Option<InferenceProvider>,
+    pub loaded_skill_bodies: Vec<LoadedSkill>,
+    pub context_cache: Option<(u64, Arc<String>)>,
+    pub discovered_skills: Option<Vec<SkillMeta>>,
 }
 
 impl SessionState {
@@ -300,6 +307,9 @@ impl SessionState {
         SessionSnapshot {
             config: self.config.clone(),
             turns: self.turns.clone(),
+            loaded_skill_bodies: self.loaded_skill_bodies.clone(),
+            context_cache: self.context_cache.clone(),
+            discovered_skills: self.discovered_skills.clone(),
         }
     }
 
@@ -316,6 +326,9 @@ impl SessionState {
             subscribers,
             active_requests: HashMap::new(),
             provider: None,
+            loaded_skill_bodies: snapshot.loaded_skill_bodies,
+            context_cache: snapshot.context_cache,
+            discovered_skills: snapshot.discovered_skills,
         }
     }
 
@@ -453,6 +466,9 @@ impl SessionState {
             subscribers: HashMap::new(),
             active_requests: HashMap::new(),
             provider: None,
+            loaded_skill_bodies: Vec::new(),
+            context_cache: None,
+            discovered_skills: None,
         }
     }
 }
@@ -1037,6 +1053,12 @@ fn handle_request_finished(
         warn!(error = %e, "failed to persist session config after request");
     }
 
+    // Merge runtime state from the worker snapshot so that loaded skills,
+    // context cache, and discovered skills survive across requests.
+    state.loaded_skill_bodies = snapshot.loaded_skill_bodies;
+    state.context_cache = snapshot.context_cache;
+    state.discovered_skills = snapshot.discovered_skills;
+
     // Merge turns from the worker snapshot into the main session state.
     for (&turn_id, turn) in &snapshot.turns {
         let is_new = !state.turns.contains_key(&turn_id);
@@ -1461,6 +1483,9 @@ mod tests {
             next_turn_id: 1,
             last_undo_turn_ids: None,
             turns,
+            loaded_skill_bodies: Vec::new(),
+            context_cache: None,
+            discovered_skills: None,
             subscribers: HashMap::new(),
             active_requests: HashMap::new(),
             provider: None,
@@ -1874,5 +1899,55 @@ mod tests {
         // New user turn clears redo stack
         let _ = state.start_turn(Some("second".into()));
         assert!(state.redo_turns().is_none());
+    }
+
+    // -- loaded_skill_bodies / context_cache field tests -------------------
+
+    #[test]
+    fn loaded_skill_bodies_default_is_empty() {
+        let state = SessionState::empty();
+        assert!(state.loaded_skill_bodies.is_empty());
+    }
+
+    #[test]
+    fn context_cache_default_is_none() {
+        let state = SessionState::empty();
+        assert!(state.context_cache.is_none());
+    }
+
+    #[test]
+    fn loaded_skill_bodies_survives_snapshot_round_trip() {
+        let mut state = SessionState::empty();
+        state.loaded_skill_bodies.push(LoadedSkill {
+            name: "test".to_string(),
+            body: "body content".to_string(),
+        });
+
+        let snap = state.snapshot();
+        assert_eq!(snap.loaded_skill_bodies.len(), 1);
+        assert_eq!(snap.loaded_skill_bodies[0].name, "test");
+
+        let restored = SessionState::from_snapshot(snap, HashMap::new());
+        assert_eq!(restored.loaded_skill_bodies.len(), 1);
+        assert_eq!(restored.loaded_skill_bodies[0].name, "test");
+        assert_eq!(restored.loaded_skill_bodies[0].body, "body content");
+    }
+
+    #[test]
+    fn context_cache_survives_snapshot_round_trip() {
+        let mut state = SessionState::empty();
+        state.context_cache = Some((42, Arc::new("cached content".to_string())));
+
+        let snap = state.snapshot();
+        assert_eq!(
+            snap.context_cache,
+            Some((42, Arc::new("cached content".to_string())))
+        );
+
+        let restored = SessionState::from_snapshot(snap, HashMap::new());
+        assert_eq!(
+            restored.context_cache,
+            Some((42, Arc::new("cached content".to_string())))
+        );
     }
 }

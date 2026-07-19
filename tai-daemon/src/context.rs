@@ -33,6 +33,12 @@ pub struct SkillMeta {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct LoadedSkill {
+    pub name: String,
+    pub body: String,
+}
+
 pub fn discover_context(working_dir: &Path, config: &ContextConfig) -> io::Result<ContextBundle> {
     let mut files = Vec::new();
     load_global_files(&mut files, config)?;
@@ -173,7 +179,11 @@ pub fn assemble_context(bundle: &ContextBundle) -> String {
     out
 }
 
-pub fn build_base_prompt(skills: &[SkillMeta], groups: &[ToolGroup]) -> String {
+pub fn build_base_prompt(
+    skills: &[SkillMeta],
+    groups: &[ToolGroup],
+    loaded_skills: &[LoadedSkill],
+) -> String {
     let user_prompt = load_user_system_prompt();
     let mut base = user_prompt.unwrap_or_else(default_system_prompt);
 
@@ -189,6 +199,19 @@ pub fn build_base_prompt(skills: &[SkillMeta], groups: &[ToolGroup]) -> String {
         base.push_str("Use the `load_skill` tool to load a skill's full instructions when a task matches its description:\n\n");
         for skill in skills {
             base.push_str(&format!("- **{}**: {}\n", skill.name, skill.description));
+        }
+    }
+
+    if !loaded_skills.is_empty() {
+        base.push_str(
+            "\n## Loaded skills\nThe following skills have been loaded and are active:\n\n",
+        );
+        for ls in loaded_skills {
+            base.push_str(&format!(
+                "<skill name=\"{name}\">\n{body}\n</skill>\n\n",
+                name = ls.name,
+                body = ls.body
+            ));
         }
     }
     base
@@ -316,7 +339,7 @@ pub fn subdirectory_hints(
     arguments_json: &str,
     working_dir: Option<&Path>,
     known_paths: &[PathBuf],
-) -> Option<String> {
+) -> Option<(String, Vec<PathBuf>)> {
     let target_path = extract_tool_path(tool_name, arguments_json)?;
     let resolved = crate::tools::confine_path(&target_path, working_dir).ok()?;
     let parent = resolved.parent()?;
@@ -328,6 +351,7 @@ pub fn subdirectory_hints(
         .unwrap_or_else(|_| working_dir_canonical.clone());
 
     let mut hints = Vec::new();
+    let mut new_paths = Vec::new();
     let mut current = Some(parent.to_path_buf());
     while let Some(dir) = current {
         if !dir.starts_with(&working_dir_canonical) || dir == working_dir_canonical {
@@ -340,7 +364,8 @@ pub fn subdirectory_hints(
                 continue;
             }
             if let Some(content) = read_hint_file(&path) {
-                hints.push((path, content));
+                hints.push((path.clone(), content));
+                new_paths.push(path);
                 break;
             }
         }
@@ -360,7 +385,7 @@ pub fn subdirectory_hints(
             content
         ));
     }
-    Some(out)
+    Some((out, new_paths))
 }
 
 fn extract_tool_path(tool_name: &str, arguments_json: &str) -> Option<String> {
@@ -521,8 +546,9 @@ mod tests {
         let hints = subdirectory_hints("read_file", &args, Some(tmp.path()), &[]);
 
         assert!(hints.is_some());
-        let hints = hints.unwrap();
-        assert!(hints.contains("subdir hints"));
+        let (hint_text, new_paths) = hints.unwrap();
+        assert!(hint_text.contains("subdir hints"));
+        assert!(new_paths.contains(&sub.join("AGENTS.md")));
     }
 
     #[test]
@@ -538,6 +564,27 @@ mod tests {
         let args = serde_json::json!({"path": file_path.to_str().unwrap()}).to_string();
         let hints = subdirectory_hints("read_file", &args, Some(tmp.path()), &[agents_path]);
         assert!(hints.is_none());
+    }
+
+    #[test]
+    fn test_subdirectory_hints_tracks_multiple_new_paths() {
+        let tmp = TempDir::new().unwrap();
+        let sub0 = tmp.path().join("sub0");
+        let sub1 = sub0.join("sub1");
+        fs::create_dir_all(&sub1).unwrap();
+        write_file(&sub0, "AGENTS.md", "outer hints");
+        write_file(&sub1, "AGENTS.md", "inner hints");
+        write_file(&sub1, "file.txt", "hello");
+
+        let file_path = sub1.join("file.txt");
+        let args = serde_json::json!({"path": file_path.to_str().unwrap()}).to_string();
+        let hints = subdirectory_hints("read_file", &args, Some(tmp.path()), &[]);
+
+        assert!(hints.is_some());
+        let (hint_text, new_paths) = hints.unwrap();
+        assert!(hint_text.contains("outer hints"));
+        assert!(hint_text.contains("inner hints"));
+        assert_eq!(new_paths.len(), 2);
     }
 
     #[test]
@@ -568,10 +615,24 @@ mod tests {
             path: PathBuf::from("/fake/SKILL.md"),
         }];
 
-        let prompt = build_base_prompt(&skills, &[]);
+        let prompt = build_base_prompt(&skills, &[], &[]);
         assert!(prompt.contains("test-skill"));
         assert!(prompt.contains("A test skill"));
         assert!(prompt.contains("load_skill"));
+    }
+
+    #[test]
+    fn test_build_base_prompt_includes_loaded_skills() {
+        let loaded = vec![LoadedSkill {
+            name: "loaded-skill".to_string(),
+            body: "Loaded skill body content.".to_string(),
+        }];
+
+        let prompt = build_base_prompt(&[], &[], &loaded);
+        assert!(prompt.contains("Loaded skills"));
+        assert!(prompt.contains("loaded-skill"));
+        assert!(prompt.contains("Loaded skill body content."));
+        assert!(prompt.contains("<skill name=\"loaded-skill\">"));
     }
 
     #[test]
