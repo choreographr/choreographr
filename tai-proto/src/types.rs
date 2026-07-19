@@ -478,6 +478,10 @@ pub enum DaemonMessage {
     SessionAccountSet {
         account: String,
     },
+    ContextWindowResolved {
+        session_id: u64,
+        context_window: u32,
+    },
     SessionWorkingDirSet {
         session_id: u64,
         path: Option<String>,

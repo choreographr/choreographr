@@ -1513,6 +1513,18 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::SessionAccountSet { account } => {
             app.handle_session_account_set(account);
         }
+        DaemonMessage::ContextWindowResolved {
+            session_id,
+            context_window,
+        } => {
+            // Update context window for the attached session. This is
+            // broadcast after lazy resolution (e.g. first RunInput or
+            // SetModel) so the TUI's progress bar and status bar update.
+            if app.attached_session_id == Some(*session_id) {
+                app.attached_context_window = Some(*context_window);
+                app.progress_dirty = true;
+            }
+        }
         DaemonMessage::SessionWorkingDirSet { session_id, path } => {
             app.handle_session_working_dir_set(*session_id, path);
         }

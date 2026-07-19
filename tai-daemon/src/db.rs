@@ -7,7 +7,7 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
-use tai_proto::{ContextConfig, ThinkingEffort, TokenUsage, Turn};
+use tai_proto::{ContextConfig, ThinkingEffort, Turn};
 use tracing::{debug, error, info, warn};
 
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
@@ -50,12 +50,6 @@ pub struct SessionRecord {
     pub account_name: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<ThinkingEffort>,
-    #[serde(default)]
-    pub accumulated_usage: TokenUsage,
-    #[serde(default)]
-    pub context_window: Option<u32>,
-    #[serde(default)]
-    pub last_prompt_tokens: Option<u32>,
 }
 
 pub fn db_path() -> io::Result<PathBuf> {
@@ -770,9 +764,6 @@ mod tests {
             active_tool_groups: vec!["core".into(), "git".into()],
             context_config: ContextConfig::default(),
             account_name: None,
-            accumulated_usage: TokenUsage::default(),
-            context_window: None,
-            last_prompt_tokens: None,
         };
         write_session(&db, id, &record).unwrap();
 

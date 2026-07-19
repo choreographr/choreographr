@@ -1,7 +1,7 @@
 use crate::accounts::{AccountConfig, AccountManager, accounts_config_path};
 use crate::db::{self, SessionRecord};
 use crate::mcp::McpManager;
-use crate::providers::InferenceProvider;
+use crate::providers::{InferenceProvider, lookup_context_window};
 use crate::sessions::{
     ActiveSessionEntry, RequestContext, SessionCommand, SessionMetadata, session_main,
 };
@@ -360,6 +360,17 @@ impl DaemonState {
         } else {
             active_tool_groups.clone()
         };
+
+        // Resolve context window from the static catalog at creation time
+        // when both account and model are known — no provider instance needed.
+        let context_window = account_name.as_ref().and_then(|name| {
+            self.accounts.get(name).and_then(|config| {
+                selected_model
+                    .as_ref()
+                    .and_then(|model| lookup_context_window(&config.provider, model))
+            })
+        });
+
         let record = SessionRecord {
             title: title.clone(),
             selected_model,
@@ -375,9 +386,6 @@ impl DaemonState {
             active_tool_groups: active_cats.clone(),
             context_config: context_config.clone().unwrap_or_default(),
             account_name: account_name.clone(),
-            accumulated_usage: TokenUsage::default(),
-            context_window: None,
-            last_prompt_tokens: None,
         };
 
         if let Err(e) = db::write_session(&self.db, sid, &record) {
@@ -397,7 +405,7 @@ impl DaemonState {
             active_tool_groups: active_cats.clone(),
             account_name: account_name.clone(),
             accumulated_usage: TokenUsage::default(),
-            context_window: None,
+            context_window,
             last_prompt_tokens: None,
         };
         let session_tx = self.spawn_session(sid, record, metadata);

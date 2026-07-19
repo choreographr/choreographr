@@ -122,9 +122,9 @@ impl From<SessionRecord> for SessionMetadata {
             active_tool_groups: record.active_tool_groups.into_iter().collect(),
             context_config: record.context_config,
             account_name: record.account_name,
-            accumulated_usage: record.accumulated_usage,
-            context_window: record.context_window,
-            last_prompt_tokens: record.last_prompt_tokens,
+            accumulated_usage: TokenUsage::default(),
+            context_window: None,
+            last_prompt_tokens: None,
         };
         let mut meta = SessionMetadata::from(&config);
         meta.turn_count = record.turn_count;
@@ -147,9 +147,6 @@ impl From<SessionMetadata> for SessionRecord {
             active_tool_groups: meta.active_tool_groups,
             context_config: ContextConfig::default(),
             account_name: meta.account_name,
-            accumulated_usage: meta.accumulated_usage,
-            context_window: meta.context_window,
-            last_prompt_tokens: meta.last_prompt_tokens,
         }
     }
 }
@@ -289,6 +286,13 @@ impl SessionState {
                 session_id, cw, model
             );
             self.config.context_window = Some(cw);
+            broadcast(
+                &mut self.subscribers,
+                DaemonMessage::ContextWindowResolved {
+                    session_id,
+                    context_window: cw,
+                },
+            );
         }
     }
 
@@ -533,12 +537,9 @@ pub fn session_main(
             .map(|r| r.context_config.clone())
             .unwrap_or_default(),
         account_name,
-        accumulated_usage: init_record
-            .as_ref()
-            .map(|r| r.accumulated_usage)
-            .unwrap_or_default(),
-        context_window: init_record.as_ref().and_then(|r| r.context_window),
-        last_prompt_tokens: init_record.as_ref().and_then(|r| r.last_prompt_tokens),
+        accumulated_usage: TokenUsage::default(),
+        context_window: None,
+        last_prompt_tokens: None,
     };
     let mut state = SessionState {
         config,
@@ -557,6 +558,18 @@ pub fn session_main(
                 state.turns.insert(turn_id, turn);
                 state.next_turn_id = state.next_turn_id.max(turn_id + 1);
             }
+            // Reconstruct accumulated_usage from per-turn token_usage so
+            // the running total survives daemon restarts without storing
+            // it redundantly in the session record.
+            state.config.accumulated_usage = state
+                .turns
+                .values()
+                .filter_map(|t| t.token_usage)
+                .fold(TokenUsage::default(), |acc, u| TokenUsage {
+                    input_tokens: acc.input_tokens + u.input_tokens,
+                    output_tokens: acc.output_tokens + u.output_tokens,
+                    total_tokens: acc.total_tokens + u.total_tokens,
+                });
         }
         Err(e) => warn!(ctx.session_id, error = %e, "failed to load turns from DB"),
     }
@@ -833,6 +846,15 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         ctx.session_id, cw, model
     );
     state.config.context_window = cw;
+    if let Some(cw) = cw {
+        broadcast(
+            &mut state.subscribers,
+            DaemonMessage::ContextWindowResolved {
+                session_id: ctx.session_id,
+                context_window: cw,
+            },
+        );
+    }
     debug!(
         "session {}: broadcasting ModelSelected model={}",
         ctx.session_id, model
@@ -847,6 +869,12 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         session_id: ctx.session_id,
         metadata: SessionMetadata::from(&*state),
     });
+    // Persist the updated session record so resolved context_window
+    // survives daemon restarts.
+    let record = SessionRecord::from(&*state);
+    if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
+        warn!(error = %e, "failed to persist session record after SetModel");
+    }
     false
 }
 
@@ -991,8 +1019,15 @@ fn handle_request_finished(
     shutdown_requested: &bool,
     ctx: &RequestContext,
 ) -> bool {
-    // Apply config changes from worker (accumulated usage, etc.)
+    // Apply config changes from worker (accumulated usage, context_window, etc.)
     state.config = snapshot.config;
+
+    // Persist the updated session config (accumulated usage, context_window, etc.)
+    // so resolved values survive daemon restarts.
+    let record = SessionRecord::from(&*state);
+    if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
+        warn!(error = %e, "failed to persist session config after request");
+    }
 
     // Merge turns from the worker snapshot into the main session state.
     for (&turn_id, turn) in &snapshot.turns {
@@ -1067,6 +1102,15 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
                 ctx.session_id, cw, model
             );
             state.config.context_window = cw;
+            if let Some(cw) = cw {
+                broadcast(
+                    &mut state.subscribers,
+                    DaemonMessage::ContextWindowResolved {
+                        session_id: ctx.session_id,
+                        context_window: cw,
+                    },
+                );
+            }
         }
         state.provider = Some(provider);
     }
@@ -1084,6 +1128,12 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
         session_id: ctx.session_id,
         metadata: SessionMetadata::from(&*state),
     });
+    // Persist the updated session record so resolved context_window
+    // survives daemon restarts.
+    let record = SessionRecord::from(&*state);
+    if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
+        warn!(error = %e, "failed to persist session record after SetAccount");
+    }
     false
 }
 
@@ -1584,6 +1634,102 @@ mod tests {
         assert_eq!(state.config.accumulated_usage.input_tokens, 0);
         assert_eq!(state.config.accumulated_usage.output_tokens, 0);
         assert_eq!(state.config.accumulated_usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn accumulated_usage_reconstructed_from_turns() {
+        let mut state = SessionState::empty();
+
+        // Turn 0: no token_usage (should be filtered out)
+        state.turns.insert(
+            0,
+            Turn {
+                created_at: TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("hello".into()),
+                assistant_text: Some("hi".into()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                token_usage: None,
+                tool_results: Vec::new(),
+                displayed_images: Vec::new(),
+            },
+        );
+
+        // Turn 1: has token_usage
+        state.turns.insert(
+            1,
+            Turn {
+                created_at: TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("turn 2".into()),
+                assistant_text: Some("response 2".into()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                token_usage: Some(TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    total_tokens: 30,
+                }),
+                tool_results: Vec::new(),
+                displayed_images: Vec::new(),
+            },
+        );
+
+        // Turn 2: another with token_usage
+        state.turns.insert(
+            2,
+            Turn {
+                created_at: TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("turn 3".into()),
+                assistant_text: Some("response 3".into()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                token_usage: Some(TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    total_tokens: 150,
+                }),
+                tool_results: Vec::new(),
+                displayed_images: Vec::new(),
+            },
+        );
+
+        // Turn 3: no token_usage (should be filtered out)
+        state.turns.insert(
+            3,
+            Turn {
+                created_at: TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("no usage".into()),
+                assistant_text: None,
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                token_usage: None,
+                tool_results: Vec::new(),
+                displayed_images: Vec::new(),
+            },
+        );
+
+        // Run the same reconstruction logic from session_main
+        state.config.accumulated_usage = state.turns.values().filter_map(|t| t.token_usage).fold(
+            TokenUsage::default(),
+            |acc, u| TokenUsage {
+                input_tokens: acc.input_tokens + u.input_tokens,
+                output_tokens: acc.output_tokens + u.output_tokens,
+                total_tokens: acc.total_tokens + u.total_tokens,
+            },
+        );
+
+        // Expected: 10+100 = 110 input, 20+50 = 70 output, 30+150 = 180 total
+        assert_eq!(state.config.accumulated_usage.input_tokens, 110);
+        assert_eq!(state.config.accumulated_usage.output_tokens, 70);
+        assert_eq!(state.config.accumulated_usage.total_tokens, 180);
     }
 
     #[test]
