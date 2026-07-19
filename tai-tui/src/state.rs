@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Rect, Size};
 use std::collections::{HashMap, HashSet};
-use tai_client_core::dispatch::ToolCallEvent;
+use tai_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use tai_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
 use tai_proto::{
     AccountInfo, ClientMessage, OutputStream, SessionStatus, SessionSummary, ThinkingEffort,
@@ -20,8 +20,6 @@ pub(crate) const STATUS_BAR_HEIGHT: u16 = 2;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
-
-pub(crate) const STRUCTURAL_ROWS: usize = 4;
 
 pub(crate) const IMAGE_BLOCK_HEIGHT: u16 = 10;
 pub(crate) const STATUS_ERROR_BAR_HEIGHT: u16 = 2;
@@ -434,7 +432,6 @@ pub(crate) struct HistoryViewport {
 pub(crate) struct HistoryScrollState {
     pub(crate) scroll: usize,
     pub(crate) scroll_compensation: usize,
-    pub(crate) follow_output: bool,
 }
 
 pub(crate) enum UiEvent {
@@ -461,7 +458,6 @@ impl HistoryScrollState {
         Self {
             scroll: 0,
             scroll_compensation: 0,
-            follow_output: true,
         }
     }
 
@@ -473,10 +469,6 @@ impl HistoryScrollState {
     #[cfg(test)]
     pub(crate) fn scroll_compensation(&self) -> usize {
         self.scroll_compensation
-    }
-
-    pub(crate) fn follow_output(&self) -> bool {
-        self.follow_output
     }
 
     fn unclamped_effective_scroll(&self) -> usize {
@@ -493,44 +485,14 @@ impl HistoryScrollState {
         self.scroll_compensation -= compensation_reduction;
         let remaining = overflow - compensation_reduction;
         self.scroll = self.scroll.saturating_sub(remaining);
-        if self.scroll == 0 && self.scroll_compensation == 0 {
-            self.follow_output = true;
-        }
     }
 
     pub(crate) fn effective_scroll(&self, max_scroll: usize) -> usize {
         self.unclamped_effective_scroll().min(max_scroll)
     }
 
-    pub(crate) fn preserve_for_growth(
-        &mut self,
-        old_height: usize,
-        new_height: usize,
-        max_scroll: usize,
-    ) {
-        if !self.follow_output && new_height > old_height {
-            self.scroll_compensation = self
-                .scroll_compensation
-                .saturating_add(new_height - old_height);
-            self.clamp(max_scroll);
-        }
-    }
-
-    pub(crate) fn on_item_appended(&mut self, added_height: usize, max_scroll: usize) {
-        if self.follow_output {
-            self.scroll = 0;
-            self.scroll_compensation = 0;
-        } else {
-            self.scroll_compensation = self.scroll_compensation.saturating_add(added_height);
-        }
-        self.clamp(max_scroll);
-    }
-
     pub(crate) fn scroll_up(&mut self, amount: usize, max_scroll: usize) {
         self.scroll = self.scroll.saturating_add(amount);
-        if self.scroll > 0 {
-            self.follow_output = false;
-        }
         self.clamp(max_scroll);
     }
 
@@ -539,14 +501,6 @@ impl HistoryScrollState {
         self.scroll_compensation -= compensation_reduction;
         let remaining = amount.saturating_sub(compensation_reduction);
         self.scroll = self.scroll.saturating_sub(remaining);
-        if self.scroll == 0 && self.scroll_compensation == 0 {
-            self.follow_output = true;
-        }
-        self.clamp(max_scroll);
-    }
-
-    pub(crate) fn account_for_trimmed_height(&mut self, trimmed_height: usize, max_scroll: usize) {
-        self.scroll_compensation = self.scroll_compensation.saturating_sub(trimmed_height);
         self.clamp(max_scroll);
     }
 }
@@ -954,7 +908,7 @@ impl App {
             // Compute height for this turn.
             let content_width = self.history_viewport.width.saturating_sub(9);
             let text_lines = render_turn_lines(turn, content_width);
-            let text_height = lines_height(&text_lines, content_width).max(1);
+            let text_height = lines_height(&text_lines, self.history_viewport.width).max(1);
             let img_height = turn.displayed_images.len() * IMAGE_BLOCK_HEIGHT as usize;
             let turn_height = text_height + img_height;
             total += turn_height;
@@ -1033,11 +987,6 @@ impl App {
     pub(crate) fn effective_scroll(&self) -> usize {
         self.history_scroll
             .effective_scroll(self.max_scroll_offset())
-    }
-
-    pub(crate) fn preserve_scroll_for_growth(&mut self, old_height: usize, new_height: usize) {
-        self.history_scroll
-            .preserve_for_growth(old_height, new_height, self.max_scroll_offset());
     }
 
     pub(crate) fn ensure_cache_synced(&mut self) {
@@ -1148,7 +1097,6 @@ impl App {
         let amount = row.min(max_scroll);
         self.history_scroll.scroll = amount;
         self.history_scroll.scroll_compensation = 0;
-        self.history_scroll.follow_output = amount == 0;
     }
 
     pub(crate) fn scroll_to_track_row(&mut self, mouse_row: u16, track_height: u16) {
@@ -1540,25 +1488,24 @@ impl TurnEventHandler for App {
         self.markers_dirty = true;
     }
 
-    fn handle_session_state(
-        &mut self,
-        _session_id: u64,
-        turns: std::collections::BTreeMap<u32, Turn>,
-        title: Option<String>,
-        selected_model: Option<String>,
-        _active_tool_groups: Vec<String>,
-        token_usage: Option<TokenUsage>,
-        context_window: Option<u32>,
-        last_prompt_tokens: Option<u32>,
-        status: SessionStatus,
-    ) {
+    fn handle_session_state(&mut self, state: SessionStateData) {
         tracing::debug!(
-            turn_count = %turns.len(),
-            ?title,
-            ?selected_model,
-            ?status,
+            turn_count = %state.turns.len(),
+            ?state.title,
+            ?state.selected_model,
+            ?state.status,
             "handle_session_state"
         );
+        let SessionStateData {
+            turns,
+            title: _,
+            selected_model,
+            token_usage,
+            context_window,
+            last_prompt_tokens,
+            status,
+            ..
+        } = state;
         self.session_view.turns = turns;
         self.attached_model = selected_model;
         self.attached_token_usage = token_usage;
@@ -1609,6 +1556,7 @@ impl TurnEventHandler for App {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
     lines_height(&crate::markdown_render::plain_text_lines(text), width)
 }

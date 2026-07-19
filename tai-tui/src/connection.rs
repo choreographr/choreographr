@@ -855,7 +855,8 @@ fn handle_chat_event(
                                 .unwrap_or(0);
                             let content_width = app.history_viewport.width.saturating_sub(9);
                             let text_lines = render_turn_lines(turn, content_width);
-                            let text_height = lines_height(&text_lines, content_width).max(1);
+                            let text_height =
+                                lines_height(&text_lines, app.history_viewport.width).max(1);
                             let total_height = app.total_history_height();
                             let vh = app.history_viewport.height as usize;
                             let content_line = total_height

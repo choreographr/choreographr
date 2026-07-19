@@ -211,11 +211,15 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(chunks[0]);
 
+    // Build height_prefix and visible_turn_ids BEFORE rendering history,
+    // so render_history iterates the correct set of visible turns rather
+    // than an empty visible_turn_ids on the first frame after session data arrives.
+    app.compute_total_height_and_markers();
     render_history(frame, history_chunks[0], app);
 
     // ── Scrollbar ────────────────────────────────────────────
     let viewport_height = app.history_viewport.height as usize;
-    let total_height = app.compute_total_height_and_markers();
+    let total_height = app.total_history_height();
     if total_height > viewport_height {
         let position = app
             .max_scroll_offset()
@@ -379,7 +383,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             (lines, count)
         };
 
-        let text_height = lines_height(&text_lines, content_width).max(1);
+        let text_height = lines_height(&text_lines, area.width).max(1);
 
         if let Some((top_line, visible_height)) =
             clipped_area(text_height, &mut rows_to_skip, &mut rows_remaining, &mut y)
@@ -391,7 +395,6 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 top_line,
                 visible_height,
                 &mut y,
-                content_width,
                 Style::default().bg(BG_SHADE),
             );
         }
@@ -472,7 +475,6 @@ fn render_margin_lines(
     top_line: usize,
     visible_height: usize,
     y: &mut u16,
-    _content_width: u16,
     paragraph_style: Style,
 ) {
     let rect = Rect {

@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use ratatui::style::Color;
 use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::parsing::SyntaxSet;
 
 /// Load the default syntax set (with newline-aware grammars).
 pub(crate) fn syntax_set() -> &'static SyntaxSet {
@@ -45,22 +45,4 @@ pub(crate) fn to_ratatui_color(c: syntect::highlighting::Color) -> Color {
     } else {
         Color::Rgb(c.r, c.g, c.b)
     }
-}
-
-/// Look up a syntect syntax definition for the given file path.
-///
-/// Uses syntect's built-in extension and file-name matching, which covers
-/// all languages in the default syntax set.  Replaces the previous
-/// hand-maintained extension→token map.
-pub(crate) fn syntax_for_path(path: &str) -> Option<&'static SyntaxReference> {
-    let p = std::path::Path::new(path);
-    // Try full file name first (handles "Dockerfile", "Makefile", etc.)
-    if let Some(name) = p.file_name().and_then(|f| f.to_str())
-        && let Ok(Some(s)) = syntax_set().find_syntax_for_file(name)
-    {
-        return Some(s);
-    }
-    // Fall back to extension-only lookup
-    let ext = p.extension().and_then(|e| e.to_str())?;
-    syntax_set().find_syntax_by_extension(ext)
 }

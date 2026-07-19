@@ -113,7 +113,7 @@ pub(crate) fn render_turn_lines(turn: &Turn, content_width: u16) -> Vec<Line<'st
             let trimmed = reasoning.trim();
             if !trimmed.is_empty() {
                 heading_line(&mut body, "Reasoning", Color::DarkGray);
-                body.extend(plain_text_lines(trimmed));
+                body.extend(markdown_lines(trimmed, content_width));
             }
         }
 
@@ -1283,7 +1283,7 @@ mod tests {
             "reasoning header should appear"
         );
         assert!(
-            text.contains("Let me think..."),
+            text.contains("Let me think"),
             "reasoning body should appear"
         );
         assert!(text.contains("Response:"), "response header should appear");
@@ -1291,6 +1291,126 @@ mod tests {
             text.contains("The answer is 42."),
             "response body should appear"
         );
+    }
+
+    #[test]
+    fn render_turn_lines_reasoning_bold_markdown() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("Okay.".into()),
+            assistant_reasoning: Some("Use **bold** for emphasis.".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Reasoning:"),
+            "reasoning header should appear"
+        );
+        assert!(text.contains("bold"), "bold text content should appear");
+        assert!(
+            !text.contains("**bold**"),
+            "markdown bold syntax should not appear literally in output"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_reasoning_inline_code() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: Some("Use `code` inline.".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Reasoning:"),
+            "reasoning header should appear"
+        );
+        assert!(text.contains("code"), "code content should appear");
+        assert!(
+            !text.contains("`code`"),
+            "markdown inline code backticks should not appear literally"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_reasoning_whitespace_only() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("Response text.".into()),
+            assistant_reasoning: Some("   ".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("Reasoning:"),
+            "whitespace-only reasoning should not produce a Reasoning header"
+        );
+        assert!(text.contains("Response:"), "response header should appear");
+    }
+
+    #[test]
+    fn render_turn_lines_reasoning_code_block() {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: Some("Here is code:\n```rust\nfn main() {}\n```".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Reasoning:"),
+            "reasoning header should appear"
+        );
+        assert!(
+            text.contains("fn main() {}"),
+            "code block content should appear"
+        );
+        assert!(text.contains("```"), "code block fences should be visible");
     }
 
     #[test]

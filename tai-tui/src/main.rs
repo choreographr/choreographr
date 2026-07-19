@@ -1,6 +1,5 @@
 mod cache;
 mod connection;
-mod diff_render;
 mod markdown_render;
 mod render;
 mod scrollbar;

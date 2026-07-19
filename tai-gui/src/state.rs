@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use tai_client_core::{SessionView, ToolCallEvent, TurnEventHandler};
+use tai_client_core::{SessionStateData, SessionView, ToolCallEvent, TurnEventHandler};
 use tai_proto::{OutputStream, SessionStatus, TokenUsage, Turn};
 use tracing::{debug, trace, warn};
 
@@ -116,20 +116,9 @@ impl TurnEventHandler for AppState {
         }
     }
 
-    fn handle_session_state(
-        &mut self,
-        session_id: u64,
-        turns: BTreeMap<u32, Turn>,
-        title: Option<String>,
-        selected_model: Option<String>,
-        _active_tool_groups: Vec<String>,
-        _token_usage: Option<TokenUsage>,
-        _context_window: Option<u32>,
-        _last_prompt_tokens: Option<u32>,
-        status: SessionStatus,
-    ) {
-        debug!(session_id, turn_count = %turns.len(), ?title, ?selected_model, ?status, "handle_session_state");
-        self.session_view.turns = turns;
+    fn handle_session_state(&mut self, state: SessionStateData) {
+        debug!(session_id = %state.session_id, turn_count = %state.turns.len(), ?state.title, ?state.selected_model, ?state.status, "handle_session_state");
+        self.session_view.turns = state.turns;
     }
 
     fn handle_status_text(&mut self, text: String) {

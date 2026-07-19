@@ -20,6 +20,20 @@ pub enum ToolCallEvent {
     },
 }
 
+/// Grouped payload for [`TurnEventHandler::handle_session_state`].
+#[derive(Debug, Clone)]
+pub struct SessionStateData {
+    pub session_id: u64,
+    pub turns: BTreeMap<u32, Turn>,
+    pub title: Option<String>,
+    pub selected_model: Option<String>,
+    pub active_tool_groups: Vec<String>,
+    pub token_usage: Option<TokenUsage>,
+    pub context_window: Option<u32>,
+    pub last_prompt_tokens: Option<u32>,
+    pub status: SessionStatus,
+}
+
 pub trait TurnEventHandler {
     fn handle_turn_appended(&mut self, turn_id: u32, turn: Turn);
     fn handle_turn_finalized(&mut self, turn_id: u32, turn: Turn);
@@ -36,18 +50,7 @@ pub trait TurnEventHandler {
     fn handle_failed(&mut self, request_id: u32, error: String);
     fn handle_tool_call_event(&mut self, request_id: u32, event: ToolCallEvent);
     fn handle_tool_result_chunk(&mut self, request_id: u32, call_id: String, data: Vec<u8>);
-    fn handle_session_state(
-        &mut self,
-        session_id: u64,
-        turns: BTreeMap<u32, Turn>,
-        title: Option<String>,
-        selected_model: Option<String>,
-        active_tool_groups: Vec<String>,
-        token_usage: Option<TokenUsage>,
-        context_window: Option<u32>,
-        last_prompt_tokens: Option<u32>,
-        status: SessionStatus,
-    );
+    fn handle_session_state(&mut self, state: SessionStateData);
     fn handle_status_text(&mut self, text: String);
     fn handle_error(&mut self, error: String);
     fn handle_session_attached(&mut self, session_id: u64);
@@ -96,17 +99,17 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             status,
             ..
         } => {
-            handler.handle_session_state(
-                *session_id,
-                turns.clone(),
-                title.clone(),
-                selected_model.clone(),
-                active_tool_groups.clone(),
-                *token_usage,
-                *context_window,
-                *last_prompt_tokens,
-                status.clone(),
-            );
+            handler.handle_session_state(SessionStateData {
+                session_id: *session_id,
+                turns: turns.clone(),
+                title: title.clone(),
+                selected_model: selected_model.clone(),
+                active_tool_groups: active_tool_groups.clone(),
+                token_usage: *token_usage,
+                context_window: *context_window,
+                last_prompt_tokens: *last_prompt_tokens,
+                status: status.clone(),
+            });
         }
         DaemonMessage::TurnAppended { turn_id, turn } => {
             handler.handle_turn_appended(*turn_id, turn.clone());

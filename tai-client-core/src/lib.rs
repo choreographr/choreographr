@@ -12,7 +12,7 @@ pub use connection::{
 };
 pub use credentials::{build_add_credential_message, read_public_key_bytes, resolve_private_key};
 pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
-pub use dispatch::{ToolCallEvent, TurnEventHandler, dispatch_daemon_message};
+pub use dispatch::{SessionStateData, ToolCallEvent, TurnEventHandler, dispatch_daemon_message};
 pub use error::{ClientError, broken_pipe};
 pub use history::SessionView;
 pub use shell::{
