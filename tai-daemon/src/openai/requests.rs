@@ -987,6 +987,13 @@ where
                         ))));
                     }
                     raw_tool_call_deltas.push(tc.clone());
+                    debug!(
+                        "tool call delta accumulated: index={}, id={:?}, function={:?}, total_deltas={}",
+                        tc.index,
+                        tc.id,
+                        tc.function.as_ref().map(|f| &f.name),
+                        raw_tool_call_deltas.len(),
+                    );
                 }
             }
         }
