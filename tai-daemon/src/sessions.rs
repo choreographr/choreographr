@@ -1004,7 +1004,7 @@ fn handle_request_finished(
             if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, turn_id, turn) {
                 tracing::warn!(turn_id, error = %e, "failed to persist turn");
             }
-        } else if state.turns.get(&turn_id).map_or(false, |t| t != turn) {
+        } else if state.turns.get(&turn_id).is_some_and(|t| t != turn) {
             // Turn was updated — persist the latest state.
             if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, turn_id, turn) {
                 tracing::warn!(turn_id, error = %e, "failed to persist updated turn");

@@ -219,25 +219,26 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             if models.is_empty() {
                 handler.handle_status_text("[daemon] no models available".to_string());
             } else {
-                handler.handle_status_text(format!("[daemon] supported models ({})", models.len()));
+                let mut lines = vec![format!("[daemon] supported models ({})", models.len())];
                 for model in models {
                     let prefix = if selected_model.as_deref() == Some(model.as_str()) {
                         "*"
                     } else {
                         "-"
                     };
-                    handler.handle_status_text(format!("{prefix} {model}"));
+                    lines.push(format!("{prefix} {model}"));
                 }
+                handler.handle_status_text(lines.join("\n"));
             }
         }
         DaemonMessage::ModelsFailed { error } => {
-            handler.handle_status_text(format!("[daemon] models failed: {error}"));
+            handler.handle_error(format!("[daemon] models failed: {error}"));
         }
         DaemonMessage::ModelSelected { model } => {
             handler.handle_status_text(format!("[daemon] selected model: {model}"));
         }
         DaemonMessage::ModelSelectionFailed { model, error } => {
-            handler.handle_status_text(format!("[daemon] failed to select model {model}: {error}"));
+            handler.handle_error(format!("[daemon] failed to select model {model}: {error}"));
         }
         DaemonMessage::Unlocked => {
             handler.handle_status_text(
@@ -248,13 +249,13 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             handler.handle_status_text("[daemon] keystore locked, credentials cleared".to_string());
         }
         DaemonMessage::LockedError { error } => {
-            handler.handle_status_text(format!("[daemon] locked: {error}"));
+            handler.handle_error(format!("[daemon] locked: {error}"));
         }
         DaemonMessage::CredentialAdded { service } => {
             handler.handle_status_text(format!("[daemon] credential added: {service}"));
         }
         DaemonMessage::CredentialAddFailed { service, error } => {
-            handler.handle_status_text(format!(
+            handler.handle_error(format!(
                 "[daemon] credential add failed ({service}): {error}"
             ));
         }
@@ -262,7 +263,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             handler.handle_status_text(format!("[daemon] credential removed: {service}"));
         }
         DaemonMessage::CredentialRemoveFailed { service, error } => {
-            handler.handle_status_text(format!(
+            handler.handle_error(format!(
                 "[daemon] credential remove failed ({service}): {error}"
             ));
         }
@@ -273,27 +274,27 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             handler.handle_status_text(format!("[daemon] account added: {name}"));
         }
         DaemonMessage::AccountAddFailed { name, error } => {
-            handler.handle_status_text(format!("[daemon] failed to add account {name}: {error}"));
+            handler.handle_error(format!("[daemon] failed to add account {name}: {error}"));
         }
         DaemonMessage::AccountRemoved { name } => {
             handler.handle_status_text(format!("[daemon] account removed: {name}"));
         }
         DaemonMessage::AccountRemoveFailed { name, error } => {
-            handler
-                .handle_status_text(format!("[daemon] failed to remove account {name}: {error}"));
+            handler.handle_error(format!("[daemon] failed to remove account {name}: {error}"));
         }
         DaemonMessage::Accounts { accounts } => {
             if accounts.is_empty() {
                 handler.handle_status_text("[daemon] no accounts configured".to_string());
             } else {
-                handler.handle_status_text(format!("[daemon] accounts ({})", accounts.len()));
+                let mut lines = vec![format!("[daemon] accounts ({})", accounts.len())];
                 for a in accounts {
-                    handler.handle_status_text(format!("  {}: {}", a.name, a.provider));
+                    lines.push(format!("  {}: {}", a.name, a.provider));
                 }
+                handler.handle_status_text(lines.join("\n"));
             }
         }
         DaemonMessage::AccountListFailed { error } => {
-            handler.handle_status_text(format!("[daemon] failed to list accounts: {error}"));
+            handler.handle_error(format!("[daemon] failed to list accounts: {error}"));
         }
         DaemonMessage::SessionAccountSet { account } => {
             handler.handle_status_text(format!("[daemon] session account set: {account}"));
@@ -303,7 +304,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             handler.handle_status_text(format!("[daemon] reasoning effort: {}", effort.as_label()));
         }
         DaemonMessage::ReasoningEffortSetFailed { effort, error } => {
-            handler.handle_status_text(format!(
+            handler.handle_error(format!(
                 "[daemon] failed to set reasoning effort {effort}: {error}"
             ));
         }

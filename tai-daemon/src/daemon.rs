@@ -645,13 +645,19 @@ impl DaemonState {
             return;
         };
 
-        // No provider for this account → cannot validate, allow through.
+        // No provider for this account → daemon is locked or the credential
+        // hasn't been saved.  Reject so the user knows they must unlock first
+        // (or configure a credential) rather than silently accepting an
+        // unvalidated model.
         if !self.providers.contains_key(&account_name) {
             debug!(
                 "ValidateModel: no provider for account '{account_name}', \
-                 allowing model '{model}' through"
+                 rejecting model '{model}'"
             );
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(Err(format!(
+                "daemon is locked or no credential configured for account \
+                 '{account_name}'"
+            )));
             return;
         }
 
@@ -1029,10 +1035,12 @@ fn handle_list_models_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::test_util::make_test_provider;
     use crate::server::connection::SUBSCRIBER_CHANNEL_CAPACITY;
     use crate::sessions::SessionMetadata;
     use std::collections::HashMap;
     use std::sync::mpsc;
+    use std::time::Instant;
     use tai_proto::{DaemonMessage, SessionStatus};
 
     fn make_daemon_state() -> (DaemonState, mpsc::Receiver<DaemonCommand>) {
@@ -1303,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_validate_model_allows_through_when_no_provider() {
+    fn handle_validate_model_rejects_when_no_provider() {
         let (mut state, _rx) = make_daemon_state();
         state.session_metadata.insert(
             1,
@@ -1318,11 +1326,101 @@ mod tests {
                 max_turns: None,
                 status: SessionStatus::Sleeping,
                 active_tool_groups: vec![],
-                account_name: Some("nonexistent".into()),
+                account_name: Some("locked-account".into()),
                 accumulated_usage: TokenUsage::default(),
                 context_window: None,
                 last_prompt_tokens: None,
             },
+        );
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::ValidateModel {
+            session_id: 1,
+            model: "gpt-4".into(),
+            reply,
+        });
+        let result = rx.recv().unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("locked"), "error should mention locked daemon");
+        assert!(
+            err.contains("locked-account"),
+            "error should mention the account"
+        );
+    }
+
+    #[test]
+    fn handle_validate_model_rejects_unknown_model() {
+        let (mut state, _rx) = make_daemon_state();
+        state.session_metadata.insert(
+            1,
+            SessionMetadata {
+                title: None,
+                selected_model: None,
+                reasoning_effort: None,
+                parent_session_id: None,
+                working_dir: None,
+                created_at: 1000,
+                turn_count: 0,
+                max_turns: None,
+                status: SessionStatus::Inactive,
+                active_tool_groups: vec![],
+                account_name: Some("test-account".into()),
+                accumulated_usage: TokenUsage::default(),
+                context_window: None,
+                last_prompt_tokens: None,
+            },
+        );
+        state
+            .providers
+            .insert("test-account".into(), make_test_provider());
+        state.model_cache.insert(
+            "test-account".into(),
+            (vec!["gpt-4".into(), "gpt-3.5".into()], Instant::now()),
+        );
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::ValidateModel {
+            session_id: 1,
+            model: "nonexistent-model".into(),
+            reply,
+        });
+        let result = rx.recv().unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("nonexistent-model"),
+            "error should mention the model name"
+        );
+        assert!(err.contains("gpt-4"), "error should list available models");
+    }
+
+    #[test]
+    fn handle_validate_model_allows_known_model() {
+        let (mut state, _rx) = make_daemon_state();
+        state.session_metadata.insert(
+            1,
+            SessionMetadata {
+                title: None,
+                selected_model: None,
+                reasoning_effort: None,
+                parent_session_id: None,
+                working_dir: None,
+                created_at: 1000,
+                turn_count: 0,
+                max_turns: None,
+                status: SessionStatus::Inactive,
+                active_tool_groups: vec![],
+                account_name: Some("test-account".into()),
+                accumulated_usage: TokenUsage::default(),
+                context_window: None,
+                last_prompt_tokens: None,
+            },
+        );
+        state
+            .providers
+            .insert("test-account".into(), make_test_provider());
+        state.model_cache.insert(
+            "test-account".into(),
+            (vec!["gpt-4".into(), "gpt-3.5".into()], Instant::now()),
         );
         let (reply, rx) = mpsc::channel();
         state.handle_command(DaemonCommand::ValidateModel {

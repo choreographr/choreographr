@@ -11,7 +11,7 @@ use tai_tui::RenderedImage;
 use tai_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::markdown_render::{lines_height, render_turn_lines};
+use crate::markdown_render::{lines_height, plain_text_lines, render_turn_lines};
 use ratatui::text::Line;
 use tui_prompts::{SelectState, State, TextState};
 
@@ -22,7 +22,6 @@ pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
 
 pub(crate) const IMAGE_BLOCK_HEIGHT: u16 = 10;
-pub(crate) const STATUS_ERROR_BAR_HEIGHT: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HomeMenuItem {
@@ -946,8 +945,24 @@ impl App {
         self.history_scroll.clamp(self.max_scroll_offset());
     }
 
+    /// Number of lines needed for the status/error bar, based on the current
+    /// message content and the available terminal width.  Returns 0 when there
+    /// is no message to display.
+    pub(crate) fn status_error_height(&self, width: u16) -> u16 {
+        let text = if let Some(ref err) = self.error {
+            err.as_str()
+        } else if let Some(ref status) = self.status {
+            status.as_str()
+        } else {
+            return 0;
+        };
+        let lines = plain_text_lines(text);
+        lines_height(&lines, width).max(1) as u16
+    }
+
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
-        let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT + STATUS_ERROR_BAR_HEIGHT;
+        // Resolve the terminal size first so we have a width to pass to
+        // status_error_height for the wrapped-line calculation.
         let size = if self.terminal_resized || self.last_terminal_size.is_none() {
             if let Ok(size) = crossterm::terminal::size() {
                 self.last_terminal_size = Some(size);
@@ -963,6 +978,7 @@ impl App {
             }
         };
         let (width, height) = size;
+        let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT + self.status_error_height(width);
         if width > 1 && height > bottom_height {
             let old_width = self.history_viewport.width;
             self.history_viewport.update(Rect {
@@ -1949,5 +1965,80 @@ mod tests {
         // content_line larger than total height → should saturate to scroll=0.
         app.scroll_to_content_line(9999);
         assert_eq!(app.effective_scroll(), 0);
+    }
+
+    // ── status_error_height ──
+
+    #[test]
+    fn status_error_height_neither_set_returns_zero() {
+        let app = test_app("/tmp/tai.sock");
+        assert_eq!(app.status_error_height(80), 0);
+    }
+
+    #[test]
+    fn status_error_height_short_error_returns_one() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.error = Some("oops".into());
+        assert_eq!(app.status_error_height(80), 1);
+    }
+
+    #[test]
+    fn status_error_height_short_status_returns_one() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.status = Some("all good".into());
+        assert_eq!(app.status_error_height(80), 1);
+    }
+
+    #[test]
+    fn status_error_height_error_preferred_over_status() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.error = Some("error".into());
+        app.status = Some("status".into());
+        // Should use error text, not status text
+        assert_eq!(app.status_error_height(80), 1);
+    }
+
+    #[test]
+    fn status_error_height_wrapping() {
+        let mut app = test_app("/tmp/tai.sock");
+        // A 10-char line at width 5 wraps to 2 lines
+        app.error = Some("12345 7890".into());
+        assert_eq!(app.status_error_height(5), 2);
+    }
+
+    #[test]
+    fn status_error_height_multi_line() {
+        let mut app = test_app("/tmp/tai.sock");
+        // Three explicit lines via \n
+        app.status = Some("line a\nline b\nline c".into());
+        // Each line fits in width 80, so total = 3
+        assert_eq!(app.status_error_height(80), 3);
+    }
+
+    #[test]
+    fn status_error_height_multi_line_with_wrapping() {
+        let mut app = test_app("/tmp/tai.sock");
+        // Two lines, second wraps
+        app.error = Some("hello\n12345 7890".into());
+        // line 1: "hello" → 1 line
+        // line 2: "12345 7890" → wraps to 2 lines at width 5
+        // total = 3
+        assert_eq!(app.status_error_height(5), 3);
+    }
+
+    #[test]
+    fn status_error_height_empty_after_clearing() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.error = Some("error".into());
+        // Clear it
+        app.error = None;
+        assert_eq!(app.status_error_height(80), 0);
+    }
+
+    #[test]
+    fn status_error_height_status_takes_over_when_error_cleared() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.status = Some("status".into());
+        assert_eq!(app.status_error_height(80), 1);
     }
 }

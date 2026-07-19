@@ -2,14 +2,13 @@ use crate::markdown_render::{display_width, lines_height, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, IMAGE_BLOCK_HEIGHT,
-    INPUT_BAR_HEIGHT, PROVIDER_OPTIONS, Page, RenderedCache, STATUS_BAR_HEIGHT,
-    STATUS_ERROR_BAR_HEIGHT, SessionManagerView,
+    INPUT_BAR_HEIGHT, PROVIDER_OPTIONS, Page, RenderedCache, STATUS_BAR_HEIGHT, SessionManagerView,
 };
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
     style::{Color, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
@@ -21,31 +20,17 @@ use tui_prompts::{
 
 const BG_SHADE: Color = Color::Rgb(60, 60, 60);
 
-fn history_area() -> Option<(u16, u16)> {
-    let Ok((width, height)) = crossterm::terminal::size() else {
-        return None;
-    };
-    let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT + STATUS_ERROR_BAR_HEIGHT;
-    if width < 2 || height <= bottom_height {
-        return None;
-    }
-    Some((width, height.saturating_sub(bottom_height)))
+pub(crate) fn mouse_in_history_box(column: u16, row: u16, vp_width: u16, vp_height: u16) -> bool {
+    column < vp_width && row < vp_height
 }
 
-pub(crate) fn mouse_in_history_box(column: u16, row: u16) -> bool {
-    let (width, history_height) = match history_area() {
-        Some(v) => v,
-        None => return false,
-    };
-    column < width.saturating_sub(1) && row < history_height
-}
-
-pub(crate) fn mouse_in_scrollbar_column(column: u16, row: u16) -> bool {
-    let (width, history_height) = match history_area() {
-        Some(v) => v,
-        None => return false,
-    };
-    column == width.saturating_sub(1) && row < history_height
+pub(crate) fn mouse_in_scrollbar_column(
+    column: u16,
+    row: u16,
+    vp_width: u16,
+    vp_height: u16,
+) -> bool {
+    column == vp_width && row < vp_height
 }
 
 fn vertical_scrollbar() -> SmoothScrollbar {
@@ -195,11 +180,12 @@ fn render_home(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
+    let status_error_height = app.status_error_height(frame.area().width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(STATUS_ERROR_BAR_HEIGHT),
+            Constraint::Length(status_error_height),
             Constraint::Length(INPUT_BAR_HEIGHT),
             Constraint::Length(STATUS_BAR_HEIGHT),
         ])
@@ -236,18 +222,14 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
     // ── Status/error bar (above command box) ──────────────────
     if let Some(ref err) = app.error {
-        let err_para = Paragraph::new(Line::from(Span::styled(
-            err.clone(),
-            Style::default().fg(Color::Red),
-        )))
-        .block(Block::default().borders(Borders::ALL).title("error"));
+        let err_para = Paragraph::new(Text::from(err.clone()))
+            .style(Style::default().fg(Color::Red))
+            .wrap(Wrap { trim: false });
         frame.render_widget(err_para, chunks[1]);
     } else if let Some(ref status) = app.status {
-        let status_para = Paragraph::new(Line::from(Span::styled(
-            status.clone(),
-            Style::default().fg(Color::Cyan),
-        )))
-        .block(Block::default().borders(Borders::ALL).title("status"));
+        let status_para = Paragraph::new(Text::from(status.clone()))
+            .style(Style::default().fg(Color::Cyan))
+            .wrap(Wrap { trim: false });
         frame.render_widget(status_para, chunks[1]);
     }
 
@@ -1088,4 +1070,68 @@ pub(crate) fn format_status(status: &SessionStatus) -> String {
 
 pub(crate) fn status_color(status: &SessionStatus) -> Color {
     status_display(status).1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── mouse_in_history_box ──
+
+    #[test]
+    fn mouse_in_history_box_inside() {
+        assert!(mouse_in_history_box(5, 10, 80, 24));
+    }
+
+    #[test]
+    fn mouse_in_history_box_column_too_large() {
+        assert!(!mouse_in_history_box(80, 10, 80, 24));
+    }
+
+    #[test]
+    fn mouse_in_history_box_row_too_large() {
+        assert!(!mouse_in_history_box(5, 24, 80, 24));
+    }
+
+    #[test]
+    fn mouse_in_history_box_both_out_of_bounds() {
+        assert!(!mouse_in_history_box(99, 99, 80, 24));
+    }
+
+    #[test]
+    fn mouse_in_history_box_zero_height_viewport() {
+        assert!(!mouse_in_history_box(0, 0, 80, 0));
+    }
+
+    #[test]
+    fn mouse_in_history_box_zero_width_viewport() {
+        assert!(!mouse_in_history_box(0, 0, 0, 24));
+    }
+
+    // ── mouse_in_scrollbar_column ──
+
+    #[test]
+    fn mouse_in_scrollbar_column_on_scrollbar() {
+        assert!(mouse_in_scrollbar_column(80, 10, 80, 24));
+    }
+
+    #[test]
+    fn mouse_in_scrollbar_column_before_scrollbar() {
+        assert!(!mouse_in_scrollbar_column(79, 10, 80, 24));
+    }
+
+    #[test]
+    fn mouse_in_scrollbar_column_after_scrollbar() {
+        assert!(!mouse_in_scrollbar_column(81, 10, 80, 24));
+    }
+
+    #[test]
+    fn mouse_in_scrollbar_column_row_too_large() {
+        assert!(!mouse_in_scrollbar_column(80, 24, 80, 24));
+    }
+
+    #[test]
+    fn mouse_in_scrollbar_column_zero_height() {
+        assert!(!mouse_in_scrollbar_column(80, 0, 80, 0));
+    }
 }

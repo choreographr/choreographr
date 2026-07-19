@@ -328,3 +328,45 @@ mod tests {
         assert_eq!(provider.resolve_context_window("completely-unknown"), None);
     }
 }
+
+/// Stub provider client and factory for use in daemon-level unit tests.
+/// Only checks provider existence — all provider methods panic.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use super::*;
+
+    #[derive(Debug)]
+    pub(crate) struct StubProviderClient;
+
+    impl ProviderClient for StubProviderClient {
+        fn provider_slug(&self) -> &'static str {
+            "test-stub"
+        }
+
+        fn chat_completion_turn(
+            &self,
+            _params: ChatTurnRequest<'_>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            panic!("StubProviderClient is not intended for real use");
+        }
+
+        fn chat_completion_turn_streaming(
+            &self,
+            _params: ChatTurnRequest<'_>,
+            _on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
+        ) -> Result<ChatTurnResult, InferenceError> {
+            panic!("StubProviderClient is not intended for real use");
+        }
+
+        fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+            panic!("StubProviderClient is not intended for real use");
+        }
+    }
+
+    pub(crate) fn make_test_provider() -> InferenceProvider {
+        InferenceProvider {
+            client: Arc::new(StubProviderClient),
+            slug: "test-stub",
+        }
+    }
+}

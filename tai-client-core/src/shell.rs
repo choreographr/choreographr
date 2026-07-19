@@ -353,9 +353,7 @@ fn parse_command(
 pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
     match command {
         ShellCommand::Send(message) => match message {
-            ClientMessage::RunInput { input, .. } => {
-                Some(format!("> {}", String::from_utf8_lossy(input)))
-            }
+            ClientMessage::RunInput { .. } => None,
             ClientMessage::SetModel { model } => Some(format!("> set model: {model}")),
             ClientMessage::SetReasoningEffort { effort } => {
                 Some(format!("> set reasoning effort: {}", effort.as_label()))

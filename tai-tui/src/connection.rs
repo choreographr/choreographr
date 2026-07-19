@@ -812,7 +812,14 @@ fn handle_chat_event(
         // This must be checked BEFORE the drag handler so that a new click
         // on the scrollbar always reaches this handler, even when the drag
         // flag is still set from a previous click.
-        Event::Mouse(mouse) if mouse_in_scrollbar_column(mouse.column, mouse.row) => {
+        Event::Mouse(mouse)
+            if mouse_in_scrollbar_column(
+                mouse.column,
+                mouse.row,
+                app.history_viewport.width,
+                app.history_viewport.height,
+            ) =>
+        {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     app.scrollbar_dragging = true;
@@ -863,7 +870,14 @@ fn handle_chat_event(
                 }
             }
         }
-        Event::Mouse(mouse) if mouse_in_history_box(mouse.column, mouse.row) => {
+        Event::Mouse(mouse)
+            if mouse_in_history_box(
+                mouse.column,
+                mouse.row,
+                app.history_viewport.width,
+                app.history_viewport.height,
+            ) =>
+        {
             // Accumulate scroll events rather than scrolling immediately.
             // All accumulated deltas are applied in a single batch each
             // frame by `apply_scroll_delta`, which reads the accumulator
