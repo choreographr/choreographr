@@ -360,6 +360,7 @@ pub enum DaemonMessage {
     Started {
         request_id: u32,
         turn_id: u32,
+        estimated_prompt_tokens: u32,
     },
     ToolCallStarted {
         request_id: u32,
@@ -382,6 +383,16 @@ pub enum DaemonMessage {
         call_id: String,
         tool_name: String,
         error: String,
+    },
+    TokenUsageUpdate {
+        token_usage: TokenUsage,
+        last_prompt_tokens: Option<u32>,
+    },
+    /// Cumulative output-token estimate for the current turn, updated as
+    /// each stream chunk arrives.  Used by the TUI for live token display.
+    LiveOutputTokenCount {
+        request_id: u32,
+        output_tokens: u32,
     },
     OutputChunk {
         request_id: u32,

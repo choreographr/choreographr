@@ -413,6 +413,12 @@ pub(crate) struct App {
     pub(crate) attached_token_usage: Option<TokenUsage>,
     pub(crate) attached_context_window: Option<u32>,
     pub(crate) attached_last_prompt_tokens: Option<u32>,
+    /// Estimated input tokens for the current streaming turn (set at request start).
+    pub(crate) live_input_estimate: u32,
+    /// Cumulative output-token estimate for the current turn, updated by
+    /// `LiveOutputTokenCount` messages from the daemon (which tokenizes
+    /// each stream chunk via tiktoken).
+    pub(crate) live_output_tokens: u32,
     pub(crate) progress_dirty: bool,
     pub(crate) status: Option<String>,
     pub(crate) error: Option<String>,
@@ -875,6 +881,8 @@ impl App {
             attached_token_usage: None,
             attached_context_window: None,
             attached_last_prompt_tokens: None,
+            live_input_estimate: 0,
+            live_output_tokens: 0,
             progress_dirty: false,
             status: None,
             error: None,
@@ -1431,6 +1439,15 @@ impl App {
             session_id, error
         ));
     }
+
+    pub(crate) fn display_token_usage(&self) -> Option<TokenUsage> {
+        let auth = self.attached_token_usage.as_ref()?;
+        Some(TokenUsage {
+            input_tokens: auth.input_tokens + self.live_input_estimate,
+            output_tokens: auth.output_tokens + self.live_output_tokens,
+            total_tokens: auth.total_tokens + self.live_input_estimate + self.live_output_tokens,
+        })
+    }
 }
 
 // ── TurnEventHandler implementation ──────────────────────────────────
@@ -1471,12 +1488,14 @@ impl TurnEventHandler for App {
         self.markers_dirty = true;
     }
 
-    fn handle_started(&mut self, request_id: u32, turn_id: u32) {
-        tracing::trace!(%request_id, %turn_id, "handle_started");
+    fn handle_started(&mut self, request_id: u32, turn_id: u32, estimated_prompt_tokens: u32) {
+        tracing::trace!(%request_id, %turn_id, %estimated_prompt_tokens, "handle_started");
         self.session_view
             .request_to_turn
             .insert(request_id, turn_id);
         self.active.insert(request_id);
+        self.live_input_estimate = estimated_prompt_tokens;
+        self.live_output_tokens = 0;
     }
 
     fn handle_done(
@@ -1494,6 +1513,8 @@ impl TurnEventHandler for App {
         if let Some(tokens) = last_prompt_tokens {
             self.attached_last_prompt_tokens = Some(tokens);
         }
+        self.live_input_estimate = 0;
+        self.live_output_tokens = 0;
         self.markers_dirty = true;
     }
 
@@ -1559,6 +1580,25 @@ impl TurnEventHandler for App {
         self.attached_last_prompt_tokens = last_prompt_tokens;
         self.attached_status = Some(status);
         self.markers_dirty = true;
+    }
+
+    fn handle_token_usage_update(
+        &mut self,
+        token_usage: TokenUsage,
+        last_prompt_tokens: Option<u32>,
+    ) {
+        tracing::trace!(
+            ?token_usage,
+            ?last_prompt_tokens,
+            "handle_token_usage_update"
+        );
+        self.attached_token_usage = Some(token_usage);
+        if let Some(tokens) = last_prompt_tokens {
+            self.attached_last_prompt_tokens = Some(tokens);
+        }
+        self.live_input_estimate = 0;
+        self.live_output_tokens = 0;
+        self.progress_dirty = true;
     }
 
     fn handle_status_text(&mut self, text: String) {

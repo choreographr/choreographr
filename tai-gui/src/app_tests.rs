@@ -14,6 +14,7 @@ fn app_state_stream_updates_history() {
         &DaemonMessage::Started {
             request_id: 7,
             turn_id: 1,
+            estimated_prompt_tokens: 0,
         },
         &mut state,
     );

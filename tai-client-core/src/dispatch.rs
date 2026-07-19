@@ -40,7 +40,7 @@ pub trait TurnEventHandler {
     fn handle_turns_undone(&mut self, turn_ids: &[u32]);
     fn handle_turns_redone(&mut self, turns: BTreeMap<u32, Turn>);
     fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: String);
-    fn handle_started(&mut self, request_id: u32, turn_id: u32);
+    fn handle_started(&mut self, request_id: u32, turn_id: u32, estimated_prompt_tokens: u32);
     fn handle_done(
         &mut self,
         request_id: u32,
@@ -62,6 +62,11 @@ pub trait TurnEventHandler {
         max_turns: Option<u32>,
     );
     fn handle_session_status_changed(&mut self, session_id: u64, status: SessionStatus);
+    fn handle_token_usage_update(
+        &mut self,
+        token_usage: TokenUsage,
+        last_prompt_tokens: Option<u32>,
+    );
 }
 
 pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEventHandler) {
@@ -126,8 +131,9 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
         DaemonMessage::Started {
             request_id,
             turn_id,
+            estimated_prompt_tokens,
         } => {
-            handler.handle_started(*request_id, *turn_id);
+            handler.handle_started(*request_id, *turn_id, *estimated_prompt_tokens);
         }
         DaemonMessage::OutputChunk {
             request_id,
@@ -307,6 +313,15 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             handler.handle_error(format!(
                 "[daemon] failed to set reasoning effort {effort}: {error}"
             ));
+        }
+        DaemonMessage::TokenUsageUpdate {
+            token_usage,
+            last_prompt_tokens,
+        } => {
+            handler.handle_token_usage_update(*token_usage, *last_prompt_tokens);
+        }
+        DaemonMessage::LiveOutputTokenCount { .. } => {
+            // Handled at the TUI layer in connection.rs — no generic dispatch needed.
         }
         _ => {
             debug!("unhandled daemon message variant");

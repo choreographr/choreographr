@@ -128,6 +128,17 @@ fn accumulate_token_usage(
     }
 }
 
+/// Broadcast the session's accumulated token usage to all subscribers so the
+/// UI can update its final token display at the end of a turn.
+fn broadcast_token_usage(ctx: &RequestContext, session: &SessionState) {
+    let _ = ctx
+        .cmd_tx
+        .send(SessionCommand::Broadcast(DaemonMessage::TokenUsageUpdate {
+            token_usage: session.config.accumulated_usage,
+            last_prompt_tokens: session.config.last_prompt_tokens,
+        }));
+}
+
 /// Resolve the execution timeout for a tool by name.
 ///
 /// Returns `None` for sub-sessions (run indefinitely) and `Some(duration)`
@@ -366,13 +377,6 @@ pub(crate) fn run_agent_loop(
                 turn_id: current_turn_id,
                 turn: current_turn,
             }));
-        let _ = ctx
-            .cmd_tx
-            .send(SessionCommand::Broadcast(DaemonMessage::Started {
-                request_id,
-                turn_id: current_turn_id,
-            }));
-
         if ctx
             .cmd_tx
             .send(SessionCommand::StatusChanged(SessionStatus::Inference))
@@ -382,6 +386,68 @@ pub(crate) fn run_agent_loop(
         }
 
         let messages = build_chat_request_messages(session, system_content.as_deref());
+
+        // Resolve the tiktoken encoding once so it can be used both for the
+        // prompt-token estimate (broadcast immediately) and for counting
+        // output tokens per stream chunk (inside the streaming closure).
+        let encoding =
+            tiktoken::encoding_for_model(model).or_else(|| tiktoken::get_encoding("cl100k_base"));
+
+        let estimated_prompt_tokens = match &encoding {
+            Some(enc) => {
+                // 1. Message content text
+                let content_tokens: u32 = messages
+                    .iter()
+                    .filter_map(|m| m.content.as_deref())
+                    .map(|text| enc.count(text) as u32)
+                    .sum();
+
+                // 2. Reasoning / thinking text from prior assistant turns
+                let reasoning_tokens: u32 = messages
+                    .iter()
+                    .filter_map(|m| m.reasoning_content.as_deref())
+                    .map(|text| enc.count(text) as u32)
+                    .sum();
+
+                // 3. Tool-call metadata on assistant messages
+                let tool_call_tokens: u32 = messages
+                    .iter()
+                    .filter_map(|m| m.tool_calls.as_ref())
+                    .flat_map(|calls| calls.iter())
+                    .map(|tc| {
+                        enc.count(&tc.id) as u32
+                            + enc.count(&tc.kind) as u32
+                            + enc.count(&tc.function.name) as u32
+                            + enc.count(&tc.function.arguments) as u32
+                    })
+                    .sum();
+
+                // 4. Tool definitions / schemas (serialized to JSON to capture
+                //    the exact wire-format overhead of keys, braces, etc.).
+                let tool_def_tokens: u32 = tools
+                    .iter()
+                    .filter_map(|def| {
+                        serde_json::to_string(def)
+                            .map(|s| enc.count(&s) as u32)
+                            .ok()
+                    })
+                    .sum();
+
+                content_tokens + reasoning_tokens + tool_call_tokens + tool_def_tokens
+            }
+            None => {
+                tracing::warn!("no tiktoken encoding available for {model}");
+                0
+            }
+        };
+
+        let _ = ctx
+            .cmd_tx
+            .send(SessionCommand::Broadcast(DaemonMessage::Started {
+                request_id,
+                turn_id: current_turn_id,
+                estimated_prompt_tokens,
+            }));
 
         let mut retry_cb: Option<crate::openai::RetryCallback> = Some(Box::new({
             let cmd_tx = ctx.cmd_tx.clone();
@@ -393,6 +459,9 @@ pub(crate) fn run_agent_loop(
                 }));
             }
         }));
+
+        // Running count of output tokens produced by the current turn.
+        let mut output_token_count: u32 = 0;
 
         match client.chat_completion_turn_streaming(
             ChatTurnRequest {
@@ -409,6 +478,9 @@ pub(crate) fn run_agent_loop(
             &mut |event| {
                 match event {
                     StreamEvent::Answer(text) => {
+                        if let Some(enc) = &encoding {
+                            output_token_count += enc.count(&text) as u32;
+                        }
                         let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::OutputChunk {
                                 request_id,
@@ -416,13 +488,30 @@ pub(crate) fn run_agent_loop(
                                 data: text.into_bytes(),
                             },
                         ));
+                        // Let the UI update its live token display on every
+                        // chunk so the count feels responsive.
+                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                            DaemonMessage::LiveOutputTokenCount {
+                                request_id,
+                                output_tokens: output_token_count,
+                            },
+                        ));
                     }
                     StreamEvent::Reasoning(text) => {
+                        if let Some(enc) = &encoding {
+                            output_token_count += enc.count(&text) as u32;
+                        }
                         let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::OutputChunk {
                                 request_id,
                                 stream: OutputStream::Reasoning,
                                 data: text.into_bytes(),
+                            },
+                        ));
+                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                            DaemonMessage::LiveOutputTokenCount {
+                                request_id,
+                                output_tokens: output_token_count,
                             },
                         ));
                     }
@@ -440,6 +529,7 @@ pub(crate) fn run_agent_loop(
                 );
                 let token_usage = final_text.usage;
                 accumulate_token_usage(session, &token_usage, turn_iter, ctx);
+                broadcast_token_usage(ctx, session);
                 session.set_assistant_response(
                     current_turn_id,
                     Some(final_text.content),
@@ -463,6 +553,7 @@ pub(crate) fn run_agent_loop(
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 let token_usage = tool_use.usage;
                 accumulate_token_usage(session, &token_usage, turn_iter, ctx);
+                broadcast_token_usage(ctx, session);
                 session.set_assistant_response(
                     current_turn_id,
                     tool_use.content.clone(),

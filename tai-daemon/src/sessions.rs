@@ -487,6 +487,7 @@ fn fail_request(
         DaemonMessage::Started {
             request_id,
             turn_id: 0,
+            estimated_prompt_tokens: 0,
         },
     );
     broadcast(
@@ -719,6 +720,7 @@ fn handle_run_input(
         DaemonMessage::Started {
             request_id,
             turn_id: state.next_turn_id,
+            estimated_prompt_tokens: 0,
         },
     );
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
@@ -779,6 +781,7 @@ fn handle_run_child_input(
         DaemonMessage::Started {
             request_id,
             turn_id: state.next_turn_id,
+            estimated_prompt_tokens: 0,
         },
     );
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();

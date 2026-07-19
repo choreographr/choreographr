@@ -934,11 +934,12 @@ where
                 total_tokens = u.total_tokens,
                 "OpenAI streaming turn usage"
             );
-            last_usage = Some(TokenUsage {
+            let usage = TokenUsage {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
-            });
+            };
+            last_usage = Some(usage);
         }
 
         for choice in payload.choices {
@@ -1154,11 +1155,12 @@ where
                         total_tokens = u.total_tokens,
                         "responses streaming turn usage",
                     );
-                    last_usage = Some(TokenUsage {
+                    let usage = TokenUsage {
                         input_tokens: u.prompt_tokens,
                         output_tokens: u.completion_tokens,
                         total_tokens: u.total_tokens,
-                    });
+                    };
+                    last_usage = Some(usage);
                 }
                 break;
             }

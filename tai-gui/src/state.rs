@@ -65,7 +65,7 @@ impl TurnEventHandler for AppState {
         self.session_view.stream_chunk(request_id, stream, &data);
     }
 
-    fn handle_started(&mut self, request_id: u32, turn_id: u32) {
+    fn handle_started(&mut self, request_id: u32, turn_id: u32, _estimated_prompt_tokens: u32) {
         debug!(%request_id, %turn_id, "stream started");
         self.session_view
             .request_to_turn
@@ -153,5 +153,12 @@ impl TurnEventHandler for AppState {
 
     fn handle_session_status_changed(&mut self, session_id: u64, status: SessionStatus) {
         debug!(session_id, ?status, "handle_session_status_changed");
+    }
+
+    fn handle_token_usage_update(
+        &mut self,
+        _token_usage: TokenUsage,
+        _last_prompt_tokens: Option<u32>,
+    ) {
     }
 }

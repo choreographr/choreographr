@@ -280,8 +280,8 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(status_bar, status_rows[0]);
 
     let tokens_line = if has_session {
-        let tokens = match &app.attached_token_usage {
-            Some(usage) => format!("↑{}  ↓{}", usage.output_tokens, usage.input_tokens),
+        let tokens = match &app.display_token_usage() {
+            Some(usage) => format!("↑{}  ↓{}", usage.input_tokens, usage.output_tokens),
             None => String::new(),
         };
         let context = match (app.attached_context_window, app.attached_last_prompt_tokens) {

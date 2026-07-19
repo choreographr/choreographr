@@ -20,6 +20,7 @@ hmac = "0.13"
 image.workspace = true
 rand.workspace = true
 redb.workspace = true
+tiktoken = "3.5"
 ureq.workspace = true
 url.workspace = true
 resvg.workspace = true
