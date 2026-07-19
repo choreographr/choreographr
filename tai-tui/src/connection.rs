@@ -905,7 +905,13 @@ fn handle_chat_event(
                                 .copied()
                                 .unwrap_or(0);
                             let content_width = app.history_viewport.width.saturating_sub(9);
-                            let text_lines = render_turn_lines(turn, content_width);
+                            let tool_content_width = app.history_viewport.width.saturating_sub(4);
+                            let text_lines = match app.render_cache.get(turn_idx) {
+                                Some(Some(cached)) if cached.width == content_width => {
+                                    cached.lines.clone()
+                                }
+                                _ => render_turn_lines(turn, content_width, tool_content_width),
+                            };
                             let text_height =
                                 lines_height(&text_lines, app.history_viewport.width).max(1);
                             let total_height = app.total_history_height();

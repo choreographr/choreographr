@@ -18,7 +18,7 @@ use tui_prompts::{
     Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
 };
 
-const BG_SHADE: Color = Color::Rgb(60, 60, 60);
+pub(crate) const BG_SHADE: Color = Color::Rgb(60, 60, 60);
 
 pub(crate) fn mouse_in_history_box(column: u16, row: u16, vp_width: u16, vp_height: u16) -> bool {
     column < vp_width && row < vp_height
@@ -333,6 +333,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 
     let content_width = area.width.saturating_sub(9);
+    let tool_content_width = area.width.saturating_sub(4);
 
     app.ensure_cache_synced();
 
@@ -360,7 +361,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let count = turn.displayed_images.len();
             // ── Phase A: text content ──────────────────────────
             let lines = cached_or_compute_lines(&mut app.render_cache, i, content_width, || {
-                render_turn_lines(turn, content_width)
+                render_turn_lines(turn, content_width, tool_content_width)
             });
             (lines, count)
         };
@@ -377,7 +378,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 top_line,
                 visible_height,
                 &mut y,
-                Style::default().bg(BG_SHADE),
+                Style::default(),
             );
         }
 
@@ -763,7 +764,7 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(status, chunks[1]);
 }
 
-fn format_timestamp(ts_secs: i64) -> String {
+pub(crate) fn format_timestamp(ts_secs: i64) -> String {
     if ts_secs <= 0 {
         return "-".to_string();
     }

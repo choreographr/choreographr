@@ -5,7 +5,9 @@ use tai_proto::Turn;
 use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 
 use crate::cache::GlobalLruCache;
+use crate::render::{BG_SHADE, format_timestamp};
 use crate::syntax::{highlight_theme, syntax_set, to_ratatui_color};
+use tracing::warn;
 
 fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
     static CACHE: GlobalLruCache<(String, String), Vec<Line<'static>>, 200> = GlobalLruCache::new();
@@ -58,6 +60,188 @@ pub(crate) fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
     }
 }
 
+/// Render ANSI-escape-coded text as styled ratatui lines, wrapping at `width`.
+/// Falls back to [`plain_text_lines`] on parse failure.
+fn ansi_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    use ansi_to_tui::IntoText as _;
+
+    let width = width as usize;
+
+    match text.as_bytes().into_text() {
+        Ok(t) => {
+            let mut result: Vec<Line<'static>> = Vec::new();
+            for line in &t.lines {
+                if width == 0 || line.width() <= width {
+                    let spans: Vec<Span<'static>> = line
+                        .spans
+                        .iter()
+                        .map(|span| Span::styled(span.content.to_string(), span.style))
+                        .collect();
+                    result.push(Line::from(spans));
+                } else {
+                    // Word-wrap this over-long line at width.
+                    wrap_styled_line(line, width, &mut result);
+                }
+            }
+            if result.is_empty() {
+                vec![Line::from(Span::styled(String::new(), Style::default()))]
+            } else {
+                result
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                text_len = text.len(),
+                "failed to parse ANSI escape codes, falling back to plain text"
+            );
+            plain_text_lines(text)
+        }
+    }
+}
+
+/// Word-wrap a pre-styled ratatui line so that no output line exceeds `max_width`.
+///
+/// Walks the line's styled spans left-to-right, splitting at word (whitespace)
+/// boundaries. If a single word is wider than `max_width` it is split by grapheme
+/// cluster via [`split_word_to_width`].
+fn wrap_styled_line(
+    line: &ratatui::text::Line<'_>,
+    max_width: usize,
+    out: &mut Vec<Line<'static>>,
+) {
+    // ── 1. Tokenize the line into (style, text, is_space) triplets ───────
+    //
+    // We split each span's content at whitespace boundaries so that we can
+    // later break at word boundaries.  Spaces are kept as separate tokens so
+    // they can be dropped at line-start or line-end.
+    struct StyledToken {
+        text: String,
+        style: Style,
+        is_space: bool,
+    }
+
+    let mut tokens: Vec<StyledToken> = Vec::new();
+
+    for span in &line.spans {
+        let s = span.content.as_ref();
+        let mut current = String::new();
+        // Track whether the current run is whitespace or non-whitespace.
+        let mut in_space = false;
+        for ch in s.chars() {
+            let ch_is_space = ch.is_whitespace();
+            if ch_is_space != in_space && !current.is_empty() {
+                // Finished a run — push the accumulated token.
+                tokens.push(StyledToken {
+                    text: std::mem::take(&mut current),
+                    style: span.style,
+                    is_space: in_space,
+                });
+            }
+            current.push(ch);
+            in_space = ch_is_space;
+        }
+        if !current.is_empty() {
+            tokens.push(StyledToken {
+                text: current,
+                style: span.style,
+                is_space: in_space,
+            });
+        }
+    }
+
+    if tokens.is_empty() {
+        out.push(Line::from(vec![Span::styled(
+            String::new(),
+            Style::default(),
+        )]));
+        return;
+    }
+
+    // ── 2. Word-wrap the token stream onto lines of at most max_width ──
+    let mut line_spans: Vec<Span<'static>> = Vec::new();
+    let mut line_width = 0usize;
+    // Did we just add a space at the end?  We keep at most one trailing space
+    // so that flush + re-start doesn't introduce a leading space.
+    let mut trailing_space = false;
+
+    // Helper: split an over-long word across lines, used when the word alone
+    // does not fit on the current (possibly just-flushed) line.
+    let push_split_word = |text: &str,
+                           style: Style,
+                           max_width: usize,
+                           out: &mut Vec<Line<'static>>,
+                           line_spans: &mut Vec<Span<'static>>,
+                           line_width: &mut usize|
+     -> () {
+        let chunks = split_word_to_width(text, max_width);
+        for (ci, chunk) in chunks.iter().enumerate() {
+            if ci > 0 {
+                out.push(Line::from(std::mem::take(line_spans)));
+                *line_width = 0;
+            }
+            let cw = display_width(chunk);
+            line_spans.push(Span::styled(chunk.clone(), style));
+            *line_width += cw;
+        }
+    };
+
+    for token in &tokens {
+        if token.is_space {
+            // Collapse runs of whitespace to a single space.
+            if !line_spans.is_empty() && !trailing_space {
+                line_spans.push(Span::styled(" ".to_string(), token.style));
+                line_width += 1;
+                trailing_space = true;
+            }
+            continue;
+        }
+
+        let word_width = display_width(&token.text);
+
+        if line_width + word_width <= max_width {
+            // Fits on the current line.
+            trailing_space = false;
+            line_spans.push(Span::styled(token.text.clone(), token.style));
+            line_width += word_width;
+        } else if line_spans.is_empty() {
+            // The word alone is too wide for the empty line — split it.
+            trailing_space = false;
+            push_split_word(
+                &token.text,
+                token.style,
+                max_width,
+                &mut *out,
+                &mut line_spans,
+                &mut line_width,
+            );
+        } else {
+            // Flush the current line and start a fresh line with this word.
+            out.push(Line::from(std::mem::take(&mut line_spans)));
+            line_width = 0;
+            trailing_space = false;
+
+            if word_width <= max_width {
+                line_spans.push(Span::styled(token.text.clone(), token.style));
+                line_width = word_width;
+            } else {
+                push_split_word(
+                    &token.text,
+                    token.style,
+                    max_width,
+                    &mut *out,
+                    &mut line_spans,
+                    &mut line_width,
+                );
+            }
+        }
+    }
+
+    if !line_spans.is_empty() {
+        out.push(Line::from(line_spans));
+    }
+}
+
 pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
     let width = width as usize;
     if width == 0 {
@@ -79,7 +263,11 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
 /// Each section (user, assistant, tool results) is wrapped in the margin
 /// pattern (top separator, padding, content, padding, bottom separator)
 /// with role-specific accent colors.
-pub(crate) fn render_turn_lines(turn: &Turn, content_width: u16) -> Vec<Line<'static>> {
+pub(crate) fn render_turn_lines(
+    turn: &Turn,
+    content_width: u16,
+    tool_content_width: u16,
+) -> Vec<Line<'static>> {
     let mut all_lines: Vec<Line<'static>> = Vec::new();
 
     // ── Error block ──────────────────────────────────────────
@@ -164,16 +352,27 @@ pub(crate) fn render_turn_lines(turn: &Turn, content_width: u16) -> Vec<Line<'st
 
         if !tr.content.is_empty() {
             body.push(Line::from(Span::styled(String::new(), Style::default())));
-            // Non-error results use markdown; errors stay plain text.
-            if tr.is_error {
+            // Content with ANSI escape codes gets colored rendering.
+            if tr.content.contains("\x1b[") {
+                body.extend(ansi_lines(&tr.content, tool_content_width));
+            } else if tr.is_error {
                 body.extend(plain_text_lines(&tr.content));
             } else {
-                body.extend(markdown_lines(&tr.content, content_width));
+                body.extend(markdown_lines(&tr.content, tool_content_width));
             }
         }
 
-        let margin = add_margin_lines(body, content_width, accent, None);
-        all_lines.extend(margin.0);
+        // Apply 2-column left/right indent so every row spans the full
+        // area width with exactly 2 columns of right margin.
+        for line in &mut body {
+            line.spans.insert(0, Span::styled("  ", Style::default()));
+            let content_sum: usize = line.spans.iter().skip(1).map(|s| s.width()).sum();
+            let fill = (tool_content_width as usize).saturating_sub(content_sum);
+            line.spans
+                .push(Span::styled(" ".repeat(fill), Style::default()));
+            line.spans.push(Span::styled("  ", Style::default()));
+        }
+        all_lines.extend(body);
     }
 
     // If no sections produced output, emit a blank line.
@@ -197,8 +396,7 @@ fn add_margin_lines(
     accent: Color,
     timestamp_ms: Option<i64>,
 ) -> (Vec<Line<'static>>, usize) {
-    let bg_shade = Color::Rgb(60, 60, 60);
-    let gray = Style::default().bg(bg_shade);
+    let gray = Style::default().bg(BG_SHADE);
     let no_shading = Style::default().bg(Color::Reset);
     let accent_line = Style::default().fg(accent).bg(Color::Reset);
     let total_width = content_width as usize + 9;
@@ -227,7 +425,13 @@ fn add_margin_lines(
             Span::styled("┃", accent_line),
             Span::styled("  ", gray),
         ];
-        spans.extend(line.spans);
+        // Content spans — explicitly set bg so they display correctly even without
+        // a paragraph-level background.
+        spans.extend(
+            line.spans
+                .into_iter()
+                .map(|s| Span::styled(s.content, s.style.bg(BG_SHADE))),
+        );
         spans.push(Span::styled(" ".repeat(fill), gray));
         spans.push(Span::styled("  ", gray));
         spans.push(Span::styled("  ", no_shading));
@@ -256,26 +460,6 @@ fn add_margin_lines(
 
     let total_rows = result.len();
     (result, total_rows)
-}
-
-fn format_timestamp(ts_secs: i64) -> String {
-    if ts_secs <= 0 {
-        return "-".to_string();
-    }
-
-    use chrono::{Local, TimeZone};
-
-    let dt = match Local.timestamp_opt(ts_secs, 0) {
-        chrono::LocalResult::Single(dt) => dt,
-        _ => return "-".to_string(),
-    };
-
-    let now = Local::now();
-    if dt.date_naive() == now.date_naive() {
-        dt.format("%H:%M").to_string()
-    } else {
-        dt.format("%Y-%m-%d %H:%M").to_string()
-    }
 }
 
 fn heading_line(lines: &mut Vec<Line<'static>>, heading: &'static str, color: Color) {
@@ -1225,7 +1409,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         assert!(!lines.is_empty());
         let text = lines
             .iter()
@@ -1249,7 +1433,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1272,7 +1456,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1307,7 +1491,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1338,7 +1522,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1369,7 +1553,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1396,7 +1580,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1431,7 +1615,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1462,7 +1646,7 @@ mod tests {
             }],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1491,7 +1675,7 @@ mod tests {
             }],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1515,7 +1699,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].width(), 0);
     }
@@ -1534,7 +1718,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80);
+        let lines = render_turn_lines(&turn, 80, 85);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1542,5 +1726,73 @@ mod tests {
             .join("\n");
         assert!(text.contains("Hello"), "user block should appear");
         assert!(text.contains("Hi there!"), "assistant block should appear");
+    }
+
+    // ── ansi_lines ──────────────────────────────────────────────────────
+
+    #[test]
+    fn ansi_lines_colors() {
+        let result = ansi_lines("\x1b[31mhello\x1b[0m", 80);
+        assert_eq!(result.len(), 1, "should produce one line");
+        let has_red = result[0]
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(Color::Red));
+        assert!(has_red, "ANSI red should translate to ratatui red fg");
+    }
+
+    #[test]
+    fn ansi_lines_fallback_on_junk() {
+        let result = ansi_lines("\x1b[z", 80); // incomplete/invalid ANSI sequence
+        assert_eq!(result.len(), 1, "junk bytes should fall back to one line");
+        // The fallback (plain_text_lines) produces spans with default style.
+        let all_default = result[0].spans.iter().all(|s| s.style == Style::default());
+        assert!(all_default, "fallback output should have default style");
+    }
+
+    #[test]
+    fn ansi_lines_empty() {
+        let result = ansi_lines("", 80);
+        assert_eq!(result.len(), 1, "empty input → one line");
+        assert_eq!(result[0].width(), 0, "line should be empty");
+    }
+
+    #[test]
+    fn ansi_lines_multi_line() {
+        let result = ansi_lines("line1\nline2\nline3", 80);
+        assert_eq!(
+            result.len(),
+            3,
+            "ANSI text with newlines should produce one line per segment"
+        );
+    }
+
+    #[test]
+    fn ansi_lines_wrapping() {
+        // A single-line input that is wide enough to require wrapping.
+        let long = "hello world ".repeat(20);
+        let result = ansi_lines(&long, 40);
+        assert!(
+            result.len() > 1,
+            "wide content should wrap into multiple lines, got {}",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn ansi_lines_no_wrap_when_fits() {
+        let result = ansi_lines("short", 80);
+        assert_eq!(result.len(), 1, "short content should not wrap");
+    }
+
+    #[test]
+    fn ansi_lines_wrap_long_word() {
+        // A single word wider than the wrap width should be split.
+        let result = ansi_lines("superlongword", 5);
+        assert!(result.len() > 1, "over-long word should wrap");
+        assert!(
+            result.iter().all(|l| l.width() <= 5),
+            "every wrapped line must be ≤ 5 wide"
+        );
     }
 }

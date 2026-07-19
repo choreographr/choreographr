@@ -889,7 +889,7 @@ impl App {
         self.height_prefix.last().copied().unwrap_or(0)
     }
 
-    /// Rebuild height_prefix, markers, visible_turn_ids, and render_cache from
+    /// Rebuild height_prefix, markers, visible_turn_ids, and populate render_cache from
     /// the current session_view.turns.  Called whenever turns change.
     pub(crate) fn rebuild_height_prefix(&mut self) {
         self.height_prefix.clear();
@@ -898,6 +898,8 @@ impl App {
         let mut total = 0usize;
         let viewport_height = self.history_viewport.height as usize;
         let virtual_track = 2 * viewport_height;
+        // Collect computed lines so we can warm the render_cache below.
+        let mut computed_lines: Vec<Option<(Vec<Line<'static>>, u16)>> = Vec::new();
         // Iterate turns in order (oldest first).
         for (&turn_id, turn) in self.session_view.turns.iter() {
             if turn.undone {
@@ -905,8 +907,10 @@ impl App {
             }
             // Compute height for this turn.
             let content_width = self.history_viewport.width.saturating_sub(9);
-            let text_lines = render_turn_lines(turn, content_width);
+            let tool_content_width = self.history_viewport.width.saturating_sub(4);
+            let text_lines = render_turn_lines(turn, content_width, tool_content_width);
             let text_height = lines_height(&text_lines, self.history_viewport.width).max(1);
+            computed_lines.push(Some((text_lines, content_width)));
             let img_height = turn.displayed_images.len() * IMAGE_BLOCK_HEIGHT as usize;
             let turn_height = text_height + img_height;
             // Marker for turns with user_text — points to the start of the turn.
@@ -924,6 +928,13 @@ impl App {
         }
         // Ensure render_cache matches visible_turn_ids count.
         self.ensure_cache_synced();
+        // Warm cache with the lines we just computed, avoiding a second
+        // render_turn_lines call in render_history.
+        for (slot, entry) in self.render_cache.iter_mut().zip(computed_lines.drain(..)) {
+            if let Some((lines, w)) = entry {
+                *slot = Some(RenderedCache { lines, width: w });
+            }
+        }
         self.markers_dirty = false;
     }
 

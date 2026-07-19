@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ansi-to-tui = "8.0.1"
 anstyle-progress = "0.1.0"
 anyhow.workspace = true
 clap.workspace = true
