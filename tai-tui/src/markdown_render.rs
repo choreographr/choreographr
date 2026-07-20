@@ -5,6 +5,7 @@ use tai_proto::Turn;
 use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 
 use crate::cache::GlobalLruCache;
+use crate::diff_render::try_render_diff_content;
 use crate::render::{BG_SHADE, format_timestamp};
 use crate::syntax::{highlight_theme, syntax_set, to_ratatui_color};
 use tracing::warn;
@@ -357,6 +358,10 @@ pub(crate) fn render_turn_lines(
                 body.extend(ansi_lines(&tr.content, tool_content_width));
             } else if tr.is_error {
                 body.extend(plain_text_lines(&tr.content));
+            } else if let Some(diff_lines) =
+                try_render_diff_content(&tr.content, tool_content_width)
+            {
+                body.extend(diff_lines);
             } else {
                 body.extend(markdown_lines(&tr.content, tool_content_width));
             }

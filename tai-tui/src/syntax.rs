@@ -2,7 +2,7 @@ use std::sync::OnceLock;
 
 use ratatui::style::Color;
 use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 /// Load the default syntax set (with newline-aware grammars).
 pub(crate) fn syntax_set() -> &'static SyntaxSet {
@@ -44,5 +44,53 @@ pub(crate) fn to_ratatui_color(c: syntect::highlighting::Color) -> Color {
         Color::Reset
     } else {
         Color::Rgb(c.r, c.g, c.b)
+    }
+}
+
+/// Look up a syntect syntax definition for the given file path by extension.
+///
+/// Uses syntect's built-in extension matching, which covers all languages
+/// in the default syntax set. Does **not** perform any filesystem I/O,
+/// unlike `find_syntax_for_file` (which tries to open the path for
+/// content-based sniffing).
+pub(crate) fn syntax_for_path(path: &str) -> Option<&'static SyntaxReference> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?;
+    syntax_set().find_syntax_by_extension(ext)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syntax_for_path_rs_is_rust() {
+        let s = syntax_for_path("src/main.rs");
+        assert!(s.is_some());
+        assert_eq!(s.unwrap().name, "Rust");
+    }
+
+    #[test]
+    fn syntax_for_path_extensionless_returns_none() {
+        assert!(syntax_for_path("Makefile").is_none());
+    }
+
+    #[test]
+    fn syntax_for_path_unknown_extension_returns_none() {
+        assert!(syntax_for_path("foo.xyzzy").is_none());
+    }
+
+    #[test]
+    fn syntax_for_path_does_not_perform_filesystem_io() {
+        // Should not try to open this path on disk
+        let s = syntax_for_path("/nonexistent/path/to/file.py");
+        assert!(s.is_some());
+        assert_eq!(s.unwrap().name, "Python");
+    }
+
+    #[test]
+    fn syntax_for_path_empty_string_returns_none() {
+        assert!(syntax_for_path("").is_none());
     }
 }
