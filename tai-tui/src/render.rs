@@ -577,26 +577,19 @@ fn render_turn_image(
             turn_id,
             img_idx,
             data,
-            meta,
+            meta.clone(),
             inline_size,
             tai_tui::IMAGE_RESIZE,
         );
     }
 
     // Render placeholder frame while encoding is pending.
-    // Reconstruct metadata fields from turn's displayed_images record.
-    let placeholder_title = app
-        .session_view
-        .turns
-        .get(&turn_id)
-        .and_then(|t| t.displayed_images.get(img_idx))
-        .map(|r| {
-            format!(
-                "image {} ({} {}x{})",
-                turn_id, r.metadata.mime_type, r.metadata.width, r.metadata.height,
-            )
-        })
-        .unwrap_or_else(|| format!("image {turn_id}[{img_idx}] (pending)"));
+    // Use metadata from the RenderedImage entry (already populated by
+    // sync_turn_images), not from the session turns.
+    let placeholder_title = format!(
+        "image {} ({} {}x{})",
+        turn_id, meta.mime_type, meta.width, meta.height,
+    );
     let block = Block::default().title(placeholder_title);
     frame.render_widget(block, area);
 }

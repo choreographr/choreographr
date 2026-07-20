@@ -371,6 +371,16 @@ pub(crate) struct Marker {
     pub virtual_slot: usize,
 }
 
+/// Per-turn image content-line ranges, computed alongside `height_prefix`.
+/// Maps a content-line offset within the turn to the correct image index
+/// in the click handler — no text-height recomputation needed.
+#[derive(Debug)]
+pub(crate) struct TurnImageLayout {
+    /// (start, end) content-line ranges for each displayed image,
+    /// relative to the turn's start.  Empty when the turn has no images.
+    pub image_ranges: Vec<(usize, usize)>,
+}
+
 #[derive(Clone)]
 pub(crate) struct RenderedCache {
     pub lines: Vec<Line<'static>>,
@@ -425,6 +435,10 @@ pub(crate) struct App {
     pub(crate) visible_turn_ids: Vec<u32>,
     /// Maps in-flight job IDs to their (turn_id, img_idx) for O(1) result dispatch.
     pub(crate) pending_job_idx: HashMap<ImageId, (u32, usize)>,
+    /// Per-turn layout metadata (image content-line ranges), populated by
+    /// `rebuild_height_prefix`.  Used by the click handler to determine
+    /// which image was clicked without re-rendering text lines.
+    pub(crate) turn_layouts: Vec<TurnImageLayout>,
 }
 
 #[derive(Clone, Copy)]
@@ -877,6 +891,7 @@ impl App {
             status: None,
             error: None,
             height_prefix: Vec::new(),
+            turn_layouts: Vec::new(),
             markers_dirty: true,
             last_terminal_size: None,
             terminal_resized: false,
@@ -894,9 +909,11 @@ impl App {
         self.height_prefix.clear();
         self.visible_turn_ids.clear();
         self.markers.clear();
+        self.turn_layouts.clear();
         let mut total = 0usize;
         let viewport_height = self.history_viewport.height as usize;
         let virtual_track = 2 * viewport_height;
+        let fallback_img_height = self.image_block_height() as usize;
         // Collect computed lines so we can warm the render_cache below.
         let mut computed_lines: Vec<Option<(Vec<Line<'static>>, u16)>> = Vec::new();
         // Iterate turns in order (oldest first).
@@ -910,8 +927,19 @@ impl App {
             let text_lines = render_turn_lines(turn, content_width, tool_content_width);
             let text_height = lines_height(&text_lines, self.history_viewport.width).max(1);
             computed_lines.push(Some((text_lines, content_width)));
-            let img_height = turn.displayed_images.len() * self.image_block_height() as usize;
-            let turn_height = text_height + img_height;
+            // Image blocks always use `image_block_height()` — this must
+            // match the render allocation in `render_turn_image` so that
+            // click-to-fullscreen detection (via `image_ranges`) and scroll
+            // positions (via `height_prefix`) stay in sync.
+            let mut image_ranges: Vec<(usize, usize)> = Vec::new();
+            let mut total_img_height: usize = 0;
+            for _ in 0..turn.displayed_images.len() {
+                let start = text_height + total_img_height;
+                image_ranges.push((start, start + fallback_img_height));
+                total_img_height += fallback_img_height;
+            }
+            self.turn_layouts.push(TurnImageLayout { image_ranges });
+            let turn_height = text_height + total_img_height;
             // Marker for turns with user_text — points to the start of the turn.
             if turn.user_text.is_some() {
                 let start_line = total;
@@ -1076,6 +1104,10 @@ impl App {
                 img_idx,
             );
             img.apply_result(result);
+            // Image encoding completes without changing block sizes
+            // (`image_block_height()` depends only on viewport height),
+            // so height_prefix / turn_layouts remain valid.  No need to
+            // trigger a rebuild.
         }
     }
 
@@ -1133,6 +1165,7 @@ impl App {
         self.active.clear();
         self.markers.clear();
         self.height_prefix.clear();
+        self.turn_layouts.clear();
         self.markers_dirty = true;
         self.status = None;
         self.error = None;
@@ -1689,10 +1722,10 @@ pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
     lines_height(&crate::markdown_render::plain_text_lines(text), width)
 }
 
-/// Find the visible turn index by screen row, using binary search on
-/// height_prefix.  Returns the index into visible_turn_ids (and thus
-/// into render_cache / height_prefix).
-pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<usize> {
+/// Find the visible turn index and the content-line offset within that
+/// turn for a given screen row.  Binary search on `height_prefix`.
+/// Returns `(turn_idx, offset_within_turn)`.
+pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<(usize, usize)> {
     let vh = app.history_viewport.height;
     if screen_row >= vh {
         return None;
@@ -1712,7 +1745,13 @@ pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<usize> {
     // Binary search on the prefix-sum array.
     let i = app.height_prefix.partition_point(|&p| p <= content_line);
     if i < app.height_prefix.len() {
-        Some(i)
+        let turn_start = i
+            .checked_sub(1)
+            .and_then(|prev| app.height_prefix.get(prev))
+            .copied()
+            .unwrap_or(0);
+        let offset = content_line.saturating_sub(turn_start);
+        Some((i, offset))
     } else {
         None
     }
@@ -1878,6 +1917,32 @@ mod tests {
     fn find_turn_at_row_returns_none_out_of_bounds() {
         let app = test_app("/tmp/tai.sock");
         assert!(find_turn_at_row(&app, 999).is_none());
+    }
+
+    #[test]
+    fn find_turn_at_row_returns_turn_idx_and_offset() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 200;
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("hello".into()),
+            assistant_text: Some("world".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.session_view.insert_or_replace(1, turn);
+        app.rebuild_height_prefix();
+
+        // Screen row 0 should map to turn_idx 0 and offset 0.
+        let (turn_idx, offset) = find_turn_at_row(&app, 0).unwrap();
+        assert_eq!(turn_idx, 0);
+        assert_eq!(offset, 0);
     }
 
     // ── scrollbar_notch ──
@@ -2166,5 +2231,209 @@ mod tests {
         // Second call is idempotent — preserves existing entries
         app.sync_turn_images(42, &turn);
         assert_eq!(app.rendered_images.get(&42).unwrap().len(), 2);
+    }
+
+    // ── TurnImageLayout image_ranges ──
+
+    #[test]
+    fn turn_layout_empty_when_no_images() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("hello".into()),
+            assistant_text: Some("world".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.session_view.insert_or_replace(1, turn);
+        app.rebuild_height_prefix();
+
+        assert_eq!(app.turn_layouts.len(), 1);
+        assert!(app.turn_layouts[0].image_ranges.is_empty());
+    }
+
+    #[test]
+    fn turn_layout_populates_image_ranges_with_fallback_height() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let metadata = tai_proto::ImageMetadata {
+            mime_type: "image/png".to_string(),
+            width: 100,
+            height: 100,
+            byte_len: 500,
+            alt: None,
+        };
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("short".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![
+                tai_proto::DisplayedImageRecord {
+                    metadata: metadata.clone(),
+                    data: vec![0u8; 10],
+                    tool_call_id: None,
+                },
+                tai_proto::DisplayedImageRecord {
+                    metadata: metadata.clone(),
+                    data: vec![1u8; 10],
+                    tool_call_id: None,
+                },
+            ],
+        };
+        let turn_clone = turn.clone();
+        app.session_view.insert_or_replace(2, turn);
+        app.sync_turn_images(2, &turn_clone);
+        app.rebuild_height_prefix();
+
+        assert_eq!(app.turn_layouts.len(), 1);
+        let layout = &app.turn_layouts[0];
+        assert_eq!(layout.image_ranges.len(), 2);
+
+        // Fallback height: viewport_height / 2 = 10.
+        let fallback_h = app.image_block_height() as usize;
+        // Text "short" renders at least 1 line.
+        let text_h = lines_height(
+            &render_turn_lines(&app.session_view.turns[&2], 71, 76),
+            app.history_viewport.width,
+        )
+        .max(1);
+
+        let (s0, e0) = layout.image_ranges[0];
+        assert_eq!(s0, text_h);
+        assert_eq!(e0, text_h + fallback_h);
+
+        let (s1, e1) = layout.image_ranges[1];
+        assert_eq!(s1, text_h + fallback_h);
+        assert_eq!(e1, text_h + 2 * fallback_h);
+    }
+
+    // ── apply_image_result ──
+
+    #[test]
+    fn apply_image_result_clears_pending_job_and_records_failure() {
+        use tai_tui::image_worker::next_job_id;
+
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let metadata = tai_proto::ImageMetadata {
+            mime_type: "image/png".to_string(),
+            width: 100,
+            height: 100,
+            byte_len: 500,
+            alt: None,
+        };
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![tai_proto::DisplayedImageRecord {
+                metadata: metadata.clone(),
+                data: vec![3u8; 30],
+                tool_call_id: None,
+            }],
+        };
+        let turn_clone = turn.clone();
+        app.session_view.insert_or_replace(4, turn);
+        app.sync_turn_images(4, &turn_clone);
+
+        let img_id = next_job_id();
+        app.pending_job_idx.insert(img_id, (4, 0));
+        let img = app
+            .rendered_images
+            .get_mut(&4)
+            .unwrap()
+            .get_mut(&0)
+            .unwrap();
+        img.pending_job = Some(img_id);
+
+        let inline_size = Size::new(app.history_viewport.width, app.image_block_height());
+        let result = tai_tui::image_worker::ImageResult {
+            id: img_id,
+            protocol: None,
+            cell_size: inline_size,
+        };
+        app.apply_image_result(result);
+
+        let img = app.rendered_images.get(&4).unwrap().get(&0).unwrap();
+        assert!(img.failed_sizes.contains(&inline_size));
+        assert!(img.pending_job.is_none());
+    }
+
+    #[test]
+    fn apply_image_result_records_failure_at_any_size() {
+        use tai_tui::image_worker::next_job_id;
+
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let metadata = tai_proto::ImageMetadata {
+            mime_type: "image/png".to_string(),
+            width: 100,
+            height: 100,
+            byte_len: 500,
+            alt: None,
+        };
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![tai_proto::DisplayedImageRecord {
+                metadata: metadata.clone(),
+                data: vec![4u8; 40],
+                tool_call_id: None,
+            }],
+        };
+        let turn_clone = turn.clone();
+        app.session_view.insert_or_replace(5, turn);
+        app.sync_turn_images(5, &turn_clone);
+
+        let img_id = next_job_id();
+        app.pending_job_idx.insert(img_id, (5, 0));
+        let img = app
+            .rendered_images
+            .get_mut(&5)
+            .unwrap()
+            .get_mut(&0)
+            .unwrap();
+        img.pending_job = Some(img_id);
+
+        // Use a cell_size that is NOT the inline size.
+        let non_inline_size = Size::new(80, app.image_block_height() + 1);
+        let result = tai_tui::image_worker::ImageResult {
+            id: img_id,
+            protocol: None,
+            cell_size: non_inline_size,
+        };
+        app.apply_image_result(result);
+
+        let img = app.rendered_images.get(&5).unwrap().get(&0).unwrap();
+        assert!(img.failed_sizes.contains(&non_inline_size));
     }
 }

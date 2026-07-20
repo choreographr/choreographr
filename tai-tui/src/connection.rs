@@ -1,4 +1,3 @@
-use crate::markdown_render::{lines_height, render_turn_lines};
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
@@ -890,51 +889,21 @@ fn handle_chat_event(
                 MouseEventKind::ScrollDown => {
                     app.scroll_accumulator = app.scroll_accumulator.saturating_sub(1);
                 }
-                // Left-click on an image opens it fullscreen.  We look up the
-                // turn at the clicked row and determine which displayed image
-                // (if any) the click landed on. Images occupy the bottom of
-                // each turn, so we first compute the text height from the
-                // render cache (or fresh computation) and then check whether
-                // the click fell in the image band below the text.
+                // Left-click on an image opens it fullscreen.  Uses
+                // `TurnImageLayout` (populated by `rebuild_height_prefix`) to
+                // map the click's content-line offset within the turn to
+                // the correct image index — no text-height recomputation
+                // or cache dependency needed.
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(turn_idx) = find_turn_at_row(app, mouse.row) {
-                        let turn_id = app.visible_turn_ids[turn_idx];
-                        if let Some(turn) = app.session_view.turns.get(&turn_id)
-                            && !turn.displayed_images.is_empty()
-                        {
-                            let turn_start = app
-                                .height_prefix
-                                .get(turn_idx.wrapping_sub(1))
-                                .copied()
-                                .unwrap_or(0);
-                            let total_height = app.total_history_height();
-                            let vh = app.history_viewport.height as usize;
-                            let content_line = total_height
-                                .saturating_sub(app.effective_scroll() + vh)
-                                .saturating_add(mouse.row as usize);
-                            let offset = content_line.saturating_sub(turn_start);
-
-                            // Compute text height from cached render lines or fresh computation.
-                            let content_width = app.history_viewport.width.saturating_sub(9);
-                            let tool_content_width = app.history_viewport.width.saturating_sub(4);
-                            let text_lines = match app.render_cache.get(turn_idx) {
-                                Some(Some(cached)) if cached.width == content_width => {
-                                    cached.lines.clone()
-                                }
-                                _ => render_turn_lines(turn, content_width, tool_content_width),
-                            };
-                            let text_height =
-                                lines_height(&text_lines, app.history_viewport.width).max(1);
-
-                            // Images occupy the bottom of the turn — offsets text_height to turn_height-1.
-                            let img_block_height = app.image_block_height() as usize;
-                            if offset >= text_height {
-                                let img_idx = (offset - text_height) / img_block_height;
-                                if img_idx < turn.displayed_images.len() {
-                                    app.fullscreen_image_target = Some((turn_id, img_idx));
-                                }
-                            }
-                        }
+                    if let Some((turn_idx, offset)) = find_turn_at_row(app, mouse.row)
+                        && let Some(layout) = app.turn_layouts.get(turn_idx)
+                        && let Some(img_idx) = layout
+                            .image_ranges
+                            .iter()
+                            .position(|&(start, end)| offset >= start && offset < end)
+                        && let Some(turn_id) = app.visible_turn_ids.get(turn_idx).copied()
+                    {
+                        app.fullscreen_image_target = Some((turn_id, img_idx));
                     }
                 }
                 _ => {}
