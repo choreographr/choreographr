@@ -1,6 +1,6 @@
 use crate::openai::AllowedCaller;
 use crate::tools::context::ToolContext;
-use crate::tools::{PreparedImage, ToolDyn, ToolExecutionOutput, ToolResult};
+use crate::tools::{PreparedImage, ToolDyn, ToolOutput, ToolOutputFormat};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::sync::mpsc;
@@ -50,12 +50,10 @@ impl McpToolWrapper {
     }
 }
 
-fn parse_json_args(args_json: &str) -> Result<Value, ToolExecutionOutput> {
-    serde_json::from_str(args_json).map_err(|e| ToolExecutionOutput {
-        result: ToolResult {
-            content: format!("invalid arguments: {e}"),
-            is_error: true,
-        },
+fn parse_json_args(args_json: &str) -> Result<Value, ToolOutput> {
+    serde_json::from_str(args_json).map_err(|e| ToolOutput {
+        content: format!("invalid arguments: {e}"),
+        is_error: true,
     })
 }
 
@@ -117,27 +115,38 @@ impl ToolDyn for McpToolWrapper {
     fn execute_json(
         &self,
         args_json: &str,
+        format: ToolOutputFormat,
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         _ctx: Option<&ToolContext>,
         _image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolExecutionOutput {
+    ) -> ToolOutput {
         let args = match parse_json_args(args_json) {
             Ok(v) => v,
             Err(e) => return e,
         };
         match self.call_with_args(args) {
-            Ok(result) => mcp_result_to_tool_output(result),
-            Err(e) => ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!("{e:#}"),
-                    is_error: true,
-                },
+            Ok(result) => {
+                let (text_parts, is_error) = mcp_result_to_text_parts(&result);
+                let content = text_parts.join("\n");
+                ToolOutput {
+                    content: match format {
+                        ToolOutputFormat::Text => content,
+                        ToolOutputFormat::Json => {
+                            serde_json::to_string(&content).unwrap_or(content)
+                        }
+                    },
+                    is_error,
+                }
+            }
+            Err(e) => ToolOutput {
+                content: format!("{e:#}"),
+                is_error: true,
             },
         }
     }
 
-    fn execute_binary(
+    fn execute_postcard(
         &self,
         args_bytes: &[u8],
         _x_credentials: Option<&ServiceCredential>,
@@ -158,33 +167,41 @@ impl ToolDyn for McpToolWrapper {
     fn execute_streaming_json(
         &self,
         args_json: &str,
+        format: ToolOutputFormat,
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         _ctx: Option<&ToolContext>,
         _image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolExecutionOutput {
+    ) -> ToolOutput {
         let args = match parse_json_args(args_json) {
             Ok(v) => v,
             Err(e) => return e,
         };
         match self.call_with_args(args) {
             Ok(result) => {
-                let output = mcp_result_to_tool_output(result);
-                let bytes = output.result.content.as_bytes().to_vec();
-                let _ = output_tx.send(bytes);
-                output
+                let (text_parts, is_error) = mcp_result_to_text_parts(&result);
+                let text_content = text_parts.join("\n");
+                // Always stream text content for incremental display.
+                let _ = output_tx.send(text_content.as_bytes().to_vec());
+                ToolOutput {
+                    content: match format {
+                        ToolOutputFormat::Text => text_content,
+                        ToolOutputFormat::Json => {
+                            serde_json::to_string(&text_content).unwrap_or(text_content)
+                        }
+                    },
+                    is_error,
+                }
             }
-            Err(e) => ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!("{e:#}"),
-                    is_error: true,
-                },
+            Err(e) => ToolOutput {
+                content: format!("{e:#}"),
+                is_error: true,
             },
         }
     }
 
-    fn execute_streaming_binary(
+    fn execute_streaming_postcard(
         &self,
         args_bytes: &[u8],
         _x_credentials: Option<&ServiceCredential>,
@@ -209,16 +226,6 @@ impl ToolDyn for McpToolWrapper {
     }
 }
 
-fn mcp_result_to_tool_output(result: CallToolResult) -> ToolExecutionOutput {
-    let (text_parts, is_error) = mcp_result_to_text_parts(&result);
-    ToolExecutionOutput {
-        result: ToolResult {
-            content: text_parts.join("\n"),
-            is_error,
-        },
-    }
-}
-
 fn mcp_result_to_string(result: CallToolResult) -> String {
     let (text_parts, _) = mcp_result_to_text_parts(&result);
     text_parts.join("\n")
@@ -230,6 +237,14 @@ mod tests {
 
     // ── mcp_result_to_tool_output tests ──────────────────────────────
 
+    fn mcp_result_to_tool_output(result: CallToolResult) -> ToolOutput {
+        let (text_parts, is_error) = mcp_result_to_text_parts(&result);
+        ToolOutput {
+            content: text_parts.join("\n"),
+            is_error,
+        }
+    }
+
     #[test]
     fn mcp_result_to_tool_output_text_only() {
         let result = CallToolResult {
@@ -239,8 +254,8 @@ mod tests {
             is_error: false,
         };
         let output = mcp_result_to_tool_output(result);
-        assert!(!output.result.is_error);
-        assert_eq!(output.result.content, "hello world");
+        assert!(!output.is_error);
+        assert_eq!(output.content, "hello world");
     }
 
     #[test]
@@ -257,7 +272,7 @@ mod tests {
             is_error: false,
         };
         let output = mcp_result_to_tool_output(result);
-        assert_eq!(output.result.content, "line 1\nline 2");
+        assert_eq!(output.content, "line 1\nline 2");
     }
 
     #[test]
@@ -270,8 +285,8 @@ mod tests {
             is_error: false,
         };
         let output = mcp_result_to_tool_output(result);
-        assert!(output.result.content.contains("[Image:"));
-        assert!(output.result.content.contains("image/png"));
+        assert!(output.content.contains("[Image:"));
+        assert!(output.content.contains("image/png"));
     }
 
     #[test]
@@ -284,7 +299,7 @@ mod tests {
             is_error: false,
         };
         let output = mcp_result_to_tool_output(result);
-        assert!(output.result.content.contains("image/png"));
+        assert!(output.content.contains("image/png"));
     }
 
     #[test]
@@ -296,7 +311,7 @@ mod tests {
             is_error: false,
         };
         let output = mcp_result_to_tool_output(result);
-        assert!(output.result.content.contains("[Resource:"));
+        assert!(output.content.contains("[Resource:"));
     }
 
     #[test]
@@ -308,8 +323,8 @@ mod tests {
             is_error: true,
         };
         let output = mcp_result_to_tool_output(result);
-        assert!(output.result.is_error);
-        assert_eq!(output.result.content, "error msg");
+        assert!(output.is_error);
+        assert_eq!(output.content, "error msg");
     }
 
     #[test]
@@ -319,8 +334,8 @@ mod tests {
             is_error: false,
         };
         let output = mcp_result_to_tool_output(result);
-        assert!(!output.result.is_error);
-        assert_eq!(output.result.content, "");
+        assert!(!output.is_error);
+        assert_eq!(output.content, "");
     }
 
     // ── mcp_result_to_string tests ───────────────────────────────────
@@ -353,8 +368,8 @@ mod tests {
     #[test]
     fn parse_json_args_invalid_returns_error() {
         let output = parse_json_args("not json").unwrap_err();
-        assert!(output.result.is_error);
-        assert!(output.result.content.contains("invalid arguments"));
+        assert!(output.is_error);
+        assert!(output.content.contains("invalid arguments"));
     }
 
     #[test]

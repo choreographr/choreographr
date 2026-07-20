@@ -1,4 +1,4 @@
-use super::ToolResult;
+use super::ToolOutput;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -23,23 +23,23 @@ pub enum ToolError {
     Other(String),
 }
 
-pub(crate) fn tool_ok(content: String) -> ToolResult {
-    ToolResult {
+pub(crate) fn tool_ok(content: String) -> ToolOutput {
+    ToolOutput {
         content,
         is_error: false,
     }
 }
 
-pub(crate) fn tool_err(error: impl ToString) -> ToolResult {
-    ToolResult {
+pub(crate) fn tool_err(error: impl ToString) -> ToolOutput {
+    ToolOutput {
         content: error.to_string(),
         is_error: true,
     }
 }
 
-impl From<ToolError> for ToolResult {
+impl From<ToolError> for ToolOutput {
     fn from(error: ToolError) -> Self {
-        ToolResult {
+        ToolOutput {
             content: error.to_string(),
             is_error: true,
         }

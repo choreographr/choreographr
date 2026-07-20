@@ -212,7 +212,7 @@ impl Tool for Grep {
         )
     }
 
-    fn output_content(ret: &Self::Return) -> String {
+    fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
 }

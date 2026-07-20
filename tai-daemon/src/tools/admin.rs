@@ -79,6 +79,10 @@ impl Tool for ListSessions {
         "List all sessions known to the daemon. Returns session ID, title, model, message count, parent session ID, and working directory for each session."
     }
 
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -138,6 +142,10 @@ impl Tool for GetSession {
 
     fn description(&self) -> &'static str {
         "Read the full message history of a session by its ID. Returns all messages (system, user, assistant, tool calls, tool results) with role labels."
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
     }
 
     fn execute(

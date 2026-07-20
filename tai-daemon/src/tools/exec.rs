@@ -80,7 +80,7 @@ impl Tool for Exec {
         run_shell_streaming(&mut cmd, &display_cmd, timeout_ms, output_tx)
     }
 
-    fn output_content(ret: &Self::Return) -> String {
+    fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
 }

@@ -182,6 +182,9 @@ impl super::Tool for DisplayImage {
     fn description(&self) -> &'static str {
         "Display a PNG, JPEG, or SVG image in the client UI."
     }
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
+    }
     fn execute(
         &self,
         args: Self::Args,

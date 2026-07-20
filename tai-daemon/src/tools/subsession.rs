@@ -34,6 +34,10 @@ impl Tool for SpawnSubsession {
         "Spawn a sub-session to autonomously work on a task. The sub-session inherits the parent session's working directory and runs its own tool-calling loop."
     }
 
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+
     fn execute(
         &self,
         _args: Self::Args,

@@ -315,6 +315,10 @@ impl super::Tool for XPost {
         "Post a tweet to X (Twitter). Requires X credentials to be configured via the keystore."
     }
 
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -344,6 +348,10 @@ impl super::Tool for XSearchRecent {
         "Search recent tweets on X (Twitter). Requires X credentials to be configured via the keystore."
     }
 
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -371,6 +379,10 @@ impl super::Tool for XUserLookup {
 
     fn description(&self) -> &'static str {
         "Look up a user on X (Twitter) by username or ID. Requires X credentials to be configured via the keystore."
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
     }
 
     fn execute(

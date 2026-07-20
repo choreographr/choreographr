@@ -768,8 +768,26 @@ pub trait Tool: Send + Sync {
     }
 
     fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> { None }
+
+    /// Produce a human-readable string from the return value.
+    /// The default implementation JSON-encodes the value.
+    /// Tools whose `Return` is `String` override this to return
+    /// the raw string directly (e.g. shell tools, macro-defined tools).
+    fn return_string(ret: &Self::Return) -> String {
+        serde_json::to_string(ret).unwrap_or_default()
+    }
 }
 ```
+
+`ToolOutput` replaces the old `ToolExecutionOutput` + `ToolResult` pair:
+
+```rust
+pub enum ToolOutputFormat { Text, Json }
+pub struct ToolOutput { pub content: String, pub is_error: bool }
+```
+
+`Text` format is used for LLM-facing tool results (human-readable, uses `return_string`).
+`Json` format is used for Programmatic Tool Calling (PTC) — JSON-encodes the return via `serde_json::to_string`.
 
 Tools that need session context (`ToolContext` — used by `list_sessions`, `get_session`)
 receive it in the `ctx` parameter. Tools that return structured data override
@@ -790,17 +808,21 @@ The `ToolDyn` trait erases the generic parameters so tools can be stored in a `H
 
 ```rust
 pub trait ToolDyn: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn group(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    fn name(&self) -> &str;
+    fn group(&self) -> &str;
+    fn description(&self) -> &str;
     fn schema(&self) -> serde_json::Value;
     fn output_schema(&self) -> Option<serde_json::Value>;
     fn allowed_callers(&self) -> Vec<AllowedCaller>;
 
-    fn execute_json(&self, args_json: &str, ..., image_tx: Option<mpsc::Sender<PreparedImage>>) -> ToolExecutionOutput;
-    fn execute_binary(&self, args_bytes: &[u8], ...) -> Vec<u8>;
-    fn execute_streaming_json(&self, args_json: &str, ..., image_tx: Option<mpsc::Sender<PreparedImage>>) -> ToolExecutionOutput;
-    fn execute_streaming_binary(&self, args_bytes: &[u8], ...) -> Vec<u8>;
+    /// JSON path — takes JSON args, returns ToolOutput in requested format.
+    fn execute_json(&self, args_json: &str, format: ToolOutputFormat, ...) -> ToolOutput;
+    /// Streaming JSON path.
+    fn execute_streaming_json(&self, args_json: &str, format: ToolOutputFormat, ...) -> ToolOutput;
+    /// Postcard binary path (VM ecall).
+    fn execute_postcard(&self, args_bytes: &[u8], ...) -> Vec<u8>;
+    /// Streaming postcard binary path.
+    fn execute_streaming_postcard(&self, args_bytes: &[u8], ...) -> Vec<u8>;
 }
 ```
 
@@ -808,14 +830,17 @@ A blanket impl `impl<T: Tool> ToolDyn for T` provides all four dispatch paths:
 
 | Path | Input | Output | Used by |
 |---|---|---|---|
-| `execute_json` | `&str` (JSON) | `ToolExecutionOutput` | LLM tool calls (OpenAI/Anthropic etc.) |
-| `execute_binary` | `&[u8]` (postcard) | `Vec<u8>` (postcard) | RISC-V VM tool calls |
-| `execute_streaming_json` | `&str` (JSON) | `ToolExecutionOutput` | Streaming shell/VM tools via LLM |
-| `execute_streaming_binary` | `&[u8]` (postcard) | `Vec<u8>` (postcard) | Streaming VM tool calls |
+| `execute_json` | `&str` (JSON) + `ToolOutputFormat` | `ToolOutput` | LLM tool calls (OpenAI/Anthropic etc.) |
+| `execute_postcard` | `&[u8]` (postcard) | `Vec<u8>` (postcard) | RISC-V VM tool calls |
+| `execute_streaming_json` | `&str` (JSON) + `ToolOutputFormat` | `ToolOutput` | Streaming shell/VM tools via LLM |
+| `execute_streaming_postcard` | `&[u8]` (postcard) | `Vec<u8>` (postcard) | Streaming VM tool calls |
 
 The JSON path deserializes arguments with `serde_json`, calls `Tool::execute()`, then
-serializes the return value back to JSON. The binary path uses `postcard` for both
-deserialization and serialization, enabling compact cross-VM communication.
+returns a `ToolOutput`. When `format` is `Text`, the content is produced via
+`T::return_string()` (human-readable). When `format` is `Json`, the return value
+is JSON-encoded via `serde_json::to_string()` (for PTC responses).
+The binary path uses `postcard` for both deserialization and serialization,
+enabling compact cross-VM communication.
 
 ### `define_tool!` macro
 
@@ -843,13 +868,17 @@ owned by `DaemonStateInner`, constructed once at daemon startup. The agent loop 
 an `Arc<ToolRegistry>` from the daemon state to list available tool definitions and
 dispatch tool execution.
 
-The registry provides `execute_dyn()` for the binary dispatch path (used by the VM):
+The registry provides `execute_json()`, `execute_streaming_json()`, and `execute_postcard()` for dispatch:
 
 ```rust
-pub fn execute_dyn(&self, name: &str, args_bytes: &[u8], ...) -> Vec<u8> {
-    // finds the tool by name, calls ToolDyn::execute_binary()
-}
+pub fn execute_json(&self, tool_call: &ChatToolCall, format: ToolOutputFormat, ...) -> ToolOutput;
+pub fn execute_streaming_json(&self, tool_call: &ChatToolCall, format: ToolOutputFormat, ...) -> ToolOutput;
+pub fn execute_postcard(&self, name: &str, args_bytes: &[u8], ...) -> Vec<u8>;
 ```
+
+`execute_postcard` replaces the old `execute_dyn` and calls `ToolDyn::execute_postcard()`.
+`execute_json` and `execute_streaming_json` accept a `ToolOutputFormat` parameter so
+callers can choose between `Text` (LLM) and `Json` (PTC) output formats.
 
 Each tool receives an optional `working_dir: Option<&Path>` parameter that represents the session's
 working directory. Filesystem and Git tools resolve relative paths against this working directory.
@@ -945,7 +974,7 @@ for typical N (< 10), but callers should be aware of the resource footprint.
 
 Results are collected in source-call order (the order the LLM issued them) so the
 conversation history remains deterministic regardless of which thread finishes first.
-If a tool thread panics, the error is caught and reported as a `ToolResult` with
+If a tool thread panics, the error is caught and reported as a `ToolOutput` with
 `is_error: true` instead of crashing the daemon.
 
 ### spawn_subsession
@@ -1205,7 +1234,7 @@ and exits cleanly when the daemon shuts down.
 ### Image flow (tool-triggered)
 
 Images are delivered out-of-band via a one-shot `mpsc` channel rather than embedded in
-`ToolExecutionOutput`:
+`ToolOutput`:
 
 ```
 Model calls display_image tool
@@ -1630,11 +1659,12 @@ warning logs when a subscriber is disconnected.
 The `ToolError` enum (thiserror) covers common tool failure modes: invalid arguments, I/O
 errors, network failures, postcard encoding errors, etc. Tools return `Result<Self::Return, ToolError>`
 from their `execute()` method. The `ToolDyn::execute_json()` conversion layer transforms errors
-into `ToolExecutionOutput { is_error: true }` for the LLM path, and the binary path encodes
+into `ToolOutput { is_error: true }` for the LLM path, and the binary path encodes
 them as `Result::<Return, String>::Err(e.to_string())` via postcard.
 
-The legacy `ToolResult { content, is_error }` and `ToolExecutionOutput` types remain for
-backward compatibility in the VM's internal `run_riscv_impl` and the `ToolDyn` conversion layer.
+`ToolOutput` replaces the old `ToolExecutionOutput` and `ToolResult` types. The `ToolOutputFormat`
+enum lets callers choose between `Text` (human-readable via `return_string`) and `Json`
+(JSON-encoded via `serde_json::to_string`) output formats.
 | `gix` | daemon | Git operations |
 | `teloxide` | tai-im | Telegram Bot API client |
 | `prometheus` | daemon | OpenMetrics instrumentation, process metrics |

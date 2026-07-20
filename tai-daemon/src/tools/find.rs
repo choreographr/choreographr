@@ -187,7 +187,7 @@ impl Tool for Find {
         )
     }
 
-    fn output_content(ret: &Self::Return) -> String {
+    fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
 }

@@ -17,6 +17,7 @@
 /// tests/ directories and must be ignored; `cargo test` runs only unit tests.
 use std::collections::HashSet;
 use std::sync::Arc;
+use tai_daemon::tools::ToolOutputFormat;
 
 #[test]
 #[ignore]
@@ -80,22 +81,20 @@ fn mcp_server_everything_tools_are_discovered_and_callable() {
         caller: None,
     };
 
-    let output = registry.execute(
-        &tool_call, None, // x_credentials
+    let output = registry.execute_json(
+        &tool_call,
+        ToolOutputFormat::Text,
+        None, // x_credentials
         None, // working_dir
         None, // ctx
         None, // image_tx
     );
 
+    assert!(!output.is_error, "echo should succeed: {}", output.content);
     assert!(
-        !output.result.is_error,
-        "echo should succeed: {}",
-        output.result.content
-    );
-    assert!(
-        output.result.content.contains("hello from tai"),
+        output.content.contains("hello from tai"),
         "echo should return our message, got: {}",
-        output.result.content
+        output.content
     );
 
     // ── 7. Shut down ──

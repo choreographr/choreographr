@@ -132,6 +132,10 @@ impl Tool for DbSet {
         "Insert or overwrite a key-value pair in the session's database."
     }
 
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -173,6 +177,10 @@ impl Tool for DbGet {
 
     fn description(&self) -> &'static str {
         "Retrieve a value by key from the session's database."
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone().unwrap_or_default()
     }
 
     fn output_schema(&self) -> Option<serde_json::Value> {
@@ -231,6 +239,10 @@ impl Tool for DbDelete {
         "Remove a single key from the session's database. Returns 'deleted' or 'not found'."
     }
 
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -278,6 +290,10 @@ impl Tool for DbDeleteRange {
 
     fn description(&self) -> &'static str {
         "Delete all keys in the range [start, end). If end is omitted, deletes from start to the end of the session's keys."
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
     }
 
     fn execute(
@@ -336,6 +352,13 @@ impl Tool for DbGetRange {
 
     fn description(&self) -> &'static str {
         "Retrieve all key-value pairs in the key range [start, end). Returns a JSON array of {key, value_b64} objects."
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.iter()
+            .map(|e| format!("{}: {}", e.key, e.value_b64))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn execute(
@@ -404,6 +427,10 @@ impl Tool for DbList {
         "List key names in the key range [start, end). Both start and end are optional. Returns a JSON array of key strings."
     }
 
+    fn return_string(ret: &Self::Return) -> String {
+        ret.join("\n")
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -461,6 +488,10 @@ impl Tool for DbCount {
 
     fn description(&self) -> &'static str {
         "Count keys in the session's database, optionally filtered by prefix."
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.to_string()
     }
 
     fn execute(

@@ -49,7 +49,7 @@ macro_rules! define_tool {
             ) -> Result<Self::Return, $crate::tools::ToolError> {
                 $exec_fn(&args, working_dir)
             }
-            fn output_content(ret: &Self::Return) -> String {
+            fn return_string(ret: &Self::Return) -> String {
                 ret.clone()
             }
         }
@@ -83,15 +83,16 @@ pub(crate) mod time;
 pub(crate) mod vm;
 pub(crate) mod x;
 
-#[derive(Debug, Clone)]
-pub struct ToolResult {
-    pub content: String,
-    pub is_error: bool,
+#[derive(Debug, Clone, Copy)]
+pub enum ToolOutputFormat {
+    Text,
+    Json,
 }
 
-#[derive(Debug)]
-pub struct ToolExecutionOutput {
-    pub result: ToolResult,
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    pub content: String,
+    pub is_error: bool,
 }
 
 #[derive(Debug)]
@@ -258,18 +259,13 @@ pub trait Tool: Send + Sync {
         None
     }
 
-    /// Serialize the return value into `ToolResult.content`.
+    /// Produce a human-readable string from the return value.
     ///
-    /// The default implementation JSON-encodes the value, which is correct
-    /// for structured return types (`Vec<u8>`, custom structs, etc.).
-    /// Tools whose `Return` is `String` override this to return the raw
-    /// string directly so that tools like `git_diff` and `sh` preserve
-    /// newlines and diff formatting in the persisted session history.
-    fn output_content(ret: &Self::Return) -> String {
-        let content = serde_json::to_string(ret).unwrap_or_default();
-        tracing::trace!(len = content.len(), "tool output serialized via JSON");
-        content
-    }
+    /// Every `impl Tool` must define this. The `define_tool!` macro generates
+    /// a `ret.clone()` implementation automatically. For `Return = String`,
+    /// implement `ret.clone()`. For structured types, format the value
+    /// however is most readable.
+    fn return_string(ret: &Self::Return) -> String;
 }
 
 /// Type-erased dispatch trait stored in ToolRegistry.
@@ -282,18 +278,31 @@ pub trait ToolDyn: Send + Sync {
     fn output_schema(&self) -> Option<serde_json::Value>;
     fn allowed_callers(&self) -> Vec<AllowedCaller>;
 
-    /// JSON path (LLM tool calls) — returns ToolExecutionOutput for session.
+    /// JSON path — takes JSON args, returns ToolOutput in requested format.
     fn execute_json(
         &self,
         args_json: &str,
+        format: ToolOutputFormat,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolExecutionOutput;
+    ) -> ToolOutput;
 
-    /// Binary path (VM ecall) — returns raw postcard-encoded Result<Return, String>.
-    fn execute_binary(
+    /// Streaming JSON path.
+    fn execute_streaming_json(
+        &self,
+        args_json: &str,
+        format: ToolOutputFormat,
+        x_credentials: Option<&ServiceCredential>,
+        working_dir: Option<&std::path::Path>,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        ctx: Option<&context::ToolContext>,
+        image_tx: Option<mpsc::Sender<PreparedImage>>,
+    ) -> ToolOutput;
+
+    /// Postcard binary path — args from postcard, returns postcard-encoded.
+    fn execute_postcard(
         &self,
         args_bytes: &[u8],
         x_credentials: Option<&ServiceCredential>,
@@ -301,19 +310,8 @@ pub trait ToolDyn: Send + Sync {
         ctx: Option<&context::ToolContext>,
     ) -> Vec<u8>;
 
-    /// Streaming JSON path.
-    fn execute_streaming_json(
-        &self,
-        args_json: &str,
-        x_credentials: Option<&ServiceCredential>,
-        working_dir: Option<&std::path::Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
-        ctx: Option<&context::ToolContext>,
-        image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolExecutionOutput;
-
-    /// Streaming binary path.
-    fn execute_streaming_binary(
+    /// Streaming postcard binary path.
+    fn execute_streaming_postcard(
         &self,
         args_bytes: &[u8],
         x_credentials: Option<&ServiceCredential>,
@@ -347,19 +345,18 @@ impl<T: Tool + 'static> ToolDyn for T {
     fn execute_json(
         &self,
         args_json: &str,
+        format: ToolOutputFormat,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolExecutionOutput {
+    ) -> ToolOutput {
         let args = match serde_json::from_str::<T::Args>(args_json) {
             Ok(a) => a,
             Err(e) => {
-                return ToolExecutionOutput {
-                    result: ToolResult {
-                        content: format!("invalid arguments: {e}"),
-                        is_error: true,
-                    },
+                return ToolOutput {
+                    content: format!("invalid arguments: {e}"),
+                    is_error: true,
                 };
             }
         };
@@ -370,23 +367,25 @@ impl<T: Tool + 'static> ToolDyn for T {
                 {
                     let _ = tx.send(image);
                 }
-                ToolExecutionOutput {
-                    result: ToolResult {
-                        content: T::output_content(&ret),
-                        is_error: false,
+                ToolOutput {
+                    content: match format {
+                        ToolOutputFormat::Text => T::return_string(&ret),
+                        ToolOutputFormat::Json => serde_json::to_string(&ret).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "failed to JSON-encode tool return");
+                            String::new()
+                        }),
                     },
+                    is_error: false,
                 }
             }
-            Err(e) => ToolExecutionOutput {
-                result: ToolResult {
-                    content: e.to_string(),
-                    is_error: true,
-                },
+            Err(e) => ToolOutput {
+                content: e.to_string(),
+                is_error: true,
             },
         }
     }
 
-    fn execute_binary(
+    fn execute_postcard(
         &self,
         args_bytes: &[u8],
         x_credentials: Option<&ServiceCredential>,
@@ -403,20 +402,19 @@ impl<T: Tool + 'static> ToolDyn for T {
     fn execute_streaming_json(
         &self,
         args_json: &str,
+        format: ToolOutputFormat,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolExecutionOutput {
+    ) -> ToolOutput {
         let args = match serde_json::from_str::<T::Args>(args_json) {
             Ok(a) => a,
             Err(e) => {
-                return ToolExecutionOutput {
-                    result: ToolResult {
-                        content: format!("invalid arguments: {e}"),
-                        is_error: true,
-                    },
+                return ToolOutput {
+                    content: format!("invalid arguments: {e}"),
+                    is_error: true,
                 };
             }
         };
@@ -427,23 +425,25 @@ impl<T: Tool + 'static> ToolDyn for T {
                 {
                     let _ = tx.send(image);
                 }
-                ToolExecutionOutput {
-                    result: ToolResult {
-                        content: T::output_content(&ret),
-                        is_error: false,
+                ToolOutput {
+                    content: match format {
+                        ToolOutputFormat::Text => T::return_string(&ret),
+                        ToolOutputFormat::Json => serde_json::to_string(&ret).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "failed to JSON-encode tool return");
+                            String::new()
+                        }),
                     },
+                    is_error: false,
                 }
             }
-            Err(e) => ToolExecutionOutput {
-                result: ToolResult {
-                    content: e.to_string(),
-                    is_error: true,
-                },
+            Err(e) => ToolOutput {
+                content: e.to_string(),
+                is_error: true,
             },
         }
     }
 
-    fn execute_streaming_binary(
+    fn execute_streaming_postcard(
         &self,
         args_bytes: &[u8],
         x_credentials: Option<&ServiceCredential>,
@@ -574,60 +574,62 @@ impl ToolRegistry {
         self.tools.insert(name, Box::new(tool));
     }
 
-    pub fn execute(
+    /// JSON path — caller picks Text (LLM) or Json (PTC).
+    pub fn execute_json(
         &self,
         tool_call: &ChatToolCall,
+        format: ToolOutputFormat,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolExecutionOutput {
+    ) -> ToolOutput {
         match self.tools.get(tool_call.name.as_str()) {
             Some(tool) => tool.execute_json(
                 &tool_call.arguments_json,
+                format,
                 x_credentials,
                 working_dir,
                 ctx,
                 image_tx,
             ),
-            None => ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!("unknown tool: {}", tool_call.name),
-                    is_error: true,
-                },
+            None => ToolOutput {
+                content: format!("unknown tool: {}", tool_call.name),
+                is_error: true,
             },
         }
     }
 
-    pub fn execute_streaming(
+    /// Streaming JSON path.
+    pub fn execute_streaming_json(
         &self,
         tool_call: &ChatToolCall,
+        format: ToolOutputFormat,
         output_tx: mpsc::Sender<Vec<u8>>,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolExecutionOutput {
+    ) -> ToolOutput {
         match self.tools.get(tool_call.name.as_str()) {
             Some(tool) => tool.execute_streaming_json(
                 &tool_call.arguments_json,
+                format,
                 x_credentials,
                 working_dir,
                 output_tx,
                 ctx,
                 image_tx,
             ),
-            None => ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!("unknown tool: {}", tool_call.name),
-                    is_error: true,
-                },
+            None => ToolOutput {
+                content: format!("unknown tool: {}", tool_call.name),
+                is_error: true,
             },
         }
     }
 
-    /// Execute a tool via postcard binary dispatch (VM path).
-    pub fn execute_dyn(
+    /// Postcard binary dispatch (VM path).
+    pub fn execute_postcard(
         &self,
         name: &str,
         args_bytes: &[u8],
@@ -636,7 +638,7 @@ impl ToolRegistry {
         ctx: Option<&context::ToolContext>,
     ) -> Vec<u8> {
         match self.tools.get(name) {
-            Some(tool) => tool.execute_binary(args_bytes, x_credentials, working_dir, ctx),
+            Some(tool) => tool.execute_postcard(args_bytes, x_credentials, working_dir, ctx),
             None => {
                 let err: Result<(), String> = Err(format!("unknown tool: {name}"));
                 postcard::to_allocvec(&err).unwrap_or_else(|e| {
@@ -941,6 +943,9 @@ mod tests {
         ) -> Result<Self::Return, ToolError> {
             Ok("ok".to_string())
         }
+        fn return_string(ret: &Self::Return) -> String {
+            ret.clone()
+        }
     }
 
     #[test]
@@ -1005,6 +1010,9 @@ mod tests {
         }
         fn description(&self) -> &'static str {
             "A tool with restricted callers"
+        }
+        fn return_string(ret: &Self::Return) -> String {
+            ret.to_string()
         }
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object", "properties": {}})
@@ -1264,6 +1272,9 @@ mod tests {
         fn description(&self) -> &'static str {
             "Tool with unit args"
         }
+        fn return_string(ret: &Self::Return) -> String {
+            ret.clone()
+        }
         fn execute(
             &self,
             _args: Self::Args,
@@ -1284,11 +1295,9 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
     }
 
-    // ── output_content tests ─────────────────────────────────────────
+    // ── return_string tests ─────────────────────────────────────────
 
-    /// A tool whose `Return` is `String` and overrides `output_content`
-    /// exactly as the `define_tool!` macro does — returning the raw string
-    /// instead of the JSON-wrapped default.
+    /// A tool whose `Return` is `String` — the Display impl returns the raw string.
     struct RawOutputTool;
 
     impl Tool for RawOutputTool {
@@ -1302,7 +1311,7 @@ mod tests {
             "test"
         }
         fn description(&self) -> &'static str {
-            "Tool with macro-style output_content override"
+            "Tool with default return_string (Display)"
         }
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object", "properties": {}})
@@ -1316,53 +1325,38 @@ mod tests {
         ) -> Result<Self::Return, ToolError> {
             Ok("raw\noutput".to_string())
         }
-        fn output_content(ret: &Self::Return) -> String {
+        fn return_string(ret: &Self::Return) -> String {
             ret.clone()
         }
     }
 
     #[test]
-    fn output_content_default_for_string_is_json_wrapped() {
-        // The default trait impl for `Return = String` JSON-encodes,
-        // producing `"\"value\"` instead of `"value"`.
-        let content = <DefaultTool as Tool>::output_content(&"hello".to_string());
-        assert_eq!(content, r#""hello""#);
+    fn return_string_default_for_string_is_raw() {
+        let content = <DefaultTool as Tool>::return_string(&"hello".to_string());
+        assert_eq!(content, "hello");
     }
 
     #[test]
-    fn output_content_default_for_integer_is_plain_number() {
-        let content = <RestrictedTool as Tool>::output_content(&42u64);
+    fn return_string_default_for_integer_is_plain_number() {
+        let content = <RestrictedTool as Tool>::return_string(&42u64);
         assert_eq!(content, "42");
     }
 
     #[test]
-    fn output_content_raw_returns_unmodified_string() {
-        // The macro-style override clones the string directly, preserving
-        // newlines and formatting without JSON quoting.
+    fn return_string_through_execute_json_text_format() {
+        // execute_json with Text format calls T::return_string.
         let tool = RawOutputTool;
-        // () args deserialize from `null`, not `{}`.
-        let output = tool.execute_json("null", None, None, None, None);
-        assert_eq!(output.result.content, "raw\noutput");
+        let result = tool.execute_json("null", ToolOutputFormat::Text, None, None, None, None);
+        assert!(!result.is_error, "should succeed");
+        assert_eq!(result.content, "raw\noutput");
     }
 
     #[test]
-    fn output_content_default_vs_raw_differ() {
-        // Same underlying value yields different serialization:
-        // default JSON-encodes (double-wraps strings), raw returns as-is.
-        let value = "line1\nline2";
-        let default = <DefaultTool as Tool>::output_content(&value.to_string());
-        let raw = <RawOutputTool as Tool>::output_content(&value.to_string());
-        assert_ne!(default, raw, "default and raw should differ for strings");
-        assert_eq!(raw, value, "raw override should return the original value");
-    }
-
-    #[test]
-    fn output_content_through_execute_json_uses_override() {
-        // execute_json calls T::output_content, so the override must take
-        // effect end-to-end.
+    fn return_string_through_execute_json_json_format() {
+        // execute_json with Json format calls serde_json::to_string.
         let tool = RawOutputTool;
-        let result = tool.execute_json("null", None, None, None, None);
-        assert!(!result.result.is_error, "should succeed");
-        assert_eq!(result.result.content, "raw\noutput");
+        let result = tool.execute_json("null", ToolOutputFormat::Json, None, None, None, None);
+        assert!(!result.is_error, "should succeed");
+        assert_eq!(result.content, r#""raw\noutput""#);
     }
 }

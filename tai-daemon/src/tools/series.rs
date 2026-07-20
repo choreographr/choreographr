@@ -1,4 +1,4 @@
-use super::{Tool, ToolRegistry, context::ToolContext, error::ToolError};
+use super::{Tool, ToolOutputFormat, ToolRegistry, context::ToolContext, error::ToolError};
 use crate::providers::types::ChatToolCall;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -55,6 +55,10 @@ impl Tool for RunSeries {
          Note: placeholders found inside previous step outputs are NOT substituted \
          to avoid double-substitution — only literal {{step_N}} patterns in the \
          original arguments are resolved."
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
     }
 
     fn execute(
@@ -149,7 +153,7 @@ fn substitute_args(args: &Value, outputs: &HashMap<usize, String>) -> Value {
 /// Shared execution core for both `execute` and `execute_streaming`.
 ///
 /// Iterates over steps sequentially. After each step checks
-/// `ToolExecutionOutput.result.is_error` — on failure the series
+/// `ToolOutput.is_error` — on failure the series
 /// stops immediately and propagates the error.
 fn execute_series(
     registry: &Weak<ToolRegistry>,
@@ -202,30 +206,38 @@ fn execute_series(
                     }
                 }
             });
-            let result = registry.execute_streaming(
+            let result = registry.execute_streaming_json(
                 &tool_call,
+                ToolOutputFormat::Text,
                 sub_tx,
                 x_credentials,
                 working_dir,
                 ctx,
                 None,
             );
-            // sub_tx is dropped when execute_streaming returns → relay drains.
+            // sub_tx is dropped when execute_streaming_json returns → relay drains.
             let _ = relay_handle.join();
             result
         } else {
-            registry.execute(&tool_call, x_credentials, working_dir, ctx, None)
+            registry.execute_json(
+                &tool_call,
+                ToolOutputFormat::Text,
+                x_credentials,
+                working_dir,
+                ctx,
+                None,
+            )
         };
 
         // Stop on first error — the series cannot proceed past a failed step.
-        if output.result.is_error {
+        if output.is_error {
             return Err(ToolError::Other(format!(
                 "step {step_idx} ('{}') failed: {}",
-                step.tool, output.result.content
+                step.tool, output.content
             )));
         }
 
-        step_outputs.insert(step_idx, output.result.content);
+        step_outputs.insert(step_idx, output.content);
     }
 
     serde_json::to_string(&step_outputs)
@@ -253,6 +265,9 @@ mod tests {
         fn description(&self) -> &'static str {
             "echo args back"
         }
+        fn return_string(ret: &Self::Return) -> String {
+            ret.clone()
+        }
         fn execute(
             &self,
             args: Self::Args,
@@ -277,6 +292,9 @@ mod tests {
         }
         fn description(&self) -> &'static str {
             "always fails"
+        }
+        fn return_string(ret: &Self::Return) -> String {
+            ret.clone()
         }
         fn execute(
             &self,

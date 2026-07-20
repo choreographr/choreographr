@@ -1,5 +1,5 @@
 use crate::tools::{
-    Tool, ToolError, ToolExecutionOutput, ToolRegistry, context::ToolContext, tool_err, tool_ok,
+    Tool, ToolError, ToolOutput, ToolRegistry, context::ToolContext, tool_err, tool_ok,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ckb_vm::Bytes;
@@ -648,7 +648,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                 let (tool_name, rest): (String, &[u8]) = postcard::take_from_bytes(&request_bytes)
                     .map_err(|_| VmError::Unexpected("invalid postcard frame: tool name".into()))?;
 
-                let result_bytes = self.registry.execute_dyn(
+                let result_bytes = self.registry.execute_postcard(
                     &tool_name,
                     rest,
                     self.x_credentials.as_ref(),
@@ -714,7 +714,8 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                     let handles: Vec<_> = requests
                         .into_iter()
                         .map(|(name, args)| {
-                            scope.spawn(move || registry.execute_dyn(&name, &args, xc, cw, ctx))
+                            scope
+                                .spawn(move || registry.execute_postcard(&name, &args, xc, cw, ctx))
                         })
                         .collect();
                     handles
@@ -731,7 +732,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                 });
 
                 // Encode response: [count: varint][result: postcard Result]*.
-                // Each result from execute_dyn is already a postcard-encoded
+                // Each result from execute_postcard is already a postcard-encoded
                 // Result<Vec<u8>, String>, so we just concatenate them.
                 let count_encoded: Vec<u8> = postcard::to_allocvec(&(results.len() as u32))
                     .map_err(|_| VmError::Unexpected("batch encode count failed".into()))?;
@@ -842,7 +843,7 @@ fn run_riscv_impl(
     write_tx: Option<mpsc::Sender<Vec<u8>>>,
     registry: Arc<ToolRegistry>,
     ctx: Option<crate::tools::context::ToolContext>,
-) -> ToolExecutionOutput {
+) -> ToolOutput {
     let enable_allocator = input.allocator.unwrap_or(true);
 
     // Format the user's Rust source with rustfmt before compiling.
@@ -861,41 +862,29 @@ fn run_riscv_impl(
         (Some(source), None) => match compile(source, enable_allocator) {
             Ok(elf) => elf,
             Err(e) => {
-                return ToolExecutionOutput {
-                    result: tool_err(e),
-                };
+                return tool_err(e);
             }
         },
         (None, Some(program_b64)) => match BASE64.decode(program_b64) {
             Ok(elf) => elf,
             Err(e) => {
-                return ToolExecutionOutput {
-                    result: tool_err(format!("base64 decode error: {e}")),
-                };
+                return tool_err(format!("base64 decode error: {e}"));
             }
         },
         (None, None) => {
-            return ToolExecutionOutput {
-                result: tool_err("either 'source' or 'program' is required"),
-            };
+            return tool_err("either 'source' or 'program' is required");
         }
         (Some(_), Some(_)) => {
-            return ToolExecutionOutput {
-                result: tool_err("provide only one of 'source' or 'program'"),
-            };
+            return tool_err("provide only one of 'source' or 'program'");
         }
     };
 
     let memory_size = input.memory_size.unwrap_or(4 * 1024 * 1024);
     if !memory_size.is_multiple_of(4096) {
-        return ToolExecutionOutput {
-            result: tool_err("memory_size must be a multiple of 4096"),
-        };
+        return tool_err("memory_size must be a multiple of 4096");
     }
     if memory_size > 4 * 1024 * 1024 {
-        return ToolExecutionOutput {
-            result: tool_err("memory_size cannot exceed 4MB"),
-        };
+        return tool_err("memory_size cannot exceed 4MB");
     }
 
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
@@ -931,9 +920,7 @@ fn run_riscv_impl(
         .collect();
 
     if let Err(e) = trace.load_program(&Bytes::from(elf), args_list.iter().map(|b| Ok(b.clone()))) {
-        return ToolExecutionOutput {
-            result: tool_err(format!("failed to load program: {e}")),
-        };
+        return tool_err(format!("failed to load program: {e}"));
     }
 
     // The CKB-VM does not set A0/A1 registers before jumping to _start.
@@ -975,9 +962,7 @@ fn run_riscv_impl(
                 "\n[VM: exited with code {exit_code} in {cycles} cycles]"
             ));
 
-            ToolExecutionOutput {
-                result: tool_ok(result_content),
-            }
+            tool_ok(result_content)
         }
         Err(e) => {
             let cycles = trace.machine.cycles();
@@ -994,9 +979,7 @@ fn run_riscv_impl(
             } else {
                 format!("VM error after {cycles} cycles: {e}\noutput so far:\n{out_str}")
             };
-            ToolExecutionOutput {
-                result: tool_err(msg),
-            }
+            tool_err(msg)
         }
     }
 }
@@ -1025,6 +1008,10 @@ impl Tool for RunRiscV {
 
     fn description(&self) -> &'static str {
         "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `tai` module. Use per-tool convenience wrappers (tai::read_file, tai::write_file, tai::db_get, tai::db_set, tai::sh, tai::exec, tai::grep, tai::find, tai::http_request) for tool calls — they handle the postcard encoding automatically. Use tai::write(b\"...\") for VM output and tai::exit(code) to finish. Do NOT use raw ecall with Linux syscall numbers (64, 93) — they are not supported."
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
     }
 
     fn schema(&self) -> serde_json::Value {
@@ -1075,10 +1062,10 @@ impl Tool for RunRiscV {
             registry,
             ctx.cloned(),
         );
-        if output.result.is_error {
-            Err(ToolError::Other(output.result.content))
+        if output.is_error {
+            Err(ToolError::Other(output.content))
         } else {
-            Ok(output.result.content)
+            Ok(output.content)
         }
     }
 
@@ -1102,10 +1089,10 @@ impl Tool for RunRiscV {
             registry,
             ctx.cloned(),
         );
-        if output.result.is_error {
-            Err(ToolError::Other(output.result.content))
+        if output.is_error {
+            Err(ToolError::Other(output.content))
         } else {
-            Ok(output.result.content)
+            Ok(output.content)
         }
     }
 }
@@ -1116,10 +1103,10 @@ pub fn execute_run_riscv_tool(
 ) -> Result<String, ToolError> {
     let registry = Arc::new(ToolRegistry::new());
     let output = run_riscv_impl(input, None, working_dir, None, registry, None);
-    if output.result.is_error {
-        Err(ToolError::Other(output.result.content))
+    if output.is_error {
+        Err(ToolError::Other(output.content))
     } else {
-        Ok(output.result.content)
+        Ok(output.content)
     }
 }
 
@@ -1234,15 +1221,11 @@ mod tests {
             dummy_registry(),
             None,
         );
+        assert!(result.is_error, "expected error: {}", result.content);
         assert!(
-            result.result.is_error,
-            "expected error: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("source") || result.result.content.contains("program"),
+            result.content.contains("source") || result.content.contains("program"),
             "should mention source/program: {}",
-            result.result.content
+            result.content
         );
     }
 
@@ -1260,16 +1243,8 @@ mod tests {
             dummy_registry(),
             None,
         );
-        assert!(
-            result.result.is_error,
-            "expected error: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("only one of"),
-            "{}",
-            result.result.content
-        );
+        assert!(result.is_error, "expected error: {}", result.content);
+        assert!(result.content.contains("only one of"), "{}", result.content);
     }
 
     #[test]
@@ -1285,15 +1260,11 @@ mod tests {
             dummy_registry(),
             None,
         );
+        assert!(result.is_error, "expected error: {}", result.content);
         assert!(
-            result.result.is_error,
-            "expected error: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("base64 decode error"),
+            result.content.contains("base64 decode error"),
             "{}",
-            result.result.content
+            result.content
         );
     }
 
@@ -1311,15 +1282,11 @@ mod tests {
             dummy_registry(),
             None,
         );
+        assert!(result.is_error, "expected error: {}", result.content);
         assert!(
-            result.result.is_error,
-            "expected error: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("multiple of 4096"),
+            result.content.contains("multiple of 4096"),
             "{}",
-            result.result.content
+            result.content
         );
     }
 
@@ -1337,15 +1304,11 @@ mod tests {
             dummy_registry(),
             None,
         );
+        assert!(result.is_error, "expected error: {}", result.content);
         assert!(
-            result.result.is_error,
-            "expected error: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("cannot exceed 4MB"),
+            result.content.contains("cannot exceed 4MB"),
             "{}",
-            result.result.content
+            result.content
         );
     }
 
@@ -1367,25 +1330,21 @@ mod tests {
             None,
         );
         // Should fail at ELF load, not at input validation
+        assert!(result.is_error, "expected error: {}", result.content);
         assert!(
-            result.result.is_error,
-            "expected error: {}",
-            result.result.content
-        );
-        assert!(
-            !result.result.content.contains("base64 decode error"),
+            !result.content.contains("base64 decode error"),
             "should not be base64 error: {}",
-            result.result.content
+            result.content
         );
         assert!(
-            !result.result.content.contains("multiple of 4096"),
+            !result.content.contains("multiple of 4096"),
             "should not be alignment error: {}",
-            result.result.content
+            result.content
         );
         assert!(
-            !result.result.content.contains("cannot exceed 4MB"),
+            !result.content.contains("cannot exceed 4MB"),
             "should not be size error: {}",
-            result.result.content
+            result.content
         );
     }
 
@@ -1472,6 +1431,9 @@ mod tests {
         fn description(&self) -> &'static str {
             "test tool for concurrent dispatch"
         }
+        fn return_string(ret: &Self::Return) -> String {
+            ret.clone()
+        }
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({})
         }
@@ -1487,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn echo_test_tool_works_with_execute_dyn() {
+    fn echo_test_tool_works_with_execute_postcard() {
         let mut registry = ToolRegistry::new();
         registry.register(EchoTestTool {
             name: "_echo_solo",
@@ -1497,7 +1459,7 @@ mod tests {
 
         // Postcard-encoded () unit — EchoTestTool takes no args.
         let unit_args: Vec<u8> = postcard::to_allocvec(&()).unwrap();
-        let result = registry.execute_dyn("_echo_solo", &unit_args, None, None, None);
+        let result = registry.execute_postcard("_echo_solo", &unit_args, None, None, None);
 
         assert!(!result.is_empty(), "should have a result");
         if result[0] == 0 {
@@ -1509,7 +1471,7 @@ mod tests {
             // Decode the error message for debugging.
             let (err_msg, _rest): (String, &[u8]) =
                 postcard::take_from_bytes(&result[1..]).unwrap();
-            panic!("execute_dyn returned Err: {err_msg}");
+            panic!("execute_postcard returned Err: {err_msg}");
         }
     }
 
@@ -1541,7 +1503,7 @@ mod tests {
                 .into_iter()
                 .map(|(name, args)| {
                     let reg = Arc::clone(&registry);
-                    scope.spawn(move || reg.execute_dyn(&name, &args, None, None, None))
+                    scope.spawn(move || reg.execute_postcard(&name, &args, None, None, None))
                 })
                 .collect();
             handles

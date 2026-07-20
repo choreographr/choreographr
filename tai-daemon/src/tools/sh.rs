@@ -109,7 +109,7 @@ impl Tool for Sh {
         run_shell_streaming(&mut cmd, command, timeout_ms, output_tx)
     }
 
-    fn output_content(ret: &Self::Return) -> String {
+    fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
 }

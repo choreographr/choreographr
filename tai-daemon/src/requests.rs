@@ -10,7 +10,7 @@ use crate::providers::{
 };
 use crate::sessions::{RequestContext, SessionCommand, SessionMetadata, SessionState};
 use crate::tools::context::ToolContext;
-use crate::tools::{PreparedImage, ToolExecutionOutput, ToolRegistry, ToolResult, resolve_path};
+use crate::tools::{PreparedImage, ToolOutput, ToolOutputFormat, ToolRegistry, resolve_path};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -174,7 +174,7 @@ fn determine_tool_timeout(name: &str) -> Option<Duration> {
 /// image the tool emitted through its streaming channel.
 struct ToolHandle {
     tool_call: ChatToolCall,
-    output: ToolExecutionOutput,
+    output: ToolOutput,
     image: Option<PreparedImage>,
 }
 
@@ -208,7 +208,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
         ctx,
     } = args;
     // Channel for the execution thread to deliver its final result.
-    let (result_tx, result_rx) = mpsc::channel::<ToolExecutionOutput>();
+    let (result_tx, result_rx) = mpsc::channel::<ToolOutput>();
 
     // Channel for streaming output forwarded to subscribers in real time.
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
@@ -233,8 +233,9 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
     let c = working_dir;
     let tool_ctx = ctx;
     thread::spawn(move || {
-        let result = tr.execute_streaming(
+        let result = tr.execute_streaming_json(
             &tc,
+            ToolOutputFormat::Text,
             output_tx,
             xc.as_ref(),
             c.as_deref(),
@@ -256,22 +257,18 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
             if let Some(deadline) = deadline {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    break ToolExecutionOutput {
-                        result: ToolResult {
-                            content: format!("tool '{}' timed out", tool_call.name,),
-                            is_error: true,
-                        },
+                    break ToolOutput {
+                        content: format!("tool '{}' timed out", tool_call.name,),
+                        is_error: true,
                     };
                 }
                 match result_rx.recv_timeout(remaining.min(check_interval)) {
                     Ok(output) => break output,
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => {
-                        break ToolExecutionOutput {
-                            result: ToolResult {
-                                content: "tool execution thread panicked".to_string(),
-                                is_error: true,
-                            },
+                        break ToolOutput {
+                            content: "tool execution thread panicked".to_string(),
+                            is_error: true,
                         };
                     }
                 }
@@ -280,11 +277,9 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                 match result_rx.recv() {
                     Ok(output) => break output,
                     Err(_) => {
-                        break ToolExecutionOutput {
-                            result: ToolResult {
-                                content: "tool execution thread panicked".to_string(),
-                                is_error: true,
-                            },
+                        break ToolOutput {
+                            content: "tool execution thread panicked".to_string(),
+                            is_error: true,
                         };
                     }
                 }
@@ -519,7 +514,7 @@ struct CollectToolResultParams<'a> {
     tool_results: &'a mut Vec<ToolResultItem>,
     session: &'a mut SessionState,
     tool_call: &'a ChatToolCall,
-    output: &'a ToolExecutionOutput,
+    output: &'a ToolOutput,
     known_hint_paths: &'a mut Vec<PathBuf>,
     pending_hints: &'a mut Vec<String>,
 }
@@ -542,7 +537,7 @@ fn collect_tool_result(params: CollectToolResultParams) {
     );
     tool_results.push(ToolResultItem {
         call_id: tool_call.id.clone(),
-        output: output.result.content.clone(),
+        output: output.content.clone(),
         caller: tool_call.caller.clone(),
     });
     persist_loaded_skill(session, &tool_call.name, &tool_call.arguments_json);
@@ -957,11 +952,9 @@ pub(crate) fn run_agent_loop(
                                 arguments_json,
                                 caller: None,
                             },
-                            output: ToolExecutionOutput {
-                                result: ToolResult {
-                                    content: "tool thread panicked".to_string(),
-                                    is_error: true,
-                                },
+                            output: ToolOutput {
+                                content: "tool thread panicked".to_string(),
+                                is_error: true,
                             },
                             image: None,
                         });
@@ -973,8 +966,8 @@ pub(crate) fn run_agent_loop(
                             turn = turn_iter,
                             tool_name = %tool_call.name,
                             elapsed_ms = elapsed.as_millis(),
-                            result_len = output.result.content.len(),
-                            is_error = output.result.is_error,
+                            result_len = output.content.len(),
+                            is_error = output.is_error,
                             "tool finished (concurrent)",
                         );
 
@@ -1024,12 +1017,12 @@ fn finish_tool_call(
     request_id: u32,
     session: &mut SessionState,
     tool_call: &ChatToolCall,
-    output: &mut ToolExecutionOutput,
+    output: &mut ToolOutput,
     ctx: &RequestContext,
     turn_id: u32,
 ) {
-    let is_error = output.result.is_error;
-    let content = output.result.content.clone();
+    let is_error = output.is_error;
+    let content = output.content.clone();
 
     session.add_tool_result(
         turn_id,
@@ -1071,7 +1064,11 @@ fn execute_tool_with_timeout(
     cancel_rx: &mpsc::Receiver<()>,
     ctx: &RequestContext,
     image_tx: Option<mpsc::Sender<PreparedImage>>,
-) -> ToolExecutionOutput {
+) -> ToolOutput {
+    let format = match &tool_call.caller {
+        Some(caller) if caller.kind == "program" => ToolOutputFormat::Json,
+        _ => ToolOutputFormat::Text,
+    };
     // Capture start time for tool execution metrics.
     // Meta-tools (load_tools, unload_tools) that need mutable session state
     // return early and are not timed — only the registry-executed path below
@@ -1089,11 +1086,9 @@ fn execute_tool_with_timeout(
                     session_id: ctx.session_id,
                     metadata: SessionMetadata::from(&*session),
                 });
-            return ToolExecutionOutput {
-                result: ToolResult {
-                    content: result,
-                    is_error: false,
-                },
+            return ToolOutput {
+                content: result,
+                is_error: false,
             };
         }
         "unload_tools" => {
@@ -1107,11 +1102,9 @@ fn execute_tool_with_timeout(
                     session_id: ctx.session_id,
                     metadata: SessionMetadata::from(&*session),
                 });
-            return ToolExecutionOutput {
-                result: ToolResult {
-                    content: result,
-                    is_error: false,
-                },
+            return ToolOutput {
+                content: result,
+                is_error: false,
             };
         }
         "set_working_dir" => {
@@ -1122,22 +1115,18 @@ fn execute_tool_with_timeout(
             let args: serde_json::Value = match serde_json::from_str(&tool_call.arguments_json) {
                 Ok(a) => a,
                 Err(e) => {
-                    return ToolExecutionOutput {
-                        result: ToolResult {
-                            content: format!("invalid arguments: {e}"),
-                            is_error: true,
-                        },
+                    return ToolOutput {
+                        content: format!("invalid arguments: {e}"),
+                        is_error: true,
                     };
                 }
             };
             let path_str = match args.get("path").and_then(|v| v.as_str()) {
                 Some(s) => s,
                 None => {
-                    return ToolExecutionOutput {
-                        result: ToolResult {
-                            content: "missing required argument: path".to_string(),
-                            is_error: true,
-                        },
+                    return ToolOutput {
+                        content: "missing required argument: path".to_string(),
+                        is_error: true,
                     };
                 }
             };
@@ -1156,14 +1145,12 @@ fn execute_tool_with_timeout(
             let canonical = match resolved.canonicalize() {
                 Ok(p) => p,
                 Err(e) => {
-                    return ToolExecutionOutput {
-                        result: ToolResult {
-                            content: format!(
-                                "path '{}' does not exist or cannot be resolved: {e}",
-                                resolved.display()
-                            ),
-                            is_error: true,
-                        },
+                    return ToolOutput {
+                        content: format!(
+                            "path '{}' does not exist or cannot be resolved: {e}",
+                            resolved.display()
+                        ),
+                        is_error: true,
                     };
                 }
             };
@@ -1219,11 +1206,9 @@ fn execute_tool_with_timeout(
                 );
             }
 
-            return ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!("Working directory changed to '{}'", canonical.display()),
-                    is_error: false,
-                },
+            return ToolOutput {
+                content: format!("Working directory changed to '{}'", canonical.display()),
+                is_error: false,
             };
         }
         _ => {}
@@ -1270,8 +1255,9 @@ fn execute_tool_with_timeout(
         cancelled: Arc::new(AtomicBool::new(false)),
     };
     std::thread::spawn(move || {
-        let result = tr.execute_streaming(
+        let result = tr.execute_streaming_json(
             &tc,
+            format,
             output_tx,
             xc.as_ref(),
             c.as_deref(),
@@ -1296,11 +1282,9 @@ fn execute_tool_with_timeout(
                 exec_start.elapsed().as_secs_f64(),
                 true,
             );
-            return ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!("tool '{}' cancelled", tool_call.name),
-                    is_error: true,
-                },
+            return ToolOutput {
+                content: format!("tool '{}' cancelled", tool_call.name),
+                is_error: true,
             };
         }
 
@@ -1311,15 +1295,13 @@ fn execute_tool_with_timeout(
                 exec_start.elapsed().as_secs_f64(),
                 true,
             );
-            return ToolExecutionOutput {
-                result: ToolResult {
-                    content: format!(
-                        "tool '{}' timed out after {}s",
-                        tool_call.name,
-                        timeout_dur.as_secs()
-                    ),
-                    is_error: true,
-                },
+            return ToolOutput {
+                content: format!(
+                    "tool '{}' timed out after {}s",
+                    tool_call.name,
+                    timeout_dur.as_secs()
+                ),
+                is_error: true,
             };
         }
 
@@ -1328,7 +1310,7 @@ fn execute_tool_with_timeout(
                 crate::metrics::record_tool_execution(
                     &tool_call.name,
                     exec_start.elapsed().as_secs_f64(),
-                    output.result.is_error,
+                    output.is_error,
                 );
                 return output;
             }
@@ -1339,11 +1321,9 @@ fn execute_tool_with_timeout(
                     exec_start.elapsed().as_secs_f64(),
                     true,
                 );
-                return ToolExecutionOutput {
-                    result: ToolResult {
-                        content: "tool execution thread panicked".to_string(),
-                        is_error: true,
-                    },
+                return ToolOutput {
+                    content: "tool execution thread panicked".to_string(),
+                    is_error: true,
                 };
             }
         }
@@ -1715,6 +1695,9 @@ mod tests {
         fn description(&self) -> &'static str {
             "test tool that completes immediately"
         }
+        fn return_string(ret: &Self::Return) -> String {
+            ret.clone()
+        }
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({})
         }
@@ -1745,6 +1728,9 @@ mod tests {
         }
         fn description(&self) -> &'static str {
             "test tool that blocks until proceed"
+        }
+        fn return_string(ret: &Self::Return) -> String {
+            ret.clone()
         }
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({})
@@ -1779,7 +1765,7 @@ mod tests {
         tool_args: &str,
         timeout_dur: Duration,
         cancel_rx: mpsc::Receiver<()>,
-    ) -> (ToolExecutionOutput, mpsc::Receiver<SessionCommand>) {
+    ) -> (ToolOutput, mpsc::Receiver<SessionCommand>) {
         let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
 
@@ -1831,16 +1817,8 @@ mod tests {
             Duration::from_secs(60),
             cancel_rx,
         );
-        assert!(
-            !result.result.is_error,
-            "expected success: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("fast result"),
-            "{}",
-            result.result.content
-        );
+        assert!(!result.is_error, "expected success: {}", result.content);
+        assert!(result.content.contains("fast result"), "{}", result.content);
     }
 
     #[test]
@@ -1856,16 +1834,8 @@ mod tests {
             Duration::from_secs(60),
             cancel_rx,
         );
-        assert!(
-            result.result.is_error,
-            "expected error: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("cancelled"),
-            "{}",
-            result.result.content
-        );
+        assert!(result.is_error, "expected error: {}", result.content);
+        assert!(result.content.contains("cancelled"), "{}", result.content);
     }
 
     #[test]
@@ -1883,16 +1853,8 @@ mod tests {
             cancel_rx,
         );
 
-        assert!(
-            result.result.is_error,
-            "expected error: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("timed out"),
-            "{}",
-            result.result.content
-        );
+        assert!(result.is_error, "expected error: {}", result.content);
+        assert!(result.content.contains("timed out"), "{}", result.content);
 
         drop(proceed_tx);
     }
@@ -1911,6 +1873,9 @@ mod tests {
         }
         fn description(&self) -> &'static str {
             "test tool that sends streaming output"
+        }
+        fn return_string(ret: &Self::Return) -> String {
+            ret.clone()
         }
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({})
@@ -1948,15 +1913,11 @@ mod tests {
             cancel_rx,
         );
 
+        assert!(!result.is_error, "expected success: {}", result.content);
         assert!(
-            !result.result.is_error,
-            "expected success: {}",
-            result.result.content
-        );
-        assert!(
-            result.result.content.contains("streaming done"),
+            result.content.contains("streaming done"),
             "{}",
-            result.result.content
+            result.content
         );
 
         match cmd_rx.recv() {
@@ -2061,14 +2022,14 @@ mod tests {
             Some(Duration::from_secs(60)),
         );
         assert!(
-            !handle.output.result.is_error,
+            !handle.output.is_error,
             "expected success: {}",
-            handle.output.result.content
+            handle.output.content
         );
         assert!(
-            handle.output.result.content.contains("fast result"),
+            handle.output.content.contains("fast result"),
             "{}",
-            handle.output.result.content
+            handle.output.content
         );
         assert!(handle.image.is_none(), "expected no image from fast tool");
     }
@@ -2077,14 +2038,14 @@ mod tests {
     fn spawn_single_tool_no_timeout_still_completes() {
         let handle = run_spawn_single_tool(FastTestTool, "_test_fast", "{}", None);
         assert!(
-            !handle.output.result.is_error,
+            !handle.output.is_error,
             "expected success: {}",
-            handle.output.result.content
+            handle.output.content
         );
         assert!(
-            handle.output.result.content.contains("fast result"),
+            handle.output.content.contains("fast result"),
             "{}",
-            handle.output.result.content
+            handle.output.content
         );
     }
 
