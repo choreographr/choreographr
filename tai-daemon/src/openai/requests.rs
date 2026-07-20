@@ -916,6 +916,8 @@ where
     // Collect raw tool call deltas across all chunks, then delegate to the
     // shared accumulator once the stream is fully consumed.
     let mut raw_tool_call_deltas: Vec<StreamToolCallDelta> = Vec::new();
+    let mut seen_tool_call_indices = [false; MAX_TOOL_CALLS];
+    let mut distinct_tool_call_count = 0usize;
 
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // Track usage from the final SSE chunk (OpenAI sends a usage chunk with
@@ -975,9 +977,9 @@ where
             if let Some(ref tcs) = delta.tool_calls {
                 has_any_output = true;
                 for tc in tcs.iter() {
-                    if raw_tool_call_deltas.len() >= MAX_TOOL_CALLS {
+                    if distinct_tool_call_count >= MAX_TOOL_CALLS {
                         return Err(super::OpenAiError::Io(io::Error::other(format!(
-                            "too many tool call deltas (max {MAX_TOOL_CALLS})"
+                            "too many tool calls (max {MAX_TOOL_CALLS})"
                         ))));
                     }
                     if (tc.index as usize) >= MAX_TOOL_CALLS {
@@ -987,14 +989,11 @@ where
                             MAX_TOOL_CALLS - 1,
                         ))));
                     }
+                    if !seen_tool_call_indices[tc.index as usize] {
+                        seen_tool_call_indices[tc.index as usize] = true;
+                        distinct_tool_call_count += 1;
+                    }
                     raw_tool_call_deltas.push(tc.clone());
-                    debug!(
-                        "tool call delta accumulated: index={}, id={:?}, function={:?}, total_deltas={}",
-                        tc.index,
-                        tc.id,
-                        tc.function.as_ref().map(|f| &f.name),
-                        raw_tool_call_deltas.len(),
-                    );
                 }
             }
         }
