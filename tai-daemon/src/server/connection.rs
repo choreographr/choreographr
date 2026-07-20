@@ -123,8 +123,13 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
         }
         ClientMessage::Cancel { request_id } => {
             debug!("client {}: Cancel id={}", ctx.client_id, request_id);
-            if let Some(tx) = ctx.attached_session_tx {
-                let _ = tx.send(SessionCommand::Cancel { request_id });
+            // Route through the daemon so it can also cancel child
+            // sub-sessions without requiring a round-trip message.
+            if let Some(session_id) = *ctx.attached_session_id {
+                let _ = ctx.daemon_tx.send(DaemonCommand::CancelRequest {
+                    session_id,
+                    request_id,
+                });
             }
         }
         ClientMessage::Undo => {

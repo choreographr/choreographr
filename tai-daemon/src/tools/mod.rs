@@ -2,8 +2,8 @@ pub(crate) use crate::openai::AllowedCaller;
 use crate::openai::ChatToolDefinition;
 use crate::providers::types::ChatToolCall;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1425,7 +1425,8 @@ mod tests {
         let schema = sanitize_params_schema(schema);
         assert_eq!(schema["type"], "object");
         assert_eq!(
-            schema["additionalProperties"], serde_json::Value::Bool(false),
+            schema["additionalProperties"],
+            serde_json::Value::Bool(false),
             "should forbid extra properties"
         );
     }

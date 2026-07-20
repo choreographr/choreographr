@@ -1,8 +1,13 @@
+use crate::daemon::DaemonCommand;
+use crate::sessions::SessionCommand;
+use crate::tools::context::ToolContext;
 use crate::tools::{Tool, ToolExecError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::mpsc;
 use tai_keystore::ServiceCredential;
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SpawnSubsessionArgs {
@@ -41,14 +46,137 @@ impl Tool for SpawnSubsession {
 
     fn execute(
         &self,
-        _args: Self::Args,
+        args: Self::Args,
         _x_credentials: Option<&ServiceCredential>,
-        _working_dir: Option<&Path>,
-        _ctx: Option<&crate::tools::context::ToolContext>,
+        working_dir: Option<&Path>,
+        ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
-        Err(ToolExecError(
-            "spawn_subsession is not yet implemented in the turn-based refactor".into(),
-        ))
+        let ctx = ctx.ok_or_else(|| {
+            warn!("spawn_subsession: no session context provided");
+            ToolExecError("no session context".into())
+        })?;
+
+        let prompt_len = args.prompt.len();
+        info!(
+            session_id = ctx.session_id,
+            prompt_len,
+            title = args.title.as_deref().unwrap_or("(none)"),
+            "spawn_subsession: creating child session"
+        );
+
+        // Determine child working_dir: prefer tool-level parameter, fall back to session context
+        let child_working_dir = working_dir
+            .or(ctx.working_dir.as_deref())
+            .map(|p| p.to_path_buf());
+
+        // Inherit or override tool groups
+        let categories = args
+            .categories
+            .unwrap_or_else(|| ctx.active_tool_groups.iter().cloned().collect());
+
+        // Create child session via the daemon command loop
+        let (reply_tx, reply_rx) = mpsc::channel();
+        ctx.daemon_tx
+            .send(DaemonCommand::CreateSession {
+                title: args.title,
+                parent_session_id: Some(ctx.session_id),
+                working_dir: child_working_dir.clone(),
+                max_turns: args.max_turns,
+                reasoning_effort: ctx.reasoning_effort,
+                selected_model: ctx.selected_model.clone(),
+                context_config: None,
+                account_name: None,
+                active_tool_groups: categories,
+                reply: reply_tx,
+            })
+            .map_err(|e| {
+                warn!(
+                    session_id = ctx.session_id,
+                    error = %e,
+                    "spawn_subsession: daemon channel send failed"
+                );
+                ToolExecError(format!("daemon communication failed: {e}"))
+            })?;
+
+        let (child_id, child_tx) = match reply_rx.recv() {
+            Ok(Ok(pair)) => {
+                info!(
+                    parent_id = ctx.session_id,
+                    child_id = pair.0,
+                    "spawn_subsession: child session created"
+                );
+                pair
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    session_id = ctx.session_id,
+                    error = %e,
+                    "spawn_subsession: daemon rejected session creation"
+                );
+                return Err(ToolExecError(format!("failed to create sub-session: {e}")));
+            }
+            Err(_) => {
+                error!(
+                    session_id = ctx.session_id,
+                    "spawn_subsession: daemon disconnected before CreateSession reply"
+                );
+                return Err(ToolExecError("daemon disconnected".into()));
+            }
+        };
+
+        // Run the child session with the prompt and wait for its result.
+        // Cancellation propagation is handled at the daemon level via
+        // parent-child session tracking — no polling needed here.
+        let (result_tx, result_rx) = mpsc::channel();
+        if child_tx
+            .send(SessionCommand::RunChildInput {
+                request_id: 1,
+                user_text: Some(args.prompt),
+                reply: result_tx,
+            })
+            .is_err()
+        {
+            warn!(
+                child_id,
+                parent_id = ctx.session_id,
+                "spawn_subsession: child session channel closed before RunChildInput"
+            );
+            return Err(ToolExecError(format!(
+                "sub-session {child_id} exited unexpectedly"
+            )));
+        }
+
+        match result_rx.recv() {
+            Ok(Ok(child_result)) => {
+                debug!(
+                    child_id,
+                    output_len = child_result.output.len(),
+                    "spawn_subsession: child completed successfully"
+                );
+                Ok(format!(
+                    "sub-session {child_id} result:\n{}",
+                    child_result.output
+                ))
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    child_id,
+                    error = %e,
+                    "spawn_subsession: child returned error"
+                );
+                Err(ToolExecError(format!("child session error: {e}")))
+            }
+            Err(_) => {
+                error!(
+                    child_id,
+                    parent_id = ctx.session_id,
+                    "spawn_subsession: child exited without sending result"
+                );
+                Err(ToolExecError(format!(
+                    "sub-session {child_id} exited unexpectedly"
+                )))
+            }
+        }
     }
 }
 

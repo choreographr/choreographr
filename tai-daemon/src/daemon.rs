@@ -3,7 +3,7 @@ use crate::db::{self, SessionRecord};
 use crate::mcp::McpManager;
 use crate::providers::{InferenceProvider, lookup_context_window};
 use crate::sessions::{
-    ActiveSessionEntry, RequestContext, SessionCommand, SessionMetadata, session_main,
+    ActiveSessionEntry, CANCEL_ALL, RequestContext, SessionCommand, SessionMetadata, session_main,
 };
 use std::collections::HashMap;
 use std::io;
@@ -30,6 +30,9 @@ pub struct DaemonState {
     pub max_turns: u32,
     pub active_sessions: HashMap<u64, ActiveSessionEntry>,
     pub session_metadata: HashMap<u64, SessionMetadata>,
+    /// Tracks parent→children session relationships so that cancelling or
+    /// deleting a parent session also stops its child sub-sessions.
+    pub children: HashMap<u64, Vec<u64>>,
     pub accounts: AccountManager,
     pub providers: HashMap<String, InferenceProvider>,
     pub credentials: HashMap<String, ServiceCredential>,
@@ -142,6 +145,13 @@ pub enum DaemonCommand {
         model: String,
         reply: mpsc::Sender<Result<(), String>>,
     },
+    /// Cancel the active request in a session and propagate cancellation
+    /// to any child sub-sessions.  The daemon handles child propagation
+    /// directly so that leaf sessions never generate unnecessary messages.
+    CancelRequest {
+        session_id: u64,
+        request_id: u32,
+    },
 }
 
 impl DaemonState {
@@ -242,6 +252,10 @@ impl DaemonState {
                 model,
                 reply,
             } => self.handle_validate_model(session_id, model, reply),
+            DaemonCommand::CancelRequest {
+                session_id,
+                request_id,
+            } => self.handle_cancel_request(session_id, request_id),
             DaemonCommand::Shutdown => {
                 warn!("unexpected Shutdown command in handle_command; handled at loop level");
             }
@@ -409,6 +423,13 @@ impl DaemonState {
             last_prompt_tokens: None,
         };
         let session_tx = self.spawn_session(sid, record, metadata);
+
+        // Track parent→child relationship so cancellation/deletion
+        // of the parent propagates to sub-sessions.
+        if let Some(parent_id) = parent_session_id {
+            self.children.entry(parent_id).or_default().push(sid);
+        }
+
         let _ = reply.send(Ok((sid, session_tx)));
         crate::metrics::record_session_created();
         let created_msg = DaemonMessage::SessionCreated {
@@ -529,10 +550,23 @@ impl DaemonState {
     }
 
     /// Mark a session as exited (sleeping) and broadcast the status change.
+    /// If the session has any children, cancel and shut them down so they
+    /// don't continue running as orphans.
     fn handle_session_exited(&mut self, session_id: u64) {
         info!("SessionExited: id={}", session_id);
         crate::metrics::record_session_exited();
+
+        // Remove the session entry so it is no longer treated as active.
         self.active_sessions.remove(&session_id);
+
+        // Cancel and shut down children so they don't run as orphans.
+        if let Some(children) = self.children.remove(&session_id) {
+            for child_id in children {
+                self.remove_child_from_all_parents(child_id);
+                self.cancel_and_shutdown_child(child_id);
+            }
+        }
+
         if let Some(meta) = self.session_metadata.get_mut(&session_id) {
             meta.status = SessionStatus::Sleeping;
         }
@@ -692,6 +726,16 @@ impl DaemonState {
         }
     }
 
+    /// Remove `child_id` from any parent's children list (safety net).
+    /// This handles the case where a child appears in multiple tracking
+    /// entries (shouldn't happen, but we guard against it).
+    fn remove_child_from_all_parents(&mut self, child_id: u64) {
+        self.children.retain(|_, v| {
+            v.retain(|c| *c != child_id);
+            !v.is_empty()
+        });
+    }
+
     /// Get the API key for a stored credential (returns None if not found).
     fn handle_get_credential(
         &mut self,
@@ -725,7 +769,78 @@ impl DaemonState {
         self.broadcast(msg);
     }
 
+    /// Handle a cancel request from a client.  Sends `SessionCommand::Cancel`
+    /// to the target session and then propagates cancellation to any child
+    /// sub-sessions directly — avoiding a round-trip message from the session
+    /// thread back to the daemon.
+    fn handle_cancel_request(&mut self, session_id: u64, request_id: u32) {
+        debug!("CancelRequest: session={session_id} request={request_id}");
+
+        // Forward the cancel to the session thread.
+        if let Some(entry) = self.active_sessions.get(&session_id) {
+            let _ = entry.cmd_tx.send(SessionCommand::Cancel { request_id });
+        }
+
+        // Propagate to children — this runs here in the daemon so that
+        // leaf sessions never generate an unnecessary message.
+        self.cancel_children_of(session_id);
+    }
+
+    /// Send `Cancel` to every active child session of `parent_id`.
+    /// If the parent no longer exists (e.g. cascade-deleted while a
+    /// child's cancel fired), this is a no-op.
+    fn cancel_children_of(&mut self, parent_id: u64) {
+        // Guard: if the parent has already been torn down (e.g. during
+        // cascade delete), don't try to cancel its children.
+        if !self.active_sessions.contains_key(&parent_id)
+            && !self.session_metadata.contains_key(&parent_id)
+        {
+            return;
+        }
+        let Some(children) = self.children.get(&parent_id).cloned() else {
+            return;
+        };
+        for child_id in &children {
+            if let Some(entry) = self.active_sessions.get(child_id) {
+                debug!(
+                    "propagating cancel from session {} to child {}",
+                    parent_id, child_id
+                );
+                if entry
+                    .cmd_tx
+                    .send(SessionCommand::Cancel {
+                        request_id: CANCEL_ALL,
+                    })
+                    .is_err()
+                {
+                    warn!("cancel_children_of: failed to send Cancel to child {child_id}");
+                }
+            }
+        }
+    }
+
+    /// Cancel the active request in a child session and send Shutdown so it
+    /// persists its state and exits. Used when the parent session exits.
+    fn cancel_and_shutdown_child(&mut self, child_id: u64) {
+        let Some(entry) = self.active_sessions.get(&child_id) else {
+            return;
+        };
+        if entry
+            .cmd_tx
+            .send(SessionCommand::Cancel {
+                request_id: CANCEL_ALL,
+            })
+            .is_err()
+        {
+            warn!("cancel_and_shutdown_child: failed to send Cancel to child {child_id}");
+        }
+        if entry.cmd_tx.send(SessionCommand::Shutdown).is_err() {
+            warn!("cancel_and_shutdown_child: failed to send Shutdown to child {child_id}");
+        }
+    }
+
     /// Delete a session, shutting down its thread and removing it from the DB.
+    /// If the session has children, they are cascade-deleted first.
     fn handle_delete_session(
         &mut self,
         session_id: u64,
@@ -736,28 +851,62 @@ impl DaemonState {
             let _ = reply.send(Err(e));
             return;
         }
+
+        // Cascade-delete children before the parent.
+        if let Some(children) = self.children.remove(&session_id) {
+            for child_id in children {
+                self.remove_child_from_all_parents(child_id);
+                if let Err(e) = self.delete_session_inner(child_id) {
+                    warn!("failed to cascade-delete child {child_id}: {e}");
+                }
+            }
+        }
+
+        // Remove from any parent's children list
+        self.remove_child_from_all_parents(session_id);
+
+        match self.delete_session_inner(session_id) {
+            Ok(()) => {
+                let _ = reply.send(Ok(()));
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+            }
+        }
+    }
+
+    /// Shared session-teardown logic used by both `handle_delete_session`
+    /// (with permission checks) and cascade-deletion of children.
+    /// Returns an error if the database delete fails; callers decide whether
+    /// to stop or continue (cascade-delete continues on error).
+    fn delete_session_inner(&mut self, session_id: u64) -> io::Result<()> {
+        info!("DeleteSession (inner): id={}", session_id);
         // Gracefully shut down the session thread so it can persist its
         // final state before we delete from the DB — otherwise the
         // session's persist_and_exit would re-write the session
         // back to the DB after we delete it.
         if let Some(entry) = self.active_sessions.remove(&session_id) {
-            let _ = entry.cmd_tx.send(SessionCommand::Shutdown);
+            if entry
+                .cmd_tx
+                .send(SessionCommand::Cancel {
+                    request_id: CANCEL_ALL,
+                })
+                .is_err()
+            {
+                warn!("delete_session_inner: failed to send Cancel to session {session_id}");
+            }
+            if entry.cmd_tx.send(SessionCommand::Shutdown).is_err() {
+                warn!("delete_session_inner: failed to send Shutdown to session {session_id}");
+            }
             let _ = entry.handle.join();
         }
         // Remove from in-memory metadata
         self.session_metadata.remove(&session_id);
         // Remove from database
-        if let Err(e) = db::delete_session(&self.db, session_id) {
-            error!(
-                "DeleteSession: failed to delete session {} from db: {e}",
-                session_id
-            );
-            let _ = reply.send(Err(e));
-            return;
-        }
+        db::delete_session(&self.db, session_id)?;
         // Broadcast deletion to subscribers
         self.broadcast(DaemonMessage::SessionDeleted { session_id });
-        let _ = reply.send(Ok(()));
+        Ok(())
     }
 
     /// Add a new inference account.
@@ -1063,6 +1212,7 @@ mod tests {
             max_turns: 10,
             active_sessions: HashMap::new(),
             session_metadata: HashMap::new(),
+            children: HashMap::new(),
             accounts: AccountManager::load(&accounts_path).unwrap(),
             providers: HashMap::new(),
             credentials: HashMap::new(),

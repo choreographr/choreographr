@@ -1002,9 +1002,23 @@ It runs in the concurrent dispatch path alongside other tools. When invoked:
 4. The child's assistant text output is collected and returned to the parent as the tool result.
 5. The child session persists in the database and is listable/attachable like any other session.
 
-The child session runs to completion regardless of parent cancellation — it uses `ToolContext`
-(`active_tool_groups`, `reasoning_effort`, `working_dir`, `daemon_tx`) to inherit parent config and
-communicate with the daemon command loop.
+The daemon maintains a `children: HashMap<u64, Vec<u64>>` on `DaemonState` tracking the
+parent→child relationship. This is used for **cancellation propagation** and **cascade
+deletion**:
+
+- **Cancellation:** When a client sends `Cancel`, the daemon routes it through
+  `DaemonCommand::CancelRequest` rather than sending `SessionCommand::Cancel` directly to the
+  session thread. After forwarding the cancel to the target session, the daemon also calls
+  `cancel_children_of()` to propagate the cancel to all active child sessions, so they stop
+  their work without polling.
+- **Session exit:** When a parent session exits (sleeps), `handle_session_exited` calls
+  `cancel_and_shutdown_child()` on each child to shut them down gracefully.
+- **Session deletion:** `handle_delete_session` cascade-deletes children before the parent by
+  calling `delete_session_inner()` on each child, logging but continuing if a child's DB
+  delete fails.
+
+The child session uses `ToolContext` (`active_tool_groups`, `reasoning_effort`, `working_dir`,
+`daemon_tx`) to inherit parent config and communicate with the daemon command loop.
 
 
 ---

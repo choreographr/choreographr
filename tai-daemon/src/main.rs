@@ -140,6 +140,7 @@ fn main() -> anyhow::Result<()> {
         max_turns,
         active_sessions: std::collections::HashMap::new(),
         session_metadata,
+        children: std::collections::HashMap::new(),
         accounts,
         providers: HashMap::new(),
         credentials: std::collections::HashMap::new(),

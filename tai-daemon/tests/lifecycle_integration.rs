@@ -25,6 +25,7 @@ fn test_daemon_state() -> DaemonState {
         max_turns: 10,
         active_sessions: HashMap::new(),
         session_metadata: HashMap::new(),
+        children: HashMap::new(),
         accounts: AccountManager::load(&accounts_path).unwrap(),
         providers: HashMap::new(),
         credentials: HashMap::new(),

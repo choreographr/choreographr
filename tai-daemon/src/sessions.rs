@@ -17,6 +17,10 @@ use tai_proto::{
 };
 use tracing::{debug, error, info, warn};
 
+/// Sentinel `request_id` meaning "cancel whatever is currently active, regardless of its ID".
+/// Used in child-session cancellation where we don't know the child's active request ID.
+pub(crate) const CANCEL_ALL: u32 = 0;
+
 pub enum SessionCommand {
     RunInput {
         request_id: u32,
@@ -24,6 +28,7 @@ pub enum SessionCommand {
     },
     RunChildInput {
         request_id: u32,
+        user_text: Option<String>,
         reply: std::sync::mpsc::Sender<io::Result<ChildResult>>,
     },
     Cancel {
@@ -624,9 +629,11 @@ fn process_command(
         SessionCommand::RunInput { request_id, input } => {
             handle_run_input(request_id, input, state, shutdown_requested, ctx)
         }
-        SessionCommand::RunChildInput { request_id, reply } => {
-            handle_run_child_input(request_id, reply, state, shutdown_requested, ctx)
-        }
+        SessionCommand::RunChildInput {
+            request_id,
+            user_text,
+            reply,
+        } => handle_run_child_input(request_id, user_text, reply, state, shutdown_requested, ctx),
         SessionCommand::Cancel { request_id } => handle_cancel(request_id, state, ctx),
         SessionCommand::SetModel { model } => handle_set_model(model, state, ctx),
         SessionCommand::StatusChanged(new_status) => handle_status_changed(new_status, state, ctx),
@@ -777,6 +784,7 @@ fn handle_run_input(
 /// queued. The response is delivered through the `reply` channel.
 fn handle_run_child_input(
     request_id: u32,
+    user_text: Option<String>,
     reply: std::sync::mpsc::Sender<io::Result<ChildResult>>,
     state: &mut SessionState,
     shutdown_requested: &mut bool,
@@ -821,7 +829,7 @@ fn handle_run_child_input(
             cancel_rx,
             ctx,
             Some(reply),
-            None,
+            user_text,
         );
         let _ = result;
     });
@@ -829,14 +837,29 @@ fn handle_run_child_input(
 }
 
 /// Cancel an active request by sending on its cancel channel.
-fn handle_cancel(request_id: u32, state: &mut SessionState, ctx: &RequestContext) -> bool {
-    let _ = ctx;
-    if let Some(active) = state.active_requests.get(&request_id) {
-        let _ = active.cancel_tx.send(());
-        broadcast(
-            &mut state.subscribers,
-            DaemonMessage::Cancelled { request_id },
-        );
+/// Child-session propagation is handled by the daemon when it processes
+/// `DaemonCommand::CancelRequest`, so this function does not send any
+/// additional messages back to the daemon.
+/// Cancel one or all active requests.
+///
+/// When `request_id` is `0` (the `CANCEL_ALL` sentinel), every active
+/// request is cancelled — this is used by child-session cancellation
+/// where the parent doesn't know the child's specific request ID.
+/// Otherwise only the matching request is cancelled.
+fn handle_cancel(request_id: u32, state: &mut SessionState, _ctx: &RequestContext) -> bool {
+    let targets: Vec<u32> = if request_id == 0 {
+        state.active_requests.keys().copied().collect()
+    } else {
+        vec![request_id]
+    };
+    for rid in targets {
+        if let Some(active) = state.active_requests.get(&rid) {
+            let _ = active.cancel_tx.send(());
+            broadcast(
+                &mut state.subscribers,
+                DaemonMessage::Cancelled { request_id: rid },
+            );
+        }
     }
     false
 }
