@@ -1,4 +1,4 @@
-use super::{Tool, ToolError, context::ToolContext, truncate_tool_output};
+use super::{Tool, ToolExecError, context::ToolContext, truncate_tool_output};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
 use schemars::JsonSchema;
@@ -46,25 +46,25 @@ fn run_grep_walk(
     include: Option<&str>,
     max_results: u32,
     output_tx: Option<mpsc::Sender<Vec<u8>>>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     // Build the pattern matcher: literal text or regex depending on flags.
     let matcher: RegexMatcher = if regex {
         RegexMatcher::new(pattern)
-            .map_err(|e| ToolError::Other(format!("invalid regex pattern: {e}")))?
+            .map_err(|e| ToolExecError(format!("invalid regex pattern: {e}")))?
     } else {
         // `fixed_string(true)` escapes all regex metacharacters so the
         // pattern is matched as a literal substring.
         RegexMatcherBuilder::new()
             .fixed_strings(true)
             .build(pattern)
-            .map_err(|e| ToolError::Other(format!("invalid pattern: {e}")))?
+            .map_err(|e| ToolExecError(format!("invalid pattern: {e}")))?
     };
 
     // Optionally compile an include glob pattern for file filtering.
     let include_pattern: Option<ZlobPattern> = if let Some(include) = include {
         Some(
             ZlobPattern::compile(include, ZlobFlags::empty())
-                .map_err(|e| ToolError::Other(format!("invalid include glob: {e}")))?,
+                .map_err(|e| ToolExecError(format!("invalid include glob: {e}")))?,
         )
     } else {
         None
@@ -91,7 +91,7 @@ fn run_grep_walk(
     // Walk the directory tree with gitignore-aware traversal.
     // WalkFlags::RECOMMENDED skips hidden files and respects .gitignore rules.
     WalkBuilder::new(resolved)
-        .map_err(|e| ToolError::Other(format!("failed to create walker: {e}")))?
+        .map_err(|e| ToolExecError(format!("failed to create walker: {e}")))?
         .options(WalkFlags::RECOMMENDED)
         .run_serial(|entry| {
             // Skip non-file entries (directories, symlinks, etc.).
@@ -134,7 +134,7 @@ fn run_grep_walk(
             // denied, broken symlinks, etc.) — only truly fatal errors surface
             // here (e.g. root-dir missing, OOM).
             tracing::warn!(error = %e, "grep walk aborted due to fatal error");
-            ToolError::Other(format!("walk error: {e}"))
+            ToolExecError(format!("walk error: {e}"))
         })?;
 
     if sink.results.is_empty() {
@@ -153,7 +153,10 @@ fn run_grep_walk(
     Ok(truncate_tool_output(&lines.join("\n")))
 }
 
-pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
+pub fn execute_grep_tool(
+    args: &GrepArgs,
+    working_dir: Option<&Path>,
+) -> Result<String, ToolExecError> {
     let path = args.path.as_deref().unwrap_or(".");
     let resolved = super::confine_path(path, working_dir)?;
     run_grep_walk(
@@ -169,6 +172,7 @@ pub fn execute_grep_tool(args: &GrepArgs, working_dir: Option<&Path>) -> Result<
 impl Tool for Grep {
     type Args = GrepArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "grep"
@@ -188,7 +192,7 @@ impl Tool for Grep {
         _x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_grep_tool(&args, working_dir)
     }
 
@@ -199,7 +203,7 @@ impl Tool for Grep {
         working_dir: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         let path = args.path.as_deref().unwrap_or(".");
         let resolved = super::confine_path(path, working_dir)?;
         run_grep_walk(

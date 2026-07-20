@@ -1,4 +1,4 @@
-use super::{Tool, ToolError, context::ToolContext, truncate_tool_output};
+use super::{Tool, ToolExecError, context::ToolContext, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -42,13 +42,13 @@ fn run_find_walk(
     glob: bool,
     max_results: u32,
     output_tx: Option<&mpsc::Sender<Vec<u8>>>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     // Build an optional glob matcher when the caller wants glob mode.
     // For substring mode we don't need a matcher — we do simple contains().
     let glob_matcher: Option<ZlobPattern> = if glob {
         Some(
             ZlobPattern::compile(pattern, ZlobFlags::RECOMMENDED)
-                .map_err(|e| ToolError::Other(format!("invalid glob pattern: {e}")))?,
+                .map_err(|e| ToolExecError(format!("invalid glob pattern: {e}")))?,
         )
     } else {
         None
@@ -66,7 +66,7 @@ fn run_find_walk(
     // Walk the directory tree with gitignore-aware traversal.
     // WalkFlags::RECOMMENDED skips hidden files and respects .gitignore rules.
     WalkBuilder::new(resolved)
-        .map_err(|e| ToolError::Other(format!("failed to create walker: {e}")))?
+        .map_err(|e| ToolExecError(format!("failed to create walker: {e}")))?
         .options(WalkFlags::RECOMMENDED)
         .run_serial(|entry| {
             // Get the file or directory name for matching against the pattern.
@@ -120,7 +120,7 @@ fn run_find_walk(
             // denied, broken symlinks, etc.) — only truly fatal errors surface
             // here (e.g. root-dir missing, OOM).
             tracing::warn!(error = %e, "find walk aborted due to fatal error");
-            ToolError::Other(format!("walk error: {e}"))
+            ToolExecError(format!("walk error: {e}"))
         })?;
 
     if results.is_empty() {
@@ -130,7 +130,10 @@ fn run_find_walk(
     Ok(truncate_tool_output(&results.join("\n")))
 }
 
-pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
+pub fn execute_find_tool(
+    args: &FindArgs,
+    working_dir: Option<&Path>,
+) -> Result<String, ToolExecError> {
     let path = args.path.as_deref().unwrap_or(".");
     let resolved = super::confine_path(path, working_dir)?;
     run_find_walk(
@@ -145,6 +148,7 @@ pub fn execute_find_tool(args: &FindArgs, working_dir: Option<&Path>) -> Result<
 impl Tool for Find {
     type Args = FindArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "find"
@@ -164,7 +168,7 @@ impl Tool for Find {
         _x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_find_tool(&args, working_dir)
     }
 
@@ -175,7 +179,7 @@ impl Tool for Find {
         working_dir: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         let path = args.path.as_deref().unwrap_or(".");
         let resolved = super::confine_path(path, working_dir)?;
         run_find_walk(

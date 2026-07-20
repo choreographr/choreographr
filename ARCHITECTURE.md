@@ -714,6 +714,11 @@ meta-schema features, and `additionalProperties: false` is injected for paramete
 pub trait Tool: Send + Sync {
     type Args: DeserializeOwned + JsonSchema + 'static;
     type Return: Serialize + JsonSchema + 'static;
+    /// Error type — each tool defines its own. Simple tools use `ToolExecError`
+    /// (a string-wrapper). Tools whose errors are consumed by VM guests (e.g.
+    /// `DbError`, `HttpError`) define a `thiserror` enum that is serde-serializable,
+    /// enabling the guest to pattern-match on specific variants.
+    type Error: std::error::Error + Send + Sync + Serialize + DeserializeOwned + 'static;
 
     fn name(&self) -> &'static str;
     fn group(&self) -> &'static str { "core" }
@@ -751,7 +756,7 @@ pub trait Tool: Send + Sync {
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, ToolError>;
+    ) -> Result<Self::Return, Self::Error>;
 
     fn execute_streaming(
         &self,
@@ -760,10 +765,13 @@ pub trait Tool: Send + Sync {
         working_dir: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         let ret = self.execute(args, x_credentials, working_dir, ctx)?;
-        let bytes = postcard::to_allocvec(&ret).map_err(ToolError::Postcard)?;
-        let _ = output_tx.send(bytes);
+        // Best-effort: send postcard-encoded result for streaming display,
+        // silently discard if encoding fails.
+        if let Ok(bytes) = postcard::to_allocvec(&ret) {
+            let _ = output_tx.send(bytes);
+        }
         Ok(ret)
     }
 
@@ -815,25 +823,25 @@ pub trait ToolDyn: Send + Sync {
     fn output_schema(&self) -> Option<serde_json::Value>;
     fn allowed_callers(&self) -> Vec<AllowedCaller>;
 
-    /// JSON path — takes JSON args, returns ToolOutput in requested format.
-    fn execute_json(&self, args_json: &str, format: ToolOutputFormat, ...) -> ToolOutput;
+    /// JSON path — takes JSON args, returns Result so callers can distinguish
+    /// infrastructure errors (deserialisation failures) from tool errors.
+    fn execute_json(&self, args_json: &str, format: ToolOutputFormat, ...) -> Result<ToolOutput, ToolError>;
     /// Streaming JSON path.
-    fn execute_streaming_json(&self, args_json: &str, format: ToolOutputFormat, ...) -> ToolOutput;
-    /// Postcard binary path (VM ecall).
+    fn execute_streaming_json(&self, args_json: &str, format: ToolOutputFormat, ...) -> Result<ToolOutput, ToolError>;
+    /// Postcard binary path (VM ecall). Returns bytes encoding
+    /// `Result<Result<T::Return, T::Error>, ToolError>` — all outcomes
+    /// (infra error, tool error, tool success) are contained in the buffer.
     fn execute_postcard(&self, args_bytes: &[u8], ...) -> Vec<u8>;
-    /// Streaming postcard binary path.
-    fn execute_streaming_postcard(&self, args_bytes: &[u8], ...) -> Vec<u8>;
 }
 ```
 
 A blanket impl `impl<T: Tool> ToolDyn for T` provides all four dispatch paths:
 
 | Path | Input | Output | Used by |
-|---|---|---|---|
-| `execute_json` | `&str` (JSON) + `ToolOutputFormat` | `ToolOutput` | LLM tool calls (OpenAI/Anthropic etc.) |
-| `execute_postcard` | `&[u8]` (postcard) | `Vec<u8>` (postcard) | RISC-V VM tool calls |
-| `execute_streaming_json` | `&str` (JSON) + `ToolOutputFormat` | `ToolOutput` | Streaming shell/VM tools via LLM |
-| `execute_streaming_postcard` | `&[u8]` (postcard) | `Vec<u8>` (postcard) | Streaming VM tool calls |
+|---|---|---|---|---|
+| `execute_json` | `&str` (JSON) + `ToolOutputFormat` | `Result<ToolOutput, ToolError>` | LLM tool calls (OpenAI/Anthropic etc.) |
+| `execute_streaming_json` | `&str` (JSON) + `ToolOutputFormat` | `Result<ToolOutput, ToolError>` | Streaming shell/VM tools via LLM |
+| `execute_postcard` | `&[u8]` (postcard) | `Vec<u8>` (postcard of `Result<Result<R, E>, ToolError>`) | RISC-V VM tool calls |
 
 The JSON path deserializes arguments with `serde_json`, calls `Tool::execute()`, then
 returns a `ToolOutput`. When `format` is `Text`, the content is produced via
@@ -888,9 +896,14 @@ working directory. Filesystem and Git tools resolve relative paths against this 
 Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protocol:
 
 - **Arguments:** Encoded as `postcard::to_allocvec(&args)` where `args: Self::Args`
-- **Return value:** Encoded as `postcard::to_allocvec(&Result::<Self::Return, String>::Ok(ret))`
-  — a postcard `Result` where `Ok(bytes)` carries the serialized return value and
-  `Err(String)` carries the error message
+- **Return value:** Encoded as `postcard::to_allocvec(&Result::<Result<R, E>, ToolError>::Ok(Ok(ret)))`
+  — a nested postcard `Result` where:
+  - `Ok(Ok(ret))` — tool succeeded, `ret: R` (serialized return value)
+  - `Ok(Err(e))` — tool failed, `e: E` (structured, per-tool error type)
+  - `Err(e)` — infrastructure failure, `e: ToolError`
+  The outer layer captures infrastructure failures (arg deserialisation); the inner
+  layer captures tool-defined errors.  This allows VM guests to pattern-match on
+  specific error variants (e.g. `DbError::NotFound`, `HttpError::InvalidUrl`).
 - **Tool call frame (VM → host):** `[tool_name: postcard String][args: postcard-encoded Args]`
 
 ### Available tools (up to 35 total, some dependent on installed binaries)
@@ -1656,11 +1669,25 @@ warning logs when a subscriber is disconnected.
 
 ### Tool errors
 
-The `ToolError` enum (thiserror) covers common tool failure modes: invalid arguments, I/O
-errors, network failures, postcard encoding errors, etc. Tools return `Result<Self::Return, ToolError>`
-from their `execute()` method. The `ToolDyn::execute_json()` conversion layer transforms errors
-into `ToolOutput { is_error: true }` for the LLM path, and the binary path encodes
-them as `Result::<Return, String>::Err(e.to_string())` via postcard.
+Each tool defines its own error type via the `type Error` associated type on the `Tool` trait.
+Simple tools use `ToolExecError` (a string-wrapper newtype). Tools whose errors are consumed by
+VM guests (e.g. `DbError`, `HttpError`) define a `thiserror` enum that is `Serialize` +
+`Deserialize`, enabling the guest to pattern-match on specific variants.
+
+The `ToolError` enum (thiserror) covers *infrastructure* failures that happen around tool execution:
+argument deserialisation, I/O, postcard encoding. It is never returned by a tool's `execute()`
+directly — only by the `ToolDyn` conversion layer.
+
+The `ToolDyn::execute_json()` and `execute_streaming_json()` methods return
+`Result<ToolOutput, ToolError>` so callers can distinguish infrastructure errors
+(JSON deserialisation) from tool execution errors. The caller converts `Err(e)` into a
+`ToolOutput { is_error: true }` for the LLM path, preserving the structured error
+for programmatic consumers.
+
+The postcard binary path encodes all outcomes as a nested
+`Result<Result<R, E>, ToolError>`: `Ok(Ok(ret))` for success, `Ok(Err(e))` for a
+structured tool error, and `Err(e)` for an infrastructure failure. The `encode_outer()`
+helper in `tai-daemon/src/tools/mod.rs` handles this serialization.
 
 `ToolOutput` replaces the old `ToolExecutionOutput` and `ToolResult` types. The `ToolOutputFormat`
 enum lets callers choose between `Text` (human-readable via `return_string`) and `Json`

@@ -1,4 +1,4 @@
-use super::ToolError;
+use super::ToolExecError;
 use notify_rust::Notification;
 use notify_rust::Urgency;
 use schemars::JsonSchema;
@@ -112,11 +112,11 @@ impl JsonSchema for Timeout {
 pub fn execute_notify_send(
     args: &NotifySendArgs,
     _working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     // Reject empty/whitespace-only summaries early — a notification with no
     // title is never useful and typically indicates a caller bug.
     if args.summary.trim().is_empty() {
-        return Err(ToolError::Other(SUMMARY_REQUIRED.into()));
+        return Err(ToolExecError(SUMMARY_REQUIRED.into()));
     }
 
     // Build the notification with a fixed app name so the desktop environment
@@ -144,7 +144,7 @@ pub fn execute_notify_send(
     // want to reference or replace the notification later).
     let handle = notification.show().map_err(|e| {
         tracing::error!(error = %e, summary = %args.summary, "desktop notification failed");
-        ToolError::Other(format!("notification failed: {e}"))
+        ToolExecError(format!("notification failed: {e}"))
     })?;
 
     tracing::info!(id = handle.id(), summary = %args.summary, "desktop notification sent");

@@ -1,4 +1,4 @@
-use crate::tools::{Tool, ToolError};
+use crate::tools::{Tool, ToolExecError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -21,6 +21,7 @@ pub struct SpawnSubsession;
 impl Tool for SpawnSubsession {
     type Args = SpawnSubsessionArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "spawn_subsession"
@@ -44,8 +45,8 @@ impl Tool for SpawnSubsession {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&Path>,
         _ctx: Option<&crate::tools::context::ToolContext>,
-    ) -> Result<String, ToolError> {
-        Err(ToolError::Other(
+    ) -> Result<Self::Return, Self::Error> {
+        Err(ToolExecError(
             "spawn_subsession is not yet implemented in the turn-based refactor".into(),
         ))
     }

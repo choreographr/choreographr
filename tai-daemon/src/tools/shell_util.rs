@@ -1,4 +1,4 @@
-use super::{ToolError, truncate_tool_output};
+use super::{ToolExecError, truncate_tool_output};
 use std::{
     io::{BufRead, BufReader, Read},
     os::unix::process::CommandExt,
@@ -20,7 +20,7 @@ pub(crate) fn binary_exists(name: &str) -> bool {
 pub(crate) fn resolve_and_confine(
     workdir: Option<&str>,
     working_dir: Option<&Path>,
-) -> Result<PathBuf, ToolError> {
+) -> Result<PathBuf, ToolExecError> {
     super::confine_path(workdir.unwrap_or("."), working_dir)
 }
 
@@ -73,7 +73,7 @@ pub(crate) fn setup_child(cmd: &mut Command) {
 pub(crate) fn spawn_with_watchdog(
     cmd: &mut Command,
     timeout_ms: u64,
-) -> Result<(Output, bool), ToolError> {
+) -> Result<(Output, bool), ToolExecError> {
     let child = cmd.spawn()?;
     let pid = child.id();
 
@@ -123,7 +123,7 @@ pub fn spawn_with_streaming(
     cmd: &mut Command,
     timeout_ms: u64,
     output_tx: mpsc::Sender<Vec<u8>>,
-) -> Result<(Output, bool), ToolError> {
+) -> Result<(Output, bool), ToolExecError> {
     let mut child = cmd.spawn()?;
     let pid = child.id();
 
@@ -222,7 +222,7 @@ pub fn run_shell_streaming(
     display_cmd: &str,
     timeout_ms: u64,
     output_tx: mpsc::Sender<Vec<u8>>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     setup_child(cmd);
     let (output, was_killed) = spawn_with_streaming(cmd, timeout_ms, output_tx)?;
     Ok(format_shell_output(

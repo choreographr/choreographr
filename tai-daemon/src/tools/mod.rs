@@ -2,7 +2,7 @@ pub(crate) use crate::openai::AllowedCaller;
 use crate::openai::ChatToolDefinition;
 use crate::providers::types::ChatToolCall;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -11,10 +11,17 @@ use std::sync::OnceLock;
 use std::sync::mpsc;
 use tai_keystore::ServiceCredential;
 
-/// Helper: encode Result<R, impl ToString> as postcard-encoded Result<R, String>.
-fn encode_result<R: Serialize>(result: Result<R, impl ToString>) -> Vec<u8> {
-    let wrapped: Result<R, String> = result.map_err(|e| e.to_string());
-    postcard::to_allocvec(&wrapped).unwrap_or_else(|e| {
+/// Helper: encode Result<Result<R, E>, ToolError> as postcard bytes.
+/// Used by `execute_postcard` to produce a single byte buffer containing
+/// all possible outcomes for the VM guest:
+///
+///   Ok(Ok(ret))  → tool succeeded, `ret: R`
+///   Ok(Err(e))   → tool failed, `e: E` (structured)
+///   Err(e)       → infrastructure failure, `e: ToolError`
+pub(crate) fn encode_outer<R: Serialize, E: Serialize>(
+    result: Result<Result<R, E>, ToolError>,
+) -> Vec<u8> {
+    postcard::to_allocvec(&result).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "failed to postcard-encode tool result");
         Vec::new()
     })
@@ -31,6 +38,7 @@ macro_rules! define_tool {
         impl $crate::tools::Tool for $struct {
             type Args = $args_ty;
             type Return = String;
+            type Error = $crate::tools::ToolExecError;
             fn name(&self) -> &'static str {
                 $name
             }
@@ -46,8 +54,8 @@ macro_rules! define_tool {
                 _x_credentials: Option<&$crate::tools::ServiceCredential>,
                 working_dir: Option<&std::path::Path>,
                 _ctx: Option<&$crate::tools::context::ToolContext>,
-            ) -> Result<Self::Return, $crate::tools::ToolError> {
-                $exec_fn(&args, working_dir)
+            ) -> Result<Self::Return, Self::Error> {
+                $exec_fn(&args, working_dir).map_err(Into::into)
             }
             fn return_string(ret: &Self::Return) -> String {
                 ret.clone()
@@ -59,7 +67,45 @@ macro_rules! define_tool {
 pub(crate) mod admin;
 mod error;
 pub use error::ToolError;
+pub use error::ToolExecError;
 pub(crate) use error::{tool_err, tool_ok};
+
+/// Tool arguments for tools that take no parameters.
+///
+/// Accepts both `null` and `{}` from JSON (serde_json deserializes `()` only
+/// from `null`, but OpenAI-style tool schemas advertise `{"type": "object",
+/// "properties": {}}`, leading the model to send `{}`). This wrapper accepts
+/// both forms so the schema and the actual deserialization agree.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmptyArgs {}
+
+impl JsonSchema for EmptyArgs {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("EmptyArgs")
+    }
+
+    fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }))
+        .unwrap()
+    }
+}
+
+impl<'de> Deserialize<'de> for EmptyArgs {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::Null => Ok(EmptyArgs {}),
+            serde_json::Value::Object(m) if m.is_empty() => Ok(EmptyArgs {}),
+            other => Err(D::Error::custom(format!(
+                "expected null or empty object, got {other}"
+            ))),
+        }
+    }
+}
 
 pub mod context;
 pub(crate) mod db;
@@ -186,13 +232,17 @@ fn resolve_refs(value: &mut serde_json::Value, defs: &serde_json::Map<String, se
     }
 }
 
-/// Typed tool trait. Each tool declares its Args and Return types.
-/// Both must be serde-compatible (JSON path uses serde_json, binary path uses postcard).
+/// Typed tool trait. Each tool declares its Args, Return, and Error types.
+/// Args and Return must be serde-compatible (JSON path uses serde_json, binary path uses postcard).
+/// Error must implement `std::error::Error` and be serializable (for the structured-error postcard path).
 pub trait Tool: Send + Sync {
     /// Argument type — must be deserializable from both JSON and postcard.
     type Args: DeserializeOwned + JsonSchema + 'static;
     /// Return type — must be serializable to both JSON and postcard.
     type Return: Serialize + JsonSchema + 'static;
+    /// Error type — each tool defines its own. Simple tools use `ToolExecError`;
+    /// tools whose structured errors are consumed by VM guests define a `thiserror` enum.
+    type Error: std::error::Error + Send + Sync + Serialize + DeserializeOwned + 'static;
 
     fn name(&self) -> &'static str;
     fn group(&self) -> &'static str {
@@ -232,7 +282,7 @@ pub trait Tool: Send + Sync {
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
-    ) -> Result<Self::Return, ToolError>;
+    ) -> Result<Self::Return, Self::Error>;
 
     /// Execute with streaming output.
     ///
@@ -246,10 +296,13 @@ pub trait Tool: Send + Sync {
         working_dir: Option<&std::path::Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
-    ) -> Result<Self::Return, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         let ret = self.execute(args, x_credentials, working_dir, ctx)?;
-        let bytes = postcard::to_allocvec(&ret).map_err(ToolError::Postcard)?;
-        let _ = output_tx.send(bytes);
+        // Best-effort: send postcard-encoded result for streaming display,
+        // silently discard if encoding fails.
+        if let Ok(bytes) = postcard::to_allocvec(&ret) {
+            let _ = output_tx.send(bytes);
+        }
         Ok(ret)
     }
 
@@ -278,7 +331,7 @@ pub trait ToolDyn: Send + Sync {
     fn output_schema(&self) -> Option<serde_json::Value>;
     fn allowed_callers(&self) -> Vec<AllowedCaller>;
 
-    /// JSON path — takes JSON args, returns ToolOutput in requested format.
+    /// JSON path — takes JSON args, returns Result for the caller to handle.
     fn execute_json(
         &self,
         args_json: &str,
@@ -287,7 +340,7 @@ pub trait ToolDyn: Send + Sync {
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolOutput;
+    ) -> Result<ToolOutput, ToolError>;
 
     /// Streaming JSON path.
     fn execute_streaming_json(
@@ -299,24 +352,16 @@ pub trait ToolDyn: Send + Sync {
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolOutput;
+    ) -> Result<ToolOutput, ToolError>;
 
-    /// Postcard binary path — args from postcard, returns postcard-encoded.
+    /// Postcard binary path — args from postcard, returns bytes encoding
+    /// `Result<Result<T::Return, T::Error>, ToolError>`. All outcomes (infra
+    /// error, tool error, tool success) are contained in the byte buffer.
     fn execute_postcard(
         &self,
         args_bytes: &[u8],
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
-        ctx: Option<&context::ToolContext>,
-    ) -> Vec<u8>;
-
-    /// Streaming postcard binary path.
-    fn execute_streaming_postcard(
-        &self,
-        args_bytes: &[u8],
-        x_credentials: Option<&ServiceCredential>,
-        working_dir: Option<&std::path::Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
     ) -> Vec<u8>;
 }
@@ -350,39 +395,26 @@ impl<T: Tool + 'static> ToolDyn for T {
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolOutput {
-        let args = match serde_json::from_str::<T::Args>(args_json) {
-            Ok(a) => a,
-            Err(e) => {
-                return ToolOutput {
-                    content: format!("invalid arguments: {e}"),
-                    is_error: true,
-                };
-            }
-        };
-        match self.execute(args, x_credentials, working_dir, ctx) {
-            Ok(ret) => {
-                if let Some(tx) = image_tx
-                    && let Some(image) = self.extract_image(&ret)
-                {
-                    let _ = tx.send(image);
-                }
-                ToolOutput {
-                    content: match format {
-                        ToolOutputFormat::Text => T::return_string(&ret),
-                        ToolOutputFormat::Json => serde_json::to_string(&ret).unwrap_or_else(|e| {
-                            tracing::warn!(error = %e, "failed to JSON-encode tool return");
-                            String::new()
-                        }),
-                    },
-                    is_error: false,
-                }
-            }
-            Err(e) => ToolOutput {
-                content: e.to_string(),
-                is_error: true,
-            },
+    ) -> Result<ToolOutput, ToolError> {
+        let args = serde_json::from_str::<T::Args>(args_json)?;
+        let ret = self
+            .execute(args, x_credentials, working_dir, ctx)
+            .map_err(|e| ToolError::Other(e.to_string()))?;
+        if let Some(tx) = image_tx
+            && let Some(image) = self.extract_image(&ret)
+        {
+            let _ = tx.send(image);
         }
+        Ok(ToolOutput {
+            content: match format {
+                ToolOutputFormat::Text => T::return_string(&ret),
+                ToolOutputFormat::Json => serde_json::to_string(&ret).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to JSON-encode tool return");
+                    String::new()
+                }),
+            },
+            is_error: false,
+        })
     }
 
     fn execute_postcard(
@@ -394,9 +426,15 @@ impl<T: Tool + 'static> ToolDyn for T {
     ) -> Vec<u8> {
         let args = match postcard::from_bytes::<T::Args>(args_bytes) {
             Ok(a) => a,
-            Err(e) => return encode_result::<T::Return>(Err::<T::Return, _>(e)),
+            Err(e) => {
+                return encode_outer::<T::Return, T::Error>(Err(ToolError::Postcard(
+                    e.to_string(),
+                )));
+            }
         };
-        encode_result(self.execute(args, x_credentials, working_dir, ctx))
+        let result: Result<T::Return, T::Error> =
+            self.execute(args, x_credentials, working_dir, ctx);
+        encode_outer::<T::Return, T::Error>(Ok(result))
     }
 
     fn execute_streaming_json(
@@ -408,54 +446,26 @@ impl<T: Tool + 'static> ToolDyn for T {
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolOutput {
-        let args = match serde_json::from_str::<T::Args>(args_json) {
-            Ok(a) => a,
-            Err(e) => {
-                return ToolOutput {
-                    content: format!("invalid arguments: {e}"),
-                    is_error: true,
-                };
-            }
-        };
-        match self.execute_streaming(args, x_credentials, working_dir, output_tx, ctx) {
-            Ok(ret) => {
-                if let Some(tx) = image_tx
-                    && let Some(image) = self.extract_image(&ret)
-                {
-                    let _ = tx.send(image);
-                }
-                ToolOutput {
-                    content: match format {
-                        ToolOutputFormat::Text => T::return_string(&ret),
-                        ToolOutputFormat::Json => serde_json::to_string(&ret).unwrap_or_else(|e| {
-                            tracing::warn!(error = %e, "failed to JSON-encode tool return");
-                            String::new()
-                        }),
-                    },
-                    is_error: false,
-                }
-            }
-            Err(e) => ToolOutput {
-                content: e.to_string(),
-                is_error: true,
-            },
+    ) -> Result<ToolOutput, ToolError> {
+        let args = serde_json::from_str::<T::Args>(args_json)?;
+        let ret = self
+            .execute_streaming(args, x_credentials, working_dir, output_tx, ctx)
+            .map_err(|e| ToolError::Other(e.to_string()))?;
+        if let Some(tx) = image_tx
+            && let Some(image) = self.extract_image(&ret)
+        {
+            let _ = tx.send(image);
         }
-    }
-
-    fn execute_streaming_postcard(
-        &self,
-        args_bytes: &[u8],
-        x_credentials: Option<&ServiceCredential>,
-        working_dir: Option<&std::path::Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
-        ctx: Option<&context::ToolContext>,
-    ) -> Vec<u8> {
-        let args = match postcard::from_bytes::<T::Args>(args_bytes) {
-            Ok(a) => a,
-            Err(e) => return encode_result::<T::Return>(Err::<T::Return, _>(e)),
-        };
-        encode_result(self.execute_streaming(args, x_credentials, working_dir, output_tx, ctx))
+        Ok(ToolOutput {
+            content: match format {
+                ToolOutputFormat::Text => T::return_string(&ret),
+                ToolOutputFormat::Json => serde_json::to_string(&ret).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to JSON-encode tool return");
+                    String::new()
+                }),
+            },
+            is_error: false,
+        })
     }
 }
 
@@ -583,7 +593,7 @@ impl ToolRegistry {
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolOutput {
+    ) -> Result<ToolOutput, ToolError> {
         match self.tools.get(tool_call.name.as_str()) {
             Some(tool) => tool.execute_json(
                 &tool_call.arguments_json,
@@ -593,10 +603,10 @@ impl ToolRegistry {
                 ctx,
                 image_tx,
             ),
-            None => ToolOutput {
-                content: format!("unknown tool: {}", tool_call.name),
-                is_error: true,
-            },
+            None => Err(ToolError::Other(format!(
+                "unknown tool: {}",
+                tool_call.name
+            ))),
         }
     }
 
@@ -610,7 +620,7 @@ impl ToolRegistry {
         working_dir: Option<&std::path::Path>,
         ctx: Option<&context::ToolContext>,
         image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolOutput {
+    ) -> Result<ToolOutput, ToolError> {
         match self.tools.get(tool_call.name.as_str()) {
             Some(tool) => tool.execute_streaming_json(
                 &tool_call.arguments_json,
@@ -621,10 +631,10 @@ impl ToolRegistry {
                 ctx,
                 image_tx,
             ),
-            None => ToolOutput {
-                content: format!("unknown tool: {}", tool_call.name),
-                is_error: true,
-            },
+            None => Err(ToolError::Other(format!(
+                "unknown tool: {}",
+                tool_call.name
+            ))),
         }
     }
 
@@ -639,13 +649,7 @@ impl ToolRegistry {
     ) -> Vec<u8> {
         match self.tools.get(name) {
             Some(tool) => tool.execute_postcard(args_bytes, x_credentials, working_dir, ctx),
-            None => {
-                let err: Result<(), String> = Err(format!("unknown tool: {name}"));
-                postcard::to_allocvec(&err).unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, tool = %name, "failed to postcard-encode unknown-tool error");
-                    Vec::new()
-                })
-            }
+            None => encode_outer::<(), ()>(Err(ToolError::Other(format!("unknown tool: {name}")))),
         }
     }
 
@@ -750,11 +754,11 @@ pub(crate) fn resolve_path(
 pub(crate) fn confine_path(
     path: &str,
     working_dir: Option<&std::path::Path>,
-) -> Result<std::path::PathBuf, ToolError> {
+) -> Result<std::path::PathBuf, ToolExecError> {
     let resolved = resolve_path(path, working_dir);
     if let Some(wd) = working_dir {
         let wd_canonical = wd.canonicalize().map_err(|e| {
-            ToolError::Other(format!(
+            ToolExecError(format!(
                 "cannot resolve session working directory '{}': {e}",
                 wd.display()
             ))
@@ -763,19 +767,19 @@ pub(crate) fn confine_path(
         // created by write_file), walk up to the nearest existing
         // ancestor and canonicalize that for the confinement check.
         let anchor = resolve_existing_ancestor(&resolved).map_err(|_| {
-            ToolError::Other(format!(
+            ToolExecError(format!(
                 "path '{}' has no existing ancestor within the filesystem",
                 resolved.display()
             ))
         })?;
         let anchor_canonical = anchor.canonicalize().map_err(|e| {
-            ToolError::Other(format!(
+            ToolExecError(format!(
                 "cannot resolve path component '{}': {e}",
                 anchor.display()
             ))
         })?;
         if !anchor_canonical.starts_with(&wd_canonical) {
-            return Err(ToolError::Other(format!(
+            return Err(ToolExecError(format!(
                 "path '{}' is outside the session working directory '{}'",
                 resolved.display(),
                 wd.display(),
@@ -846,7 +850,7 @@ mod tests {
         let result = confine_path("..", Some(dir.path()));
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ToolError::Other(_)));
+        assert!(matches!(err, ToolExecError(_)));
     }
 
     #[test]
@@ -921,6 +925,7 @@ mod tests {
     impl Tool for DefaultTool {
         type Args = ();
         type Return = String;
+        type Error = ToolExecError;
 
         fn name(&self) -> &'static str {
             "default_tool"
@@ -940,7 +945,7 @@ mod tests {
             _x_credentials: Option<&ServiceCredential>,
             _working_dir: Option<&std::path::Path>,
             _ctx: Option<&crate::tools::context::ToolContext>,
-        ) -> Result<Self::Return, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             Ok("ok".to_string())
         }
         fn return_string(ret: &Self::Return) -> String {
@@ -1001,6 +1006,7 @@ mod tests {
     impl Tool for RestrictedTool {
         type Args = ();
         type Return = u64;
+        type Error = ToolExecError;
 
         fn name(&self) -> &'static str {
             "restricted_tool"
@@ -1029,7 +1035,7 @@ mod tests {
             _x_credentials: Option<&ServiceCredential>,
             _working_dir: Option<&std::path::Path>,
             _ctx: Option<&crate::tools::context::ToolContext>,
-        ) -> Result<Self::Return, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             Ok(42)
         }
     }
@@ -1262,6 +1268,7 @@ mod tests {
     impl Tool for UnitArgsTool {
         type Args = ();
         type Return = String;
+        type Error = ToolExecError;
 
         fn name(&self) -> &'static str {
             "unit_args_tool"
@@ -1281,7 +1288,7 @@ mod tests {
             _x_credentials: Option<&ServiceCredential>,
             _working_dir: Option<&std::path::Path>,
             _ctx: Option<&crate::tools::context::ToolContext>,
-        ) -> Result<Self::Return, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             Ok("ok".to_string())
         }
     }
@@ -1303,6 +1310,7 @@ mod tests {
     impl Tool for RawOutputTool {
         type Args = ();
         type Return = String;
+        type Error = ToolExecError;
 
         fn name(&self) -> &'static str {
             "raw_output_tool"
@@ -1322,7 +1330,7 @@ mod tests {
             _credentials: Option<&ServiceCredential>,
             _working_dir: Option<&std::path::Path>,
             _ctx: Option<&context::ToolContext>,
-        ) -> Result<Self::Return, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             Ok("raw\noutput".to_string())
         }
         fn return_string(ret: &Self::Return) -> String {
@@ -1346,7 +1354,9 @@ mod tests {
     fn return_string_through_execute_json_text_format() {
         // execute_json with Text format calls T::return_string.
         let tool = RawOutputTool;
-        let result = tool.execute_json("null", ToolOutputFormat::Text, None, None, None, None);
+        let result = tool
+            .execute_json("null", ToolOutputFormat::Text, None, None, None, None)
+            .unwrap();
         assert!(!result.is_error, "should succeed");
         assert_eq!(result.content, "raw\noutput");
     }
@@ -1355,8 +1365,68 @@ mod tests {
     fn return_string_through_execute_json_json_format() {
         // execute_json with Json format calls serde_json::to_string.
         let tool = RawOutputTool;
-        let result = tool.execute_json("null", ToolOutputFormat::Json, None, None, None, None);
+        let result = tool
+            .execute_json("null", ToolOutputFormat::Json, None, None, None, None)
+            .unwrap();
         assert!(!result.is_error, "should succeed");
         assert_eq!(result.content, r#""raw\noutput""#);
+    }
+
+    // ── encode_outer tests ──────────────────────────────────────────
+
+    #[test]
+    fn encode_outer_ok_ok() {
+        let bytes = encode_outer::<String, ToolExecError>(Ok(Ok("hello".into())));
+        let decoded: Result<Result<String, ToolExecError>, ToolError> =
+            postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, Ok(Ok(v)) if v == "hello"));
+    }
+
+    #[test]
+    fn encode_outer_ok_err() {
+        let bytes = encode_outer::<String, ToolExecError>(Ok(Err(ToolExecError("fail".into()))));
+        let decoded: Result<Result<String, ToolExecError>, ToolError> =
+            postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, Ok(Err(e)) if e.to_string() == "fail"));
+    }
+
+    #[test]
+    fn encode_outer_err_infra() {
+        let bytes =
+            encode_outer::<String, ToolExecError>(Err(ToolError::Other("infra fail".into())));
+        let decoded: Result<Result<String, ToolExecError>, ToolError> =
+            postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(decoded, Err(e) if e.to_string() == "infra fail"));
+    }
+
+    // ── EmptyArgs deserialization tests ────────────────────────────
+
+    #[test]
+    fn empty_args_from_null() {
+        let args: EmptyArgs = serde_json::from_str("null").unwrap();
+        let _ = args;
+    }
+
+    #[test]
+    fn empty_args_from_empty_object() {
+        let args: EmptyArgs = serde_json::from_str("{}").unwrap();
+        let _ = args;
+    }
+
+    #[test]
+    fn empty_args_rejects_nonempty_object() {
+        let result: Result<EmptyArgs, _> = serde_json::from_str(r#"{"key": "value"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_args_schema_is_empty_object() {
+        let schema = serde_json::to_value(schemars::schema_for!(EmptyArgs)).unwrap();
+        let schema = sanitize_params_schema(schema);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(
+            schema["additionalProperties"], serde_json::Value::Bool(false),
+            "should forbid extra properties"
+        );
     }
 }

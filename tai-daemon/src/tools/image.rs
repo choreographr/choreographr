@@ -1,4 +1,4 @@
-use super::{PreparedImage, ToolError, context::ToolContext, truncate_tool_output};
+use super::{PreparedImage, ToolExecError, context::ToolContext, truncate_tool_output};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use image::GenericImageView;
 use resvg::usvg;
@@ -175,6 +175,7 @@ impl DisplayImage {
 impl super::Tool for DisplayImage {
     type Args = DisplayImageArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "display_image"
@@ -191,8 +192,8 @@ impl super::Tool for DisplayImage {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
-        let image = prepare_image(&args).map_err(|e| ToolError::Other(e.to_string()))?;
+    ) -> Result<Self::Return, Self::Error> {
+        let image = prepare_image(&args).map_err(|e| ToolExecError(e.to_string()))?;
         let mime_type = image.mime_type.clone();
         let width = image.width;
         let height = image.height;

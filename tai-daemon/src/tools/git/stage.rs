@@ -222,7 +222,7 @@ fn worktree_metadata(
         .workdir()
         .ok_or_else(|| ToolError::Other("repository has no worktree".to_string()))?;
     gix::index::fs::Metadata::from_path_no_follow(&workdir.join(gix::path::from_bstr(path)))
-        .map_err(ToolError::Io)
+        .map_err(|e| ToolError::Io(e.to_string()))
 }
 
 fn finalize_index(index: &mut gix::index::File) -> Result<(), ToolError> {

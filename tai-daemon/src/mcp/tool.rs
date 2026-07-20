@@ -1,6 +1,6 @@
 use crate::openai::AllowedCaller;
 use crate::tools::context::ToolContext;
-use crate::tools::{PreparedImage, ToolDyn, ToolOutput, ToolOutputFormat};
+use crate::tools::{PreparedImage, ToolDyn, ToolError, ToolOutput, ToolOutputFormat, encode_outer};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::sync::mpsc;
@@ -50,20 +50,23 @@ impl McpToolWrapper {
     }
 }
 
-fn parse_json_args(args_json: &str) -> Result<Value, ToolOutput> {
-    serde_json::from_str(args_json).map_err(|e| ToolOutput {
-        content: format!("invalid arguments: {e}"),
-        is_error: true,
-    })
+fn parse_json_args(args_json: &str) -> Result<Value, ToolError> {
+    serde_json::from_str(args_json).map_err(|e| ToolError::InvalidArguments(e.to_string()))
 }
 
 fn parse_binary_args(args_bytes: &[u8]) -> Result<Value, Vec<u8>> {
     postcard::from_bytes(args_bytes).map_err(|e| {
-        postcard::to_allocvec(&Err::<String, String>(format!(
+        encode_outer::<String, String>(Err(ToolError::Postcard(format!(
             "invalid binary arguments: {e}"
-        )))
-        .unwrap_or_default()
+        ))))
     })
+}
+
+/// Convert an anyhow error to a `ToolError` for the ToolDyn boundary.
+/// Uses `{:#}` formatting to include the full error chain (context added
+/// by `.context()` / `.with_context()` upstream).
+fn to_tool_error(e: anyhow::Error) -> ToolError {
+    ToolError::Other(format!("{e:#}"))
 }
 
 fn mcp_result_to_text_parts(result: &CallToolResult) -> (Vec<String>, bool) {
@@ -120,30 +123,18 @@ impl ToolDyn for McpToolWrapper {
         _working_dir: Option<&std::path::Path>,
         _ctx: Option<&ToolContext>,
         _image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolOutput {
-        let args = match parse_json_args(args_json) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        match self.call_with_args(args) {
-            Ok(result) => {
-                let (text_parts, is_error) = mcp_result_to_text_parts(&result);
-                let content = text_parts.join("\n");
-                ToolOutput {
-                    content: match format {
-                        ToolOutputFormat::Text => content,
-                        ToolOutputFormat::Json => {
-                            serde_json::to_string(&content).unwrap_or(content)
-                        }
-                    },
-                    is_error,
-                }
-            }
-            Err(e) => ToolOutput {
-                content: format!("{e:#}"),
-                is_error: true,
+    ) -> Result<ToolOutput, ToolError> {
+        let args = parse_json_args(args_json)?;
+        let result = self.call_with_args(args).map_err(to_tool_error)?;
+        let (text_parts, is_error) = mcp_result_to_text_parts(&result);
+        let content = text_parts.join("\n");
+        Ok(ToolOutput {
+            content: match format {
+                ToolOutputFormat::Text => content,
+                ToolOutputFormat::Json => serde_json::to_string(&content).unwrap_or(content),
             },
-        }
+            is_error,
+        })
     }
 
     fn execute_postcard(
@@ -161,7 +152,7 @@ impl ToolDyn for McpToolWrapper {
             Ok(call_result) => Ok(mcp_result_to_string(call_result)),
             Err(e) => Err(format!("{e:#}")),
         };
-        postcard::to_allocvec(&result).unwrap_or_default()
+        encode_outer::<String, String>(Ok(result))
     }
 
     fn execute_streaming_json(
@@ -173,56 +164,22 @@ impl ToolDyn for McpToolWrapper {
         output_tx: mpsc::Sender<Vec<u8>>,
         _ctx: Option<&ToolContext>,
         _image_tx: Option<mpsc::Sender<PreparedImage>>,
-    ) -> ToolOutput {
-        let args = match parse_json_args(args_json) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        match self.call_with_args(args) {
-            Ok(result) => {
-                let (text_parts, is_error) = mcp_result_to_text_parts(&result);
-                let text_content = text_parts.join("\n");
-                // Always stream text content for incremental display.
-                let _ = output_tx.send(text_content.as_bytes().to_vec());
-                ToolOutput {
-                    content: match format {
-                        ToolOutputFormat::Text => text_content,
-                        ToolOutputFormat::Json => {
-                            serde_json::to_string(&text_content).unwrap_or(text_content)
-                        }
-                    },
-                    is_error,
+    ) -> Result<ToolOutput, ToolError> {
+        let args = parse_json_args(args_json)?;
+        let result = self.call_with_args(args).map_err(to_tool_error)?;
+        let (text_parts, is_error) = mcp_result_to_text_parts(&result);
+        let text_content = text_parts.join("\n");
+        // Always stream text content for incremental display.
+        let _ = output_tx.send(text_content.as_bytes().to_vec());
+        Ok(ToolOutput {
+            content: match format {
+                ToolOutputFormat::Text => text_content,
+                ToolOutputFormat::Json => {
+                    serde_json::to_string(&text_content).unwrap_or(text_content)
                 }
-            }
-            Err(e) => ToolOutput {
-                content: format!("{e:#}"),
-                is_error: true,
             },
-        }
-    }
-
-    fn execute_streaming_postcard(
-        &self,
-        args_bytes: &[u8],
-        _x_credentials: Option<&ServiceCredential>,
-        _working_dir: Option<&std::path::Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
-        _ctx: Option<&ToolContext>,
-    ) -> Vec<u8> {
-        let args = match parse_binary_args(args_bytes) {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let result: Result<String, String> = match self.call_with_args(args) {
-            Ok(call_result) => {
-                let text = mcp_result_to_string(call_result);
-                let bytes = text.as_bytes().to_vec();
-                let _ = output_tx.send(bytes);
-                Ok(text)
-            }
-            Err(e) => Err(format!("{e:#}")),
-        };
-        postcard::to_allocvec(&result).unwrap_or_default()
+            is_error,
+        })
     }
 }
 
@@ -367,9 +324,9 @@ mod tests {
 
     #[test]
     fn parse_json_args_invalid_returns_error() {
-        let output = parse_json_args("not json").unwrap_err();
-        assert!(output.is_error);
-        assert!(output.content.contains("invalid arguments"));
+        let err = parse_json_args("not json").unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+        assert!(err.to_string().contains("invalid arguments"));
     }
 
     #[test]
@@ -401,8 +358,14 @@ mod tests {
     fn parse_binary_args_invalid_returns_error_bytes() {
         let bytes = parse_binary_args(b"not postcard").unwrap_err();
         assert!(!bytes.is_empty());
-        let decoded: Result<String, String> = postcard::from_bytes(&bytes).unwrap();
+        let decoded: Result<Result<String, String>, ToolError> =
+            postcard::from_bytes(&bytes).unwrap();
         assert!(decoded.is_err());
-        assert!(decoded.unwrap_err().contains("invalid binary arguments"));
+        assert!(
+            decoded
+                .unwrap_err()
+                .to_string()
+                .contains("invalid binary arguments")
+        );
     }
 }

@@ -1,5 +1,5 @@
 use super::{
-    Tool, ToolError,
+    Tool, ToolExecError,
     context::ToolContext,
     shell_util::{
         format_shell_output, resolve_and_confine, run_shell_streaming, setup_child,
@@ -60,6 +60,7 @@ pub(crate) struct Sh;
 impl Tool for Sh {
     type Args = ShArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "sh"
@@ -79,7 +80,7 @@ impl Tool for Sh {
         _x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_sh_tool(&args, working_dir)
     }
 
@@ -90,7 +91,7 @@ impl Tool for Sh {
         working_dir: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         let shell_str = match args.shell {
             Shell::Bash => "bash",
             Shell::Dash => "dash",
@@ -114,7 +115,7 @@ impl Tool for Sh {
     }
 }
 
-pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
+pub fn execute_sh_tool(args: &ShArgs, working_dir: Option<&Path>) -> Result<String, ToolExecError> {
     let shell_str = match args.shell {
         Shell::Bash => "bash",
         Shell::Dash => "dash",

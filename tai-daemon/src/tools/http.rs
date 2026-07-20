@@ -1,7 +1,23 @@
-use super::{ToolError, truncate_tool_output};
+use super::truncate_tool_output;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::Path, time::Duration};
+use ureq::RequestBuilder;
+
+/// HTTP tool errors — a structured error type for http_request failures.
+#[derive(Debug, Serialize, Deserialize, thiserror::Error)]
+pub enum HttpError {
+    #[error("unsupported method: {0}")]
+    UnsupportedMethod(String),
+    #[error("invalid url: {0}")]
+    InvalidUrl(String),
+    #[error("unsupported URL scheme: {0}")]
+    UnsupportedUrlScheme(String),
+    #[error("invalid header {name}: {error}")]
+    InvalidHeader { name: String, error: String },
+    #[error("request failed: {0}")]
+    RequestFailed(String),
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HttpRequestArgs {
@@ -21,17 +37,17 @@ pub struct HttpRequestArgs {
 pub fn execute_http_request_tool(
     args: &HttpRequestArgs,
     _working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, HttpError> {
     match args.method.as_str() {
-        "GET" | "POST" | "HEAD" => {}
-        other => return Err(ToolError::UnsupportedMethod(other.to_string())),
+        "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" => {}
+        other => return Err(HttpError::UnsupportedMethod(other.to_string())),
     }
 
     let parsed_url =
-        url::Url::parse(&args.url).map_err(|e| ToolError::InvalidUrl(e.to_string()))?;
+        url::Url::parse(&args.url).map_err(|e| HttpError::InvalidUrl(e.to_string()))?;
     match parsed_url.scheme() {
         "http" | "https" => {}
-        other => return Err(ToolError::UnsupportedUrlScheme(other.to_string())),
+        other => return Err(HttpError::UnsupportedUrlScheme(other.to_string())),
     }
 
     let timeout_secs = args.timeout_secs.unwrap_or(10).clamp(1, 30);
@@ -42,38 +58,62 @@ pub fn execute_http_request_tool(
             .build(),
     );
 
-    let response = match args.method.as_str() {
-        "GET" => {
-            let mut req = agent.get(&args.url);
-            req = req.header("User-Agent", "tai-daemon/0.1");
-            for (name, value) in &args.headers {
-                req = req.header(name.as_str(), value.as_str());
-            }
-            req.call()
+    // Validate header names/values before making the request so structured
+    // errors surface instead of ureq panicking on invalid input.  Reject
+    // empty names, control characters and colons in names, and newlines in
+    // values (preventing header injection).
+    for (name, value) in &args.headers {
+        if name.is_empty() {
+            return Err(HttpError::InvalidHeader {
+                name: "(empty)".into(),
+                error: "header name must not be empty".into(),
+            });
         }
+        if name.bytes().any(|b| b <= 0x1f || b == 0x7f || b == b':') {
+            return Err(HttpError::InvalidHeader {
+                name: name.clone(),
+                error: "header name contains invalid characters".into(),
+            });
+        }
+        if value.bytes().any(|b| b == b'\n' || b == b'\r') {
+            return Err(HttpError::InvalidHeader {
+                name: name.clone(),
+                error: "header value contains newline characters".into(),
+            });
+        }
+    }
+
+    let response = match args.method.as_str() {
+        "GET" => apply_headers(agent.get(&args.url), &args.headers).call(),
         "POST" => {
-            let mut req = agent.post(&args.url);
-            req = req.header("User-Agent", "tai-daemon/0.1");
-            for (name, value) in &args.headers {
-                req = req.header(name.as_str(), value.as_str());
-            }
+            let req = apply_headers(agent.post(&args.url), &args.headers);
             if let Some(body) = &args.body {
                 req.send(body.as_str())
             } else {
                 req.send_empty()
             }
         }
-        "HEAD" => {
-            let mut req = agent.head(&args.url);
-            req = req.header("User-Agent", "tai-daemon/0.1");
-            for (name, value) in &args.headers {
-                req = req.header(name.as_str(), value.as_str());
+        "PUT" => {
+            let req = apply_headers(agent.put(&args.url), &args.headers);
+            if let Some(body) = &args.body {
+                req.send(body.as_str())
+            } else {
+                req.send_empty()
             }
-            req.call()
         }
-        other => return Err(ToolError::UnsupportedMethod(other.to_string())),
+        "DELETE" => apply_headers(agent.delete(&args.url), &args.headers).call(),
+        "PATCH" => {
+            let req = apply_headers(agent.patch(&args.url), &args.headers);
+            if let Some(body) = &args.body {
+                req.send(body.as_str())
+            } else {
+                req.send_empty()
+            }
+        }
+        "HEAD" => apply_headers(agent.head(&args.url), &args.headers).call(),
+        other => return Err(HttpError::UnsupportedMethod(other.to_string())),
     }
-    .map_err(|e| ToolError::RequestFailed(e.to_string()))?;
+    .map_err(|e| HttpError::RequestFailed(e.to_string()))?;
 
     let status = response.status();
     let content_type = response
@@ -130,6 +170,18 @@ fn is_text_content_type(content_type: &str) -> bool {
         || mime.ends_with("+xml")
 }
 
+/// Apply User-Agent and user-supplied headers to a ureq request builder.
+fn apply_headers<B>(
+    req: RequestBuilder<B>,
+    headers: &HashMap<String, String>,
+) -> RequestBuilder<B> {
+    let mut req = req.header("User-Agent", "tai-daemon/0.1");
+    for (name, value) in headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    req
+}
+
 fn format_http_response(
     status: ureq::http::StatusCode,
     headers: &[(String, String)],
@@ -154,11 +206,215 @@ fn format_http_response(
 
 pub(crate) struct HttpRequest;
 
-define_tool!(
-    HttpRequest,
-    "http_request",
-    "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests.",
-    HttpRequestArgs,
-    execute_http_request_tool,
-    "core"
-);
+impl crate::tools::Tool for HttpRequest {
+    type Args = HttpRequestArgs;
+    type Return = String;
+    type Error = HttpError;
+
+    fn name(&self) -> &'static str {
+        "http_request"
+    }
+
+    fn group(&self) -> &'static str {
+        "core"
+    }
+
+    fn description(&self) -> &'static str {
+        "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests."
+    }
+
+    fn execute(
+        &self,
+        args: Self::Args,
+        _x_credentials: Option<&crate::tools::ServiceCredential>,
+        working_dir: Option<&std::path::Path>,
+        _ctx: Option<&crate::tools::context::ToolContext>,
+    ) -> Result<Self::Return, Self::Error> {
+        execute_http_request_tool(&args, working_dir)
+    }
+
+    fn return_string(ret: &Self::Return) -> String {
+        ret.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── header validation tests ─────────────────────────────────────
+
+    #[test]
+    fn header_validation_rejects_empty_name() {
+        let args = HttpRequestArgs {
+            method: "GET".into(),
+            url: "http://example.com".into(),
+            headers: [("".into(), "value".into())].into(),
+            body: None,
+            timeout_secs: None,
+        };
+        let err = execute_http_request_tool(&args, None).unwrap_err();
+        assert!(matches!(err, HttpError::InvalidHeader { .. }));
+    }
+
+    #[test]
+    fn header_validation_rejects_colon_in_name() {
+        let args = HttpRequestArgs {
+            method: "GET".into(),
+            url: "http://example.com".into(),
+            headers: [("bad:header".into(), "value".into())].into(),
+            body: None,
+            timeout_secs: None,
+        };
+        let err = execute_http_request_tool(&args, None).unwrap_err();
+        assert!(matches!(err, HttpError::InvalidHeader { .. }));
+    }
+
+    #[test]
+    fn header_validation_rejects_newline_in_value() {
+        let args = HttpRequestArgs {
+            method: "GET".into(),
+            url: "http://example.com".into(),
+            headers: [("name".into(), "value\ninjected".into())].into(),
+            body: None,
+            timeout_secs: None,
+        };
+        let err = execute_http_request_tool(&args, None).unwrap_err();
+        assert!(matches!(err, HttpError::InvalidHeader { .. }));
+    }
+
+    #[test]
+    fn header_validation_rejects_carriage_return_in_value() {
+        let args = HttpRequestArgs {
+            method: "GET".into(),
+            url: "http://example.com".into(),
+            headers: [("name".into(), "value\rinjected".into())].into(),
+            body: None,
+            timeout_secs: None,
+        };
+        let err = execute_http_request_tool(&args, None).unwrap_err();
+        assert!(matches!(err, HttpError::InvalidHeader { .. }));
+    }
+
+    #[test]
+    fn header_validation_rejects_control_char_in_name() {
+        let args = HttpRequestArgs {
+            method: "GET".into(),
+            url: "http://example.com".into(),
+            headers: [("header\x00name".into(), "value".into())].into(),
+            body: None,
+            timeout_secs: None,
+        };
+        let err = execute_http_request_tool(&args, None).unwrap_err();
+        assert!(matches!(err, HttpError::InvalidHeader { .. }));
+    }
+
+    #[test]
+    fn header_validation_accepts_valid_headers() {
+        let args = HttpRequestArgs {
+            method: "GET".into(),
+            url: "http://example.com".into(),
+            headers: [("Accept".into(), "text/html".into())].into(),
+            body: None,
+            timeout_secs: None,
+        };
+        // Should pass header validation — only fail at the network layer
+        // (RequestFailed) or succeed. Never an InvalidHeader error.
+        let result = execute_http_request_tool(&args, None);
+        match result {
+            Ok(_) => {} // network succeeded
+            Err(e) => assert!(
+                matches!(e, HttpError::RequestFailed(_)),
+                "expected RequestFailed, got {e}"
+            ),
+        }
+    }
+
+    // ── method validation tests ─────────────────────────────────────
+
+    #[test]
+    fn unsupported_method_rejected() {
+        let args = HttpRequestArgs {
+            method: "OPTIONS".into(),
+            url: "http://example.com".into(),
+            headers: [].into(),
+            body: None,
+            timeout_secs: None,
+        };
+        let err = execute_http_request_tool(&args, None).unwrap_err();
+        assert!(matches!(err, HttpError::UnsupportedMethod(_)));
+    }
+
+    #[test]
+    fn invalid_url_rejected() {
+        let args = HttpRequestArgs {
+            method: "GET".into(),
+            url: "\0invalid".into(),
+            headers: [].into(),
+            body: None,
+            timeout_secs: None,
+        };
+        let err = execute_http_request_tool(&args, None).unwrap_err();
+        assert!(matches!(err, HttpError::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn unsupported_scheme_rejected() {
+        let args = HttpRequestArgs {
+            method: "GET".into(),
+            url: "ftp://example.com".into(),
+            headers: [].into(),
+            body: None,
+            timeout_secs: None,
+        };
+        let err = execute_http_request_tool(&args, None).unwrap_err();
+        assert!(matches!(err, HttpError::UnsupportedUrlScheme(_)));
+    }
+
+    // ── HttpError postcard round trip ───────────────────────────────
+
+    #[test]
+    fn http_error_postcard_round_trip() {
+        let errors = vec![
+            HttpError::UnsupportedMethod("PATCH".into()),
+            HttpError::InvalidUrl("bad".into()),
+            HttpError::UnsupportedUrlScheme("file".into()),
+            HttpError::InvalidHeader {
+                name: "X-Foo".into(),
+                error: "bad value".into(),
+            },
+            HttpError::RequestFailed("timeout".into()),
+        ];
+        for err in &errors {
+            let encoded = postcard::to_allocvec(err).unwrap();
+            let decoded: HttpError = postcard::from_bytes(&encoded).unwrap();
+            assert_eq!(err.to_string(), decoded.to_string());
+        }
+    }
+
+    // ── format_http_response tests ──────────────────────────────────
+
+    #[test]
+    fn format_http_response_includes_status_body() {
+        let status = ureq::http::StatusCode::OK;
+        let headers = vec![("content-type".into(), "text/plain".into())];
+        let body = "hello";
+        let output = format_http_response(status, &headers, body);
+        assert!(output.contains("200 OK"));
+        assert!(output.contains("content-type: text/plain"));
+        assert!(output.contains("hello"));
+    }
+
+    #[test]
+    fn format_http_response_sorts_headers() {
+        let status = ureq::http::StatusCode::OK;
+        let headers = vec![
+            ("z-header".into(), "z".into()),
+            ("a-header".into(), "a".into()),
+        ];
+        let output = format_http_response(status, &headers, "");
+        let a_pos = output.find("a-header").unwrap();
+        let z_pos = output.find("z-header").unwrap();
+        assert!(a_pos < z_pos, "headers should be sorted alphabetically");
+    }
+}

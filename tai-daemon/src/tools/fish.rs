@@ -1,5 +1,5 @@
 use super::{
-    Tool, ToolError,
+    Tool, ToolExecError,
     context::ToolContext,
     shell_util::{
         format_shell_output, resolve_and_confine, run_shell_streaming, setup_child,
@@ -27,6 +27,7 @@ pub(crate) struct FishShell;
 impl Tool for FishShell {
     type Args = FishArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "fish"
@@ -46,7 +47,7 @@ impl Tool for FishShell {
         _x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_fish_tool(&args, working_dir)
     }
 
@@ -57,7 +58,7 @@ impl Tool for FishShell {
         working_dir: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         let command = &args.command;
         let timeout_ms = args.timeout.unwrap_or(30000);
         let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
@@ -76,7 +77,10 @@ impl Tool for FishShell {
     }
 }
 
-pub fn execute_fish_tool(args: &FishArgs, working_dir: Option<&Path>) -> Result<String, ToolError> {
+pub fn execute_fish_tool(
+    args: &FishArgs,
+    working_dir: Option<&Path>,
+) -> Result<String, ToolExecError> {
     let command = &args.command;
     let timeout_ms = args.timeout.unwrap_or(30000);
 

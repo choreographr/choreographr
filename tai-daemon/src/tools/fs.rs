@@ -1,4 +1,4 @@
-use super::{ToolError, confine_path, sha256_hex, truncate_tool_output};
+use super::{ToolExecError, confine_path, sha256_hex, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{fs::OpenOptions, io::Write};
@@ -73,9 +73,9 @@ pub struct ListFilesArgs {
 pub(crate) fn execute_line_count_tool(
     args: &LineCountArgs,
     working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     if args.path.trim().is_empty() {
-        return Err(ToolError::Other(
+        return Err(ToolExecError(
             "missing required string argument: path".to_string(),
         ));
     }
@@ -88,9 +88,9 @@ pub(crate) fn execute_line_count_tool(
 pub(crate) fn execute_read_file_tool(
     args: &ReadFileArgs,
     working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     if args.path.trim().is_empty() {
-        return Err(ToolError::Other(
+        return Err(ToolExecError(
             "missing required string argument: path".to_string(),
         ));
     }
@@ -102,25 +102,25 @@ pub(crate) fn execute_read_file_tool(
 pub(crate) fn execute_read_file_range_tool(
     args: &ReadFileRangeArgs,
     working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     const MAX_READ_FILE_RANGE_LINES: usize = 200;
 
     if args.path.trim().is_empty() {
-        return Err(ToolError::Other(
+        return Err(ToolExecError(
             "missing required string argument: path".to_string(),
         ));
     }
 
     if args.start_line == 0 {
-        return Err(ToolError::Other("start_line must be >= 1".to_string()));
+        return Err(ToolExecError("start_line must be >= 1".to_string()));
     }
 
     if args.max_lines == 0 {
-        return Err(ToolError::Other("max_lines must be >= 1".to_string()));
+        return Err(ToolExecError("max_lines must be >= 1".to_string()));
     }
 
     if args.max_lines > MAX_READ_FILE_RANGE_LINES {
-        return Err(ToolError::Other(format!(
+        return Err(ToolExecError(format!(
             "max_lines must be <= {MAX_READ_FILE_RANGE_LINES}"
         )));
     }
@@ -132,7 +132,7 @@ pub(crate) fn execute_read_file_range_tool(
     let total_lines = lines.len();
 
     if args.start_line > total_lines {
-        return Err(ToolError::Other(format!(
+        return Err(ToolExecError(format!(
             "start_line {} is past end of file; file has {} lines",
             args.start_line, total_lines
         )));
@@ -161,7 +161,7 @@ pub(crate) fn execute_read_file_range_tool(
 pub(crate) fn execute_list_files_tool(
     args: &ListFilesArgs,
     working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     let path = args.path.as_deref().unwrap_or(".");
     let resolved = confine_path(path, working_dir)?;
     let entries = std::fs::read_dir(&resolved)?;
@@ -181,7 +181,7 @@ pub(crate) fn execute_list_files_tool(
 pub(crate) fn execute_write_file_tool(
     args: &WriteFileArgs,
     working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     let path = validate_nonempty_path(&args.path)?;
     let resolved = confine_path(&path, working_dir)?;
     ensure_parent_directories(&resolved, args.create_parents.unwrap_or(true))?;
@@ -191,12 +191,12 @@ pub(crate) fn execute_write_file_tool(
         Err(error) => {
             let overwrite = args.overwrite.unwrap_or(true);
             if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
-                Err(ToolError::Other(format!(
+                Err(ToolExecError(format!(
                     "refusing to overwrite existing file: {}",
                     resolved.display()
                 )))
             } else {
-                Err(ToolError::Io(error))
+                Err(ToolExecError(format!("{error}")))
             }
         }
     }
@@ -205,11 +205,11 @@ pub(crate) fn execute_write_file_tool(
 pub(crate) fn execute_edit_file_tool(
     args: &EditFileArgs,
     working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     let path = validate_nonempty_path(&args.path)?;
 
     if args.edits.is_empty() {
-        return Err(ToolError::Other(
+        return Err(ToolExecError(
             "missing required array argument: edits".to_string(),
         ));
     }
@@ -220,7 +220,7 @@ pub(crate) fn execute_edit_file_tool(
     if let Some(expected_sha256) = args.expected_sha256.as_deref() {
         let actual_sha256 = sha256_hex(&original_content);
         if actual_sha256 != expected_sha256.trim().to_ascii_lowercase() {
-            return Err(ToolError::Other(format!(
+            return Err(ToolExecError(format!(
                 "expected_sha256 mismatch for {}: expected {}, got {}",
                 resolved.display(),
                 expected_sha256.trim(),
@@ -229,8 +229,7 @@ pub(crate) fn execute_edit_file_tool(
         }
     }
 
-    let edit_summary =
-        apply_text_edits(&original_content, &args.edits).map_err(ToolError::Other)?;
+    let edit_summary = apply_text_edits(&original_content, &args.edits).map_err(ToolExecError)?;
 
     if args.dry_run.unwrap_or(false) {
         return Ok(format_edit_result(
@@ -246,14 +245,14 @@ pub(crate) fn execute_edit_file_tool(
             &resolved.display().to_string(),
             &edit_summary,
         )),
-        Err(error) => Err(ToolError::Io(error)),
+        Err(error) => Err(ToolExecError(format!("{error}"))),
     }
 }
 
-fn validate_nonempty_path(path: &str) -> Result<String, ToolError> {
+fn validate_nonempty_path(path: &str) -> Result<String, ToolExecError> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
-        Err(ToolError::Other(
+        Err(ToolExecError(
             "missing required string argument: path".to_string(),
         ))
     } else {
@@ -261,7 +260,7 @@ fn validate_nonempty_path(path: &str) -> Result<String, ToolError> {
     }
 }
 
-fn ensure_parent_directories(path: &Path, create_parents: bool) -> Result<(), ToolError> {
+fn ensure_parent_directories(path: &Path, create_parents: bool) -> Result<(), ToolExecError> {
     if !create_parents {
         return Ok(());
     }

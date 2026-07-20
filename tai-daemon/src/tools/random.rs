@@ -1,4 +1,4 @@
-use super::ToolError;
+use super::ToolExecError;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::RngExt;
 use rand::SeedableRng;
@@ -29,14 +29,14 @@ pub struct RandomArgs {
 pub(crate) fn execute_random_tool(
     args: &RandomArgs,
     _working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     match args.seed {
         Some(s) => generate(&mut StdRng::seed_from_u64(s), args),
         None => generate(&mut rand::rng(), args),
     }
 }
 
-fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolError> {
+fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolExecError> {
     let type_ = args.r#type.as_deref().unwrap_or("int");
 
     match type_ {
@@ -44,7 +44,7 @@ fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolErro
             let min = args.min.unwrap_or(0);
             let max = args.max.unwrap_or(100);
             if min > max {
-                return Err(ToolError::Other(
+                return Err(ToolExecError(
                     "min must not be greater than max".to_string(),
                 ));
             }
@@ -56,7 +56,7 @@ fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolErro
             let min = args.min_float.unwrap_or(0.0);
             let max = args.max_float.unwrap_or(1.0);
             if min >= max {
-                return Err(ToolError::Other(
+                return Err(ToolExecError(
                     "min_float must be less than max_float".to_string(),
                 ));
             }
@@ -106,7 +106,7 @@ fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolErro
             Ok(uuid)
         }
 
-        other => Err(ToolError::Other(format!(
+        other => Err(ToolExecError(format!(
             "unknown random type: {other}; expected one of: int, float, bool, bytes, uuid"
         ))),
     }

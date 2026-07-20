@@ -1,4 +1,4 @@
-use super::{Tool, ToolOutputFormat, ToolRegistry, context::ToolContext, error::ToolError};
+use super::{Tool, ToolExecError, ToolOutputFormat, ToolRegistry, context::ToolContext};
 use crate::providers::types::ChatToolCall;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -37,6 +37,7 @@ pub(crate) struct RunSeriesInput {
 impl Tool for RunSeries {
     type Args = RunSeriesInput;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "run_series"
@@ -67,7 +68,7 @@ impl Tool for RunSeries {
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_series(
             &self.registry,
             &args.steps,
@@ -85,7 +86,7 @@ impl Tool for RunSeries {
         working_dir: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_series(
             &self.registry,
             &args.steps,
@@ -162,10 +163,10 @@ fn execute_series(
     working_dir: Option<&Path>,
     ctx: Option<&ToolContext>,
     output_tx: Option<mpsc::Sender<Vec<u8>>>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     let registry = registry
         .upgrade()
-        .ok_or_else(|| ToolError::Other("ToolRegistry no longer available".to_string()))?;
+        .ok_or_else(|| ToolExecError("ToolRegistry no longer available".to_string()))?;
 
     if steps.is_empty() {
         return Ok("{}".to_string());
@@ -180,7 +181,7 @@ fn execute_series(
         // Substitute {{step_N}} placeholders with prior step outputs.
         let substituted_args = substitute_args(&step.arguments, &step_outputs);
         let args_json = serde_json::to_string(&substituted_args).map_err(|e| {
-            ToolError::Other(format!(
+            ToolExecError(format!(
                 "failed to serialize step {step_idx} arguments: {e}"
             ))
         })?;
@@ -217,21 +218,37 @@ fn execute_series(
             );
             // sub_tx is dropped when execute_streaming_json returns → relay drains.
             let _ = relay_handle.join();
-            result
+            match result {
+                Ok(output) => output,
+                Err(e) => {
+                    return Err(ToolExecError(format!(
+                        "step {step_idx} ('{}') failed: {e}",
+                        step.tool
+                    )));
+                }
+            }
         } else {
-            registry.execute_json(
+            match registry.execute_json(
                 &tool_call,
                 ToolOutputFormat::Text,
                 x_credentials,
                 working_dir,
                 ctx,
                 None,
-            )
+            ) {
+                Ok(output) => output,
+                Err(e) => {
+                    return Err(ToolExecError(format!(
+                        "step {step_idx} ('{}') failed: {e}",
+                        step.tool
+                    )));
+                }
+            }
         };
 
         // Stop on first error — the series cannot proceed past a failed step.
         if output.is_error {
-            return Err(ToolError::Other(format!(
+            return Err(ToolExecError(format!(
                 "step {step_idx} ('{}') failed: {}",
                 step.tool, output.content
             )));
@@ -241,7 +258,7 @@ fn execute_series(
     }
 
     serde_json::to_string(&step_outputs)
-        .map_err(|e| ToolError::Other(format!("failed to serialize series results: {e}")))
+        .map_err(|e| ToolExecError(format!("failed to serialize series results: {e}")))
 }
 
 #[cfg(test)]
@@ -258,6 +275,7 @@ mod tests {
     impl Tool for EchoTest {
         type Args = serde_json::Value;
         type Return = String;
+        type Error = ToolExecError;
 
         fn name(&self) -> &'static str {
             "echo_test"
@@ -274,7 +292,7 @@ mod tests {
             _x_credentials: Option<&ServiceCredential>,
             _working_dir: Option<&Path>,
             _ctx: Option<&ToolContext>,
-        ) -> Result<String, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             let content = serde_json::to_string(&args).unwrap_or_default();
             Ok(format!("{}{}", content, self.suffix))
         }
@@ -286,6 +304,7 @@ mod tests {
     impl Tool for AlwaysFail {
         type Args = serde_json::Value;
         type Return = String;
+        type Error = ToolExecError;
 
         fn name(&self) -> &'static str {
             "always_fail"
@@ -302,8 +321,8 @@ mod tests {
             _x_credentials: Option<&ServiceCredential>,
             _working_dir: Option<&Path>,
             _ctx: Option<&ToolContext>,
-        ) -> Result<String, ToolError> {
-            Err(ToolError::Other("intentional failure".to_string()))
+        ) -> Result<Self::Return, Self::Error> {
+            Err(ToolExecError("intentional failure".to_string()))
         }
     }
 

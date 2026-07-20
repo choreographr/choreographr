@@ -10,7 +10,9 @@ use crate::providers::{
 };
 use crate::sessions::{RequestContext, SessionCommand, SessionMetadata, SessionState};
 use crate::tools::context::ToolContext;
-use crate::tools::{PreparedImage, ToolOutput, ToolOutputFormat, ToolRegistry, resolve_path};
+use crate::tools::{
+    PreparedImage, ToolError, ToolOutput, ToolOutputFormat, ToolRegistry, resolve_path,
+};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -208,7 +210,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
         ctx,
     } = args;
     // Channel for the execution thread to deliver its final result.
-    let (result_tx, result_rx) = mpsc::channel::<ToolOutput>();
+    let (result_tx, result_rx) = mpsc::channel::<Result<ToolOutput, ToolError>>();
 
     // Channel for streaming output forwarded to subscribers in real time.
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
@@ -263,7 +265,13 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                     };
                 }
                 match result_rx.recv_timeout(remaining.min(check_interval)) {
-                    Ok(output) => break output,
+                    Ok(Ok(output)) => break output,
+                    Ok(Err(e)) => {
+                        break ToolOutput {
+                            content: e.to_string(),
+                            is_error: true,
+                        };
+                    }
                     Err(RecvTimeoutError::Timeout) => continue,
                     Err(RecvTimeoutError::Disconnected) => {
                         break ToolOutput {
@@ -275,7 +283,13 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
             } else {
                 // No timeout — block indefinitely until the tool finishes.
                 match result_rx.recv() {
-                    Ok(output) => break output,
+                    Ok(Ok(output)) => break output,
+                    Ok(Err(e)) => {
+                        break ToolOutput {
+                            content: e.to_string(),
+                            is_error: true,
+                        };
+                    }
                     Err(_) => {
                         break ToolOutput {
                             content: "tool execution thread panicked".to_string(),
@@ -1306,13 +1320,24 @@ fn execute_tool_with_timeout(
         }
 
         match result_rx.recv_timeout(remaining.min(check_interval)) {
-            Ok(output) => {
+            Ok(Ok(output)) => {
                 crate::metrics::record_tool_execution(
                     &tool_call.name,
                     exec_start.elapsed().as_secs_f64(),
                     output.is_error,
                 );
                 return output;
+            }
+            Ok(Err(e)) => {
+                crate::metrics::record_tool_execution(
+                    &tool_call.name,
+                    exec_start.elapsed().as_secs_f64(),
+                    true,
+                );
+                return ToolOutput {
+                    content: e.to_string(),
+                    is_error: true,
+                };
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -1408,7 +1433,7 @@ mod tests {
     use crate::providers::InferenceProvider;
     use crate::providers::test_util::make_test_provider;
     use crate::tools::context::ToolContext;
-    use crate::tools::{Tool, ToolError, ToolRegistry};
+    use crate::tools::{Tool, ToolExecError, ToolRegistry};
     use std::sync::mpsc;
 
     fn make_session_with_turns() -> SessionState {
@@ -1685,6 +1710,7 @@ mod tests {
     impl Tool for FastTestTool {
         type Args = serde_json::Value;
         type Return = String;
+        type Error = ToolExecError;
 
         fn name(&self) -> &'static str {
             "_test_fast"
@@ -1707,7 +1733,7 @@ mod tests {
             _xc: Option<&ServiceCredential>,
             _working_dir: Option<&Path>,
             _ctx: Option<&ToolContext>,
-        ) -> Result<String, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             Ok("fast result".into())
         }
     }
@@ -1719,6 +1745,7 @@ mod tests {
     impl Tool for BlockingTestTool {
         type Args = serde_json::Value;
         type Return = String;
+        type Error = ToolExecError;
 
         fn name(&self) -> &'static str {
             "_test_blocking"
@@ -1741,7 +1768,7 @@ mod tests {
             _xc: Option<&ServiceCredential>,
             _working_dir: Option<&Path>,
             _ctx: Option<&ToolContext>,
-        ) -> Result<String, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             Ok("ignored".into())
         }
         fn execute_streaming(
@@ -1751,7 +1778,7 @@ mod tests {
             _working_dir: Option<&Path>,
             _output_tx: mpsc::Sender<Vec<u8>>,
             _ctx: Option<&ToolContext>,
-        ) -> Result<String, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             if let Some(rx) = self.proceed.lock().unwrap().take() {
                 let _ = rx.recv();
             }
@@ -1864,6 +1891,7 @@ mod tests {
     impl Tool for StreamingTestTool {
         type Args = serde_json::Value;
         type Return = String;
+        type Error = ToolExecError;
 
         fn name(&self) -> &'static str {
             "_test_streaming"
@@ -1886,7 +1914,7 @@ mod tests {
             _xc: Option<&ServiceCredential>,
             _working_dir: Option<&Path>,
             _ctx: Option<&ToolContext>,
-        ) -> Result<String, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             Ok("exec result".into())
         }
         fn execute_streaming(
@@ -1896,7 +1924,7 @@ mod tests {
             _working_dir: Option<&Path>,
             output_tx: mpsc::Sender<Vec<u8>>,
             _ctx: Option<&ToolContext>,
-        ) -> Result<String, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             let _ = output_tx.send(b"streamed payload".to_vec());
             Ok("streaming done".into())
         }

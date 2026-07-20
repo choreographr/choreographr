@@ -1,5 +1,5 @@
 use crate::tools::{
-    Tool, ToolError, ToolOutput, ToolRegistry, context::ToolContext, tool_err, tool_ok,
+    Tool, ToolExecError, ToolOutput, ToolRegistry, context::ToolContext, tool_err, tool_ok,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ckb_vm::Bytes;
@@ -997,6 +997,7 @@ impl RunRiscV {
 impl Tool for RunRiscV {
     type Args = RunRiscVInput;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "run_riscv"
@@ -1049,11 +1050,11 @@ impl Tool for RunRiscV {
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         let registry = self
             .registry
             .upgrade()
-            .ok_or_else(|| ToolError::Other("ToolRegistry no longer available".to_string()))?;
+            .ok_or_else(|| ToolExecError("ToolRegistry no longer available".to_string()))?;
         let output = run_riscv_impl(
             &args,
             x_credentials,
@@ -1063,7 +1064,7 @@ impl Tool for RunRiscV {
             ctx.cloned(),
         );
         if output.is_error {
-            Err(ToolError::Other(output.content))
+            Err(ToolExecError(output.content))
         } else {
             Ok(output.content)
         }
@@ -1076,11 +1077,11 @@ impl Tool for RunRiscV {
         working_dir: Option<&Path>,
         output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         let registry = self
             .registry
             .upgrade()
-            .ok_or_else(|| ToolError::Other("ToolRegistry no longer available".to_string()))?;
+            .ok_or_else(|| ToolExecError("ToolRegistry no longer available".to_string()))?;
         let output = run_riscv_impl(
             &args,
             x_credentials,
@@ -1090,7 +1091,7 @@ impl Tool for RunRiscV {
             ctx.cloned(),
         );
         if output.is_error {
-            Err(ToolError::Other(output.content))
+            Err(ToolExecError(output.content))
         } else {
             Ok(output.content)
         }
@@ -1100,11 +1101,11 @@ impl Tool for RunRiscV {
 pub fn execute_run_riscv_tool(
     input: &RunRiscVInput,
     working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     let registry = Arc::new(ToolRegistry::new());
     let output = run_riscv_impl(input, None, working_dir, None, registry, None);
     if output.is_error {
-        Err(ToolError::Other(output.content))
+        Err(ToolExecError(output.content))
     } else {
         Ok(output.content)
     }
@@ -1421,6 +1422,7 @@ mod tests {
     impl Tool for EchoTestTool {
         type Args = ();
         type Return = String;
+        type Error = ToolExecError;
 
         fn name(&self) -> &'static str {
             self.name
@@ -1443,7 +1445,7 @@ mod tests {
             _xc: Option<&ServiceCredential>,
             _working_dir: Option<&Path>,
             _ctx: Option<&ToolContext>,
-        ) -> Result<String, ToolError> {
+        ) -> Result<Self::Return, Self::Error> {
             Ok(self.response.to_string())
         }
     }
@@ -1463,9 +1465,9 @@ mod tests {
 
         assert!(!result.is_empty(), "should have a result");
         if result[0] == 0 {
-            // Decode the Ok payload.
+            // Decode the Ok payload — skip outer Ok(0x00) and inner Ok(0x00).
             let (payload, _rest): (Vec<u8>, &[u8]) =
-                postcard::take_from_bytes(&result[1..]).unwrap();
+                postcard::take_from_bytes(&result[2..]).unwrap();
             assert_eq!(payload, b"hello", "payload mismatch");
         } else {
             // Decode the error message for debugging.
@@ -1514,8 +1516,8 @@ mod tests {
 
         assert_eq!(results.len(), 2, "should have 2 results");
 
-        // Each result is a postcard-encoded Result<Vec<u8>, String>.
-        // For Ok values, the encoding is: 0x00 (Ok tag) + postcard(Vec<u8>).
+        // Each result is a postcard-encoded Result<Result<Vec<u8>, E>, ToolError>.
+        // For Ok(Ok(...)), the encoding is: 0x00 (outer Ok) + 0x00 (inner Ok) + payload.
         for (i, result) in results.iter().enumerate() {
             assert!(
                 !result.is_empty() && result[0] == 0,
@@ -1527,8 +1529,9 @@ mod tests {
 
         // Decode payloads to verify they match expected responses.
         fn decode_ok_payload(data: &[u8]) -> Vec<u8> {
-            assert_eq!(data[0], 0, "expected Ok tag byte");
-            let (payload, _rest): (Vec<u8>, &[u8]) = postcard::take_from_bytes(&data[1..]).unwrap();
+            assert_eq!(data[0], 0, "expected outer Ok tag byte");
+            assert_eq!(data[1], 0, "expected inner Ok tag byte");
+            let (payload, _rest): (Vec<u8>, &[u8]) = postcard::take_from_bytes(&data[2..]).unwrap();
             payload
         }
 

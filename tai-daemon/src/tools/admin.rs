@@ -1,7 +1,7 @@
 use crate::context;
 use crate::daemon::DaemonCommand;
 use crate::tools::context::ToolContext;
-use crate::tools::{Tool, ToolError, truncate_tool_output};
+use crate::tools::{Tool, ToolExecError, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -30,15 +30,15 @@ fn execute_list_sessions(
     _args: &ListSessionsArgs,
     _working_dir: Option<&Path>,
     ctx: Option<&ToolContext>,
-) -> Result<String, ToolError> {
-    let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
+) -> Result<String, ToolExecError> {
+    let ctx = ctx.ok_or_else(|| ToolExecError("no session context".into()))?;
     let (reply, rx) = std::sync::mpsc::channel();
     ctx.daemon_tx
         .send(DaemonCommand::ListSessions { reply })
-        .map_err(|e| ToolError::Other(format!("daemon communication failed: {e}")))?;
+        .map_err(|e| ToolExecError(format!("daemon communication failed: {e}")))?;
     let sessions = rx
         .recv()
-        .map_err(|_| ToolError::Other("failed to list sessions".into()))?;
+        .map_err(|_| ToolExecError("failed to list sessions".into()))?;
     if sessions.is_empty() {
         return Ok("No sessions found.".to_string());
     }
@@ -66,6 +66,7 @@ pub(crate) struct ListSessions;
 impl Tool for ListSessions {
     type Args = ListSessionsArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "list_sessions"
@@ -89,7 +90,7 @@ impl Tool for ListSessions {
         _x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_list_sessions(&args, working_dir, ctx)
     }
 }
@@ -100,18 +101,18 @@ fn execute_get_session(
     args: &GetSessionArgs,
     _working_dir: Option<&Path>,
     ctx: Option<&ToolContext>,
-) -> Result<String, ToolError> {
-    let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
+) -> Result<String, ToolExecError> {
+    let ctx = ctx.ok_or_else(|| ToolExecError("no session context".into()))?;
     let (reply, rx) = std::sync::mpsc::channel();
     ctx.daemon_tx
         .send(DaemonCommand::GetSession {
             session_id: args.session_id,
             reply,
         })
-        .map_err(|e| ToolError::Other(format!("daemon communication failed: {e}")))?;
+        .map_err(|e| ToolExecError(format!("daemon communication failed: {e}")))?;
     match rx
         .recv()
-        .map_err(|_| ToolError::Other("failed to get session".into()))?
+        .map_err(|_| ToolExecError("failed to get session".into()))?
     {
         Some(summary) => Ok(format!(
             "Session {} ({}) has {} messages.",
@@ -119,7 +120,7 @@ fn execute_get_session(
             summary.title.as_deref().unwrap_or("untitled"),
             summary.turn_count
         )),
-        None => Err(ToolError::Other(format!(
+        None => Err(ToolExecError(format!(
             "Session {} not found.",
             args.session_id
         ))),
@@ -131,6 +132,7 @@ pub(crate) struct GetSession;
 impl Tool for GetSession {
     type Args = GetSessionArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "get_session"
@@ -154,7 +156,7 @@ impl Tool for GetSession {
         _x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_get_session(&args, working_dir, ctx)
     }
 }
@@ -164,10 +166,10 @@ impl Tool for GetSession {
 fn execute_load_skill(
     args: &LoadSkillArgs,
     working_dir: Option<&Path>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     let effective_working_dir = working_dir.unwrap_or_else(|| Path::new("."));
     let body = context::load_skill_body(&args.name, effective_working_dir)
-        .ok_or_else(|| ToolError::Other(format!("skill not found: {}", args.name)))?;
+        .ok_or_else(|| ToolExecError(format!("skill not found: {}", args.name)))?;
     let skill_message = format!(
         "The following skill instructions are now active:\n\n<skill name=\"{name}\">\n{body}\n</skill>",
         name = args.name,

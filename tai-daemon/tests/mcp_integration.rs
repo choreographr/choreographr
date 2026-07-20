@@ -90,6 +90,7 @@ fn mcp_server_everything_tools_are_discovered_and_callable() {
         None, // image_tx
     );
 
+    let output = output.expect("tool execution should succeed");
     assert!(!output.is_error, "echo should succeed: {}", output.content);
     assert!(
         output.content.contains("hello from tai"),

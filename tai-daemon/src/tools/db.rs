@@ -1,11 +1,22 @@
 use crate::db;
+use crate::tools::Tool;
 use crate::tools::context::ToolContext;
-use crate::tools::{Tool, ToolError};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tai_keystore::ServiceCredential;
 use tracing::{debug, error};
+
+/// Database tool errors — a structured error type for VM guests to match on.
+#[derive(Debug, Serialize, Deserialize, thiserror::Error)]
+pub enum DbError {
+    #[error("key not found: {0}")]
+    NotFound(String),
+    #[error("no session context")]
+    NoSessionContext,
+    #[error("storage error: {0}")]
+    Storage(String),
+}
 
 // ── DbValue: binary-safe value wrapper ──────────────────────────────────
 
@@ -119,6 +130,7 @@ pub(crate) struct DbSet;
 impl Tool for DbSet {
     type Args = DbSetArgs;
     type Return = String;
+    type Error = DbError;
 
     fn name(&self) -> &'static str {
         "db_set"
@@ -142,12 +154,12 @@ impl Tool for DbSet {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, ToolError> {
-        let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
+    ) -> Result<Self::Return, Self::Error> {
+        let ctx = ctx.ok_or(DbError::NoSessionContext)?;
         let value_len = args.value.0.len();
         db::kv_set(ctx.db.as_ref(), ctx.session_id, &args.key, &args.value.0).map_err(|e| {
             error!(session = ctx.session_id, key = &args.key, error = %e, "db_set failed");
-            ToolError::Other(format!("db_set failed: {e}"))
+            DbError::Storage(format!("db_set failed: {e}"))
         })?;
         debug!(
             session = ctx.session_id,
@@ -166,6 +178,7 @@ pub(crate) struct DbGet;
 impl Tool for DbGet {
     type Args = DbGetArgs;
     type Return = Option<String>;
+    type Error = DbError;
 
     fn name(&self) -> &'static str {
         "db_get"
@@ -197,8 +210,8 @@ impl Tool for DbGet {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, ToolError> {
-        let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
+    ) -> Result<Self::Return, Self::Error> {
+        let ctx = ctx.ok_or(DbError::NoSessionContext)?;
         match db::kv_get(ctx.db.as_ref(), ctx.session_id, &args.key) {
             Ok(value) => {
                 let value_len = value.as_ref().map_or(0, Vec::len);
@@ -213,7 +226,7 @@ impl Tool for DbGet {
             }
             Err(e) => {
                 error!(session = ctx.session_id, key = &args.key, error = %e, "db_get failed");
-                Err(ToolError::Other(format!("db_get failed: {e}")))
+                Err(DbError::Storage(format!("db_get failed: {e}")))
             }
         }
     }
@@ -226,6 +239,7 @@ pub(crate) struct DbDelete;
 impl Tool for DbDelete {
     type Args = DbDeleteArgs;
     type Return = String;
+    type Error = DbError;
 
     fn name(&self) -> &'static str {
         "db_delete"
@@ -249,8 +263,8 @@ impl Tool for DbDelete {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, ToolError> {
-        let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
+    ) -> Result<Self::Return, Self::Error> {
+        let ctx = ctx.ok_or(DbError::NoSessionContext)?;
         match db::kv_delete(ctx.db.as_ref(), ctx.session_id, &args.key) {
             Ok(true) => {
                 debug!(session = ctx.session_id, key = &args.key, "db_delete ok");
@@ -266,7 +280,7 @@ impl Tool for DbDelete {
             }
             Err(e) => {
                 error!(session = ctx.session_id, key = &args.key, error = %e, "db_delete failed");
-                Err(ToolError::Other(format!("db_delete failed: {e}")))
+                Err(DbError::Storage(format!("db_delete failed: {e}")))
             }
         }
     }
@@ -279,6 +293,7 @@ pub(crate) struct DbDeleteRange;
 impl Tool for DbDeleteRange {
     type Args = DbDeleteRangeArgs;
     type Return = String;
+    type Error = DbError;
 
     fn name(&self) -> &'static str {
         "db_delete_range"
@@ -302,8 +317,8 @@ impl Tool for DbDeleteRange {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, ToolError> {
-        let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
+    ) -> Result<Self::Return, Self::Error> {
+        let ctx = ctx.ok_or(DbError::NoSessionContext)?;
         match db::kv_delete_range(
             ctx.db.as_ref(),
             ctx.session_id,
@@ -328,7 +343,7 @@ impl Tool for DbDeleteRange {
                     error = %e,
                     "db_delete_range failed"
                 );
-                Err(ToolError::Other(format!("db_delete_range failed: {e}")))
+                Err(DbError::Storage(format!("db_delete_range failed: {e}")))
             }
         }
     }
@@ -341,6 +356,7 @@ pub(crate) struct DbGetRange;
 impl Tool for DbGetRange {
     type Args = DbGetRangeArgs;
     type Return = Vec<DbGetRangeEntry>;
+    type Error = DbError;
 
     fn name(&self) -> &'static str {
         "db_get_range"
@@ -367,8 +383,8 @@ impl Tool for DbGetRange {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, ToolError> {
-        let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
+    ) -> Result<Self::Return, Self::Error> {
+        let ctx = ctx.ok_or(DbError::NoSessionContext)?;
         match db::kv_get_range(
             ctx.db.as_ref(),
             ctx.session_id,
@@ -401,7 +417,7 @@ impl Tool for DbGetRange {
                     error = %e,
                     "db_get_range failed"
                 );
-                Err(ToolError::Other(format!("db_get_range failed: {e}")))
+                Err(DbError::Storage(format!("db_get_range failed: {e}")))
             }
         }
     }
@@ -414,6 +430,7 @@ pub(crate) struct DbList;
 impl Tool for DbList {
     type Args = DbListArgs;
     type Return = Vec<String>;
+    type Error = DbError;
 
     fn name(&self) -> &'static str {
         "db_list"
@@ -437,8 +454,8 @@ impl Tool for DbList {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, ToolError> {
-        let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
+    ) -> Result<Self::Return, Self::Error> {
+        let ctx = ctx.ok_or(DbError::NoSessionContext)?;
         match db::kv_list(
             ctx.db.as_ref(),
             ctx.session_id,
@@ -464,7 +481,7 @@ impl Tool for DbList {
                     error = %e,
                     "db_list failed"
                 );
-                Err(ToolError::Other(format!("db_list failed: {e}")))
+                Err(DbError::Storage(format!("db_list failed: {e}")))
             }
         }
     }
@@ -477,6 +494,7 @@ pub(crate) struct DbCount;
 impl Tool for DbCount {
     type Args = DbCountArgs;
     type Return = u64;
+    type Error = DbError;
 
     fn name(&self) -> &'static str {
         "db_count"
@@ -500,8 +518,8 @@ impl Tool for DbCount {
         _x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&std::path::Path>,
         ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, ToolError> {
-        let ctx = ctx.ok_or_else(|| ToolError::Other("no session context".into()))?;
+    ) -> Result<Self::Return, Self::Error> {
+        let ctx = ctx.ok_or(DbError::NoSessionContext)?;
         match db::kv_count(ctx.db.as_ref(), ctx.session_id, args.prefix.as_deref()) {
             Ok(count) => {
                 debug!(
@@ -519,7 +537,7 @@ impl Tool for DbCount {
                     error = %e,
                     "db_count failed"
                 );
-                Err(ToolError::Other(format!("db_count failed: {e}")))
+                Err(DbError::Storage(format!("db_count failed: {e}")))
             }
         }
     }
@@ -868,5 +886,21 @@ mod tests {
     fn db_count_output_schema_is_integer() {
         let schema = DbCount.output_schema().expect("schema");
         assert_eq!(schema["type"], "integer");
+    }
+
+    // ── DbError postcard round trip ────────────────────────────────
+
+    #[test]
+    fn db_error_postcard_round_trip() {
+        let errors = vec![
+            DbError::NotFound("my_key".into()),
+            DbError::NoSessionContext,
+            DbError::Storage("disk full".into()),
+        ];
+        for err in &errors {
+            let encoded = postcard::to_allocvec(err).unwrap();
+            let decoded: DbError = postcard::from_bytes(&encoded).unwrap();
+            assert_eq!(err.to_string(), decoded.to_string());
+        }
     }
 }

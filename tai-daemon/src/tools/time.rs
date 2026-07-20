@@ -1,19 +1,19 @@
-use super::ToolError;
+use super::{EmptyArgs, ToolExecError};
 use std::path::Path;
 use std::time::SystemTime;
 
 /// Returns the current Unix timestamp in milliseconds since the epoch.
 ///
-/// Propagates a [`ToolError`] if the system clock is set before UNIX_EPOCH
+/// Propagates a [`ToolExecError`] if the system clock is set before UNIX_EPOCH
 /// (essentially impossible on real hardware, but handled gracefully rather
 /// than silently returning 0).
 pub(crate) fn execute_get_current_time(
-    _args: &(),
+    _args: &EmptyArgs,
     _working_dir: Option<&Path>,
-) -> Result<u64, ToolError> {
+) -> Result<u64, ToolExecError> {
     let millis = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| ToolError::Other(format!("system clock before epoch: {e}")))?
+        .map_err(|e| ToolExecError(format!("system clock before epoch: {e}")))?
         .as_millis() as u64;
     tracing::debug!(millis, "get_current_time");
     Ok(millis)
@@ -22,8 +22,9 @@ pub(crate) fn execute_get_current_time(
 pub(crate) struct GetCurrentTime;
 
 impl super::Tool for GetCurrentTime {
-    type Args = ();
+    type Args = EmptyArgs;
     type Return = u64;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "get_current_time"
@@ -47,7 +48,7 @@ impl super::Tool for GetCurrentTime {
         _x_credentials: Option<&crate::tools::ServiceCredential>,
         working_dir: Option<&std::path::Path>,
         _ctx: Option<&crate::tools::context::ToolContext>,
-    ) -> Result<Self::Return, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_get_current_time(&args, working_dir)
     }
 }
@@ -59,7 +60,7 @@ mod tests {
 
     #[test]
     fn test_returns_reasonable_millis() {
-        let result = execute_get_current_time(&(), None).unwrap();
+        let result = execute_get_current_time(&EmptyArgs {}, None).unwrap();
         // Should be around 1.7+ trillion ms (year 2024+), well short of u64::MAX
         assert!(
             result > 1_700_000_000_000,

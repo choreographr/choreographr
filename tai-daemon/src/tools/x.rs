@@ -1,4 +1,4 @@
-use crate::tools::{ToolError, context::ToolContext, truncate_tool_output};
+use crate::tools::{ToolExecError, context::ToolContext, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -226,10 +226,10 @@ fn format_x_api_response(response: &str) -> String {
 fn execute_x_post_tool(
     args: &XPostArgs,
     x_credentials: Option<&ServiceCredential>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     let text = args.text.trim();
     if text.is_empty() {
-        return Err(ToolError::Other("text must not be empty".to_string()));
+        return Err(ToolExecError("text must not be empty".to_string()));
     }
 
     let body = serde_json::json!({ "text": text }).to_string();
@@ -241,16 +241,16 @@ fn execute_x_post_tool(
                 format_x_api_response(&response)
             ))
         })
-        .map_err(|e| ToolError::Other(truncate_tool_output(&e)))
+        .map_err(|e| ToolExecError(truncate_tool_output(&e)))
 }
 
 fn execute_x_search_recent_tool(
     args: &XSearchRecentArgs,
     x_credentials: Option<&ServiceCredential>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     let query = args.query.trim();
     if query.is_empty() {
-        return Err(ToolError::Other("query must not be empty".to_string()));
+        return Err(ToolExecError("query must not be empty".to_string()));
     }
 
     let max_results = args.max_results.unwrap_or(10).clamp(10, 100);
@@ -269,16 +269,16 @@ fn execute_x_search_recent_tool(
                 format_x_api_response(&response)
             ))
         })
-        .map_err(|e| ToolError::Other(truncate_tool_output(&e)))
+        .map_err(|e| ToolExecError(truncate_tool_output(&e)))
 }
 
 fn execute_x_user_lookup_tool(
     args: &XUserLookupArgs,
     x_credentials: Option<&ServiceCredential>,
-) -> Result<String, ToolError> {
+) -> Result<String, ToolExecError> {
     let username = args.username.trim();
     if username.is_empty() {
-        return Err(ToolError::Other("username must not be empty".to_string()));
+        return Err(ToolExecError("username must not be empty".to_string()));
     }
 
     let params = vec![("user.fields", "description,public_metrics,created_at")];
@@ -294,7 +294,7 @@ fn execute_x_user_lookup_tool(
             format_x_api_response(&response)
         ))
     })
-    .map_err(|e| ToolError::Other(truncate_tool_output(&e)))
+    .map_err(|e| ToolExecError(truncate_tool_output(&e)))
 }
 
 pub(crate) struct XPost;
@@ -302,6 +302,7 @@ pub(crate) struct XPost;
 impl super::Tool for XPost {
     type Args = XPostArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "x_post"
@@ -325,7 +326,7 @@ impl super::Tool for XPost {
         x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_x_post_tool(&args, x_credentials)
     }
 }
@@ -335,6 +336,7 @@ pub(crate) struct XSearchRecent;
 impl super::Tool for XSearchRecent {
     type Args = XSearchRecentArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "x_search_recent"
@@ -358,7 +360,7 @@ impl super::Tool for XSearchRecent {
         x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_x_search_recent_tool(&args, x_credentials)
     }
 }
@@ -368,6 +370,7 @@ pub(crate) struct XUserLookup;
 impl super::Tool for XUserLookup {
     type Args = XUserLookupArgs;
     type Return = String;
+    type Error = ToolExecError;
 
     fn name(&self) -> &'static str {
         "x_user_lookup"
@@ -391,7 +394,7 @@ impl super::Tool for XUserLookup {
         x_credentials: Option<&ServiceCredential>,
         _working_dir: Option<&Path>,
         _ctx: Option<&ToolContext>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<Self::Return, Self::Error> {
         execute_x_user_lookup_tool(&args, x_credentials)
     }
 }
