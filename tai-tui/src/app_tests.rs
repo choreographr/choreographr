@@ -4,7 +4,11 @@ use crate::state::*;
 use crate::test_util::test_app;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::text::Line;
-use tai_proto::{ClientMessage, DaemonMessage, SessionStatus, TokenUsage, Turn};
+use tai_client_core::TurnEventHandler;
+use tai_proto::{
+    ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, SessionStatus, TokenUsage,
+    Turn,
+};
 use tui_prompts::State;
 
 /// Add a UserText turn to the session, mimicking what the daemon sends after
@@ -1779,4 +1783,43 @@ fn handle_session_status_changed_updates_attached_status() {
         app.attached_status,
         Some(SessionStatus::ToolCall("test".into()))
     );
+}
+
+#[test]
+fn handle_turn_appended_with_displayed_image_populates_rendered_images() {
+    let mut app = test_app("/tmp/tai.sock");
+    let metadata = ImageMetadata {
+        mime_type: "image/png".to_string(),
+        width: 640,
+        height: 480,
+        byte_len: 100,
+        alt: Some("test image".to_string()),
+    };
+    let turn = Turn {
+        created_at: tai_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("generate an image".to_string()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![DisplayedImageRecord {
+            metadata: metadata.clone(),
+            data: vec![0u8; 100],
+            tool_call_id: None,
+        }],
+    };
+    app.handle_turn_appended(1, turn);
+
+    let images = app.rendered_images.get(&1).unwrap();
+    assert_eq!(images.len(), 1);
+    let img = images.get(&0).unwrap();
+    assert_eq!(img.metadata.mime_type, "image/png");
+    assert_eq!(img.metadata.width, 640);
+    assert_eq!(img.metadata.height, 480);
+    assert_eq!(img.data.len(), 100);
+    assert!(img.pending_job.is_none());
+    assert!(img.protocols.is_empty());
 }

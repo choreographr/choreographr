@@ -2,6 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Rect, Size};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tai_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use tai_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
 use tai_proto::{
@@ -21,8 +22,6 @@ pub(crate) const STATUS_BAR_HEIGHT: u16 = 2;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
-
-pub(crate) const IMAGE_BLOCK_HEIGHT: u16 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HomeMenuItem {
@@ -911,7 +910,7 @@ impl App {
             let text_lines = render_turn_lines(turn, content_width, tool_content_width);
             let text_height = lines_height(&text_lines, self.history_viewport.width).max(1);
             computed_lines.push(Some((text_lines, content_width)));
-            let img_height = turn.displayed_images.len() * IMAGE_BLOCK_HEIGHT as usize;
+            let img_height = turn.displayed_images.len() * self.image_block_height() as usize;
             let turn_height = text_height + img_height;
             // Marker for turns with user_text — points to the start of the turn.
             if turn.user_text.is_some() {
@@ -991,13 +990,15 @@ impl App {
         let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT + self.status_error_height(width);
         if width > 1 && height > bottom_height {
             let old_width = self.history_viewport.width;
+            let old_height = self.history_viewport.height;
+            let new_height = height - bottom_height;
             self.history_viewport.update(Rect {
                 x: 0,
                 y: 0,
                 width: width - 1,
-                height: height - bottom_height,
+                height: new_height,
             });
-            if old_width != width {
+            if old_width != width || old_height != new_height {
                 for cached in &mut self.render_cache {
                     *cached = None;
                 }
@@ -1013,6 +1014,36 @@ impl App {
     pub(crate) fn effective_scroll(&self) -> usize {
         self.history_scroll
             .effective_scroll(self.max_scroll_offset())
+    }
+
+    /// Populate `rendered_images` from a turn's `displayed_images`.
+    ///
+    /// Each `DisplayedImageRecord` is converted to a `RenderedImage::new_placeholder`
+    /// so the inline/fullscreen render path can find it and submit encoding jobs
+    /// to the background worker.  Called whenever a turn arrives.
+    pub(crate) fn sync_turn_images(&mut self, turn_id: u32, turn: &Turn) {
+        let images = self.rendered_images.entry(turn_id).or_default();
+        for (idx, record) in turn.displayed_images.iter().enumerate() {
+            // Only insert missing entries — preserve cached protocols across
+            // re-syncs (e.g. TurnAppended → TurnFinalized with same images).
+            images.entry(idx).or_insert_with(|| {
+                RenderedImage::new_placeholder(
+                    record.metadata.clone(),
+                    Arc::from(record.data.clone()),
+                )
+            });
+        }
+        // Remove entries for images that no longer exist in the turn.
+        images.retain(|&idx, _| idx < turn.displayed_images.len());
+    }
+
+    /// Stable image block height for layout and scroll calculations.
+    ///
+    /// Uses half the viewport height as a heuristic.  This value is stable
+    /// within a given terminal size so scroll positions don't shift when
+    /// encoding completes.
+    pub(crate) fn image_block_height(&self) -> u16 {
+        (self.history_viewport.height / 2).max(1)
     }
 
     pub(crate) fn ensure_cache_synced(&mut self) {
@@ -1457,12 +1488,14 @@ impl App {
 impl TurnEventHandler for App {
     fn handle_turn_appended(&mut self, turn_id: u32, turn: Turn) {
         tracing::trace!(%turn_id, "handle_turn_appended");
+        self.sync_turn_images(turn_id, &turn);
         self.session_view.insert_or_replace(turn_id, turn);
         self.markers_dirty = true;
     }
 
     fn handle_turn_finalized(&mut self, turn_id: u32, turn: Turn) {
         tracing::trace!(%turn_id, "handle_turn_finalized");
+        self.sync_turn_images(turn_id, &turn);
         self.session_view.insert_or_replace(turn_id, turn);
         self.markers_dirty = true;
     }
@@ -1480,6 +1513,7 @@ impl TurnEventHandler for App {
     fn handle_turns_redone(&mut self, turns: std::collections::BTreeMap<u32, Turn>) {
         tracing::trace!(?turns, "handle_turns_redone");
         for (tid, turn) in turns {
+            self.sync_turn_images(tid, &turn);
             self.session_view.insert_or_replace(tid, turn);
         }
         self.markers_dirty = true;
@@ -1575,6 +1609,12 @@ impl TurnEventHandler for App {
             status,
             ..
         } = state;
+        // Sync images from the incoming turns before assigning to self,
+        // avoiding a borrow conflict between &mut self and &self.session_view.
+        self.rendered_images.clear();
+        for (tid, turn) in &turns {
+            self.sync_turn_images(*tid, turn);
+        }
         self.session_view.turns = turns;
         self.attached_model = selected_model;
         self.attached_token_usage = token_usage;
@@ -2082,5 +2122,49 @@ mod tests {
         let mut app = test_app("/tmp/tai.sock");
         app.status = Some("status".into());
         assert_eq!(app.status_error_height(80), 1);
+    }
+
+    #[test]
+    fn sync_turn_images_populates_rendered_images() {
+        let mut app = test_app("/tmp/tai.sock");
+        let metadata = tai_proto::ImageMetadata {
+            mime_type: "image/svg+xml".to_string(),
+            width: 100,
+            height: 200,
+            byte_len: 50,
+            alt: None,
+        };
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![
+                tai_proto::DisplayedImageRecord {
+                    metadata: metadata.clone(),
+                    data: b"svg-data".to_vec(),
+                    tool_call_id: Some("call-1".into()),
+                },
+                tai_proto::DisplayedImageRecord {
+                    metadata: metadata.clone(),
+                    data: b"more-svg".to_vec(),
+                    tool_call_id: None,
+                },
+            ],
+        };
+        app.sync_turn_images(42, &turn);
+
+        let images = app.rendered_images.get(&42).unwrap();
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[&0].data.as_ref(), b"svg-data");
+        assert_eq!(images[&1].data.as_ref(), b"more-svg");
+        // Second call is idempotent — preserves existing entries
+        app.sync_turn_images(42, &turn);
+        assert_eq!(app.rendered_images.get(&42).unwrap().len(), 2);
     }
 }

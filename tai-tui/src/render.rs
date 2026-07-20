@@ -1,8 +1,8 @@
 use crate::markdown_render::{display_width, lines_height, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
-    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, IMAGE_BLOCK_HEIGHT,
-    INPUT_BAR_HEIGHT, PROVIDER_OPTIONS, Page, RenderedCache, STATUS_BAR_HEIGHT, SessionManagerView,
+    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, INPUT_BAR_HEIGHT,
+    PROVIDER_OPTIONS, Page, RenderedCache, STATUS_BAR_HEIGHT, SessionManagerView,
 };
 use ratatui::{
     Frame,
@@ -12,7 +12,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
+use std::sync::Arc;
 use tai_proto::{SessionStatus, ThinkingEffort};
+use tai_tui::RenderedImage;
 
 use tui_prompts::{
     Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
@@ -59,7 +61,13 @@ pub(crate) fn render_fullscreen_only(frame: &mut Frame<'_>, app: &mut App) -> bo
     let Some((turn_id, img_idx)) = app.fullscreen_image_target else {
         return false;
     };
-    if !app.rendered_images.contains_key(&turn_id) {
+    if !app.rendered_images.contains_key(&turn_id)
+        && !app
+            .session_view
+            .turns
+            .get(&turn_id)
+            .is_some_and(|t| !t.displayed_images.is_empty())
+    {
         app.fullscreen_image_target = None;
         return false;
     }
@@ -78,6 +86,22 @@ fn render_fullscreen_placeholder(frame: &mut Frame<'_>) {
 fn render_fullscreen_image(frame: &mut Frame<'_>, turn_id: u32, img_idx: usize, app: &mut App) {
     let area = frame.area();
     let full = Size::new(area.width, area.height);
+
+    // Ensure the rendered_images entry exists — create from turn data if missing.
+    if !app.rendered_images.contains_key(&turn_id) {
+        let Some(turn) = app.session_view.turns.get(&turn_id) else {
+            return;
+        };
+        let Some(record) = turn.displayed_images.get(img_idx) else {
+            return;
+        };
+        let placeholder =
+            RenderedImage::new_placeholder(record.metadata.clone(), Arc::from(record.data.clone()));
+        app.rendered_images
+            .entry(turn_id)
+            .or_default()
+            .insert(img_idx, placeholder);
+    }
 
     // Fast path — already encoded at full size.
     let should_submit = match app
@@ -359,7 +383,6 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 continue;
             }
             let count = turn.displayed_images.len();
-            // ── Phase A: text content ──────────────────────────
             let lines = cached_or_compute_lines(&mut app.render_cache, i, content_width, || {
                 render_turn_lines(turn, content_width, tool_content_width)
             });
@@ -368,6 +391,27 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
         let text_height = lines_height(&text_lines, area.width).max(1);
 
+        // ── Images (rendered first so they sit below text) ──
+        let full_img_height = app.image_block_height() as usize;
+        for img_idx in (0..img_count).rev() {
+            if let Some((_top_line, visible_height)) = clipped_area(
+                full_img_height,
+                &mut rows_to_skip,
+                &mut rows_remaining,
+                &mut y,
+            ) {
+                let fully_visible = visible_height >= full_img_height;
+                let img_rect = Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: visible_height as u16,
+                };
+                render_turn_image(frame, img_rect, turn_id, img_idx, app, fully_visible);
+            }
+        }
+
+        // ── Text content (render above images) ──
         if let Some((top_line, visible_height)) =
             clipped_area(text_height, &mut rows_to_skip, &mut rows_remaining, &mut y)
         {
@@ -380,22 +424,6 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 &mut y,
                 Style::default(),
             );
-        }
-
-        // ── Phase B: images ────────────────────────────────────
-        for img_idx in 0..img_count {
-            let img_height = IMAGE_BLOCK_HEIGHT as usize;
-            if let Some((_top_line, visible_height)) =
-                clipped_area(img_height, &mut rows_to_skip, &mut rows_remaining, &mut y)
-            {
-                let img_rect = Rect {
-                    x: area.x,
-                    y,
-                    width: area.width,
-                    height: visible_height as u16,
-                };
-                render_turn_image(frame, img_rect, turn_id, img_idx, app);
-            }
         }
     }
 }
@@ -478,16 +506,22 @@ fn render_margin_lines(
 
 /// Render a single turn-displayed image block.
 ///
-/// Height is always `IMAGE_BLOCK_HEIGHT` regardless of encoding state,
+/// Height is always `image_block_height()` regardless of encoding state,
 /// so scroll positions remain stable.
+///
+/// When `fully_visible` is true the image is centered within its block
+/// using the protocol's actual rendered dimensions (via `size_for`). When
+/// only a slice of the block is visible it is rendered without centering
+/// to prevent visual reflow during scrolling.
 fn render_turn_image(
     frame: &mut Frame<'_>,
     area: Rect,
     turn_id: u32,
     img_idx: usize,
     app: &mut App,
+    fully_visible: bool,
 ) {
-    let inline_size = Size::new(area.width, IMAGE_BLOCK_HEIGHT);
+    let inline_size = Size::new(area.width, app.image_block_height());
 
     // Extract data we need while the borrow is active.
     let (needs_job, data, meta) = match app
@@ -504,11 +538,23 @@ fn render_turn_image(
                 let block = Block::default().title(title);
                 let inner = block.inner(area);
                 frame.render_widget(block, area);
-                frame.render_stateful_widget(
-                    StatefulImage::new().resize(tai_tui::IMAGE_RESIZE),
-                    inner,
-                    protocol,
-                );
+                if fully_visible {
+                    // Center the image within the block using the protocol's actual
+                    // rendered dimensions, preventing visual reflow when only part
+                    // of the block is visible.
+                    let rendered_at = protocol.size_for(tai_tui::IMAGE_RESIZE, inline_size);
+                    let centered = Rect {
+                        x: inner.x + (inner.width.saturating_sub(rendered_at.width)) / 2,
+                        y: inner.y + (inner.height.saturating_sub(rendered_at.height)) / 2,
+                        width: rendered_at.width.min(inner.width),
+                        height: rendered_at.height.min(inner.height),
+                    };
+                    frame.render_stateful_widget(
+                        StatefulImage::new().resize(tai_tui::IMAGE_RESIZE),
+                        centered,
+                        protocol,
+                    );
+                }
                 return;
             }
             (

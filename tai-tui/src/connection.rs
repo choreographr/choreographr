@@ -2,8 +2,8 @@ use crate::markdown_render::{lines_height, render_turn_lines};
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    AIProvidersView, App, HOME_MENU_ITEMS, HomeMenuItem, IMAGE_BLOCK_HEIGHT, InputBuffer,
-    PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent, find_turn_at_row,
+    AIProvidersView, App, HOME_MENU_ITEMS, HomeMenuItem, InputBuffer, PAGE_SCROLL_LINES, Page,
+    SessionManagerView, UiEvent, find_turn_at_row,
 };
 use crossbeam::channel;
 use crossbeam::select;
@@ -892,7 +892,10 @@ fn handle_chat_event(
                 }
                 // Left-click on an image opens it fullscreen.  We look up the
                 // turn at the clicked row and determine which displayed image
-                // (if any) the click landed on.
+                // (if any) the click landed on. Images occupy the bottom of
+                // each turn, so we first compute the text height from the
+                // render cache (or fresh computation) and then check whether
+                // the click fell in the image band below the text.
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some(turn_idx) = find_turn_at_row(app, mouse.row) {
                         let turn_id = app.visible_turn_ids[turn_idx];
@@ -904,6 +907,14 @@ fn handle_chat_event(
                                 .get(turn_idx.wrapping_sub(1))
                                 .copied()
                                 .unwrap_or(0);
+                            let total_height = app.total_history_height();
+                            let vh = app.history_viewport.height as usize;
+                            let content_line = total_height
+                                .saturating_sub(app.effective_scroll() + vh)
+                                .saturating_add(mouse.row as usize);
+                            let offset = content_line.saturating_sub(turn_start);
+
+                            // Compute text height from cached render lines or fresh computation.
                             let content_width = app.history_viewport.width.saturating_sub(9);
                             let tool_content_width = app.history_viewport.width.saturating_sub(4);
                             let text_lines = match app.render_cache.get(turn_idx) {
@@ -914,14 +925,11 @@ fn handle_chat_event(
                             };
                             let text_height =
                                 lines_height(&text_lines, app.history_viewport.width).max(1);
-                            let total_height = app.total_history_height();
-                            let vh = app.history_viewport.height as usize;
-                            let content_line = total_height
-                                .saturating_sub(app.effective_scroll() + vh)
-                                .saturating_add(mouse.row as usize);
-                            let offset = content_line.saturating_sub(turn_start);
+
+                            // Images occupy the bottom of the turn — offsets text_height to turn_height-1.
+                            let img_block_height = app.image_block_height() as usize;
                             if offset >= text_height {
-                                let img_idx = (offset - text_height) / IMAGE_BLOCK_HEIGHT as usize;
+                                let img_idx = (offset - text_height) / img_block_height;
                                 if img_idx < turn.displayed_images.len() {
                                     app.fullscreen_image_target = Some((turn_id, img_idx));
                                 }
