@@ -522,7 +522,7 @@ pub fn static_groups() -> &'static [ToolGroup] {
             },
             ToolGroup {
                 name: "git".into(),
-                description: "Local Git repository operations (status, diff, log, add, commit, push)".into(),
+                description:                 "Local Git repository operations (status, diff, log, add, commit, push, show)".into(),
             },
             ToolGroup {
                 name: "shell".into(),
@@ -571,6 +571,7 @@ impl ToolRegistry {
         reg.register(git::GitAdd);
         reg.register(git::GitCommit);
         reg.register(git::GitPush);
+        reg.register(git::GitShow);
         reg.register(sh::Sh);
         if shell_util::binary_exists("nu") {
             reg.register(nu::NuShell);

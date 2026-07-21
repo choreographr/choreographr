@@ -29,9 +29,9 @@ pub use crate::tools::exec::{ExecArgs, execute_exec_tool};
 pub use crate::tools::find::{FindArgs, execute_find_tool};
 pub use crate::tools::fish::{FishArgs, execute_fish_tool};
 pub use crate::tools::git::{
-    GitAddArgs, GitCommitArgs, GitDiffArgs, GitLogArgs, GitPushArgs, GitRepoArgs,
+    GitAddArgs, GitCommitArgs, GitDiffArgs, GitLogArgs, GitPushArgs, GitRepoArgs, GitShowArgs,
     execute_git_add_tool, execute_git_commit_tool, execute_git_diff_tool, execute_git_log_tool,
-    execute_git_push_tool, execute_git_status_tool,
+    execute_git_push_tool, execute_git_show_tool, execute_git_status_tool,
 };
 pub use crate::tools::grep::{GrepArgs, execute_grep_tool};
 pub use crate::tools::notify::{NotifySendArgs, execute_notify_send};

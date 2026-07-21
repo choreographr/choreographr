@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 base64.workspace = true
 dirs.workspace = true
@@ -14,7 +15,7 @@ grep-searcher = "0.1"
 hex = "0.4"
 nix = { workspace = true, features = ["signal", "resource"] }
 
-gix = { version = "0.85", features = ["tree-editor"] }
+gix = { version = "0.85", features = ["tree-editor", "revision"] }
 gix-imara-diff = { version = "0.2", features = ["unified_diff"] }
 hmac = "0.13"
 image.workspace = true

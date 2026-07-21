@@ -19,7 +19,7 @@ pub struct GitDiffArgs {
 ///
 /// This ensures the diff content is clearly delimited from surrounding
 /// tool output when rendered in markdown or the TUI.
-fn append_fenced_diff(out: &mut String, diff: &str) {
+pub fn append_fenced_diff(out: &mut String, diff: &str) {
     if !diff.is_empty() {
         out.push_str("```diff\n");
         out.push_str(diff);
