@@ -932,8 +932,7 @@ pub(crate) fn run_agent_loop(
                         .into_iter()
                         .map(|tool_call| {
                             let timeout = determine_tool_timeout(&tool_call.name);
-                            let invocation_description =
-                                reg.describe_invocation(&tool_call);
+                            let invocation_description = reg.describe_invocation(&tool_call);
                             let call_info = (
                                 tool_call.id.clone(),
                                 tool_call.name.clone(),
@@ -959,8 +958,10 @@ pub(crate) fn run_agent_loop(
                     if is_cancelled_once(cancel_rx) {
                         cancel_flag.store(true, Ordering::Relaxed);
                     }
-                    for ((call_id, tool_name, arguments_json, tool_start, invocation_description), handle) in
-                        handles.into_iter()
+                    for (
+                        (call_id, tool_name, arguments_json, tool_start, invocation_description),
+                        handle,
+                    ) in handles.into_iter()
                     {
                         if is_cancelled_once(cancel_rx) {
                             cancel_flag.store(true, Ordering::Relaxed);

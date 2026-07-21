@@ -10,6 +10,17 @@ use crate::render::{BG_SHADE, format_timestamp};
 use crate::syntax::{highlight_theme, syntax_set, to_ratatui_color};
 use tracing::warn;
 
+fn find_syntax<'a>(
+    ss: &'a syntect::parsing::SyntaxSet,
+    lang: &str,
+) -> Option<&'a syntect::parsing::SyntaxReference> {
+    ss.find_syntax_by_token(lang).or_else(move || match lang {
+        "typescript" | "tsx" | "mts" | "cts" => ss.find_syntax_by_token("javascript"),
+        "vue" | "svelte" => ss.find_syntax_by_token("html"),
+        _ => None,
+    })
+}
+
 fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
     static CACHE: GlobalLruCache<(String, String), Vec<Line<'static>>, 200> = GlobalLruCache::new();
 
@@ -19,7 +30,7 @@ fn highlight_code(language: Option<&str>, code: &str) -> Vec<Line<'static>> {
         let ss = syntax_set();
 
         let syntax = language
-            .and_then(|lang| ss.find_syntax_by_token(lang))
+            .and_then(|lang| find_syntax(ss, lang))
             .unwrap_or_else(|| ss.find_syntax_plain_text());
 
         let theme = highlight_theme();
@@ -1251,6 +1262,55 @@ fn wrapped_line_height(line: &Line<'_>, width: usize) -> usize {
 mod tests {
     use super::*;
     use ratatui::style::Color;
+
+    // ── find_syntax ──────────────────────────────────────────────────────
+
+    #[test]
+    fn find_syntax_rust() {
+        let ss = syntax_set();
+        let result = find_syntax(ss, "rust");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "Rust");
+    }
+
+    #[test]
+    fn find_syntax_typescript_maps_to_javascript() {
+        let ss = syntax_set();
+        let result = find_syntax(ss, "typescript");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "JavaScript");
+    }
+
+    #[test]
+    fn find_syntax_tsx_maps_to_javascript() {
+        let ss = syntax_set();
+        let result = find_syntax(ss, "tsx");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "JavaScript");
+    }
+
+    #[test]
+    fn find_syntax_vue_maps_to_html() {
+        let ss = syntax_set();
+        let result = find_syntax(ss, "vue");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "HTML");
+    }
+
+    #[test]
+    fn find_syntax_svelte_maps_to_html() {
+        let ss = syntax_set();
+        let result = find_syntax(ss, "svelte");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "HTML");
+    }
+
+    #[test]
+    fn find_syntax_unknown_returns_none() {
+        let ss = syntax_set();
+        let result = find_syntax(ss, "not-a-real-language-12345");
+        assert!(result.is_none());
+    }
 
     // ── highlight_code ───────────────────────────────────────────────────
 

@@ -23,8 +23,21 @@ const ADD_BG: Color = Color::Rgb(0, 80, 0);
 // ── Detection ────────────────────────────────────────────────────────
 
 /// Check if text looks like a unified diff.
+///
+/// Detects both raw unified diff headers and markdown-fenced diff blocks
+/// (```` ```diff ```` / ```` ``` ````).  When looking for `diff --git` the match
+/// must occur at a **line boundary** rather than anywhere in the string, so
+/// that content inside other kinds of markdown code blocks (e.g. file contents
+/// displayed by `write_file`) won't trigger a false positive.
 pub fn is_diff_text(text: &str) -> bool {
-    text.contains("diff --git ") || text.contains("\n--- ") || text.starts_with("--- ")
+    // Explicit fenced diff block
+    if text.contains("\n```diff\n") || text.starts_with("```diff\n") {
+        return true;
+    }
+    // Raw unified diff header at line start
+    text.starts_with("diff --git ") || text.contains("\ndiff --git ")
+    // `--- a/` / `--- /dev/` style path headers (part of unified diff)
+    || text.starts_with("--- ") || text.contains("\n--- ")
 }
 
 // ── Parsing ──────────────────────────────────────────────────────────

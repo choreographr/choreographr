@@ -4,10 +4,15 @@ use ratatui::style::Color;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
-/// Load the default syntax set (with newline-aware grammars).
+/// Load the default syntax set (without newline-aware grammars).
+///
+/// `nonewlines` mode is used because the TUI highlights each line
+/// independently via `highlight_line()`. With `newlines` mode syntect
+/// appends an extra `\n` to every highlighted line, producing
+/// double-spaced output in the TUI diff and code-block renderers.
 pub(crate) fn syntax_set() -> &'static SyntaxSet {
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
-    SS.get_or_init(SyntaxSet::load_defaults_newlines)
+    SS.get_or_init(SyntaxSet::load_defaults_nonewlines)
 }
 
 fn theme_set() -> &'static ThemeSet {

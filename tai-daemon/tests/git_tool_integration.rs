@@ -106,7 +106,6 @@ fn diff_working_tree() {
             repo_path: repo_path_arg(&repo),
             cached: None,
             pathspec: None,
-            full: None,
         },
         None,
     )
@@ -129,7 +128,6 @@ fn diff_cached() {
             repo_path: repo_path_arg(&repo),
             cached: Some(true),
             pathspec: None,
-            full: None,
         },
         None,
     )

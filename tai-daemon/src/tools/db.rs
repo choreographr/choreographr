@@ -1008,9 +1008,7 @@ mod tests {
     #[test]
     fn describe_db_count_invocation_without_prefix() {
         let tool = DbCount;
-        let args = DbCountArgs {
-            prefix: None,
-        };
+        let args = DbCountArgs { prefix: None };
         let desc = tool.describe_invocation(&args);
         assert_eq!(desc, "Counting all database entries.");
     }

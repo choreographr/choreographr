@@ -5,8 +5,7 @@ use serde::Deserialize;
 use std::{fmt::Write as _, io, ops::Deref};
 
 use super::{
-    collect_cached_diff_lines, format_index_worktree_change, open_repo, path_from_bytes,
-    pathspec_patterns, repo_work_dir_display, sort_and_dedup,
+    collect_cached_diff_lines, open_repo, path_from_bytes, pathspec_patterns, repo_work_dir_display,
 };
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -14,7 +13,18 @@ pub struct GitDiffArgs {
     pub repo_path: Option<String>,
     pub cached: Option<bool>,
     pub pathspec: Option<Vec<String>>,
-    pub full: Option<bool>,
+}
+
+/// Append a unified diff wrapped in a ````diff` fenced code block.
+///
+/// This ensures the diff content is clearly delimited from surrounding
+/// tool output when rendered in markdown or the TUI.
+fn append_fenced_diff(out: &mut String, diff: &str) {
+    if !diff.is_empty() {
+        out.push_str("```diff\n");
+        out.push_str(diff);
+        out.push_str("\n```");
+    }
 }
 
 pub fn execute_git_diff_tool(
@@ -22,31 +32,21 @@ pub fn execute_git_diff_tool(
     working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     let pathspec = args.pathspec.clone().unwrap_or_default();
-    if args.full.unwrap_or(false) {
-        let output = git_full_diff_impl(
-            args.repo_path.as_deref(),
-            args.cached.unwrap_or(false),
-            pathspec,
-            working_dir,
-        )?;
-        Ok(truncate_tool_output(&output))
-    } else {
-        let output = git_diff_impl(
-            args.repo_path.as_deref(),
-            args.cached.unwrap_or(false),
-            pathspec,
-            working_dir,
-        )?;
-        Ok(truncate_tool_output(&output))
-    }
+    let output = git_diff_impl(
+        args.repo_path.as_deref(),
+        args.cached.unwrap_or(false),
+        pathspec,
+        working_dir,
+    )?;
+    Ok(truncate_tool_output(&output))
 }
 
-/// Produce full unified diffs for changed files using gix.
+/// Produce unified diffs for changed files using gix.
 ///
 /// When `cached` is true, compares HEAD↔index (staged changes).
 /// When `cached` is false, compares index↔worktree (unstaged changes).
 /// Added files diff against an empty string; deleted files diff against HEAD content.
-fn git_full_diff_impl(
+pub(crate) fn git_diff_impl(
     repo_path: Option<&str>,
     cached: bool,
     pathspec: Vec<String>,
@@ -94,7 +94,7 @@ fn git_full_diff_impl(
                     writeln!(out).ok();
                     if let Some(new_content) = entry_content_by_path(&repo, &index, path) {
                         let diff = crate::diff_util::generate_diff("", &new_content, path, path);
-                        out.push_str(&diff);
+                        append_fenced_diff(&mut out, &diff);
                     }
                 }
                 // Deleted files have no new content — diff against HEAD.
@@ -103,7 +103,7 @@ fn git_full_diff_impl(
                     writeln!(out).ok();
                     if let Some(old_content) = head_content_by_path(&repo, path) {
                         let diff = crate::diff_util::generate_diff(&old_content, "", path, path);
-                        out.push_str(&diff);
+                        append_fenced_diff(&mut out, &diff);
                     }
                 }
                 // Modified or renamed files: diff HEAD content against index content.
@@ -116,7 +116,7 @@ fn git_full_diff_impl(
                     if old_content != new_content {
                         let diff =
                             crate::diff_util::generate_diff(&old_content, &new_content, path, path);
-                        out.push_str(&diff);
+                        append_fenced_diff(&mut out, &diff);
                     }
                 }
             }
@@ -154,7 +154,7 @@ fn git_full_diff_impl(
                             &path,
                             &path,
                         );
-                        out.push_str(&diff);
+                        append_fenced_diff(&mut out, &diff);
                     }
                 }
                 // Untracked files have no index counterpart — diff against empty string.
@@ -166,7 +166,7 @@ fn git_full_diff_impl(
                     let full_path = repo.workdir().unwrap_or(repo.git_dir()).join(&path);
                     if let Ok(new_content) = std::fs::read_to_string(&full_path) {
                         let diff = crate::diff_util::generate_diff("", &new_content, &path, &path);
-                        out.push_str(&diff);
+                        append_fenced_diff(&mut out, &diff);
                     }
                 }
                 _ => {}
@@ -214,62 +214,6 @@ fn entry_content_by_path(
     String::from_utf8(obj.data.to_vec()).ok()
 }
 
-/// Original summary-only diff (unchanged from before).
-pub(crate) fn git_diff_impl(
-    repo_path: Option<&str>,
-    cached: bool,
-    pathspec: Vec<String>,
-    working_dir: Option<&std::path::Path>,
-) -> Result<String, ToolError> {
-    let repo = open_repo(repo_path, working_dir)?;
-    let mut lines = if cached {
-        collect_cached_diff_lines(&repo, &pathspec)?
-    } else {
-        collect_worktree_diff_lines(&repo, &pathspec)?
-    };
-    sort_and_dedup(&mut lines);
-
-    let mut out = String::new();
-    writeln!(&mut out, "repository: {}", repo_work_dir_display(&repo)).ok();
-    writeln!(
-        &mut out,
-        "mode: {}",
-        if cached { "staged" } else { "working tree" }
-    )
-    .ok();
-    if !pathspec.is_empty() {
-        writeln!(&mut out, "pathspec: {}", humfmt::list(&pathspec)).ok();
-    }
-    if lines.is_empty() {
-        writeln!(&mut out, "no changes").ok();
-    } else {
-        for line in lines {
-            writeln!(&mut out, "{line}").ok();
-        }
-    }
-    Ok(out.trim_end().to_string())
-}
-
-fn collect_worktree_diff_lines(
-    repo: &gix::Repository,
-    pathspec: &[String],
-) -> Result<Vec<String>, ToolError> {
-    let patterns = pathspec_patterns(pathspec);
-    let iter = repo
-        .status(gix::progress::Discard)
-        .map_err(io::Error::other)?
-        .untracked_files(UntrackedFiles::Files)
-        .into_index_worktree_iter(patterns)
-        .map_err(io::Error::other)?;
-
-    let mut lines = Vec::new();
-    for item in iter {
-        let item = item.map_err(io::Error::other)?;
-        lines.push(format_index_worktree_change(&item));
-    }
-    Ok(lines)
-}
-
 pub fn describe_git_diff_invocation(args: &GitDiffArgs) -> String {
     let mut parts = vec!["Showing git diff.".to_string()];
     if args.cached.unwrap_or(false) {
@@ -280,9 +224,6 @@ pub fn describe_git_diff_invocation(args: &GitDiffArgs) -> String {
     {
         parts.push(format!(" Pathspec: `{}`.", paths.join("`, `")));
     }
-    if args.full.unwrap_or(false) {
-        parts.push(" Full diff.".to_string());
-    }
     parts.concat()
 }
 
@@ -291,7 +232,7 @@ pub(crate) struct GitDiff;
 define_tool!(
     GitDiff,
     "git_diff",
-    "Show the diff for a file or repository. When `full` is true, returns line-by-line unified diff instead of file status summary.",
+    "Show the line-by-line unified diff for a file or repository.",
     GitDiffArgs,
     execute_git_diff_tool,
     "git",

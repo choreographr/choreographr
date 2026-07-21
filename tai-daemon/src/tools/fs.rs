@@ -2,11 +2,7 @@ use super::{ToolExecError, confine_path, sha256_hex, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{fs::OpenOptions, io::Write};
-use std::{
-    io,
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{io, path::Path};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadFileArgs {
@@ -187,7 +183,11 @@ pub(crate) fn execute_write_file_tool(
     ensure_parent_directories(&resolved, args.create_parents.unwrap_or(true))?;
 
     match write_text_file(&resolved, &args.content, args.overwrite.unwrap_or(true)) {
-        Ok(()) => Ok(format!("wrote file: {}", resolved.display())),
+        Ok(()) => {
+            let lang = ext_to_lang(&resolved.display().to_string());
+            let fenced = fence_content(&args.content, lang);
+            Ok(format!("wrote file: {}\n\n{}", resolved.display(), fenced))
+        }
         Err(error) => {
             let overwrite = args.overwrite.unwrap_or(true);
             if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
@@ -286,37 +286,12 @@ fn write_text_file(path: &Path, content: &str, overwrite: bool) -> io::Result<()
 }
 
 fn atomic_write_text_file(path: &Path, content: &str) -> io::Result<()> {
-    let temp_path = temporary_sibling_path(path);
-    let write_result = (|| -> io::Result<()> {
-        let mut temp_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        temp_file.write_all(content.as_bytes())?;
-        temp_file.flush()?;
-        drop(temp_file);
-        std::fs::rename(&temp_path, path)
-    })();
-
-    match write_result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = std::fs::remove_file(&temp_path);
-            Err(error)
-        }
-    }
-}
-
-fn temporary_sibling_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("file");
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    path.with_file_name(format!(".{file_name}.tai-tmp-{unique}"))
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(content.as_bytes())?;
+    tmp.flush()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    Ok(())
 }
 
 struct AppliedEditSummary {
@@ -381,6 +356,68 @@ fn apply_text_edits(
     })
 }
 
+fn ext_to_lang(path: &str) -> &'static str {
+    let p = std::path::Path::new(path);
+    // Filename-based detection for files without extensions (e.g., Dockerfile).
+    if let Some(fname) = p.file_name().and_then(|n| n.to_str())
+        && fname.eq_ignore_ascii_case("dockerfile")
+    {
+        return "dockerfile";
+    }
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext.to_lowercase().as_str() {
+        "rs" => "rust",
+        "py" => "python",
+        "js" => "javascript",
+        "ts" | "tsx" | "mts" | "cts" => "javascript",
+        "json" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "md" | "mdown" | "markdown" => "markdown",
+        "html" | "htm" => "html",
+        "css" => "css",
+        "scss" | "sass" => "scss",
+        "sh" | "bash" | "zsh" => "bash",
+        "c" => "c",
+        "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
+        "go" => "go",
+        "rb" => "ruby",
+        "java" => "java",
+        "sql" => "sql",
+        "xml" => "xml",
+        "dockerfile" => "dockerfile",
+        "makefile" | "mk" => "makefile",
+        "lua" => "lua",
+        "zig" => "zig",
+        "swift" => "swift",
+        "kt" | "kts" => "kotlin",
+        "pl" | "pm" => "perl",
+        "tex" => "latex",
+        "proto" => "protobuf",
+        _ => "",
+    }
+}
+
+fn fence_content(content: &str, lang: &str) -> String {
+    // Strip trailing newlines so the closing fence sits directly after the
+    // last line of content, avoiding a blank line before the fence.
+    let trimmed = content.trim_end_matches('\n');
+    let max_run = trimmed
+        .chars()
+        .fold((0usize, 0usize), |(max_run, current), c| {
+            if c == '`' {
+                (max_run.max(current + 1), current + 1)
+            } else {
+                (max_run, 0)
+            }
+        })
+        .0;
+    let fence_len = (max_run + 1).max(3);
+    let fence = "`".repeat(fence_len);
+    format!("{fence}{lang}\n{trimmed}\n{fence}")
+}
+
 fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) -> String {
     let mut out = format!(
         "{action} file: {path} ({} replacement{}, {:+} chars)",
@@ -397,8 +434,9 @@ fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) ->
     if let Some(ref original) = summary.original {
         let diff = crate::diff_util::generate_diff(original, &summary.content, path, path);
         if !diff.is_empty() {
-            out.push_str("\n\n");
+            out.push_str("\n\n```diff\n");
             out.push_str(&diff);
+            out.push_str("\n```");
         }
     }
 
@@ -559,21 +597,32 @@ mod tests {
 
     #[test]
     fn describe_read_file_invocation() {
-        let args = ReadFileArgs { path: "src/main.rs".into() };
+        let args = ReadFileArgs {
+            path: "src/main.rs".into(),
+        };
         let desc = super::describe_read_file_invocation(&args);
         assert_eq!(desc, "Reading file `src/main.rs`.");
     }
 
     #[test]
     fn describe_read_file_range_invocation() {
-        let args = ReadFileRangeArgs { path: "src/lib.rs".into(), start_line: 10, max_lines: 50 };
+        let args = ReadFileRangeArgs {
+            path: "src/lib.rs".into(),
+            start_line: 10,
+            max_lines: 50,
+        };
         let desc = super::describe_read_file_range_invocation(&args);
-        assert_eq!(desc, "Reading file `src/lib.rs` from line 10 (max 50 lines).");
+        assert_eq!(
+            desc,
+            "Reading file `src/lib.rs` from line 10 (max 50 lines)."
+        );
     }
 
     #[test]
     fn describe_list_files_invocation_with_path() {
-        let args = ListFilesArgs { path: Some("src".into()) };
+        let args = ListFilesArgs {
+            path: Some("src".into()),
+        };
         let desc = super::describe_list_files_invocation(&args);
         assert_eq!(desc, "Listing files in `src`.");
     }
@@ -587,7 +636,9 @@ mod tests {
 
     #[test]
     fn describe_line_count_invocation() {
-        let args = LineCountArgs { path: "Cargo.toml".into() };
+        let args = LineCountArgs {
+            path: "Cargo.toml".into(),
+        };
         let desc = super::describe_line_count_invocation(&args);
         assert_eq!(desc, "Counting lines in `Cargo.toml`.");
     }
@@ -601,14 +652,21 @@ mod tests {
             create_parents: Some(false),
         };
         let desc = super::describe_write_file_invocation(&args);
-        assert_eq!(desc, "Writing 11 bytes to file `output.txt` (overwrite: true, create_parents: false).");
+        assert_eq!(
+            desc,
+            "Writing 11 bytes to file `output.txt` (overwrite: true, create_parents: false)."
+        );
     }
 
     #[test]
     fn describe_edit_file_invocation_with_sha_dry_run() {
         let args = EditFileArgs {
             path: "src/main.rs".into(),
-            edits: vec![TextEditArgs { old_text: "foo".into(), new_text: "bar".into(), replace_all: Some(false) }],
+            edits: vec![TextEditArgs {
+                old_text: "foo".into(),
+                new_text: "bar".into(),
+                replace_all: Some(false),
+            }],
             expected_sha256: Some("abc123".into()),
             dry_run: Some(true),
         };
@@ -617,5 +675,128 @@ mod tests {
         assert!(desc.contains("1 edit(s)"));
         assert!(desc.contains("Expecting SHA-256: abc123"));
         assert!(desc.contains("Dry run"));
+    }
+
+    // ── ext_to_lang tests ────────────────────────────────────────────
+
+    #[test]
+    fn ext_to_lang_rust() {
+        assert_eq!(super::ext_to_lang("src/main.rs"), "rust");
+    }
+
+    #[test]
+    fn ext_to_lang_python() {
+        assert_eq!(super::ext_to_lang("script.py"), "python");
+    }
+
+    #[test]
+    fn ext_to_lang_javascript() {
+        assert_eq!(super::ext_to_lang("app.js"), "javascript");
+    }
+
+    #[test]
+    fn ext_to_lang_typescript_mapped_to_javascript() {
+        assert_eq!(super::ext_to_lang("app.ts"), "javascript");
+        assert_eq!(super::ext_to_lang("app.tsx"), "javascript");
+        assert_eq!(super::ext_to_lang("app.mts"), "javascript");
+        assert_eq!(super::ext_to_lang("app.cts"), "javascript");
+    }
+
+    #[test]
+    fn ext_to_lang_dockerfile_detected_by_filename() {
+        assert_eq!(super::ext_to_lang("Dockerfile"), "dockerfile");
+        assert_eq!(super::ext_to_lang("path/to/Dockerfile"), "dockerfile");
+    }
+
+    #[test]
+    fn ext_to_lang_dockerfile_extension() {
+        assert_eq!(super::ext_to_lang("config.dockerfile"), "dockerfile");
+    }
+
+    #[test]
+    fn ext_to_lang_unknown_extension() {
+        assert_eq!(super::ext_to_lang("file.xyzzy"), "");
+    }
+
+    #[test]
+    fn ext_to_lang_no_extension() {
+        assert_eq!(super::ext_to_lang("Makefile"), "");
+    }
+
+    #[test]
+    fn ext_to_lang_markdown() {
+        assert_eq!(super::ext_to_lang("README.md"), "markdown");
+    }
+
+    #[test]
+    fn ext_to_lang_shell() {
+        assert_eq!(super::ext_to_lang("script.sh"), "bash");
+        assert_eq!(super::ext_to_lang("script.bash"), "bash");
+    }
+
+    #[test]
+    fn ext_to_lang_protobuf() {
+        assert_eq!(super::ext_to_lang("message.proto"), "protobuf");
+    }
+
+    #[test]
+    fn ext_to_lang_toml() {
+        assert_eq!(super::ext_to_lang("Cargo.toml"), "toml");
+    }
+
+    #[test]
+    fn ext_to_lang_yaml() {
+        assert_eq!(super::ext_to_lang("config.yaml"), "yaml");
+        assert_eq!(super::ext_to_lang("config.yml"), "yaml");
+    }
+
+    // ── fence_content tests ──────────────────────────────────────────
+
+    #[test]
+    fn fence_content_basic() {
+        let result = super::fence_content("hello", "rust");
+        assert_eq!(result, "```rust\nhello\n```");
+    }
+
+    #[test]
+    fn fence_content_no_lang() {
+        let result = super::fence_content("plain text", "");
+        assert_eq!(result, "```\nplain text\n```");
+    }
+
+    #[test]
+    fn fence_content_with_backticks() {
+        let result = super::fence_content("`code`", "text");
+        // Content contains a single backtick, so fence must be at least 2 wide.
+        assert!(result.starts_with("``"));
+        assert!(result.ends_with("``"));
+        assert!(result.contains("`code`"));
+    }
+
+    #[test]
+    fn fence_content_triple_backticks() {
+        let result = super::fence_content("```\ncode\n```", "text");
+        // Content contains 3 consecutive backticks, so fence must be at least 4 wide.
+        assert!(result.starts_with("````"));
+        assert!(result.ends_with("````"));
+    }
+
+    #[test]
+    fn fence_content_empty_content() {
+        let result = super::fence_content("", "json");
+        assert_eq!(result, "```json\n\n```");
+    }
+
+    #[test]
+    fn fence_content_trailing_newline_stripped() {
+        let result = super::fence_content("hello\n", "text");
+        // Should not have a blank line before the closing fence.
+        assert_eq!(result, "```text\nhello\n```");
+    }
+
+    #[test]
+    fn fence_content_multiple_trailing_newlines_stripped() {
+        let result = super::fence_content("a\nb\n\n", "text");
+        assert_eq!(result, "```text\na\nb\n```");
     }
 }
