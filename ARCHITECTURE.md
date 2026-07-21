@@ -954,7 +954,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 
 | Group | Tools |
 |---|---|
-| **Core** | `list_sessions`, `get_session`, `load_skill`, `read_file`, `read_file_range`, `write_file`, `edit_file`, `list_files`, `line_count`, `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed), `get_current_time` (Unix millisecond timestamp) |
+| **Core** | `list_sessions`, `get_session`, `load_skill`, `read_file`, `read_file_range`, `write_file`, `edit_file`, `list_files`, `delete_files`, `line_count`, `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed), `get_current_time` (Unix millisecond timestamp) |
 | **HTTP** | `http_request` (GET/POST/HEAD with headers, body, timeout) |
 | **Image** | `display_image` (from path, URL, base64, or SVG text) |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push`, `git_show` |

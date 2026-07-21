@@ -560,6 +560,7 @@ impl ToolRegistry {
         reg.register(fs::ReadFile);
         reg.register(fs::ReadFileRange);
         reg.register(fs::ListFiles);
+        reg.register(fs::DeleteFiles);
         reg.register(fs::LineCount);
         reg.register(http::HttpRequest);
         reg.register(fs::WriteFile);
