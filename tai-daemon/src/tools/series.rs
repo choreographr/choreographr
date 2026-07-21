@@ -58,6 +58,23 @@ impl Tool for RunSeries {
          original arguments are resolved."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let registry = self.registry.upgrade();
+        let mut parts = vec![format!(
+            "Running a series of {} tool call(s):",
+            args.steps.len()
+        )];
+        for (i, step) in args.steps.iter().enumerate() {
+            let step_args_json = serde_json::to_string(&step.arguments).unwrap_or_default();
+            let desc = registry
+                .as_ref()
+                .and_then(|r| r.describe_invocation_for(&step.tool, &step_args_json))
+                .unwrap_or_else(|| format!("Step {}.", i + 1));
+            parts.push(format!("{}. {}", i + 1, desc));
+        }
+        parts.join("\n")
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
@@ -283,6 +300,9 @@ mod tests {
         fn description(&self) -> &'static str {
             "echo args back"
         }
+        fn describe_invocation(&self, _args: &Self::Args) -> String {
+            format!("{}.", self.name())
+        }
         fn return_string(ret: &Self::Return) -> String {
             ret.clone()
         }
@@ -311,6 +331,9 @@ mod tests {
         }
         fn description(&self) -> &'static str {
             "always fails"
+        }
+        fn describe_invocation(&self, _args: &Self::Args) -> String {
+            format!("{}.", self.name())
         }
         fn return_string(ret: &Self::Return) -> String {
             ret.clone()

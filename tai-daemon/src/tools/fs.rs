@@ -405,6 +405,10 @@ fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) ->
     out
 }
 
+pub fn describe_read_file_invocation(args: &ReadFileArgs) -> String {
+    format!("Reading file `{}`.", args.path)
+}
+
 pub(crate) struct ReadFile;
 
 define_tool!(
@@ -413,8 +417,16 @@ define_tool!(
     "Read a UTF-8 text file from the local workspace.",
     ReadFileArgs,
     execute_read_file_tool,
-    "core"
+    "core",
+    describe_read_file_invocation
 );
+
+pub fn describe_read_file_range_invocation(args: &ReadFileRangeArgs) -> String {
+    format!(
+        "Reading file `{}` from line {} (max {} lines).",
+        args.path, args.start_line, args.max_lines
+    )
+}
 
 pub(crate) struct ReadFileRange;
 
@@ -424,8 +436,16 @@ define_tool!(
     "Read a line range from a UTF-8 text file in the local workspace.",
     ReadFileRangeArgs,
     execute_read_file_range_tool,
-    "core"
+    "core",
+    describe_read_file_range_invocation
 );
+
+pub fn describe_list_files_invocation(args: &ListFilesArgs) -> String {
+    match &args.path {
+        Some(p) => format!("Listing files in `{}`.", p),
+        None => "Listing files in the working directory.".to_string(),
+    }
+}
 
 pub(crate) struct ListFiles;
 
@@ -435,8 +455,13 @@ define_tool!(
     "List files in a local directory.",
     ListFilesArgs,
     execute_list_files_tool,
-    "core"
+    "core",
+    describe_list_files_invocation
 );
+
+pub fn describe_line_count_invocation(args: &LineCountArgs) -> String {
+    format!("Counting lines in `{}`.", args.path)
+}
 
 pub(crate) struct LineCount;
 
@@ -446,8 +471,19 @@ define_tool!(
     "Count the number of lines in a UTF-8 text file.",
     LineCountArgs,
     execute_line_count_tool,
-    "core"
+    "core",
+    describe_line_count_invocation
 );
+
+pub fn describe_write_file_invocation(args: &WriteFileArgs) -> String {
+    format!(
+        "Writing {} bytes to file `{}` (overwrite: {}, create_parents: {}).",
+        args.content.len(),
+        args.path,
+        args.overwrite.unwrap_or(false),
+        args.create_parents.unwrap_or(false)
+    )
+}
 
 pub(crate) struct WriteFile;
 
@@ -457,8 +493,24 @@ define_tool!(
     "Write a UTF-8 text file to the local workspace.",
     WriteFileArgs,
     execute_write_file_tool,
-    "core"
+    "core",
+    describe_write_file_invocation
 );
+
+pub fn describe_edit_file_invocation(args: &EditFileArgs) -> String {
+    let mut parts = vec![format!(
+        "Editing file `{}` with {} edit(s).",
+        args.path,
+        args.edits.len()
+    )];
+    if let Some(ref sha) = args.expected_sha256 {
+        parts.push(format!(" Expecting SHA-256: {}.", sha));
+    }
+    if args.dry_run.unwrap_or(false) {
+        parts.push(" Dry run (no changes will be applied).".to_string());
+    }
+    parts.concat()
+}
 
 pub(crate) struct EditFile;
 
@@ -468,7 +520,8 @@ define_tool!(
     "Edit a UTF-8 text file by applying one or more exact text replacements. Each edit must match at least once; non-replace_all edits must match exactly once.",
     EditFileArgs,
     execute_edit_file_tool,
-    "core"
+    "core",
+    describe_edit_file_invocation
 );
 
 #[cfg(test)]
@@ -502,5 +555,67 @@ mod tests {
         .unwrap();
         assert_eq!(summary.content, "a B c");
         assert_eq!(summary.replacement_count, 1);
+    }
+
+    #[test]
+    fn describe_read_file_invocation() {
+        let args = ReadFileArgs { path: "src/main.rs".into() };
+        let desc = super::describe_read_file_invocation(&args);
+        assert_eq!(desc, "Reading file `src/main.rs`.");
+    }
+
+    #[test]
+    fn describe_read_file_range_invocation() {
+        let args = ReadFileRangeArgs { path: "src/lib.rs".into(), start_line: 10, max_lines: 50 };
+        let desc = super::describe_read_file_range_invocation(&args);
+        assert_eq!(desc, "Reading file `src/lib.rs` from line 10 (max 50 lines).");
+    }
+
+    #[test]
+    fn describe_list_files_invocation_with_path() {
+        let args = ListFilesArgs { path: Some("src".into()) };
+        let desc = super::describe_list_files_invocation(&args);
+        assert_eq!(desc, "Listing files in `src`.");
+    }
+
+    #[test]
+    fn describe_list_files_invocation_without_path() {
+        let args = ListFilesArgs { path: None };
+        let desc = super::describe_list_files_invocation(&args);
+        assert_eq!(desc, "Listing files in the working directory.");
+    }
+
+    #[test]
+    fn describe_line_count_invocation() {
+        let args = LineCountArgs { path: "Cargo.toml".into() };
+        let desc = super::describe_line_count_invocation(&args);
+        assert_eq!(desc, "Counting lines in `Cargo.toml`.");
+    }
+
+    #[test]
+    fn describe_write_file_invocation() {
+        let args = WriteFileArgs {
+            path: "output.txt".into(),
+            content: "hello world".into(),
+            overwrite: Some(true),
+            create_parents: Some(false),
+        };
+        let desc = super::describe_write_file_invocation(&args);
+        assert_eq!(desc, "Writing 11 bytes to file `output.txt` (overwrite: true, create_parents: false).");
+    }
+
+    #[test]
+    fn describe_edit_file_invocation_with_sha_dry_run() {
+        let args = EditFileArgs {
+            path: "src/main.rs".into(),
+            edits: vec![TextEditArgs { old_text: "foo".into(), new_text: "bar".into(), replace_all: Some(false) }],
+            expected_sha256: Some("abc123".into()),
+            dry_run: Some(true),
+        };
+        let desc = super::describe_edit_file_invocation(&args);
+        assert!(desc.contains("Editing file `src/main.rs`"));
+        assert!(desc.contains("1 edit(s)"));
+        assert!(desc.contains("Expecting SHA-256: abc123"));
+        assert!(desc.contains("Dry run"));
     }
 }

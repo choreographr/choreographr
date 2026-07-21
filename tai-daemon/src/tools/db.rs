@@ -144,6 +144,14 @@ impl Tool for DbSet {
         "Insert or overwrite a key-value pair in the session's database."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        format!(
+            "Setting database key `{}` to value ({} bytes).",
+            args.key,
+            args.value.0.len()
+        )
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
@@ -190,6 +198,10 @@ impl Tool for DbGet {
 
     fn description(&self) -> &'static str {
         "Retrieve a value by key from the session's database."
+    }
+
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        format!("Getting database key `{}`.", args.key)
     }
 
     fn return_string(ret: &Self::Return) -> String {
@@ -253,6 +265,10 @@ impl Tool for DbDelete {
         "Remove a single key from the session's database. Returns 'deleted' or 'not found'."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        format!("Deleting database key `{}`.", args.key)
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
@@ -305,6 +321,14 @@ impl Tool for DbDeleteRange {
 
     fn description(&self) -> &'static str {
         "Delete all keys in the range [start, end). If end is omitted, deletes from start to the end of the session's keys."
+    }
+
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        format!(
+            "Deleting database keys from `{}` to {}.",
+            args.start,
+            args.end.as_deref().unwrap_or("the end")
+        )
     }
 
     fn return_string(ret: &Self::Return) -> String {
@@ -368,6 +392,14 @@ impl Tool for DbGetRange {
 
     fn description(&self) -> &'static str {
         "Retrieve all key-value pairs in the key range [start, end). Returns a JSON array of {key, value_b64} objects."
+    }
+
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        format!(
+            "Getting database keys from `{}` to {}.",
+            args.start,
+            args.end.as_deref().unwrap_or("the end")
+        )
     }
 
     fn return_string(ret: &Self::Return) -> String {
@@ -444,6 +476,15 @@ impl Tool for DbList {
         "List key names in the key range [start, end). Both start and end are optional. Returns a JSON array of key strings."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        match (&args.start, &args.end) {
+            (Some(s), Some(e)) => format!("Listing database keys from `{}` to `{}`.", s, e),
+            (Some(s), None) => format!("Listing database keys starting from `{}`.", s),
+            (None, Some(e)) => format!("Listing database keys up to `{}`.", e),
+            (None, None) => "Listing all database keys.".to_string(),
+        }
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.join("\n")
     }
@@ -506,6 +547,13 @@ impl Tool for DbCount {
 
     fn description(&self) -> &'static str {
         "Count keys in the session's database, optionally filtered by prefix."
+    }
+
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        match &args.prefix {
+            Some(p) => format!("Counting database entries with prefix `{}`.", p),
+            None => "Counting all database entries.".to_string(),
+        }
     }
 
     fn return_string(ret: &Self::Return) -> String {
@@ -902,5 +950,68 @@ mod tests {
             let decoded: DbError = postcard::from_bytes(&encoded).unwrap();
             assert_eq!(err.to_string(), decoded.to_string());
         }
+    }
+
+    #[test]
+    fn describe_db_set_invocation() {
+        let tool = DbSet;
+        let args = DbSetArgs {
+            key: "my_key".into(),
+            value: DbValue(b"hello".to_vec()),
+        };
+        let desc = tool.describe_invocation(&args);
+        assert_eq!(desc, "Setting database key `my_key` to value (5 bytes).");
+    }
+
+    #[test]
+    fn describe_db_get_invocation() {
+        let tool = DbGet;
+        let args = DbGetArgs {
+            key: "my_key".into(),
+        };
+        let desc = tool.describe_invocation(&args);
+        assert_eq!(desc, "Getting database key `my_key`.");
+    }
+
+    #[test]
+    fn describe_db_delete_range_invocation() {
+        let tool = DbDeleteRange;
+        let args = DbDeleteRangeArgs {
+            start: "a".into(),
+            end: Some("z".into()),
+        };
+        let desc = tool.describe_invocation(&args);
+        assert_eq!(desc, "Deleting database keys from `a` to z.");
+    }
+
+    #[test]
+    fn describe_db_list_invocation_start_only() {
+        let tool = DbList;
+        let args = DbListArgs {
+            start: Some("b".into()),
+            end: None,
+        };
+        let desc = tool.describe_invocation(&args);
+        assert_eq!(desc, "Listing database keys starting from `b`.");
+    }
+
+    #[test]
+    fn describe_db_count_invocation_with_prefix() {
+        let tool = DbCount;
+        let args = DbCountArgs {
+            prefix: Some("test".into()),
+        };
+        let desc = tool.describe_invocation(&args);
+        assert_eq!(desc, "Counting database entries with prefix `test`.");
+    }
+
+    #[test]
+    fn describe_db_count_invocation_without_prefix() {
+        let tool = DbCount;
+        let args = DbCountArgs {
+            prefix: None,
+        };
+        let desc = tool.describe_invocation(&args);
+        assert_eq!(desc, "Counting all database entries.");
     }
 }

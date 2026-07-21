@@ -270,6 +270,22 @@ fn collect_worktree_diff_lines(
     Ok(lines)
 }
 
+pub fn describe_git_diff_invocation(args: &GitDiffArgs) -> String {
+    let mut parts = vec!["Showing git diff.".to_string()];
+    if args.cached.unwrap_or(false) {
+        parts.push(" Cached (staged) changes.".to_string());
+    }
+    if let Some(ref paths) = args.pathspec
+        && !paths.is_empty()
+    {
+        parts.push(format!(" Pathspec: `{}`.", paths.join("`, `")));
+    }
+    if args.full.unwrap_or(false) {
+        parts.push(" Full diff.".to_string());
+    }
+    parts.concat()
+}
+
 pub(crate) struct GitDiff;
 
 define_tool!(
@@ -278,5 +294,6 @@ define_tool!(
     "Show the diff for a file or repository. When `full` is true, returns line-by-line unified diff instead of file status summary.",
     GitDiffArgs,
     execute_git_diff_tool,
-    "git"
+    "git",
+    describe_git_diff_invocation
 );

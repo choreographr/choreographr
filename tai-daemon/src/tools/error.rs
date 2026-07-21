@@ -61,6 +61,7 @@ pub(crate) fn tool_ok(content: String) -> ToolOutput {
     ToolOutput {
         content,
         is_error: false,
+        invocation_description: String::new(),
     }
 }
 
@@ -68,6 +69,7 @@ pub(crate) fn tool_err(error: impl ToString) -> ToolOutput {
     ToolOutput {
         content: error.to_string(),
         is_error: true,
+        invocation_description: String::new(),
     }
 }
 

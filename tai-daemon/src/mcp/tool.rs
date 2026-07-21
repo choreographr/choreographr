@@ -91,6 +91,10 @@ fn mcp_result_to_text_parts(result: &CallToolResult) -> (Vec<String>, bool) {
 }
 
 impl ToolDyn for McpToolWrapper {
+    fn describe_invocation_json(&self, _args_json: &str) -> String {
+        format!("{}.", self.description())
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -134,6 +138,7 @@ impl ToolDyn for McpToolWrapper {
                 ToolOutputFormat::Json => serde_json::to_string(&content).unwrap_or(content),
             },
             is_error,
+            invocation_description: String::new(),
         })
     }
 
@@ -179,6 +184,7 @@ impl ToolDyn for McpToolWrapper {
                 }
             },
             is_error,
+            invocation_description: String::new(),
         })
     }
 }
@@ -199,6 +205,7 @@ mod tests {
         ToolOutput {
             content: text_parts.join("\n"),
             is_error,
+            invocation_description: String::new(),
         }
     }
 

@@ -73,6 +73,14 @@ pub(crate) fn git_log_impl(
     Ok(out.trim_end().to_string())
 }
 
+pub fn describe_git_log_invocation(args: &GitLogArgs) -> String {
+    let limit = args.limit.unwrap_or(10).clamp(1, 100);
+    match &args.repo_path {
+        Some(p) => format!("Showing git log for `{}` (last {} commits).", p, limit),
+        None => format!("Showing git log (last {} commits).", limit),
+    }
+}
+
 pub(crate) struct GitLog;
 
 define_tool!(
@@ -81,5 +89,6 @@ define_tool!(
     "Show recent Git commits for the repository containing the given path.",
     GitLogArgs,
     execute_git_log_tool,
-    "git"
+    "git",
+    describe_git_log_invocation
 );

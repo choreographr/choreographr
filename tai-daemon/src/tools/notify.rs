@@ -151,6 +151,23 @@ pub fn execute_notify_send(
     Ok(format!("Notification sent (id: {})", handle.id()))
 }
 
+pub fn describe_notify_send_invocation(args: &NotifySendArgs) -> String {
+    let mut parts = vec![format!("Sending notification: {}.", args.summary)];
+    if let Some(ref body) = args.body {
+        parts.push(format!(" Body: {}.", body));
+    }
+    if let Some(ref urgency) = args.urgency {
+        parts.push(format!(" Urgency: {:?}.", urgency));
+    }
+    if let Some(ref timeout) = args.timeout {
+        parts.push(format!(" Timeout: {:?}.", timeout));
+    }
+    if let Some(ref icon) = args.icon {
+        parts.push(format!(" Icon: `{}`.", icon));
+    }
+    parts.concat()
+}
+
 pub(crate) struct NotifySend;
 
 define_tool!(
@@ -159,7 +176,8 @@ define_tool!(
     "Send a desktop notification to the user. Use this to alert the user, notify them of completed tasks, or provide information that requires their attention.",
     NotifySendArgs,
     execute_notify_send,
-    "desktop"
+    "desktop",
+    describe_notify_send_invocation
 );
 
 #[cfg(test)]
@@ -252,5 +270,36 @@ mod tests {
     fn timeout_deserialize_negative_integer_fails() {
         let result: Result<Timeout, _> = serde_json::from_str("-1");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn describe_invocation_includes_summary() {
+        let args = NotifySendArgs {
+            summary: "Build complete".into(),
+            body: None,
+            urgency: None,
+            timeout: None,
+            icon: None,
+        };
+        let desc = describe_notify_send_invocation(&args);
+        assert_eq!(desc, "Sending notification: Build complete.");
+    }
+
+    #[test]
+    fn describe_invocation_includes_all_fields() {
+        use crate::tools::notify::UrgencyLevel;
+        let args = NotifySendArgs {
+            summary: "Error".into(),
+            body: Some("Something went wrong".into()),
+            urgency: Some(UrgencyLevel::Critical),
+            timeout: Some(Timeout::Never),
+            icon: Some("dialog-error".into()),
+        };
+        let desc = describe_notify_send_invocation(&args);
+        assert!(desc.contains("Sending notification: Error."));
+        assert!(desc.contains("Body: Something went wrong."));
+        assert!(desc.contains("Urgency: Critical."));
+        assert!(desc.contains("Timeout: Never."));
+        assert!(desc.contains("Icon: `dialog-error`."));
     }
 }

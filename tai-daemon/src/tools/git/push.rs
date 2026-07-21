@@ -105,6 +105,23 @@ fn git_push_impl(
     Ok(out.trim_end().to_string())
 }
 
+pub fn describe_git_push_invocation(args: &GitPushArgs) -> String {
+    let mut parts = vec![format!("Pushing to `{}`.", args.remote)];
+    if let Some(ref branch) = args.branch {
+        parts.push(format!(" Branch: `{}`.", branch));
+    }
+    if args.set_upstream.unwrap_or(false) {
+        parts.push(" Setting upstream.".to_string());
+    }
+    if args.force_with_lease.unwrap_or(false) {
+        parts.push(" Force-with-lease.".to_string());
+    }
+    if args.dry_run.unwrap_or(false) {
+        parts.push(" Dry run.".to_string());
+    }
+    parts.concat()
+}
+
 pub(crate) struct GitPush;
 
 define_tool!(
@@ -113,5 +130,6 @@ define_tool!(
     "Push to a Git remote branch.",
     GitPushArgs,
     execute_git_push_tool,
-    "git"
+    "git",
+    describe_git_push_invocation
 );

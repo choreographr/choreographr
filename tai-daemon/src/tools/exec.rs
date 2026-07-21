@@ -44,6 +44,21 @@ impl Tool for Exec {
         "Execute a program directly without a shell. The command is not parsed by a shell — no pipes, redirects, glob expansion, or environment variable interpolation. Prefer this over `sh` when you only need to run a single program with arguments (lower risk of shell-injection issues)."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let full_cmd: Vec<&str> = std::iter::once(&args.command)
+            .chain(args.args.iter())
+            .map(|s| s.as_str())
+            .collect();
+        let mut parts = vec![format!("Running command: `{}`.", full_cmd.join(" "))];
+        if let Some(ref wd) = args.workdir {
+            parts.push(format!(" Working directory: `{}`.", wd));
+        }
+        if let Some(timeout) = args.timeout {
+            parts.push(format!(" Timeout: {}ms.", timeout));
+        }
+        parts.concat()
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -123,6 +138,7 @@ pub fn execute_exec_tool(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::tools::Tool;
 
     #[test]
@@ -132,5 +148,46 @@ mod tests {
         assert!(!tool.description().is_empty());
         let schema = tool.schema();
         assert!(schema.is_object());
+    }
+
+    #[test]
+    fn describe_invocation_includes_command_and_args() {
+        let tool = Exec;
+        let args = ExecArgs {
+            command: "cargo".into(),
+            args: vec!["build".into(), "--release".into()],
+            workdir: None,
+            timeout: None,
+        };
+        let desc = tool.describe_invocation(&args);
+        assert_eq!(desc, "Running command: `cargo build --release`.");
+    }
+
+    #[test]
+    fn describe_invocation_includes_workdir() {
+        let tool = Exec;
+        let args = ExecArgs {
+            command: "make".into(),
+            args: vec![],
+            workdir: Some("/home/user/project".into()),
+            timeout: None,
+        };
+        let desc = tool.describe_invocation(&args);
+        assert!(desc.contains("Running command: `make`."));
+        assert!(desc.contains("Working directory: `/home/user/project`."));
+    }
+
+    #[test]
+    fn describe_invocation_includes_timeout() {
+        let tool = Exec;
+        let args = ExecArgs {
+            command: "sleep".into(),
+            args: vec!["10".into()],
+            workdir: None,
+            timeout: Some(30000),
+        };
+        let desc = tool.describe_invocation(&args);
+        assert!(desc.contains("Running command: `sleep 10`."));
+        assert!(desc.contains("Timeout: 30000ms."));
     }
 }

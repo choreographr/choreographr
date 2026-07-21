@@ -38,6 +38,10 @@ impl super::Tool for GetCurrentTime {
         "Get the current Unix timestamp in milliseconds since epoch"
     }
 
+    fn describe_invocation(&self, _args: &Self::Args) -> String {
+        "Fetching current date and time.".to_string()
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.to_string()
     }
@@ -77,5 +81,13 @@ mod tests {
         let tool = GetCurrentTime;
         let schema = tool.output_schema().expect("output_schema");
         assert_eq!(schema["type"], "integer");
+    }
+
+    #[test]
+    fn describe_invocation_returns_fetching_message() {
+        let tool = GetCurrentTime;
+        let args = EmptyArgs {};
+        let desc = tool.describe_invocation(&args);
+        assert_eq!(desc, "Fetching current date and time.");
     }
 }

@@ -80,6 +80,10 @@ impl Tool for ListSessions {
         "List all sessions known to the daemon. Returns session ID, title, model, message count, parent session ID, and working directory for each session."
     }
 
+    fn describe_invocation(&self, _args: &Self::Args) -> String {
+        "Listing all sessions.".to_string()
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
@@ -146,6 +150,10 @@ impl Tool for GetSession {
         "Read the full message history of a session by its ID. Returns all messages (system, user, assistant, tool calls, tool results) with role labels."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        format!("Getting session {}.", args.session_id)
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
@@ -180,6 +188,10 @@ fn execute_load_skill(
     ))
 }
 
+pub fn describe_load_skill_invocation(args: &LoadSkillArgs) -> String {
+    format!("Loading skill `{}`.", args.name)
+}
+
 pub(crate) struct LoadSkill;
 
 define_tool!(
@@ -188,7 +200,8 @@ define_tool!(
     "Load the full instructions for a skill by name. Use this when a task matches one of the available skill descriptions.",
     LoadSkillArgs,
     execute_load_skill,
-    "core"
+    "core",
+    describe_load_skill_invocation
 );
 
 #[cfg(test)]

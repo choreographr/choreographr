@@ -162,6 +162,21 @@ impl Tool for Find {
         "Find files and directories by name. Respects .gitignore and hidden files."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let mut parts = vec![format!("Searching for files matching `{}`.", args.pattern)];
+        if args.glob {
+            parts.push(" Using glob matching.".to_string());
+        }
+        match &args.path {
+            Some(p) => parts.push(format!(" In path: `{}`.", p)),
+            None => parts.push(" In working directory.".to_string()),
+        }
+        if let Some(max) = args.max_results {
+            parts.push(format!(" Max results: {}.", max));
+        }
+        parts.concat()
+    }
+
     fn execute(
         &self,
         args: Self::Args,

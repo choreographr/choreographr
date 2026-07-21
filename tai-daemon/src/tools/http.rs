@@ -223,6 +223,21 @@ impl crate::tools::Tool for HttpRequest {
         "Make an HTTP request to an absolute URL and return status, response headers, and response body text. Supports custom headers such as Range for partial content requests."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let mut parts = vec![format!(
+            "Making {} HTTP request to {}.",
+            args.method, args.url
+        )];
+        if !args.headers.is_empty() {
+            parts.push(format!(" {} header(s).", args.headers.len()));
+        }
+        if let Some(ref body) = args.body {
+            parts.push(format!(" Body: {} bytes.", body.len()));
+        }
+        parts.push(format!(" Timeout: {}s.", args.timeout_secs.unwrap_or(30)));
+        parts.concat()
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -241,6 +256,7 @@ impl crate::tools::Tool for HttpRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::Tool;
 
     // ── header validation tests ─────────────────────────────────────
 
@@ -416,5 +432,37 @@ mod tests {
         let a_pos = output.find("a-header").unwrap();
         let z_pos = output.find("z-header").unwrap();
         assert!(a_pos < z_pos, "headers should be sorted alphabetically");
+    }
+
+    #[test]
+    fn describe_invocation_includes_method_and_url() {
+        let tool = HttpRequest;
+        let args = HttpRequestArgs {
+            method: "POST".into(),
+            url: "https://api.example.com/data".into(),
+            headers: [("Authorization".into(), "Bearer token123".into())].into(),
+            body: Some("{\"key\":\"value\"}".into()),
+            timeout_secs: Some(60),
+        };
+        let desc = tool.describe_invocation(&args);
+        assert!(desc.contains("Making POST HTTP request to https://api.example.com/data."));
+        assert!(desc.contains("1 header(s)."));
+        assert!(desc.contains("Body: 15 bytes."));
+        assert!(desc.contains("Timeout: 60s."));
+    }
+
+    #[test]
+    fn describe_invocation_no_body() {
+        let tool = HttpRequest;
+        let args = HttpRequestArgs {
+            method: "GET".into(),
+            url: "https://example.com".into(),
+            headers: std::collections::HashMap::new(),
+            body: None,
+            timeout_secs: None,
+        };
+        let desc = tool.describe_invocation(&args);
+        assert!(desc.contains("Making GET HTTP request to https://example.com."));
+        assert!(desc.contains("Timeout: 30s."));
     }
 }

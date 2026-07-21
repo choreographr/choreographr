@@ -190,6 +190,7 @@ struct SpawnToolArgs {
     x_credentials: Option<ServiceCredential>,
     working_dir: Option<PathBuf>,
     ctx: ToolContext,
+    invocation_description: String,
 }
 
 /// Spawn a single tool call on a dedicated thread with its own forwarding
@@ -208,6 +209,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
         x_credentials,
         working_dir,
         ctx,
+        invocation_description,
     } = args;
     // Channel for the execution thread to deliver its final result.
     let (result_tx, result_rx) = mpsc::channel::<Result<ToolOutput, ToolError>>();
@@ -262,6 +264,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                     break ToolOutput {
                         content: format!("tool '{}' timed out", tool_call.name,),
                         is_error: true,
+                        invocation_description: invocation_description.clone(),
                     };
                 }
                 match result_rx.recv_timeout(remaining.min(check_interval)) {
@@ -270,6 +273,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                         break ToolOutput {
                             content: e.to_string(),
                             is_error: true,
+                            invocation_description: invocation_description.clone(),
                         };
                     }
                     Err(RecvTimeoutError::Timeout) => continue,
@@ -277,6 +281,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                         break ToolOutput {
                             content: "tool execution thread panicked".to_string(),
                             is_error: true,
+                            invocation_description: invocation_description.clone(),
                         };
                     }
                 }
@@ -288,12 +293,14 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                         break ToolOutput {
                             content: e.to_string(),
                             is_error: true,
+                            invocation_description: invocation_description.clone(),
                         };
                     }
                     Err(_) => {
                         break ToolOutput {
                             content: "tool execution thread panicked".to_string(),
                             is_error: true,
+                            invocation_description: invocation_description.clone(),
                         };
                     }
                 }
@@ -925,11 +932,14 @@ pub(crate) fn run_agent_loop(
                         .into_iter()
                         .map(|tool_call| {
                             let timeout = determine_tool_timeout(&tool_call.name);
+                            let invocation_description =
+                                reg.describe_invocation(&tool_call);
                             let call_info = (
                                 tool_call.id.clone(),
                                 tool_call.name.clone(),
                                 tool_call.arguments_json.clone(),
                                 Instant::now(),
+                                invocation_description.clone(),
                             );
                             let handle = spawn_single_tool(SpawnToolArgs {
                                 tool_call,
@@ -940,6 +950,7 @@ pub(crate) fn run_agent_loop(
                                 x_credentials: None,
                                 working_dir: session.config.working_dir.clone(),
                                 ctx: tool_ctx.clone(),
+                                invocation_description,
                             });
                             (call_info, handle)
                         })
@@ -948,7 +959,7 @@ pub(crate) fn run_agent_loop(
                     if is_cancelled_once(cancel_rx) {
                         cancel_flag.store(true, Ordering::Relaxed);
                     }
-                    for ((call_id, tool_name, arguments_json, tool_start), handle) in
+                    for ((call_id, tool_name, arguments_json, tool_start, invocation_description), handle) in
                         handles.into_iter()
                     {
                         if is_cancelled_once(cancel_rx) {
@@ -969,6 +980,7 @@ pub(crate) fn run_agent_loop(
                             output: ToolOutput {
                                 content: "tool thread panicked".to_string(),
                                 is_error: true,
+                                invocation_description,
                             },
                             image: None,
                         });
@@ -1037,6 +1049,7 @@ fn finish_tool_call(
 ) {
     let is_error = output.is_error;
     let content = output.content.clone();
+    let invocation_description = output.invocation_description.clone();
 
     session.add_tool_result(
         turn_id,
@@ -1044,6 +1057,7 @@ fn finish_tool_call(
         tool_call.name.clone(),
         content.clone(),
         is_error,
+        invocation_description,
     );
 
     broadcast_turn_appended(&ctx.cmd_tx, session, turn_id);
@@ -1103,6 +1117,7 @@ fn execute_tool_with_timeout(
             return ToolOutput {
                 content: result,
                 is_error: false,
+                invocation_description: String::new(),
             };
         }
         "unload_tools" => {
@@ -1119,6 +1134,7 @@ fn execute_tool_with_timeout(
             return ToolOutput {
                 content: result,
                 is_error: false,
+                invocation_description: String::new(),
             };
         }
         "set_working_dir" => {
@@ -1132,6 +1148,7 @@ fn execute_tool_with_timeout(
                     return ToolOutput {
                         content: format!("invalid arguments: {e}"),
                         is_error: true,
+                        invocation_description: String::new(),
                     };
                 }
             };
@@ -1141,6 +1158,7 @@ fn execute_tool_with_timeout(
                     return ToolOutput {
                         content: "missing required argument: path".to_string(),
                         is_error: true,
+                        invocation_description: String::new(),
                     };
                 }
             };
@@ -1165,6 +1183,7 @@ fn execute_tool_with_timeout(
                             resolved.display()
                         ),
                         is_error: true,
+                        invocation_description: String::new(),
                     };
                 }
             };
@@ -1223,6 +1242,7 @@ fn execute_tool_with_timeout(
             return ToolOutput {
                 content: format!("Working directory changed to '{}'", canonical.display()),
                 is_error: false,
+                invocation_description: String::new(),
             };
         }
         _ => {}
@@ -1299,6 +1319,7 @@ fn execute_tool_with_timeout(
             return ToolOutput {
                 content: format!("tool '{}' cancelled", tool_call.name),
                 is_error: true,
+                invocation_description: String::new(),
             };
         }
 
@@ -1316,6 +1337,7 @@ fn execute_tool_with_timeout(
                     timeout_dur.as_secs()
                 ),
                 is_error: true,
+                invocation_description: String::new(),
             };
         }
 
@@ -1337,6 +1359,7 @@ fn execute_tool_with_timeout(
                 return ToolOutput {
                     content: e.to_string(),
                     is_error: true,
+                    invocation_description: String::new(),
                 };
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1349,6 +1372,7 @@ fn execute_tool_with_timeout(
                 return ToolOutput {
                     content: "tool execution thread panicked".to_string(),
                     is_error: true,
+                    invocation_description: String::new(),
                 };
             }
         }
@@ -1485,7 +1509,14 @@ mod tests {
             }],
             None,
         );
-        session.add_tool_result(tid, "call_1".into(), "ls".into(), "file.txt".into(), false);
+        session.add_tool_result(
+            tid,
+            "call_1".into(),
+            "ls".into(),
+            "file.txt".into(),
+            false,
+            String::new(),
+        );
 
         let result = build_chat_request_messages(&session, None);
         assert_eq!(result.len(), 3);
@@ -1721,6 +1752,9 @@ mod tests {
         fn description(&self) -> &'static str {
             "test tool that completes immediately"
         }
+        fn describe_invocation(&self, _args: &Self::Args) -> String {
+            format!("{}.", self.description())
+        }
         fn return_string(ret: &Self::Return) -> String {
             ret.clone()
         }
@@ -1755,6 +1789,9 @@ mod tests {
         }
         fn description(&self) -> &'static str {
             "test tool that blocks until proceed"
+        }
+        fn describe_invocation(&self, _args: &Self::Args) -> String {
+            format!("{}.", self.description())
         }
         fn return_string(ret: &Self::Return) -> String {
             ret.clone()
@@ -1902,6 +1939,9 @@ mod tests {
         fn description(&self) -> &'static str {
             "test tool that sends streaming output"
         }
+        fn describe_invocation(&self, _args: &Self::Args) -> String {
+            format!("{}.", self.description())
+        }
         fn return_string(ret: &Self::Return) -> String {
             ret.clone()
         }
@@ -1948,6 +1988,15 @@ mod tests {
             result.content
         );
 
+        // First chunk is the description string (from execute_streaming_json)
+        match cmd_rx.recv() {
+            Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
+                assert_eq!(data, b"test tool that sends streaming output.");
+            }
+            Ok(_other) => panic!("expected ToolResultChunk, got unexpected SessionCommand"),
+            Err(e) => panic!("channel disconnected while waiting for streaming output: {e}"),
+        }
+        // Second chunk is the actual payload from the tool's execute_streaming
         match cmd_rx.recv() {
             Ok(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk { data, .. })) => {
                 assert_eq!(data, b"streamed payload");
@@ -2027,6 +2076,10 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
         };
 
+        let invocation_description = registry
+            .describe_invocation_for(&tool_call.name, &tool_call.arguments_json)
+            .unwrap_or_default();
+
         let handle = spawn_single_tool(SpawnToolArgs {
             tool_call,
             timeout,
@@ -2036,6 +2089,7 @@ mod tests {
             x_credentials: None,
             working_dir: None,
             ctx: tool_ctx,
+            invocation_description,
         });
 
         handle.join().expect("tool thread panicked")

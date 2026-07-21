@@ -72,6 +72,13 @@ fn git_status_impl(
     Ok(out.trim_end().to_string())
 }
 
+pub fn describe_git_status_invocation(args: &GitRepoArgs) -> String {
+    match &args.repo_path {
+        Some(p) => format!("Checking git repository status in `{}`.", p),
+        None => "Checking git repository status.".to_string(),
+    }
+}
+
 pub(crate) struct GitStatus;
 
 define_tool!(
@@ -80,5 +87,6 @@ define_tool!(
     "Show the status of the Git repository containing the given path.",
     GitRepoArgs,
     execute_git_status_tool,
-    "git"
+    "git",
+    describe_git_status_invocation
 );

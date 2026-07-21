@@ -253,6 +253,14 @@ impl IndexEntrySnapshot {
     }
 }
 
+pub fn describe_git_add_invocation(args: &GitAddArgs) -> String {
+    let paths = args.pathspec.join("`, `");
+    match &args.repo_path {
+        Some(p) => format!("Staging `{}` in repository `{}`.", paths, p),
+        None => format!("Staging `{}`.", paths),
+    }
+}
+
 pub(crate) struct GitAdd;
 
 define_tool!(
@@ -261,5 +269,6 @@ define_tool!(
     "Stage a file or pathspec in Git.",
     GitAddArgs,
     execute_git_add_tool,
-    "git"
+    "git",
+    describe_git_add_invocation
 );

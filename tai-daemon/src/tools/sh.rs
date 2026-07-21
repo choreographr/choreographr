@@ -74,6 +74,15 @@ impl Tool for Sh {
         "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let mut parts = vec![format!("Running shell command: `{}`.", args.command)];
+        parts.push(format!(" Shell: {:?}.", args.shell));
+        if let Some(timeout) = args.timeout {
+            parts.push(format!(" Timeout: {}ms.", timeout));
+        }
+        parts.concat()
+    }
+
     fn execute(
         &self,
         args: Self::Args,

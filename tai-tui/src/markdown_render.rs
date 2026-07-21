@@ -291,9 +291,7 @@ pub(crate) fn render_turn_lines(
     }
 
     // ── Assistant response block (blue accent) ───────────────
-    let has_assistant = turn.assistant_text.is_some()
-        || turn.assistant_reasoning.is_some()
-        || !turn.tool_calls.is_empty();
+    let has_assistant = turn.assistant_text.is_some() || turn.assistant_reasoning.is_some();
     if has_assistant {
         let mut body: Vec<Line<'static>> = Vec::new();
 
@@ -313,14 +311,6 @@ pub(crate) fn render_turn_lines(
                 heading_line(&mut body, "Response", Color::Cyan);
                 body.extend(markdown_lines(trimmed, content_width));
             }
-        }
-
-        // Tool call labels
-        for tc in &turn.tool_calls {
-            body.push(Line::from(Span::styled(
-                format!("tool: {}({})", tc.name, tc.arguments_json),
-                Style::default().fg(Color::Yellow),
-            )));
         }
 
         // If we have content, wrap with margin lines (no timestamp).
@@ -344,6 +334,16 @@ pub(crate) fn render_turn_lines(
         };
 
         let mut body: Vec<Line<'static>> = Vec::new();
+
+        // Invocation description (rendered as markdown so code blocks
+        // highlight properly) appears before the tool result/error label.
+        if !tr.invocation_description.is_empty() {
+            body.extend(markdown_lines(
+                &tr.invocation_description,
+                tool_content_width,
+            ));
+            body.push(Line::from(Span::styled(String::new(), Style::default())));
+        }
 
         // Header line
         body.push(Line::from(Span::styled(
@@ -1626,10 +1626,10 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            text.contains("tool: read_file"),
-            "tool call label should appear: {text}"
-        );
+        // The turn has only tool_calls (no text, no reasoning), so no
+        // assistant block is rendered. Tool calls are now only visible
+        // through their streaming output and subsequent tool results.
+        assert!(!text.contains("tool:"), "tool: label should not appear");
     }
 
     #[test]
@@ -1648,6 +1648,7 @@ mod tests {
                 name: "read_file".into(),
                 content: "file contents".into(),
                 is_error: false,
+                invocation_description: String::new(),
             }],
             displayed_images: vec![],
         };
@@ -1677,6 +1678,7 @@ mod tests {
                 name: "run".into(),
                 content: "command failed".into(),
                 is_error: true,
+                invocation_description: String::new(),
             }],
             displayed_images: vec![],
         };

@@ -148,6 +148,7 @@ pub struct ToolResultRecord {
     pub name: String,
     pub content: String,
     pub is_error: bool,
+    pub invocation_description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

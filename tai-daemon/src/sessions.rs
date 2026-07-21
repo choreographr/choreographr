@@ -387,6 +387,7 @@ impl SessionState {
         name: String,
         content: String,
         is_error: bool,
+        invocation_description: String,
     ) {
         if let Some(turn) = self.turns.get_mut(&turn_id) {
             turn.tool_results.push(ToolResultRecord {
@@ -394,6 +395,7 @@ impl SessionState {
                 name,
                 content,
                 is_error,
+                invocation_description,
             });
         }
     }

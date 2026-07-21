@@ -107,6 +107,14 @@ fn current_head_parents(repo: &gix::Repository) -> Result<Vec<ObjectId>, ToolErr
     }
 }
 
+pub fn describe_git_commit_invocation(args: &GitCommitArgs) -> String {
+    let mut parts = vec![format!("Committing: {}.", args.message)];
+    if args.allow_empty.unwrap_or(false) {
+        parts.push(" Allow empty commit.".to_string());
+    }
+    parts.concat()
+}
+
 pub(crate) struct GitCommit;
 
 define_tool!(
@@ -115,5 +123,6 @@ define_tool!(
     "Create a Git commit from the current index.",
     GitCommitArgs,
     execute_git_commit_tool,
-    "git"
+    "git",
+    describe_git_commit_invocation
 );

@@ -316,6 +316,15 @@ impl super::Tool for XPost {
         "Post a tweet to X (Twitter). Requires X credentials to be configured via the keystore."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let preview: String = args.text.chars().take(80).collect();
+        format!(
+            "Posting to X ({} characters): \"{}\".",
+            args.text.len(),
+            preview
+        )
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
@@ -350,6 +359,14 @@ impl super::Tool for XSearchRecent {
         "Search recent tweets on X (Twitter). Requires X credentials to be configured via the keystore."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let mut parts = vec![format!("Searching X for: `{}`.", args.query)];
+        if let Some(max) = args.max_results {
+            parts.push(format!(" Max results: {}.", max));
+        }
+        parts.concat()
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
@@ -382,6 +399,10 @@ impl super::Tool for XUserLookup {
 
     fn description(&self) -> &'static str {
         "Look up a user on X (Twitter) by username or ID. Requires X credentials to be configured via the keystore."
+    }
+
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        format!("Looking up X user `{}`.", args.username)
     }
 
     fn return_string(ret: &Self::Return) -> String {

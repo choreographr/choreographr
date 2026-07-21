@@ -41,6 +41,17 @@ impl Tool for FishShell {
         "Execute a fish shell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let mut parts = vec![format!("Running fish command: `{}`.", args.command)];
+        if let Some(ref wd) = args.workdir {
+            parts.push(format!(" Working directory: `{}`.", wd));
+        }
+        if let Some(timeout) = args.timeout {
+            parts.push(format!(" Timeout: {}ms.", timeout));
+        }
+        parts.concat()
+    }
+
     fn execute(
         &self,
         args: Self::Args,

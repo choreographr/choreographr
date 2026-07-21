@@ -112,6 +112,39 @@ fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolExec
     }
 }
 
+pub fn describe_random_invocation(args: &RandomArgs) -> String {
+    let rtype = args.r#type.as_deref().unwrap_or("value");
+    let mut parts = vec![format!("Generating random {}.", rtype)];
+    match rtype {
+        "int" => {
+            if let Some(min) = args.min {
+                parts.push(format!(" Min: {}.", min));
+            }
+            if let Some(max) = args.max {
+                parts.push(format!(" Max: {}.", max));
+            }
+        }
+        "float" => {
+            if let Some(min) = args.min_float {
+                parts.push(format!(" Min: {}.", min));
+            }
+            if let Some(max) = args.max_float {
+                parts.push(format!(" Max: {}.", max));
+            }
+        }
+        "bytes" | "string" => {
+            if let Some(len) = args.length {
+                parts.push(format!(" Length: {}.", len));
+            }
+        }
+        _ => {}
+    }
+    if let Some(seed) = args.seed {
+        parts.push(format!(" Seed: {}.", seed));
+    }
+    parts.concat()
+}
+
 pub(crate) struct Random;
 
 define_tool!(
@@ -120,7 +153,8 @@ define_tool!(
     "Generate random values: integers, floats, booleans, bytes (base64), or UUID v4. Supports optional seed for reproducibility.",
     RandomArgs,
     execute_random_tool,
-    "core"
+    "core",
+    describe_random_invocation
 );
 
 #[cfg(test)]

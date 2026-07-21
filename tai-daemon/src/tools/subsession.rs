@@ -40,6 +40,20 @@ impl Tool for SpawnSubsession {
         "Spawn a sub-session to autonomously work on a task. The sub-session inherits the parent session's working directory and runs its own tool-calling loop."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let mut parts = vec![format!("Spawning subsession: {}.", args.prompt)];
+        if let Some(ref title) = args.title {
+            parts.push(format!(" Title: {}.", title));
+        }
+        if let Some(turns) = args.max_turns {
+            parts.push(format!(" Max turns: {}.", turns));
+        }
+        if let Some(ref cats) = args.categories {
+            parts.push(format!(" Categories: {}.", cats.join(", ")));
+        }
+        parts.concat()
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
@@ -241,5 +255,34 @@ mod tests {
         let json = r#"{"title": "no prompt"}"#;
         let result: Result<SpawnSubsessionArgs, _> = serde_json::from_str(json);
         assert!(result.is_err(), "missing prompt should fail: {result:?}",);
+    }
+
+    #[test]
+    fn describe_invocation_includes_prompt() {
+        let tool = SpawnSubsession;
+        let args = SpawnSubsessionArgs {
+            prompt: "Write a test".into(),
+            title: None,
+            max_turns: None,
+            categories: None,
+        };
+        let desc = tool.describe_invocation(&args);
+        assert_eq!(desc, "Spawning subsession: Write a test.");
+    }
+
+    #[test]
+    fn describe_invocation_includes_all_fields() {
+        let tool = SpawnSubsession;
+        let args = SpawnSubsessionArgs {
+            prompt: "Refactor code".into(),
+            title: Some("Refactor".into()),
+            max_turns: Some(10),
+            categories: Some(vec!["core".into(), "git".into()]),
+        };
+        let desc = tool.describe_invocation(&args);
+        assert!(desc.contains("Spawning subsession: Refactor code."));
+        assert!(desc.contains("Title: Refactor."));
+        assert!(desc.contains("Max turns: 10."));
+        assert!(desc.contains("Categories: core, git."));
     }
 }

@@ -95,6 +95,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 | `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessageKind::AssistantText` and `SessionMessageKind::AssistantToolUse` for per-turn accounting, in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals, and in `DaemonMessage::Done` for per-request usage. |
 | `last_prompt_tokens` | `Option<u32>` field on session metadata and protocol messages tracking the `input_tokens` from the most recent API response — the actual context size being sent to the model, used for context-window progress displays. |
 | `SessionStatus` | Enum representing the current session state: `Inactive`, `Inference`, `ToolCall(String)`, `Retrying {…}`, `Sleeping`. Included in `SessionSummary` and `DaemonMessage::SessionState` for live status display in client toolbars. |
+| `ToolResultRecord` | Persisted tool result with fields `call_id`, `name`, `content`, `is_error`, and `invocation_description` — a human-readable sentence from `Tool::describe_invocation` describing what the tool did. Used for UI display only; excluded from LLM message construction. |
 
 `ClientMessage` variants:
 `CreateSession`, `ListSessions`, `AttachSession`, `GetSessionState`, `RunInput`,
@@ -606,7 +607,7 @@ while !app.should_quit:
 | `state.rs` | `App` struct: input buffer, request tracking, `ClientHistory`, scroll state (`HistoryScrollState`), height prefix-sum array for O(1) total height and O(log n) item lookup via binary search, and the per-frame scroll accumulator (`scroll_accumulator`) consumed by `apply_scroll_delta()`. |
 | `render.rs` | Ratatui rendering: history pane (top) + command input + status bar (bottom), word wrap, Unicode width. Does **not** mutate scroll state or viewport dimensions — those are updated in the event loop before `terminal.draw()`. |
 | `syntax.rs` | Shared syntect helpers (`syntax_set`, `highlight_theme`, `to_ratatui_color`). Used by `markdown_render.rs` for code-block syntax highlighting. |
-| `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `tai-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Code blocks are syntax-highlighted via `syntect` (shared setup from `syntax.rs`). |
+| `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `tai-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Code blocks are syntax-highlighted via `syntect` (shared setup from `syntax.rs`). Tool call labels (`tool: name(args)`) have been removed from the assistant block — tool invocations are now visible through the `invocation_description` rendered as markdown before each tool result label, and through streaming output. |
 | `lib.rs` | `RenderedImage` struct, `build_picker()` helper, public re-exports |
 | `image_worker.rs` | Background worker thread for SVG rasterization and terminal protocol encoding. Communicates with the UI thread via `mpsc` channels; raw image data shared through `Arc<Vec<u8>>` to avoid copies. |
 | `terminal_progress.rs` | Terminal-native progress bar via OSC 9;4 escape sequences. Cached capability detection, percentage/indeterminate/remove modes based on `last_prompt_tokens` vs `context_window`. |
@@ -777,6 +778,15 @@ pub trait Tool: Send + Sync {
 
     fn extract_image(&self, _ret: &Self::Return) -> Option<PreparedImage> { None }
 
+    /// Produce a human-readable description of what the tool is about to do,
+    /// using every supplied argument for detail (e.g. "Reading file `main.rs`.",
+    /// "Making POST HTTP request to `https://api.example.com/data`.").
+    /// Returns a natural English sentence. There is no default — every tool
+    /// must provide one. The value is stored in `ToolOutput.invocation_description`
+    /// and flowes through to `ToolResultRecord.invocation_description` for the
+    /// TUI to render as the first line of the tool result block.
+    fn describe_invocation(&self, args: &Self::Args) -> String;
+
     /// Produce a human-readable string from the return value.
     /// The default implementation JSON-encodes the value.
     /// Tools whose `Return` is `String` override this to return
@@ -791,11 +801,22 @@ pub trait Tool: Send + Sync {
 
 ```rust
 pub enum ToolOutputFormat { Text, Json }
-pub struct ToolOutput { pub content: String, pub is_error: bool }
+pub struct ToolOutput {
+    pub content: String,
+    pub is_error: bool,
+    /// Human-readable sentence describing what the tool is about to do,
+    /// produced by `Tool::describe_invocation()` before execution.
+    /// Empty string when the description is unavailable (e.g. spawned
+    /// thread error paths before the description could be generated).
+    pub invocation_description: String,
+}
 ```
 
 `Text` format is used for LLM-facing tool results (human-readable, uses `return_string`).
 `Json` format is used for Programmatic Tool Calling (PTC) — JSON-encodes the return via `serde_json::to_string`.
+`invocation_description` is stored in `ToolResultRecord` and streamed as the first chunk in
+`execute_streaming_json` for real-time TUI display. It is explicitly excluded from LLM message
+construction — the model never sees it.
 
 Tools that need session context (`ToolContext` — used by `list_sessions`, `get_session`)
 receive it in the `ctx` parameter. Tools that return structured data override
@@ -823,6 +844,11 @@ pub trait ToolDyn: Send + Sync {
     fn output_schema(&self) -> Option<serde_json::Value>;
     fn allowed_callers(&self) -> Vec<AllowedCaller>;
 
+    /// Human-readable invocation description from JSON args.
+    /// Delegates to `Tool::describe_invocation` via the blanket impl.
+    /// Returns the static `description()` fallback when args fail to parse.
+    fn describe_invocation_json(&self, args_json: &str) -> String;
+
     /// JSON path — takes JSON args, returns Result so callers can distinguish
     /// infrastructure errors (deserialisation failures) from tool errors.
     fn execute_json(&self, args_json: &str, format: ToolOutputFormat, ...) -> Result<ToolOutput, ToolError>;
@@ -835,7 +861,9 @@ pub trait ToolDyn: Send + Sync {
 }
 ```
 
-A blanket impl `impl<T: Tool> ToolDyn for T` provides all four dispatch paths:
+A blanket impl `impl<T: Tool> ToolDyn for T` provides `describe_invocation_json` (deserializes
+args and delegates to `Tool::describe_invocation`, falling back to `description()` on parse
+failure) and all three dispatch paths:
 
 | Path | Input | Output | Used by |
 |---|---|---|---|---|
@@ -844,7 +872,11 @@ A blanket impl `impl<T: Tool> ToolDyn for T` provides all four dispatch paths:
 | `execute_postcard` | `&[u8]` (postcard) | `Vec<u8>` (postcard of `Result<Result<R, E>, ToolError>`) | RISC-V VM tool calls |
 
 The JSON path deserializes arguments with `serde_json`, calls `Tool::execute()`, then
-returns a `ToolOutput`. When `format` is `Text`, the content is produced via
+returns a `ToolOutput`. Both `execute_json` and `execute_streaming_json` first call
+`T::describe_invocation(self, &args)` to produce the invocation description, then store
+it on the returned `ToolOutput`. In the streaming path, the description is also sent as
+the first chunk via `output_tx` so the TUI can display it in real time before the tool
+produces any output. When `format` is `Text`, the content is produced via
 `T::return_string()` (human-readable). When `format` is `Json`, the return value
 is JSON-encoded via `serde_json::to_string()` (for PTC responses).
 The binary path uses `postcard` for both deserialization and serialization,
@@ -855,12 +887,16 @@ enabling compact cross-VM communication.
 The `define_tool!` macro reduces boilerplate for the common tool case
 (`Return = String`, no credentials needed). It lives in `tai-daemon/src/tools/mod.rs`.
 The JSON schema is auto-derived from the args type via `schemars`, so no manual
-schema parameter is needed:
+schema parameter is needed. The macro now takes 7 arguments — the 7th is a
+`fn(&Args) -> String` path that provides the invocation description:
 
 ```rust
 define_tool!(MyTool, "my_tool", "Description...", MyToolArgs,
-    execute_my_tool, "core");
+    execute_my_tool, "core", describe_my_tool_invocation);
 ```
+
+The describe function is also used by the blanket `ToolDyn::describe_invocation_json`
+implementation and by `ToolRegistry::describe_invocation`.
 
 Tools that need custom `output_schema()`, `allowed_callers()`, non-`String` return types,
 session context (`ToolContext`), or credentials (`ServiceCredential`) are written as
@@ -876,13 +912,21 @@ owned by `DaemonStateInner`, constructed once at daemon startup. The agent loop 
 an `Arc<ToolRegistry>` from the daemon state to list available tool definitions and
 dispatch tool execution.
 
-The registry provides `execute_json()`, `execute_streaming_json()`, and `execute_postcard()` for dispatch:
+The registry provides `describe_invocation()`, `describe_invocation_for()`,
+`execute_json()`, `execute_streaming_json()`, and `execute_postcard()` for dispatch:
 
 ```rust
+pub fn describe_invocation(&self, tool_call: &ChatToolCall) -> String;
+pub fn describe_invocation_for(&self, name: &str, args_json: &str) -> Option<String>;
 pub fn execute_json(&self, tool_call: &ChatToolCall, format: ToolOutputFormat, ...) -> ToolOutput;
 pub fn execute_streaming_json(&self, tool_call: &ChatToolCall, format: ToolOutputFormat, ...) -> ToolOutput;
 pub fn execute_postcard(&self, name: &str, args_bytes: &[u8], ...) -> Vec<u8>;
 ```
+
+`describe_invocation` returns the invocation description for a tool call by name + JSON args,
+falling back to the tool name for unknown tools. `describe_invocation_for` returns `None`
+for unknown tools. These are used by `run_agent_loop` to generate the description before
+spawning tool threads, so error paths (timeout, panic) can include it in the `ToolOutput`.
 
 `execute_postcard` replaces the old `execute_dyn` and calls `ToolDyn::execute_postcard()`.
 `execute_json` and `execute_streaming_json` accept a `ToolOutputFormat` parameter so
@@ -988,7 +1032,9 @@ for typical N (< 10), but callers should be aware of the resource footprint.
 Results are collected in source-call order (the order the LLM issued them) so the
 conversation history remains deterministic regardless of which thread finishes first.
 If a tool thread panics, the error is caught and reported as a `ToolOutput` with
-`is_error: true` instead of crashing the daemon.
+`is_error: true` instead of crashing the daemon. The `invocation_description` is generated
+before spawning (via `ToolRegistry::describe_invocation`) and passed through `SpawnToolArgs`,
+so even timeout and panic error paths carry a meaningful description in the `ToolOutput`.
 
 ### spawn_subsession
 

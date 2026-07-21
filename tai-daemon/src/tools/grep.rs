@@ -186,6 +186,24 @@ impl Tool for Grep {
         "Search file contents for a pattern. Respects .gitignore, hidden, and binary files. Results in file:line:content format."
     }
 
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let mut parts = vec![format!("Searching for `{}`.", args.pattern)];
+        if args.regex {
+            parts.push(" Using regex.".to_string());
+        }
+        if let Some(ref incl) = args.include {
+            parts.push(format!(" Include pattern: `{}`.", incl));
+        }
+        match &args.path {
+            Some(p) => parts.push(format!(" In path: `{}`.", p)),
+            None => parts.push(" In working directory.".to_string()),
+        }
+        if let Some(max) = args.max_results {
+            parts.push(format!(" Max results: {}.", max));
+        }
+        parts.concat()
+    }
+
     fn execute(
         &self,
         args: Self::Args,
@@ -474,5 +492,37 @@ mod tests {
             result.is_empty(),
             "expected case-sensitive no match, got:\n{result}"
         );
+    }
+
+    #[test]
+    fn describe_invocation_includes_pattern_and_path() {
+        let tool = Grep;
+        let args = GrepArgs {
+            pattern: "fn main".into(),
+            regex: false,
+            include: None,
+            path: Some("src".into()),
+            max_results: None,
+        };
+        let desc = tool.describe_invocation(&args);
+        assert!(desc.contains("Searching for `fn main`."));
+        assert!(desc.contains("In path: `src`."));
+    }
+
+    #[test]
+    fn describe_invocation_includes_regex_and_include() {
+        let tool = Grep;
+        let args = GrepArgs {
+            pattern: "fn \\w+".into(),
+            regex: true,
+            include: Some("*.rs".into()),
+            path: None,
+            max_results: Some(50),
+        };
+        let desc = tool.describe_invocation(&args);
+        assert!(desc.contains("Searching for `fn \\w+`."));
+        assert!(desc.contains("Using regex."));
+        assert!(desc.contains("Include pattern: `*.rs`."));
+        assert!(desc.contains("Max results: 50."));
     }
 }

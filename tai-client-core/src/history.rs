@@ -117,6 +117,7 @@ impl SessionView {
                     name: String::new(),
                     content: data.to_string(),
                     is_error: false,
+                    invocation_description: String::new(),
                 });
             }
         }

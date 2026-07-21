@@ -183,6 +183,26 @@ impl super::Tool for DisplayImage {
     fn description(&self) -> &'static str {
         "Display a PNG, JPEG, or SVG image in the client UI."
     }
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        let mut parts = vec![format!("Displaying image ({}).", args.mime_type)];
+        if let Some(ref p) = args.path {
+            parts.push(format!(" Path: `{}`.", p));
+        }
+        if let Some(ref u) = args.url {
+            parts.push(format!(" URL: {}.", u));
+        }
+        if args.base64_data.is_some() {
+            parts.push(" Source: base64 data.".to_string());
+        }
+        if args.svg_text.is_some() {
+            parts.push(" Source: SVG markup.".to_string());
+        }
+        if let Some(ref alt) = args.alt {
+            parts.push(format!(" Alt text: {}.", alt));
+        }
+        parts.concat()
+    }
+
     fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }

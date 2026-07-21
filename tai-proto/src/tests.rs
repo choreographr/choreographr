@@ -139,6 +139,7 @@ fn tool_result_record_serde_round_trip() {
         name: "ls".into(),
         content: "file.txt".into(),
         is_error: false,
+        invocation_description: String::new(),
     };
     let frame = encode_frame(&record).expect("encode");
     let decoded: ToolResultRecord = decode_frame(&frame[4..]).expect("decode");
@@ -169,6 +170,7 @@ fn turn_with_tool_results_round_trip() {
             name: "ls".into(),
             content: "file.txt".into(),
             is_error: false,
+            invocation_description: String::new(),
         }],
         displayed_images: vec![],
     };

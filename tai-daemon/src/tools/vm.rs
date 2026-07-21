@@ -786,6 +786,8 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
             "opt-level=z",
             "--edition",
             "2024",
+            "--color",
+            "always",
             "-o",
         ])
         .arg(&output_path)
@@ -855,16 +857,25 @@ fn run_riscv_impl(
     // the original if formatting failed or was skipped.
     let compile_source: Option<&str> = formatted_source.as_deref().or(input.source.as_deref());
 
-    // Source to include in the result display (also prefer formatted).
-    let display_source: Option<&str> = formatted_source.as_deref().or(input.source.as_deref());
+    let target = "riscv64imac-unknown-none-elf";
+    let compile_cmd =
+        format!("rustc +nightly --target {target} -C opt-level=z --edition 2024 --color always");
 
     let elf = match (compile_source, input.program.as_deref()) {
-        (Some(source), None) => match compile(source, enable_allocator) {
-            Ok(elf) => elf,
-            Err(e) => {
-                return tool_err(e);
+        (Some(source), None) => {
+            // Show the compile command in the streaming output so the user
+            // knows what's being run.
+            if let Some(ref tx) = write_tx {
+                let _ = tx.send(format!("$ {compile_cmd}\n").as_bytes().to_vec());
             }
-        },
+
+            match compile(source, enable_allocator) {
+                Ok(elf) => elf,
+                Err(e) => {
+                    return tool_err(format!("$ {compile_cmd}\n{e}"));
+                }
+            }
+        }
         (None, Some(program_b64)) => match BASE64.decode(program_b64) {
             Ok(elf) => elf,
             Err(e) => {
@@ -946,18 +957,7 @@ fn run_riscv_impl(
             }
             let out_str = String::from_utf8_lossy(&out).to_string();
 
-            // Prepend the formatted source as a syntax-highlighted markdown
-            // code block so the tai-tui can render it with syntect.
-            let mut result_content = String::new();
-            if let Some(source) = display_source {
-                result_content.push_str("```rust\n");
-                result_content.push_str(source);
-                if !source.ends_with('\n') {
-                    result_content.push('\n');
-                }
-                result_content.push_str("```\n\n");
-            }
-            result_content.push_str(&out_str);
+            let mut result_content = out_str;
             result_content.push_str(&format!(
                 "\n[VM: exited with code {exit_code} in {cycles} cycles]"
             ));
@@ -1009,6 +1009,35 @@ impl Tool for RunRiscV {
 
     fn description(&self) -> &'static str {
         "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `tai` module. Use per-tool convenience wrappers (tai::read_file, tai::write_file, tai::db_get, tai::db_set, tai::sh, tai::exec, tai::grep, tai::find, tai::http_request) for tool calls — they handle the postcard encoding automatically. Use tai::write(b\"...\") for VM output and tai::exit(code) to finish. Do NOT use raw ecall with Linux syscall numbers (64, 93) — they are not supported."
+    }
+
+    fn describe_invocation(&self, args: &Self::Args) -> String {
+        match (&args.source, &args.program) {
+            (Some(source), None) => {
+                let display = format_rust_source(source);
+                let mut parts = vec![format!(
+                    "Compiling and running Rust code:\n```rust\n{display}\n```"
+                )];
+                if let Some(ref prog_args) = args.args
+                    && !prog_args.is_empty()
+                {
+                    parts.push(format!("\nProgram args: {:?}.", prog_args));
+                }
+                parts.push(format!("\nAllocator: {}.", args.allocator.unwrap_or(true)));
+                parts.push(format!(
+                    "\nMax cycles: {}.",
+                    args.max_cycles.unwrap_or(1_000_000)
+                ));
+                parts.push(format!(
+                    "\nMemory: {} bytes.",
+                    args.memory_size.unwrap_or(4 * 1024 * 1024)
+                ));
+                parts.concat()
+            }
+            (None, Some(_)) => "Running a pre-compiled RISC-V ELF binary.".to_string(),
+            (Some(_), Some(_)) => "Provide only one of 'source' or 'program'.".to_string(),
+            (None, None) => "No source or program provided for run_riscv.".to_string(),
+        }
     }
 
     fn return_string(ret: &Self::Return) -> String {
@@ -1432,6 +1461,9 @@ mod tests {
         }
         fn description(&self) -> &'static str {
             "test tool for concurrent dispatch"
+        }
+        fn describe_invocation(&self, _args: &Self::Args) -> String {
+            format!("{}.", self.name())
         }
         fn return_string(ret: &Self::Return) -> String {
             ret.clone()

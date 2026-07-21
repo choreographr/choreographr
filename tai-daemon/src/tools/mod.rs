@@ -34,7 +34,7 @@ pub(crate) fn encode_outer<R: Serialize, E: Serialize>(
 /// returns, or `use_credentials`, write `impl Tool` manually.
 macro_rules! define_tool {
     ($struct:ident, $name:literal, $desc:literal, $args_ty:ty,
-     $exec_fn:path, $group:literal) => {
+     $exec_fn:path, $group:literal, $invoke_fn:path) => {
         impl $crate::tools::Tool for $struct {
             type Args = $args_ty;
             type Return = String;
@@ -59,6 +59,9 @@ macro_rules! define_tool {
             }
             fn return_string(ret: &Self::Return) -> String {
                 ret.clone()
+            }
+            fn describe_invocation(&self, args: &Self::Args) -> String {
+                $invoke_fn(args)
             }
         }
     };
@@ -139,6 +142,7 @@ pub enum ToolOutputFormat {
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    pub invocation_description: String,
 }
 
 #[derive(Debug)]
@@ -275,6 +279,9 @@ pub trait Tool: Send + Sync {
         vec![AllowedCaller::Direct, AllowedCaller::Programmatic]
     }
 
+    /// Describe the invocation in human-readable form for logging/presentation.
+    fn describe_invocation(&self, args: &Self::Args) -> String;
+
     /// Execute the tool with typed arguments.
     fn execute(
         &self,
@@ -330,6 +337,8 @@ pub trait ToolDyn: Send + Sync {
     fn schema(&self) -> serde_json::Value;
     fn output_schema(&self) -> Option<serde_json::Value>;
     fn allowed_callers(&self) -> Vec<AllowedCaller>;
+
+    fn describe_invocation_json(&self, args_json: &str) -> String;
 
     /// JSON path — takes JSON args, returns Result for the caller to handle.
     fn execute_json(
@@ -387,6 +396,13 @@ impl<T: Tool + 'static> ToolDyn for T {
         Tool::allowed_callers(self)
     }
 
+    fn describe_invocation_json(&self, args_json: &str) -> String {
+        match serde_json::from_str::<T::Args>(args_json) {
+            Ok(args) => T::describe_invocation(self, &args),
+            Err(_) => Tool::description(self).to_string(),
+        }
+    }
+
     fn execute_json(
         &self,
         args_json: &str,
@@ -397,9 +413,17 @@ impl<T: Tool + 'static> ToolDyn for T {
         image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         let args = serde_json::from_str::<T::Args>(args_json)?;
-        let ret = self
-            .execute(args, x_credentials, working_dir, ctx)
-            .map_err(|e| ToolError::Other(e.to_string()))?;
+        let desc = T::describe_invocation(self, &args);
+        let ret = match self.execute(args, x_credentials, working_dir, ctx) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(ToolOutput {
+                    content: e.to_string(),
+                    is_error: true,
+                    invocation_description: desc,
+                });
+            }
+        };
         if let Some(tx) = image_tx
             && let Some(image) = self.extract_image(&ret)
         {
@@ -414,6 +438,7 @@ impl<T: Tool + 'static> ToolDyn for T {
                 }),
             },
             is_error: false,
+            invocation_description: desc,
         })
     }
 
@@ -448,9 +473,18 @@ impl<T: Tool + 'static> ToolDyn for T {
         image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError> {
         let args = serde_json::from_str::<T::Args>(args_json)?;
-        let ret = self
-            .execute_streaming(args, x_credentials, working_dir, output_tx, ctx)
-            .map_err(|e| ToolError::Other(e.to_string()))?;
+        let desc = T::describe_invocation(self, &args);
+        let _ = output_tx.send(desc.as_bytes().to_vec());
+        let ret = match self.execute_streaming(args, x_credentials, working_dir, output_tx, ctx) {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(ToolOutput {
+                    content: e.to_string(),
+                    is_error: true,
+                    invocation_description: desc,
+                });
+            }
+        };
         if let Some(tx) = image_tx
             && let Some(image) = self.extract_image(&ret)
         {
@@ -465,6 +499,7 @@ impl<T: Tool + 'static> ToolDyn for T {
                 }),
             },
             is_error: false,
+            invocation_description: desc,
         })
     }
 }
@@ -636,6 +671,19 @@ impl ToolRegistry {
                 tool_call.name
             ))),
         }
+    }
+
+    pub fn describe_invocation(&self, tool_call: &ChatToolCall) -> String {
+        match self.tools.get(tool_call.name.as_str()) {
+            Some(tool) => tool.describe_invocation_json(&tool_call.arguments_json),
+            None => tool_call.name.clone(),
+        }
+    }
+
+    pub fn describe_invocation_for(&self, name: &str, args_json: &str) -> Option<String> {
+        self.tools
+            .get(name)
+            .map(|t| t.describe_invocation_json(args_json))
     }
 
     /// Postcard binary dispatch (VM path).
@@ -951,6 +999,9 @@ mod tests {
         fn return_string(ret: &Self::Return) -> String {
             ret.clone()
         }
+        fn describe_invocation(&self, _args: &Self::Args) -> String {
+            format!("{}.", Tool::description(self))
+        }
     }
 
     #[test]
@@ -1019,6 +1070,9 @@ mod tests {
         }
         fn return_string(ret: &Self::Return) -> String {
             ret.to_string()
+        }
+        fn describe_invocation(&self, _args: &Self::Args) -> String {
+            format!("{}.", Tool::description(self))
         }
         fn schema(&self) -> serde_json::Value {
             serde_json::json!({"type": "object", "properties": {}})
@@ -1282,6 +1336,9 @@ mod tests {
         fn return_string(ret: &Self::Return) -> String {
             ret.clone()
         }
+        fn describe_invocation(&self, _args: &Self::Args) -> String {
+            format!("{}.", Tool::description(self))
+        }
         fn execute(
             &self,
             _args: Self::Args,
@@ -1336,6 +1393,9 @@ mod tests {
         fn return_string(ret: &Self::Return) -> String {
             ret.clone()
         }
+        fn describe_invocation(&self, _args: &Self::Args) -> String {
+            format!("{}.", Tool::description(self))
+        }
     }
 
     #[test]
@@ -1359,6 +1419,11 @@ mod tests {
             .unwrap();
         assert!(!result.is_error, "should succeed");
         assert_eq!(result.content, "raw\noutput");
+        assert!(
+            result
+                .invocation_description
+                .contains("Tool with default return_string")
+        );
     }
 
     #[test]
@@ -1428,6 +1493,61 @@ mod tests {
             schema["additionalProperties"],
             serde_json::Value::Bool(false),
             "should forbid extra properties"
+        );
+    }
+
+    #[test]
+    fn describe_invocation_json_uses_tool_description_fallback_on_bad_args() {
+        let tool = DefaultTool;
+        let wrapper: Box<dyn ToolDyn> = Box::new(tool);
+        // () deserializes from null, not from arbitrary strings or maps.
+        let desc = wrapper.describe_invocation_json("\"this is a string\"");
+        assert_eq!(desc, "A tool with default settings");
+    }
+
+    #[test]
+    fn describe_invocation_json_returns_description_for_valid_args() {
+        let tool = DefaultTool;
+        let wrapper: Box<dyn ToolDyn> = Box::new(tool);
+        // For type Args = (), valid JSON is "null".
+        let desc = wrapper.describe_invocation_json("null");
+        assert_eq!(desc, "A tool with default settings.");
+    }
+
+    #[test]
+    fn describe_invocation_in_tool_output_is_populated_on_success() {
+        let tool = DefaultTool;
+        let wrapper: Box<dyn ToolDyn> = Box::new(tool);
+        let (output_tx, _output_rx) = mpsc::channel();
+        let result = wrapper
+            .execute_streaming_json(
+                "null",
+                ToolOutputFormat::Text,
+                None,
+                None,
+                output_tx,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !result.invocation_description.is_empty(),
+            "invocation_description should be populated: {:?}",
+            result.invocation_description,
+        );
+    }
+
+    #[test]
+    fn describe_invocation_in_tool_output_is_populated_on_execute_json() {
+        let tool = DefaultTool;
+        let wrapper: Box<dyn ToolDyn> = Box::new(tool);
+        let result = wrapper
+            .execute_json("null", ToolOutputFormat::Text, None, None, None, None)
+            .unwrap();
+        assert!(
+            !result.invocation_description.is_empty(),
+            "invocation_description should be populated: {:?}",
+            result.invocation_description,
         );
     }
 }
