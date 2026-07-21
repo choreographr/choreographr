@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 ansi-to-tui = "8.0.1"
-anstyle-progress = "0.1.0"
+anstyle-progress = "0.1"
 anyhow.workspace = true
 clap.workspace = true
 crossterm = "0.29"
@@ -20,7 +20,7 @@ syntect = "5.3"
 tai-client-core.workspace = true
 tai-keystore.workspace = true
 tai-markdown.workspace = true
-unicode-segmentation = "1.12"
+unicode-segmentation = "1.13"
 unicode-width = "0.2"
 tai-proto.workspace = true
 tracing.workspace = true
