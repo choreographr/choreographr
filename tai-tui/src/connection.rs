@@ -7,8 +7,9 @@ use crate::state::{
 use crossbeam::channel;
 use crossbeam::select;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use mio::unix::pipe;
 use mio::{Events, Interest, Poll, Token};
@@ -148,6 +149,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     let mut stdout = io::stdout();
     crossterm::execute!(
         stdout,
+        EnableBracketedPaste,
         crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableMouseCapture,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
@@ -298,6 +300,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     crossterm::execute!(
         terminal.backend_mut(),
         crossterm::terminal::LeaveAlternateScreen,
+        DisableBracketedPaste,
         crossterm::event::DisableMouseCapture,
         PopKeyboardEnhancementFlags,
     )?;
@@ -470,6 +473,7 @@ fn handle_resume_command(
             crossterm::terminal::enable_raw_mode()?;
             crossterm::execute!(
                 terminal.backend_mut(),
+                EnableBracketedPaste,
                 crossterm::terminal::EnterAlternateScreen,
                 crossterm::event::EnableMouseCapture,
                 PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
@@ -484,6 +488,7 @@ fn handle_resume_command(
                 terminal.backend_mut(),
                 crossterm::event::DisableMouseCapture,
                 crossterm::terminal::LeaveAlternateScreen,
+                DisableBracketedPaste,
                 PopKeyboardEnhancementFlags,
             )?;
             // Suspend the process.  When SIGCONT resumes us the
@@ -499,6 +504,22 @@ pub(crate) fn handle_terminal_event(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // Handle bracketed-paste events before anything else.  Pasted text
+    // (including embedded newlines) arrives as a single Paste(String)
+    // event rather than individual key events, so it must be inserted
+    // directly into whichever input buffer is active.  Without this,
+    // the newlines in pasted text arrive as bare KeyCode::Enter events
+    // and trigger submission of the partial text instead of inserting
+    // the newline.
+    if let Event::Paste(data) = &event {
+        if app.fullscreen_image_target.is_some() {
+            tracing::debug!("[tai-tui] ignoring paste while fullscreen overlay is active");
+            return Ok(());
+        }
+        tracing::debug!("[tai-tui] handling paste event");
+        return handle_paste_event(data, app);
+    }
+
     // Terminal-resize events are handled irrespective of page or fullscreen
     // state so the viewport is refreshed on the next frame.
     if let Event::Resize(cols, rows) = &event {
@@ -517,6 +538,68 @@ pub(crate) fn handle_terminal_event(
         Page::Settings => handle_settings_event(event, app, client_tx),
         Page::Home => handle_home_event(event, app, client_tx),
     }
+}
+
+/// Insert pasted text into whichever input buffer is currently active.
+///
+/// Routes the paste to the appropriate field based on the current page
+/// and sub-view.  On the Chat page the command input receives the paste;
+/// on the AI Providers page either the credential input or a form field
+/// (account name / API key) receives it.
+fn handle_paste_event(data: &str, app: &mut App) -> Result<(), ClientError> {
+    match app.page {
+        Page::Chat => {
+            tracing::debug!("[tai-tui] pasting into chat input buffer");
+            app.input.insert_str_at_cursor(data);
+        }
+        Page::AIProviders => match app.ai_providers.view {
+            AIProvidersView::List if app.ai_providers.credential_target.is_some() => {
+                tracing::debug!("[tai-tui] pasting into credential input");
+                app.ai_providers.credential_input.insert_str_at_cursor(data);
+            }
+            AIProvidersView::NewForm => {
+                // New-account form: bulk-insert into whichever field is focused.
+                if app.ai_providers.new_name_state.is_focused() {
+                    tracing::debug!("[tai-tui] pasting into new-account name field");
+                    paste_into_text_state(&mut app.ai_providers.new_name_state, data);
+                } else if app.ai_providers.new_api_key_state.is_focused() {
+                    tracing::debug!("[tai-tui] pasting into new-account API key field");
+                    paste_into_text_state(&mut app.ai_providers.new_api_key_state, data);
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Efficiently insert a string at the cursor position of a `tui_prompts::State`.
+///
+/// The trait's `push(char)` method rebuilds the entire string on every call,
+/// making a char-by-char loop O(n*m).  This helper does the same thing in a
+/// single pass, which matters for large pastes (e.g. API keys, base64 data).
+fn paste_into_text_state(state: &mut impl tui_prompts::State, data: &str) {
+    let pos = state.position();
+    let suffix = state.value().chars().skip(pos).collect::<String>();
+    // Truncate the value to the cursor position (char-indexed)…
+    let truncated: String = state.value().chars().take(pos).collect();
+    // …then append the pasted text and the original suffix.
+    let new_value = if pos == state.len() {
+        // Fast path: cursor at end — just append.
+        let mut v = truncated;
+        v.push_str(data);
+        v
+    } else {
+        // Cursor in the middle — build in one allocation.
+        let mut v = String::with_capacity(truncated.len() + data.len() + suffix.len());
+        v.push_str(&truncated);
+        v.push_str(data);
+        v.push_str(&suffix);
+        v
+    };
+    *state.value_mut() = new_value;
+    *state.position_mut() = pos + data.chars().count();
 }
 
 fn handle_home_event(

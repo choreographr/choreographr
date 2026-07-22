@@ -754,6 +754,19 @@ impl InputBuffer {
         self.cursor += c.len_utf8();
     }
 
+    /// Insert a string at the cursor position.
+    ///
+    /// Used for paste events where a block of text (potentially
+    /// containing newlines) is inserted all at once rather than
+    /// character-by-character.
+    pub(crate) fn insert_str_at_cursor(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.text.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
     pub(crate) fn backspace_at_cursor(&mut self) {
         if self.cursor == 0 {
             return;

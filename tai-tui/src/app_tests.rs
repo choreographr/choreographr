@@ -214,6 +214,156 @@ fn insert_char_at_cursor_works_at_start() {
 }
 
 #[test]
+fn insert_str_at_cursor_appends_at_end() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.input.text = "ab".to_string();
+    app.input.cursor = 2;
+    app.input.insert_str_at_cursor("cd");
+    assert_eq!(app.input.text, "abcd");
+    assert_eq!(app.input.cursor, 4);
+}
+
+#[test]
+fn insert_str_at_cursor_inserts_in_middle() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.input.text = "abcd".to_string();
+    app.input.cursor = 2;
+    app.input.insert_str_at_cursor("XY");
+    assert_eq!(app.input.text, "abXYcd");
+    assert_eq!(app.input.cursor, 4);
+}
+
+#[test]
+fn insert_str_at_cursor_works_at_start() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.input.text = "bc".to_string();
+    app.input.cursor = 0;
+    app.input.insert_str_at_cursor("a");
+    assert_eq!(app.input.text, "abc");
+    assert_eq!(app.input.cursor, 1);
+}
+
+#[test]
+fn insert_str_at_cursor_handles_newlines() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.input.text = "ab".to_string();
+    app.input.cursor = 1;
+    app.input.insert_str_at_cursor("\ncd");
+    assert_eq!(app.input.text, "a\ncdb");
+    assert_eq!(app.input.cursor, 4);
+}
+
+#[test]
+fn insert_str_at_cursor_empty_string_no_op() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.input.text = "ab".to_string();
+    app.input.cursor = 1;
+    app.input.insert_str_at_cursor("");
+    assert_eq!(app.input.text, "ab");
+    assert_eq!(app.input.cursor, 1);
+}
+
+// --- paste-event tests ---
+
+#[test]
+fn paste_event_inserts_into_chat_input() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    app.input.text = "hel".to_string();
+    app.input.cursor = 3;
+    handle_terminal_event(Event::Paste("lo world".to_string()), &mut app, &tx)
+        .expect("handle paste");
+    assert_eq!(app.input.text, "hello world");
+    assert_eq!(app.input.cursor, 11);
+}
+
+#[test]
+fn paste_event_inserts_into_chat_input_at_cursor() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    app.input.text = "heorld".to_string();
+    app.input.cursor = 2;
+    handle_terminal_event(Event::Paste("llo w".to_string()), &mut app, &tx).expect("handle paste");
+    assert_eq!(app.input.text, "hello world");
+    assert_eq!(app.input.cursor, 7);
+}
+
+#[test]
+fn paste_event_ignored_during_fullscreen_overlay() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    app.input.text = "original".to_string();
+    app.input.cursor = 8;
+    app.fullscreen_image_target = Some((0, 0));
+    handle_terminal_event(Event::Paste("should be ignored".to_string()), &mut app, &tx)
+        .expect("handle paste during fullscreen");
+    // Text should be unchanged.
+    assert_eq!(app.input.text, "original");
+    assert_eq!(app.input.cursor, 8);
+}
+
+#[test]
+fn paste_event_inserts_into_credential_input() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    app.page = Page::AIProviders;
+    app.ai_providers.credential_target = Some("my-account".to_string());
+    handle_terminal_event(Event::Paste("sk-abc123".to_string()), &mut app, &tx)
+        .expect("handle paste into credential input");
+    assert_eq!(app.ai_providers.credential_input.text, "sk-abc123");
+    assert_eq!(app.ai_providers.credential_input.cursor, 9);
+}
+
+#[test]
+fn paste_event_inserts_into_new_form_name_field() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    app.page = Page::AIProviders;
+    app.ai_providers.view = AIProvidersView::NewForm;
+    app.ai_providers.new_name_state.focus();
+    handle_terminal_event(Event::Paste("My Account".to_string()), &mut app, &tx)
+        .expect("handle paste into name field");
+    assert_eq!(app.ai_providers.new_name_state.value(), "My Account");
+    assert_eq!(app.ai_providers.new_name_state.position(), 10);
+}
+
+#[test]
+fn paste_event_inserts_into_new_form_api_key_field() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    app.page = Page::AIProviders;
+    app.ai_providers.view = AIProvidersView::NewForm;
+    // Focus the API key field by focusing name then moving focus (simulate).
+    // TextState defaults to unfocused, so we directly focus the right field.
+    app.ai_providers.new_api_key_state.focus();
+    handle_terminal_event(Event::Paste("sk-secret".to_string()), &mut app, &tx)
+        .expect("handle paste into API key field");
+    assert_eq!(app.ai_providers.new_api_key_state.value(), "sk-secret");
+    assert_eq!(app.ai_providers.new_api_key_state.position(), 9);
+}
+
+#[test]
+fn paste_event_noop_on_unhandled_page() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    // Settings page has no paste handler — should be a no-op.
+    app.page = Page::Settings;
+    app.input.text = "unchanged".to_string();
+    app.input.cursor = 9;
+    handle_terminal_event(Event::Paste("data".to_string()), &mut app, &tx)
+        .expect("handle paste on settings page");
+    assert_eq!(app.input.text, "unchanged");
+    assert_eq!(app.input.cursor, 9);
+}
+
+#[test]
 fn cursor_left_moves_back_by_one_grapheme() {
     let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abcd".to_string();
