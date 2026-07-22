@@ -661,6 +661,13 @@ impl SessionManagerState {
 pub(crate) struct InputBuffer {
     pub(crate) text: String,
     pub(crate) cursor: usize,
+    /// Index of the first visual line shown in the visible window.
+    /// Adjusted by `ensure_cursor_visible` after each mutation to keep
+    /// the cursor in view.
+    pub(crate) scroll_offset: usize,
+    /// Lazily computed visual lines, keyed by `max_width`.
+    /// Invalidated whenever `text` changes.
+    pub(crate) lines_cache: Option<(usize, Vec<VisualLineInfo>)>,
 }
 
 impl InputBuffer {
@@ -668,6 +675,8 @@ impl InputBuffer {
         Self {
             text: String::new(),
             cursor: 0,
+            scroll_offset: 0,
+            lines_cache: None,
         }
     }
 
@@ -676,13 +685,11 @@ impl InputBuffer {
         self.text.is_empty()
     }
 
-    pub(crate) fn as_str(&self) -> &str {
-        self.text.as_str()
-    }
-
     pub(crate) fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        self.scroll_offset = 0;
+        self.lines_cache = None;
     }
 
     pub(crate) fn cursor_left(&mut self) {
@@ -752,6 +759,7 @@ impl InputBuffer {
     pub(crate) fn insert_char_at_cursor(&mut self, c: char) {
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.lines_cache = None;
     }
 
     /// Insert a string at the cursor position.
@@ -765,6 +773,7 @@ impl InputBuffer {
         }
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
+        self.lines_cache = None;
     }
 
     pub(crate) fn backspace_at_cursor(&mut self) {
@@ -776,6 +785,7 @@ impl InputBuffer {
             self.text.drain(start..self.cursor);
             self.cursor = start;
         }
+        self.lines_cache = None;
     }
 
     pub(crate) fn delete_at_cursor(&mut self) {
@@ -787,6 +797,7 @@ impl InputBuffer {
             self.text
                 .drain(self.cursor + offset..self.cursor + offset + grapheme.len());
         }
+        self.lines_cache = None;
     }
 
     pub(crate) fn delete_word_backward(&mut self) {
@@ -796,6 +807,7 @@ impl InputBuffer {
         let boundary = self.word_left_boundary();
         self.text.drain(boundary..self.cursor);
         self.cursor = boundary;
+        self.lines_cache = None;
     }
 
     pub(crate) fn delete_word_forward(&mut self) {
@@ -804,11 +816,13 @@ impl InputBuffer {
         }
         let boundary = self.word_right_boundary();
         self.text.drain(self.cursor..boundary);
+        self.lines_cache = None;
     }
 
     pub(crate) fn delete_to_start(&mut self) {
         self.text.drain(..self.cursor);
         self.cursor = 0;
+        self.lines_cache = None;
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -895,8 +909,8 @@ impl InputBuffer {
         if max_width < 1 {
             return;
         }
-        let lines = compute_visual_lines(&self.text, max_width);
-        let (current_line, col) = find_cursor_pos(&self.text, self.cursor, &lines);
+        let lines = cached_visual_lines(&self.text, max_width, &mut self.lines_cache);
+        let (current_line, col) = find_cursor_pos(&self.text, self.cursor, lines);
         if current_line == 0 {
             return;
         }
@@ -912,8 +926,8 @@ impl InputBuffer {
         if max_width < 1 {
             return;
         }
-        let lines = compute_visual_lines(&self.text, max_width);
-        let (current_line, col) = find_cursor_pos(&self.text, self.cursor, &lines);
+        let lines = cached_visual_lines(&self.text, max_width, &mut self.lines_cache);
+        let (current_line, col) = find_cursor_pos(&self.text, self.cursor, lines);
         if current_line + 1 >= lines.len() as u16 {
             return;
         }
@@ -926,28 +940,75 @@ impl InputBuffer {
 
     /// Return the (visual_row, visual_col) of the cursor within wrapped text.
     /// Both are 0-indexed.
-    pub(crate) fn cursor_visual_pos(&self, max_width: usize) -> (u16, u16) {
+    pub(crate) fn cursor_visual_pos(&mut self, max_width: usize) -> (u16, u16) {
         if max_width < 1 {
             return (0, 0);
         }
-        let lines = compute_visual_lines(&self.text, max_width);
-        find_cursor_pos(&self.text, self.cursor, &lines)
+        let lines = cached_visual_lines(&self.text, max_width, &mut self.lines_cache);
+        find_cursor_pos(&self.text, self.cursor, lines)
     }
 
     /// True when the cursor is on the first visual line of the input.
-    pub(crate) fn is_on_first_visual_line(&self, max_width: usize) -> bool {
+    pub(crate) fn is_on_first_visual_line(&mut self, max_width: usize) -> bool {
         self.cursor_visual_pos(max_width).0 == 0
     }
 
     /// True when the cursor is on the last visual line of the input.
-    pub(crate) fn is_on_last_visual_line(&self, max_width: usize) -> bool {
+    pub(crate) fn is_on_last_visual_line(&mut self, max_width: usize) -> bool {
         if max_width < 1 {
             return true;
         }
-        let lines = compute_visual_lines(&self.text, max_width);
-        let (row, _) = find_cursor_pos(&self.text, self.cursor, &lines);
+        let lines = cached_visual_lines(&self.text, max_width, &mut self.lines_cache);
+        let (row, _) = find_cursor_pos(&self.text, self.cursor, lines);
         row + 1 >= lines.len() as u16
     }
+
+    /// Adjust `scroll_offset` so the cursor's visual line is within the visible window.
+    ///
+    /// `max_width` is the inner width of the input box (terminal width minus borders).
+    /// `visible_height` is the number of content rows available.
+    pub(crate) fn ensure_cursor_visible(&mut self, max_width: usize, visible_height: usize) {
+        if max_width < 1 || visible_height == 0 {
+            self.scroll_offset = 0;
+            return;
+        }
+        let lines = cached_visual_lines(&self.text, max_width, &mut self.lines_cache);
+        if lines.len() <= visible_height {
+            self.scroll_offset = 0;
+            return;
+        }
+        let max_scroll = lines.len() - visible_height;
+        let (cursor_row, _) = find_cursor_pos(&self.text, self.cursor, lines);
+        let cursor_row = cursor_row as usize;
+
+        // If cursor is above the visible area, scroll up.
+        if cursor_row < self.scroll_offset {
+            self.scroll_offset = cursor_row;
+        }
+        // If cursor is below the visible area, scroll down.
+        if self.scroll_offset + visible_height <= cursor_row {
+            self.scroll_offset = cursor_row + 1 - visible_height;
+        }
+
+        self.scroll_offset = self.scroll_offset.min(max_scroll);
+    }
+}
+
+/// Return cached visual lines for `max_width`, recomputing only when
+/// `max_width` or `text` has changed since the last call.
+///
+/// Takes separate references to `text` and `cache` so callers can pass
+/// field-level borrows and avoid borrow-checker conflicts with other
+/// fields (e.g. `cursor`).
+pub(crate) fn cached_visual_lines<'a>(
+    text: &str,
+    max_width: usize,
+    cache: &'a mut Option<(usize, Vec<VisualLineInfo>)>,
+) -> &'a [VisualLineInfo] {
+    if cache.as_ref().is_none_or(|(w, _)| *w != max_width) {
+        *cache = Some((max_width, compute_visual_lines(text, max_width)));
+    }
+    &cache.as_ref().unwrap().1
 }
 
 /// A single visual (wrapped) line derived from the input text.
@@ -962,7 +1023,7 @@ pub(crate) struct VisualLineInfo {
 }
 
 /// Find the cursor's (visual_row, visual_col) within pre-computed visual lines.
-fn find_cursor_pos(text: &str, cursor: usize, lines: &[VisualLineInfo]) -> (u16, u16) {
+pub(crate) fn find_cursor_pos(text: &str, cursor: usize, lines: &[VisualLineInfo]) -> (u16, u16) {
     for (i, vl) in lines.iter().enumerate() {
         if cursor >= vl.start_byte && cursor <= vl.end_byte {
             let line_text = &text[vl.start_byte..cursor.min(vl.end_byte)];
@@ -1292,17 +1353,17 @@ impl App {
 
     /// Number of visual content lines the input box currently occupies,
     /// computed from the text and terminal width.
-    pub(crate) fn input_bar_content_lines(&self, term_width: u16) -> u16 {
+    pub(crate) fn input_bar_content_lines(&mut self, term_width: u16) -> u16 {
         let inner = term_width.saturating_sub(2) as usize;
         if inner < 1 {
             return 1;
         }
-        let visual = compute_visual_lines(&self.input.text, inner);
+        let visual = cached_visual_lines(&self.input.text, inner, &mut self.input.lines_cache);
         (visual.len() as u16).clamp(MIN_INPUT_CONTENT_LINES, MAX_INPUT_CONTENT_LINES)
     }
 
     /// Total height of the input bar (content + borders).
-    pub(crate) fn input_bar_height(&self, term_width: u16) -> u16 {
+    pub(crate) fn input_bar_height(&mut self, term_width: u16) -> u16 {
         self.input_bar_content_lines(term_width) + 2
     }
 
@@ -1587,14 +1648,19 @@ impl App {
             self.saved_draft = self.input.text.clone();
             self.history_index = Some(0);
             self.input.text = texts[0].to_string();
+            self.input.lines_cache = None;
+            self.input.cursor = self.input.text.len();
+            self.ensure_input_cursor_visible();
         } else if let Some(idx) = self.history_index {
             let next = idx + 1;
             if next < texts.len() {
                 self.history_index = Some(next);
                 self.input.text = texts[next].to_string();
+                self.input.lines_cache = None;
+                self.input.cursor = self.input.text.len();
+                self.ensure_input_cursor_visible();
             }
         }
-        self.input.cursor = self.input.text.len();
     }
 
     pub(crate) fn navigate_history_down(&mut self) {
@@ -1604,18 +1670,33 @@ impl App {
                 let prev = idx - 1;
                 self.history_index = Some(prev);
                 self.input.text = texts[prev].to_string();
+                self.input.lines_cache = None;
+                self.input.cursor = self.input.text.len();
+                self.ensure_input_cursor_visible();
             } else {
                 self.history_index = None;
                 self.input.text = self.saved_draft.clone();
+                self.input.lines_cache = None;
                 self.saved_draft.clear();
+                self.input.cursor = self.input.text.len();
+                self.ensure_input_cursor_visible();
             }
-            self.input.cursor = self.input.text.len();
         }
     }
 
     pub(crate) fn commit_to_history(&mut self) {
         self.history_index = None;
         self.saved_draft.clear();
+    }
+
+    /// After loading a history entry (or restoring a draft), adjust the
+    /// scroll offset so the cursor is visible within the input box.
+    pub(crate) fn ensure_input_cursor_visible(&mut self) {
+        if let Some((term_w, _)) = self.last_terminal_size {
+            let inner = term_w.saturating_sub(2) as usize;
+            let visible_height = self.input_bar_content_lines(term_w) as usize;
+            self.input.ensure_cursor_visible(inner, visible_height);
+        }
     }
 
     pub(crate) fn set_page(&mut self, page: Page) {

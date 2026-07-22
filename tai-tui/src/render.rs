@@ -2,7 +2,7 @@ use crate::markdown_render::{display_width, lines_height, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, PROVIDER_OPTIONS, Page,
-    RenderedCache, STATUS_BAR_HEIGHT, SessionManagerView, compute_visual_lines,
+    RenderedCache, STATUS_BAR_HEIGHT, SessionManagerView, cached_visual_lines,
 };
 use ratatui::{
     Frame,
@@ -260,20 +260,46 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
     // ── Command input box ──────────────────────────────────────
     let inner_width = (chunks[2].width.saturating_sub(2)) as usize;
-    let visual_lines = compute_visual_lines(app.input.as_str(), inner_width);
-    let text_lines: Vec<Line> = visual_lines
+    let visible_height = (chunks[2].height.saturating_sub(2)) as usize;
+
+    // Compute cursor position first (populates the lines cache) so we
+    // can then borrow separate fields of app.input for the cached lines.
+    let (vrow, vcol) = app.input.cursor_visual_pos(inner_width);
+
+    let all_visual_lines =
+        cached_visual_lines(&app.input.text, inner_width, &mut app.input.lines_cache);
+
+    // Apply scroll offset — only show the visible window.
+    let visible_count = visible_height.max(1).min(all_visual_lines.len());
+    let offset = app
+        .input
+        .scroll_offset
+        .min(all_visual_lines.len().saturating_sub(visible_count));
+    let visible_lines = all_visual_lines
+        .get(offset..offset + visible_count)
+        .unwrap_or(&[]);
+    let text_lines: Vec<Line> = visible_lines
         .iter()
-        .map(|vl| Line::from(&app.input.text[vl.start_byte..vl.end_byte]))
+        .map(|vl| {
+            Line::from(
+                app.input
+                    .text
+                    .get(vl.start_byte..vl.end_byte)
+                    .unwrap_or_default(),
+            )
+        })
         .collect();
 
     let input = Paragraph::new(Text::from(text_lines))
         .block(Block::default().borders(Borders::ALL).title("command"));
     frame.render_widget(input, chunks[2]);
-
-    // Cursor position within the wrapped text.
-    let (vrow, vcol) = app.input.cursor_visual_pos(inner_width);
+    // Clamp to visible area so the cursor is always inside the box,
+    // even when scroll_offset hasn't been adjusted yet (e.g. after
+    // loading a long history entry that ends at scroll_offset = 0).
+    let max_display_row = (visible_count as u16).saturating_sub(1);
+    let display_vrow = vrow.saturating_sub(offset as u16).min(max_display_row);
     let cursor_x = chunks[2].x.saturating_add(1).saturating_add(vcol);
-    let cursor_y = chunks[2].y.saturating_add(1).saturating_add(vrow);
+    let cursor_y = chunks[2].y.saturating_add(1).saturating_add(display_vrow);
     frame.set_cursor_position((cursor_x, cursor_y));
 
     // ── Status bar ────────────────────────────────────────────

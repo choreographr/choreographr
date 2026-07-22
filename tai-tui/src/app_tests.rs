@@ -755,6 +755,103 @@ fn navigate_history_up_down_with_multi_line() {
 }
 
 #[test]
+fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.last_terminal_size = Some((80, 24));
+    // Short text currently in input
+    app.input.text = "x".to_string();
+    app.input.cursor = 1;
+
+    // Insert a long multi-line history entry (20 visual lines at 80-wide terminal)
+    let long_text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+    let id = app.next_request_id;
+    app.session_view.insert_or_replace(
+        id,
+        tai_proto::Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some(long_text),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        },
+    );
+    app.next_request_id += 1;
+
+    app.navigate_history_up();
+    // After loading a long history entry and setting cursor to end,
+    // scroll_offset should be adjusted so the cursor is visible.
+    let inner = 78; // 80 - 2 borders
+    let visual_lines = compute_visual_lines(&app.input.text, inner);
+    let (cursor_row, _) = find_cursor_pos(&app.input.text, app.input.cursor, &visual_lines);
+    let visible_height = app.input_bar_content_lines(80) as usize;
+    let cursor_row = cursor_row as usize;
+    // Cursor should be within the visible window
+    assert!(
+        cursor_row >= app.input.scroll_offset,
+        "cursor_row {cursor_row} should be >= scroll_offset {}",
+        app.input.scroll_offset
+    );
+    assert!(
+        cursor_row < app.input.scroll_offset + visible_height,
+        "cursor_row {cursor_row} should be < scroll_offset {} + visible_height {visible_height}",
+        app.input.scroll_offset
+    );
+}
+
+#[test]
+fn navigate_history_down_adjusts_scroll_offset_for_long_draft() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.last_terminal_size = Some((80, 24));
+    // A long multi-line draft saved in history state
+    let long_draft: String = (0..20).map(|i| format!("line {i}\n")).collect();
+    app.saved_draft = long_draft.clone();
+    app.input.text = "x".to_string();
+    app.input.cursor = 1;
+    // Simulate being at the first history entry (so Down restores draft)
+    app.history_index = Some(0);
+    let id = app.next_request_id;
+    app.session_view.insert_or_replace(
+        id,
+        tai_proto::Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("history entry".into()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        },
+    );
+    app.next_request_id += 1;
+
+    app.navigate_history_down();
+    // After restoring the long draft, scroll_offset should ensure cursor is visible.
+    let inner = 78;
+    let visual_lines = compute_visual_lines(&app.input.text, inner);
+    let (cursor_row, _) = find_cursor_pos(&app.input.text, app.input.cursor, &visual_lines);
+    let visible_height = app.input_bar_content_lines(80) as usize;
+    let cursor_row = cursor_row as usize;
+    assert!(
+        cursor_row >= app.input.scroll_offset,
+        "cursor_row {cursor_row} should be >= scroll_offset {}",
+        app.input.scroll_offset
+    );
+    assert!(
+        cursor_row < app.input.scroll_offset + visible_height,
+        "cursor_row {cursor_row} should be < scroll_offset {} + visible_height {visible_height}",
+        app.input.scroll_offset
+    );
+}
+
+#[test]
 fn backspace_at_cursor_removes_before_cursor() {
     let mut app = test_app("/tmp/tai.sock");
     app.input.text = "abcd".to_string();
@@ -2277,4 +2374,136 @@ fn handle_turn_appended_with_displayed_image_populates_rendered_images() {
     assert_eq!(img.data.len(), 100);
     assert!(img.pending_job.is_none());
     assert!(img.protocols.is_empty());
+}
+
+// ── InputBuffer scroll_offset ──────────────────────────────────
+
+#[test]
+fn ensure_cursor_visible_short_text_keeps_offset_at_zero() {
+    let mut buf = InputBuffer::new();
+    buf.insert_str_at_cursor("short text");
+    // 1 visual line, visible_height=10 → no scrolling needed
+    buf.ensure_cursor_visible(40, 10);
+    assert_eq!(buf.scroll_offset, 0);
+}
+
+#[test]
+fn ensure_cursor_visible_clears_offset_when_text_fits() {
+    let mut buf = InputBuffer::new();
+    // Build 5 visual lines of text, visible_height=10 → all fit
+    for i in 0..5 {
+        buf.insert_str_at_cursor(&format!("line {i}\n"));
+    }
+    buf.scroll_offset = 3; // artificially set to an invalid position
+    buf.ensure_cursor_visible(40, 10);
+    assert_eq!(buf.scroll_offset, 0);
+}
+
+#[test]
+fn ensure_cursor_visible_scrolls_to_cursor_at_end() {
+    let mut buf = InputBuffer::new();
+    // 15 lines of text (no trailing newline → exactly 15 visual lines)
+    for i in 0..14 {
+        buf.insert_str_at_cursor(&format!("line {i}\n"));
+    }
+    buf.insert_str_at_cursor("line 14");
+    // Cursor is at the end (last visual line = 14)
+    buf.ensure_cursor_visible(40, 10);
+    // Should scroll so the last line is visible: offset = 15 - 10 = 5
+    assert_eq!(buf.scroll_offset, 5);
+}
+
+#[test]
+fn ensure_cursor_visible_keeps_offset_at_zero_when_cursor_at_start() {
+    let mut buf = InputBuffer::new();
+    for i in 0..15 {
+        buf.insert_str_at_cursor(&format!("line {i}\n"));
+    }
+    // Move cursor to the beginning
+    buf.cursor = 0;
+    buf.ensure_cursor_visible(40, 10);
+    // Cursor is on visual line 0, should see from the start
+    assert_eq!(buf.scroll_offset, 0);
+}
+
+#[test]
+fn ensure_cursor_visible_scrolls_up_when_cursor_moves_above_window() {
+    let mut buf = InputBuffer::new();
+    // 15 lines (no trailing newline → exactly 15 visual lines)
+    for i in 0..14 {
+        buf.insert_str_at_cursor(&format!("line {i}\n"));
+    }
+    buf.insert_str_at_cursor("line 14");
+
+    // Start with scroll_offset = 5 (showing lines 5-14)
+    buf.scroll_offset = 5;
+    buf.ensure_cursor_visible(40, 10);
+    // Cursor is at the end (line 14), still visible at offset 5
+    // (lines 5-14 contain line 14)
+    assert_eq!(buf.scroll_offset, 5);
+
+    // Move cursor to line 2 (visual row 2, which is above the window)
+    // "line 2\n" starts at byte 14 (after "line 0\n" at 0-6, "line 1\n" at 7-13)
+    buf.cursor = 14;
+    buf.ensure_cursor_visible(40, 10);
+    // Should scroll up to show line 2
+    assert_eq!(buf.scroll_offset, 2);
+}
+
+#[test]
+fn scroll_offset_resets_on_clear() {
+    let mut buf = InputBuffer::new();
+    for i in 0..15 {
+        buf.insert_str_at_cursor(&format!("line {i}\n"));
+    }
+    buf.ensure_cursor_visible(40, 10);
+    assert!(buf.scroll_offset > 0);
+
+    buf.clear();
+    assert_eq!(buf.scroll_offset, 0);
+    assert_eq!(buf.text, "");
+    assert_eq!(buf.cursor, 0);
+}
+
+#[test]
+fn ensure_cursor_visible_cursor_on_partial_line() {
+    let mut buf = InputBuffer::new();
+    // 15 lines plus trailing content on the last line
+    for i in 0..14 {
+        buf.insert_str_at_cursor(&format!("line {i}\n"));
+    }
+    buf.insert_str_at_cursor("extra at end");
+    // 15 visual lines (14 numbered + "extra at end"), cursor at end
+    buf.ensure_cursor_visible(40, 10);
+    assert_eq!(buf.scroll_offset, 5);
+}
+
+#[test]
+fn ensure_cursor_visible_handles_visible_height_one() {
+    let mut buf = InputBuffer::new();
+    // 5 lines (no trailing newline → exactly 5 visual lines)
+    for i in 0..4 {
+        buf.insert_str_at_cursor(&format!("line {i}\n"));
+    }
+    buf.insert_str_at_cursor("line 4");
+    // visible_height = 1: only one line visible at a time
+    buf.ensure_cursor_visible(40, 1);
+    // Cursor at end (visual line 4), max offset = 5 - 1 = 4
+    assert_eq!(buf.scroll_offset, 4);
+}
+
+#[test]
+fn scroll_offset_clamped_to_valid_range() {
+    let mut buf = InputBuffer::new();
+    // 5 lines (no trailing newline → exactly 5 visual lines)
+    for i in 0..4 {
+        buf.insert_str_at_cursor(&format!("line {i}\n"));
+    }
+    buf.insert_str_at_cursor("line 4");
+    // Artificially set scroll_offset way out of range
+    buf.scroll_offset = 100;
+    buf.ensure_cursor_visible(40, 3);
+    // 5 visual lines, visible_height=3, max offset = 5-3 = 2
+    // Cursor at end (visual line 4), scroll = 4+1-3 = 2
+    assert_eq!(buf.scroll_offset, 2);
 }

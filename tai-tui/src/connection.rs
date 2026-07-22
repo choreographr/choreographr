@@ -551,6 +551,7 @@ fn handle_paste_event(data: &str, app: &mut App) -> Result<(), ClientError> {
         Page::Chat => {
             tracing::debug!("[tai-tui] pasting into chat input buffer");
             app.input.insert_str_at_cursor(data);
+            app.ensure_input_cursor_visible();
         }
         Page::AIProviders => match app.ai_providers.view {
             AIProvidersView::List if app.ai_providers.credential_target.is_some() => {
@@ -757,6 +758,7 @@ fn handle_chat_event(
                         app.navigate_history_up();
                     } else {
                         app.input.cursor_up(inner);
+                        app.ensure_input_cursor_visible();
                     }
                 }
                 KeyCode::Down => {
@@ -768,10 +770,12 @@ fn handle_chat_event(
                         app.navigate_history_down();
                     } else {
                         app.input.cursor_down(inner);
+                        app.ensure_input_cursor_visible();
                     }
                 }
                 KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     app.input.insert_char_at_cursor('\n');
+                    app.ensure_input_cursor_visible();
                 }
                 KeyCode::Enter => {
                     let line = app.input.text.trim().to_string();
@@ -902,9 +906,11 @@ fn handle_chat_event(
                 | KeyCode::Home
                 | KeyCode::End => {
                     handle_input_key(key, &mut app.input);
+                    app.ensure_input_cursor_visible();
                 }
                 KeyCode::Char(_) => {
                     handle_input_key(key, &mut app.input);
+                    app.ensure_input_cursor_visible();
                 }
                 KeyCode::PageUp => {
                     app.scroll_up(PAGE_SCROLL_LINES);
