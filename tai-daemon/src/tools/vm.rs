@@ -309,7 +309,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
 
     /// Decode a postcard `Result<Vec<u8>, String>` from a byte slice.
     /// Returns Ok(bytes) or Err(error_string).
-    pub fn dec_result(resp: &[u8]) -> Result<&[u8], &str> {
+    pub fn dec_result<'a>(resp: &'a [u8]) -> Result<&'a [u8], &'a str> {
         if resp.is_empty() { return Err("empty response"); }
         let status = resp[0];
         let rest = &resp[1..];
@@ -329,7 +329,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
 
     /// Like `dec_result` but also returns the total number of bytes consumed
     /// so callers can advance a cursor across a sequence of results.
-    pub fn dec_result_raw(data: &[u8]) -> Result<(&[u8], usize), &str> {
+    pub fn dec_result_raw<'a>(data: &'a [u8]) -> Result<(&'a [u8], usize), &'a str> {
         if data.is_empty() { return Err("empty"); }
         let status = data[0];
         let (payload_len, mut consumed) = dec_varint(&data[1..])?;
@@ -364,7 +364,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
     /// Encodes all requests into a single batch frame, issues one ecall,
     /// and returns results in submission order. Each result is independent —
     /// one tool may fail without affecting the others.
-    pub fn call_multi(requests: &[(&str, &[u8])]) -> Vec<Result<Vec<u8>, &str>> {
+    pub fn call_multi(requests: &[(&str, &[u8])]) -> Vec<Result<Vec<u8>, String>> {
         let mut buf = Vec::new();
         enc_varint(requests.len() as u64, &mut buf);
         for (name, args) in requests {
@@ -391,7 +391,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
                     // Decoding failed mid-stream; return partial results and stop.
                     // The host always produces well-formed responses, so hitting
                     // this path indicates a fundamental protocol mismatch.
-                    results.push(Err(e));
+                    results.push(Err(String::from(e)));
                     break;
                 }
             }
