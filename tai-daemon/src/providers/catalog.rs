@@ -112,7 +112,7 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         default_model: "deepseek-v4-pro",
         reasoning: ReasoningSupport::ReasoningEffort,
         max_tokens_field: MaxTokensField::MaxTokens,
-        model_context_windows: &[],
+        model_context_windows: &[("deepseek-v4-flash", 1_000_000)],
     },
     ProviderEntry {
         slug: "deepseek",
