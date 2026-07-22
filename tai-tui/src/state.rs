@@ -12,13 +12,15 @@ use tai_proto::{
 use tai_tui::RenderedImage;
 use tai_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::markdown_render::{lines_height, plain_text_lines, render_turn_lines};
 use ratatui::text::Line;
 use tui_prompts::{SelectState, State, TextState};
 
-pub(crate) const INPUT_BAR_HEIGHT: u16 = 3;
 pub(crate) const STATUS_BAR_HEIGHT: u16 = 2;
+pub(crate) const MIN_INPUT_CONTENT_LINES: u16 = 1;
+pub(crate) const MAX_INPUT_CONTENT_LINES: u16 = 10;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
@@ -824,12 +826,20 @@ impl InputBuffer {
                 self.cursor_right();
                 true
             }
-            KeyCode::Home => {
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cursor_home();
                 true
             }
-            KeyCode::End => {
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cursor_end();
+                true
+            }
+            KeyCode::Home => {
+                self.cursor_home_line();
+                true
+            }
+            KeyCode::End => {
+                self.cursor_end_line();
                 true
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -848,6 +858,237 @@ impl InputBuffer {
             _ => false,
         }
     }
+
+    /// Move cursor to the start of the current logical line (after `\n` or at offset 0).
+    pub(crate) fn cursor_home_line(&mut self) {
+        let prefix = &self.text[..self.cursor];
+        self.cursor = prefix.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    }
+
+    /// Move cursor to the end of the current logical line (at the `\n` or at text end).
+    pub(crate) fn cursor_end_line(&mut self) {
+        let suffix = &self.text[self.cursor..];
+        self.cursor += suffix.find('\n').unwrap_or(suffix.len());
+    }
+
+    /// Move cursor up one visual line (wrapping-aware).
+    pub(crate) fn cursor_up(&mut self, max_width: usize) {
+        if max_width < 1 {
+            return;
+        }
+        let lines = compute_visual_lines(&self.text, max_width);
+        let (current_line, col) = find_cursor_pos(&self.text, self.cursor, &lines);
+        if current_line == 0 {
+            return;
+        }
+        let target = &lines[current_line as usize - 1];
+        let target_text = &self.text[target.start_byte..target.end_byte];
+        let target_col = (col as usize).min(target.display_width);
+        let byte_off = byte_offset_at_column(target_text, target_col);
+        self.cursor = target.start_byte + byte_off;
+    }
+
+    /// Move cursor down one visual line (wrapping-aware).
+    pub(crate) fn cursor_down(&mut self, max_width: usize) {
+        if max_width < 1 {
+            return;
+        }
+        let lines = compute_visual_lines(&self.text, max_width);
+        let (current_line, col) = find_cursor_pos(&self.text, self.cursor, &lines);
+        if current_line + 1 >= lines.len() as u16 {
+            return;
+        }
+        let target = &lines[current_line as usize + 1];
+        let target_text = &self.text[target.start_byte..target.end_byte];
+        let target_col = (col as usize).min(target.display_width);
+        let byte_off = byte_offset_at_column(target_text, target_col);
+        self.cursor = target.start_byte + byte_off;
+    }
+
+    /// Return the (visual_row, visual_col) of the cursor within wrapped text.
+    /// Both are 0-indexed.
+    pub(crate) fn cursor_visual_pos(&self, max_width: usize) -> (u16, u16) {
+        if max_width < 1 {
+            return (0, 0);
+        }
+        let lines = compute_visual_lines(&self.text, max_width);
+        find_cursor_pos(&self.text, self.cursor, &lines)
+    }
+
+    /// True when the cursor is on the first visual line of the input.
+    pub(crate) fn is_on_first_visual_line(&self, max_width: usize) -> bool {
+        self.cursor_visual_pos(max_width).0 == 0
+    }
+
+    /// True when the cursor is on the last visual line of the input.
+    pub(crate) fn is_on_last_visual_line(&self, max_width: usize) -> bool {
+        if max_width < 1 {
+            return true;
+        }
+        let lines = compute_visual_lines(&self.text, max_width);
+        let (row, _) = find_cursor_pos(&self.text, self.cursor, &lines);
+        row + 1 >= lines.len() as u16
+    }
+}
+
+/// A single visual (wrapped) line derived from the input text.
+#[derive(Debug)]
+pub(crate) struct VisualLineInfo {
+    /// Byte offset of the start of this visual line within the full input text.
+    pub(crate) start_byte: usize,
+    /// Byte offset of the end (exclusive) of this visual line.
+    pub(crate) end_byte: usize,
+    /// Display width of the text on this visual line.
+    pub(crate) display_width: usize,
+}
+
+/// Find the cursor's (visual_row, visual_col) within pre-computed visual lines.
+fn find_cursor_pos(text: &str, cursor: usize, lines: &[VisualLineInfo]) -> (u16, u16) {
+    for (i, vl) in lines.iter().enumerate() {
+        if cursor >= vl.start_byte && cursor <= vl.end_byte {
+            let line_text = &text[vl.start_byte..cursor.min(vl.end_byte)];
+            let col = UnicodeWidthStr::width(line_text);
+            return (i as u16, col as u16);
+        }
+    }
+    // Cursor past the last visual line — place at end.
+    let last = match lines.last() {
+        Some(vl) => vl,
+        None => return (0, 0),
+    };
+    let col = UnicodeWidthStr::width(&text[last.start_byte..last.end_byte]);
+    (lines.len().saturating_sub(1) as u16, col as u16)
+}
+
+/// Word-wrap `text` into visual lines that each fit within `max_width`.
+/// Explicit `\n` characters always create line breaks.  Words longer than
+/// `max_width` are placed on their own line and overflow — they are never
+/// character-broken.  Returns at least one entry (for empty text).
+pub(crate) fn compute_visual_lines(text: &str, max_width: usize) -> Vec<VisualLineInfo> {
+    if max_width == 0 {
+        return vec![VisualLineInfo {
+            start_byte: 0,
+            end_byte: 0,
+            display_width: 0,
+        }];
+    }
+
+    let text_ptr = text.as_ptr() as usize;
+    let mut lines: Vec<VisualLineInfo> = Vec::new();
+
+    for logical in text.split('\n') {
+        let logical_offset = logical.as_ptr() as usize - text_ptr;
+
+        if logical.is_empty() {
+            lines.push(VisualLineInfo {
+                start_byte: logical_offset,
+                end_byte: logical_offset,
+                display_width: 0,
+            });
+            continue;
+        }
+
+        // Collect word positions (non-whitespace runs) within this logical line.
+        let mut words: Vec<(usize, usize)> = Vec::new(); // (start, end) byte offsets within `logical`
+        let mut pos = 0;
+        while pos < logical.len() {
+            while pos < logical.len() && logical.as_bytes()[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos >= logical.len() {
+                break;
+            }
+            let w_start = pos;
+            while pos < logical.len() && !logical.as_bytes()[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            words.push((w_start, pos));
+        }
+
+        if words.is_empty() {
+            // Logical line contained only whitespace.
+            lines.push(VisualLineInfo {
+                start_byte: logical_offset,
+                end_byte: logical_offset + logical.len(),
+                display_width: UnicodeWidthStr::width(logical),
+            });
+            continue;
+        }
+
+        // Greedy word-wrap: accumulate words onto visual lines.
+        let mut line_start_byte = logical_offset; // byte offset in full text
+        let mut line_width: usize = 0;
+        let mut last_word_end_byte = logical_offset; // end of last word placed
+
+        for (i, &(w_start, w_end)) in words.iter().enumerate() {
+            let word = &logical[w_start..w_end];
+            let word_width = UnicodeWidthStr::width(word);
+
+            // Whitespace between the previous word (or start of logical line) and this word.
+            let preceding_ws = if i == 0 {
+                &logical[0..w_start]
+            } else {
+                &logical[words[i - 1].1..w_start]
+            };
+            let ws_width = UnicodeWidthStr::width(preceding_ws);
+
+            let space_needed = ws_width + word_width;
+
+            if line_width > 0 && line_width + space_needed > max_width {
+                // Flush current line (everything up to the end of the previous word).
+                lines.push(VisualLineInfo {
+                    start_byte: line_start_byte,
+                    end_byte: last_word_end_byte,
+                    display_width: line_width,
+                });
+                // Start new visual line with this word (leading whitespace trimmed).
+                line_start_byte = logical_offset + w_start;
+                line_width = word_width;
+                last_word_end_byte = logical_offset + w_end;
+            } else {
+                line_width += space_needed;
+                last_word_end_byte = logical_offset + w_end;
+            }
+        }
+
+        // Flush the last visual line of this logical line,
+        // including any trailing whitespace after the last word.
+        let trailing_ws = words
+            .last()
+            .map(|&(_, w_end)| &logical[w_end..])
+            .unwrap_or(logical);
+        let trailing_ws_width = UnicodeWidthStr::width(trailing_ws);
+        lines.push(VisualLineInfo {
+            start_byte: line_start_byte,
+            end_byte: last_word_end_byte + trailing_ws.len(),
+            display_width: line_width + trailing_ws_width,
+        });
+    }
+
+    if lines.is_empty() {
+        lines.push(VisualLineInfo {
+            start_byte: 0,
+            end_byte: 0,
+            display_width: 0,
+        });
+    }
+
+    lines
+}
+
+/// Find the byte offset within `s` for the given display-width column,
+/// without exceeding `target_col`.  Returns `s.len()` if `target_col` is
+/// larger than the string's display width.
+pub(crate) fn byte_offset_at_column(s: &str, target_col: usize) -> usize {
+    let mut col = 0;
+    for (byte_i, ch) in s.char_indices() {
+        let ch_w = UnicodeWidthStr::width(&s[byte_i..byte_i + ch.len_utf8()]);
+        if col + ch_w > target_col {
+            return byte_i;
+        }
+        col += ch_w;
+    }
+    s.len()
 }
 
 impl App {
@@ -997,6 +1238,22 @@ impl App {
         lines_height(&lines, width).max(1) as u16
     }
 
+    /// Number of visual content lines the input box currently occupies,
+    /// computed from the text and terminal width.
+    pub(crate) fn input_bar_content_lines(&self, term_width: u16) -> u16 {
+        let inner = term_width.saturating_sub(2) as usize;
+        if inner < 1 {
+            return 1;
+        }
+        let visual = compute_visual_lines(&self.input.text, inner);
+        (visual.len() as u16).clamp(MIN_INPUT_CONTENT_LINES, MAX_INPUT_CONTENT_LINES)
+    }
+
+    /// Total height of the input bar (content + borders).
+    pub(crate) fn input_bar_height(&self, term_width: u16) -> u16 {
+        self.input_bar_content_lines(term_width) + 2
+    }
+
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
         // Resolve the terminal size first so we have a width to pass to
         // status_error_height for the wrapped-line calculation.
@@ -1015,7 +1272,8 @@ impl App {
             }
         };
         let (width, height) = size;
-        let bottom_height = INPUT_BAR_HEIGHT + STATUS_BAR_HEIGHT + self.status_error_height(width);
+        let bottom_height =
+            self.input_bar_height(width) + STATUS_BAR_HEIGHT + self.status_error_height(width);
         if width > 1 && height > bottom_height {
             let old_width = self.history_viewport.width;
             let old_height = self.history_viewport.height;

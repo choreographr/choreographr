@@ -7,7 +7,8 @@ use crate::state::{
 use crossbeam::channel;
 use crossbeam::select;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use mio::unix::pipe;
 use mio::{Events, Interest, Poll, Token};
@@ -148,7 +149,8 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     crossterm::execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -296,7 +298,8 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     crossterm::execute!(
         terminal.backend_mut(),
         crossterm::terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
+        crossterm::event::DisableMouseCapture,
+        PopKeyboardEnhancementFlags,
     )?;
     terminal.show_cursor()?;
     // Clear the terminal-native progress bar now that the TUI is exiting.
@@ -469,6 +472,7 @@ fn handle_resume_command(
                 terminal.backend_mut(),
                 crossterm::terminal::EnterAlternateScreen,
                 crossterm::event::EnableMouseCapture,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             )?;
             terminal.clear()?;
             Ok(true)
@@ -480,6 +484,7 @@ fn handle_resume_command(
                 terminal.backend_mut(),
                 crossterm::event::DisableMouseCapture,
                 crossterm::terminal::LeaveAlternateScreen,
+                PopKeyboardEnhancementFlags,
             )?;
             // Suspend the process.  When SIGCONT resumes us the
             // terminal-event thread will send ReinitTerminal.
@@ -661,10 +666,29 @@ fn handle_chat_event(
                     app.set_page(Page::Home);
                 }
                 KeyCode::Up => {
-                    app.navigate_history_up();
+                    let inner = app
+                        .last_terminal_size
+                        .map(|(w, _)| w.saturating_sub(2) as usize)
+                        .unwrap_or(78);
+                    if app.input.is_on_first_visual_line(inner) {
+                        app.navigate_history_up();
+                    } else {
+                        app.input.cursor_up(inner);
+                    }
                 }
                 KeyCode::Down => {
-                    app.navigate_history_down();
+                    let inner = app
+                        .last_terminal_size
+                        .map(|(w, _)| w.saturating_sub(2) as usize)
+                        .unwrap_or(78);
+                    if app.input.is_on_last_visual_line(inner) {
+                        app.navigate_history_down();
+                    } else {
+                        app.input.cursor_down(inner);
+                    }
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    app.input.insert_char_at_cursor('\n');
                 }
                 KeyCode::Enter => {
                     let line = app.input.text.trim().to_string();

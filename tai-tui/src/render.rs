@@ -1,8 +1,8 @@
 use crate::markdown_render::{display_width, lines_height, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
-    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, INPUT_BAR_HEIGHT,
-    PROVIDER_OPTIONS, Page, RenderedCache, STATUS_BAR_HEIGHT, SessionManagerView,
+    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, PROVIDER_OPTIONS, Page,
+    RenderedCache, STATUS_BAR_HEIGHT, SessionManagerView, compute_visual_lines,
 };
 use ratatui::{
     Frame,
@@ -205,12 +205,13 @@ fn render_home(frame: &mut Frame<'_>, app: &mut App) {
 
 fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let status_error_height = app.status_error_height(frame.area().width);
+    let input_height = app.input_bar_height(frame.area().width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(status_error_height),
-            Constraint::Length(INPUT_BAR_HEIGHT),
+            Constraint::Length(input_height),
             Constraint::Length(STATUS_BAR_HEIGHT),
         ])
         .split(frame.area());
@@ -258,15 +259,21 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     // ── Command input box ──────────────────────────────────────
-    let input = Paragraph::new(app.input.as_str())
-        .block(Block::default().borders(Borders::ALL).title("command"))
-        .wrap(Wrap { trim: false });
+    let inner_width = (chunks[2].width.saturating_sub(2)) as usize;
+    let visual_lines = compute_visual_lines(app.input.as_str(), inner_width);
+    let text_lines: Vec<Line> = visual_lines
+        .iter()
+        .map(|vl| Line::from(&app.input.text[vl.start_byte..vl.end_byte]))
+        .collect();
+
+    let input = Paragraph::new(Text::from(text_lines))
+        .block(Block::default().borders(Borders::ALL).title("command"));
     frame.render_widget(input, chunks[2]);
 
-    let cursor_x = chunks[2].x.saturating_add(
-        1 + display_width(app.input.text.get(..app.input.cursor).unwrap_or("")) as u16,
-    );
-    let cursor_y = chunks[2].y.saturating_add(1);
+    // Cursor position within the wrapped text.
+    let (vrow, vcol) = app.input.cursor_visual_pos(inner_width);
+    let cursor_x = chunks[2].x.saturating_add(1).saturating_add(vcol);
+    let cursor_y = chunks[2].y.saturating_add(1).saturating_add(vrow);
     frame.set_cursor_position((cursor_x, cursor_y));
 
     // ── Status bar ────────────────────────────────────────────

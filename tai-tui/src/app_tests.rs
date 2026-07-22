@@ -299,6 +299,311 @@ fn cursor_end_moves_to_end() {
     assert_eq!(app.input.cursor, 5);
 }
 
+// ── Multi-line input tests ─────────────────────────────────
+
+fn vl_text<'a>(vl: &VisualLineInfo, source: &'a str) -> &'a str {
+    &source[vl.start_byte..vl.end_byte]
+}
+
+#[test]
+fn cursor_home_line_with_newline() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc\ndef".to_string();
+    buf.cursor = 6; // after "def" → line "def"
+    buf.cursor_home_line();
+    assert_eq!(buf.cursor, 4); // start of "def" (after \n)
+
+    buf.cursor = 3; // at the \n
+    buf.cursor_home_line();
+    assert_eq!(buf.cursor, 0); // start of "abc"
+}
+
+#[test]
+fn cursor_end_line_with_newline() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc\ndef".to_string();
+    buf.cursor = 0; // start of "abc"
+    buf.cursor_end_line();
+    assert_eq!(buf.cursor, 3); // at the \n (end of "abc" line)
+
+    buf.cursor = 4; // start of "def"
+    buf.cursor_end_line();
+    assert_eq!(buf.cursor, 7); // end of text
+}
+
+#[test]
+fn cursor_visual_pos_single_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello".to_string();
+    buf.cursor = 3;
+    let (row, col) = buf.cursor_visual_pos(80);
+    assert_eq!(row, 0);
+    assert_eq!(col, 3);
+}
+
+#[test]
+fn cursor_visual_pos_multi_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello\nworld".to_string();
+    buf.cursor = 11; // after "world"
+    let (row, col) = buf.cursor_visual_pos(80);
+    assert_eq!(row, 1);
+    assert_eq!(col, 5); // "world" has width 5
+}
+
+#[test]
+fn cursor_visual_pos_wrapped() {
+    let mut buf = InputBuffer::new();
+    buf.text = "aaa bbb ccc ddd".to_string();
+    buf.cursor = 15; // end of entire text
+    let (row, col) = buf.cursor_visual_pos(7);
+    // With max_width 7, greedy wrapping:
+    // "aaa bbb" (width 7) on line 0
+    // "ccc ddd" (width 7) on line 1
+    assert_eq!(row, 1);
+    assert_eq!(col, 7);
+}
+
+#[test]
+fn cursor_up_simple() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello\nworld".to_string();
+    buf.cursor = 9; // byte 9 = 'l', visual col 3 within "world"
+    buf.cursor_up(80);
+    assert!(!buf.text[..buf.cursor].contains('\n'));
+    // same col 3 lands at byte 3 ('l' in "hello")
+    assert_eq!(buf.cursor, 3);
+}
+
+#[test]
+fn cursor_down_simple() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello\nworld".to_string();
+    buf.cursor = 2; // byte 2 = 'l', visual col 2 within "hello"
+    buf.cursor_down(80);
+    assert!(buf.text[..buf.cursor].contains('\n'));
+    // same col 2 lands at byte 8 ('r' in "world")
+    assert_eq!(buf.cursor, 8);
+}
+
+#[test]
+fn cursor_up_stays_at_top() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello".to_string();
+    buf.cursor = 2;
+    buf.cursor_up(80);
+    assert_eq!(buf.cursor, 2); // unchanged — already on first visual line
+}
+
+#[test]
+fn cursor_down_stays_at_bottom() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello".to_string();
+    buf.cursor = 2;
+    buf.cursor_down(80);
+    assert_eq!(buf.cursor, 2); // unchanged — already on last visual line
+}
+
+#[test]
+fn is_on_first_visual_line_returns_true_at_top() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello\nworld".to_string();
+    buf.cursor = 2;
+    assert!(buf.is_on_first_visual_line(80));
+}
+
+#[test]
+fn is_on_first_visual_line_returns_false_on_second_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello\nworld".to_string();
+    buf.cursor = 8; // in "world"
+    assert!(!buf.is_on_first_visual_line(80));
+}
+
+#[test]
+fn is_on_last_visual_line_returns_true_at_bottom() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello\nworld".to_string();
+    buf.cursor = 8; // in "world"
+    assert!(buf.is_on_last_visual_line(80));
+}
+
+#[test]
+fn is_on_last_visual_line_returns_false_on_first_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello\nworld".to_string();
+    buf.cursor = 2;
+    assert!(!buf.is_on_last_visual_line(80));
+}
+
+#[test]
+fn handle_key_enter_submits_without_shift() {
+    let mut buf = InputBuffer::new();
+    buf.text = "hello".to_string();
+    buf.cursor = 5;
+    // Plain Enter returns false (caller should submit)
+    assert!(!buf.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert_eq!(buf.text, "hello"); // unchanged
+}
+
+#[test]
+fn handle_key_home_on_multi_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc\ndef".to_string();
+    buf.cursor = 6; // in "def"
+    buf.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+    assert_eq!(buf.cursor, 4); // start of "def" (not 0)
+}
+
+#[test]
+fn handle_key_ctrl_home_on_multi_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc\ndef".to_string();
+    buf.cursor = 6;
+    buf.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+    assert_eq!(buf.cursor, 0); // document start
+}
+
+#[test]
+fn handle_key_end_on_multi_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc\ndef".to_string();
+    buf.cursor = 0;
+    buf.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    assert_eq!(buf.cursor, 3); // at the \n (end of "abc" line)
+}
+
+#[test]
+fn handle_key_ctrl_end_on_multi_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "abc\ndef".to_string();
+    buf.cursor = 0;
+    buf.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+    assert_eq!(buf.cursor, 7); // document end
+}
+
+#[test]
+fn compute_visual_lines_handles_empty_text() {
+    let lines = compute_visual_lines("", 80);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].start_byte, 0);
+    assert_eq!(lines[0].end_byte, 0);
+}
+
+#[test]
+fn compute_visual_lines_no_wrap() {
+    let lines = compute_visual_lines("hello world", 80);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(vl_text(&lines[0], "hello world"), "hello world");
+}
+
+#[test]
+fn compute_visual_lines_wraps_words() {
+    let lines = compute_visual_lines("aaa bbb ccc", 7);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(vl_text(&lines[0], "aaa bbb ccc"), "aaa bbb");
+    assert_eq!(vl_text(&lines[1], "aaa bbb ccc"), "ccc");
+}
+
+#[test]
+fn compute_visual_lines_respects_newlines() {
+    let lines = compute_visual_lines("hello\nworld", 80);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(vl_text(&lines[0], "hello\nworld"), "hello");
+    assert_eq!(vl_text(&lines[1], "hello\nworld"), "world");
+}
+
+#[test]
+fn compute_visual_lines_mixed_newlines_and_wrapping() {
+    let lines = compute_visual_lines("a b c\nd e f", 4);
+    assert_eq!(lines.len(), 4);
+    assert_eq!(vl_text(&lines[0], "a b c\nd e f"), "a b");
+    assert_eq!(vl_text(&lines[1], "a b c\nd e f"), "c");
+    assert_eq!(vl_text(&lines[2], "a b c\nd e f"), "d e");
+    assert_eq!(vl_text(&lines[3], "a b c\nd e f"), "f");
+}
+
+#[test]
+fn compute_visual_lines_long_word_does_not_break() {
+    let lines = compute_visual_lines("superlongword", 5);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(vl_text(&lines[0], "superlongword"), "superlongword");
+}
+
+#[test]
+fn byte_offset_at_column_basic() {
+    assert_eq!(byte_offset_at_column("hello", 2), 2);
+    assert_eq!(byte_offset_at_column("hello", 10), 5); // clamps to len
+}
+
+#[test]
+fn byte_offset_at_column_cjk() {
+    // Each CJK char is 2 columns wide
+    assert_eq!(byte_offset_at_column("你好", 2), 3); // after first CJK char (3 bytes)
+}
+
+#[test]
+fn cursor_up_preserves_column_across_wrapped_lines() {
+    let mut buf = InputBuffer::new();
+    buf.text = "aaaa bbbb cccc dddd".to_string();
+    buf.cursor = buf.text.len(); // end of text
+    // With max_width 8:
+    // "aaaa" (4) + " " (1) + "bbbb" (4) = 9 > 8 → wrap
+    // Line 0: "aaaa bbbb" (width 9) — wait, that's > 8...
+    // Actually: "aaaa" (4) fits. " bbbb" (5) → 4+5=9 > 8 → wrap
+    // Line 0: "aaaa" (width 4), Line 1: "bbbb cccc" (wait...)
+    // "bbbb" (4) fits on line 1. " cccc" (5) → 4+5=9 > 8 → wrap
+    // Line 1: "bbbb" (width 4), Line 2: "cccc dddd" ...
+    // "cccc" (4) fits. " dddd" (5) → 4+5=9 > 8 → wrap
+    // Line 2: "cccc" (width 4), Line 3: "dddd" (width 4)
+
+    buf.cursor = 19; // end of "dddd"
+    buf.cursor_up(8);
+    // Should land at end of "cccc" (last word on line 2)
+    let (row, _) = buf.cursor_visual_pos(8);
+    assert_eq!(row, 2);
+}
+
+#[test]
+fn cursor_down_from_wrapped_line() {
+    let mut buf = InputBuffer::new();
+    buf.text = "aaaa bbbb cccc".to_string();
+    buf.cursor = 0;
+    buf.cursor_down(8);
+    // Should land on line 1 at column 0
+    let (row, col) = buf.cursor_visual_pos(8);
+    assert_eq!(row, 1);
+    assert_eq!(col, 0);
+}
+
+#[test]
+fn navigate_history_up_down_with_multi_line() {
+    let mut app = test_app("/tmp/tai.sock");
+    // Insert a turn with user_text so history exists
+    let id = app.next_request_id;
+    app.session_view.insert_or_replace(
+        id,
+        tai_proto::Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("multi\nline\ntext".into()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        },
+    );
+    app.next_request_id += 1;
+
+    // Navigation should set cursor to end of text
+    app.navigate_history_up();
+    assert_eq!(app.input.text, "multi\nline\ntext");
+    assert_eq!(app.input.cursor, 15);
+}
+
 #[test]
 fn backspace_at_cursor_removes_before_cursor() {
     let mut app = test_app("/tmp/tai.sock");
