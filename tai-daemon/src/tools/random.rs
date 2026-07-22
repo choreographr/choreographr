@@ -5,13 +5,37 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::fmt;
 use std::path::Path;
+
+/// Supported random value types.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RandomType {
+    Int,
+    Float,
+    Bool,
+    Bytes,
+    Uuid,
+}
+
+impl fmt::Display for RandomType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RandomType::Int => write!(f, "int"),
+            RandomType::Float => write!(f, "float"),
+            RandomType::Bool => write!(f, "bool"),
+            RandomType::Bytes => write!(f, "bytes"),
+            RandomType::Uuid => write!(f, "uuid"),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RandomArgs {
-    /// Type of random value to generate: "int", "float", "string", or "bytes"
+    /// Type of random value to generate.
     #[schemars(rename = "type")]
-    pub r#type: Option<String>,
+    pub r#type: Option<RandomType>,
     /// Minimum value (inclusive) for integers
     pub min: Option<i64>,
     /// Maximum value (inclusive) for integers
@@ -37,10 +61,10 @@ pub(crate) fn execute_random_tool(
 }
 
 fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolExecError> {
-    let type_ = args.r#type.as_deref().unwrap_or("int");
+    let type_ = args.r#type.as_ref().unwrap_or(&RandomType::Int);
 
     match type_ {
-        "int" => {
+        RandomType::Int => {
             let min = args.min.unwrap_or(0);
             let max = args.max.unwrap_or(100);
             if min > max {
@@ -52,7 +76,7 @@ fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolExec
             Ok(format!("{value}"))
         }
 
-        "float" => {
+        RandomType::Float => {
             let min = args.min_float.unwrap_or(0.0);
             let max = args.max_float.unwrap_or(1.0);
             if min >= max {
@@ -64,12 +88,12 @@ fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolExec
             Ok(format!("{value}"))
         }
 
-        "bool" => {
+        RandomType::Bool => {
             let value: bool = rng.random();
             Ok(value.to_string())
         }
 
-        "bytes" => {
+        RandomType::Bytes => {
             let length = args.length.unwrap_or(16).min(65536) as usize;
             let mut buf = vec![0u8; length];
             rng.fill_bytes(&mut buf);
@@ -77,7 +101,7 @@ fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolExec
             Ok(encoded)
         }
 
-        "uuid" => {
+        RandomType::Uuid => {
             let mut bytes = [0u8; 16];
             rng.fill_bytes(&mut bytes);
             // Set version nibble to 0100 (v4)
@@ -105,18 +129,21 @@ fn generate(rng: &mut impl RngExt, args: &RandomArgs) -> Result<String, ToolExec
             );
             Ok(uuid)
         }
-
-        other => Err(ToolExecError(format!(
-            "unknown random type: {other}; expected one of: int, float, bool, bytes, uuid"
-        ))),
     }
 }
 
 pub fn describe_random_invocation(args: &RandomArgs) -> String {
-    let rtype = args.r#type.as_deref().unwrap_or("value");
+    let rtype = match args.r#type.as_ref() {
+        Some(RandomType::Int) => "int",
+        Some(RandomType::Float) => "float",
+        Some(RandomType::Bool) => "bool",
+        Some(RandomType::Bytes) => "bytes",
+        Some(RandomType::Uuid) => "uuid",
+        None => "value",
+    };
     let mut parts = vec![format!("Generating random {}.", rtype)];
-    match rtype {
-        "int" => {
+    match args.r#type.as_ref().unwrap_or(&RandomType::Int) {
+        RandomType::Int => {
             if let Some(min) = args.min {
                 parts.push(format!(" Min: {}.", min));
             }
@@ -124,7 +151,7 @@ pub fn describe_random_invocation(args: &RandomArgs) -> String {
                 parts.push(format!(" Max: {}.", max));
             }
         }
-        "float" => {
+        RandomType::Float => {
             if let Some(min) = args.min_float {
                 parts.push(format!(" Min: {}.", min));
             }
@@ -132,7 +159,7 @@ pub fn describe_random_invocation(args: &RandomArgs) -> String {
                 parts.push(format!(" Max: {}.", max));
             }
         }
-        "bytes" | "string" => {
+        RandomType::Bytes => {
             if let Some(len) = args.length {
                 parts.push(format!(" Length: {}.", len));
             }
@@ -180,7 +207,7 @@ mod tests {
     #[test]
     fn random_int_range_respected() {
         let args = RandomArgs {
-            r#type: Some("int".into()),
+            r#type: Some(RandomType::Int),
             min: Some(50),
             max: Some(60),
             min_float: None,
@@ -196,7 +223,7 @@ mod tests {
     #[test]
     fn random_int_min_greater_than_max_error() {
         let args = RandomArgs {
-            r#type: Some("int".into()),
+            r#type: Some(RandomType::Int),
             min: Some(100),
             max: Some(0),
             min_float: None,
@@ -211,7 +238,7 @@ mod tests {
     #[test]
     fn random_float_default_range() {
         let args = RandomArgs {
-            r#type: Some("float".into()),
+            r#type: Some(RandomType::Float),
             min: None,
             max: None,
             min_float: None,
@@ -227,7 +254,7 @@ mod tests {
     #[test]
     fn random_float_range_respected() {
         let args = RandomArgs {
-            r#type: Some("float".into()),
+            r#type: Some(RandomType::Float),
             min: None,
             max: None,
             min_float: Some(5.0),
@@ -243,7 +270,7 @@ mod tests {
     #[test]
     fn random_bool() {
         let args = RandomArgs {
-            r#type: Some("bool".into()),
+            r#type: Some(RandomType::Bool),
             min: None,
             max: None,
             min_float: None,
@@ -260,7 +287,7 @@ mod tests {
     #[test]
     fn random_bytes_default_length() {
         let args = RandomArgs {
-            r#type: Some("bytes".into()),
+            r#type: Some(RandomType::Bytes),
             min: None,
             max: None,
             min_float: None,
@@ -276,7 +303,7 @@ mod tests {
     #[test]
     fn random_bytes_custom_length() {
         let args = RandomArgs {
-            r#type: Some("bytes".into()),
+            r#type: Some(RandomType::Bytes),
             min: None,
             max: None,
             min_float: None,
@@ -292,7 +319,7 @@ mod tests {
     #[test]
     fn random_uuid_format() {
         let args = RandomArgs {
-            r#type: Some("uuid".into()),
+            r#type: Some(RandomType::Uuid),
             min: None,
             max: None,
             min_float: None,
@@ -310,24 +337,9 @@ mod tests {
     }
 
     #[test]
-    fn random_unknown_type_error() {
-        let args = RandomArgs {
-            r#type: Some("invalid".into()),
-            min: None,
-            max: None,
-            min_float: None,
-            max_float: None,
-            length: None,
-            seed: Some(42),
-        };
-        let result = execute_random_tool(&args, None);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn random_seed_deterministic() {
         let args = RandomArgs {
-            r#type: Some("int".into()),
+            r#type: Some(RandomType::Int),
             min: Some(0),
             max: Some(1000),
             min_float: None,
@@ -343,7 +355,7 @@ mod tests {
     #[test]
     fn random_different_seeds_produce_different_values() {
         let args_a = RandomArgs {
-            r#type: Some("int".into()),
+            r#type: Some(RandomType::Int),
             min: Some(0),
             max: Some(1000000),
             min_float: None,
@@ -352,7 +364,7 @@ mod tests {
             seed: Some(1),
         };
         let args_b = RandomArgs {
-            r#type: Some("int".into()),
+            r#type: Some(RandomType::Int),
             min: Some(0),
             max: Some(1000000),
             min_float: None,
@@ -368,7 +380,7 @@ mod tests {
     #[test]
     fn random_float_min_gte_max_error() {
         let args = RandomArgs {
-            r#type: Some("float".into()),
+            r#type: Some(RandomType::Float),
             min: None,
             max: None,
             min_float: Some(10.0),

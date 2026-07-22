@@ -1390,11 +1390,11 @@ User presses Enter on a session in the session manager
     per-model overrides (`model_request_formats`) and falls back to `default_request_format`.
     Every entry point (`completion`, `completion_stream`, `chat_completion_turn`,
     `chat_completion_turn_streaming`) matches on the resolved format and calls the appropriate
-    request builder. Input/output mapping differs between the two: system messages become the
-    Responses `instructions` field, tool results become `function_call_output` items, and the
-    `input` is an array of typed items rather than a flat messages list. Multi-turn chaining uses
-    `previous_response_id` to link turns together, while Chat Completions relies on the full
-    message history.
+    request builder. Input/output mapping differs between the two: system messages go into the
+    `input` array as `{role: "system"}` items (rather than the `instructions` field), tool results
+    become `function_call_output` items, and the `input` is an array of typed items rather than a
+    flat messages list. Multi-turn chaining uses `previous_response_id` to link turns together,
+    while Chat Completions relies on the full message history.
 
     **Programmatic tool calling (Responses API, gpt-5.6+):** When enabled, the Responses
     request body includes a `programmatic_tool_calling` tool with `type: "programmatic_tool_calling"`.

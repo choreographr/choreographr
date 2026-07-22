@@ -99,6 +99,8 @@ struct ResponsesRequest<'a> {
     include: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 /// Raw Responses API response envelope.
@@ -466,23 +468,22 @@ pub(crate) fn reasoning_effort_api_value(effort: ThinkingEffort) -> Option<&'sta
 }
 
 /// Convert ChatRequestMessage slice to Responses API input format.
-/// Returns (instructions, input_items) where instructions is the system prompt
-/// extracted from system-role messages.
+/// System messages go into `input` as `{role: "system"}` items (not the
+/// `instructions` field); the `instructions` field is a separate top-level
+/// parameter set via explicit provider configuration.
 pub(crate) fn messages_to_responses_input(
     messages: &[ChatRequestMessage],
-) -> (Option<String>, Vec<ResponsesInputItem>) {
-    let mut instructions = None;
+) -> Vec<ResponsesInputItem> {
     let mut items = Vec::new();
 
     for msg in messages {
         match msg.role {
             "system" => {
                 if let Some(ref content) = msg.content {
-                    tracing::debug!(
-                        "extracted instructions from system message (len={})",
-                        content.len()
-                    );
-                    instructions = Some(content.clone());
+                    items.push(ResponsesInputItem::Message {
+                        role: "system".to_string(),
+                        content: content.clone(),
+                    });
                 }
             }
             "user" | "assistant" => {
@@ -514,13 +515,9 @@ pub(crate) fn messages_to_responses_input(
         }
     }
 
-    tracing::debug!(
-        "messages_to_responses_input: {} items, instructions={}",
-        items.len(),
-        instructions.is_some()
-    );
+    tracing::debug!("messages_to_responses_input: {} items", items.len());
 
-    (instructions, items)
+    items
 }
 
 // ── ProviderClient trait impl ───────────────────────────────────────────

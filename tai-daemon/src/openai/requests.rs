@@ -1,4 +1,4 @@
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use super::ServiceConfig;
 use super::retry;
@@ -20,6 +20,30 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc;
 use tai_proto::TokenUsage;
+
+/// Filter tool calls whose `arguments_json` is not valid JSON (e.g. truncated
+/// mid-stream by the provider).  Returns the names of discarded calls.
+/// Providers (especially cheaper models via OpenAI-compatible APIs) sometimes
+/// return incomplete `function.arguments` strings, which would cause tool
+/// execution to fail with a JSON parse error and trigger an error-recovery
+/// loop that inflates the context and eventually hits the provider's 400/500.
+fn validate_tool_call_arguments(tool_calls: &mut Vec<ChatToolCall>) -> Vec<String> {
+    let mut discarded = Vec::new();
+    tool_calls.retain(|tc| {
+        if serde_json::from_str::<serde_json::Value>(&tc.arguments_json).is_ok() {
+            true
+        } else {
+            warn!(
+                name = %tc.name,
+                args_len = tc.arguments_json.len(),
+                "discarding tool call with invalid (truncated) arguments JSON",
+            );
+            discarded.push(tc.name.clone());
+            false
+        }
+    });
+    discarded
+}
 
 impl OpenAiClient {
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, super::OpenAiError> {
@@ -305,7 +329,6 @@ fn chat_completions_request_with_tools(
         total_tokens = payload.usage.as_ref().map(|u| u.total_tokens),
         "chat completion turn",
     );
-
     let Some(mut choice) = payload.choices.into_iter().next() else {
         return Err(super::OpenAiError::EmptyResponse);
     };
@@ -320,24 +343,32 @@ fn chat_completions_request_with_tools(
         total_tokens: u.total_tokens,
     });
 
-    if !choice.message.tool_calls.is_empty() {
+    let mut tool_calls: Vec<ChatToolCall> = choice
+        .message
+        .tool_calls
+        .into_iter()
+        .map(|tool_call| ChatToolCall {
+            id: tool_call.id,
+            name: tool_call.function.name,
+            arguments_json: tool_call.function.arguments,
+            caller: None,
+        })
+        .collect();
+    let discarded = validate_tool_call_arguments(&mut tool_calls);
+    if !tool_calls.is_empty() {
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
             content: choice.message.content,
-            tool_calls: choice
-                .message
-                .tool_calls
-                .into_iter()
-                .map(|tool_call| ChatToolCall {
-                    id: tool_call.id,
-                    name: tool_call.function.name,
-                    arguments_json: tool_call.function.arguments,
-                    caller: None,
-                })
-                .collect(),
+            tool_calls,
             reasoning,
             usage: turn_usage,
             response_id: None,
         }));
+    }
+
+    if !discarded.is_empty() {
+        return Err(super::OpenAiError::TruncatedToolCall {
+            tool_names: discarded,
+        });
     }
 
     let content = choice
@@ -477,27 +508,23 @@ where
     Ok(())
 }
 
-/// Shared helper: build the `instructions` and `input` JSON value for a
-/// Responses API request, based on whether this is a follow-up turn carrying
-/// tool results or a first turn built from message history.
+/// Build the `input` JSON value for a Responses API request, based on
+/// whether this is a follow-up turn carrying tool results or a first turn
+/// built from message history.
 fn build_responses_input(
     tool_results: &[ToolResultItem],
     messages: &[ChatRequestMessage],
-) -> (Option<String>, Option<serde_json::Value>) {
+) -> Result<Option<serde_json::Value>, super::OpenAiError> {
     if tool_results.is_empty() {
         // First call in a turn: convert messages to Responses input items.
-        // System message(s) become `instructions`; everything else goes into
-        // the `input` array.
-        let (instructions, items) = messages_to_responses_input(messages);
+        // System messages go into `input` as `{role: "system"}` items.
+        let items = messages_to_responses_input(messages);
         let input_value = if items.is_empty() {
             serde_json::Value::String(String::new())
         } else {
-            serde_json::to_value(&items).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "failed to serialize responses input items");
-                serde_json::Value::String(String::new())
-            })
+            serde_json::to_value(&items).map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?
         };
-        (instructions, Some(input_value))
+        Ok(Some(input_value))
     } else {
         // Returning tool results from a previous turn: build
         // function_call_output items.  Both `instructions` and `messages`
@@ -512,11 +539,9 @@ fn build_responses_input(
                 caller: tr.caller.clone(),
             })
             .collect();
-        let input_value = serde_json::to_value(&items).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to serialize tool result items");
-            serde_json::Value::String(String::new())
-        });
-        (None, Some(input_value))
+        let input_value = serde_json::to_value(&items)
+            .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+        Ok(Some(input_value))
     }
 }
 
@@ -556,7 +581,7 @@ fn build_responses_request_body(
 ) -> Result<(String, serde_json::Value), super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.responses_path)?;
     let max_output_tokens = config.max_output_tokens_for_model(model);
-    let (instructions, input_value) = build_responses_input(tool_results, messages);
+    let input_value = build_responses_input(tool_results, messages)?;
 
     let mut responses_tools: Vec<ResponsesTool> = tools.iter().map(ResponsesTool::from).collect();
     if programmatic_tool_calling {
@@ -580,18 +605,29 @@ fn build_responses_request_body(
     // that don't support reasoning.
     let include = Some(vec!["reasoning.summary"]);
 
+    // tool_choice: "auto" tells the model to use function calling.
+    // Without this, some models may generate tool calls as plain text instead.
+    let tool_choice = if tools_opt.is_some() {
+        Some("auto".into())
+    } else {
+        None
+    };
+
     let body = serde_json::to_value(&ResponsesRequest {
         model,
         input: input_value,
-        instructions: instructions.as_deref(),
+        instructions: None,
         tools: tools_opt,
         stream,
         max_output_tokens,
         reasoning_effort,
-        store: config.responses_store,
+        // store: true is required for previous_response_id to work correctly
+        // and matches the @ai-sdk/openai default behavior.
+        store: true,
         previous_response_id,
         include,
         parallel_tool_calls: None,
+        tool_choice,
     })
     .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
@@ -619,12 +655,11 @@ fn build_simple_responses_body(
         max_output_tokens: None,
         reasoning_effort: None,
         // Simple requests are ephemeral — don't persist on the server side.
-        // Tool-using paths respect `config.responses_store` for multi-turn
-        // conversations that benefit from server-side history.
         store: false,
         previous_response_id: None,
         include: None,
         parallel_tool_calls: None,
+        tool_choice: None,
     })
     .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
     Ok((url, body))
@@ -763,6 +798,7 @@ fn responses_request_with_tools(
         }
     }
 
+    let discarded = validate_tool_call_arguments(&mut tool_calls);
     if !tool_calls.is_empty() {
         Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
             content: if full_text.is_empty() {
@@ -779,6 +815,23 @@ fn responses_request_with_tools(
             usage: turn_usage,
             response_id,
         }))
+    } else if !discarded.is_empty() && !full_text.is_empty() {
+        // All calls were discarded but the model also produced text —
+        // return the text instead of failing.
+        Ok(ChatTurnResult::FinalText(FinalTextResult {
+            content: full_text,
+            reasoning: if full_reasoning.is_empty() {
+                None
+            } else {
+                Some(full_reasoning)
+            },
+            usage: turn_usage,
+            response_id,
+        }))
+    } else if !discarded.is_empty() {
+        Err(super::OpenAiError::TruncatedToolCall {
+            tool_names: discarded,
+        })
     } else if full_text.is_empty() {
         Err(super::OpenAiError::EmptyResponse)
     } else {
@@ -1004,22 +1057,30 @@ where
     }
 
     if !raw_tool_call_deltas.is_empty() {
-        let tool_calls = accumulate_tool_calls_from_deltas(raw_tool_call_deltas);
-        return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
-            content: if full_content.is_empty() {
-                None
-            } else {
-                Some(full_content)
-            },
-            tool_calls,
-            reasoning: if full_reasoning.is_empty() {
-                None
-            } else {
-                Some(full_reasoning)
-            },
-            usage: last_usage,
-            response_id: None,
-        }));
+        let mut tool_calls = accumulate_tool_calls_from_deltas(raw_tool_call_deltas);
+        let discarded = validate_tool_call_arguments(&mut tool_calls);
+        if !tool_calls.is_empty() {
+            return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
+                content: if full_content.is_empty() {
+                    None
+                } else {
+                    Some(full_content)
+                },
+                tool_calls,
+                reasoning: if full_reasoning.is_empty() {
+                    None
+                } else {
+                    Some(full_reasoning)
+                },
+                usage: last_usage,
+                response_id: None,
+            }));
+        }
+        if !discarded.is_empty() {
+            return Err(super::OpenAiError::TruncatedToolCall {
+                tool_names: discarded,
+            });
+        }
     }
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
@@ -1217,30 +1278,65 @@ where
     if !acc_calls.is_empty() {
         let mut sorted: Vec<(String, AccCall)> = acc_calls.into_iter().collect();
         sorted.sort_by_key(|(_, acc)| acc.index);
-        let tool_calls: Vec<ChatToolCall> = sorted
+        let total_calls = sorted.len();
+
+        // First pass: filter out calls without a name (the provider sent
+        // incomplete function call events, e.g. arguments delta without a
+        // done event).
+        let mut tool_calls: Vec<ChatToolCall> = sorted
             .into_iter()
-            .map(|(call_id, acc)| ChatToolCall {
-                id: call_id,
-                name: acc.name.unwrap_or_default(),
-                arguments_json: acc.arguments,
-                caller: None,
+            .filter_map(|(call_id, acc)| {
+                let name = acc.name.as_deref().filter(|n| !n.is_empty())?;
+                Some(ChatToolCall {
+                    id: call_id,
+                    name: name.to_string(),
+                    arguments_json: acc.arguments,
+                    caller: None,
+                })
             })
             .collect();
-        return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
-            content: if full_content.is_empty() {
-                None
-            } else {
-                Some(full_content)
-            },
-            tool_calls,
-            reasoning: if full_reasoning.is_empty() {
-                None
-            } else {
-                Some(full_reasoning)
-            },
-            usage: last_usage,
-            response_id,
-        }));
+
+        // Second pass: discard calls with truncated arguments JSON.
+        let discarded = validate_tool_call_arguments(&mut tool_calls);
+
+        if !tool_calls.is_empty() {
+            return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
+                content: if full_content.is_empty() {
+                    None
+                } else {
+                    Some(full_content)
+                },
+                tool_calls,
+                reasoning: if full_reasoning.is_empty() {
+                    None
+                } else {
+                    Some(full_reasoning)
+                },
+                usage: last_usage,
+                response_id,
+            }));
+        }
+
+        // All calls were discarded — show a user-visible error in the TUI,
+        // not just a log line, unless the model also produced text.
+        if !discarded.is_empty() && !full_content.is_empty() {
+            return Ok(ChatTurnResult::FinalText(FinalTextResult {
+                content: full_content,
+                reasoning: if full_reasoning.is_empty() {
+                    None
+                } else {
+                    Some(full_reasoning)
+                },
+                usage: last_usage,
+                response_id,
+            }));
+        }
+        if !discarded.is_empty() {
+            return Err(super::OpenAiError::TruncatedToolCall {
+                tool_names: discarded,
+            });
+        }
+        warn!("discarded {total_calls} incomplete tool call(s) from provider (no name set)",);
     }
 
     // If only reasoning events arrived without any answer text, treat it as
@@ -1268,6 +1364,80 @@ mod tests {
     use crate::providers::types::CallerInfo;
     use std::time::Duration;
     use tai_proto::ThinkingEffort;
+
+    // -- validate_tool_call_arguments tests --------------------------------
+
+    #[test]
+    fn validate_valid_arguments_kept() {
+        let mut calls = vec![
+            ChatToolCall {
+                id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments_json: r#"{"city":"London"}"#.into(),
+                caller: None,
+            },
+            ChatToolCall {
+                id: "call_2".into(),
+                name: "search".into(),
+                arguments_json: r#"{"q":"rust"}"#.into(),
+                caller: None,
+            },
+        ];
+        let discarded = validate_tool_call_arguments(&mut calls);
+        assert!(discarded.is_empty());
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn validate_invalid_arguments_discarded() {
+        let mut calls = vec![
+            ChatToolCall {
+                id: "call_1".into(),
+                name: "get_weather".into(),
+                arguments_json: r#"{"city":"London"}"#.into(),
+                caller: None,
+            },
+            ChatToolCall {
+                id: "call_2".into(),
+                name: "bad_tool".into(),
+                arguments_json: "truncated garbage".into(),
+                caller: None,
+            },
+        ];
+        let discarded = validate_tool_call_arguments(&mut calls);
+        assert_eq!(discarded, vec!["bad_tool"]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn validate_all_invalid_returns_all_names() {
+        let mut calls = vec![
+            ChatToolCall {
+                id: "call_1".into(),
+                name: "tool_a".into(),
+                arguments_json: "bad".into(),
+                caller: None,
+            },
+            ChatToolCall {
+                id: "call_2".into(),
+                name: "tool_b".into(),
+                arguments_json: "also bad".into(),
+                caller: None,
+            },
+        ];
+        let discarded = validate_tool_call_arguments(&mut calls);
+        assert_eq!(discarded.len(), 2);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn validate_empty_list_returns_empty() {
+        let mut calls: Vec<ChatToolCall> = vec![];
+        let discarded = validate_tool_call_arguments(&mut calls);
+        assert!(discarded.is_empty());
+        assert!(calls.is_empty());
+    }
 
     // -- sleep_or_cancel tests -------------------------------------------
 
@@ -1666,6 +1836,7 @@ mod tests {
             previous_response_id: Some("resp_abc"),
             include: None,
             parallel_tool_calls: None,
+            tool_choice: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["model"], "gpt-5.6-sol");
@@ -1696,6 +1867,7 @@ mod tests {
             previous_response_id: None,
             include: None,
             parallel_tool_calls: None,
+            tool_choice: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["input"][0]["type"], "message");
@@ -1718,6 +1890,7 @@ mod tests {
             previous_response_id: None,
             include: None,
             parallel_tool_calls: None,
+            tool_choice: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("reasoning_effort").is_none());
@@ -1727,6 +1900,7 @@ mod tests {
         assert!(json.get("tools").is_none());
         assert!(json.get("parallel_tool_calls").is_none());
         assert!(json.get("instructions").is_none());
+        assert!(json.get("tool_choice").is_none());
         assert!(json.get("stream").is_none());
         assert!(json.get("store").is_none());
     }
@@ -1777,20 +1951,26 @@ mod tests {
     }
 
     #[test]
-    fn messages_to_responses_input_extracts_instructions() {
+    fn messages_to_responses_input_puts_system_message_in_input() {
         let messages = vec![
             ChatRequestMessage::simple("system", "You are helpful".into()),
             ChatRequestMessage::simple("user", "Hello".into()),
         ];
-        let (instructions, items) = messages_to_responses_input(&messages);
-        assert_eq!(instructions, Some("You are helpful".into()));
-        assert_eq!(items.len(), 1);
+        let items = messages_to_responses_input(&messages);
+        assert_eq!(items.len(), 2);
         match &items[0] {
+            ResponsesInputItem::Message { role, content } => {
+                assert_eq!(role, "system");
+                assert_eq!(content, "You are helpful");
+            }
+            _ => panic!("expected Message item for system message"),
+        }
+        match &items[1] {
             ResponsesInputItem::Message { role, content } => {
                 assert_eq!(role, "user");
                 assert_eq!(content, "Hello");
             }
-            _ => panic!("expected Message item"),
+            _ => panic!("expected Message item for user message"),
         }
     }
 
@@ -1805,8 +1985,7 @@ mod tests {
             reasoning: None,
             reasoning_text: None,
         }];
-        let (instructions, items) = messages_to_responses_input(&messages);
-        assert!(instructions.is_none());
+        let items = messages_to_responses_input(&messages);
         assert_eq!(items.len(), 1);
         match &items[0] {
             ResponsesInputItem::FunctionCallOutput {
@@ -1860,11 +2039,14 @@ mod tests {
             ChatRequestMessage::simple("system", "be helpful".into()),
             ChatRequestMessage::simple("user", "Hello".into()),
         ];
-        let (instructions, input) = build_responses_input(&[], &messages);
-        assert_eq!(instructions, Some("be helpful".into()));
+        let input = build_responses_input(&[], &messages).expect("should succeed");
         let input_value = input.expect("input should be Some");
-        assert_eq!(input_value[0]["role"], "user");
-        assert_eq!(input_value[0]["content"], "Hello");
+        assert_eq!(input_value[0]["type"], "message");
+        assert_eq!(input_value[0]["role"], "system");
+        assert_eq!(input_value[0]["content"], "be helpful");
+        assert_eq!(input_value[1]["type"], "message");
+        assert_eq!(input_value[1]["role"], "user");
+        assert_eq!(input_value[1]["content"], "Hello");
     }
 
     #[test]
@@ -1873,8 +2055,7 @@ mod tests {
             ChatRequestMessage::simple("assistant", "Hi there".into()),
             ChatRequestMessage::simple("user", "What is the weather?".into()),
         ];
-        let (instructions, input) = build_responses_input(&[], &messages);
-        assert!(instructions.is_none());
+        let input = build_responses_input(&[], &messages).expect("should succeed");
         let input_value = input.expect("input should be Some");
         let arr = input_value.as_array().expect("expected array");
         assert_eq!(arr.len(), 2);
@@ -1898,8 +2079,7 @@ mod tests {
                 caller: None,
             },
         ];
-        let (instructions, input) = build_responses_input(&tool_results, &[]);
-        assert!(instructions.is_none());
+        let input = build_responses_input(&tool_results, &[]).expect("should succeed");
         let input_value = input.expect("input should be Some");
         assert_eq!(input_value.as_array().map(|a| a.len()), Some(2));
         assert_eq!(input_value[0]["type"], "function_call_output");
@@ -1918,8 +2098,7 @@ mod tests {
         }];
         // Even with messages present, tool_results branch is taken
         let messages = vec![ChatRequestMessage::simple("user", "Hello".into())];
-        let (instructions, input) = build_responses_input(&tool_results, &messages);
-        assert!(instructions.is_none());
+        let input = build_responses_input(&tool_results, &messages).expect("should succeed");
         let input_value = input.expect("input should be Some");
         assert_eq!(input_value.as_array().map(|a| a.len()), Some(1));
         assert_eq!(input_value[0]["type"], "function_call_output");

@@ -49,8 +49,6 @@ pub struct AccountConfig {
     #[serde(default)]
     pub model_responses_max_output_tokens: Option<HashMap<String, u32>>,
     #[serde(default)]
-    pub responses_store: Option<bool>,
-    #[serde(default)]
     pub programmatic_tool_calling: Option<bool>,
     #[serde(default)]
     pub model_max_tokens_fields: Option<HashMap<String, MaxTokensField>>,
@@ -90,7 +88,6 @@ impl AccountConfig {
             model_max_tokens_fields: None,
             responses_max_output_tokens: None,
             model_responses_max_output_tokens: None,
-            responses_store: None,
             programmatic_tool_calling: None,
             retry_initial_backoff_ms: None,
             retry_max_backoff_ms: None,
@@ -151,9 +148,6 @@ impl AccountConfig {
         }
         if let Some(ref map) = self.model_responses_max_output_tokens {
             config.model_responses_max_output_tokens = map.clone();
-        }
-        if let Some(v) = self.responses_store {
-            config.responses_store = v;
         }
         if let Some(v) = self.programmatic_tool_calling {
             config.programmatic_tool_calling = v;
@@ -506,7 +500,6 @@ model = "claude-4"
             chat_completions_max_tokens_field: Some(crate::openai::MaxTokensField::MaxTokens),
             responses_max_output_tokens: Some(4096),
             model_responses_max_output_tokens: Some(HashMap::from([("gpt-4".to_string(), 8192)])),
-            responses_store: Some(false),
             retry_initial_backoff_ms: Some(500),
             retry_max_backoff_ms: Some(60000),
             ..AccountConfig::simple("ovr", "openai")
@@ -536,6 +529,5 @@ model = "claude-4"
             svc_config.model_responses_max_output_tokens.get("gpt-4"),
             Some(&8192)
         );
-        assert!(!svc_config.responses_store);
     }
 }

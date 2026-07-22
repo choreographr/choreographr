@@ -1030,7 +1030,29 @@ pub(crate) fn run_agent_loop(
             Err(tai_proto::InferenceError::Cancelled) => {
                 return Ok(true);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // Finalize the turn so the session doesn't have an orphaned
+                // open turn that confuses the LLM on the next request.
+                if matches!(&e, tai_proto::InferenceError::TruncatedToolCall { .. }) {
+                    session.set_assistant_response(
+                        current_turn_id,
+                        Some(format!("[tool call truncated: {e}]")),
+                        None,
+                        Vec::new(),
+                        None,
+                    );
+                    session.finalize_turn(&ctx.db, ctx.session_id, current_turn_id)?;
+                    if let Some(turn) = session.turns.get(&current_turn_id) {
+                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                            DaemonMessage::TurnFinalized {
+                                turn_id: current_turn_id,
+                                turn: turn.clone(),
+                            },
+                        ));
+                    }
+                }
+                return Err(e.into());
+            }
         }
     }
 

@@ -108,6 +108,8 @@ pub enum InferenceError {
     EmptyResponse,
     #[error("request cancelled during retry backoff")]
     Cancelled,
+    #[error("tool call arguments truncated by provider: {tool_names:?}")]
+    TruncatedToolCall { tool_names: Vec<String> },
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }

@@ -712,6 +712,7 @@ fn handle_chat_event(
                                 app.status = Some(echo);
                             }
                             if let ClientMessage::RunInput { request_id, .. } = &message {
+                                app.error = None;
                                 app.active.insert(*request_id);
                             }
                             client_tx.send(message).map_err(broken_pipe)?;

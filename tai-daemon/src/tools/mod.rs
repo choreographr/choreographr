@@ -756,23 +756,53 @@ impl ToolRegistry {
 
     /// Return tool definitions for groups in the active set, plus always-available
     /// meta-tools (load_tools, unload_tools, etc.).
+    ///
+    /// Uses plain `ChatToolDefinition::function()` — no `output_schema` or
+    /// `allowed_callers` — so the definitions are compatible with both Chat
+    /// Completions and Responses API paths.  The Responses API path should
+    /// call [`available_definitions_for_responses`] instead when it needs
+    /// those fields.
     pub fn available_definitions(&self, active: &HashSet<String>) -> Vec<ChatToolDefinition> {
         let mut defs: Vec<_> = self
             .tools
             .values()
             .filter(|t| active.contains(t.group()))
+            .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
+            .collect();
+        // Always-available meta-tools (not in the registry because they
+        // need mutable access to session state — load_tools, unload_tools).
+        defs.push(groups::load_tools_definition(self));
+        defs.push(groups::unload_tools_definition(self));
+        defs.push(groups::set_working_dir_definition());
+        defs
+    }
+
+    /// Like [`available_definitions`] but includes `output_schema` and
+    /// `allowed_callers` for the Responses API (programmatic tool calling).
+    /// Only use this when sending requests to a Responses API endpoint.
+    pub fn available_definitions_for_responses(
+        &self,
+        active: &HashSet<String>,
+    ) -> Vec<ChatToolDefinition> {
+        let mut defs: Vec<_> = self
+            .tools
+            .values()
+            .filter(|t| active.contains(t.group()))
             .map(|t| {
+                let callers = t.allowed_callers();
                 ChatToolDefinition::function_with_options(
                     t.name(),
                     t.description(),
                     t.schema(),
                     t.output_schema(),
-                    Some(t.allowed_callers()),
+                    if callers.is_empty() {
+                        None
+                    } else {
+                        Some(callers)
+                    },
                 )
             })
             .collect();
-        // Always-available meta-tools (not in the registry because they
-        // need mutable access to session state — load_tools, unload_tools).
         defs.push(groups::load_tools_definition(self));
         defs.push(groups::unload_tools_definition(self));
         defs.push(groups::set_working_dir_definition());
