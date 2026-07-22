@@ -40,8 +40,10 @@ pub enum ProviderError {
     EmptyResponse,
     #[error("request cancelled during retry backoff")]
     Cancelled,
-    #[error("tool call arguments truncated by provider: {tool_names:?}")]
-    TruncatedToolCall { tool_names: Vec<String> },
+    #[error("tool call arguments truncated by provider: {}", .discarded.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "))]
+    TruncatedToolCall {
+        discarded: Vec<tai_proto::DiscardedToolCall>,
+    },
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
@@ -114,8 +116,8 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
         }
         ProviderError::EmptyResponse => InferenceError::EmptyResponse,
         ProviderError::Cancelled => InferenceError::Cancelled,
-        ProviderError::TruncatedToolCall { tool_names } => {
-            InferenceError::TruncatedToolCall { tool_names }
+        ProviderError::TruncatedToolCall { discarded } => {
+            InferenceError::TruncatedToolCall { discarded }
         }
         ProviderError::Io(e) => InferenceError::Io(e),
     }

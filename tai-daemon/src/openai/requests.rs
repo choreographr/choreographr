@@ -22,27 +22,34 @@ use std::sync::mpsc;
 use tai_proto::TokenUsage;
 
 /// Filter tool calls whose `arguments_json` is not valid JSON (e.g. truncated
-/// mid-stream by the provider).  Returns the names of discarded calls.
+/// mid-stream by the provider).  Returns the discarded calls so the caller can
+/// surface the cropped JSON in error messages.
 /// Providers (especially cheaper models via OpenAI-compatible APIs) sometimes
 /// return incomplete `function.arguments` strings, which would cause tool
 /// execution to fail with a JSON parse error and trigger an error-recovery
 /// loop that inflates the context and eventually hits the provider's 400/500.
-fn validate_tool_call_arguments(tool_calls: &mut Vec<ChatToolCall>) -> Vec<String> {
-    let mut discarded = Vec::new();
-    tool_calls.retain(|tc| {
-        if serde_json::from_str::<serde_json::Value>(&tc.arguments_json).is_ok() {
-            true
-        } else {
-            warn!(
-                name = %tc.name,
-                args_len = tc.arguments_json.len(),
-                "discarding tool call with invalid (truncated) arguments JSON",
-            );
-            discarded.push(tc.name.clone());
-            false
-        }
-    });
+fn validate_tool_call_arguments(
+    tool_calls: &mut Vec<ChatToolCall>,
+) -> Vec<tai_proto::DiscardedToolCall> {
+    let all = std::mem::take(tool_calls);
+    let (valid, discarded): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|tc| serde_json::from_str::<serde_json::Value>(&tc.arguments_json).is_ok());
+    for tc in &discarded {
+        warn!(
+            name = %tc.name,
+            args_len = tc.arguments_json.len(),
+            "discarding tool call with invalid (truncated) arguments JSON",
+        );
+    }
+    *tool_calls = valid;
     discarded
+        .into_iter()
+        .map(|tc| tai_proto::DiscardedToolCall {
+            name: tc.name,
+            arguments_json: tc.arguments_json,
+        })
+        .collect()
 }
 
 impl OpenAiClient {
@@ -366,9 +373,7 @@ fn chat_completions_request_with_tools(
     }
 
     if !discarded.is_empty() {
-        return Err(super::OpenAiError::TruncatedToolCall {
-            tool_names: discarded,
-        });
+        return Err(super::OpenAiError::TruncatedToolCall { discarded });
     }
 
     let content = choice
@@ -829,9 +834,7 @@ fn responses_request_with_tools(
             response_id,
         }))
     } else if !discarded.is_empty() {
-        Err(super::OpenAiError::TruncatedToolCall {
-            tool_names: discarded,
-        })
+        Err(super::OpenAiError::TruncatedToolCall { discarded })
     } else if full_text.is_empty() {
         Err(super::OpenAiError::EmptyResponse)
     } else {
@@ -1077,9 +1080,7 @@ where
             }));
         }
         if !discarded.is_empty() {
-            return Err(super::OpenAiError::TruncatedToolCall {
-                tool_names: discarded,
-            });
+            return Err(super::OpenAiError::TruncatedToolCall { discarded });
         }
     }
 
@@ -1332,9 +1333,7 @@ where
             }));
         }
         if !discarded.is_empty() {
-            return Err(super::OpenAiError::TruncatedToolCall {
-                tool_names: discarded,
-            });
+            return Err(super::OpenAiError::TruncatedToolCall { discarded });
         }
         warn!("discarded {total_calls} incomplete tool call(s) from provider (no name set)",);
     }
@@ -1405,7 +1404,13 @@ mod tests {
             },
         ];
         let discarded = validate_tool_call_arguments(&mut calls);
-        assert_eq!(discarded, vec!["bad_tool"]);
+        assert_eq!(
+            discarded,
+            vec![tai_proto::DiscardedToolCall {
+                name: "bad_tool".into(),
+                arguments_json: "truncated garbage".into(),
+            }]
+        );
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
     }
@@ -1428,6 +1433,10 @@ mod tests {
         ];
         let discarded = validate_tool_call_arguments(&mut calls);
         assert_eq!(discarded.len(), 2);
+        assert_eq!(discarded[0].name, "tool_a");
+        assert_eq!(discarded[0].arguments_json, "bad");
+        assert_eq!(discarded[1].name, "tool_b");
+        assert_eq!(discarded[1].arguments_json, "also bad");
         assert!(calls.is_empty());
     }
 

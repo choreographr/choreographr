@@ -87,6 +87,24 @@ impl TimestampMs {
     }
 }
 
+/// A tool call that was discarded because the provider sent truncated or
+/// otherwise invalid (non-JSON) arguments.
+///
+/// The `arguments_json` field holds the partial/cropped payload the provider
+/// actually returned, making it easier to diagnose what went wrong without
+/// digging through raw network logs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscardedToolCall {
+    pub name: String,
+    pub arguments_json: String,
+}
+
+impl std::fmt::Display for DiscardedToolCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {:?}", self.name, self.arguments_json)
+    }
+}
+
 /// Unified error type for all inference providers.
 /// NOTE: does NOT derive Serialize/Deserialize — this error type is never
 /// sent over the wire.  Provider errors are stringified before being placed
@@ -108,8 +126,8 @@ pub enum InferenceError {
     EmptyResponse,
     #[error("request cancelled during retry backoff")]
     Cancelled,
-    #[error("tool call arguments truncated by provider: {tool_names:?}")]
-    TruncatedToolCall { tool_names: Vec<String> },
+    #[error("tool call arguments truncated by provider: {}", .discarded.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "))]
+    TruncatedToolCall { discarded: Vec<DiscardedToolCall> },
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
