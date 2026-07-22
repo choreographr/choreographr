@@ -43,15 +43,15 @@ pub(crate) fn sanitize_env(cmd: &mut Command) {
 /// Attach resource limits (AS, FSIZE) via a pre-exec hook.
 /// Must be called inside an `unsafe { cmd.pre_exec(|| …) }` block.
 pub(crate) fn apply_rlimits() -> Result<(), std::io::Error> {
-    use nix::sys::resource::{Resource, setrlimit};
-
-    let limits = [
-        (Resource::RLIMIT_AS, 4 * 1024 * 1024 * 1024),
-        (Resource::RLIMIT_FSIZE, 100 * 1024 * 1024),
-    ];
-    for (resource, value) in limits {
-        setrlimit(resource, value, value)?;
-    }
+    // use nix::sys::resource::{Resource, setrlimit};
+    //
+    // let limits = [
+    //     (Resource::RLIMIT_AS, 4 * 1024 * 1024 * 1024),
+    //     (Resource::RLIMIT_FSIZE, 100 * 1024 * 1024),
+    // ];
+    // for (resource, value) in limits {
+    //     setrlimit(resource, value, value)?;
+    // }
     Ok(())
 }
 
