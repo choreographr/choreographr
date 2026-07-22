@@ -36,16 +36,19 @@ struct Cli {
 
 const DEFAULT_MAX_TURNS: u32 = 25;
 
+/// Resolve the tool-loop iteration limit.
+///
+/// Resolution chain: `TAI_MAX_TURNS` env var → `config.toml` → default 25.
+/// A value of `0` means *unlimited* — the agent loop will run until the
+/// model produces a final answer, is cancelled, or hits an error.
 fn resolve_max_turns() -> u32 {
     if let Ok(val) = std::env::var("TAI_MAX_TURNS")
         && let Ok(n) = val.parse::<u32>()
-        && n > 0
     {
         return n;
     }
     if let Ok(config) = load_daemon_config()
         && let Some(n) = config.max_turns
-        && n > 0
     {
         return n;
     }

@@ -432,6 +432,12 @@ pub(crate) struct App {
     /// each stream chunk via tiktoken).
     pub(crate) live_output_tokens: u32,
     pub(crate) progress_dirty: bool,
+    /// True when turn content has changed and we need to re-layout.
+    /// Set alongside `markers_dirty` for content mutations (stream chunks,
+    /// turn appends, tool results, etc.) but NOT for terminal resize.
+    /// Used by `compute_total_height_and_markers` to decide whether to
+    /// preserve the effective scroll position for users who have scrolled up.
+    pub(crate) content_dirty: bool,
     pub(crate) status: Option<String>,
     pub(crate) error: Option<String>,
     pub(crate) visible_turn_ids: Vec<u32>,
@@ -1129,6 +1135,7 @@ impl App {
             live_input_estimate: 0,
             live_output_tokens: 0,
             progress_dirty: false,
+            content_dirty: false,
             status: None,
             error: None,
             height_prefix: Vec::new(),
@@ -1206,9 +1213,41 @@ impl App {
         self.markers_dirty = false;
     }
 
+    /// Helper for content mutations that affect both markers and scroll preservation.
+    fn mark_content_changed(&mut self) {
+        self.markers_dirty = true;
+        self.content_dirty = true;
+    }
+
     pub(crate) fn compute_total_height_and_markers(&mut self) -> usize {
         if self.markers_dirty {
+            let at_bottom = self.effective_scroll() == 0;
+            let preserve_scroll = self.content_dirty && !at_bottom;
+            let old_total = if preserve_scroll {
+                self.total_history_height()
+            } else {
+                0
+            };
+
             self.rebuild_height_prefix();
+
+            if preserve_scroll {
+                let new_total = self.total_history_height();
+                if new_total > old_total {
+                    // Content was added — shift scroll down by the delta so
+                    // the same content stays at the top of the viewport.
+                    self.history_scroll.scroll = self
+                        .history_scroll
+                        .scroll
+                        .saturating_add(new_total - old_total);
+                } else if old_total > new_total {
+                    // Content was removed (e.g. undo) — scroll to bottom so the
+                    // user doesn't stare at blank space.
+                    self.history_scroll.scroll = self.max_scroll_offset();
+                }
+            }
+
+            self.content_dirty = false;
         }
         self.total_history_height().max(1)
     }
@@ -1425,6 +1464,10 @@ impl App {
         self.height_prefix.clear();
         self.turn_layouts.clear();
         self.markers_dirty = true;
+        // Clear the content-dirty flag: a session switch resets scroll
+        // position to the bottom, so we should not attempt to preserve
+        // the old scroll position when the new content arrives.
+        self.content_dirty = false;
         self.status = None;
         self.error = None;
         self.fullscreen_image_target = None;
@@ -1781,14 +1824,14 @@ impl TurnEventHandler for App {
         tracing::trace!(%turn_id, "handle_turn_appended");
         self.sync_turn_images(turn_id, &turn);
         self.session_view.insert_or_replace(turn_id, turn);
-        self.markers_dirty = true;
+        self.mark_content_changed();
     }
 
     fn handle_turn_finalized(&mut self, turn_id: u32, turn: Turn) {
         tracing::trace!(%turn_id, "handle_turn_finalized");
         self.sync_turn_images(turn_id, &turn);
         self.session_view.insert_or_replace(turn_id, turn);
-        self.markers_dirty = true;
+        self.mark_content_changed();
     }
 
     fn handle_turns_undone(&mut self, turn_ids: &[u32]) {
@@ -1798,7 +1841,7 @@ impl TurnEventHandler for App {
                 turn.undone = true;
             }
         }
-        self.markers_dirty = true;
+        self.mark_content_changed();
     }
 
     fn handle_turns_redone(&mut self, turns: std::collections::BTreeMap<u32, Turn>) {
@@ -1807,12 +1850,12 @@ impl TurnEventHandler for App {
             self.sync_turn_images(tid, &turn);
             self.session_view.insert_or_replace(tid, turn);
         }
-        self.markers_dirty = true;
+        self.mark_content_changed();
     }
 
     fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: Cow<'_, str>) {
         self.session_view.stream_chunk(request_id, stream, &data);
-        self.markers_dirty = true;
+        self.mark_content_changed();
     }
 
     fn handle_started(&mut self, request_id: u32, turn_id: u32, estimated_prompt_tokens: u32) {
@@ -1842,7 +1885,7 @@ impl TurnEventHandler for App {
         }
         self.live_input_estimate = 0;
         self.live_output_tokens = 0;
-        self.markers_dirty = true;
+        self.mark_content_changed();
     }
 
     fn handle_failed(&mut self, request_id: u32, error: String) {
@@ -1850,7 +1893,7 @@ impl TurnEventHandler for App {
         self.error = Some(error);
         self.session_view.request_to_turn.remove(&request_id);
         self.active.remove(&request_id);
-        self.markers_dirty = true;
+        self.mark_content_changed();
     }
 
     fn handle_tool_call_event(&mut self, request_id: u32, event: ToolCallEvent) {
@@ -1862,7 +1905,7 @@ impl TurnEventHandler for App {
             } => {
                 self.session_view
                     .tool_call_started(request_id, call_id, tool_name, arguments_json);
-                self.markers_dirty = true;
+                self.mark_content_changed();
             }
             ToolCallEvent::Finished { .. } => {
                 // Finished events are informational — tool results arrive via
@@ -1879,7 +1922,7 @@ impl TurnEventHandler for App {
         let text = String::from_utf8_lossy(&data).into_owned();
         self.session_view
             .tool_result_chunk(request_id, &call_id, &text);
-        self.markers_dirty = true;
+        self.mark_content_changed();
     }
 
     fn handle_session_state(&mut self, state: SessionStateData) {
@@ -1912,7 +1955,7 @@ impl TurnEventHandler for App {
         self.attached_context_window = context_window;
         self.attached_last_prompt_tokens = last_prompt_tokens;
         self.attached_status = Some(status);
-        self.markers_dirty = true;
+        self.mark_content_changed();
     }
 
     fn handle_token_usage_update(
@@ -2693,5 +2736,126 @@ mod tests {
 
         let img = app.rendered_images.get(&5).unwrap().get(&0).unwrap();
         assert!(img.failed_sizes.contains(&non_inline_size));
+    }
+
+    // ── compute_total_height_and_markers scroll preservation ──
+
+    /// Helper: insert a minimal turn into `app`.
+    fn insert_turn(app: &mut App, id: u32, user_text: &str, assistant_text: &str) {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some(user_text.into()),
+            assistant_text: Some(assistant_text.into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.session_view.insert_or_replace(id, turn);
+    }
+
+    #[test]
+    fn scroll_preserved_when_scrolled_up_and_content_changes() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 5;
+
+        // Add initial turns and rebuild layout.
+        insert_turn(&mut app, 0, "a", "a");
+        insert_turn(&mut app, 1, "b", "b");
+        app.rebuild_height_prefix();
+
+        // Total height after 2 short turns.
+        let initial_total = app.total_history_height();
+
+        // Scroll up so the user is NOT at the bottom.
+        app.history_scroll.scroll =
+            initial_total.saturating_sub(app.history_viewport.height as usize) / 2;
+        assert!(app.effective_scroll() > 0, "should be scrolled up");
+
+        // Simulate a content mutation: add a turn that increases total height.
+        insert_turn(&mut app, 2, "new content", "new content");
+        let old_total = app.total_history_height();
+        let old_scroll = app.history_scroll.scroll;
+
+        // Mark content as changed (like TurnEventHandler methods do).
+        app.mark_content_changed();
+
+        // Recompute — should preserve scroll by shifting it for the new content.
+        app.compute_total_height_and_markers();
+
+        let new_total = app.total_history_height();
+        let delta = new_total.saturating_sub(old_total);
+        assert!(
+            delta > 0,
+            "total height should increase after adding content"
+        );
+        assert_eq!(
+            app.history_scroll.scroll,
+            old_scroll + delta,
+            "scroll should be adjusted by the content delta"
+        );
+        assert!(
+            !app.content_dirty,
+            "content_dirty should be cleared after computation"
+        );
+    }
+
+    #[test]
+    fn scroll_not_preserved_when_at_bottom_and_content_changes() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 5;
+
+        // Add initial turns.
+        insert_turn(&mut app, 0, "a", "a");
+        insert_turn(&mut app, 1, "b", "b");
+        app.rebuild_height_prefix();
+
+        // Scroll to bottom (effective_scroll == 0).
+        app.history_scroll.scroll = 0;
+        assert_eq!(app.effective_scroll(), 0, "should be at bottom");
+
+        // Add new content.
+        insert_turn(&mut app, 2, "more", "more");
+        let old_scroll = app.history_scroll.scroll;
+
+        app.mark_content_changed();
+        app.compute_total_height_and_markers();
+
+        // Scroll should remain 0 (no adjustment when at bottom).
+        assert_eq!(
+            app.history_scroll.scroll, old_scroll,
+            "scroll should stay at 0 when user is at bottom"
+        );
+    }
+
+    #[test]
+    fn scroll_not_preserved_when_content_dirty_is_false() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 5;
+
+        insert_turn(&mut app, 0, "a", "a");
+        app.rebuild_height_prefix();
+
+        // Scroll up.
+        app.history_scroll.scroll = 10;
+        let old_scroll = app.history_scroll.scroll;
+
+        // Rebuild with markers_dirty but NOT content_dirty (e.g. terminal resize).
+        // content_dirty is false by default.
+        app.markers_dirty = true;
+        assert!(!app.content_dirty, "content should not be dirty");
+        app.compute_total_height_and_markers();
+
+        // Scroll should stay at the old value (no delta adjustment applied).
+        assert_eq!(
+            app.history_scroll.scroll, old_scroll,
+            "scroll should not change when content_dirty is false"
+        );
     }
 }

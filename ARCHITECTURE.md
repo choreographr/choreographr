@@ -433,7 +433,7 @@ main()
 RunInput received
   └► extract/validate session, check active requests
      └► if chat_completions + tools:
-        └► tool-call loop (max configurable iterations, default 25):
+        └► tool-call loop (max configurable iterations, default 25; 0 = unlimited):
            0.5. build system content (skills + context with fingerprint cache + loaded skills + subdirectory hints)
            1. send messages + tools → model
            2. receive response
@@ -1101,7 +1101,7 @@ across snapshot/restore, metadata conversion, and record persistence:
 - `reasoning_effort: Option<ThinkingEffort>` — per-session reasoning effort
 - `parent_session_id: Option<u64>` — parent session for sub-sessions
 - `working_dir: Option<PathBuf>` — working directory for filesystem tools
-- `max_turns: Option<u32>` — per-session tool loop iteration cap (inherits from parent)
+- `max_turns: Option<u32>` — per-session tool loop iteration cap (inherits from parent). `0` = unlimited (loop runs until final answer, cancellation, or error).
 - `created_at: i64` — Unix timestamp of creation
 - `status: SessionStatus` — current status (Inactive, Inference, Retrying, Sleeping, …)
 - `active_tool_groups: HashSet<String>` — tool groups active for this session
@@ -1185,7 +1185,7 @@ uses `turn_id` to maintain a globally ordered history.
 **Service config:** `~/.config/tai-daemon/config.toml`
 
 ```toml
-max_turns = 25                                   # default tool loop iteration cap
+max_turns = 25      # 0 = unlimited (loop runs until final answer or error)
 
 [context]
 context_file_names = ["AGENTS.md", "CLAUDE.md"]
@@ -1202,6 +1202,8 @@ context_file_max_bytes = 32768
 
 **Tool loop limit:** `TAI_MAX_TURNS` env var overrides `config.toml` `max_turns`. Resolution
 chain: per-session `max_turns` → `TAI_MAX_TURNS` env var → `config.toml` → default 25.
+A value of `0` means *unlimited* — the agent loop runs indefinitely until the model
+produces a final answer, is cancelled, or hits an error.
 The `spawn_subsession` tool accepts an optional `max_turns` parameter; if not set, the
 child inherits the parent's value.
 
@@ -1369,7 +1371,7 @@ User presses Enter on a session in the session manager
    loop and report results back to the parent.
 
 6. **Tool-call loop in the daemon** — the daemon drives multi-turn tool interactions (up to a
-   configurable `max_turns` per session, default 25) rather than pushing that complexity to
+   configurable `max_turns` per session, default 25 (0 = unlimited) rather than pushing that complexity to
    the client or model. The client just sees `ToolCallStarted`/`ToolCallFinished` events.
 
 7. **Session subscription model** — multiple clients can subscribe to the same session. Events

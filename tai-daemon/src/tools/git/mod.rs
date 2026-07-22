@@ -6,7 +6,11 @@ use gix::{
     status::{Item as StatusItem, UntrackedFiles},
     worktree::IndexPersistedOrInMemory,
 };
-use std::{fmt::Write as _, io, path::Path};
+use std::{
+    fmt::Write as _,
+    io,
+    path::{Path, PathBuf},
+};
 
 use super::ToolError;
 use zlob::{ZlobFlags, ZlobPattern};
@@ -205,6 +209,76 @@ pub(crate) fn simple_glob_matches(pattern: &str, text: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Given a repo, an optional explicit `repo_path`, and the session
+/// `working_dir`, compute the relative path from the repo worktree root
+/// to the directory that pathspecs are relative to.
+///
+/// Returns `None` when no prefix is needed (pathspecs are already
+/// repo-root-relative).
+///
+/// This is used during path-prefixing for `git_add` and `git_diff` so
+/// that pathspecs provided relative to the session working directory
+/// (or an explicit subdirectory path) are correctly remapped to the repo
+/// root before being passed to gix's pathspec matching.
+pub(crate) fn resolve_pathspec_prefix(
+    repo: &gix::Repository,
+    repo_path: Option<&str>,
+    working_dir: Option<&Path>,
+) -> Result<Option<String>, ToolError> {
+    let Some(workdir) = repo.workdir() else {
+        return Ok(None);
+    };
+
+    // Canonicalize working_dir once so all path resolution below is
+    // consistent with repo.workdir() (which always returns the real,
+    // canonical path).  This handles symlinks (e.g. macOS /var → /private/var).
+    let working_dir = match working_dir {
+        Some(wd) => Some(wd.canonicalize().map_err(|e| {
+            ToolError::Other(format!(
+                "failed to canonicalize working directory '{}': {e}",
+                wd.display()
+            ))
+        })?),
+        None => None,
+    };
+
+    let base: PathBuf = match repo_path {
+        Some(rp) => {
+            let trimmed = rp.trim();
+            if trimmed.is_empty() || trimmed == "." {
+                return Ok(None);
+            }
+            let candidate = Path::new(trimmed);
+            if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else if let Some(wd) = working_dir {
+                wd.join(candidate)
+            } else {
+                candidate.to_path_buf()
+            }
+        }
+        None => match working_dir {
+            Some(wd) => wd,
+            None => return Ok(None),
+        },
+    };
+
+    let Ok(prefix) = base.strip_prefix(workdir) else {
+        return Ok(None);
+    };
+    if prefix.as_os_str().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        prefix
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    ))
+}
+
 pub(crate) fn format_tree_index_change(change: &gix::diff::index::Change) -> String {
     use gix::diff::index::ChangeRef;
     match change {
@@ -284,5 +358,126 @@ pub(crate) fn worktree_summary_code(
         Summary::TypeChange => "T",
         Summary::Conflict => "U",
         Summary::IntentToAdd => "I",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create a temporary git repository with a subdirectory at `sub_path`
+    /// relative to the repo root, and return the tempdir, subdirectory path,
+    /// and opened gix repository.
+    fn init_repo_with_subdir(sub_path: &str) -> (tempfile::TempDir, PathBuf, gix::Repository) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+
+        // Initialize a bare-bones git repo.
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Configure a minimal user so commits work.
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "test"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        // Create the subdirectory.
+        let sub = repo_root.join(sub_path);
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let repo = gix::discover(repo_root).unwrap();
+        (tmp, sub, repo)
+    }
+
+    #[test]
+    fn test_resolve_pathspec_prefix_none_when_working_dir_is_repo_root() {
+        let (_tmp, _sub, repo) = init_repo_with_subdir("sub");
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        let result = resolve_pathspec_prefix(&repo, None, Some(&workdir)).unwrap();
+        // Working dir = repo root → no prefix needed.
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_pathspec_prefix_returns_subdir_prefix() {
+        let (_tmp, sub, repo) = init_repo_with_subdir("sub");
+        let result = resolve_pathspec_prefix(&repo, None, Some(&sub)).unwrap();
+        assert_eq!(result.as_deref(), Some("sub"));
+    }
+
+    #[test]
+    fn test_resolve_pathspec_prefix_nested_subdir() {
+        let (_tmp, sub, repo) = init_repo_with_subdir("a/b/c");
+        let result = resolve_pathspec_prefix(&repo, None, Some(&sub)).unwrap();
+        assert_eq!(result.as_deref(), Some("a/b/c"));
+    }
+
+    #[test]
+    fn test_resolve_pathspec_prefix_none_when_no_working_dir() {
+        let (_tmp, _sub, repo) = init_repo_with_subdir("sub");
+        let result = resolve_pathspec_prefix(&repo, None, None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_pathspec_prefix_with_explicit_repo_path() {
+        let (_tmp, _sub, repo) = init_repo_with_subdir("sub");
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        // Pass repo_path = "sub" explicitly — should resolve to the same prefix.
+        let result = resolve_pathspec_prefix(&repo, Some("sub"), Some(&workdir)).unwrap();
+        assert_eq!(result.as_deref(), Some("sub"));
+    }
+
+    #[test]
+    fn test_resolve_pathspec_prefix_empty_repo_path_returns_none() {
+        let (_tmp, _sub, repo) = init_repo_with_subdir("sub");
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        let result = resolve_pathspec_prefix(&repo, Some(""), Some(&workdir)).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_pathspec_prefix_dot_repo_path_returns_none() {
+        let (_tmp, _sub, repo) = init_repo_with_subdir("sub");
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        let result = resolve_pathspec_prefix(&repo, Some("."), Some(&workdir)).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_pathspec_prefix_absolute_repo_path() {
+        let (_tmp, sub, repo) = init_repo_with_subdir("sub");
+        let result = resolve_pathspec_prefix(&repo, Some(sub.to_str().unwrap()), None).unwrap();
+        assert_eq!(result.as_deref(), Some("sub"));
+    }
+
+    #[test]
+    fn test_resolve_pathspec_prefix_bare_repo_no_workdir_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path();
+
+        // Create a bare repo.
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(repo_root)
+            .output()
+            .unwrap();
+
+        let repo = gix::discover(repo_root).unwrap();
+        // Bare repos have no workdir.
+        assert!(repo.workdir().is_none());
+
+        let result = resolve_pathspec_prefix(&repo, None, None).unwrap();
+        assert_eq!(result, None);
     }
 }

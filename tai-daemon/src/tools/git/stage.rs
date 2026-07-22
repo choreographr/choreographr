@@ -169,39 +169,13 @@ fn prefix_pathspecs(
     pathspec: &[String],
     working_dir: Option<&Path>,
 ) -> Result<Vec<String>, ToolError> {
-    let Some(workdir) = repo.workdir() else {
-        return Ok(pathspec.to_vec());
-    };
-    let Some(repo_path) = repo_path else {
-        return Ok(pathspec.to_vec());
-    };
-
-    let trimmed = repo_path.trim();
-    if trimmed.is_empty() || trimmed == "." {
-        return Ok(pathspec.to_vec());
-    }
-
-    let candidate = Path::new(trimmed);
-    let absolute = if candidate.is_absolute() {
-        candidate.to_path_buf()
-    } else {
-        // Resolve relative repo_path against the session working_dir,
-        // falling back to the daemon's process CWD when none is set.
-        crate::tools::resolve_path(candidate.to_str().unwrap_or("."), working_dir)
+    // Delegate the prefix-computation logic to the shared helper so that
+    // both git_add and git_diff handle pathspec-prefixing consistently.
+    let prefix = match super::resolve_pathspec_prefix(repo, repo_path, working_dir)? {
+        Some(p) => p,
+        None => return Ok(pathspec.to_vec()),
     };
 
-    let Ok(prefix) = absolute.strip_prefix(workdir) else {
-        return Ok(pathspec.to_vec());
-    };
-    if prefix.as_os_str().is_empty() {
-        return Ok(pathspec.to_vec());
-    }
-
-    let prefix = prefix
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/");
     Ok(pathspec
         .iter()
         .map(|spec| {

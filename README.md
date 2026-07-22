@@ -21,7 +21,7 @@ A local AI terminal interface in Rust. Supports multiple LLM providers (OpenAI-c
 **Agent loop (harness):** The daemon drives a server-side loop that repeatedly sends
 conversation history and available tools to the LLM, executes any tool calls the model
 requests, appends results back into the conversation, and loops until the model produces a
-final answer or the per-session iteration cap is reached. Each session keeps a responsive
+final answer or the per-session iteration cap is reached (or runs indefinitely when set to 0). Each session keeps a responsive
 control thread and runs request work in a separate worker thread. The client only sees
 `ToolCallStarted`/`ToolCallFinished` lifecycle events, keeping it simple.
 
@@ -94,7 +94,7 @@ requesting daemon shutdown.
 The daemon reads config from `~/.config/tai-daemon/config.toml` (all fields optional):
 
 ```toml
-max_turns = 25
+max_turns = 25      # 0 = unlimited (loop runs until final answer or error)
 
 [context]
 context_file_names = ["AGENTS.md", "CLAUDE.md"]

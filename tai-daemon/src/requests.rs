@@ -581,6 +581,9 @@ pub(crate) fn run_agent_loop(
     user_text: Option<String>,
 ) -> io::Result<bool> {
     let max_turns = session.config.max_turns.unwrap_or(ctx.max_turns_default);
+    // `max_turns == 0` means *unlimited* — the loop runs until the model
+    // produces a final answer, is cancelled, or hits an error.
+    let limited = max_turns > 0;
 
     let mut prev_resp_id: Option<String> = None;
     let mut tool_results: Vec<ToolResultItem> = Vec::new();
@@ -594,7 +597,16 @@ pub(crate) fn run_agent_loop(
         session.discovered_skills = Some(context::discover_skills(wd));
     }
 
-    for turn_iter in 0..max_turns {
+    let mut turn_iter: u32 = 0;
+    loop {
+        // Enforce the iteration limit only when one is configured.
+        // When `max_turns == 0` the loop is unbounded.
+        if limited && turn_iter >= max_turns {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("tool loop exceeded {max_turns} iterations"),
+            ));
+        }
         debug!(
             session_id = ctx.session_id,
             turn = turn_iter,
@@ -1054,12 +1066,10 @@ pub(crate) fn run_agent_loop(
                 return Err(e.into());
             }
         }
-    }
 
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("tool loop exceeded {max_turns} iterations"),
-    ))
+        // Advance the turn counter for the next iteration.
+        turn_iter += 1;
+    }
 }
 
 fn finish_tool_call(

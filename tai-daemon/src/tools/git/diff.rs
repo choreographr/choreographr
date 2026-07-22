@@ -49,12 +49,26 @@ pub fn execute_git_diff_tool(
 pub(crate) fn git_diff_impl(
     repo_path: Option<&str>,
     cached: bool,
-    pathspec: Vec<String>,
+    mut pathspec: Vec<String>,
     working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
     use gix::status::index_worktree::Item as WtItem;
 
     let repo = open_repo(repo_path, working_dir)?;
+
+    // Prefix user-provided pathspecs so they are repo-root-relative even
+    // when the session working directory is a subdirectory of the repo.
+    // This ensures gix's pathspec matching (which always operates relative
+    // to the repo root) finds the correct files.
+    if let Some(prefix) = super::resolve_pathspec_prefix(&repo, repo_path, working_dir)? {
+        for spec in &mut pathspec {
+            if spec == "." || spec == "./" {
+                *spec = prefix.clone();
+            } else {
+                *spec = format!("{}/{}", prefix, spec.trim_start_matches("./"));
+            }
+        }
+    }
     let workdir = repo_work_dir_display(&repo);
 
     let mut out = String::new();
@@ -75,6 +89,8 @@ pub(crate) fn git_diff_impl(
         let changes = collect_cached_diff_lines(&repo, &pathspec)?;
         let index = repo.index().map_err(io::Error::other)?;
 
+        // `collect_cached_diff_lines` already filters by pathspec, so no
+        // additional filtering is needed here.
         for line in &changes {
             let parts: Vec<&str> = line.splitn(2, ' ').collect();
             if parts.len() < 2 {
@@ -82,10 +98,6 @@ pub(crate) fn git_diff_impl(
             }
             let status = parts[0];
             let path = parts[1];
-
-            if !pathspec.is_empty() && !super::pathspec_matches(&pathspec, path) {
-                continue;
-            }
 
             match status {
                 // Added or copied files have no old content — diff against empty string.
