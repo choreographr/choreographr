@@ -6,6 +6,7 @@ use gix::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{collections::BTreeSet, fmt::Write as _, io, path::Path};
+use tracing::{debug, info, warn};
 
 use super::{
     describe_head, load_mutable_index, open_repo, pathspec_patterns, repo_work_dir_display,
@@ -46,24 +47,38 @@ fn git_add_impl(
     pathspec: Vec<String>,
     working_dir: Option<&std::path::Path>,
 ) -> Result<String, ToolError> {
+    debug!(
+        ?repo_path,
+        pathspec_count = pathspec.len(),
+        "executing git_add"
+    );
     let repo = open_repo(repo_path, working_dir)?;
     let effective_pathspec = prefix_pathspecs(&repo, repo_path, &pathspec, working_dir)?;
     let mut index = load_mutable_index(&repo)?;
     let paths = collect_paths_to_stage(&repo, &index, &effective_pathspec)?;
     if paths.is_empty() {
-        return Err(ToolError::Other(format!(
+        let msg = format!(
             "pathspec did not match any tracked or untracked paths: {}",
             humfmt::list(&pathspec)
-        )));
+        );
+        warn!(%msg, "git_add found no matching paths");
+        return Err(ToolError::Other(msg));
     }
 
     let (mut pipeline, _) = repo.filter_pipeline(None).map_err(io::Error::other)?;
     let mut changed = false;
     for path in &paths {
-        changed |= stage_path(&repo, &mut pipeline, &mut index, path.as_bstr())?;
+        // Capture the previous entry snapshot BEFORE any mutation of the index.
+        // current_entry_snapshot uses entry_by_path which relies on binary search,
+        // and the index is unsorted after earlier calls to dangerously_push_entry.
+        let path_bstr = path.as_bstr();
+        let previous = current_entry_snapshot(&index, path_bstr);
+        changed |= stage_path(&repo, &mut pipeline, &mut index, path_bstr, previous)?;
     }
 
     finalize_index(&mut index)?;
+
+    info!(path_count = paths.len(), changed, "git_add completed");
 
     let mut out = String::new();
     writeln!(&mut out, "repository: {}", repo_work_dir_display(&repo)).ok();
@@ -86,6 +101,7 @@ fn collect_paths_to_stage(
     index: &gix::index::File,
     pathspec: &[String],
 ) -> Result<Vec<BString>, ToolError> {
+    debug!(pathspec_len = pathspec.len(), "collecting paths to stage");
     let mut paths = BTreeSet::<BString>::new();
 
     let patterns = pathspec_patterns(pathspec);
@@ -125,8 +141,9 @@ fn stage_path(
     pipeline: &mut gix::filter::Pipeline<'_>,
     index: &mut gix::index::File,
     path: &BStr,
+    previous: Option<IndexEntrySnapshot>,
 ) -> Result<bool, ToolError> {
-    let previous = current_entry_snapshot(index, path);
+    debug!(%path, previous_present = previous.is_some(), "staging path");
     remove_entries_for_path(index, path);
 
     let maybe_object = pipeline
@@ -137,16 +154,21 @@ fn stage_path(
         Some((id, kind, _)) => {
             let metadata = worktree_metadata(repo, path)?;
             let stat = gix::index::entry::Stat::from_fs(&metadata).map_err(io::Error::other)?;
-            index.dangerously_push_entry(
-                stat,
+            let flags = gix::index::entry::Flags::from(gix::index::entry::Stage::Unconflicted);
+            let mode: gix::index::entry::Mode = kind.into();
+            index.dangerously_push_entry(stat, id, flags, mode, path);
+
+            // Build the "current" snapshot from the values we just pushed rather than
+            // looking them up via binary search.  `dangerously_push_entry` appends to the
+            // end of the entries vector, breaking the sorted invariant, so
+            // `entry_by_path` (which uses binary search) would fail.
+            let current = IndexEntrySnapshot {
                 id,
-                gix::index::entry::Flags::from(gix::index::entry::Stage::Unconflicted),
-                kind.into(),
-                path,
-            );
-            let current = current_entry_snapshot(index, path).ok_or_else(|| {
-                ToolError::Other("staged entry not found after insertion".to_string())
-            })?;
+                mode,
+                flags,
+                stat,
+                path: path.to_owned(),
+            };
             Ok(previous.as_ref() != Some(&current))
         }
         None => Ok(previous.is_some()),
@@ -195,8 +217,9 @@ fn worktree_metadata(
     let workdir = repo
         .workdir()
         .ok_or_else(|| ToolError::Other("repository has no worktree".to_string()))?;
-    gix::index::fs::Metadata::from_path_no_follow(&workdir.join(gix::path::from_bstr(path)))
-        .map_err(|e| ToolError::Io(e.to_string()))
+    Ok(gix::index::fs::Metadata::from_path_no_follow(
+        &workdir.join(gix::path::from_bstr(path)),
+    )?)
 }
 
 fn finalize_index(index: &mut gix::index::File) -> Result<(), ToolError> {
@@ -246,3 +269,60 @@ define_tool!(
     "git",
     describe_git_add_invocation
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gix::ObjectId;
+
+    #[test]
+    fn normalize_pathspecs_filters_empty() {
+        let result = normalize_pathspecs(vec!["  ".into(), "a.txt".into(), "".into()]);
+        assert_eq!(result.unwrap(), vec!["a.txt"]);
+    }
+
+    #[test]
+    fn normalize_pathspecs_all_empty_fails() {
+        let result = normalize_pathspecs(vec!["   ".into(), "".into()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn normalize_pathspecs_preserves_valid() {
+        let result = normalize_pathspecs(vec!["src/".into(), "Cargo.toml".into()]);
+        assert_eq!(result.unwrap(), vec!["src/", "Cargo.toml"]);
+    }
+
+    #[test]
+    fn normalize_pathspecs_trims_whitespace() {
+        let result = normalize_pathspecs(vec!["  foo.rs  ".into()]);
+        assert_eq!(result.unwrap(), vec!["foo.rs"]);
+    }
+
+    /// Verify IndexEntrySnapshot equality comparison works as expected.
+    #[test]
+    fn index_entry_snapshot_eq() {
+        let id = ObjectId::null(gix::hash::Kind::Sha1);
+        let mode = gix::index::entry::Mode::FILE;
+        let flags = gix::index::entry::Flags::from(gix::index::entry::Stage::Unconflicted);
+        let stat = gix::index::entry::Stat::default();
+        let path: BString = "test.txt".into();
+
+        let a = IndexEntrySnapshot {
+            id,
+            mode,
+            flags,
+            stat: stat.clone(),
+            path: path.clone(),
+        };
+        let b = IndexEntrySnapshot {
+            id,
+            mode,
+            flags,
+            stat,
+            path,
+        };
+        assert_eq!(a, b);
+    }
+}
