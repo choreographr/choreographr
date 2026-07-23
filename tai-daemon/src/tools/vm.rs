@@ -479,10 +479,11 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
     }
 
     /// find(pattern: &str) -> file name search results as string.
+    /// Glob mode is auto-detected — patterns with `*`, `?`, `[` are treated as globs.
     pub fn find(pattern: &str) -> String {
         let mut args = Vec::new();
         enc_str(pattern, &mut args);
-        enc_bool(false, &mut args);       // glob (default: substring)
+        enc_bool(false, &mut args);       // glob: false = auto-detect
         enc_option_str(None, &mut args);  // path
         enc_option_u64(None, &mut args);  // max_results
         let resp = call("find", &args);

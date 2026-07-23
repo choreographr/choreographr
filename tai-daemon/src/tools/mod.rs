@@ -819,7 +819,13 @@ pub(crate) fn resolve_path(
         return p.to_path_buf();
     }
     if let Some(working_dir) = working_dir {
-        working_dir.join(p)
+        // Path::join(".") appends a literal `.` component, polluting paths
+        // with `/.` separators that confuse glob matchers and walkers.
+        if path == "." || path == "./" {
+            working_dir.to_path_buf()
+        } else {
+            working_dir.join(p)
+        }
     } else {
         p.to_path_buf()
     }

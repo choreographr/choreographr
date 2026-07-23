@@ -21,7 +21,10 @@ impl GlobFilter {
     /// `true` when the pattern contains no `/`, `false` otherwise.
     pub(crate) fn compile(glob: &str) -> Result<Self, String> {
         let match_basename = !glob.contains('/');
-        let pattern = ZlobPattern::compile(glob, ZlobFlags::empty())
+        // PERIOD is added so `**` matches through dot-prefixed directories
+        // (e.g. temp dirs, `.hidden`) — the walker controls which entries are
+        // visible; the glob should match whatever the walker yields.
+        let pattern = ZlobPattern::compile(glob, ZlobFlags::RECOMMENDED | ZlobFlags::PERIOD)
             .map_err(|e| format!("invalid glob pattern '{glob}': {e}"))?;
         Ok(Self {
             pattern,

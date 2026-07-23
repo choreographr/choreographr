@@ -201,10 +201,10 @@ pub(crate) fn pathspec_matches(pathspec: &[String], path: &str) -> bool {
 pub(crate) fn simple_glob_matches(pattern: &str, text: &str) -> bool {
     // Early-out for patterns without glob wildcards — these are handled by
     // the exact-match and prefix-match checks in pathspec_matches.
-    if !zlob::has_wildcards(pattern, ZlobFlags::empty()) {
+    if !zlob::has_wildcards(pattern, ZlobFlags::RECOMMENDED) {
         return false;
     }
-    ZlobPattern::compile(pattern, ZlobFlags::empty())
+    ZlobPattern::compile(pattern, ZlobFlags::RECOMMENDED)
         .map(|p| p.matches_default(text))
         .unwrap_or(false)
 }

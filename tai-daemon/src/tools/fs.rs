@@ -219,7 +219,7 @@ pub(crate) fn execute_delete_files_tool(
         if trimmed.is_empty() {
             continue;
         }
-        if zlob::has_wildcards(trimmed, ZlobFlags::empty()) {
+        if zlob::has_wildcards(trimmed, ZlobFlags::RECOMMENDED) {
             glob_patterns
                 .push(GlobFilter::compile(trimmed).map_err(|e| {
                     ToolExecError(format!("invalid glob pattern '{trimmed}': {e}"))
@@ -768,7 +768,7 @@ pub fn describe_delete_files_invocation(args: &DeleteFilesArgs) -> String {
     let glob_count = args
         .targets
         .iter()
-        .filter(|t| zlob::has_wildcards(t.trim(), ZlobFlags::empty()))
+        .filter(|t| zlob::has_wildcards(t.trim(), ZlobFlags::RECOMMENDED))
         .count();
     let literal_count = args.targets.len() - glob_count;
     if literal_count == 1 && glob_count == 0 {

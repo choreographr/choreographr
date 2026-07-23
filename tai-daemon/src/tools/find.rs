@@ -4,6 +4,7 @@ use serde::Deserialize;
 use std::path::Path;
 use std::sync::mpsc;
 use tai_keystore::ServiceCredential;
+use tracing::debug;
 use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
 use zlob::{ZlobFlags, ZlobPattern};
 
@@ -18,7 +19,12 @@ const MAX_RESULTS_CAP: u32 = 200;
 pub struct FindArgs {
     /// File name pattern to search for (supports glob like '*.rs')
     pub pattern: String,
-    /// When true, treat pattern as a glob instead of a substring match
+    /// When true, treat pattern as a glob instead of substring match.
+    /// When false (default), auto-detects glob metacharacters (`*`, `?`, `[`, `{`, `!`, `~`):
+    /// if present, glob matching is used; otherwise, case-insensitive substring match.
+    /// Set to false explicitly to force substring matching for patterns that
+    /// happen to contain glob wildcards. Escape glob characters with `\` to
+    /// match them literally in any mode.
     #[serde(default)]
     pub glob: bool,
     /// Directory to search in (defaults to working directory)
@@ -29,10 +35,21 @@ pub struct FindArgs {
 
 /// Stateless, zero-sized tool that finds files and directories by name.
 ///
-/// Supports case-insensitive substring matching (default) and glob-based
-/// pattern matching. Respects `.gitignore` and hidden files via zlob's
-/// gitignore-aware walker.
+/// Supports case-insensitive substring matching and glob-based pattern matching.
+/// Glob mode is auto-detected when the pattern contains wildcard characters
+/// (`*`, `?`, `[`, `{`, `!`, `~`). Use the `glob` parameter to override
+/// auto-detection. Escape glob characters with `\` to match them literally.
+/// Respects `.gitignore` and hidden files via zlob's gitignore-aware walker.
 pub struct Find;
+
+/// Determine whether the given search pattern should be treated as a glob.
+/// When `glob` is explicitly true, always use glob matching. When false,
+/// auto-detect: if the pattern contains wildcard characters (`*`, `?`, `[`,
+/// `{`, `!`, `~`), glob is used; otherwise, case-insensitive substring
+/// matching is used.
+fn use_glob_pattern(pattern: &str, glob: bool) -> bool {
+    glob || zlob::has_wildcards(pattern, ZlobFlags::RECOMMENDED)
+}
 
 /// Run the find walk with the given parameters, optionally streaming each
 /// match to `output_tx` as it is found (for incremental client display).
@@ -43,9 +60,11 @@ fn run_find_walk(
     max_results: u32,
     output_tx: Option<&mpsc::Sender<Vec<u8>>>,
 ) -> Result<String, ToolExecError> {
-    // Build an optional glob matcher when the caller wants glob mode.
-    // For substring mode we don't need a matcher — we do simple contains().
-    let glob_matcher: Option<ZlobPattern> = if glob {
+    let use_glob = use_glob_pattern(pattern, glob);
+    debug!(pattern, resolved = %resolved.display(), use_glob, max_results, "find: starting search");
+
+    // Substring mode skips the matcher entirely — just does contains().
+    let glob_matcher: Option<ZlobPattern> = if use_glob {
         Some(
             ZlobPattern::compile(pattern, ZlobFlags::RECOMMENDED)
                 .map_err(|e| ToolExecError(format!("invalid glob pattern: {e}")))?,
@@ -54,8 +73,8 @@ fn run_find_walk(
         None
     };
 
-    // Pre-lowercase the pattern so we only pay the cost once for
-    // case-insensitive substring matching on every entry's name.
+    // Pre-lowercase the pattern once for case-insensitive substring matching
+    // so we don't pay this cost on every entry.
     let pattern_lower = pattern.to_lowercase();
 
     // Clamp max_results to the configured bounds so the caller can't
@@ -83,7 +102,8 @@ fn run_find_walk(
                 // Glob mode: delegate to zlob's compiled matcher.
                 matcher.matches_default(&name)
             } else {
-                // Substring mode: case-insensitive contains check.
+                // Substring mode: case-insensitive contains check using the
+                // pre-lowercased pattern.
                 name.to_lowercase().contains(&pattern_lower)
             };
 
@@ -159,13 +179,18 @@ impl Tool for Find {
     }
 
     fn description(&self) -> &'static str {
-        "Find files and directories by name. Respects .gitignore and hidden files."
+        "Find files and directories by name. Glob auto-detected when pattern contains `*`, `?`, `[`, `{`, `!`, or `~`. Escape glob chars with `\\` to match literals. Respects .gitignore and hidden files."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Searching for files matching `{}`.", args.pattern)];
+        let use_glob = use_glob_pattern(&args.pattern, args.glob);
         if args.glob {
-            parts.push(" Using glob matching.".to_string());
+            parts.push(" Using glob matching (explicit).".to_string());
+        } else if use_glob {
+            parts.push(" Using glob matching (auto-detected).".to_string());
+        } else {
+            parts.push(" Using substring matching.".to_string());
         }
         match &args.path {
             Some(p) => parts.push(format!(" In path: `{}`.", p)),
@@ -276,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn test_glob_match() {
+    fn test_glob_match_explicit() {
         let dir = setup_test_dir();
         let tool = Find;
         let args = FindArgs {
@@ -301,6 +326,48 @@ mod tests {
             result.contains("test/test_foo.rs"),
             "expected test/test_foo.rs:\n{result}"
         );
+    }
+
+    #[test]
+    fn test_glob_auto_detect() {
+        // `*.rs` has wildcards → auto-detected as glob, no `glob: true` needed.
+        let dir = setup_test_dir();
+        let tool = Find;
+        let args = FindArgs {
+            pattern: "*.rs".to_string(),
+            glob: false,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+
+        assert!(result.contains("foo.rs"), "expected foo.rs:\n{result}");
+        assert!(result.contains("bar.rs"), "expected bar.rs:\n{result}");
+        assert!(
+            result.contains("src/main.rs"),
+            "expected src/main.rs:\n{result}"
+        );
+        assert!(
+            result.contains("test/test_foo.rs"),
+            "expected test/test_foo.rs:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_glob_auto_detect_with_question_mark() {
+        let dir = setup_test_dir();
+        let tool = Find;
+        let args = FindArgs {
+            // foo.rs matched by f?o.rs or foo.?s
+            pattern: "foo.?s".to_string(),
+            glob: false,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+
+        assert!(result.contains("foo.rs"), "expected foo.rs:\n{result}");
+        assert!(!result.contains("bar.rs"), "expected no bar.rs:\n{result}");
     }
 
     #[test]
@@ -338,7 +405,8 @@ mod tests {
         };
         let result = tool.execute(args, None, None, None).unwrap();
 
-        // With max_results=1 we should get exactly one line of output
+        // With max_results=1 we should get exactly one line of output.
+        // Note: ".rs" has no wildcards, so it stays in substring mode.
         assert_eq!(
             result.lines().count(),
             1,
