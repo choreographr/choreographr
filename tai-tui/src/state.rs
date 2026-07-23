@@ -18,7 +18,7 @@ use crate::markdown_render::{lines_height, plain_text_lines, render_turn_lines};
 use ratatui::text::Line;
 use tui_prompts::{SelectState, State, TextState};
 
-pub(crate) const STATUS_BAR_HEIGHT: u16 = 2;
+pub(crate) const STATUS_BAR_HEIGHT: u16 = 1;
 pub(crate) const MIN_INPUT_CONTENT_LINES: u16 = 1;
 pub(crate) const MAX_INPUT_CONTENT_LINES: u16 = 10;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
@@ -406,6 +406,7 @@ pub(crate) struct App {
     pub(crate) attached_provider_slug: Option<String>,
     pub(crate) attached_working_dir: Option<String>,
     pub(crate) attached_status: Option<SessionStatus>,
+    pub(crate) attached_tool_groups: Vec<String>,
     pub(crate) page: Page,
     pub(crate) previous_page: Page,
     pub(crate) home_selection: usize,
@@ -1239,6 +1240,7 @@ impl App {
             attached_provider_slug: None,
             attached_working_dir: None,
             attached_status: None,
+            attached_tool_groups: Vec::new(),
             page: Page::Chat,
             previous_page: Page::Chat,
             home_selection: 0,
@@ -2116,6 +2118,7 @@ impl TurnEventHandler for App {
             turns,
             title: _,
             selected_model,
+            active_tool_groups,
             token_usage,
             context_window,
             last_prompt_tokens,
@@ -2134,6 +2137,7 @@ impl TurnEventHandler for App {
         self.attached_context_window = context_window;
         self.attached_last_prompt_tokens = last_prompt_tokens;
         self.attached_status = Some(status);
+        self.attached_tool_groups = active_tool_groups;
         self.mark_content_changed();
     }
 

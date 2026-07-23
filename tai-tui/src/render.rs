@@ -313,16 +313,13 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let cursor_y = chunks[2].y.saturating_add(1).saturating_add(display_vrow);
     frame.set_cursor_position((cursor_x, cursor_y));
 
-    // ── Status bar ────────────────────────────────────────────
+    // ── Status bar (single line) ───────────────────────────────
     let status_area = chunks[3];
-    let status_rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(status_area);
 
     let has_session = app.attached_session_id.is_some();
 
     let status_line = if has_session {
+        // --- Right side (original line 1): session metadata ---
         let wd = app.attached_working_dir.as_deref().unwrap_or("-");
         let provider = app.attached_provider_slug.as_deref().unwrap_or("-");
         let model = app.attached_model.as_deref().unwrap_or("-");
@@ -332,22 +329,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             .map(|e| e.as_label())
             .unwrap_or("-");
 
-        Line::from(vec![
-            Span::styled(wd, Style::default().fg(Color::White)),
-            Span::raw("  |  "),
-            Span::styled(provider, Style::default().fg(Color::White)),
-            Span::raw("  |  "),
-            Span::styled(model, Style::default().fg(Color::White)),
-            Span::raw("  |  "),
-            Span::styled(reasoning, Style::default().fg(Color::White)),
-        ])
-    } else {
-        Line::from("")
-    };
-    let status_bar = Paragraph::new(status_line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
-    frame.render_widget(status_bar, status_rows[0]);
-
-    let tokens_line = if has_session {
+        // --- Left side (original line 2): tokens, context, status ---
         let tokens = match &app.display_token_usage() {
             Some(usage) => format!("↑{}  ↓{}", usage.input_tokens, usage.output_tokens),
             None => String::new(),
@@ -370,16 +352,25 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             (None, Some(current)) => format!("{} / ?", humfmt::number(current)),
             (None, None) => String::new(),
         };
+
+        // --- Tool groups ---
+        let tool_groups = app.attached_tool_groups.join(", ");
+
+        // Build spans: left-side info first, then session metadata, then tool groups.
         let mut spans: Vec<Span> = Vec::new();
+
+        // Tokens
         if !tokens.is_empty() {
             spans.push(Span::styled(tokens, Style::default().fg(Color::White)));
         }
+        // Context window
         if !context.is_empty() {
             if !spans.is_empty() {
                 spans.push(Span::raw("  |  "));
             }
             spans.push(Span::styled(context, Style::default().fg(Color::White)));
         }
+        // Session status
         if let Some(status) = &app.attached_status {
             let (label, color) = status_display(status);
             if !spans.is_empty() {
@@ -387,12 +378,35 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             }
             spans.push(Span::styled(label, Style::default().fg(color)));
         }
+        // Working directory
+        if !spans.is_empty() {
+            spans.push(Span::raw("  |  "));
+        }
+        spans.push(Span::styled(wd, Style::default().fg(Color::White)));
+        // Provider
+        spans.push(Span::raw("  |  "));
+        spans.push(Span::styled(provider, Style::default().fg(Color::White)));
+        // Model
+        spans.push(Span::raw("  |  "));
+        spans.push(Span::styled(model, Style::default().fg(Color::White)));
+        // Reasoning effort
+        spans.push(Span::raw("  |  "));
+        spans.push(Span::styled(reasoning, Style::default().fg(Color::White)));
+        // Tool groups
+        if !tool_groups.is_empty() {
+            spans.push(Span::raw("  |  "));
+            spans.push(Span::styled(
+                tool_groups,
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
         Line::from(spans)
     } else {
         Line::from("")
     };
-    let tokens_bar = Paragraph::new(tokens_line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
-    frame.render_widget(tokens_bar, status_rows[1]);
+    let status_bar = Paragraph::new(status_line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
+    frame.render_widget(status_bar, status_area);
 }
 
 fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
