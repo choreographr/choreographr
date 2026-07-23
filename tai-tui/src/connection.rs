@@ -1649,6 +1649,9 @@ pub(crate) fn handle_daemon_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Marker;
+    use crate::test_util::test_app;
+    use tai_proto::Turn;
 
     #[test]
     fn sigcont_maps_to_reinit_terminal() {
@@ -1675,5 +1678,203 @@ mod tests {
     #[test]
     fn invalid_signal_number_returns_none() {
         assert!(signal_to_resume_command(9999).is_none());
+    }
+
+    // ── Marker click logic ──
+    //
+    // The scrollbar click handler (line 935) maps a mouse row to virtual
+    // half-slots and looks up matching markers in app.markers.  These tests
+    // verify that the data flow — from rebuild_height_prefix through marker
+    // creation and the lookup pattern — produces correct scroll positions.
+
+    fn insert_turn(app: &mut App, id: u32, user_text: &str, assistant_text: &str) {
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some(user_text.into()),
+            assistant_text: Some(assistant_text.into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.session_view.insert_or_replace(id, turn);
+    }
+
+    /// Simulate the scrollbar click handler's marker lookup: compute
+    /// half-slots for the given `mouse_row` and scan `app.markers` for
+    /// a match.  Returns the matched marker if found.
+    fn find_marker_by_row(app: &App, mouse_row: u16) -> Option<&Marker> {
+        let top_slot = 2 * mouse_row as usize;
+        let bot_slot = top_slot + 1;
+        app.markers
+            .iter()
+            .find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot)
+    }
+
+    #[test]
+    fn marker_lookup_finds_marker_at_mouse_row() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+
+        // Two user-text turns → two markers.
+        insert_turn(&mut app, 0, "user a", "assistant a");
+        insert_turn(&mut app, 1, "user b", "assistant b");
+        app.rebuild_height_prefix();
+
+        assert_eq!(app.markers.len(), 2, "should have 2 markers");
+
+        // Each marker's virtual_slot must be findable by the click handler's
+        // row-to-slot mapping (slot = 2*row or slot = 2*row+1).
+        for marker in &app.markers {
+            let row = marker.virtual_slot / 2;
+            let found = find_marker_by_row(&app, row as u16);
+            assert!(
+                found.is_some(),
+                "marker at virtual_slot {} should be findable at row {}",
+                marker.virtual_slot,
+                row,
+            );
+            if let Some(f) = found {
+                assert_eq!(
+                    f.content_line, marker.content_line,
+                    "found marker should match content_line"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn marker_click_scrolls_to_content_line() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        // Three user-text turns.
+        insert_turn(&mut app, 0, "first", "response a");
+        insert_turn(&mut app, 1, "second", "response b");
+        insert_turn(&mut app, 2, "third", "response c");
+        app.rebuild_height_prefix();
+
+        let total = app.total_history_height();
+        let vh = app.history_viewport.height as usize;
+
+        // Collect content_lines first to avoid borrow conflict with
+        // scroll_to_content_line which takes &mut self.
+        let content_lines: Vec<usize> = app.markers.iter().map(|m| m.content_line).collect();
+
+        // Clicking on each marker should scroll so that the marker's
+        // content_line is at the top of the viewport.
+        for &cl in &content_lines {
+            app.scroll_to_content_line(cl);
+
+            let scroll = app.effective_scroll();
+            // The first visible content line at the top of the viewport
+            // should be the marker's content_line.
+            let first_visible = total.saturating_sub(scroll + vh);
+            assert_eq!(
+                first_visible, cl,
+                "click on marker at content_line {} should make it the first visible line",
+                cl,
+            );
+        }
+    }
+
+    #[test]
+    fn marker_click_after_content_change_still_correct() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        // Initial turns.
+        insert_turn(&mut app, 0, "a", "resp a");
+        insert_turn(&mut app, 1, "b", "resp b");
+        app.rebuild_height_prefix();
+
+        // Add more content — markers should be recomputed.
+        insert_turn(&mut app, 2, "c", "resp c");
+        app.rebuild_height_prefix();
+
+        assert_eq!(
+            app.markers.len(),
+            3,
+            "should have 3 markers after adding content"
+        );
+
+        // Collect content_lines first to avoid borrow conflict.
+        let content_lines: Vec<usize> = app.markers.iter().map(|m| m.content_line).collect();
+
+        // Each marker should scroll to the correct content_line.
+        for &cl in &content_lines {
+            app.scroll_to_content_line(cl);
+            let scroll = app.effective_scroll();
+            let total = app.total_history_height();
+            let vh = app.history_viewport.height as usize;
+            let first_visible = total.saturating_sub(scroll + vh);
+            assert_eq!(
+                first_visible, cl,
+                "click on recomputed marker should scroll correctly"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_slot_uses_final_total_as_denominator() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+
+        // Add turns of varying heights.
+        insert_turn(&mut app, 0, "short", "short");
+        insert_turn(&mut app, 1, "longer text here", "some response that wraps");
+        app.rebuild_height_prefix();
+
+        let total = app.total_history_height();
+        let virtual_track = 2 * app.history_viewport.height as usize;
+
+        for marker in &app.markers {
+            let expected_slot = marker.content_line * virtual_track / total.max(1);
+            assert_eq!(
+                marker.virtual_slot,
+                expected_slot.min(virtual_track.saturating_sub(1)),
+                "virtual_slot should be proportional to content_line using final total as denominator"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_lookup_no_match_on_empty_track() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+
+        // No markers (no user_text turns).
+        app.session_view.turns.clear();
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("assistant only".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.session_view.insert_or_replace(0, turn);
+        app.rebuild_height_prefix();
+        assert!(app.markers.is_empty(), "should have no markers");
+
+        // No marker should be found at any row.
+        for row in 0..10 {
+            assert!(
+                find_marker_by_row(&app, row).is_none(),
+                "row {row} should not match any marker"
+            );
+        }
     }
 }

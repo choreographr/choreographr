@@ -72,8 +72,9 @@ impl SmoothScrollbar {
 
     /// Attach pre-computed virtual-slot positions where user-text
     /// markers should appear on the track.
-    pub(crate) fn with_markers(mut self, markers: Vec<usize>) -> Self {
-        self.markers = markers.into_iter().collect();
+    pub(crate) fn with_markers(mut self, markers: &[usize]) -> Self {
+        self.markers.clear();
+        self.markers.extend(markers.iter().copied());
         self
     }
 }
@@ -352,7 +353,7 @@ mod tests {
         content_length: usize,
         viewport_content_length: usize,
         position: usize,
-        marker_slots: Vec<usize>,
+        marker_slots: &[usize],
     ) -> Vec<String> {
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, height));
         let scrollbar = SmoothScrollbar::new()
@@ -375,7 +376,7 @@ mod tests {
         //   virtual_track=10, thumb_slots=3, virtual_scroll_range=7,
         //   scroll_range=7, thumb_start=0 → thumb covers [0,3) → rows 0-1
         // Marker at line 5 → virtual slot 5*10/10=5 → row 2 bottom half.
-        let symbols = render_to_symbols_with_markers(5, 10, 3, 0, vec![5]);
+        let symbols = render_to_symbols_with_markers(5, 10, 3, 0, &[5]);
         assert_eq!(symbols[0], "█", "row 0 thumb");
         assert_eq!(symbols[1], "▀", "row 1 thumb upper half");
         assert_eq!(symbols[2], "▄", "row 2 should be marker lower half");
@@ -391,7 +392,7 @@ mod tests {
         //     → marker_top=true → "▀" fg=green bg=thumb (marker over thumb)
         //   Row 1: top_slot=2 (thumb only), bot_slot=3 (track)
         //     → "▀" half_style (original thumb behavior)
-        let symbols = render_to_symbols_with_markers(5, 10, 3, 0, vec![0]);
+        let symbols = render_to_symbols_with_markers(5, 10, 3, 0, &[0]);
         assert_eq!(symbols[0], "▀", "row 0 marker top half over thumb");
         assert_eq!(symbols[1], "▀", "row 1 thumb upper half");
     }
@@ -406,7 +407,7 @@ mod tests {
         // Marker at line 5  → slot 5  → row 2 bot   → "▄"
         // Marker at line 9  → slot 9  → row 4 bot   → "▄"
         // Marker at line 11 → slot 11 → row 5 bot   → "▄"
-        let symbols = render_to_symbols_with_markers(6, 12, 2, 0, vec![2, 5, 9, 11]);
+        let symbols = render_to_symbols_with_markers(6, 12, 2, 0, &[2, 5, 9, 11]);
         assert_eq!(symbols[0], "█", "row 0 thumb");
         assert_eq!(symbols[1], "▀", "row 1 marker top half");
         assert_eq!(symbols[2], "▄", "row 2 marker bottom half");
@@ -418,7 +419,7 @@ mod tests {
     #[test]
     fn empty_markers_unchanged() {
         // No markers → regular thumb rendering.
-        let symbols = render_to_symbols_with_markers(5, 10, 3, 0, vec![]);
+        let symbols = render_to_symbols_with_markers(5, 10, 3, 0, &[]);
         assert_eq!(symbols[0], "█", "row 0 thumb");
         assert_eq!(symbols[1], "▀", "row 1 thumb upper half");
         for i in 2..5 {
@@ -433,7 +434,7 @@ mod tests {
             .thumb_fg(Color::Gray)
             .track_bg(Color::DarkGray)
             .marker_fg(Color::Green)
-            .with_markers(vec![6]);
+            .with_markers(&[6]);
         // Position=0, content=10, viewport=3 → thumb covers rows 0-1.
         // Marker at line 6 → virtual slot 6 → row 3 top half.
         let mut state = SmoothScrollbarState::new(10)
@@ -455,7 +456,7 @@ mod tests {
             .thumb_fg(Color::Gray)
             .track_bg(Color::DarkGray)
             .marker_fg(Color::Green)
-            .with_markers(vec![0]);
+            .with_markers(&[0]);
         // Position=0, content=10, viewport=3 → thumb covers rows 0-1.
         // Marker at line 0 → virtual slot 0 → row 0 top half, which is
         // also inside the thumb range → mixed marker+thumb rendering.

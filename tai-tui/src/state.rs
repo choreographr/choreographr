@@ -385,8 +385,9 @@ pub(crate) struct TurnImageLayout {
 
 #[derive(Clone)]
 pub(crate) struct RenderedCache {
-    pub lines: Vec<Line<'static>>,
+    pub lines: Arc<[Line<'static>]>,
     pub width: u16,
+    pub height: usize,
 }
 
 pub(crate) struct App {
@@ -1287,8 +1288,7 @@ impl App {
         let turn_count = self.session_view.turns.len();
         tracing::trace!(turn_count, "rebuild_height_prefix");
         // Collect computed lines so we can warm the render_cache below.
-        let mut computed_lines: Vec<Option<(Vec<Line<'static>>, u16)>> =
-            Vec::with_capacity(turn_count);
+        let mut computed_lines: Vec<Option<RenderedCache>> = Vec::with_capacity(turn_count);
         // Collect start lines of user-text turns for marker computation
         // after we know the final total height.
         let mut user_text_start_lines: Vec<usize> = Vec::with_capacity(turn_count);
@@ -1302,7 +1302,11 @@ impl App {
             let tool_content_width = self.history_viewport.width.saturating_sub(4);
             let text_lines = render_turn_lines(turn, content_width, tool_content_width);
             let text_height = lines_height(&text_lines, self.history_viewport.width).max(1);
-            computed_lines.push(Some((text_lines, content_width)));
+            computed_lines.push(Some(RenderedCache {
+                lines: Arc::from(text_lines),
+                width: content_width,
+                height: text_height,
+            }));
             // Image blocks always use `image_block_height()` — this must
             // match the render allocation in `render_turn_image` so that
             // click-to-fullscreen detection (via `image_ranges`) and scroll
@@ -1351,8 +1355,8 @@ impl App {
         // Warm cache with the lines we just computed, avoiding a second
         // render_turn_lines call in render_history.
         for (slot, entry) in self.render_cache.iter_mut().zip(computed_lines.drain(..)) {
-            if let Some((lines, w)) = entry {
-                *slot = Some(RenderedCache { lines, width: w });
+            if let Some(cache) = entry {
+                *slot = Some(cache);
             }
         }
         self.markers_dirty = false;
@@ -1481,22 +1485,23 @@ impl App {
                 width: width - 1,
                 height: new_height,
             });
-            if old_width != width || old_height != new_height {
+            if old_width != width.saturating_sub(1) || old_height != self.history_viewport.height {
                 for cached in &mut self.render_cache {
                     *cached = None;
                 }
                 self.markers_dirty = true;
-                if old_width != width {
+                if old_width != width.saturating_sub(1) {
                     // Width changed — the old layout is at a different wrapping
                     // width, so the old total height is meaningless for scroll
                     // preservation.  Clear content_dirty to prevent the stale
                     // flag (left over from a prior content change in the same
                     // event batch) from triggering preserve_scroll with an
                     // incompatible old_total.
+                    let new_vp_width = width.saturating_sub(1);
                     tracing::debug!(
                         "width changed ({} → {}), clearing content_dirty",
                         old_width,
-                        width
+                        new_vp_width,
                     );
                     self.content_dirty = false;
                 }
@@ -3330,8 +3335,9 @@ mod tests {
         app.markers_dirty = true;
         // Add a cached entry to verify it gets cleared.
         app.render_cache = vec![Some(RenderedCache {
-            lines: vec![],
+            lines: Arc::from(Vec::<Line<'static>>::new()),
             width: 0,
+            height: 0,
         })];
 
         app.update_viewport_from_terminal_size();
@@ -3353,8 +3359,8 @@ mod tests {
     fn height_only_change_does_not_clear_content_dirty() {
         let mut app = test_app("/tmp/tai.sock");
 
-        // Establish a "current" viewport with the old height.
-        app.history_viewport.width = 80;
+        // Establish a "current" viewport matching terminal_width - 1 (scrollbar column).
+        app.history_viewport.width = 79;
         app.history_viewport.height = 20;
 
         // Set last_terminal_size to a new size with larger height, same width.
@@ -3364,8 +3370,9 @@ mod tests {
         app.content_dirty = true;
         app.markers_dirty = true;
         app.render_cache = vec![Some(RenderedCache {
-            lines: vec![],
+            lines: Arc::from(Vec::<Line<'static>>::new()),
             width: 0,
+            height: 0,
         })];
 
         app.update_viewport_from_terminal_size();

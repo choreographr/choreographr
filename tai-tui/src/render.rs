@@ -240,7 +240,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             .saturating_sub(app.effective_scroll());
         let marker_slots: Vec<usize> = app.markers.iter().map(|m| m.virtual_slot).collect();
         frame.render_stateful_widget(
-            vertical_scrollbar().with_markers(marker_slots),
+            vertical_scrollbar().with_markers(&marker_slots),
             history_chunks[1],
             &mut SmoothScrollbarState::new(total_height)
                 .position(position)
@@ -424,6 +424,10 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut rows_to_skip = app.effective_scroll();
 
     let len = app.visible_turn_ids.len();
+
+    // Iterate visible turns from newest to oldest.  clipped_area consumes
+    // rows_to_skip from the bottom (newest end) so that turns fully below
+    // the viewport are skipped before any content is rendered.
     for raw_i in 0..len {
         let i = len - 1 - raw_i;
         let turn_id = app.visible_turn_ids[i];
@@ -432,8 +436,8 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             break;
         }
 
-        // Clone turn data before borrowing render_cache mutably.
-        let (text_lines, img_count) = {
+        // Get cached lines (Arc clone is O(1)) and the pre-computed height.
+        let (text_lines_arc, text_height, img_count) = {
             let Some(turn) = app.session_view.turns.get(&turn_id) else {
                 continue;
             };
@@ -441,13 +445,15 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 continue;
             }
             let count = turn.displayed_images.len();
-            let lines = cached_or_compute_lines(&mut app.render_cache, i, content_width, || {
-                render_turn_lines(turn, content_width, tool_content_width)
-            });
-            (lines, count)
+            let (arc, height) = cached_or_compute_lines(
+                &mut app.render_cache,
+                i,
+                content_width,
+                area.width,
+                || render_turn_lines(turn, content_width, tool_content_width),
+            );
+            (arc, height, count)
         };
-
-        let text_height = lines_height(&text_lines, area.width).max(1);
 
         // ── Images (rendered first so they sit below text) ──
         let full_img_height = app.image_block_height() as usize;
@@ -473,11 +479,14 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         if let Some((top_line, visible_height)) =
             clipped_area(text_height, &mut rows_to_skip, &mut rows_remaining, &mut y)
         {
-            render_margin_lines(
+            // Clone only the visible slice from the Arc — O(visible_lines)
+            // instead of O(total_lines_in_turn).
+            let end = (top_line + visible_height).min(text_lines_arc.len());
+            let visible_lines = text_lines_arc[top_line..end].to_vec();
+            render_text_block(
                 frame,
                 area,
-                text_lines,
-                top_line,
+                visible_lines,
                 visible_height,
                 &mut y,
                 Style::default(),
@@ -486,28 +495,41 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
-/// Return the cached rendered lines for a turn at the given cache index,
-/// or compute, cache, and return them.
+/// Return the cached rendered lines (as an `Arc` slice for O(1) sharing) and
+/// their pre-computed height for a turn at the given cache index, or compute,
+/// cache, and return them.
+///
+/// On cache hit the height is returned from the cache (avoids re-computing
+/// `lines_height`, which iterates every line).  On cache miss the height is
+/// computed inline and stored alongside the lines.
+///
+/// Note: `width` is the content area width (viewport minus decorations) and
+/// `viewport_width` is the full viewport width.  They always change together
+/// since `content_width = viewport_width - 9`, so we only key the cache on
+/// `width` — `viewport_width` is never stored as a separate cache dimension.
 fn cached_or_compute_lines(
     cache: &mut [Option<RenderedCache>],
     index: usize,
     width: u16,
+    viewport_width: u16,
     compute: impl FnOnce() -> Vec<Line<'static>>,
-) -> Vec<Line<'static>> {
+) -> (Arc<[Line<'static>]>, usize) {
     if let Some(Some(cached)) = cache.get(index)
         && cached.width == width
     {
-        return cached.lines.clone();
+        return (Arc::clone(&cached.lines), cached.height);
     }
 
-    let lines = compute();
+    let lines = Arc::from(compute());
+    let height = lines_height(&lines, viewport_width).max(1);
     if let Some(slot) = cache.get_mut(index) {
         *slot = Some(RenderedCache {
-            lines: lines.clone(),
+            height,
+            lines: Arc::clone(&lines),
             width,
         });
     }
-    lines
+    (lines, height)
 }
 
 fn clipped_area(
@@ -536,12 +558,14 @@ fn clipped_area(
     Some((top_line, visible_height))
 }
 
-/// Render pre-margin-decorated lines with viewport clipping.
-fn render_margin_lines(
+/// Render a text block into the given area with wrapping.
+///
+/// `lines` must already be clipped to the visible portion (no `scroll` offset
+/// is applied since the slice starts at the correct position).
+fn render_text_block(
     frame: &mut Frame<'_>,
     area: Rect,
     lines: Vec<Line<'static>>,
-    top_line: usize,
     visible_height: usize,
     y: &mut u16,
     paragraph_style: Style,
@@ -557,7 +581,7 @@ fn render_margin_lines(
         Paragraph::new(lines)
             .style(paragraph_style)
             .wrap(Wrap { trim: false })
-            .scroll((top_line as u16, 0)),
+            .scroll((0, 0)),
         rect,
     );
 }
@@ -1173,6 +1197,7 @@ pub(crate) fn status_color(status: &SessionStatus) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown_render::lines_height;
 
     // ── mouse_in_history_box ──
 
@@ -1231,5 +1256,256 @@ mod tests {
     #[test]
     fn mouse_in_scrollbar_column_zero_height() {
         assert!(!mouse_in_scrollbar_column(80, 0, 80, 0));
+    }
+
+    // ── clipped_area ──
+
+    #[test]
+    fn clipped_area_skip_when_rows_to_skip_equals_full_height() {
+        let mut skip = 10usize;
+        let mut remain = 20usize;
+        let mut y = 30u16;
+        let result = clipped_area(10, &mut skip, &mut remain, &mut y);
+        assert!(
+            result.is_none(),
+            "should skip when rows_to_skip >= full_height"
+        );
+        assert_eq!(skip, 0, "rows_to_skip should be decremented by full_height");
+        assert_eq!(remain, 20, "rows_remaining should be unchanged");
+        assert_eq!(y, 30, "y should be unchanged");
+    }
+
+    #[test]
+    fn clipped_area_skip_when_rows_to_skip_exceeds_full_height() {
+        let mut skip = 15usize;
+        let mut remain = 20usize;
+        let mut y = 30u16;
+        let result = clipped_area(10, &mut skip, &mut remain, &mut y);
+        assert!(
+            result.is_none(),
+            "should skip when rows_to_skip > full_height"
+        );
+        assert_eq!(skip, 5, "rows_to_skip should be decremented by full_height");
+    }
+
+    #[test]
+    fn clipped_area_partial_visibility_at_boundary() {
+        let mut skip = 7usize;
+        let mut remain = 20usize;
+        let mut y = 30u16;
+        let result = clipped_area(10, &mut skip, &mut remain, &mut y);
+        let (top_line, visible_height) = result.expect("should be visible");
+        // bottom_line = 10 - 7 = 3, top_line = 3 - 3 = 0, visible = 3
+        assert_eq!(
+            top_line, 0,
+            "top_line should be at start of non-skipped region"
+        );
+        assert_eq!(visible_height, 3, "should show remaining 3 lines");
+        assert_eq!(skip, 0, "rows_to_skip should be reset to 0");
+        assert_eq!(
+            remain, 17,
+            "rows_remaining should decrease by visible_height"
+        );
+        assert_eq!(y, 27, "y should decrease by visible_height");
+    }
+
+    #[test]
+    fn clipped_area_partial_visibility_skip_some_rows_within_turn() {
+        let mut skip = 3usize;
+        let mut remain = 10usize;
+        let mut y = 50u16;
+        let result = clipped_area(10, &mut skip, &mut remain, &mut y);
+        let (top_line, visible_height) = result.expect("should be visible");
+        // bottom_line = 10 - 3 = 7, top_line = 7 - 7 = 0, visible = 7...
+        // Wait: visible_height = min(10-3, 10) = 7, bottom_line = 10-3 = 7, top_line = 7-7 = 0
+        assert_eq!(top_line, 0);
+        assert_eq!(visible_height, 7);
+        assert_eq!(skip, 0);
+        assert_eq!(remain, 3);
+        assert_eq!(y, 43);
+    }
+
+    #[test]
+    fn clipped_area_full_turn_within_viewport() {
+        let mut skip = 0usize;
+        let mut remain = 20usize;
+        let mut y = 40u16;
+        let result = clipped_area(10, &mut skip, &mut remain, &mut y);
+        let (top_line, visible_height) = result.expect("should show all");
+        assert_eq!(top_line, 0, "top_line should be 0 when nothing is skipped");
+        assert_eq!(visible_height, 10, "should show full height");
+        assert_eq!(y, 30, "y should decrease by full height");
+    }
+
+    #[test]
+    fn clipped_area_clamps_to_rows_remaining() {
+        let mut skip = 0usize;
+        let mut remain = 3usize;
+        let mut y = 20u16;
+        let result = clipped_area(10, &mut skip, &mut remain, &mut y);
+        let (top_line, visible_height) = result.expect("should clip to remaining");
+        // visible_height = min(10, 3) = 3
+        // bottom_line = 10 - 0 = 10, top_line = 10 - 3 = 7
+        assert_eq!(
+            top_line, 7,
+            "top_line should be offset from bottom by visible_height"
+        );
+        assert_eq!(visible_height, 3, "should be clamped by rows_remaining");
+        assert_eq!(remain, 0);
+        assert_eq!(y, 17);
+    }
+
+    #[test]
+    fn clipped_area_zero_rows_remaining_returns_none() {
+        let mut skip = 0usize;
+        let mut remain = 0usize;
+        let mut y = 10u16;
+        let result = clipped_area(10, &mut skip, &mut remain, &mut y);
+        assert!(result.is_none(), "should return None when no rows remain");
+        assert_eq!(y, 10, "y should be unchanged");
+    }
+
+    #[test]
+    fn clipped_area_skip_exactly_full_height_then_show_next() {
+        let mut skip = 6usize;
+        let mut remain = 10usize;
+        let mut y = 30u16;
+        // First turn: full height = 6, rows_to_skip = 6 → skip entirely
+        let result1 = clipped_area(6, &mut skip, &mut remain, &mut y);
+        assert!(result1.is_none());
+        assert_eq!(skip, 0);
+        // Second turn: full height = 4, rows_to_skip = 0 → show fully
+        let result2 = clipped_area(4, &mut skip, &mut remain, &mut y);
+        let (_, visible) = result2.unwrap();
+        assert_eq!(visible, 4);
+        assert_eq!(y, 26);
+    }
+
+    // ── cached_or_compute_lines ──
+
+    /// Helper: a simple compute function that returns a single short line.
+    fn compute_one_line() -> Vec<Line<'static>> {
+        vec![Line::from("hello")]
+    }
+
+    #[test]
+    fn cached_or_compute_lines_cache_miss_stores_result() {
+        let mut cache = vec![None];
+        let (lines, height) = cached_or_compute_lines(&mut cache, 0, 80, 100, compute_one_line);
+        assert_eq!(lines.len(), 1, "should return computed lines");
+        assert_eq!(height, 1, "single line at any viewport width has height 1");
+        // Cache should be filled
+        let cached = cache[0].as_ref().unwrap();
+        assert_eq!(cached.width, 80);
+        assert_eq!(cached.height, 1);
+        assert_eq!(cached.lines.len(), 1);
+    }
+
+    #[test]
+    fn cached_or_compute_lines_cache_hit_returns_stored_height() {
+        let mut cache = vec![Some(RenderedCache {
+            lines: Arc::from(vec![Line::from("cached")]),
+            width: 80,
+            height: 42,
+        })];
+        // Cache hit — should return stored height without recomputing
+        let (lines, height) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+            panic!("should not be called on cache hit")
+        });
+        assert_eq!(height, 42, "should return cached height");
+        assert_eq!(lines.len(), 1, "should return cached lines");
+        assert_eq!(lines[0], Line::from("cached"));
+    }
+
+    #[test]
+    fn cached_or_compute_lines_cache_hit_arc_shares_allocation() {
+        let stored = Arc::from(vec![Line::from("shared")]);
+        let stored_ptr = Arc::as_ptr(&stored);
+        let mut cache = vec![Some(RenderedCache {
+            lines: stored,
+            width: 80,
+            height: 7,
+        })];
+        let (returned, _) =
+            cached_or_compute_lines(&mut cache, 0, 80, 100, || panic!("should not recompute"));
+        assert_eq!(
+            Arc::as_ptr(&returned),
+            stored_ptr,
+            "returned Arc should point to the same allocation as cache entry"
+        );
+    }
+
+    #[test]
+    fn cached_or_compute_lines_width_mismatch_recomputes() {
+        let mut cache = vec![Some(RenderedCache {
+            lines: Arc::from(vec![Line::from("stale")]),
+            width: 40, // different from requested width 80
+            height: 99,
+        })];
+        let compute_called = std::cell::Cell::new(false);
+        let (lines, height) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+            compute_called.set(true);
+            vec![Line::from("fresh")]
+        });
+        assert!(compute_called.get(), "should recompute on width mismatch");
+        assert_eq!(lines[0], Line::from("fresh"));
+        // Height of a single "fresh" line at viewport width 100 is 1
+        assert_eq!(height, 1);
+        // Cache should be updated
+        let cached = cache[0].as_ref().unwrap();
+        assert_eq!(cached.width, 80);
+        assert_eq!(cached.lines[0], Line::from("fresh"));
+    }
+
+    #[test]
+    fn cached_or_compute_lines_out_of_range_index_does_not_store() {
+        let mut cache = vec![None]; // length 1
+        // Request index 5 which is out of range
+        let (lines, height) = cached_or_compute_lines(&mut cache, 5, 80, 100, compute_one_line);
+        assert_eq!(lines.len(), 1, "should still return computed result");
+        assert_eq!(height, 1);
+        // Cache should remain unchanged (all entries still None since index 5 doesn't exist)
+        assert!(
+            cache[0].is_none(),
+            "original cache entry should be untouched"
+        );
+    }
+
+    #[test]
+    fn cached_or_compute_lines_height_matches_lines_height() {
+        let mut cache = vec![None];
+        let lines = vec![
+            Line::from("line one"),
+            Line::from("line two"),
+            Line::from("line three"),
+        ];
+        let expected_h = lines_height(&lines, 80);
+        let (_, height) = cached_or_compute_lines(
+            &mut cache,
+            0,
+            70, // content_width
+            80, // viewport_width
+            || lines.clone(),
+        );
+        assert_eq!(
+            height, expected_h,
+            "returned height should match lines_height"
+        );
+        let cached = cache[0].as_ref().unwrap();
+        assert_eq!(cached.height, expected_h, "stored height should match");
+    }
+
+    #[test]
+    fn cached_or_compute_lines_none_slot_treated_as_miss() {
+        let mut cache: Vec<Option<RenderedCache>> = vec![None];
+        let compute_called = std::cell::Cell::new(false);
+        let (lines, height) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+            compute_called.set(true);
+            compute_one_line()
+        });
+        assert!(compute_called.get(), "should compute when slot is None");
+        assert!(cache[0].is_some(), "should fill the slot");
+        drop(lines);
+        drop(height);
     }
 }
