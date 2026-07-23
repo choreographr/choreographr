@@ -1209,6 +1209,15 @@ pub(crate) fn byte_offset_at_column(s: &str, target_col: usize) -> usize {
     s.len()
 }
 
+/// Integer ceiling division: `ceil(a / b)`.
+/// Returns 0 when `b == 0`.
+fn ceil_div(a: usize, b: usize) -> usize {
+    if b == 0 {
+        return 0;
+    }
+    a.saturating_add(b).saturating_sub(1) / b
+}
+
 impl App {
     pub(crate) fn new(_socket_path: String) -> Self {
         Self {
@@ -1271,8 +1280,7 @@ impl App {
         self.markers.clear();
         self.turn_layouts.clear();
         let mut total = 0usize;
-        let viewport_height = self.history_viewport.height as usize;
-        let virtual_track = 2 * viewport_height;
+        let virtual_track = self.virtual_track_slots();
         let fallback_img_height = self.image_block_height() as usize;
         let turn_count = self.session_view.turns.len();
         tracing::trace!(turn_count, "rebuild_height_prefix");
@@ -1391,6 +1399,13 @@ impl App {
         let viewport_height = self.history_viewport.height as usize;
         let total_height = self.total_history_height();
         total_height.saturating_sub(viewport_height)
+    }
+
+    /// Number of virtual half-height slots on the scrollbar track.
+    /// The scrollbar is rendered with half-height blocks (`▀`/`▄`/`█`), giving
+    /// 2× the terminal row count in virtual slots for finer granularity.
+    pub(crate) fn virtual_track_slots(&self) -> usize {
+        2 * self.history_viewport.height as usize
     }
 
     pub(crate) fn clamp_scroll_state(&mut self) {
@@ -1635,8 +1650,10 @@ impl App {
         if track_height > 1 {
             let row = (mouse_row as usize).min(track_height.saturating_sub(1));
             let max_scroll = self.max_scroll_offset();
-            let ratio = row as f64 / track_height.saturating_sub(1) as f64;
-            let target = (ratio * max_scroll as f64).round() as usize;
+            let denom = track_height.saturating_sub(1);
+            // Rounding division: round(row / denom * max_scroll).
+            // Equivalent to float: round(row / (track_height-1) * max_scroll).
+            let target = row.saturating_mul(max_scroll).saturating_add(denom / 2) / denom;
             self.scroll_to(max_scroll.saturating_sub(target.min(max_scroll)));
         }
     }
@@ -1650,8 +1667,9 @@ impl App {
 
     /// Scroll up by one scrollbar notch — the amount the viewport moves when
     /// the user clicks or scroll-wheels one "row" on the scrollbar track.
-    /// Each notch is the smallest movement that visibly shifts the content:
-    /// `ceil(max_scroll / track_height)`, at least 1.
+    /// Each notch is the smallest movement that visibly shifts the content,
+    /// matching the half-height virtual-slot resolution:
+    /// `ceil(max_scroll / (2 * track_height))`, at least 1.
     pub(crate) fn scrollbar_scroll_up(&mut self) {
         let notch = self.scrollbar_notch();
         self.scroll_up(notch);
@@ -1664,18 +1682,19 @@ impl App {
     }
 
     /// Compute the scrollbar notch size — the amount of content lines that
-    /// a single scrollbar-track row corresponds to.
+    /// a single virtual half-height slot on the scrollbar track corresponds to.
+    /// The scrollbar is rendered with half-height blocks (`▀`/`▄`/`█`), so it
+    /// has 2× the terminal row count in virtual slots.  The notch uses this
+    /// finer granularity so each wheel click moves the thumb by one virtual
+    /// slot rather than one full terminal row.
     fn scrollbar_notch(&self) -> usize {
-        let track = self.history_viewport.height as usize;
         let max_scroll = self.max_scroll_offset();
-        if track > 0 {
-            // Integer ceiling division: ceil(max_scroll / track).
-            // checked_div is safe here because we've verified track > 0.
-            max_scroll
-                .saturating_add(track)
-                .saturating_sub(1)
-                .checked_div(track)
-                .unwrap_or(0)
+        let virtual_track = self.virtual_track_slots();
+        if virtual_track > 0 {
+            // ceil_div is safe here because virtual_track > 0 after the
+            // check above — when the viewport has non-zero height,
+            // virtual_track_slots returns at least 2.
+            ceil_div(max_scroll, virtual_track)
         } else {
             // Degenerate case: viewport has zero height.  Just use
             // max_scroll — the .max(1) below ensures we always move at
@@ -2423,8 +2442,9 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 1;
         app.height_prefix.push(50);
-        // max_scroll = 50 - 1 = 49, notch = ceil(49 / 1) = 49
-        assert_eq!(app.scrollbar_notch(), 49);
+        // max_scroll = 50 - 1 = 49, virtual_track = 2
+        // notch = ceil(49 / 2) = 25
+        assert_eq!(app.scrollbar_notch(), 25);
     }
 
     #[test]
@@ -2433,8 +2453,9 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 50;
         app.height_prefix.push(150);
-        // max_scroll = 150 - 50 = 100, notch = ceil(100 / 50) = 2
-        assert_eq!(app.scrollbar_notch(), 2);
+        // max_scroll = 150 - 50 = 100, virtual_track = 100
+        // notch = ceil(100 / 100) = 1
+        assert_eq!(app.scrollbar_notch(), 1);
     }
 
     #[test]
@@ -2443,8 +2464,9 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 30;
         app.height_prefix.push(105);
-        // max_scroll = 105 - 30 = 75, notch = ceil(75 / 30) = 3
-        assert_eq!(app.scrollbar_notch(), 3);
+        // max_scroll = 105 - 30 = 75, virtual_track = 60
+        // notch = ceil(75 / 60) = 2
+        assert_eq!(app.scrollbar_notch(), 2);
     }
 
     // ── scrollbar_scroll_up / scrollbar_scroll_down ──
@@ -2455,7 +2477,8 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.height_prefix.push(110);
-        // max_scroll = 100, notch = ceil(100 / 10) = 10
+        // max_scroll = 100, virtual_track = 20
+        // notch = ceil(100 / 20) = 5
 
         // Start at the bottom (scroll = 0).
         app.history_scroll.scroll = 0;
@@ -2463,7 +2486,7 @@ mod tests {
 
         app.scrollbar_scroll_up();
 
-        assert_eq!(app.effective_scroll(), before + 10);
+        assert_eq!(app.effective_scroll(), before + 5);
     }
 
     #[test]
@@ -2472,7 +2495,7 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.height_prefix.push(110);
-        // max_scroll = 100, notch = 10
+        // max_scroll = 100, virtual_track = 20, notch = 5
 
         // Start at the top (scroll = 100) — already at max.
         app.history_scroll.scroll = 100;
@@ -2489,7 +2512,7 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.height_prefix.push(110);
-        // max_scroll = 100, notch = 10
+        // max_scroll = 100, virtual_track = 20, notch = 5
 
         // Start at the top (scroll = 100).
         app.history_scroll.scroll = 100;
@@ -2497,7 +2520,7 @@ mod tests {
 
         app.scrollbar_scroll_down();
 
-        assert_eq!(app.effective_scroll(), before - 10);
+        assert_eq!(app.effective_scroll(), before - 5);
     }
 
     #[test]
@@ -2506,14 +2529,113 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.height_prefix.push(110);
-        // max_scroll = 100, notch = 10
+        // max_scroll = 100, virtual_track = 20, notch = 5
 
-        // Start at scroll = 5 — less than one notch from bottom.
+        // Start at scroll = 5 — exactly one notch from bottom.
         app.history_scroll.scroll = 5;
 
         app.scrollbar_scroll_down();
 
         // Should clamp to 0 (not underflow).
+        assert_eq!(app.effective_scroll(), 0);
+    }
+
+    // ── scroll_to_track_row ──
+
+    #[test]
+    fn scroll_to_track_row_at_bottom() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        app.height_prefix.push(110);
+        // max_scroll = 90, denom = 19
+        // row 0 → target = round(0/19 * 90) = 0 → scroll = 90 - 0 = 90
+
+        // Start scrolled to the top.
+        app.history_scroll.scroll = 90;
+
+        // Click at bottom of scrollbar (row 0).
+        app.scroll_to_track_row(0, 20);
+
+        assert_eq!(app.effective_scroll(), 90);
+    }
+
+    #[test]
+    fn scroll_to_track_row_at_top() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        app.height_prefix.push(110);
+        // max_scroll = 90, denom = 19
+        // row 19 → target = round(19/19 * 90) = 90 → scroll = 90 - 90 = 0
+
+        // Start scrolled to the bottom.
+        app.history_scroll.scroll = 0;
+
+        // Click at top of scrollbar (row 19).
+        app.scroll_to_track_row(19, 20);
+
+        assert_eq!(app.effective_scroll(), 0);
+    }
+
+    #[test]
+    fn scroll_to_track_row_midpoint() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.height_prefix.push(110);
+        // max_scroll = 100, denom = 9
+        // row 4 → target = round(4/9 * 100) = 44
+        // scroll = 100 - 44 = 56
+
+        app.scroll_to_track_row(4, 10);
+
+        assert_eq!(app.effective_scroll(), 56);
+    }
+
+    #[test]
+    fn scroll_to_track_row_zero_viewport() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 0;
+        app.height_prefix.push(110);
+
+        app.history_scroll.scroll = 42;
+
+        // Zero-height viewport → track_height = 0 → no-op.
+        app.scroll_to_track_row(0, 0);
+
+        assert_eq!(app.effective_scroll(), 42);
+    }
+
+    #[test]
+    fn scroll_to_track_row_track_one() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        app.height_prefix.push(110);
+
+        app.history_scroll.scroll = 42;
+
+        // track_height = 1 → early return (track_height > 1 is false).
+        app.scroll_to_track_row(0, 1);
+
+        assert_eq!(app.effective_scroll(), 42);
+    }
+
+    #[test]
+    fn scroll_to_track_row_mouse_row_clamped() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        app.height_prefix.push(110);
+        // max_scroll = 90, denom = 19
+        // mouse_row=30 clamped to 19 → target = round(19/19 * 90) = 90
+        // scroll = 90 - 90 = 0
+
+        app.history_scroll.scroll = 0;
+        app.scroll_to_track_row(30, 20);
+
         assert_eq!(app.effective_scroll(), 0);
     }
 
