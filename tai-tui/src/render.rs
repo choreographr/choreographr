@@ -259,7 +259,8 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     // ── Command input box ──────────────────────────────────────
-    let inner_width = (chunks[2].width.saturating_sub(2)) as usize;
+    // Full width (no left/right border padding) minus top/bottom border.
+    let inner_width = chunks[2].width as usize;
     let visible_height = (chunks[2].height.saturating_sub(2)) as usize;
 
     // Compute cursor position first (populates the lines cache) so we
@@ -291,14 +292,14 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         .collect();
 
     let input = Paragraph::new(Text::from(text_lines))
-        .block(Block::default().borders(Borders::ALL).title("command"));
+        .block(Block::default().borders(Borders::TOP | Borders::BOTTOM));
     frame.render_widget(input, chunks[2]);
     // Clamp to visible area so the cursor is always inside the box,
     // even when scroll_offset hasn't been adjusted yet (e.g. after
     // loading a long history entry that ends at scroll_offset = 0).
     let max_display_row = (visible_count as u16).saturating_sub(1);
     let display_vrow = vrow.saturating_sub(offset as u16).min(max_display_row);
-    let cursor_x = chunks[2].x.saturating_add(1).saturating_add(vcol);
+    let cursor_x = chunks[2].x.saturating_add(vcol);
     let cursor_y = chunks[2].y.saturating_add(1).saturating_add(display_vrow);
     frame.set_cursor_position((cursor_x, cursor_y));
 
