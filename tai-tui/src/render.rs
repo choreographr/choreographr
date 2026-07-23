@@ -270,8 +270,12 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     // can then borrow separate fields of app.input for the cached lines.
     let (vrow, vcol) = app.input.cursor_visual_pos(inner_width);
 
-    let all_visual_lines =
-        cached_visual_lines(&app.input.text, inner_width, &mut app.input.lines_cache);
+    let all_visual_lines = cached_visual_lines(
+        &app.input.text,
+        inner_width,
+        app.input.generation,
+        &mut app.input.lines_cache,
+    );
 
     // Apply scroll offset — only show the visible window.
     let visible_count = visible_height.max(1).min(all_visual_lines.len());

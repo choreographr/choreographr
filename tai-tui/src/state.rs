@@ -665,9 +665,11 @@ pub(crate) struct InputBuffer {
     /// Adjusted by `ensure_cursor_visible` after each mutation to keep
     /// the cursor in view.
     pub(crate) scroll_offset: usize,
-    /// Lazily computed visual lines, keyed by `max_width`.
-    /// Invalidated whenever `text` changes.
-    pub(crate) lines_cache: Option<(usize, Vec<VisualLineInfo>)>,
+    /// Monotonically increasing counter bumped on every text mutation.
+    /// Used by `cached_visual_lines` to detect stale cache entries.
+    pub(crate) generation: u64,
+    /// Lazily computed visual lines, keyed by `(generation, max_width)`.
+    pub(crate) lines_cache: Option<(u64, usize, Vec<VisualLineInfo>)>,
 }
 
 impl InputBuffer {
@@ -676,6 +678,7 @@ impl InputBuffer {
             text: String::new(),
             cursor: 0,
             scroll_offset: 0,
+            generation: 0,
             lines_cache: None,
         }
     }
@@ -689,7 +692,7 @@ impl InputBuffer {
         self.text.clear();
         self.cursor = 0;
         self.scroll_offset = 0;
-        self.lines_cache = None;
+        self.generation += 1;
     }
 
     pub(crate) fn cursor_left(&mut self) {
@@ -759,7 +762,7 @@ impl InputBuffer {
     pub(crate) fn insert_char_at_cursor(&mut self, c: char) {
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
-        self.lines_cache = None;
+        self.generation += 1;
     }
 
     /// Insert a string at the cursor position.
@@ -773,7 +776,7 @@ impl InputBuffer {
         }
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
-        self.lines_cache = None;
+        self.generation += 1;
     }
 
     pub(crate) fn backspace_at_cursor(&mut self) {
@@ -785,7 +788,7 @@ impl InputBuffer {
             self.text.drain(start..self.cursor);
             self.cursor = start;
         }
-        self.lines_cache = None;
+        self.generation += 1;
     }
 
     pub(crate) fn delete_at_cursor(&mut self) {
@@ -797,7 +800,7 @@ impl InputBuffer {
             self.text
                 .drain(self.cursor + offset..self.cursor + offset + grapheme.len());
         }
-        self.lines_cache = None;
+        self.generation += 1;
     }
 
     pub(crate) fn delete_word_backward(&mut self) {
@@ -807,7 +810,7 @@ impl InputBuffer {
         let boundary = self.word_left_boundary();
         self.text.drain(boundary..self.cursor);
         self.cursor = boundary;
-        self.lines_cache = None;
+        self.generation += 1;
     }
 
     pub(crate) fn delete_word_forward(&mut self) {
@@ -816,13 +819,13 @@ impl InputBuffer {
         }
         let boundary = self.word_right_boundary();
         self.text.drain(self.cursor..boundary);
-        self.lines_cache = None;
+        self.generation += 1;
     }
 
     pub(crate) fn delete_to_start(&mut self) {
         self.text.drain(..self.cursor);
         self.cursor = 0;
-        self.lines_cache = None;
+        self.generation += 1;
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -909,7 +912,12 @@ impl InputBuffer {
         if max_width < 1 {
             return;
         }
-        let lines = cached_visual_lines(&self.text, max_width, &mut self.lines_cache);
+        let lines = cached_visual_lines(
+            &self.text,
+            max_width,
+            self.generation,
+            &mut self.lines_cache,
+        );
         let (current_line, col) = find_cursor_pos(&self.text, self.cursor, lines);
         if current_line == 0 {
             return;
@@ -926,7 +934,12 @@ impl InputBuffer {
         if max_width < 1 {
             return;
         }
-        let lines = cached_visual_lines(&self.text, max_width, &mut self.lines_cache);
+        let lines = cached_visual_lines(
+            &self.text,
+            max_width,
+            self.generation,
+            &mut self.lines_cache,
+        );
         let (current_line, col) = find_cursor_pos(&self.text, self.cursor, lines);
         if current_line + 1 >= lines.len() as u16 {
             return;
@@ -944,7 +957,12 @@ impl InputBuffer {
         if max_width < 1 {
             return (0, 0);
         }
-        let lines = cached_visual_lines(&self.text, max_width, &mut self.lines_cache);
+        let lines = cached_visual_lines(
+            &self.text,
+            max_width,
+            self.generation,
+            &mut self.lines_cache,
+        );
         find_cursor_pos(&self.text, self.cursor, lines)
     }
 
@@ -958,7 +976,12 @@ impl InputBuffer {
         if max_width < 1 {
             return true;
         }
-        let lines = cached_visual_lines(&self.text, max_width, &mut self.lines_cache);
+        let lines = cached_visual_lines(
+            &self.text,
+            max_width,
+            self.generation,
+            &mut self.lines_cache,
+        );
         let (row, _) = find_cursor_pos(&self.text, self.cursor, lines);
         row + 1 >= lines.len() as u16
     }
@@ -972,7 +995,12 @@ impl InputBuffer {
             self.scroll_offset = 0;
             return;
         }
-        let lines = cached_visual_lines(&self.text, max_width, &mut self.lines_cache);
+        let lines = cached_visual_lines(
+            &self.text,
+            max_width,
+            self.generation,
+            &mut self.lines_cache,
+        );
         if lines.len() <= visible_height {
             self.scroll_offset = 0;
             return;
@@ -997,18 +1025,28 @@ impl InputBuffer {
 /// Return cached visual lines for `max_width`, recomputing only when
 /// `max_width` or `text` has changed since the last call.
 ///
+/// `generation` is a monotonically increasing counter from the owning
+/// `InputBuffer` that is bumped on every text mutation.  The cache is
+/// invalidated when either `generation` or `max_width` differs from
+/// the values stored at the last computation.
+///
 /// Takes separate references to `text` and `cache` so callers can pass
 /// field-level borrows and avoid borrow-checker conflicts with other
 /// fields (e.g. `cursor`).
 pub(crate) fn cached_visual_lines<'a>(
     text: &str,
     max_width: usize,
-    cache: &'a mut Option<(usize, Vec<VisualLineInfo>)>,
+    generation: u64,
+    cache: &'a mut Option<(u64, usize, Vec<VisualLineInfo>)>,
 ) -> &'a [VisualLineInfo] {
-    if cache.as_ref().is_none_or(|(w, _)| *w != max_width) {
-        *cache = Some((max_width, compute_visual_lines(text, max_width)));
+    let entry =
+        cache.get_or_insert_with(|| (generation, max_width, compute_visual_lines(text, max_width)));
+    if entry.0 != generation || entry.1 != max_width {
+        entry.0 = generation;
+        entry.1 = max_width;
+        entry.2 = compute_visual_lines(text, max_width);
     }
-    &cache.as_ref().unwrap().1
+    &entry.2
 }
 
 /// A single visual (wrapped) line derived from the input text.
@@ -1358,7 +1396,12 @@ impl App {
         if inner < 1 {
             return 1;
         }
-        let visual = cached_visual_lines(&self.input.text, inner, &mut self.input.lines_cache);
+        let visual = cached_visual_lines(
+            &self.input.text,
+            inner,
+            self.input.generation,
+            &mut self.input.lines_cache,
+        );
         (visual.len() as u16).clamp(MIN_INPUT_CONTENT_LINES, MAX_INPUT_CONTENT_LINES)
     }
 
@@ -1648,7 +1691,7 @@ impl App {
             self.saved_draft = self.input.text.clone();
             self.history_index = Some(0);
             self.input.text = texts[0].to_string();
-            self.input.lines_cache = None;
+            self.input.generation += 1;
             self.input.cursor = self.input.text.len();
             self.ensure_input_cursor_visible();
         } else if let Some(idx) = self.history_index {
@@ -1656,7 +1699,7 @@ impl App {
             if next < texts.len() {
                 self.history_index = Some(next);
                 self.input.text = texts[next].to_string();
-                self.input.lines_cache = None;
+                self.input.generation += 1;
                 self.input.cursor = self.input.text.len();
                 self.ensure_input_cursor_visible();
             }
@@ -1670,13 +1713,13 @@ impl App {
                 let prev = idx - 1;
                 self.history_index = Some(prev);
                 self.input.text = texts[prev].to_string();
-                self.input.lines_cache = None;
+                self.input.generation += 1;
                 self.input.cursor = self.input.text.len();
                 self.ensure_input_cursor_visible();
             } else {
                 self.history_index = None;
                 self.input.text = self.saved_draft.clone();
-                self.input.lines_cache = None;
+                self.input.generation += 1;
                 self.saved_draft.clear();
                 self.input.cursor = self.input.text.len();
                 self.ensure_input_cursor_visible();

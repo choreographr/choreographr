@@ -88,12 +88,11 @@ impl JsonSchema for EmptyArgs {
     }
 
     fn json_schema(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        serde_json::from_value(serde_json::json!({
+        schemars::json_schema!({
             "type": "object",
             "properties": {},
             "additionalProperties": false
-        }))
-        .unwrap()
+        })
     }
 }
 
