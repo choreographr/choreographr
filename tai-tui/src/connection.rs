@@ -827,6 +827,13 @@ fn handle_chat_event(
                                 app.active.insert(*request_id);
                             }
                             client_tx.send(message).map_err(broken_pipe)?;
+
+                            // Scroll the history view to the bottom so the user can
+                            // see their submitted message appear as the daemon
+                            // processes it.  Without this, a user who has scrolled
+                            // up to read past conversation would remain scrolled up
+                            // and miss the new content arriving at the bottom.
+                            app.scroll_to(0);
                         }
                         ShellCommand::Unlock { method } => {
                             if let Some(echo) = shell_command_echo(&ShellCommand::Unlock {

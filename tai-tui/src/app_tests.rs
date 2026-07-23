@@ -1035,6 +1035,55 @@ fn delete_to_start_when_at_zero_does_nothing() {
 }
 
 #[test]
+fn terminal_event_enter_scrolls_to_bottom_from_scrolled_up() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    // Set a small viewport so even a few turns are scrollable.
+    app.history_viewport = HistoryViewport {
+        width: 80,
+        height: 1,
+    };
+
+    // Add user text turns to create scrollable content beyond the viewport.
+    add_user_text(&mut app, "first");
+    add_user_text(&mut app, "second");
+    add_user_text(&mut app, "third");
+
+    // Start at the bottom.
+    assert_eq!(
+        app.effective_scroll(),
+        0,
+        "should start at bottom (effective_scroll = 0)"
+    );
+
+    // Scroll up to simulate a user who was reading past history.
+    app.scroll_up(1);
+    assert!(
+        app.effective_scroll() > 0,
+        "should have scrolled away from bottom, got {}",
+        app.effective_scroll()
+    );
+
+    // Submit a new message via Enter.
+    app.input.text = "new message".to_string();
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    // After submitting, the scroll should return to the bottom so the
+    // user can see their message appear in the history.
+    assert_eq!(
+        app.effective_scroll(),
+        0,
+        "should scroll to bottom after submitting a message"
+    );
+}
+
+#[test]
 fn terminal_event_submit_resets_cursor() {
     let mut app = test_app("/tmp/tai.sock");
     app.input.text = "hello".to_string();
