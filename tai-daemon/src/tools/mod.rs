@@ -807,11 +807,47 @@ impl ToolRegistry {
     }
 }
 
+/// Expand a leading tilde (`~` or `~/...`) to the user's home directory.
+///
+/// Handles `~` alone (maps to home dir), `~/path` (prepends home dir),
+/// and plain paths (returned unchanged).  Does **not** handle `~user`
+/// forms — those are passed through unmodified.
+pub(crate) fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        match dirs::home_dir() {
+            Some(home) => {
+                let home_str = home.to_string_lossy();
+                if path == "~" {
+                    home_str.into_owned()
+                } else {
+                    // path starts with "~/" — replace the tilde with the home dir
+                    format!("{home_str}{}", &path[1..])
+                }
+            }
+            None => {
+                // No home directory known (unusual on Linux/macOS, but possible
+                // in containerised or embedded environments).  Pass through.
+                tracing::warn!(
+                    "expand_tilde: no home directory found, leaving '{}' unchanged",
+                    path
+                );
+                path.to_string()
+            }
+        }
+    } else {
+        path.to_string()
+    }
+}
+
 pub(crate) fn resolve_path(
     path: &str,
     working_dir: Option<&std::path::Path>,
 ) -> std::path::PathBuf {
-    let p = std::path::Path::new(path);
+    // Expand leading tilde so callers can write `~/project` instead of the
+    // full absolute path.  Only `~` and `~/...` are expanded; `~user` is
+    // passed through unchanged.
+    let expanded = expand_tilde(path);
+    let p = std::path::Path::new(&expanded);
     if p.is_absolute() {
         return p.to_path_buf();
     }
@@ -989,6 +1025,52 @@ mod tests {
         // Accessing a file through the symlink should be rejected
         let result = confine_path("escape/outside.txt", Some(dir.path()));
         assert!(result.is_err());
+    }
+
+    // ── expand_tilde tests ────────────────────────────────────────────
+
+    #[test]
+    fn expand_tilde_plain_path_unchanged() {
+        assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
+        assert_eq!(expand_tilde("relative/path"), "relative/path");
+        assert_eq!(expand_tilde("./dots"), "./dots");
+        assert_eq!(expand_tilde(""), "");
+    }
+
+    #[test]
+    fn expand_tilde_expands_to_home_dir() {
+        let expanded = expand_tilde("~");
+        let home = dirs::home_dir().expect("home dir should exist in test env");
+        assert_eq!(expanded, home.to_string_lossy());
+    }
+
+    #[test]
+    fn expand_tilde_expands_with_slash() {
+        let expanded = expand_tilde("~/tai");
+        let home = dirs::home_dir().expect("home dir should exist in test env");
+        let expected = format!("{}/tai", home.to_string_lossy());
+        assert_eq!(expanded, expected);
+    }
+
+    #[test]
+    fn expand_tilde_expands_nested() {
+        let expanded = expand_tilde("~/projects/foo/bar");
+        let home = dirs::home_dir().expect("home dir should exist in test env");
+        let expected = format!("{}/projects/foo/bar", home.to_string_lossy());
+        assert_eq!(expanded, expected);
+    }
+
+    #[test]
+    fn expand_tilde_user_form_left_alone() {
+        // ~user is intentionally not expanded.
+        assert_eq!(expand_tilde("~other/project"), "~other/project");
+        assert_eq!(expand_tilde("~other"), "~other");
+    }
+
+    #[test]
+    fn expand_tilde_mid_path_left_alone() {
+        // Tilde not at the start is not expanded.
+        assert_eq!(expand_tilde("/path/~foo"), "/path/~foo");
     }
 
     #[test]

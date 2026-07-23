@@ -277,7 +277,11 @@ impl Sink for GrepSink {
 
         let path = self.current_path.clone();
         let line_number = mat.line_number().unwrap_or(0);
-        let content = String::from_utf8_lossy(mat.bytes()).to_string();
+        // SinkMatch bytes include the line terminator (\n).  Strip it so
+        // that joining results with "\n" does not produce blank lines.
+        let content = String::from_utf8_lossy(mat.bytes())
+            .trim_end_matches('\n')
+            .to_string();
 
         // Stream the match line if a sender is configured, so the client
         // can display results incrementally rather than waiting for the
@@ -554,17 +558,13 @@ mod tests {
             max_results: None,
         };
         let result = tool.execute(args, None, None, None).unwrap();
-        // SinkMatch bytes include trailing \n, so some lines will be empty.
-        let non_empty: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(non_empty.len(), 2, "expected 2 matches:\n{result}");
+        assert_eq!(result.lines().count(), 2, "expected 2 matches:\n{result}");
         assert!(
-            non_empty.iter().any(|l| l.contains("root.txt:1:content")),
+            result.lines().any(|l| l.contains("root.txt:1:content")),
             "expected root.txt:\n{result}"
         );
         assert!(
-            non_empty
-                .iter()
-                .any(|l| l.contains("sub/root.txt:1:content")),
+            result.lines().any(|l| l.contains("sub/root.txt:1:content")),
             "expected sub/root.txt:\n{result}"
         );
     }
@@ -616,7 +616,6 @@ mod tests {
         // `*/data.txt` against absolute paths: zlob's `*` matches `/`,
         // so `*` consumes the prefix, then `/data.txt` matches literally.
         // Both `/tmp/xxx/data.txt` and `/tmp/xxx/sub/data.txt` should match.
-        let non_empty: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(non_empty.len(), 2, "expected 2 matches:\n{result}");
+        assert_eq!(result.lines().count(), 2, "expected 2 matches:\n{result}");
     }
 }

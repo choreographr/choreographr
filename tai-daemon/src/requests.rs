@@ -1196,7 +1196,8 @@ fn execute_tool_with_timeout(
                 }
             };
             // Resolve relative to the current session working directory
-            // (or process cwd if none is set yet).
+            // (or process cwd if none is set yet).  Tilde expansion (`~`
+            // → home directory) is handled inside resolve_path.
             let resolved = resolve_path(path_str, working_dir);
             // canonicalize() resolves symlinks and normalizes the path.
             // This serves two purposes:

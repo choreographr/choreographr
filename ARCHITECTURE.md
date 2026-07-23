@@ -931,6 +931,9 @@ callers can choose between `Text` (LLM) and `Json` (PTC) output formats.
 
 Each tool receives an optional `working_dir: Option<&Path>` parameter that represents the session's
 working directory. Filesystem and Git tools resolve relative paths against this working directory.
+A leading `~` or `~/` in any path argument is expanded to the user's home directory via
+`expand_tilde()` inside `resolve_path()`, so callers can write `~/project` instead of the
+full absolute path. The `~user` form is *not* expanded and is passed through unchanged.
 
 ### Postcard binary encoding
 
@@ -994,6 +997,8 @@ Implementation details:
 - `load_tools`/`unload_tools`/`set_working_dir` are intercepted in
   `execute_tool_with_timeout()` — they are not in the registry because they modify
   `session.config.active_tool_groups` or `session.config.working_dir`
+  (`set_working_dir` supports tilde expansion in its `path` argument, inherited from
+  `resolve_path`)
 - `list_sessions`, `get_session`, `load_skill`, and `spawn_subsession` were formerly
   intercepted like `load_tools`/`unload_tools` but are now proper `Tool` trait implementations
   registered in the default registry via `ToolRegistry::build()`, using `ToolContext.daemon_tx`
