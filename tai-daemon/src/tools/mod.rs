@@ -293,24 +293,21 @@ pub trait Tool: Send + Sync {
 
     /// Execute with streaming output.
     ///
-    /// The default implementation calls execute() and sends the serialized
-    /// return value as one chunk through output_tx. Tools that produce
-    /// incremental output (shell commands, VM execution) override this.
+    /// The default implementation calls execute() and returns the result.
+    /// Tools that produce incremental output (shell commands, VM execution)
+    /// override this and send intermediate chunks through `output_tx`.
     fn execute_streaming(
         &self,
         args: Self::Args,
         x_credentials: Option<&ServiceCredential>,
         working_dir: Option<&std::path::Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
+        _output_tx: mpsc::Sender<Vec<u8>>,
         ctx: Option<&context::ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
-        let ret = self.execute(args, x_credentials, working_dir, ctx)?;
-        // Best-effort: send postcard-encoded result for streaming display,
-        // silently discard if encoding fails.
-        if let Ok(bytes) = postcard::to_allocvec(&ret) {
-            let _ = output_tx.send(bytes);
-        }
-        Ok(ret)
+        // Non-streaming tools deliver their result via TurnAppended —
+        // no ToolResultChunk traffic needed.
+        tracing::trace!("non-streaming tool called via execute_streaming, delegating to execute");
+        self.execute(args, x_credentials, working_dir, ctx)
     }
 
     /// Optional: extract a PreparedImage from the return value.
