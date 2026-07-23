@@ -319,7 +319,9 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let has_session = app.attached_session_id.is_some();
 
     let status_line = if has_session {
-        // --- Right side (original line 1): session metadata ---
+        // Collect session-identity values that change infrequently and belong
+        // on the right side of the bar so they don't shift as runtime metrics
+        // (tokens, context fill) update on the left.
         let wd = app.attached_working_dir.as_deref().unwrap_or("-");
         let provider = app.attached_provider_slug.as_deref().unwrap_or("-");
         let model = app.attached_model.as_deref().unwrap_or("-");
@@ -329,7 +331,9 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             .map(|e| e.as_label())
             .unwrap_or("-");
 
-        // --- Left side (original line 2): tokens, context, status ---
+        // Runtime metrics: tokens flow and context-window fill.  Placed first
+        // (left side) because they update every turn and users scan quickly
+        // for changes when running inference.
         let tokens = match &app.display_token_usage() {
             Some(usage) => format!("↑{}  ↓{}", usage.input_tokens, usage.output_tokens),
             None => String::new(),
@@ -353,24 +357,25 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             (None, None) => String::new(),
         };
 
-        // --- Tool groups ---
+        // Tool groups can change at runtime via load_tools/unload_tools, so
+        // they appear after stable session metadata but before the end.
         let tool_groups = app.attached_tool_groups.join(", ");
 
-        // Build spans: left-side info first, then session metadata, then tool groups.
+        // Layout strategy: left-aligned dynamic metrics → session identity →
+        // tool groups.  Pushing session-identity items unconditionally (even
+        // when empty) keeps the separator positions stable so the bar doesn't
+        // visually jump when fields appear/disappear.
         let mut spans: Vec<Span> = Vec::new();
 
-        // Tokens
         if !tokens.is_empty() {
             spans.push(Span::styled(tokens, Style::default().fg(Color::White)));
         }
-        // Context window
         if !context.is_empty() {
             if !spans.is_empty() {
                 spans.push(Span::raw("  |  "));
             }
             spans.push(Span::styled(context, Style::default().fg(Color::White)));
         }
-        // Session status
         if let Some(status) = &app.attached_status {
             let (label, color) = status_display(status);
             if !spans.is_empty() {
@@ -378,21 +383,16 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             }
             spans.push(Span::styled(label, Style::default().fg(color)));
         }
-        // Working directory
         if !spans.is_empty() {
             spans.push(Span::raw("  |  "));
         }
         spans.push(Span::styled(wd, Style::default().fg(Color::White)));
-        // Provider
         spans.push(Span::raw("  |  "));
         spans.push(Span::styled(provider, Style::default().fg(Color::White)));
-        // Model
         spans.push(Span::raw("  |  "));
         spans.push(Span::styled(model, Style::default().fg(Color::White)));
-        // Reasoning effort
         spans.push(Span::raw("  |  "));
         spans.push(Span::styled(reasoning, Style::default().fg(Color::White)));
-        // Tool groups
         if !tool_groups.is_empty() {
             spans.push(Span::raw("  |  "));
             spans.push(Span::styled(

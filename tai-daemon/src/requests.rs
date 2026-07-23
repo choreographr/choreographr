@@ -1148,26 +1148,9 @@ fn execute_tool_with_timeout(
             );
             // Broadcast updated session state so the client (e.g. TUI status
             // bar) picks up the new active_tool_groups immediately.
-            let _ = ctx
-                .cmd_tx
-                .send(SessionCommand::Broadcast(DaemonMessage::SessionState {
-                    session_id: ctx.session_id,
-                    title: session.config.title.clone(),
-                    selected_model: session.config.selected_model.clone(),
-                    parent_session_id: session.config.parent_session_id,
-                    working_dir: session
-                        .config
-                        .working_dir
-                        .as_ref()
-                        .map(|p| p.display().to_string()),
-                    max_turns: session.config.max_turns,
-                    turns: session.turns.clone(),
-                    active_tool_groups: session.config.active_tool_groups.iter().cloned().collect(),
-                    token_usage: Some(session.config.accumulated_usage),
-                    context_window: session.config.context_window,
-                    last_prompt_tokens: session.config.last_prompt_tokens,
-                    status: session.config.status.clone(),
-                }));
+            let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                session.session_state_message(ctx.session_id),
+            ));
             let _ = ctx
                 .daemon_tx
                 .send(crate::daemon::DaemonCommand::UpdateMetadata {
@@ -1187,26 +1170,9 @@ fn execute_tool_with_timeout(
             );
             // Broadcast updated session state so the client picks up the
             // new active_tool_groups immediately.
-            let _ = ctx
-                .cmd_tx
-                .send(SessionCommand::Broadcast(DaemonMessage::SessionState {
-                    session_id: ctx.session_id,
-                    title: session.config.title.clone(),
-                    selected_model: session.config.selected_model.clone(),
-                    parent_session_id: session.config.parent_session_id,
-                    working_dir: session
-                        .config
-                        .working_dir
-                        .as_ref()
-                        .map(|p| p.display().to_string()),
-                    max_turns: session.config.max_turns,
-                    turns: session.turns.clone(),
-                    active_tool_groups: session.config.active_tool_groups.iter().cloned().collect(),
-                    token_usage: Some(session.config.accumulated_usage),
-                    context_window: session.config.context_window,
-                    last_prompt_tokens: session.config.last_prompt_tokens,
-                    status: session.config.status.clone(),
-                }));
+            let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
+                session.session_state_message(ctx.session_id),
+            ));
             let _ = ctx
                 .daemon_tx
                 .send(crate::daemon::DaemonCommand::UpdateMetadata {

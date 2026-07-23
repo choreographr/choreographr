@@ -2259,7 +2259,36 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
     );
     assert_eq!(app.attached_context_window, Some(4096));
     assert_eq!(app.attached_status, Some(SessionStatus::Inactive));
+    assert!(app.attached_tool_groups.is_empty());
     assert!(app.progress_dirty);
+}
+
+#[test]
+fn daemon_message_session_state_sets_tool_groups() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_daemon_message(
+        DaemonMessage::SessionState {
+            session_id: 7,
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            working_dir: None,
+            max_turns: None,
+            turns: std::collections::BTreeMap::new(),
+            active_tool_groups: vec!["core".into(), "browser".into()],
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+            status: SessionStatus::Inactive,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    assert_eq!(app.attached_tool_groups, vec!["core", "browser"]);
 }
 
 #[test]
@@ -2305,6 +2334,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
     );
     assert_eq!(app.attached_context_window, Some(1024));
     assert_eq!(app.attached_status, Some(SessionStatus::Inactive));
+    assert!(app.attached_tool_groups.is_empty());
     assert!(!app.progress_dirty);
 }
 

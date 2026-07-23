@@ -337,6 +337,30 @@ impl SessionState {
         }
     }
 
+    /// Build a [`DaemonMessage::SessionState`] snapshot of the current session
+    /// for broadcasting to connected clients.  Centralises the field mapping
+    /// so that every broadcast site stays consistent when new fields are added.
+    pub(crate) fn session_state_message(&self, session_id: u64) -> DaemonMessage {
+        DaemonMessage::SessionState {
+            session_id,
+            title: self.config.title.clone(),
+            selected_model: self.config.selected_model.clone(),
+            parent_session_id: self.config.parent_session_id,
+            working_dir: self
+                .config
+                .working_dir
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            max_turns: self.config.max_turns,
+            turns: self.turns.clone(),
+            active_tool_groups: self.config.active_tool_groups.iter().cloned().collect(),
+            token_usage: Some(self.config.accumulated_usage),
+            context_window: self.config.context_window,
+            last_prompt_tokens: self.config.last_prompt_tokens,
+            status: self.config.status.clone(),
+        }
+    }
+
     /// Start a new turn, returning its turn_id.
     /// If the turn has user text, the redo stack is cleared.
     pub fn start_turn(&mut self, user_text: Option<String>) -> (u32, Turn) {
@@ -993,24 +1017,7 @@ fn handle_attach(
 ) -> bool {
     info!("session {}: client {} attached", ctx.session_id, client_id);
     state.subscribers.insert(client_id, tx);
-    let snapshot = DaemonMessage::SessionState {
-        session_id: ctx.session_id,
-        title: state.config.title.clone(),
-        selected_model: state.config.selected_model.clone(),
-        parent_session_id: state.config.parent_session_id,
-        working_dir: state
-            .config
-            .working_dir
-            .as_ref()
-            .map(|p| p.display().to_string()),
-        max_turns: state.config.max_turns,
-        turns: state.turns.clone(),
-        active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
-        token_usage: Some(state.config.accumulated_usage),
-        context_window: state.config.context_window,
-        last_prompt_tokens: state.config.last_prompt_tokens,
-        status: state.config.status.clone(),
-    };
+    let snapshot = state.session_state_message(ctx.session_id);
     if let Some(tx) = state.subscribers.get(&client_id) {
         let _ = tx.send(snapshot);
     }
