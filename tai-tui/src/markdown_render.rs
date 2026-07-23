@@ -554,7 +554,9 @@ fn render_markdown_block(
         }
         MarkdownBlock::BlockQuote(blocks) => {
             let mut quoted = Vec::new();
-            render_markdown_blocks(blocks, &mut quoted, 0, width);
+            // Content is rendered at (width - indent - 2) so that when "> " and the
+            // outer indent are prepended on each line the total stays within `width`.
+            render_markdown_blocks(blocks, &mut quoted, 0, width.saturating_sub(indent + 2));
             for line in quoted {
                 let mut spans = line.spans.clone();
                 spans.insert(0, Span::styled("> ".to_string(), Style::default()));
@@ -572,9 +574,18 @@ fn render_markdown_block(
                 } else {
                     "• ".to_string()
                 };
-                let continuation_indent = indent + display_width(&marker);
+                let marker_width = display_width(&marker);
+                let continuation_indent = indent + marker_width;
                 let mut rendered = Vec::new();
-                render_markdown_blocks(item, &mut rendered, 0, width);
+                // Content is rendered at (width - indent - marker_width) so that
+                // when the marker and outer indent are prepended the total fits
+                // within `width`.
+                render_markdown_blocks(
+                    item,
+                    &mut rendered,
+                    0,
+                    width.saturating_sub(indent + marker_width),
+                );
                 let mut rendered_iter = rendered.into_iter();
                 if let Some(first) = rendered_iter.next() {
                     let mut spans = vec![Span::styled(
@@ -587,13 +598,12 @@ fn render_markdown_block(
                     lines.push(indented_line(indent, marker));
                 }
                 for line in rendered_iter {
-                    lines.push({
-                        let text = line.to_string();
-                        Line::from(Span::styled(
-                            format!("{}{}", " ".repeat(continuation_indent), text),
-                            Style::default(),
-                        ))
-                    });
+                    let mut spans = vec![Span::styled(
+                        " ".repeat(continuation_indent),
+                        Style::default(),
+                    )];
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
                 }
             }
         }
@@ -1439,6 +1449,91 @@ mod tests {
         let result = markdown_lines(md, 80);
         assert!(result.len() >= 3);
         assert_eq!(result[0].to_string(), "```");
+    }
+
+    // ── BlockQuote ──────────────────────────────────────────────────────
+
+    #[test]
+    fn markdown_lines_blockquote_simple() {
+        let md = "> hello world";
+        let result = markdown_lines(md, 80);
+        assert!(!result.is_empty());
+        assert_eq!(result[0].to_string(), "> hello world");
+    }
+
+    #[test]
+    fn markdown_lines_blockquote_within_budget() {
+        let md = "> hello world";
+        let result = markdown_lines(md, 20);
+        let text = result
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for line in &result {
+            assert!(
+                line.width() <= 20,
+                "blockquote line width {} exceeds 20",
+                line.width()
+            );
+        }
+        assert!(text.contains("> hello world"), "text should be present");
+    }
+
+    // ── List ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn markdown_lines_unordered_list_simple() {
+        let md = "- item one\n- item two";
+        let result = markdown_lines(md, 80);
+        let text = result
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("• item one"), "first item should render");
+        assert!(text.contains("• item two"), "second item should render");
+    }
+
+    #[test]
+    fn markdown_lines_ordered_list_simple() {
+        let md = "1. first\n2. second";
+        let result = markdown_lines(md, 80);
+        let text = result
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("1. first"), "first ordered item");
+        assert!(text.contains("2. second"), "second ordered item");
+    }
+
+    #[test]
+    fn markdown_lines_list_within_budget() {
+        let md = "- hello world";
+        let result = markdown_lines(md, 10);
+        let text = result
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("•"), "bullet should be present");
+        assert!(text.contains("hello"), "content should be present");
+    }
+
+    #[test]
+    fn markdown_lines_list_continuation_preserves_spans() {
+        let md = "- **bold** and `code`";
+        let result = markdown_lines(md, 80);
+        assert!(!result.is_empty());
+        let first = &result[0];
+        // At minimum the text should not have markdown syntax literals.
+        let text = first.to_string();
+        assert!(
+            !text.contains("**bold**"),
+            "bold syntax should not appear literally"
+        );
+        assert!(text.contains("bold"), "bold text should appear");
     }
 
     // ── display_width ────────────────────────────────────────────────────
