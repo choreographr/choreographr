@@ -405,7 +405,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     } else {
         Line::from("")
     };
-    let status_bar = Paragraph::new(status_line).style(Style::default().bg(Color::Rgb(30, 30, 30)));
+    let status_bar = Paragraph::new(status_line).style(Style::default().bg(Color::Reset));
     frame.render_widget(status_bar, status_area);
 }
 
