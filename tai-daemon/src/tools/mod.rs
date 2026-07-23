@@ -117,6 +117,7 @@ pub(crate) mod find;
 pub(crate) mod fish;
 pub(crate) mod fs;
 pub(crate) mod git;
+pub(crate) mod glob_util;
 pub(crate) mod grep;
 pub(crate) mod groups;
 pub mod http;

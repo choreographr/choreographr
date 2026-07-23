@@ -38,7 +38,7 @@ impl Tool for FishShell {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a fish shell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang."
+        "Execute a fish shell command. Supports fish pipes, globs, and variables. Prefer this over `exec` when you need fish shell features. Non-interactive only — commands that read from stdin will hang. For running a single program without shell features, use `exec` instead."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {

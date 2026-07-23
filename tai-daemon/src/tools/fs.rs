@@ -4,8 +4,10 @@ use serde::Deserialize;
 use std::{fs::OpenOptions, io::Write};
 use std::{io, path::Path};
 use tracing::{error, info, warn};
+use zlob::ZlobFlags;
 use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
-use zlob::{ZlobFlags, ZlobPattern};
+
+use super::glob_util::GlobFilter;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadFileArgs {
@@ -74,6 +76,11 @@ pub struct DeleteFilesArgs {
     /// Paths or glob patterns to delete. Strings containing glob metacharacters
     /// (`*`, `?`, `[`) are treated as glob patterns. Metacharacters can be
     /// escaped with a backslash (e.g. `file\[.txt` for a literal `[`).
+    ///
+    /// Glob patterns without `/` are matched against the file's basename
+    /// (filename only), so `*.log` matches `.log` files at any directory
+    /// depth. Patterns with `/` are matched against the full path starting
+    /// from the working directory.
     #[serde(default)]
     pub targets: Vec<String>,
     /// Whether to recursively delete directories (required for directories).
@@ -199,7 +206,9 @@ pub(crate) fn execute_delete_files_tool(
     }
 
     let mut targets: Vec<std::path::PathBuf> = Vec::new();
-    let mut glob_patterns: Vec<ZlobPattern> = Vec::new();
+    // Each glob entry determines match_basename automatically
+    // (gitignore-style: no `/` → basename match, has `/` → full path match).
+    let mut glob_patterns: Vec<GlobFilter> = Vec::new();
 
     // Pre-classify each target as either a glob pattern or a literal path.
     // Auto-detecting via has_wildcards avoids burdening the caller with an
@@ -211,10 +220,10 @@ pub(crate) fn execute_delete_files_tool(
             continue;
         }
         if zlob::has_wildcards(trimmed, ZlobFlags::empty()) {
-            glob_patterns.push(
-                ZlobPattern::compile(trimmed, ZlobFlags::empty())
-                    .map_err(|e| ToolExecError(format!("invalid glob pattern '{trimmed}': {e}")))?,
-            );
+            glob_patterns
+                .push(GlobFilter::compile(trimmed).map_err(|e| {
+                    ToolExecError(format!("invalid glob pattern '{trimmed}': {e}"))
+                })?);
         } else {
             // Literal paths are confined immediately, rejecting directory
             // traversal attempts before any I/O occurs.
@@ -238,8 +247,8 @@ pub(crate) fn execute_delete_files_tool(
             .options(WalkFlags::RECOMMENDED)
             .run_serial(|entry| {
                 let path = entry.path();
-                for matcher in &glob_patterns {
-                    if matcher.matches_default(path.to_string_lossy().as_ref()) {
+                for filter in &glob_patterns {
+                    if filter.matches(path) {
                         matched.push(path.to_path_buf());
                         break;
                     }
@@ -783,7 +792,7 @@ pub(crate) struct DeleteFiles;
 define_tool!(
     DeleteFiles,
     "delete_files",
-    "Delete files or directories from the local workspace. Supports literal paths and glob patterns (auto-detected via presence of wildcard characters `*`, `?`, `[`).",
+    "Delete files or directories from the local workspace. Supports literal paths and glob patterns (auto-detected via presence of wildcard characters `*`, `?`, `[`). Glob patterns without `/` are matched against the file's basename (e.g. `*.log` matches `.log` files at any depth). Patterns with `/` are matched against the full path from the working directory.",
     DeleteFilesArgs,
     execute_delete_files_tool,
     "core",
@@ -1228,5 +1237,57 @@ mod tests {
         };
         let result = super::execute_delete_files_tool(&args, Some(dir.path())).unwrap();
         assert!(result.contains("Deleted 1 item(s)"));
+    }
+
+    #[test]
+    fn delete_files_glob_without_separator_matches_basename_at_any_depth() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Root-level file
+        std::fs::write(dir.path().join("a.log"), "").unwrap();
+        // File in a subdirectory
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("b.log"), "").unwrap();
+
+        // Pattern has no `/` — matched by basename at any depth
+        let args = DeleteFilesArgs {
+            targets: vec!["*.log".into()],
+            recursive: None,
+        };
+        let result = super::execute_delete_files_tool(&args, Some(dir.path())).unwrap();
+        assert!(
+            result.contains("Deleted 2 item(s)"),
+            "expected 2 deletes, got:\n{result}"
+        );
+        assert!(!dir.path().join("a.log").exists());
+        assert!(!sub.join("b.log").exists());
+    }
+
+    #[test]
+    fn delete_files_glob_with_separator_matches_full_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Root-level file (should NOT match)
+        std::fs::write(dir.path().join("data.txt"), "").unwrap();
+        // File in sub/subdir (SHOULD match `*/sub/*.txt`)
+        let inner = dir.path().join("sub").join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("data.txt"), "").unwrap();
+
+        // Pattern has `/` — matched against the full absolute path.
+        // `*/sub/*.txt` matches files where `sub/` is between two segments.
+        let args = DeleteFilesArgs {
+            targets: vec!["*/sub/*.txt".into()],
+            recursive: None,
+        };
+        let result = super::execute_delete_files_tool(&args, Some(dir.path())).unwrap();
+        assert!(
+            result.contains("Deleted 1 item(s)"),
+            "expected 1 delete, got:\n{result}"
+        );
+        assert!(
+            dir.path().join("data.txt").exists(),
+            "root-level data.txt should NOT have been deleted"
+        );
+        assert!(!inner.join("data.txt").exists());
     }
 }

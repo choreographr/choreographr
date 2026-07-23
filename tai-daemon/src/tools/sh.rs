@@ -71,7 +71,7 @@ impl Tool for Sh {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified."
+        "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Supports pipes, redirects, glob expansion, and environment variables. Prefer this over `exec` when you need shell features. Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified (bash, dash, or zsh)."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {

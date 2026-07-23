@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
     style::{Color, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Padding, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
 use std::sync::Arc;
@@ -21,6 +21,9 @@ use tui_prompts::{
 };
 
 pub(crate) const BG_SHADE: Color = Color::Rgb(60, 60, 60);
+
+/// Horizontal padding (columns) on each side of the command input box.
+const INPUT_PAD: u16 = 2;
 
 pub(crate) fn mouse_in_history_box(column: u16, row: u16, vp_width: u16, vp_height: u16) -> bool {
     column < vp_width && row < vp_height
@@ -259,8 +262,8 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     // ── Command input box ──────────────────────────────────────
-    // Full width (no left/right border padding) minus top/bottom border.
-    let inner_width = chunks[2].width as usize;
+    // Account for INPUT_PAD padding on both sides (left + right = 2 * INPUT_PAD).
+    let inner_width = chunks[2].width.saturating_sub(INPUT_PAD * 2) as usize;
     let visible_height = (chunks[2].height.saturating_sub(2)) as usize;
 
     // Compute cursor position first (populates the lines cache) so we
@@ -291,15 +294,18 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         })
         .collect();
 
-    let input = Paragraph::new(Text::from(text_lines))
-        .block(Block::default().borders(Borders::TOP | Borders::BOTTOM));
+    let input = Paragraph::new(Text::from(text_lines)).block(
+        Block::default()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .padding(Padding::new(INPUT_PAD, INPUT_PAD, 0, 0)),
+    );
     frame.render_widget(input, chunks[2]);
     // Clamp to visible area so the cursor is always inside the box,
     // even when scroll_offset hasn't been adjusted yet (e.g. after
     // loading a long history entry that ends at scroll_offset = 0).
     let max_display_row = (visible_count as u16).saturating_sub(1);
     let display_vrow = vrow.saturating_sub(offset as u16).min(max_display_row);
-    let cursor_x = chunks[2].x.saturating_add(vcol);
+    let cursor_x = chunks[2].x.saturating_add(INPUT_PAD).saturating_add(vcol);
     let cursor_y = chunks[2].y.saturating_add(1).saturating_add(display_vrow);
     frame.set_cursor_position((cursor_x, cursor_y));
 

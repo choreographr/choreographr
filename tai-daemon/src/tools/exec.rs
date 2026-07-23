@@ -14,9 +14,11 @@ use tai_keystore::ServiceCredential;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecArgs {
-    /// Program or command to execute (first argument)
+    /// Program to execute directly (not a shell command). This is not parsed
+    /// by a shell — shell operators, globs, and variables won't work. Use the
+    /// `sh`, `nushell`, or `fish` tools for shell commands.
     pub command: String,
-    /// Additional arguments passed to the program
+    /// Literal arguments passed to the program (not shell-parsed)
     #[serde(default)]
     pub args: Vec<String>,
     /// Working directory for the command (relative to the session working directory, or absolute)
@@ -41,7 +43,7 @@ impl Tool for Exec {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a program directly without a shell. The command is not parsed by a shell — no pipes, redirects, glob expansion, or environment variable interpolation. Prefer this over `sh` when you only need to run a single program with arguments (lower risk of shell-injection issues)."
+        "Execute a program directly — no shell parsing. The command is run as a subprocess without a shell, so pipes, redirects, glob expansion, and environment variable interpolation are NOT available. Do NOT use exec to run a shell interpreter — use the dedicated `sh`, `nushell`, or `fish` tools for shell commands. Prefer exec over shell tools when you only need to run a single program with arguments (lower risk of parsing issues)."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {

@@ -1,3 +1,4 @@
+use super::glob_util::GlobFilter;
 use super::{Tool, ToolExecError, context::ToolContext, truncate_tool_output};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
@@ -7,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use tai_keystore::ServiceCredential;
 use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
-use zlob::{ZlobFlags, ZlobPattern};
 
 /// Default result limit when the caller doesn't specify one.
 const DEFAULT_MAX_RESULTS: u32 = 50;
@@ -60,10 +60,12 @@ fn run_grep_walk(
             .map_err(|e| ToolExecError(format!("invalid pattern: {e}")))?
     };
 
-    // Optionally compile an include glob pattern for file filtering.
-    let include_pattern: Option<ZlobPattern> = if let Some(include) = include {
+    // Compile the include glob. Patterns without `/` are matched against
+    // the file's basename (gitignore convention) — a bare `Cargo.toml`
+    // matches at any directory depth without needing an explicit `*` prefix.
+    let include_filter: Option<GlobFilter> = if let Some(include) = include {
         Some(
-            ZlobPattern::compile(include, ZlobFlags::empty())
+            GlobFilter::compile(include)
                 .map_err(|e| ToolExecError(format!("invalid include glob: {e}")))?,
         )
     } else {
@@ -100,10 +102,8 @@ fn run_grep_walk(
             }
 
             // Apply the include glob filter if one was configured.
-            // zlob uses POSIX-compatible matching: `*` does not match `/`,
-            // so use `**/*.rs` for recursive matching.
-            if let Some(ref pat) = include_pattern
-                && !pat.matches_default(entry.path().to_string_lossy().as_ref())
+            if let Some(ref filter) = include_filter
+                && !filter.matches(entry.path())
             {
                 return WalkState::Continue;
             }
@@ -524,5 +524,99 @@ mod tests {
         assert!(desc.contains("Using regex."));
         assert!(desc.contains("Include pattern: `*.rs`."));
         assert!(desc.contains("Max results: 50."));
+    }
+
+    #[test]
+    fn test_bare_filename_include_matches_at_any_depth() {
+        let dir = TempDir::new().expect("temp dir");
+        // Create a file at root level
+        {
+            let mut f =
+                std::fs::File::create(dir.path().join("root.txt")).expect("create root.txt");
+            writeln!(f, "content").expect("write");
+        }
+        // Create a file in a subdirectory
+        {
+            let sub = dir.path().join("sub");
+            std::fs::create_dir(&sub).expect("create subdir");
+            let mut f = std::fs::File::create(sub.join("root.txt")).expect("create sub/root.txt");
+            writeln!(f, "content").expect("write");
+        }
+
+        let tool = Grep;
+        let args = GrepArgs {
+            pattern: "content".to_string(),
+            regex: false,
+            // Bare filename with no path separator — matches by basename
+            // at any directory depth.
+            include: Some("root.txt".to_string()),
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+        // SinkMatch bytes include trailing \n, so some lines will be empty.
+        let non_empty: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(non_empty.len(), 2, "expected 2 matches:\n{result}");
+        assert!(
+            non_empty.iter().any(|l| l.contains("root.txt:1:content")),
+            "expected root.txt:\n{result}"
+        );
+        assert!(
+            non_empty
+                .iter()
+                .any(|l| l.contains("sub/root.txt:1:content")),
+            "expected sub/root.txt:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_bare_filename_include_no_match() {
+        let dir = setup_test_dir();
+        let tool = Grep;
+        let args = GrepArgs {
+            pattern: "hello".to_string(),
+            regex: false,
+            include: Some("nonexistent.rs".to_string()),
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(result.is_empty(), "expected empty, got:\n{result}");
+    }
+
+    #[test]
+    fn test_path_pattern_include_matches_full_path() {
+        let dir = TempDir::new().expect("temp dir");
+        // Create a file at root level
+        {
+            let mut f =
+                std::fs::File::create(dir.path().join("data.txt")).expect("create data.txt");
+            writeln!(f, "hello").expect("write");
+        }
+        // Create a file in subdir matching the path pattern
+        {
+            let sub = dir.path().join("sub");
+            std::fs::create_dir(&sub).expect("create subdir");
+            let mut f = std::fs::File::create(sub.join("data.txt")).expect("create sub/data.txt");
+            writeln!(f, "hello").expect("write");
+        }
+
+        let tool = Grep;
+        // Pattern has a `/` so it's matched against the full path.
+        // Since zlob's `*` matches `/`, `*/data.txt` matches any
+        // file at any depth whose basename is `data.txt`.
+        let args = GrepArgs {
+            pattern: "hello".to_string(),
+            regex: false,
+            include: Some("*/data.txt".to_string()),
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+        // `*/data.txt` against absolute paths: zlob's `*` matches `/`,
+        // so `*` consumes the prefix, then `/data.txt` matches literally.
+        // Both `/tmp/xxx/data.txt` and `/tmp/xxx/sub/data.txt` should match.
+        let non_empty: Vec<&str> = result.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(non_empty.len(), 2, "expected 2 matches:\n{result}");
     }
 }

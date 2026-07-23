@@ -38,7 +38,7 @@ impl Tool for NuShell {
     }
 
     fn description(&self) -> &'static str {
-        "Execute a nushell command in the project directory. Returns combined stdout/stderr and exit code. Non-interactive only — commands that read from stdin will hang."
+        "Execute a nushell command. Supports nushell pipelines, globbing, and data processing features. Prefer this over `exec` when you need nushell features. Non-interactive only — commands that read from stdin will hang. For running a single program without shell features, use `exec` instead."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
