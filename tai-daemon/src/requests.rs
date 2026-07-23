@@ -763,16 +763,7 @@ pub(crate) fn run_agent_loop(
                     Vec::new(),
                     token_usage,
                 );
-                // Persist and broadcast the finalized turn.
-                session.finalize_turn(&ctx.db, ctx.session_id, current_turn_id)?;
-                if let Some(turn) = session.turns.get(&current_turn_id) {
-                    let _ =
-                        ctx.cmd_tx
-                            .send(SessionCommand::Broadcast(DaemonMessage::TurnFinalized {
-                                turn_id: current_turn_id,
-                                turn: turn.clone(),
-                            }));
-                }
+                finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
                 tool_results.clear();
                 return Ok(false);
             }
@@ -1046,6 +1037,7 @@ pub(crate) fn run_agent_loop(
                 // Finalize the turn so the session doesn't have an orphaned
                 // open turn that confuses the LLM on the next request.
                 if matches!(&e, tai_proto::InferenceError::TruncatedToolCall { .. }) {
+                    tracing::warn!(?e, "truncated tool call, finalizing turn gracefully");
                     session.set_assistant_response(
                         current_turn_id,
                         Some(format!("[tool call truncated: {e}]")),
@@ -1053,15 +1045,9 @@ pub(crate) fn run_agent_loop(
                         Vec::new(),
                         None,
                     );
-                    session.finalize_turn(&ctx.db, ctx.session_id, current_turn_id)?;
-                    if let Some(turn) = session.turns.get(&current_turn_id) {
-                        let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                            DaemonMessage::TurnFinalized {
-                                turn_id: current_turn_id,
-                                turn: turn.clone(),
-                            },
-                        ));
-                    }
+                    finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
+                    tool_results.clear();
+                    return Ok(false);
                 }
                 return Err(e.into());
             }
@@ -1070,6 +1056,25 @@ pub(crate) fn run_agent_loop(
         // Advance the turn counter for the next iteration.
         turn_iter += 1;
     }
+}
+
+/// Persist the finalized turn to the database and broadcast the
+/// [`DaemonMessage::TurnFinalized`] event to all connected clients.
+fn finalize_and_broadcast_turn(
+    session: &mut SessionState,
+    ctx: &RequestContext,
+    current_turn_id: u32,
+) -> io::Result<()> {
+    session.finalize_turn(&ctx.db, ctx.session_id, current_turn_id)?;
+    if let Some(turn) = session.turns.get(&current_turn_id) {
+        let _ = ctx
+            .cmd_tx
+            .send(SessionCommand::Broadcast(DaemonMessage::TurnFinalized {
+                turn_id: current_turn_id,
+                turn: turn.clone(),
+            }));
+    }
+    Ok(())
 }
 
 fn finish_tool_call(
