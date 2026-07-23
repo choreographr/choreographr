@@ -1274,8 +1274,14 @@ impl App {
         let viewport_height = self.history_viewport.height as usize;
         let virtual_track = 2 * viewport_height;
         let fallback_img_height = self.image_block_height() as usize;
+        let turn_count = self.session_view.turns.len();
+        tracing::trace!(turn_count, "rebuild_height_prefix");
         // Collect computed lines so we can warm the render_cache below.
-        let mut computed_lines: Vec<Option<(Vec<Line<'static>>, u16)>> = Vec::new();
+        let mut computed_lines: Vec<Option<(Vec<Line<'static>>, u16)>> =
+            Vec::with_capacity(turn_count);
+        // Collect start lines of user-text turns for marker computation
+        // after we know the final total height.
+        let mut user_text_start_lines: Vec<usize> = Vec::with_capacity(turn_count);
         // Iterate turns in order (oldest first).
         for (&turn_id, turn) in self.session_view.turns.iter() {
             if turn.undone {
@@ -1300,18 +1306,35 @@ impl App {
             }
             self.turn_layouts.push(TurnImageLayout { image_ranges });
             let turn_height = text_height + total_img_height;
-            // Marker for turns with user_text — points to the start of the turn.
+            // Record the content-line start for user-text markers.
+            // Virtual-slot computation is deferred to after the loop so
+            // the denominator is the FINAL total height, matching the
+            // scrollbar's coordinate system.
             if turn.user_text.is_some() {
-                let start_line = total;
-                let slot = start_line * virtual_track / (total + turn_height).max(1);
-                self.markers.push(Marker {
-                    content_line: start_line,
-                    virtual_slot: slot,
-                });
+                user_text_start_lines.push(total);
             }
             total += turn_height;
             self.height_prefix.push(total);
             self.visible_turn_ids.push(turn_id);
+        }
+        // Compute marker virtual slots using the final total height so they
+        // match the scrollbar's coordinate system (which uses total_history_height
+        // as content_length).  Previously the per-turn (total + turn_height) was
+        // used as denominator, which placed dots at wrong positions for all except
+        // the last turn.
+        let final_total = total.max(1);
+        tracing::trace!(
+            marker_count = user_text_start_lines.len(),
+            final_total,
+            "computed markers"
+        );
+        self.markers.reserve(user_text_start_lines.len());
+        for &start_line in &user_text_start_lines {
+            let slot = start_line * virtual_track / final_total;
+            self.markers.push(Marker {
+                content_line: start_line,
+                virtual_slot: slot,
+            });
         }
         // Ensure render_cache matches visible_turn_ids count.
         self.ensure_cache_synced();
@@ -2967,6 +2990,156 @@ mod tests {
         assert_eq!(
             app.history_scroll.scroll, old_scroll,
             "scroll should stay at 0 when user is at bottom"
+        );
+    }
+
+    // ── marker computation ──
+
+    #[test]
+    fn markers_empty_when_no_user_text_turns() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+
+        // Insert a turn with assistant_text only (no user_text).
+        let turn = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("hello".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.session_view.insert_or_replace(0, turn);
+        app.rebuild_height_prefix();
+
+        assert!(
+            app.markers.is_empty(),
+            "no markers should be created when no turn has user_text"
+        );
+    }
+
+    #[test]
+    fn markers_created_for_each_user_text_turn() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+
+        // Turn 0: has user_text.
+        insert_turn(&mut app, 0, "user a", "assistant a");
+        // Turn 1: NO user_text (assistant-only turn).
+        let turn_no_user = Turn {
+            created_at: tai_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("assistant only".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.session_view.insert_or_replace(1, turn_no_user);
+        // Turn 2: has user_text.
+        insert_turn(&mut app, 2, "user c", "assistant c");
+
+        app.rebuild_height_prefix();
+
+        // Only the two user-text turns should have markers.
+        assert_eq!(
+            app.markers.len(),
+            2,
+            "expected 2 markers for 2 user-text turns"
+        );
+
+        // content_line values should be strictly increasing (turn order).
+        assert!(
+            app.markers[0].content_line < app.markers[1].content_line,
+            "first user-text turn should appear before the second"
+        );
+
+        // Every content_line must be within the total history.
+        let total = app.total_history_height();
+        for marker in &app.markers {
+            assert!(
+                marker.content_line < total,
+                "marker content_line {0} should be < total history {total}",
+                marker.content_line
+            );
+        }
+    }
+
+    #[test]
+    fn marker_virtual_slot_uses_final_total_height() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let virtual_track = 2 * app.history_viewport.height as usize;
+
+        // Two user-text turns; their heights depend on content/wrapping but
+        // we verify the slot formula directly.
+        insert_turn(&mut app, 0, "x", "y");
+        insert_turn(&mut app, 1, "x", "y");
+        app.rebuild_height_prefix();
+
+        let total = app.total_history_height();
+        assert!(total > 0, "total history should be positive");
+
+        // Re-derive start_line for each marker from height_prefix.
+        // height_prefix[i] == cumulative height up to and including turn i.
+        let mut prev_end = 0usize;
+        for (i, marker) in app.markers.iter().enumerate() {
+            // The marker's content_line should be the cumulative offset
+            // of that turn (where it starts).
+            assert_eq!(
+                marker.content_line, prev_end,
+                "marker {i} content_line should equal the start of the turn"
+            );
+            if let Some(&end) = app.height_prefix.get(i) {
+                prev_end = end;
+            }
+
+            // virtual_slot = content_line * virtual_track / total.
+            let expected_slot = marker.content_line * virtual_track / total;
+            assert_eq!(
+                marker.virtual_slot, expected_slot,
+                "marker {i} virtual_slot should use final total={total} as denominator"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_virtual_slot_proportional_to_position() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let virtual_track = 2 * app.history_viewport.height as usize;
+
+        // Add three user-text turns at once, then rebuild.
+        insert_turn(&mut app, 0, "a", "a");
+        insert_turn(&mut app, 1, "b", "b");
+        insert_turn(&mut app, 2, "c", "c");
+        app.rebuild_height_prefix();
+
+        // A turn that starts later must have a proportionally larger slot.
+        assert!(
+            app.markers[0].virtual_slot <= app.markers[1].virtual_slot,
+            "second marker slot should be >= first marker slot"
+        );
+        assert!(
+            app.markers[1].virtual_slot <= app.markers[2].virtual_slot,
+            "third marker slot should be >= second marker slot"
+        );
+
+        // The last marker's slot must be within the virtual track.
+        assert!(
+            app.markers[2].virtual_slot < virtual_track,
+            "last marker slot should be less than virtual_track={virtual_track}"
         );
     }
 
