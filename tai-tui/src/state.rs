@@ -1388,7 +1388,8 @@ impl App {
                 } else if old_total > new_total {
                     // Content was removed (e.g. undo) — scroll to bottom so the
                     // user doesn't stare at blank space.
-                    self.history_scroll.scroll = self.max_scroll_offset();
+                    tracing::trace!(old_total, new_total, "content removed, scrolling to bottom");
+                    self.history_scroll.scroll = 0;
                 }
             }
 
@@ -1485,6 +1486,20 @@ impl App {
                     *cached = None;
                 }
                 self.markers_dirty = true;
+                if old_width != width {
+                    // Width changed — the old layout is at a different wrapping
+                    // width, so the old total height is meaningless for scroll
+                    // preservation.  Clear content_dirty to prevent the stale
+                    // flag (left over from a prior content change in the same
+                    // event batch) from triggering preserve_scroll with an
+                    // incompatible old_total.
+                    tracing::debug!(
+                        "width changed ({} → {}), clearing content_dirty",
+                        old_width,
+                        width
+                    );
+                    self.content_dirty = false;
+                }
             }
         }
     }
@@ -3292,6 +3307,145 @@ mod tests {
         assert_eq!(
             app.history_scroll.scroll, old_scroll,
             "scroll should not change when content_dirty is false"
+        );
+    }
+
+    // ── update_viewport_from_terminal_size ──
+
+    #[test]
+    fn width_change_clears_content_dirty() {
+        let mut app = test_app("/tmp/tai.sock");
+
+        // Establish a "current" viewport with the old width.
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 26;
+
+        // Set last_terminal_size to a new size with larger width.
+        // terminal_resized is false so the function uses the cached size.
+        app.last_terminal_size = Some((100, 30));
+        app.terminal_resized = false;
+
+        // Set content_dirty and markers_dirty to verify changes.
+        app.content_dirty = true;
+        app.markers_dirty = true;
+        // Add a cached entry to verify it gets cleared.
+        app.render_cache = vec![Some(RenderedCache {
+            lines: vec![],
+            width: 0,
+        })];
+
+        app.update_viewport_from_terminal_size();
+
+        assert!(
+            !app.content_dirty,
+            "content_dirty should be cleared on width change"
+        );
+        assert!(app.markers_dirty, "markers_dirty should remain true");
+        assert!(
+            app.render_cache.iter().all(|c| c.is_none()),
+            "render_cache should be cleared"
+        );
+        // Viewport should have been updated to the new dimensions.
+        assert_eq!(app.history_viewport.width, 99);
+    }
+
+    #[test]
+    fn height_only_change_does_not_clear_content_dirty() {
+        let mut app = test_app("/tmp/tai.sock");
+
+        // Establish a "current" viewport with the old height.
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+
+        // Set last_terminal_size to a new size with larger height, same width.
+        app.last_terminal_size = Some((80, 30));
+        app.terminal_resized = false;
+
+        app.content_dirty = true;
+        app.markers_dirty = true;
+        app.render_cache = vec![Some(RenderedCache {
+            lines: vec![],
+            width: 0,
+        })];
+
+        app.update_viewport_from_terminal_size();
+
+        assert!(
+            app.content_dirty,
+            "content_dirty should NOT be cleared on height-only change"
+        );
+        assert!(app.markers_dirty, "markers_dirty should remain true");
+        assert!(
+            app.render_cache.iter().all(|c| c.is_none()),
+            "render_cache should be cleared"
+        );
+    }
+
+    // ── compute_total_height_and_markers: scroll-to-bottom on content removal ──
+
+    #[test]
+    fn content_removed_scrolls_to_bottom() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 5;
+
+        // Add initial turns and establish a height_prefix.
+        insert_turn(&mut app, 0, "user text", "assistant text");
+        insert_turn(&mut app, 1, "more user", "more assistant");
+        app.rebuild_height_prefix();
+
+        let old_total = app.total_history_height();
+        assert!(old_total > 0, "should have content");
+
+        // Scroll up so effective_scroll > 0 (not at bottom).
+        app.history_scroll.scroll =
+            old_total.saturating_sub(app.history_viewport.height as usize) / 2;
+        assert!(app.effective_scroll() > 0, "should be scrolled up");
+
+        // Remove a turn — height_prefix is now stale (larger than actual).
+        app.session_view.turns.remove(&1);
+        assert_eq!(app.session_view.turns.len(), 1);
+
+        // Mark both dirty so compute_total_height_and_markers runs.
+        app.mark_content_changed();
+
+        app.compute_total_height_and_markers();
+
+        // After content removal, scroll should be 0 (bottom).
+        assert_eq!(
+            app.effective_scroll(),
+            0,
+            "scroll should be at bottom after content removal"
+        );
+    }
+
+    #[test]
+    fn content_added_shifts_scroll_down() {
+        let mut app = test_app("/tmp/tai.sock");
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 5;
+
+        insert_turn(&mut app, 0, "a", "b");
+        app.rebuild_height_prefix();
+
+        let old_total = app.total_history_height();
+        // Scroll up.
+        app.history_scroll.scroll =
+            old_total.saturating_sub(app.history_viewport.height as usize) / 2;
+        let old_scroll = app.history_scroll.scroll;
+
+        // Add a turn that increases total height.
+        insert_turn(&mut app, 1, "c", "d");
+        app.mark_content_changed();
+        app.compute_total_height_and_markers();
+
+        let new_total = app.total_history_height();
+        let delta = new_total.saturating_sub(old_total);
+        assert!(delta > 0, "total height should increase");
+        assert_eq!(
+            app.history_scroll.scroll,
+            old_scroll + delta,
+            "scroll should be shifted down by the content delta"
         );
     }
 }
