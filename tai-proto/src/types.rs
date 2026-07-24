@@ -305,6 +305,11 @@ pub enum ClientMessage {
     GetReasoningEffort,
     Undo,
     Redo,
+    /// Create a new turn with the text "Continue." and run the agent loop.
+    /// Semantically distinct from RunInput — the daemon controls the prompt text.
+    ContinueGeneration {
+        request_id: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

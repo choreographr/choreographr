@@ -14,6 +14,30 @@ fn encode_decode_round_trip_client_message() {
 }
 
 #[test]
+fn undo_serde_round_trip() {
+    let message = ClientMessage::Undo;
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn redo_serde_round_trip() {
+    let message = ClientMessage::Redo;
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
+fn continue_generation_serde_round_trip() {
+    let message = ClientMessage::ContinueGeneration { request_id: 7 };
+    let frame = encode_frame(&message).expect("encode");
+    let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+    assert_eq!(decoded, message);
+}
+
+#[test]
 fn decode_rejects_trailing_bytes() {
     let message = ClientMessage::Ping;
     let mut frame = encode_frame(&message).expect("encode");

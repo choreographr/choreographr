@@ -1,7 +1,9 @@
 use super::*;
-use tai_client_core::dispatch_daemon_message;
+use crate::client::handle_shell_command;
+use tai_client_core::{ShellCommand, dispatch_daemon_message};
 use tai_proto::{
-    DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream, TimestampMs, TokenUsage, Turn,
+    ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, OutputStream, TimestampMs,
+    TokenUsage, Turn,
 };
 
 #[test]
@@ -125,4 +127,84 @@ fn apply_daemon_turn_appended_with_image() {
 
     assert_eq!(stored.displayed_images.len(), 1);
     assert_eq!(stored.displayed_images[0].metadata, metadata);
+}
+
+// ── Shell command dispatch ────────────────────────────────────────────
+
+#[test]
+fn handle_continue_when_attached_sends_continue_generation() {
+    let mut state = AppState::new("/tmp/tai.sock".to_string());
+    state.attached_session_id = Some(42);
+    state.next_request_id = 5;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_shell_command(&mut state, Some(tx), ShellCommand::Continue);
+
+    assert_eq!(state.next_request_id, 6);
+    let msg = rx.recv().expect("should send ContinueGeneration");
+    assert_eq!(msg, ClientMessage::ContinueGeneration { request_id: 5 });
+}
+
+#[test]
+fn handle_continue_when_not_attached_shows_error() {
+    let mut state = AppState::new("/tmp/tai.sock".to_string());
+    state.attached_session_id = None;
+
+    handle_shell_command(&mut state, None, ShellCommand::Continue);
+
+    assert!(
+        state
+            .status_texts
+            .iter()
+            .any(|t| t.contains("no session attached"))
+    );
+}
+
+#[test]
+fn handle_stop_when_attached_sends_cancel_all() {
+    let mut state = AppState::new("/tmp/tai.sock".to_string());
+    state.attached_session_id = Some(42);
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_shell_command(&mut state, Some(tx), ShellCommand::Stop);
+
+    let msg = rx.recv().expect("should send Cancel");
+    assert_eq!(msg, ClientMessage::Cancel { request_id: 0 });
+}
+
+#[test]
+fn handle_stop_when_not_attached_shows_error() {
+    let mut state = AppState::new("/tmp/tai.sock".to_string());
+    state.attached_session_id = None;
+
+    handle_shell_command(&mut state, None, ShellCommand::Stop);
+
+    assert!(
+        state
+            .status_texts
+            .iter()
+            .any(|t| t.contains("no session attached"))
+    );
+}
+
+#[test]
+fn handle_undo_sends_undo_message() {
+    let mut state = AppState::new("/tmp/tai.sock".to_string());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_shell_command(&mut state, Some(tx), ShellCommand::Undo);
+
+    let msg = rx.recv().expect("should send Undo");
+    assert_eq!(msg, ClientMessage::Undo);
+}
+
+#[test]
+fn handle_redo_sends_redo_message() {
+    let mut state = AppState::new("/tmp/tai.sock".to_string());
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_shell_command(&mut state, Some(tx), ShellCommand::Redo);
+
+    let msg = rx.recv().expect("should send Redo");
+    assert_eq!(msg, ClientMessage::Redo);
 }

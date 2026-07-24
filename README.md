@@ -130,6 +130,8 @@ In `tai-tui`:
 - `/reasoning` — show current reasoning effort
 - `/reasoning off|low|medium|high` — set reasoning/thinking effort for the session
 - `/account <name>` — set the session's AI provider account
+- `/continue` — continue a stopped/idle session by sending a "Please continue." prompt
+- `/stop` — cancel whatever request is currently active on the attached session (same as `/cancel 0`)
 - `/undo` — undo the most recent user turn and its entire assistant response subtree
 - `/redo` — redo the most recently undone turn (cleared if new input is sent)
 - any other input — sent as a prompt

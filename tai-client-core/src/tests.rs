@@ -556,3 +556,79 @@ fn reasoning_invalid_effort() {
     assert!(matches!(result, ShellCommand::UnknownCommand(ref msg) if msg.contains("turbo")));
     assert_eq!(next, 3);
 }
+
+// ── Undo / Redo commands ────────────────────────────────────────────────
+
+#[test]
+fn parses_undo() {
+    let mut next = 5;
+    assert_eq!(
+        parse_input_line("/undo", &mut next, None),
+        ShellCommand::Undo
+    );
+    assert_eq!(next, 5);
+}
+
+#[test]
+fn parses_redo() {
+    let mut next = 5;
+    assert_eq!(
+        parse_input_line("/redo", &mut next, None),
+        ShellCommand::Redo
+    );
+    assert_eq!(next, 5);
+}
+
+#[test]
+fn shell_command_echo_undo() {
+    assert_eq!(
+        shell_command_echo(&ShellCommand::Undo),
+        Some("> undo".to_string())
+    );
+}
+
+#[test]
+fn shell_command_echo_redo() {
+    assert_eq!(
+        shell_command_echo(&ShellCommand::Redo),
+        Some("> redo".to_string())
+    );
+}
+
+// ── Continue / Stop commands ────────────────────────────────────────────
+
+#[test]
+fn parses_continue() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/continue", &mut next, None),
+        ShellCommand::Continue
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn parses_stop() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/stop", &mut next, None),
+        ShellCommand::Stop
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn shell_command_continue_echo() {
+    assert_eq!(
+        shell_command_echo(&ShellCommand::Continue),
+        Some("> continue".to_string())
+    );
+}
+
+#[test]
+fn shell_command_stop_echo() {
+    assert_eq!(
+        shell_command_echo(&ShellCommand::Stop),
+        Some("> stop".to_string())
+    );
+}

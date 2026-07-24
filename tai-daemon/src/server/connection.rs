@@ -144,6 +144,23 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let _ = tx.send(SessionCommand::Redo);
             }
         }
+        ClientMessage::ContinueGeneration { request_id } => {
+            debug!(
+                "client {}: ContinueGeneration id={}",
+                ctx.client_id, request_id
+            );
+            if let Some(tx) = ctx.attached_session_tx {
+                let _ = tx.send(SessionCommand::RunInput {
+                    request_id,
+                    input: b"Continue.".to_vec(),
+                });
+            } else {
+                let _ = ctx.writer_tx.send(DaemonMessage::Failed {
+                    request_id,
+                    error: "no session attached".to_string(),
+                });
+            }
+        }
         ClientMessage::Ping => {
             debug!("client {}: Ping", ctx.client_id);
             let _ = ctx.writer_tx.send(DaemonMessage::Pong);
@@ -1049,6 +1066,164 @@ mod tests {
         assert!(matches!(
             new_rx.try_recv().ok(),
             Some(SessionCommand::Attach { client_id: 42, .. })
+        ));
+    }
+
+    // ── Undo dispatch ────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_undo_when_attached_sends_undo_command() {
+        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (writer_tx, _writer_rx) =
+            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (session_tx, session_rx) = mpsc::channel();
+        let mut attached_id = Some(1u64);
+        let mut attached_tx = Some(session_tx);
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut attached_id,
+            attached_session_tx: &mut attached_tx,
+            client_id: 42,
+        };
+
+        dispatch_client_message(ClientMessage::Undo, &mut ctx).unwrap();
+
+        assert!(matches!(
+            session_rx.try_recv().ok(),
+            Some(SessionCommand::Undo)
+        ));
+    }
+
+    #[test]
+    fn dispatch_undo_when_not_attached_is_noop() {
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (writer_tx, writer_rx) =
+            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
+
+        dispatch_client_message(ClientMessage::Undo, &mut ctx).unwrap();
+
+        // No message should appear on writer or session channels.
+        assert!(writer_rx.try_recv().is_err());
+    }
+
+    // ── Redo dispatch ────────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_redo_when_attached_sends_redo_command() {
+        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (writer_tx, _writer_rx) =
+            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (session_tx, session_rx) = mpsc::channel();
+        let mut attached_id = Some(1u64);
+        let mut attached_tx = Some(session_tx);
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut attached_id,
+            attached_session_tx: &mut attached_tx,
+            client_id: 42,
+        };
+
+        dispatch_client_message(ClientMessage::Redo, &mut ctx).unwrap();
+
+        assert!(matches!(
+            session_rx.try_recv().ok(),
+            Some(SessionCommand::Redo)
+        ));
+    }
+
+    #[test]
+    fn dispatch_redo_when_not_attached_is_noop() {
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (writer_tx, writer_rx) =
+            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
+
+        dispatch_client_message(ClientMessage::Redo, &mut ctx).unwrap();
+
+        assert!(writer_rx.try_recv().is_err());
+    }
+
+    // ── ContinueGeneration dispatch ──────────────────────────────────────
+
+    #[test]
+    fn dispatch_continue_generation_when_attached_sends_run_input() {
+        let (daemon_tx, _daemon_rx) = mpsc::channel();
+        let (writer_tx, _writer_rx) =
+            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (session_tx, session_rx) = mpsc::channel();
+        let mut attached_id = Some(1u64);
+        let mut attached_tx = Some(session_tx);
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut attached_id,
+            attached_session_tx: &mut attached_tx,
+            client_id: 42,
+        };
+
+        dispatch_client_message(
+            ClientMessage::ContinueGeneration { request_id: 7 },
+            &mut ctx,
+        )
+        .unwrap();
+
+        let cmd = session_rx.try_recv().expect("should receive RunInput");
+        assert!(matches!(
+            &cmd,
+            SessionCommand::RunInput {
+                request_id: 7,
+                input,
+            } if input == b"Continue."
+        ));
+    }
+
+    #[test]
+    fn dispatch_continue_generation_when_not_attached_sends_failed() {
+        let (daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let (writer_tx, writer_rx) =
+            mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+        let mut none_id = None;
+        let mut none_tx = None;
+        let mut ctx = ClientCtx {
+            writer_tx: &writer_tx,
+            daemon_tx: &daemon_tx,
+            attached_session_id: &mut none_id,
+            attached_session_tx: &mut none_tx,
+            client_id: 0,
+        };
+
+        dispatch_client_message(
+            ClientMessage::ContinueGeneration { request_id: 7 },
+            &mut ctx,
+        )
+        .unwrap();
+
+        let msg = writer_rx.recv().expect("should receive Failed");
+        assert!(matches!(
+            &msg,
+            DaemonMessage::Failed {
+                request_id: 7,
+                error,
+            } if error == "no session attached"
         ));
     }
 }

@@ -2586,3 +2586,173 @@ fn scroll_offset_clamped_to_valid_range() {
     // Cursor at end (visual line 4), scroll = 4+1-3 = 2
     assert_eq!(buf.scroll_offset, 2);
 }
+
+// ── Entry handling for Continue / Stop / Undo / Redo ──────────────────
+
+#[test]
+fn enter_continue_when_attached_sends_continue_generation() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.attached_session_id = Some(1);
+    app.input.text = "/continue".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(app.status.as_deref(), Some("> continue"));
+    assert!(app.active.contains(&1));
+    let msg = rx.recv().expect("should send ContinueGeneration");
+    assert_eq!(msg, ClientMessage::ContinueGeneration { request_id: 1 });
+}
+
+#[test]
+fn enter_continue_when_not_attached_shows_error() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.attached_session_id = None;
+    app.input.text = "/continue".to_string();
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(app.status.as_deref(), Some("no session attached"));
+}
+
+#[test]
+fn enter_continue_scrolls_to_bottom() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.attached_session_id = Some(1);
+    app.history_viewport = HistoryViewport {
+        width: 80,
+        height: 5,
+    };
+    // Add enough content to be scrollable.
+    add_user_text(&mut app, "a");
+    add_user_text(&mut app, "b");
+    add_user_text(&mut app, "c");
+    // Scroll up so we're not at the bottom.
+    app.scroll_up(2);
+    let scrolled = app.effective_scroll();
+    assert!(scrolled > 0, "should be scrolled up");
+    app.input.text = "/continue".to_string();
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(app.effective_scroll(), 0, "should scroll to bottom");
+}
+
+#[test]
+fn enter_stop_when_attached_sends_cancel_all() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.attached_session_id = Some(1);
+    app.input.text = "/stop".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(app.status.as_deref(), Some("> stop"));
+    let msg = rx.recv().expect("should send Cancel");
+    assert_eq!(msg, ClientMessage::Cancel { request_id: 0 });
+}
+
+#[test]
+fn enter_stop_when_not_attached_shows_error() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.attached_session_id = None;
+    app.input.text = "/stop".to_string();
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(app.status.as_deref(), Some("no session attached"));
+}
+
+#[test]
+fn enter_undo_sends_undo() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.input.text = "/undo".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(app.status.as_deref(), Some("> undo"));
+    let msg = rx.recv().expect("should send Undo");
+    assert_eq!(msg, ClientMessage::Undo);
+}
+
+#[test]
+fn enter_redo_sends_redo() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.input.text = "/redo".to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    assert_eq!(app.status.as_deref(), Some("> redo"));
+    let msg = rx.recv().expect("should send Redo");
+    assert_eq!(msg, ClientMessage::Redo);
+}
+
+#[test]
+fn enter_stop_does_not_scroll() {
+    let mut app = test_app("/tmp/tai.sock");
+    app.attached_session_id = Some(1);
+    app.history_viewport = HistoryViewport {
+        width: 80,
+        height: 5,
+    };
+    add_user_text(&mut app, "a");
+    add_user_text(&mut app, "b");
+    app.scroll_up(1);
+    let scrolled = app.effective_scroll();
+    assert!(scrolled > 0, "should be scrolled up");
+    app.input.text = "/stop".to_string();
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle enter");
+
+    // Stop should NOT scroll to bottom (unlike Continue).
+    assert!(
+        app.effective_scroll() > 0,
+        "should preserve scroll position"
+    );
+}

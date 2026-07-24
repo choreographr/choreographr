@@ -162,6 +162,9 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: crate::tg_api::Message)
         }
         ShellCommand::Empty | ShellCommand::InvalidCancel(_) => {}
         ShellCommand::Undo | ShellCommand::Redo => {}
+        ShellCommand::Continue | ShellCommand::Stop => {
+            debug!("telegram does not support Continue/Stop commands");
+        }
     }
 }
 

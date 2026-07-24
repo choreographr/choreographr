@@ -102,7 +102,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 `TestImage`, `Cancel`, `Ping`, `GetCredential`, `ListModels`, `SetModel`, `Unlock`,
 `Lock`, `AddCredential`, `RemoveCredential`, `AddAccount`, `RemoveAccount`,
 `ListAccounts`, `SetSessionAccount`, `SetReasoningEffort`, `GetReasoningEffort`,
-`Undo`, `Redo`
+`Undo`, `Redo`, `ContinueGeneration`
 - `CreateSession` now carries optional `context_config`, `account_name`, `selected_model`, and `reasoning_effort` fields
 
 `DaemonMessage` variants:

@@ -904,6 +904,35 @@ fn handle_chat_event(
                             }
                             let _ = client_tx.send(ClientMessage::Redo);
                         }
+                        ShellCommand::Continue => {
+                            if let Some(echo) = shell_command_echo(&ShellCommand::Continue) {
+                                app.status = Some(echo);
+                            }
+                            if app.attached_session_id.is_some() {
+                                let request_id = app.next_request_id;
+                                app.next_request_id = app.next_request_id.wrapping_add(1);
+                                app.active.insert(request_id);
+                                client_tx
+                                    .send(ClientMessage::ContinueGeneration { request_id })
+                                    .map_err(broken_pipe)?;
+                                app.scroll_to(0);
+                            } else {
+                                app.status = Some("no session attached".to_string());
+                            }
+                        }
+                        ShellCommand::Stop => {
+                            if let Some(echo) = shell_command_echo(&ShellCommand::Stop) {
+                                app.status = Some(echo);
+                            }
+                            // Send Cancel with request_id 0 (the CANCEL_ALL sentinel)
+                            // to stop whatever request is currently active on the
+                            // attached session and all its children.
+                            if app.attached_session_id.is_some() {
+                                let _ = client_tx.send(ClientMessage::Cancel { request_id: 0 });
+                            } else {
+                                app.status = Some("no session attached".to_string());
+                            }
+                        }
                     }
                 }
                 KeyCode::Backspace

@@ -29,6 +29,12 @@ pub enum ShellCommand {
     },
     Undo,
     Redo,
+    /// Continue a stopped/idle session — sends a "Please continue." prompt
+    /// to the currently attached session.
+    Continue,
+    /// Stop a running session — cancels whatever request is currently active
+    /// on the attached session, equivalent to `Cancel` with `CANCEL_ALL`.
+    Stop,
     InvalidCancel(String),
     UnknownCommand(String),
     Empty,
@@ -327,6 +333,12 @@ fn parse_command(
     if rest == "redo" {
         return ShellCommand::Redo;
     }
+    if rest == "continue" {
+        return ShellCommand::Continue;
+    }
+    if rest == "stop" {
+        return ShellCommand::Stop;
+    }
 
     if let Some(effort_s) = rest.strip_prefix("reasoning ") {
         let effort_s = effort_s.trim();
@@ -373,6 +385,8 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
         ShellCommand::RemoveCredential { service } => Some(format!("> /remove-key {service}")),
         ShellCommand::Undo => Some("> undo".to_string()),
         ShellCommand::Redo => Some("> redo".to_string()),
+        ShellCommand::Continue => Some("> continue".to_string()),
+        ShellCommand::Stop => Some("> stop".to_string()),
         _ => None,
     }
 }

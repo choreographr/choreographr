@@ -87,6 +87,28 @@ pub(crate) fn handle_shell_command(
         ShellCommand::Redo => {
             send_client_message(state, daemon_tx, ClientMessage::Redo);
         }
+        ShellCommand::Continue => {
+            if state.attached_session_id.is_some() {
+                let request_id = state.next_request_id;
+                state.next_request_id = state.next_request_id.wrapping_add(1);
+                send_client_message(
+                    state,
+                    daemon_tx,
+                    ClientMessage::ContinueGeneration { request_id },
+                );
+            } else {
+                state.status_texts.push("no session attached".to_string());
+            }
+        }
+        ShellCommand::Stop => {
+            // Send Cancel with request_id 0 (CANCEL_ALL sentinel) to stop
+            // whatever request is currently active on the attached session.
+            if state.attached_session_id.is_some() {
+                send_client_message(state, daemon_tx, ClientMessage::Cancel { request_id: 0 });
+            } else {
+                state.status_texts.push("no session attached".to_string());
+            }
+        }
     }
 }
 
