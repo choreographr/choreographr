@@ -262,15 +262,6 @@ impl DaemonState {
         }
     }
 
-    /// Returns an error if the daemon hasn't been unlocked yet.
-    fn ensure_unlocked(&self) -> io::Result<()> {
-        if self.credentials.is_empty() {
-            Err(io::Error::other("daemon is locked"))
-        } else {
-            Ok(())
-        }
-    }
-
     fn spawn_session(
         &mut self,
         session_id: u64,
@@ -360,10 +351,9 @@ impl DaemonState {
         reply: std::sync::mpsc::Sender<io::Result<(u64, std::sync::mpsc::Sender<SessionCommand>)>>,
     ) {
         // A session is just a conversation container — it can be
-        // created regardless of whether the daemon is locked.
-        // Credentials are only needed when running models (RunInput).
-        // The daemon may be locked, but the user can still browse,
-        // create, and delete sessions freely.
+        // created, browsed, and deleted regardless of whether the
+        // daemon is locked.  Credentials are only needed when running
+        // models (RunInput).
         let sid = self.next_session_id;
         self.next_session_id += 1;
         info!("CreateSession: id={}, title={:?}", sid, title);
@@ -488,23 +478,7 @@ impl DaemonState {
         let mut summaries: Vec<SessionSummary> = self
             .session_metadata
             .iter()
-            .map(|(id, meta)| SessionSummary {
-                session_id: *id,
-                title: meta.title.clone(),
-                selected_model: meta.selected_model.clone(),
-                reasoning_effort: meta.reasoning_effort,
-                parent_session_id: meta.parent_session_id,
-                working_dir: meta.working_dir.clone(),
-                created_at: meta.created_at,
-                turn_count: meta.turn_count,
-                max_turns: meta.max_turns,
-                status: meta.status.clone(),
-                active_tool_groups: meta.active_tool_groups.clone(),
-                account_name: meta.account_name.clone(),
-                token_usage: Some(meta.accumulated_usage),
-                context_window: meta.context_window,
-                last_prompt_tokens: meta.last_prompt_tokens,
-            })
+            .map(|(id, meta)| meta.to_summary(*id))
             .collect();
 
         summaries.sort_by_key(|s| s.session_id);
@@ -520,23 +494,7 @@ impl DaemonState {
         let summary = self
             .session_metadata
             .get(&session_id)
-            .map(|meta| SessionSummary {
-                session_id,
-                title: meta.title.clone(),
-                selected_model: meta.selected_model.clone(),
-                reasoning_effort: meta.reasoning_effort,
-                parent_session_id: meta.parent_session_id,
-                working_dir: meta.working_dir.clone(),
-                created_at: meta.created_at,
-                turn_count: meta.turn_count,
-                max_turns: meta.max_turns,
-                status: meta.status.clone(),
-                active_tool_groups: meta.active_tool_groups.clone(),
-                account_name: meta.account_name.clone(),
-                token_usage: Some(meta.accumulated_usage),
-                context_window: meta.context_window,
-                last_prompt_tokens: meta.last_prompt_tokens,
-            });
+            .map(|meta| meta.to_summary(session_id));
         let _ = reply.send(summary);
     }
 
@@ -841,16 +799,17 @@ impl DaemonState {
 
     /// Delete a session, shutting down its thread and removing it from the DB.
     /// If the session has children, they are cascade-deleted first.
+    ///
+    /// Sessions are just conversation containers — they can be deleted
+    /// regardless of whether the daemon is locked, just like they can
+    /// be created and browsed freely.  Credentials are only needed to
+    /// run models (RunInput).
     fn handle_delete_session(
         &mut self,
         session_id: u64,
         reply: std::sync::mpsc::Sender<io::Result<()>>,
     ) {
         info!("DeleteSession: id={}", session_id);
-        if let Err(e) = self.ensure_unlocked() {
-            let _ = reply.send(Err(e));
-            return;
-        }
 
         // Cascade-delete children before the parent.
         if let Some(children) = self.children.remove(&session_id) {
@@ -1411,24 +1370,23 @@ mod tests {
     }
 
     #[test]
-    fn ensure_unlocked_returns_err_when_locked() {
-        let (state, _rx) = make_daemon_state();
-        let result = state.ensure_unlocked();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), "daemon is locked");
-    }
-
-    #[test]
-    fn handle_delete_session_locked() {
+    fn handle_delete_session_succeeds_when_locked() {
+        // DeleteSession should succeed even when the daemon is locked,
+        // because a session is just a container — credentials are only
+        // needed to run models, not to create, browse, or delete sessions.
         let (mut state, _rx) = make_daemon_state();
         let (reply, rx) = mpsc::channel();
         state.handle_command(DaemonCommand::DeleteSession {
             session_id: 1,
             reply,
         });
+        // Should succeed (session 1 doesn't exist, so it's a no-op)
         let result = rx.recv().unwrap();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().to_string(), "daemon is locked");
+        assert!(
+            result.is_ok(),
+            "DeleteSession should succeed even when locked: {:?}",
+            result.err()
+        );
     }
 
     #[test]

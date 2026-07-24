@@ -171,6 +171,28 @@ impl From<&SessionState> for SessionMetadata {
     }
 }
 
+impl SessionMetadata {
+    pub fn to_summary(&self, session_id: u64) -> SessionSummary {
+        SessionSummary {
+            session_id,
+            title: self.title.clone(),
+            selected_model: self.selected_model.clone(),
+            reasoning_effort: self.reasoning_effort,
+            parent_session_id: self.parent_session_id,
+            working_dir: self.working_dir.clone(),
+            created_at: self.created_at,
+            turn_count: self.turn_count,
+            max_turns: self.max_turns,
+            status: self.status.clone(),
+            active_tool_groups: self.active_tool_groups.clone(),
+            account_name: self.account_name.clone(),
+            token_usage: Some(self.accumulated_usage),
+            context_window: self.context_window,
+            last_prompt_tokens: self.last_prompt_tokens,
+        }
+    }
+}
+
 /// Persistent configuration fields for a session.
 /// Bundled to avoid duplication across snapshot/restore, metadata conversion,
 /// and record persistence.
