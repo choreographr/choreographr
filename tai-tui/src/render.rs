@@ -319,9 +319,10 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let has_session = app.attached_session_id.is_some();
 
     let status_line = if has_session {
-        // Collect session-identity values that change infrequently and belong
-        // on the right side of the bar so they don't shift as runtime metrics
-        // (tokens, context fill) update on the left.
+        // Session-identity values (wd, provider, model, reasoning) — stable
+        // across the session — go first (left side) so the bar's leading edge
+        // stays fixed.  Runtime metrics (tokens, context fill) follow on the
+        // right where their per-turn updates don't shift the identity fields.
         let wd = app.attached_working_dir.as_deref().unwrap_or("-");
         let provider = app.attached_provider_slug.as_deref().unwrap_or("-");
         let model = app.attached_model.as_deref().unwrap_or("-");
@@ -331,9 +332,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             .map(|e| e.as_label())
             .unwrap_or("-");
 
-        // Runtime metrics: tokens flow and context-window fill.  Placed first
-        // (left side) because they update every turn and users scan quickly
-        // for changes when running inference.
+        // Runtime metrics: tokens flow and context-window fill.
         let tokens = match &app.display_token_usage() {
             Some(usage) => format!("↑{}  ↓{}", usage.input_tokens, usage.output_tokens),
             None => String::new(),
@@ -352,53 +351,53 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
                     humfmt::percent(ratio),
                 )
             }
-            (Some(limit), None) => format!("? / {}", humfmt::number(limit)),
+            (Some(limit), None) => {
+                format!("0 / {} ({})", humfmt::number(limit), humfmt::percent(0.0))
+            }
             (None, Some(current)) => format!("{} / ?", humfmt::number(current)),
             (None, None) => String::new(),
         };
 
-        // Tool groups can change at runtime via load_tools/unload_tools, so
-        // they appear after stable session metadata but before the end.
+        // Tool groups can change at runtime via load_tools/unload_tools.
         let tool_groups = app.attached_tool_groups.join(", ");
 
-        // Layout strategy: left-aligned dynamic metrics → session identity →
-        // tool groups.  Pushing session-identity items unconditionally (even
-        // when empty) keeps the separator positions stable so the bar doesn't
-        // visually jump when fields appear/disappear.
-        let mut spans: Vec<Span> = Vec::new();
+        // Order: stable identity first (wd, provider, model, reasoning) so
+        // the bar doesn't visually jitter when per-turn metrics appear or
+        // disappear; tools in the middle; runtime metrics (tokens, context
+        // window fill, active status) on the right.
+        // ── Session identity (always present, default to "-") ──
+        let mut spans: Vec<Span> = vec![
+            Span::styled(wd, Style::default().fg(Color::White)),
+            Span::raw("  |  "),
+            Span::styled(provider, Style::default().fg(Color::White)),
+            Span::raw("  |  "),
+            Span::styled(model, Style::default().fg(Color::White)),
+            Span::raw("  |  "),
+            Span::styled(reasoning, Style::default().fg(Color::White)),
+        ];
 
-        if !tokens.is_empty() {
-            spans.push(Span::styled(tokens, Style::default().fg(Color::White)));
-        }
-        if !context.is_empty() {
-            if !spans.is_empty() {
-                spans.push(Span::raw("  |  "));
-            }
-            spans.push(Span::styled(context, Style::default().fg(Color::White)));
-        }
-        if let Some(status) = &app.attached_status {
-            let (label, color) = status_display(status);
-            if !spans.is_empty() {
-                spans.push(Span::raw("  |  "));
-            }
-            spans.push(Span::styled(label, Style::default().fg(color)));
-        }
-        if !spans.is_empty() {
-            spans.push(Span::raw("  |  "));
-        }
-        spans.push(Span::styled(wd, Style::default().fg(Color::White)));
-        spans.push(Span::raw("  |  "));
-        spans.push(Span::styled(provider, Style::default().fg(Color::White)));
-        spans.push(Span::raw("  |  "));
-        spans.push(Span::styled(model, Style::default().fg(Color::White)));
-        spans.push(Span::raw("  |  "));
-        spans.push(Span::styled(reasoning, Style::default().fg(Color::White)));
+        // ── Tool groups (conditionally present) ──
         if !tool_groups.is_empty() {
             spans.push(Span::raw("  |  "));
             spans.push(Span::styled(
                 tool_groups,
                 Style::default().fg(Color::DarkGray),
             ));
+        }
+
+        // ── Runtime metrics (tokens → context → status) ──
+        if !tokens.is_empty() {
+            spans.push(Span::raw("  |  "));
+            spans.push(Span::styled(tokens, Style::default().fg(Color::White)));
+        }
+        if !context.is_empty() {
+            spans.push(Span::raw("  |  "));
+            spans.push(Span::styled(context, Style::default().fg(Color::White)));
+        }
+        if let Some(status) = &app.attached_status {
+            let (label, color) = status_display(status);
+            spans.push(Span::raw("  |  "));
+            spans.push(Span::styled(label, Style::default().fg(color)));
         }
 
         Line::from(spans)

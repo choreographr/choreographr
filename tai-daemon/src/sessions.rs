@@ -15,7 +15,7 @@ use tai_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, SessionStatus,
     SessionSummary, ThinkingEffort, TimestampMs, TokenUsage, ToolResultRecord, Turn,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Sentinel `request_id` meaning "cancel whatever is currently active, regardless of its ID".
 /// Used in child-session cancellation where we don't know the child's active request ID.
@@ -633,18 +633,30 @@ pub fn session_main(
                 state.turns.insert(turn_id, turn);
                 state.next_turn_id = state.next_turn_id.max(turn_id + 1);
             }
-            // Reconstruct accumulated_usage from per-turn token_usage so
-            // the running total survives daemon restarts without storing
-            // it redundantly in the session record.
-            state.config.accumulated_usage = state
-                .turns
-                .values()
-                .filter_map(|t| t.token_usage)
-                .fold(TokenUsage::default(), |acc, u| TokenUsage {
-                    input_tokens: acc.input_tokens + u.input_tokens,
-                    output_tokens: acc.output_tokens + u.output_tokens,
-                    total_tokens: acc.total_tokens + u.total_tokens,
-                });
+            // Reconstruct accumulated_usage and last_prompt_tokens from
+            // per-turn token_usage so both the running total and the
+            // context-window display (e.g. "45k / 128k (35%)") survive
+            // daemon restarts without storing them redundantly in the
+            // session record.  Both are derived in a single pass over
+            // turns (ordered by turn_id) — the last turn with token_usage
+            // is the most recent one, giving us last_prompt_tokens.
+            let mut accumulated_usage = TokenUsage::default();
+            let mut last_prompt_tokens = None;
+            for turn in state.turns.values() {
+                if let Some(u) = turn.token_usage {
+                    accumulated_usage.input_tokens += u.input_tokens;
+                    accumulated_usage.output_tokens += u.output_tokens;
+                    accumulated_usage.total_tokens += u.total_tokens;
+                    last_prompt_tokens = Some(u.input_tokens);
+                }
+            }
+            state.config.accumulated_usage = accumulated_usage;
+            state.config.last_prompt_tokens = last_prompt_tokens;
+            trace!(
+                last_prompt_tokens,
+                ?accumulated_usage,
+                "reconstructed token state from turns after daemon restart"
+            );
         }
         Err(e) => warn!(ctx.session_id, error = %e, "failed to load turns from DB"),
     }
@@ -1804,19 +1816,146 @@ mod tests {
         );
 
         // Run the same reconstruction logic from session_main
-        state.config.accumulated_usage = state.turns.values().filter_map(|t| t.token_usage).fold(
-            TokenUsage::default(),
-            |acc, u| TokenUsage {
-                input_tokens: acc.input_tokens + u.input_tokens,
-                output_tokens: acc.output_tokens + u.output_tokens,
-                total_tokens: acc.total_tokens + u.total_tokens,
-            },
-        );
+        let mut accumulated_usage = TokenUsage::default();
+        let mut last_prompt_tokens = None;
+        for turn in state.turns.values() {
+            if let Some(u) = turn.token_usage {
+                accumulated_usage.input_tokens += u.input_tokens;
+                accumulated_usage.output_tokens += u.output_tokens;
+                accumulated_usage.total_tokens += u.total_tokens;
+                last_prompt_tokens = Some(u.input_tokens);
+            }
+        }
+        state.config.accumulated_usage = accumulated_usage;
+        state.config.last_prompt_tokens = last_prompt_tokens;
 
         // Expected: 10+100 = 110 input, 20+50 = 70 output, 30+150 = 180 total
         assert_eq!(state.config.accumulated_usage.input_tokens, 110);
         assert_eq!(state.config.accumulated_usage.output_tokens, 70);
         assert_eq!(state.config.accumulated_usage.total_tokens, 180);
+        // last_prompt_tokens should be the most recent turn's input_tokens (turn 2 = 100)
+        assert_eq!(state.config.last_prompt_tokens, Some(100));
+    }
+
+    #[test]
+    fn last_prompt_tokens_from_latest_usage_turn() {
+        let mut state = SessionState::empty();
+
+        // Turn 0: no token_usage
+        state.turns.insert(
+            0,
+            Turn {
+                created_at: TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("no usage".into()),
+                assistant_text: None,
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                token_usage: None,
+                tool_results: Vec::new(),
+                displayed_images: Vec::new(),
+            },
+        );
+
+        // Turn 1: has token_usage
+        state.turns.insert(
+            1,
+            Turn {
+                created_at: TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("first".into()),
+                assistant_text: Some("response".into()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                token_usage: Some(TokenUsage {
+                    input_tokens: 5,
+                    output_tokens: 10,
+                    total_tokens: 15,
+                }),
+                tool_results: Vec::new(),
+                displayed_images: Vec::new(),
+            },
+        );
+
+        // Turn 2: has token_usage with larger input
+        state.turns.insert(
+            2,
+            Turn {
+                created_at: TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("second".into()),
+                assistant_text: Some("response 2".into()),
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                token_usage: Some(TokenUsage {
+                    input_tokens: 42,
+                    output_tokens: 7,
+                    total_tokens: 49,
+                }),
+                tool_results: Vec::new(),
+                displayed_images: Vec::new(),
+            },
+        );
+
+        // Reconstruct
+        let mut accumulated_usage = TokenUsage::default();
+        let mut last_prompt_tokens = None;
+        for turn in state.turns.values() {
+            if let Some(u) = turn.token_usage {
+                accumulated_usage.input_tokens += u.input_tokens;
+                accumulated_usage.output_tokens += u.output_tokens;
+                accumulated_usage.total_tokens += u.total_tokens;
+                last_prompt_tokens = Some(u.input_tokens);
+            }
+        }
+        state.config.accumulated_usage = accumulated_usage;
+        state.config.last_prompt_tokens = last_prompt_tokens;
+
+        // total usage: 5+42 = 47 input, 10+7 = 17 output, 15+49 = 64 total
+        assert_eq!(state.config.accumulated_usage.input_tokens, 47);
+        assert_eq!(state.config.accumulated_usage.output_tokens, 17);
+        assert_eq!(state.config.accumulated_usage.total_tokens, 64);
+        // Most recent turn with usage is turn 2 → input_tokens = 42
+        assert_eq!(state.config.last_prompt_tokens, Some(42));
+    }
+
+    #[test]
+    fn last_prompt_tokens_none_when_no_turns_have_usage() {
+        let mut state = SessionState::empty();
+        state.turns.insert(
+            0,
+            Turn {
+                created_at: TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some("no usage".into()),
+                assistant_text: None,
+                assistant_reasoning: None,
+                tool_calls: Vec::new(),
+                token_usage: None,
+                tool_results: Vec::new(),
+                displayed_images: Vec::new(),
+            },
+        );
+
+        let mut accumulated_usage = TokenUsage::default();
+        let mut last_prompt_tokens = None;
+        for turn in state.turns.values() {
+            if let Some(u) = turn.token_usage {
+                accumulated_usage.input_tokens += u.input_tokens;
+                accumulated_usage.output_tokens += u.output_tokens;
+                accumulated_usage.total_tokens += u.total_tokens;
+                last_prompt_tokens = Some(u.input_tokens);
+            }
+        }
+        state.config.accumulated_usage = accumulated_usage;
+        state.config.last_prompt_tokens = last_prompt_tokens;
+
+        assert_eq!(state.config.accumulated_usage.input_tokens, 0);
+        assert_eq!(state.config.last_prompt_tokens, None);
     }
 
     #[test]
