@@ -4,6 +4,8 @@ use syntect::easy::HighlightLines;
 use tai_proto::Turn;
 use tai_tui::{MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 
+use std::sync::Arc;
+
 use crate::cache::GlobalLruCache;
 use crate::diff_render::try_render_diff_content;
 use crate::render::{BG_SHADE, format_timestamp};
@@ -260,7 +262,7 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
         return 0;
     }
 
-    if lines.len() <= 1 && lines.iter().all(|line| line.width() == 0) {
+    if lines.len() == 1 && lines[0].width() == 0 {
         return 1;
     }
 
@@ -268,7 +270,6 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
         .iter()
         .map(|line| wrapped_line_height(line, width))
         .sum::<usize>()
-        .max(1)
 }
 
 /// Render a complete Turn as styled lines suitable for the chat history.
@@ -1266,6 +1267,30 @@ fn wrapped_line_height(line: &Line<'_>, width: usize) -> usize {
     }
 }
 
+/// Precompute the cumulative visual-row offset for every semantic line.
+///
+/// `visual_offsets[i]` = total visual rows covered by `lines[0..=i]`,
+/// i.e. the sum of `wrapped_line_height` for each line up to and including `i`.
+/// An empty slice is returned when `width` is 0 or when there are no lines.
+///
+/// The resulting array enables O(log n) visual-row → line-index lookups
+/// via `partition_point`.
+pub(crate) fn compute_visual_offsets(lines: &[Line<'_>], width: u16) -> Arc<[usize]> {
+    let w = width as usize;
+    let mut offsets = Vec::with_capacity(lines.len());
+    let mut acc = 0;
+    for line in lines {
+        let h = if w == 0 {
+            0
+        } else {
+            wrapped_line_height(line, w)
+        };
+        acc += h;
+        offsets.push(acc);
+    }
+    Arc::from(offsets)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1416,6 +1441,12 @@ mod tests {
     fn lines_height_empty() {
         let lines = vec![Line::from("")];
         assert_eq!(lines_height(&lines, 80), 1);
+    }
+
+    #[test]
+    fn lines_height_empty_slice_returns_zero() {
+        let lines: Vec<Line<'static>> = vec![];
+        assert_eq!(lines_height(&lines, 80), 0);
     }
 
     // ── markdown_lines ───────────────────────────────────────────────────

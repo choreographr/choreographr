@@ -14,7 +14,9 @@ use tai_tui::image_worker::{ImageId, ImageJob, ImageResult, next_job_id};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::markdown_render::{lines_height, plain_text_lines, render_turn_lines};
+use crate::markdown_render::{
+    compute_visual_offsets, lines_height, plain_text_lines, render_turn_lines,
+};
 use ratatui::text::Line;
 use tui_prompts::{SelectState, State, TextState};
 
@@ -387,7 +389,17 @@ pub(crate) struct TurnImageLayout {
 pub(crate) struct RenderedCache {
     pub lines: Arc<[Line<'static>]>,
     pub width: u16,
+    /// Full viewport width when this cache entry was computed.
+    /// Stored alongside `width` (content width) so the cache key guards
+    /// against skew in `lines_height` and `compute_visual_offsets`
+    /// computations, which depend on viewport width.
+    pub viewport_width: u16,
     pub height: usize,
+    /// Cumulative visual-row offset for each semantic line.
+    /// `visual_offsets[i]` = total visual rows covered by lines[0..=i].
+    /// Used with `partition_point` to map a visual row → semantic line index
+    /// in O(log n).
+    pub visual_offsets: Arc<[usize]>,
 }
 
 pub(crate) struct App {
@@ -1302,10 +1314,13 @@ impl App {
             let tool_content_width = self.history_viewport.width.saturating_sub(4);
             let text_lines = render_turn_lines(turn, content_width, tool_content_width);
             let text_height = lines_height(&text_lines, self.history_viewport.width).max(1);
+            let visual_offsets = compute_visual_offsets(&text_lines, self.history_viewport.width);
             computed_lines.push(Some(RenderedCache {
                 lines: Arc::from(text_lines),
                 width: content_width,
+                viewport_width: self.history_viewport.width,
                 height: text_height,
+                visual_offsets,
             }));
             // Image blocks always use `image_block_height()` — this must
             // match the render allocation in `render_turn_image` so that
@@ -3337,7 +3352,9 @@ mod tests {
         app.render_cache = vec![Some(RenderedCache {
             lines: Arc::from(Vec::<Line<'static>>::new()),
             width: 0,
+            viewport_width: 0,
             height: 0,
+            visual_offsets: Arc::from([]),
         })];
 
         app.update_viewport_from_terminal_size();
@@ -3372,7 +3389,9 @@ mod tests {
         app.render_cache = vec![Some(RenderedCache {
             lines: Arc::from(Vec::<Line<'static>>::new()),
             width: 0,
+            viewport_width: 0,
             height: 0,
+            visual_offsets: Arc::from([]),
         })];
 
         app.update_viewport_from_terminal_size();

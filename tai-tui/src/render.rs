@@ -1,4 +1,6 @@
-use crate::markdown_render::{display_width, lines_height, render_turn_lines};
+use crate::markdown_render::{
+    compute_visual_offsets, display_width, lines_height, render_turn_lines,
+};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, PROVIDER_OPTIONS, Page,
@@ -435,8 +437,9 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             break;
         }
 
-        // Get cached lines (Arc clone is O(1)) and the pre-computed height.
-        let (text_lines_arc, text_height, img_count) = {
+        // Get cached lines (Arc clone is O(1)), the pre-computed height,
+        // and cumulative visual-row offsets for O(log n) row→line lookups.
+        let (text_lines_arc, text_height, text_offsets, img_count) = {
             let Some(turn) = app.session_view.turns.get(&turn_id) else {
                 continue;
             };
@@ -444,14 +447,14 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 continue;
             }
             let count = turn.displayed_images.len();
-            let (arc, height) = cached_or_compute_lines(
+            let (arc, height, offsets) = cached_or_compute_lines(
                 &mut app.render_cache,
                 i,
                 content_width,
                 area.width,
                 || render_turn_lines(turn, content_width, tool_content_width),
             );
-            (arc, height, count)
+            (arc, height, offsets, count)
         };
 
         // ── Images (rendered first so they sit below text) ──
@@ -480,8 +483,13 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         {
             // Clone only the visible slice from the Arc — O(visible_lines)
             // instead of O(total_lines_in_turn).
-            let end = (top_line + visible_height).min(text_lines_arc.len());
-            let visible_lines = text_lines_arc[top_line..end].to_vec();
+            // Binary-search the precomputed cumulative offsets to find which
+            // semantic lines the visible visual rows span — O(log n).
+            let row_start = top_line;
+            let row_end = top_line + visible_height;
+            let line_start = text_offsets.partition_point(|&o| o <= row_start);
+            let line_end = text_offsets.partition_point(|&o| o <= row_end);
+            let visible_lines = text_lines_arc[line_start..line_end].to_vec();
             render_text_block(
                 frame,
                 area,
@@ -503,32 +511,40 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 /// computed inline and stored alongside the lines.
 ///
 /// Note: `width` is the content area width (viewport minus decorations) and
-/// `viewport_width` is the full viewport width.  They always change together
-/// since `content_width = viewport_width - 9`, so we only key the cache on
-/// `width` — `viewport_width` is never stored as a separate cache dimension.
+/// `viewport_width` is the full viewport width.  Both are stored in the cache
+/// entry and checked on lookup because `lines_height` and `visual_offsets`
+/// depend on viewport width.
 fn cached_or_compute_lines(
     cache: &mut [Option<RenderedCache>],
     index: usize,
     width: u16,
     viewport_width: u16,
     compute: impl FnOnce() -> Vec<Line<'static>>,
-) -> (Arc<[Line<'static>]>, usize) {
+) -> (Arc<[Line<'static>]>, usize, Arc<[usize]>) {
     if let Some(Some(cached)) = cache.get(index)
         && cached.width == width
+        && cached.viewport_width == viewport_width
     {
-        return (Arc::clone(&cached.lines), cached.height);
+        return (
+            Arc::clone(&cached.lines),
+            cached.height,
+            Arc::clone(&cached.visual_offsets),
+        );
     }
 
     let lines = Arc::from(compute());
     let height = lines_height(&lines, viewport_width).max(1);
+    let visual_offsets = compute_visual_offsets(&lines, viewport_width);
     if let Some(slot) = cache.get_mut(index) {
         *slot = Some(RenderedCache {
             height,
             lines: Arc::clone(&lines),
             width,
+            viewport_width,
+            visual_offsets: Arc::clone(&visual_offsets),
         });
     }
-    (lines, height)
+    (lines, height, visual_offsets)
 }
 
 fn clipped_area(
@@ -1196,7 +1212,7 @@ pub(crate) fn status_color(status: &SessionStatus) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown_render::lines_height;
+    use crate::markdown_render::{compute_visual_offsets, lines_height};
 
     // ── mouse_in_history_box ──
 
@@ -1390,14 +1406,22 @@ mod tests {
     #[test]
     fn cached_or_compute_lines_cache_miss_stores_result() {
         let mut cache = vec![None];
-        let (lines, height) = cached_or_compute_lines(&mut cache, 0, 80, 100, compute_one_line);
+        let (lines, height, offsets) =
+            cached_or_compute_lines(&mut cache, 0, 80, 100, compute_one_line);
         assert_eq!(lines.len(), 1, "should return computed lines");
         assert_eq!(height, 1, "single line at any viewport width has height 1");
+        assert_eq!(
+            &*offsets,
+            &[1],
+            "single short line should occupy one visual row"
+        );
         // Cache should be filled
         let cached = cache[0].as_ref().unwrap();
         assert_eq!(cached.width, 80);
+        assert_eq!(cached.viewport_width, 100);
         assert_eq!(cached.height, 1);
         assert_eq!(cached.lines.len(), 1);
+        assert_eq!(&*cached.visual_offsets, &[1]);
     }
 
     #[test]
@@ -1405,15 +1429,18 @@ mod tests {
         let mut cache = vec![Some(RenderedCache {
             lines: Arc::from(vec![Line::from("cached")]),
             width: 80,
+            viewport_width: 100,
             height: 42,
+            visual_offsets: Arc::from([99]),
         })];
         // Cache hit — should return stored height without recomputing
-        let (lines, height) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+        let (lines, height, offsets) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
             panic!("should not be called on cache hit")
         });
         assert_eq!(height, 42, "should return cached height");
         assert_eq!(lines.len(), 1, "should return cached lines");
         assert_eq!(lines[0], Line::from("cached"));
+        assert_eq!(&*offsets, &[99], "should return cached offsets");
     }
 
     #[test]
@@ -1423,9 +1450,11 @@ mod tests {
         let mut cache = vec![Some(RenderedCache {
             lines: stored,
             width: 80,
+            viewport_width: 100,
             height: 7,
+            visual_offsets: Arc::from([1]),
         })];
-        let (returned, _) =
+        let (returned, _, _) =
             cached_or_compute_lines(&mut cache, 0, 80, 100, || panic!("should not recompute"));
         assert_eq!(
             Arc::as_ptr(&returned),
@@ -1439,10 +1468,12 @@ mod tests {
         let mut cache = vec![Some(RenderedCache {
             lines: Arc::from(vec![Line::from("stale")]),
             width: 40, // different from requested width 80
+            viewport_width: 100,
             height: 99,
+            visual_offsets: Arc::from([1]),
         })];
         let compute_called = std::cell::Cell::new(false);
-        let (lines, height) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+        let (lines, height, offsets) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
             compute_called.set(true);
             vec![Line::from("fresh")]
         });
@@ -1450,19 +1481,47 @@ mod tests {
         assert_eq!(lines[0], Line::from("fresh"));
         // Height of a single "fresh" line at viewport width 100 is 1
         assert_eq!(height, 1);
+        assert_eq!(&*offsets, &[1], "offsets recomputed for fresh lines");
         // Cache should be updated
         let cached = cache[0].as_ref().unwrap();
         assert_eq!(cached.width, 80);
+        assert_eq!(cached.viewport_width, 100);
         assert_eq!(cached.lines[0], Line::from("fresh"));
+        assert_eq!(&*cached.visual_offsets, &[1]);
+    }
+
+    #[test]
+    fn cached_or_compute_lines_viewport_width_mismatch_recomputes() {
+        let mut cache = vec![Some(RenderedCache {
+            lines: Arc::from(vec![Line::from("stale")]),
+            width: 80,
+            viewport_width: 40, // different from requested viewport_width 100
+            height: 99,
+            visual_offsets: Arc::from([1]),
+        })];
+        let compute_called = std::cell::Cell::new(false);
+        let (lines, height, _offsets) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+            compute_called.set(true);
+            vec![Line::from("fresh")]
+        });
+        assert!(
+            compute_called.get(),
+            "should recompute on viewport_width mismatch"
+        );
+        assert_eq!(lines[0], Line::from("fresh"));
+        let cached = cache[0].as_ref().unwrap();
+        assert_eq!(cached.viewport_width, 100);
     }
 
     #[test]
     fn cached_or_compute_lines_out_of_range_index_does_not_store() {
         let mut cache = vec![None]; // length 1
         // Request index 5 which is out of range
-        let (lines, height) = cached_or_compute_lines(&mut cache, 5, 80, 100, compute_one_line);
+        let (lines, height, offsets) =
+            cached_or_compute_lines(&mut cache, 5, 80, 100, compute_one_line);
         assert_eq!(lines.len(), 1, "should still return computed result");
         assert_eq!(height, 1);
+        assert_eq!(&*offsets, &[1]);
         // Cache should remain unchanged (all entries still None since index 5 doesn't exist)
         assert!(
             cache[0].is_none(),
@@ -1479,7 +1538,7 @@ mod tests {
             Line::from("line three"),
         ];
         let expected_h = lines_height(&lines, 80);
-        let (_, height) = cached_or_compute_lines(
+        let (_, height, offsets) = cached_or_compute_lines(
             &mut cache,
             0,
             70, // content_width
@@ -1490,15 +1549,25 @@ mod tests {
             height, expected_h,
             "returned height should match lines_height"
         );
+        assert_eq!(
+            *offsets.last().unwrap(),
+            expected_h,
+            "last offset should equal total visual height"
+        );
         let cached = cache[0].as_ref().unwrap();
         assert_eq!(cached.height, expected_h, "stored height should match");
+        assert_eq!(
+            *cached.visual_offsets.last().unwrap(),
+            expected_h,
+            "stored last offset should equal total height"
+        );
     }
 
     #[test]
     fn cached_or_compute_lines_none_slot_treated_as_miss() {
         let mut cache: Vec<Option<RenderedCache>> = vec![None];
         let compute_called = std::cell::Cell::new(false);
-        let (lines, height) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+        let (lines, height, _offsets) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
             compute_called.set(true);
             compute_one_line()
         });
@@ -1506,5 +1575,94 @@ mod tests {
         assert!(cache[0].is_some(), "should fill the slot");
         drop(lines);
         drop(height);
+    }
+
+    // ── compute_visual_offsets ─────────────────────────────────
+
+    #[test]
+    fn compute_visual_offsets_single_line_fits() {
+        let lines = vec![Line::from("hello")];
+        let offsets = compute_visual_offsets(&lines, 80);
+        assert_eq!(&*offsets, &[1], "short line at wide viewport = 1 row");
+    }
+
+    #[test]
+    fn compute_visual_offsets_single_line_wraps() {
+        let long = "a".repeat(200);
+        let lines = vec![Line::from(long)];
+        let offsets = compute_visual_offsets(&lines, 80);
+        assert_eq!(&*offsets, &[3], "200 chars at 80-wide wraps to 3 rows");
+    }
+
+    #[test]
+    fn compute_visual_offsets_empty_lines_count_as_one_row_each() {
+        let lines = vec![Line::from(""), Line::from(""), Line::from("")];
+        let offsets = compute_visual_offsets(&lines, 80);
+        assert_eq!(&*offsets, &[1, 2, 3], "each empty line = 1 visual row");
+    }
+
+    #[test]
+    fn compute_visual_offsets_mixed_lines() {
+        let lines = vec![
+            Line::from("short"),
+            Line::from(""),              // 1 row
+            Line::from("x".repeat(150)), // 2 rows at 80
+        ];
+        let offsets = compute_visual_offsets(&lines, 80);
+        assert_eq!(&*offsets, &[1, 2, 4]);
+    }
+
+    #[test]
+    fn compute_visual_offsets_empty_slice() {
+        let lines: Vec<Line<'static>> = vec![];
+        let offsets = compute_visual_offsets(&lines, 80);
+        assert!(offsets.is_empty(), "no lines → no offsets");
+    }
+
+    #[test]
+    fn compute_visual_offsets_zero_width_each_line_zero() {
+        let lines = vec![Line::from("hello"), Line::from("world")];
+        let offsets = compute_visual_offsets(&lines, 0);
+        // At width 0 every line contributes 0 visual rows, so each
+        // cumulative entry stays 0 (same length as lines).
+        assert_eq!(&*offsets, &[0, 0], "zero width → each entry = 0");
+    }
+
+    // ── partition_point mapping (visual row → line index) ──────
+
+    #[test]
+    fn partition_point_finds_line_at_row_zero() {
+        let offsets = [2, 5, 7];
+        assert_eq!(offsets.partition_point(|&o| o <= 0), 0);
+    }
+
+    #[test]
+    fn partition_point_finds_line_in_middle() {
+        let offsets = [2, 5, 7];
+        // row 3 falls in the second line (offset 2 < 3, offset 5 > 3)
+        assert_eq!(offsets.partition_point(|&o| o <= 3), 1);
+    }
+
+    #[test]
+    fn partition_point_finds_line_at_exact_boundary() {
+        let offsets = [2, 5, 7];
+        // row 2 is the last visual row of line 0 — still maps to line 0
+        assert_eq!(offsets.partition_point(|&o| o <= 2), 1);
+        // row 5 maps to line 2
+        assert_eq!(offsets.partition_point(|&o| o <= 5), 2);
+    }
+
+    #[test]
+    fn partition_point_past_end_returns_len() {
+        let offsets = [2, 5, 7];
+        assert_eq!(offsets.partition_point(|&o| o <= 7), 3);
+        assert_eq!(offsets.partition_point(|&o| o <= 99), 3);
+    }
+
+    #[test]
+    fn partition_point_empty_offsets_returns_zero() {
+        let offsets: [usize; 0] = [];
+        assert_eq!(offsets.partition_point(|&o| o <= 0), 0);
+        assert_eq!(offsets.partition_point(|&o| o <= 99), 0);
     }
 }
