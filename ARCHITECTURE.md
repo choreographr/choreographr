@@ -1555,7 +1555,7 @@ to the guest syscall handler.
 2. If `source` is provided, it is first formatted via `rustfmt` (silently skipped
    if `rustfmt` is unavailable).  The formatted source is then prepended with a
    `#![no_std]` boilerplate (panic handler, entry point, `tai` module with
-   `tool_call`, `write`, `exit` syscall wrappers, optional 128 KB bump allocator
+   `tool_call`, `write`, `exit` syscall wrappers, optional 1 MB linked-list allocator
    enabled via the `allocator` parameter) and compiled via a single
    `rustc +nightly --target riscv64imac-unknown-none-elf` invocation in a temp
    directory.
@@ -1566,7 +1566,9 @@ to the guest syscall handler.
      postcard-encoded `Result<Return, String>` result to the guest's output buffer.
    - **Syscall #1 (WRITE)** — copies guest data into an accumulator buffer that becomes the tool's
      output upon VM exit.
-   - **Syscall #2 (EXIT)** — stops the VM.
+   - **Syscall #93 (EXIT)** — stops the VM. Uses the Linux exit syscall number
+     so that CKB-VM's `DefaultMachine::ecall()` handles it natively, properly
+     propagating the exit code from register A0.
 5. Loads the ELF via `TraceMachine::load_program` and runs via `TraceMachine::run()`.
 6. After execution, the machine is dropped and the output channel is drained with
    a blocking `recv()` loop (deterministic — no buffered-item race).
@@ -1584,7 +1586,7 @@ pub mod tai {
 }
 ```
 
-When `allocator: true` (the default), a `#[global_allocator]` bump allocator is also
+When `allocator: true` (the default), a `#[global_allocator]` linked-list allocator is also
 included, enabling `alloc` crate types (`Vec`, `String`, `format!`, `Box`, etc.), and
 `args()` is injected as a free function returning `Vec<Vec<u8>>`:
 
