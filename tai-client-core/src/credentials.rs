@@ -1,6 +1,6 @@
 use tai_keystore::ServiceCredential;
 use tai_proto::ClientMessage;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::ClientError;
 use crate::shell::UnlockMethod;
@@ -13,26 +13,73 @@ pub fn resolve_private_key(method: &UnlockMethod) -> Result<Vec<u8>, ClientError
     match method {
         UnlockMethod::Raw => {
             info!("reading raw private key");
-            let path = tai_keystore::paths::private_key_path()
-                .map_err(|e| ClientError::PrivateKeyRead(e.to_string()))?;
-            let data =
-                std::fs::read(&path).map_err(|e| ClientError::PrivateKeyRead(e.to_string()))?;
-            if data.len() != 32 {
-                return Err(ClientError::PrivateKeyInvalid);
-            }
-            Ok(data)
+            read_raw_private_key()
         }
         UnlockMethod::Passphrase(passphrase) => {
             info!("reading encrypted private key");
-            let enc_path = tai_keystore::paths::private_key_enc_path()
-                .map_err(|e| ClientError::PrivateKeyEncRead(e.to_string()))?;
-            let data = std::fs::read(&enc_path)
-                .map_err(|e| ClientError::PrivateKeyEncRead(e.to_string()))?;
-            let key = tai_keystore::crypto::decrypt_private_key(&data, passphrase)
-                .map_err(|e| ClientError::PrivateKeyDecrypt(e.to_string()))?;
-            Ok(key.to_vec())
+            read_encrypted_private_key(passphrase)
         }
     }
+}
+
+/// Read and validate the raw private key file (`identity.pk`).
+/// Returns 32-byte key data.
+fn read_raw_private_key() -> Result<Vec<u8>, ClientError> {
+    let path = tai_keystore::paths::private_key_path()
+        .map_err(|e| ClientError::PrivateKeyRead(e.to_string()))?;
+    let data = std::fs::read(&path).map_err(|e| ClientError::PrivateKeyRead(e.to_string()))?;
+    if data.len() != 32 {
+        return Err(ClientError::PrivateKeyInvalid);
+    }
+    Ok(data)
+}
+
+/// Read and decrypt the encrypted private key file (`identity.pk.enc`)
+/// using the given passphrase.
+fn read_encrypted_private_key(passphrase: &str) -> Result<Vec<u8>, ClientError> {
+    let enc_path = tai_keystore::paths::private_key_enc_path()
+        .map_err(|e| ClientError::PrivateKeyEncRead(e.to_string()))?;
+    let data =
+        std::fs::read(&enc_path).map_err(|e| ClientError::PrivateKeyEncRead(e.to_string()))?;
+    let key = tai_keystore::crypto::decrypt_private_key(&data, passphrase)
+        .map_err(|e| ClientError::PrivateKeyDecrypt(e.to_string()))?;
+    Ok(key.to_vec())
+}
+
+/// Try to read the private key for automatic unlock on client connect.
+///
+/// This attempts:
+/// 1. Reading `identity.pk` (raw 32-byte key) — the common case.
+/// 2. Reading `identity.pk.enc` + decrypting with `TAI_PASSPHRASE` env var —
+///    for setups where the private key is encrypted at rest.
+///
+/// Returns `None` if no key can be resolved, which is fine — the daemon
+/// starts locked but all session operations (create, browse, delete) work
+/// without unlocking.  Only inference (RunInput) requires credentials.
+pub fn try_auto_unlock_key() -> Option<Vec<u8>> {
+    match read_raw_private_key() {
+        Ok(key) => {
+            info!("auto-unlock: using raw private key");
+            return Some(key);
+        }
+        Err(ClientError::PrivateKeyInvalid) => {
+            warn!("auto-unlock: private key file exists but is not 32 bytes");
+        }
+        Err(_) => {
+            // No raw key available — fall through to encrypted path.
+        }
+    }
+
+    if let Ok(passphrase) = std::env::var("TAI_PASSPHRASE")
+        && !passphrase.is_empty()
+        && let Ok(key) = read_encrypted_private_key(&passphrase)
+    {
+        info!("auto-unlock: using encrypted private key with env passphrase");
+        return Some(key);
+    }
+
+    debug!("auto-unlock: no private key available (daemon will start locked)");
+    None
 }
 
 /// Read and validate the public key file. Returns the 32-byte public key.
@@ -185,5 +232,65 @@ mod tests {
     fn parse_credential_unknown_type() {
         let result = parse_credential("unknown", &[]);
         assert!(result.is_err());
+    }
+
+    // ── try_auto_unlock_key tests ──────────────────────────────────
+
+    #[test]
+    fn try_auto_unlock_key_with_raw_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = tai_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("tai-daemon")).unwrap();
+
+        let (_, sk) = tai_keystore::crypto::generate_keypair();
+        std::fs::write(dir.path().join("tai-daemon/identity.pk"), &sk).unwrap();
+
+        assert_eq!(try_auto_unlock_key(), Some(sk.to_vec()));
+    }
+
+    #[test]
+    fn try_auto_unlock_key_with_invalid_raw_key_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = tai_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("tai-daemon")).unwrap();
+
+        // Write a file that isn't 32 bytes
+        std::fs::write(dir.path().join("tai-daemon/identity.pk"), b"not 32 bytes").unwrap();
+
+        assert!(try_auto_unlock_key().is_none());
+    }
+
+    #[test]
+    fn try_auto_unlock_key_with_encrypted_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = tai_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("tai-daemon")).unwrap();
+
+        let (_, sk) = tai_keystore::crypto::generate_keypair();
+        let encrypted = tai_keystore::crypto::encrypt_private_key(&sk, "hunter2").unwrap();
+        std::fs::write(dir.path().join("tai-daemon/identity.pk.enc"), &encrypted).unwrap();
+
+        // Save and override the env var for the duration of this test.
+        let old = std::env::var("TAI_PASSPHRASE").ok();
+        // SAFETY: single-threaded test context; no other test reads TAI_PASSPHRASE.
+        unsafe { std::env::set_var("TAI_PASSPHRASE", "hunter2") };
+        let result = try_auto_unlock_key();
+        // Restore the previous value (if any) or remove.
+        // SAFETY: same single-threaded test context.
+        match old {
+            Some(v) => unsafe { std::env::set_var("TAI_PASSPHRASE", v) },
+            None => unsafe { std::env::remove_var("TAI_PASSPHRASE") },
+        }
+
+        assert_eq!(result, Some(sk.to_vec()));
+    }
+
+    #[test]
+    fn try_auto_unlock_key_with_no_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = tai_keystore::paths::TestConfigGuard::set_root(Some(dir.path().to_path_buf()));
+        std::fs::create_dir_all(dir.path().join("tai-daemon")).unwrap();
+
+        assert!(try_auto_unlock_key().is_none());
     }
 }

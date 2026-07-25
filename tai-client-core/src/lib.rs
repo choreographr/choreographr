@@ -10,7 +10,9 @@ pub use connection::{
     ConnectionMode, run_daemon_connection, run_daemon_connection_with_mode, run_daemon_reader,
     run_daemon_tcp_connection,
 };
-pub use credentials::{build_add_credential_message, read_public_key_bytes, resolve_private_key};
+pub use credentials::{
+    build_add_credential_message, read_public_key_bytes, resolve_private_key, try_auto_unlock_key,
+};
 pub use diff::{DiffHunk, DiffLine, DiffLineKind, FileDiff};
 pub use dispatch::{SessionStateData, ToolCallEvent, TurnEventHandler, dispatch_daemon_message};
 pub use error::{ClientError, broken_pipe};

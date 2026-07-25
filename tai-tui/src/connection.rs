@@ -265,6 +265,22 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
 
     let mut app = App::new(app_socket_path);
     app.image_job_tx = Some(worker.job_tx);
+
+    // ── Auto-unlock the daemon on connect ──────────────────────────
+    //
+    // Resolve the private key (raw key file, or encrypted key with
+    // TAI_PASSPHRASE env var) and send an Unlock message immediately.
+    // The daemon starts locked; this transparently unlocks it so the
+    // user never needs to think about lock state.  If no key is
+    // available the daemon stays locked — session operations (create,
+    // browse, delete) still work; only inference requires unlocking.
+    if let Some(private_key) = tai_client_core::try_auto_unlock_key() {
+        tracing::info!("[tai-tui] auto-unlocking daemon on connect");
+        let _ = client_tx.send(ClientMessage::Unlock { private_key });
+    } else {
+        tracing::info!("[tai-tui] no private key available — daemon starts locked");
+    }
+
     client_tx
         .send(ClientMessage::ListSessions)
         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
@@ -835,36 +851,20 @@ fn handle_chat_event(
                             // and miss the new content arriving at the bottom.
                             app.scroll_to(0);
                         }
-                        ShellCommand::Unlock { method } => {
-                            if let Some(echo) = shell_command_echo(&ShellCommand::Unlock {
-                                method: method.clone(),
-                            }) {
-                                app.status = Some(echo);
+                        ShellCommand::Unlock { method } => match resolve_private_key(&method) {
+                            Ok(private_key) => {
+                                let _ = client_tx.send(ClientMessage::Unlock { private_key });
                             }
-                            match resolve_private_key(&method) {
-                                Ok(private_key) => {
-                                    let _ = client_tx.send(ClientMessage::Unlock { private_key });
-                                }
-                                Err(e) => {
-                                    app.error = Some(format!("[error] {e}"));
-                                    return Ok(());
-                                }
+                            Err(e) => {
+                                tracing::warn!("[tai-tui] unlock failed: {e}");
                             }
-                        }
+                        },
                         ShellCommand::AddCredential {
                             ref service,
                             ref credential_type,
                             ref fields,
                             unlock,
                         } => {
-                            if let Some(echo) = shell_command_echo(&ShellCommand::AddCredential {
-                                service: service.clone(),
-                                credential_type: credential_type.clone(),
-                                fields: fields.clone(),
-                                unlock,
-                            }) {
-                                app.status = Some(echo);
-                            }
                             match build_add_credential_message(
                                 service.clone(),
                                 credential_type.clone(),
@@ -875,8 +875,7 @@ fn handle_chat_event(
                                     let _ = client_tx.send(msg);
                                 }
                                 Err(e) => {
-                                    app.error = Some(format!("[error] {e}"));
-                                    return Ok(());
+                                    tracing::warn!("[tai-tui] add credential failed: {e}");
                                 }
                             }
                         }
@@ -1326,12 +1325,13 @@ fn handle_ai_providers_credential_key(
 
             app.ai_providers.add_error = None;
 
-            // Build and send the encrypted credential
+            // Build and send the encrypted credential, auto-unlocking
+            // the daemon so the credential is immediately usable.
             match tai_client_core::build_add_credential_message(
                 account_name.clone(),
                 "api_key".to_string(),
                 vec![api_key],
-                false,
+                true,
             ) {
                 Ok(msg) => {
                     let _ = client_tx.send(msg);
@@ -1471,14 +1471,11 @@ fn submit_new_account(
         })
         .map_err(broken_pipe)?;
 
-    // If an API key was provided, encrypt and send the credential.
+    // If an API key was provided, encrypt and send the credential,
+    // auto-unlocking the daemon so the account is immediately usable.
     if !api_key.is_empty() {
-        match build_add_credential_message(
-            name.clone(),
-            "api_key".to_string(),
-            vec![api_key],
-            false,
-        ) {
+        match build_add_credential_message(name.clone(), "api_key".to_string(), vec![api_key], true)
+        {
             Ok(msg) => {
                 let _ = client_tx.send(msg);
             }
