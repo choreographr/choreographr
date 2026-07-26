@@ -20,7 +20,7 @@ use tui_prompts::{
     Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
 };
 
-pub(crate) const BG_SHADE: Color = Color::Rgb(60, 60, 60);
+pub(crate) const BG_SHADE: Color = Color::Rgb(53, 53, 53);
 
 /// Horizontal padding (columns) on each side of the command input box.
 const INPUT_PAD: u16 = 2;
