@@ -1561,6 +1561,18 @@ impl App {
                 for i in turn_idx..self.height_prefix.len() {
                     self.height_prefix[i] = self.height_prefix[i].saturating_add(delta);
                 }
+                // Preserve scroll position when user has scrolled up and
+                // streaming content grows from the bottom.  Without this the
+                // viewport shifts because the total height increased but the
+                // absolute scroll value stayed the same.
+                // We add delta to raw `scroll` rather than effective_scroll.
+                // This is correct because effective_scroll = scroll + scroll_compensation,
+                // so (scroll + delta) + compensation = (scroll + compensation) + delta.
+                // scroll_compensation, if non-zero, is left untouched.
+                let at_bottom = self.effective_scroll() == 0;
+                if !at_bottom {
+                    self.history_scroll.scroll = self.history_scroll.scroll.saturating_add(delta);
+                }
                 // Markers' absolute positions shifted — rebuild them from the
                 // updated turn_heights so click-to-scroll and scrollbar rendering
                 // stay correct.
