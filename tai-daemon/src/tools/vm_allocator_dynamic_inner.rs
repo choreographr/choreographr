@@ -1,4 +1,4 @@
-// Linked-list allocator for guest VM programs.
+// Linked-list allocator for guest VM programs — dynamic heap bounds variant.
 //
 // Adapted from the `linked_list_allocator` crate (MIT/Apache-2.0).
 // Original: https://github.com/phil-opp/blog_os/tree/main/linked-list-allocator
@@ -7,7 +7,9 @@
 // the free memory itself — no separate allocation for bookkeeping.
 //
 // Single-threaded: designed for the CKB-VM guest where only one thread runs.
-// Lazily initialises the heap on the first allocation or deallocation.
+// Unlike vm_allocator_inner.rs, this variant has **no static 1 MB heap array**.
+// Instead, the heap is initialised at runtime by `init_heap()` with bounds
+// passed by the host via registers A2 (heap_base) and A3 (heap_size).
 
 // The unsafe operations inside unsafe fn are intentional — wrapping each
 // in a redundant unsafe block adds noise without benefit.
@@ -29,15 +31,7 @@ use core::cmp::max;
 use core::ptr;
 use core::ptr::NonNull;
 
-
-
-// ── 1 MB heap ─────────────────────────────────────────────────────────────
-// With real deallocation (unlike the previous bump allocator) this is
-// effectively inexhaustible for any reasonable guest program.
-#[cfg(not(test))]
-const HEAP_SIZE: usize = 1_048_576;
-#[cfg(not(test))]
-static mut HEAP: [u8; 1_048_576] = [0; 1_048_576];
+// ── No static HEAP array — heap bounds provided at runtime via init_heap() ──
 
 // ── Hole — a free block in the linked list ────────────────────────────────
 //
@@ -298,36 +292,62 @@ impl HoleList {
 struct GlobalHeap(UnsafeCell<HoleList>);
 
 #[cfg(not(test))]
-// Single-threaded VM guest — safe to be Sync with interior mutability.
+// Safety: the VM guest runs a single hart (thread), so there is no
+// concurrent access to the HoleList.  The UnsafeCell interior mutability
+// is exercised only by the single executing thread, making Sync sound.
 unsafe impl Sync for GlobalHeap {}
 
 #[cfg(not(test))]
+/// Tracks whether `init_heap` has been called.
 static mut HEAP_INITIALIZED: bool = false;
 
 #[cfg(not(test))]
-/// Lazily initialise the heap on first use so that we don't need to modify
-/// the `_start` entry point or wire up an init call.
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn ensure_heap_initialized() {
-    if !HEAP_INITIALIZED {
-        HEAP_INITIALIZED = true;
-        let holes = &mut *ALLOC.0.get();
-        holes.init(ptr::addr_of_mut!(HEAP) as *mut u8, 1_048_576);
-    }
+/// Initialise the heap allocator with host-provided bounds.
+///
+/// Called from `_start` (in BOILERPLATE_TAIL_CLOSE) after reading
+/// heap_base from register A2 and heap_size from register A3.
+/// This function is at crate root (not inside `pub mod tai`).
+///
+/// # Safety
+///
+/// - `base` must point to a valid, writable memory region of at least
+///   `size` bytes within the VM's flat memory space.
+/// - `base` must be aligned to `core::mem::align_of::<Hole>()` (8 bytes
+///   on 64-bit RISC-V).
+/// - This function must be called exactly once before any call to
+///   the global allocator (`alloc`/`dealloc`).
+/// - Calling this function more than once without first exhausting all
+///   allocations is undefined behaviour (the existing free list is
+///   overwritten).
+pub unsafe fn init_heap(base: usize, size: usize) {
+    let holes = &mut *ALLOC.0.get();
+    holes.init(base as *mut u8, size);
+    HEAP_INITIALIZED = true;
+}
+
+#[cfg(not(test))]
+/// Guard: bails out early when `init_heap` has not been called.
+/// Returns `true` if the heap is ready, `false` if not.
+unsafe fn ensure_heap_initialized() -> bool {
+    HEAP_INITIALIZED
 }
 
 #[cfg(not(test))]
 unsafe impl GlobalAlloc for GlobalHeap {
     #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ensure_heap_initialized();
+        if !ensure_heap_initialized() {
+            return ptr::null_mut();
+        }
         let holes = &mut *self.0.get();
         holes.allocate_first_fit(layout)
     }
 
     #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        ensure_heap_initialized();
+        if !ensure_heap_initialized() {
+            return;
+        }
         let holes = &mut *self.0.get();
         holes.deallocate(ptr, layout);
     }

@@ -37,7 +37,7 @@ fn panic(_: &PanicInfo) -> ! {
 
 "#;
 
-const BOILERPLATE_ALLOC: &str = include_str!("vm_allocator_inner.rs");
+const BOILERPLATE_ALLOC_DYNAMIC: &str = include_str!("vm_allocator_dynamic_inner.rs");
 
 const BOILERPLATE_TAIL_BASE: &str = r#"
 pub mod tai {
@@ -159,17 +159,32 @@ const BOILERPLATE_TAIL_CLOSE: &str = r#"
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() {
+    // Read all input registers in one asm block before any function calls
+    // that could clobber caller-saved registers (a0-a7 are caller-saved in
+    // the RISC-V calling convention).
     let argc: usize;
     let argv: *const *const u8;
+    let heap_base: usize;
+    let heap_size: usize;
     unsafe {
         core::arch::asm!(
             "mv {argc}, a0",
             "mv {argv}, a1",
+            "mv {base}, a2",
+            "mv {size}, a3",
             argc = out(reg) argc,
             argv = out(reg) argv,
+            base = out(reg) heap_base,
+            size = out(reg) heap_size,
         );
     }
     tai::init_args(argc, argv);
+    // init_heap is at crate root (defined in vm_allocator_dynamic_inner.rs),
+    // not inside pub mod tai — no tai:: prefix needed.
+    // SAFETY: heap_base and heap_size come from the host via registers A2
+    // and A3, populated with valid page-aligned bounds within the VM's
+    // flat memory space before _start executes.
+    unsafe { init_heap(heap_base, heap_size); }
     main();
     tai::exit(0);
 }
@@ -586,7 +601,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
 
 fn build_boilerplate() -> String {
     let mut s = String::from(BOILERPLATE_HEAD);
-    s.push_str(BOILERPLATE_ALLOC);
+    s.push_str(BOILERPLATE_ALLOC_DYNAMIC);
     s.push_str(BOILERPLATE_TAIL_BASE);
     s.push_str(BOILERPLATE_TAIL_ALLOC);
     s.push_str(BOILERPLATE_TAIL_ENCODING);
@@ -886,6 +901,20 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
     Ok(elf)
 }
 
+/// Compute heap bounds for a guest VM with the given `memory_size`.
+///
+/// The heap sits between a fixed 256 KB offset and a 64 KB guard below
+/// the stack (stack occupies the top quarter of memory).  Returns
+/// `(heap_base, heap_size)` where both are in bytes and `heap_size` may
+/// be zero when memory is too small to accommodate the layout.
+fn compute_heap_bounds(memory_size: usize) -> (u64, u64) {
+    let stack_base = memory_size - memory_size / 4;
+    let heap_base: usize = 256 * 1024;
+    let heap_end = stack_base.saturating_sub(64 * 1024);
+    let heap_size = heap_end.saturating_sub(heap_base);
+    (heap_base as u64, heap_size as u64)
+}
+
 fn run_riscv_impl(
     input: &RunRiscVInput,
     x_credentials: Option<&ServiceCredential>,
@@ -988,6 +1017,12 @@ fn run_riscv_impl(
     let sp = trace.registers()[registers::SP];
     trace.set_register(registers::A0, arg_count);
     trace.set_register(registers::A1, sp + 8);
+
+    // The host passes heap bounds to the guest via A2 (heap_base) and A3
+    // (heap_size).  memory_size is already in scope from earlier.
+    let (heap_base, heap_size) = compute_heap_bounds(memory_size);
+    trace.set_register(registers::A2, heap_base);
+    trace.set_register(registers::A3, heap_size);
 
     info!(
         memory_size,
@@ -1264,6 +1299,16 @@ mod tests {
         assert!(
             result.contains("tai::exit(1)"),
             "should contain panic handler"
+        );
+        // Dynamic allocator specific: init_heap must be present and the
+        // old static 1 MB HEAP array must NOT be present.
+        assert!(
+            result.contains("fn init_heap"),
+            "should contain init_heap for dynamic allocator"
+        );
+        assert!(
+            !result.contains("static mut HEAP: [u8; 1_048_576]"),
+            "should NOT contain the old static 1 MB HEAP array"
         );
     }
 
@@ -1622,14 +1667,14 @@ mod tests {
     //
     // These tests verify the linked-list allocator logic natively on the
     // host without requiring cross-compilation to RISC-V.  The types are
-    // shared from the production allocator source (vm_allocator_inner.rs)
+    // shared from the production allocator source (vm_allocator_dynamic_inner.rs)
     // which is included here as a module.
 
     mod vm_allocator {
         // Include the production allocator source for host-side testing.
         // Items marked #[cfg(not(test))] (e.g. the global allocator) are
         // excluded when compiled under `cargo test`.
-        include!("vm_allocator_inner.rs");
+        include!("vm_allocator_dynamic_inner.rs");
     }
 
     use core::alloc::Layout;
@@ -2266,5 +2311,39 @@ mod tests {
         let (err_msg, rest): (String, &[u8]) = postcard::take_from_bytes(&encoded[1..]).unwrap();
         assert_eq!(err_msg, "infra failure");
         assert!(rest.is_empty());
+    }
+
+    // ── Heap bounds computation tests ──────────────────────────────────
+
+    #[test]
+    fn compute_heap_bounds_default_4mb() {
+        let (base, size) = compute_heap_bounds(4 * 1024 * 1024);
+        // Default 4 MB layout:
+        //   stack_base = 0x300000 (3 MB)
+        //   heap_base  = 0x040000 (256 KB)
+        //   heap_end   = 0x300000 - 0x10000 = 0x2F0000
+        //   heap_size  = 0x2F0000 - 0x040000 = 0x2B0000 (~2.75 MB)
+        assert_eq!(base, 262_144);
+        assert_eq!(size, 0x2B0000);
+    }
+
+    #[test]
+    fn compute_heap_bounds_tiny_memory_no_underflow() {
+        // memory_size of one page — heap_end would underflow without
+        // saturating arithmetic.  Verify we get heap_size = 0.
+        let (base, size) = compute_heap_bounds(4096);
+        assert_eq!(base, 262_144);
+        assert_eq!(size, 0);
+    }
+
+    #[test]
+    fn compute_heap_bounds_exactly_enough_for_heap_base() {
+        // memory_size where heap_end == heap_base → zero-size heap.
+        // stack_base = 262144 - 262144/4 = 196608
+        // heap_end = 196608 - 65536 = 131072
+        // heap_size = 131072 - 262144 → saturates to 0
+        let (base, size) = compute_heap_bounds(262_144);
+        assert_eq!(base, 262_144);
+        assert_eq!(size, 0);
     }
 }
