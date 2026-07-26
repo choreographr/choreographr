@@ -3,22 +3,7 @@ use tai_daemon::{RunRiscVInput, execute_run_riscv_tool};
 
 #[test]
 #[ignore]
-fn simple_write_no_alloc() {
-    let result = execute_run_riscv_tool(
-        &RunRiscVInput {
-            source: Some("fn main() { tai::write(b\"Hello from VM!\"); }".to_string()),
-            allocator: Some(false),
-            ..Default::default()
-        },
-        Some(Path::new("/tmp")),
-    );
-    let content = result.unwrap_or_default();
-    assert!(content.contains("Hello from VM!"), "{}", content);
-}
-
-#[test]
-#[ignore]
-fn simple_write_with_alloc() {
+fn simple_write() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
             source: Some("fn main() { tai::write(b\"Hello from VM!\"); }".to_string()),
@@ -41,15 +26,10 @@ fn exit_zero() {
         Some(Path::new("/tmp")),
     );
     let content = result.unwrap_or_default();
-    // The tool prepends the formatted source as a markdown code block.
+    // VM should exit cleanly and show the exit banner.
     assert!(
-        content.contains("```rust"),
-        "expected source block: {}",
-        content
-    );
-    assert!(
-        content.contains("fn main()"),
-        "expected source: {}",
+        content.contains("exited with code 0"),
+        "expected exit banner: {}",
         content
     );
 }
@@ -185,29 +165,14 @@ fn invalid_base64_program() {
 
 #[test]
 #[ignore]
-fn write_with_allocator() {
+fn write_with_vec() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
-            source: Some("fn main() { let mut v = alloc::vec::Vec::new(); v.push(72u8); v.push(105u8); tai::write(&v); }".to_string()),
+            source: Some("fn main() { let mut v = Vec::new(); v.push(72u8); v.push(105u8); tai::write(&v); }".to_string()),
             ..Default::default()
         },
         Some(Path::new("/tmp")),
     );
     let content = result.unwrap_or_default();
     assert!(content.contains("Hi"), "{}", content);
-}
-
-#[test]
-#[ignore]
-fn no_allocator_omits_args() {
-    let result = execute_run_riscv_tool(
-        &RunRiscVInput {
-            source: Some("fn main() { tai::write(b\"no alloc\"); }".to_string()),
-            allocator: Some(false),
-            ..Default::default()
-        },
-        Some(Path::new("/tmp")),
-    );
-    let content = result.unwrap_or_default();
-    assert!(content.contains("no alloc"), "{}", content);
 }

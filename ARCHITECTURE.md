@@ -1554,9 +1554,9 @@ to the guest syscall handler.
 1. Accepts either Rust `source` or pre-compiled base64 `program`.
 2. If `source` is provided, it is first formatted via `rustfmt` (silently skipped
    if `rustfmt` is unavailable).  The formatted source is then prepended with a
-   `#![no_std]` boilerplate (panic handler, entry point, `tai` module with
-   `tool_call`, `write`, `exit` syscall wrappers, optional 1 MB linked-list allocator
-   enabled via the `allocator` parameter) and compiled via a single
+    `#![no_std]` boilerplate (panic handler, entry point, `tai` module with
+    `tool_call`, `write`, `exit` syscall wrappers, 1 MB linked-list allocator)
+    and compiled via a single
    `rustc +nightly --target riscv64imac-unknown-none-elf` invocation in a temp
    directory.
 3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory.
@@ -1586,16 +1586,13 @@ pub mod tai {
 }
 ```
 
-When `allocator: true` (the default), a `#[global_allocator]` linked-list allocator is also
-included, enabling `alloc` crate types (`Vec`, `String`, `format!`, `Box`, etc.), and
-`args()` is injected as a free function returning `Vec<Vec<u8>>`:
+A `#[global_allocator]` linked-list allocator is always included, enabling `alloc` crate
+types (`Vec`, `String`, `format!`, `Box`, etc.), and `args()` is injected as a free function
+returning `Vec<Vec<u8>>`:
 
 ```rust
 pub fn args() -> Vec<Vec<u8>>;
 ```
-
-With `allocator: false`, `args()` is not available and the guest must access `argc`/`argv`
-directly from the RISC-V ABI registers (`a0`/`a1` at `_start`).
 
 **Safety:** The guest runs in an isolated VM with 4 MB of flat memory. All tool access goes
 through the same `ToolRegistry` as the host agent, respecting the same `x_credentials` and `working_dir`.

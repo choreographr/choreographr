@@ -26,6 +26,7 @@ const BOILERPLATE_HEAD: &str = r#"
 #![no_std]
 #![no_main]
 #![feature(asm_experimental_arch)]
+#![allow(unused_imports)]
 
 use core::panic::PanicInfo;
 
@@ -36,7 +37,7 @@ fn panic(_: &PanicInfo) -> ! {
 
 "#;
 
-const BOILERPLATE_ALLOC: &str = include_str!("vm_allocator.rs");
+const BOILERPLATE_ALLOC: &str = include_str!("vm_allocator_inner.rs");
 
 const BOILERPLATE_TAIL_BASE: &str = r#"
 pub mod tai {
@@ -66,8 +67,9 @@ pub mod tai {
     pub const BATCH_TOOL_CALL: u64 = 3;
 
     pub unsafe fn tool_call(request: &[u8], output: &mut [u8]) -> usize {
+        let result: usize;
+        // SAFETY: ecall is inherently unsafe; caller ensures valid pointers/lengths.
         unsafe {
-            let result: usize;
             core::arch::asm!(
                 "ecall",
                 in("a0") request.as_ptr(),
@@ -78,8 +80,8 @@ pub mod tai {
                 lateout("a0") result,
                 options(nostack)
             );
-            result
         }
+        result
     }
 
     pub fn write(data: &[u8]) {
@@ -110,8 +112,9 @@ pub mod tai {
     /// Response format is: [count: varint][result]*
     /// where each result is a postcard-encoded `Result<Vec<u8>, String>`.
     pub unsafe fn batch_tool_call(request: &[u8], output: &mut [u8]) -> usize {
+        let result: usize;
+        // SAFETY: ecall is inherently unsafe; caller ensures valid pointers/lengths.
         unsafe {
-            let result: usize;
             core::arch::asm!(
                 "ecall",
                 in("a0") request.as_ptr(),
@@ -122,8 +125,8 @@ pub mod tai {
                 lateout("a0") result,
                 options(nostack)
             );
-            result
         }
+        result
     }
 "#;
 
@@ -174,10 +177,9 @@ pub extern "C" fn _start() {
 
 /// Convenience `alloc` imports available at the crate root for user code.
 ///
-/// When the allocator is enabled, these are pre-imported so user code can
-/// use `Vec`, `String`, `Box`, `format!`, and `.to_string()` without
-/// explicit imports.  They live outside `pub mod tai` so they're in scope
-/// for the user's `fn main()`.
+/// These are pre-imported so user code can use `Vec`, `String`, `Box`,
+/// `format!`, and `.to_string()` without explicit imports.  They live
+/// outside `pub mod tai` so they're in scope for the user's `fn main()`.
 const BOILERPLATE_CONVENIENCE_IMPORTS: &str = r#"
 use alloc::vec::Vec;
 use alloc::string::String;
@@ -289,22 +291,40 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         Ok((s, end))
     }
 
-    /// Decode a postcard `Result<Vec<u8>, String>` from a byte slice.
-    /// Returns Ok(bytes) or Err(error_string).
-    pub fn dec_result<'a>(resp: &'a [u8]) -> Result<&'a [u8], &'a str> {
-        if resp.is_empty() { return Err("empty response"); }
-        let status = resp[0];
-        let rest = &resp[1..];
-        let (payload_len, consumed) = dec_varint(rest)?;
-        let start = consumed;
-        let end = start + payload_len as usize;
-        if end > rest.len() {
-            return Err("truncated payload");
+    /// Shared helper: decode a double-wrapped Result `Result<Result<R, E>, ToolError>`.
+    ///
+    /// Given a frame starting at `[outer_status][inner_status][payload]`,
+    /// strips both status bytes and returns the inner payload or domain/infra error.
+    fn decode_double_frame<'a>(frame: &'a [u8]) -> Result<&'a [u8], &'a str> {
+        if frame.is_empty() {
+            return Err("empty frame");
         }
-        let payload = &rest[start..end];
-        match status {
-            0 => Ok(payload),       // Ok
-            1 => Err(core::str::from_utf8(payload).unwrap_or("decode error")), // Err
+        let outer_status = frame[0];
+        match outer_status {
+            0 => {
+                // Outer Ok — strip inner status byte too
+                if frame.len() < 2 {
+                    return Err("truncated Ok");
+                }
+                let inner_status = frame[1];
+                let payload = &frame[2..];
+                match inner_status {
+                    0 => Ok(payload),   // Inner Ok — raw postcard of tool's return type
+                    1 => {
+                        // Inner Err — domain error string
+                        let (err_str, _consumed) = dec_str(payload)
+                            .map_err(|_| "failed to decode domain error")?;
+                        Err(err_str)
+                    }
+                    _ => Err("unknown inner result status"),
+                }
+            }
+            1 => {
+                // Outer Err — infrastructure error
+                let (err_str, _consumed) = dec_str(&frame[1..])
+                    .map_err(|_| "failed to decode infrastructure error")?;
+                Err(err_str)
+            }
             _ => Err("unknown result status"),
         }
     }
@@ -313,53 +333,44 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
     ///
     /// The host wraps every tool result as `Result<Result<R, E>, ToolError>`:
     ///   Ok(Ok(data))   — tool succeeded, `data` is the tool's return payload
+    ///                    (raw postcard-encoded return value of R)
     ///   Ok(Err(e))     — tool failed with domain error `e`
     ///   Err(infra_err) — infrastructure failure (unknown tool, postcard decode
     ///                    error, etc.)
     ///
-    /// This function strips both layers in one shot.  If you only call the
-    /// single-layer `dec_result` on the raw response, the inner `Ok`/`Err` tag
-    /// byte (0x00 or 0x01) gets misinterpreted as a postcard varint length by
-    /// `dec_varint`, yielding an empty or corrupt payload.
+    /// This function strips both outer and inner status bytes and returns
+    /// the raw postcard-encoded tool return value.  Callers who interpret
+    /// the result as a `String` must then decode it with `dec_str()` since
+    /// the returned slice still includes the postcard varint length prefix.
     pub fn dec_double_result<'a>(resp: &'a [u8]) -> Result<&'a [u8], &'a str> {
-        if resp.is_empty() {
-            return Err("empty response");
-        }
-        let outer_status = resp[0];
-        let rest = &resp[1..];
-        match outer_status {
-            0 => {
-                // Outer Ok — the payload is an inner Result<Vec<u8>, String>.
-                // Delegate to single-layer dec_result to unwrap it.
-                dec_result(rest)
-            }
-            1 => {
-                // Outer Err — infrastructure error.  Postcard encodes a String
-                // as varint(length) + UTF-8 bytes.
-                let (err_str, _consumed) = dec_str(rest)
-                    .map_err(|_| "failed to decode infrastructure error")?;
-                Err(err_str)
-            }
-            _ => Err("unknown result status byte"),
-        }
+        decode_double_frame(resp)
     }
 
-    /// Like `dec_result` but also returns the total number of bytes consumed
-    /// so callers can advance a cursor across a sequence of results.
+    /// Convenience wrapper: decode a double-wrapped result and extract the
+    /// postcard-encoded `String` inside.  Returns Err on decode failure.
+    pub fn dec_double_str_result<'a>(resp: &'a [u8]) -> Result<String, &'a str> {
+        let b = dec_double_result(resp)?;
+        let (s, _) = dec_str(b).map_err(|_| "failed to decode string payload")?;
+        Ok(s.to_string())
+    }
+
+    /// Like `dec_double_result` but also returns the total number of bytes
+    /// consumed so callers can advance a cursor across a sequence of results.
+    ///
+    /// The batch response format is:
+    ///   [count: varint][frame_len: varint][frame: Result<Result<R, E>, ToolError>]*
+    ///
+    /// The host prefixes each frame with a varint length so we can find frame
+    /// boundaries without knowing the postcard encoding of the generic type R.
     pub fn dec_result_raw<'a>(data: &'a [u8]) -> Result<(&'a [u8], usize), &'a str> {
         if data.is_empty() { return Err("empty"); }
-        let status = data[0];
-        let (payload_len, mut consumed) = dec_varint(&data[1..])?;
-        consumed += 1; // account for the status byte
-        let payload_start = consumed;
-        let payload_end = payload_start + payload_len as usize;
-        if payload_end > data.len() { return Err("truncated payload"); }
-        let payload = &data[payload_start..payload_end];
-        match status {
-            0 => Ok((payload, payload_end)),
-            1 => Err(core::str::from_utf8(payload).map_err(|_| "invalid utf-8")?),
-            _ => Err("unknown result status"),
-        }
+        let (frame_len, consumed) = dec_varint(data)?;
+        let frame_start = consumed;
+        let frame_end = frame_start + frame_len as usize;
+        if frame_end > data.len() { return Err("truncated frame"); }
+        let frame = &data[frame_start..frame_end];
+        let payload = decode_double_frame(frame)?;
+        Ok((payload, frame_end))
     }
 
     // ── Tool call helpers ─────────────────────────────────────────────
@@ -406,7 +417,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
             match dec_result_raw(&data[pos..]) {
                 Ok((payload, end)) => {
                     results.push(Ok(payload.to_vec()));
-                    pos = end;
+                    pos += end;
                 }
                 Err(e) => {
                     // Decoding failed mid-stream; return partial results and stop.
@@ -436,8 +447,8 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
     /// The host's `DbGet` tool returns `Option<String>`, which gets wrapped
     /// by `encode_outer` into `Result<Result<Option<String>, DbError>, ToolError>`.
     /// We first strip the double-wrapped Result via `dec_double_result`, then
-    /// decode the inner `Option<String>` manually (since the inner payload type
-    /// differs from `Vec<u8>` that `dec_result` expects).
+    /// decode the inner `Option<String>` manually (since the inner payload is
+    /// an `Option`, not a bare `Vec<u8>`).
     pub fn db_get(key: &str) -> Vec<u8> {
         let mut args = Vec::new();
         enc_str(key, &mut args);
@@ -480,10 +491,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         let mut args = Vec::new();
         enc_str(path, &mut args);
         let resp = call("read_file", &args);
-        match dec_double_result(&resp) {
-            Ok(b) => String::from_utf8_lossy(b).to_string(),
-            Err(_) => String::new(),
-        }
+        dec_double_str_result(&resp).unwrap_or_default()
     }
 
     /// write_file(path: &str, content: &str, overwrite: bool).
@@ -491,17 +499,18 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         let mut args = Vec::new();
         enc_str(path, &mut args);
         enc_str(content, &mut args);
-        enc_bool(overwrite, &mut args);
+        // Both fields are Option<bool> in the daemon's WriteFileArgs.
+        // Use key = Some(overwrite) and create_parents = Some(true) (safe default).
+        enc_option_bool(Some(overwrite), &mut args);
+        enc_option_bool(Some(true), &mut args);
         let _resp = call("write_file", &args);
     }
 
     /// git_status() -> status string.
     pub fn git_status() -> String {
-        let resp = call("git_status", &[]);
-        match dec_double_result(&resp) {
-            Ok(b) => String::from_utf8_lossy(b).to_string(),
-            Err(_) => String::new(),
-        }
+        // GitRepoArgs { repo_path: None } = postcard 0x00
+        let resp = call("git_status", &[0x00]);
+        dec_double_str_result(&resp).unwrap_or_default()
     }
 
     /// grep(pattern: &str) -> file content search results as string.
@@ -513,10 +522,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         enc_option_str(None, &mut args);  // path
         enc_option_u64(None, &mut args);  // max_results
         let resp = call("grep", &args);
-        match dec_double_result(&resp) {
-            Ok(b) => String::from_utf8_lossy(b).to_string(),
-            Err(_) => String::new(),
-        }
+        dec_double_str_result(&resp).unwrap_or_default()
     }
 
     /// find(pattern: &str) -> file name search results as string.
@@ -528,10 +534,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         enc_option_str(None, &mut args);  // path
         enc_option_u64(None, &mut args);  // max_results
         let resp = call("find", &args);
-        match dec_double_result(&resp) {
-            Ok(b) => String::from_utf8_lossy(b).to_string(),
-            Err(_) => String::new(),
-        }
+        dec_double_str_result(&resp).unwrap_or_default()
     }
 
     /// http_request(method: &str, url: &str, body: Option<&str>, timeout_secs: Option<u64>) -> response string.
@@ -549,10 +552,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         enc_option_str(body, &mut args);
         enc_option_u64(timeout_secs, &mut args);
         let resp = call("http_request", &args);
-        match dec_double_result(&resp) {
-            Ok(b) => String::from_utf8_lossy(b).to_string(),
-            Err(_) => String::new(),
-        }
+        dec_double_str_result(&resp).unwrap_or_default()
     }
 
     /// sh(command: &str, shell: Shell) -> command output string.
@@ -565,10 +565,7 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         enc_option_str(workdir, &mut args);
         enc_option_u64(timeout_ms, &mut args);
         let resp = call("sh", &args);
-        match dec_double_result(&resp) {
-            Ok(b) => String::from_utf8_lossy(b).to_string(),
-            Err(_) => String::new(),
-        }
+        dec_double_str_result(&resp).unwrap_or_default()
     }
 
     /// exec(command: &str, cmd_args: &[&str], workdir: Option<&str>, timeout_ms: Option<u64>) -> command output string.
@@ -583,27 +580,18 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         enc_option_str(workdir, &mut args);
         enc_option_u64(timeout_ms, &mut args);
         let resp = call("exec", &args);
-        match dec_double_result(&resp) {
-            Ok(b) => String::from_utf8_lossy(b).to_string(),
-            Err(_) => String::new(),
-        }
+        dec_double_str_result(&resp).unwrap_or_default()
     }
 "#;
 
-fn build_boilerplate(enable_allocator: bool) -> String {
+fn build_boilerplate() -> String {
     let mut s = String::from(BOILERPLATE_HEAD);
-    if enable_allocator {
-        s.push_str(BOILERPLATE_ALLOC);
-    }
+    s.push_str(BOILERPLATE_ALLOC);
     s.push_str(BOILERPLATE_TAIL_BASE);
-    if enable_allocator {
-        s.push_str(BOILERPLATE_TAIL_ALLOC);
-        s.push_str(BOILERPLATE_TAIL_ENCODING);
-    }
+    s.push_str(BOILERPLATE_TAIL_ALLOC);
+    s.push_str(BOILERPLATE_TAIL_ENCODING);
     s.push_str(BOILERPLATE_TAIL_CLOSE);
-    if enable_allocator {
-        s.push_str(BOILERPLATE_CONVENIENCE_IMPORTS);
-    }
+    s.push_str(BOILERPLATE_CONVENIENCE_IMPORTS);
     s
 }
 
@@ -654,7 +642,6 @@ pub struct RunRiscVInput {
     pub args: Option<Vec<String>>,
     pub max_cycles: Option<u64>,
     pub memory_size: Option<usize>,
-    pub allocator: Option<bool>,
 }
 
 struct TaiSyscall {
@@ -777,13 +764,19 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
                         .collect()
                 });
 
-                // Encode response: [count: varint][result: postcard Result]*.
-                // Each result from execute_postcard is already a postcard-encoded
-                // Result<Vec<u8>, String>, so we just concatenate them.
+                // Encode response: [count: varint][frame_len: varint][frame_bytes]*.
+                // Each result from execute_postcard is a postcard-encoded
+                // Result<Result<R, E>, ToolError>.  Since the guest doesn't know R's
+                // postcard length at compile time, we prefix each frame with a varint
+                // length so the guest's dec_result_raw can find frame boundaries.
                 let count_encoded: Vec<u8> = postcard::to_allocvec(&(results.len() as u32))
                     .map_err(|_| VmError::Unexpected("batch encode count failed".into()))?;
                 let mut response = count_encoded;
                 for r in &results {
+                    let frame_len: u32 = r.len() as u32;
+                    let len_encoded = postcard::to_allocvec(&frame_len)
+                        .map_err(|_| VmError::Unexpected("batch encode len failed".into()))?;
+                    response.extend_from_slice(&len_encoded);
                     response.extend_from_slice(r);
                 }
 
@@ -801,7 +794,7 @@ impl Syscalls<DefaultCoreMachine<u64, FlatMemory<u64>>> for TaiSyscall {
     }
 }
 
-fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
+fn compile(source: &str) -> Result<Vec<u8>, String> {
     let target = "riscv64imac-unknown-none-elf";
 
     let version = Command::new("rustc")
@@ -818,7 +811,7 @@ fn compile(source: &str, enable_allocator: bool) -> Result<Vec<u8>, String> {
     let input_path = dir.path().join("main.rs");
     let output_path = dir.path().join("output.elf");
 
-    let boilerplate = build_boilerplate(enable_allocator);
+    let boilerplate = build_boilerplate();
     let full_source = format!("{boilerplate}\n// User code\n{source}");
     std::fs::write(&input_path, &full_source)
         .map_err(|e| format!("failed to write source: {e}"))?;
@@ -901,8 +894,6 @@ fn run_riscv_impl(
     registry: Arc<ToolRegistry>,
     ctx: Option<crate::tools::context::ToolContext>,
 ) -> ToolOutput {
-    let enable_allocator = input.allocator.unwrap_or(true);
-
     // Format the user's Rust source with rustfmt before compiling.
     // When rustfmt is unavailable or the file is already well-formatted the
     // output is identical to the input — the fallback is invisible.
@@ -924,7 +915,7 @@ fn run_riscv_impl(
                 let _ = tx.send(format!("$ {compile_cmd}\n").as_bytes().to_vec());
             }
 
-            match compile(source, enable_allocator) {
+            match compile(source) {
                 Ok(elf) => elf,
                 Err(e) => {
                     return tool_err(format!("$ {compile_cmd}\n{e}"));
@@ -1088,7 +1079,7 @@ impl Tool for RunRiscV {
                 {
                     parts.push(format!("\nProgram args: {:?}.", prog_args));
                 }
-                parts.push(format!("\nAllocator: {}.", args.allocator.unwrap_or(true)));
+                parts.push(String::from("\nAllocator: included."));
                 parts.push(format!(
                     "\nMax cycles: {}.",
                     args.max_cycles.unwrap_or(1_000_000)
@@ -1115,7 +1106,7 @@ impl Tool for RunRiscV {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `tai` module — these are auto-generated. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. Use the provided wrappers: tai::write(b\"...\"), tai::exit(code), and per-tool wrappers like tai::read_file(path), tai::write_file(path, content, overwrite), tai::db_get(key), tai::db_set(key, value), tai::sh(command, shell, ...), tai::exec(command, args, ...), tai::grep(pattern), tai::find(pattern), tai::http_request(method, url, headers, body, timeout). The wrappers handle postcard encoding automatically — no need to call tai::tool_call or tai::call directly. Example: `fn main() { let content = tai::read_file(\"Cargo.toml\"); tai::write(content.as_bytes()); }`. When allocator:true (default), alloc types are pre-imported: Vec, String, Box, format!, .to_string()."
+                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `tai` module — these are auto-generated. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. Use the provided wrappers: tai::write(b\"...\"), tai::exit(code), and per-tool wrappers like tai::read_file(path), tai::write_file(path, content, overwrite), tai::db_get(key), tai::db_set(key, value), tai::sh(command, shell, ...), tai::exec(command, args, ...), tai::grep(pattern), tai::find(pattern), tai::http_request(method, url, headers, body, timeout). The wrappers handle postcard encoding automatically — no need to call tai::tool_call or tai::call directly. Example: `fn main() { let content = tai::read_file(\"Cargo.toml\"); tai::write(content.as_bytes()); }`. Alloc types are pre-imported: Vec, String, Box, format!, .to_string()."
                 },
                 "program": {
                     "type": "string",
@@ -1124,15 +1115,16 @@ impl Tool for RunRiscV {
                 "args": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Command-line arguments passed to the guest program. Read them with tai::args() -> Vec<Vec<u8>> in the guest code (requires allocator: true, the default)."
+                    "description": "Command-line arguments passed to the guest program. Read them with tai::args() -> Vec<Vec<u8>> in the guest code."
                 },
-                "allocator": {
-                    "type": "boolean",
-                     "description": "Include a 1 MB linked-list allocator (#[global_allocator]) so guest code can use alloc crate types (Vec, String, format!, Box, etc.). When true, tai::args() is available to parse guest argv. When false, args() is omitted and guest code must access argc/argv directly from _start's a0/a1 registers. Default: true."
-                },
+
                 "max_cycles": {
                     "type": "integer",
                     "description": "Maximum CPU cycles before VM termination (default: 1_000_000)"
+                },
+                "memory_size": {
+                    "type": "integer",
+                    "description": "VM memory size in bytes (default: 4_194_304, must be a multiple of 4096, max 4MB)"
                 }
             }
         })
@@ -1261,8 +1253,8 @@ mod tests {
     }
 
     #[test]
-    fn build_boilerplate_with_alloc_includes_allocator() {
-        let result = build_boilerplate(true);
+    fn build_boilerplate_includes_allocator() {
+        let result = build_boilerplate();
         assert!(
             result.contains("struct HoleList"),
             "should contain linked-list allocator"
@@ -1276,26 +1268,8 @@ mod tests {
     }
 
     #[test]
-    fn build_boilerplate_without_alloc_excludes_allocator() {
-        let result = build_boilerplate(false);
-        assert!(
-            !result.contains("struct HoleList"),
-            "should NOT contain linked-list allocator"
-        );
-        assert!(!result.contains("fn args()"), "should NOT contain args()");
-        assert!(
-            result.contains("fn _start()"),
-            "should still contain _start"
-        );
-        assert!(
-            result.contains("tai::exit(1)"),
-            "should still contain panic handler"
-        );
-    }
-
-    #[test]
     fn build_boilerplate_contains_tai_module() {
-        let result = build_boilerplate(false);
+        let result = build_boilerplate();
         assert!(result.contains("pub mod tai"));
         assert!(result.contains("TOOL_CALL"));
         assert!(result.contains("WRITE"));
@@ -1646,14 +1620,20 @@ mod tests {
 
     // ── Allocator unit tests ─────────────────────────────────────────
     //
-    // These tests replicate the linked-list allocator data structures
-    // (Hole, HoleList, align_up) on the host side and verify their
-    // behaviour directly without requiring cross-compilation to RISC-V.
-    // The production allocator lives in vm_allocator.rs (included via
-    // include_str!) and runs inside the guest VM.
+    // These tests verify the linked-list allocator logic natively on the
+    // host without requiring cross-compilation to RISC-V.  The types are
+    // shared from the production allocator source (vm_allocator_inner.rs)
+    // which is included here as a module.
+
+    mod vm_allocator {
+        // Include the production allocator source for host-side testing.
+        // Items marked #[cfg(not(test))] (e.g. the global allocator) are
+        // excluded when compiled under `cargo test`.
+        include!("vm_allocator_inner.rs");
+    }
 
     use core::alloc::Layout;
-    use core::ptr::NonNull;
+    use vm_allocator::{Hole, HoleList, align_up};
 
     /// Min-aligned test heap size — big enough for many allocation patterns.
     const TEST_HEAP_SIZE: usize = 4096;
@@ -1664,223 +1644,6 @@ mod tests {
     struct AlignedHeap([u8; TEST_HEAP_SIZE]);
 
     static mut TEST_HEAP: AlignedHeap = AlignedHeap([0; TEST_HEAP_SIZE]);
-
-    // Replicate the Hole/HoleList types from vm_allocator.rs so we can test
-    // the logic natively.  Layout must match the riscv64 version (24 bytes).
-
-    struct Hole {
-        next: Option<NonNull<Hole>>,
-        size: usize,
-        prev: Option<NonNull<Hole>>,
-    }
-
-    impl Hole {
-        fn header_size() -> usize {
-            core::mem::size_of::<Self>()
-        }
-        fn min_size() -> usize {
-            Self::header_size()
-        }
-        fn align() -> usize {
-            core::mem::align_of::<Self>()
-        }
-        fn round_to_align(size: usize) -> usize {
-            align_up(size, Self::align())
-        }
-        fn start(&self) -> *mut u8 {
-            unsafe { (self as *const Self as *mut u8).add(Self::header_size()) }
-        }
-        fn end(&self) -> *mut u8 {
-            unsafe { (self as *const Self as *mut u8).add(self.size) }
-        }
-    }
-
-    struct HoleList {
-        front: Option<NonNull<Hole>>,
-    }
-
-    impl HoleList {
-        fn new() -> Self {
-            HoleList { front: None }
-        }
-
-        unsafe fn init(&mut self, addr: *mut u8, size: usize) {
-            unsafe {
-                core::ptr::write(
-                    addr as *mut Hole,
-                    Hole { next: None, size, prev: None },
-                );
-                self.front = Some(NonNull::new_unchecked(addr as *mut Hole));
-            }
-        }
-
-        unsafe fn allocate_first_fit(&mut self, layout: Layout) -> *mut u8 {
-            unsafe {
-                let size = Hole::round_to_align(core::cmp::max(layout.size(), Hole::min_size()));
-                let effective_align = core::cmp::max(layout.align(), Hole::align());
-
-                let mut current = self.front;
-                while let Some(hole_ptr) = current {
-                    let hole = &*hole_ptr.as_ptr();
-
-                    let hole_addr = hole_ptr.as_ptr() as usize;
-                    let hole_end_addr = hole_addr.wrapping_add(hole.size);
-
-                    let aligned = align_up(hole_addr, effective_align) as *mut u8;
-                    let aligned_addr = aligned as usize;
-                    let alloc_end = aligned_addr.wrapping_add(size);
-
-                    if aligned_addr < hole_addr
-                        || aligned_addr >= hole_end_addr
-                        || alloc_end > hole_end_addr
-                    {
-                        current = hole.next;
-                        continue;
-                    }
-
-                    self.remove(hole_ptr);
-
-                    let front_gap = aligned_addr.wrapping_sub(hole_addr);
-                    if front_gap >= Hole::min_size() {
-                        let front_hole = hole_addr as *mut Hole;
-                        core::ptr::write(
-                            front_hole,
-                            Hole { next: None, size: front_gap, prev: None },
-                        );
-                        self.insert(NonNull::new_unchecked(front_hole));
-                    }
-
-                    let tail = hole_end_addr.wrapping_sub(alloc_end);
-                    if tail >= Hole::min_size() {
-                        let tail_hole = aligned.add(size) as *mut Hole;
-                        core::ptr::write(
-                            tail_hole,
-                            Hole { next: None, size: tail, prev: None },
-                        );
-                        self.insert(NonNull::new_unchecked(tail_hole));
-                    }
-
-                    return aligned;
-                }
-
-                core::ptr::null_mut()
-            }
-        }
-
-        unsafe fn deallocate(&mut self, ptr: *mut u8, layout: Layout) {
-            unsafe {
-                let size = Hole::round_to_align(core::cmp::max(layout.size(), Hole::min_size()));
-                core::ptr::write(
-                    ptr as *mut Hole,
-                    Hole { next: None, size, prev: None },
-                );
-                self.insert(NonNull::new_unchecked(ptr as *mut Hole));
-            }
-        }
-
-        unsafe fn remove(&mut self, hole: NonNull<Hole>) {
-            unsafe {
-                let prev = (*hole.as_ptr()).prev;
-                let next = (*hole.as_ptr()).next;
-                if let Some(p) = prev {
-                    (*p.as_ptr()).next = next;
-                } else {
-                    self.front = next;
-                }
-                if let Some(n) = next {
-                    (*n.as_ptr()).prev = prev;
-                }
-            }
-        }
-
-        unsafe fn insert(&mut self, mut hole: NonNull<Hole>) {
-            unsafe {
-                let hole_addr = hole.as_ptr() as usize;
-                let mut current = self.front;
-                let mut prev: Option<NonNull<Hole>> = None;
-                while let Some(curr) = current {
-                    if curr.as_ptr() as usize > hole_addr {
-                        break;
-                    }
-                    prev = current;
-                    current = (*curr.as_ptr()).next;
-                }
-                (*hole.as_ptr()).prev = prev;
-                (*hole.as_ptr()).next = current;
-                if let Some(p) = prev {
-                    (*p.as_ptr()).next = Some(hole);
-                } else {
-                    self.front = Some(hole);
-                }
-                if let Some(c) = current {
-                    (*c.as_ptr()).prev = Some(hole);
-                }
-                // Merge with previous if adjacent.
-                if let Some(p) = prev {
-                    let p_off = p.as_ptr() as usize;
-                    let p_sz = (*p.as_ptr()).size;
-                    let h_off = hole.as_ptr() as usize;
-                    let h_sz = (*hole.as_ptr()).size;
-                    if p_off.wrapping_add(p_sz) >= h_off {
-                        let new_sz = core::cmp::max(
-                            p_off.wrapping_add(p_sz),
-                            h_off.wrapping_add(h_sz),
-                        ) - p_off;
-                        (*p.as_ptr()).size = new_sz;
-                        (*p.as_ptr()).next = (*hole.as_ptr()).next;
-                        if let Some(n) = (*hole.as_ptr()).next {
-                            (*n.as_ptr()).prev = Some(p);
-                        }
-                        hole = p;
-                    }
-                }
-                // Merge with next if adjacent.
-                if let Some(n) = (*hole.as_ptr()).next {
-                    let h_off = hole.as_ptr() as usize;
-                    let h_sz = (*hole.as_ptr()).size;
-                    let n_off = n.as_ptr() as usize;
-                    let n_sz = (*n.as_ptr()).size;
-                    if h_off.wrapping_add(h_sz) >= n_off {
-                        let new_sz = core::cmp::max(
-                            h_off.wrapping_add(h_sz),
-                            n_off.wrapping_add(n_sz),
-                        ) - h_off;
-                        (*hole.as_ptr()).size = new_sz;
-                        (*hole.as_ptr()).next = (*n.as_ptr()).next;
-                        if let Some(nn) = (*n.as_ptr()).next {
-                            (*nn.as_ptr()).prev = Some(hole);
-                        }
-                    }
-                }
-            }
-        }
-
-        /// Count holes in the list (for assertions).
-        fn hole_count(&self) -> usize {
-            let mut count = 0;
-            let mut cur = self.front;
-            while let Some(c) = cur {
-                count += 1;
-                cur = unsafe { (*c.as_ptr()).next };
-            }
-            count
-        }
-
-        /// Total free bytes (sum of hole sizes).
-        fn total_free(&self) -> usize {
-            let mut total = 0;
-            let mut cur = self.front;
-            while let Some(c) = cur {
-                total += unsafe { (*c.as_ptr()).size };
-                cur = unsafe { (*c.as_ptr()).next };
-            }
-            total
-        }
-    }
-
-    fn align_up(addr: usize, align: usize) -> usize {
-        (addr + align - 1) & !(align - 1)
-    }
 
     // ── align_up ───────────────────────────────────────────────────
 
@@ -1911,7 +1674,10 @@ mod tests {
             for addr in 0..256 {
                 let result = align_up(addr, align);
                 assert_eq!(result % align, 0, "align_up({addr}, {align}) = {result}");
-                assert!(result >= addr, "align_up({addr}, {align}) = {result} < {addr}");
+                assert!(
+                    result >= addr,
+                    "align_up({addr}, {align}) = {result} < {addr}"
+                );
                 assert!(
                     result - addr < align,
                     "align_up({addr}, {align}) = {result} too large"
@@ -2080,7 +1846,8 @@ mod tests {
 
             // Allocate a similar-sized block — first-fit should pick the
             // freed front hole (lower address), not the tail.
-            let c = list.allocate_first_fit(small);
+            let _c = list.allocate_first_fit(small);
+            assert!(!_c.is_null(), "re-allocation should succeed");
 
             // Verify the number of holes after freeing `a` and then
             // re-allocating.  First-fit from the front should consume
@@ -2313,9 +2080,7 @@ mod tests {
             let layout = Layout::from_size_align(32, 4).unwrap();
 
             for cycle in 0..10 {
-                let ptrs: Vec<_> = (0..8)
-                    .map(|_| list.allocate_first_fit(layout))
-                    .collect();
+                let ptrs: Vec<_> = (0..8).map(|_| list.allocate_first_fit(layout)).collect();
                 assert!(
                     ptrs.iter().all(|p| !p.is_null()),
                     "cycle {cycle}: allocation failed"
@@ -2343,7 +2108,9 @@ mod tests {
     fn random_sized_alloc_dealloc() {
         // Deterministic LCG for reproducibility.
         fn lcg(state: &mut u64) -> usize {
-            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *state as usize
         }
 
@@ -2397,15 +2164,17 @@ mod tests {
 
     #[test]
     fn wire_format_dec_double_result_ok_ok_data() {
-        // The guest-side `dec_double_result` expects:
-        //   Ok(Ok(b"hello"))
+        // The guest-side `dec_double_result` now returns raw postcard bytes
+        // after stripping [outer_status][inner_status].  For Ok(Ok(b"hello")):
         //   → 0x00 0x00 varint(5) b"hello"
+        //   → payload = varint(5) b"hello" (caller decodes with dec_str)
         let inner: Result<Vec<u8>, String> = Ok(b"hello".to_vec());
         let outer: Result<Result<Vec<u8>, String>, String> = Ok(inner);
         let encoded = postcard::to_allocvec(&outer).unwrap();
 
         assert_eq!(encoded[0], 0x00, "expected outer Ok tag");
         assert_eq!(encoded[1], 0x00, "expected inner Ok tag");
+        // encoded[2..] is the raw postcard of the Vec<u8> = varint(5) b"hello"
         let (payload, rest): (Vec<u8>, &[u8]) = postcard::take_from_bytes(&encoded[2..]).unwrap();
         assert_eq!(payload, b"hello");
         assert!(rest.is_empty());
@@ -2441,9 +2210,10 @@ mod tests {
 
     #[test]
     fn wire_format_db_get_ok_ok_some() {
-        // The guest-side `db_get` expects:
-        //   Ok(Ok(Some("val")))
-        //   → 0x00 0x00 0x01 varint(3) b"val"
+        // The host produces Ok(Ok(Some("val"))) as:
+        //   0x00 0x00 0x01 varint(3) b"val"
+        // `dec_double_result` strips the first two status bytes and returns
+        //   0x01 varint(3) b"val"  (raw postcard Option<String>)
         let inner: Result<Option<String>, String> = Ok(Some("val".into()));
         let outer: Result<Result<Option<String>, String>, String> = Ok(inner);
         let encoded = postcard::to_allocvec(&outer).unwrap();
