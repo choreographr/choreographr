@@ -117,9 +117,9 @@ impl StatefulWidget for SmoothScrollbar {
 
         // Thumb height in virtual half-cell slots, proportional to
         // the fraction of content visible in the viewport, clamped
-        // to at least 1 terminal cell (2 slots).
+        // to at least 1 half-block (1 slot).
         let thumb_slots = (state.viewport_content_length * virtual_track / state.content_length)
-            .clamp(2, virtual_track);
+            .clamp(1, virtual_track);
 
         // The thumb can slide through the remaining virtual space.
         let virtual_scroll_range = virtual_track - thumb_slots;
@@ -281,24 +281,32 @@ mod tests {
 
     #[test]
     fn thumb_mid_position() {
-        // H=5, content=10, viewport=1 → thumb_slots=2 (min),
-        //   virtual_scroll_range=8, scroll_range=9
-        // position=4 → thumb_start = 4*8/9 = 3
-        // virtual [3,5) → row 1: bottom half (slot 3)  → "▄"
-        //              → row 2: top half (slot 4)     → "▀"
+        // H=5, content=10, viewport=1 → thumb_slots=1 (min),
+        //   virtual_scroll_range=9, scroll_range=9
+        // position=4 → thumb_start = 4*9/9 = 4
+        // virtual [4,5) → row 2: top half (slot 4) → "▀"
         let symbols = render_to_symbols(5, 10, 1, 4);
-        assert_eq!(symbols[1], "▄", "row 1 should be lower half (slot 3)");
         assert_eq!(symbols[2], "▀", "row 2 should be upper half (slot 4)");
+        for i in 0..5 {
+            if i != 2 {
+                assert_eq!(symbols[i], " ", "row {i} should be track");
+            }
+        }
     }
 
     #[test]
     fn subcell_precision_halfway() {
-        // H=5, content=10, viewport=1 → thumb_slots=2 (min),
-        //   virtual_scroll_range=8, scroll_range=9
-        // position=3 → thumb_start = 3*8/9 = 2
-        // virtual [2,4) → row 1: both halves (slots 2,3) → "█"
+        // H=5, content=10, viewport=1 → thumb_slots=1 (min),
+        //   virtual_scroll_range=9, scroll_range=9
+        // position=3 → thumb_start = 3*9/9 = 3
+        // virtual [3,4) → row 1: bottom half (slot 3) → "▄"
         let symbols = render_to_symbols(5, 10, 1, 3);
-        assert_eq!(symbols[1], "█", "row 1 should be full thumb");
+        assert_eq!(symbols[1], "▄", "row 1 should be lower half (slot 3)");
+        for i in 0..5 {
+            if i != 1 {
+                assert_eq!(symbols[i], " ", "row {i} should be track");
+            }
+        }
     }
 
     #[test]

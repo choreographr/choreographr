@@ -334,7 +334,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
         // Runtime metrics: tokens flow and context-window fill.
         let tokens = match &app.display_token_usage() {
-            Some(usage) => format!("↑{}  ↓{}", usage.input_tokens, usage.output_tokens),
+            Some(usage) => format!("↑{} ↓{}", usage.input_tokens, usage.output_tokens),
             None => String::new(),
         };
         let context = match (app.attached_context_window, app.attached_last_prompt_tokens) {
@@ -367,18 +367,19 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         // window fill, active status) on the right.
         // ── Session identity (always present, default to "-") ──
         let mut spans: Vec<Span> = vec![
+            Span::raw(" "),
             Span::styled(wd, Style::default().fg(Color::White)),
-            Span::raw("  |  "),
+            Span::raw(" | "),
             Span::styled(provider, Style::default().fg(Color::White)),
-            Span::raw("  |  "),
+            Span::raw(" | "),
             Span::styled(model, Style::default().fg(Color::White)),
-            Span::raw("  |  "),
+            Span::raw(" | "),
             Span::styled(reasoning, Style::default().fg(Color::White)),
         ];
 
         // ── Tool groups (conditionally present) ──
         if !tool_groups.is_empty() {
-            spans.push(Span::raw("  |  "));
+            spans.push(Span::raw(" | "));
             spans.push(Span::styled(
                 tool_groups,
                 Style::default().fg(Color::DarkGray),
@@ -387,16 +388,16 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
 
         // ── Runtime metrics (tokens → context → status) ──
         if !tokens.is_empty() {
-            spans.push(Span::raw("  |  "));
+            spans.push(Span::raw(" | "));
             spans.push(Span::styled(tokens, Style::default().fg(Color::White)));
         }
         if !context.is_empty() {
-            spans.push(Span::raw("  |  "));
+            spans.push(Span::raw(" | "));
             spans.push(Span::styled(context, Style::default().fg(Color::White)));
         }
         if let Some(status) = &app.attached_status {
             let (label, color) = status_display(status);
-            spans.push(Span::raw("  |  "));
+            spans.push(Span::raw(" | "));
             spans.push(Span::styled(label, Style::default().fg(color)));
         }
 
