@@ -1,10 +1,8 @@
-use crate::markdown_render::{
-    compute_visual_offsets, display_width, lines_height, render_turn_lines,
-};
+use crate::markdown_render::{display_width, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, PROVIDER_OPTIONS, Page,
-    RenderedCache, STATUS_BAR_HEIGHT, SessionManagerView, cached_visual_lines,
+    STATUS_BAR_HEIGHT, SessionManagerView, cached_or_compute_lines, cached_visual_lines,
 };
 use ratatui::{
     Frame,
@@ -450,6 +448,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let (arc, height, offsets) = cached_or_compute_lines(
                 &mut app.render_cache,
                 i,
+                turn_id,
                 content_width,
                 area.width,
                 || render_turn_lines(turn, content_width, tool_content_width),
@@ -510,43 +509,6 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 /// `lines_height`, which iterates every line).  On cache miss the height is
 /// computed inline and stored alongside the lines.
 ///
-/// Note: `width` is the content area width (viewport minus decorations) and
-/// `viewport_width` is the full viewport width.  Both are stored in the cache
-/// entry and checked on lookup because `lines_height` and `visual_offsets`
-/// depend on viewport width.
-fn cached_or_compute_lines(
-    cache: &mut [Option<RenderedCache>],
-    index: usize,
-    width: u16,
-    viewport_width: u16,
-    compute: impl FnOnce() -> Vec<Line<'static>>,
-) -> (Arc<[Line<'static>]>, usize, Arc<[usize]>) {
-    if let Some(Some(cached)) = cache.get(index)
-        && cached.width == width
-        && cached.viewport_width == viewport_width
-    {
-        return (
-            Arc::clone(&cached.lines),
-            cached.height,
-            Arc::clone(&cached.visual_offsets),
-        );
-    }
-
-    let lines = Arc::from(compute());
-    let height = lines_height(&lines, viewport_width).max(1);
-    let visual_offsets = compute_visual_offsets(&lines, viewport_width);
-    if let Some(slot) = cache.get_mut(index) {
-        *slot = Some(RenderedCache {
-            height,
-            lines: Arc::clone(&lines),
-            width,
-            viewport_width,
-            visual_offsets: Arc::clone(&visual_offsets),
-        });
-    }
-    (lines, height, visual_offsets)
-}
-
 fn clipped_area(
     full_height: usize,
     rows_to_skip: &mut usize,
@@ -1213,6 +1175,7 @@ pub(crate) fn status_color(status: &SessionStatus) -> Color {
 mod tests {
     use super::*;
     use crate::markdown_render::{compute_visual_offsets, lines_height};
+    use crate::state::RenderedCache;
 
     // ── mouse_in_history_box ──
 
@@ -1407,7 +1370,7 @@ mod tests {
     fn cached_or_compute_lines_cache_miss_stores_result() {
         let mut cache = vec![None];
         let (lines, height, offsets) =
-            cached_or_compute_lines(&mut cache, 0, 80, 100, compute_one_line);
+            cached_or_compute_lines(&mut cache, 0, 0, 80, 100, compute_one_line);
         assert_eq!(lines.len(), 1, "should return computed lines");
         assert_eq!(height, 1, "single line at any viewport width has height 1");
         assert_eq!(
@@ -1427,6 +1390,7 @@ mod tests {
     #[test]
     fn cached_or_compute_lines_cache_hit_returns_stored_height() {
         let mut cache = vec![Some(RenderedCache {
+            turn_id: 0,
             lines: Arc::from(vec![Line::from("cached")]),
             width: 80,
             viewport_width: 100,
@@ -1434,7 +1398,7 @@ mod tests {
             visual_offsets: Arc::from([99]),
         })];
         // Cache hit — should return stored height without recomputing
-        let (lines, height, offsets) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+        let (lines, height, offsets) = cached_or_compute_lines(&mut cache, 0, 0, 80, 100, || {
             panic!("should not be called on cache hit")
         });
         assert_eq!(height, 42, "should return cached height");
@@ -1448,6 +1412,7 @@ mod tests {
         let stored = Arc::from(vec![Line::from("shared")]);
         let stored_ptr = Arc::as_ptr(&stored);
         let mut cache = vec![Some(RenderedCache {
+            turn_id: 0,
             lines: stored,
             width: 80,
             viewport_width: 100,
@@ -1455,7 +1420,7 @@ mod tests {
             visual_offsets: Arc::from([1]),
         })];
         let (returned, _, _) =
-            cached_or_compute_lines(&mut cache, 0, 80, 100, || panic!("should not recompute"));
+            cached_or_compute_lines(&mut cache, 0, 0, 80, 100, || panic!("should not recompute"));
         assert_eq!(
             Arc::as_ptr(&returned),
             stored_ptr,
@@ -1466,6 +1431,7 @@ mod tests {
     #[test]
     fn cached_or_compute_lines_width_mismatch_recomputes() {
         let mut cache = vec![Some(RenderedCache {
+            turn_id: 0,
             lines: Arc::from(vec![Line::from("stale")]),
             width: 40, // different from requested width 80
             viewport_width: 100,
@@ -1473,7 +1439,7 @@ mod tests {
             visual_offsets: Arc::from([1]),
         })];
         let compute_called = std::cell::Cell::new(false);
-        let (lines, height, offsets) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+        let (lines, height, offsets) = cached_or_compute_lines(&mut cache, 0, 0, 80, 100, || {
             compute_called.set(true);
             vec![Line::from("fresh")]
         });
@@ -1493,6 +1459,7 @@ mod tests {
     #[test]
     fn cached_or_compute_lines_viewport_width_mismatch_recomputes() {
         let mut cache = vec![Some(RenderedCache {
+            turn_id: 0,
             lines: Arc::from(vec![Line::from("stale")]),
             width: 80,
             viewport_width: 40, // different from requested viewport_width 100
@@ -1500,7 +1467,7 @@ mod tests {
             visual_offsets: Arc::from([1]),
         })];
         let compute_called = std::cell::Cell::new(false);
-        let (lines, height, _offsets) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+        let (lines, _height, _offsets) = cached_or_compute_lines(&mut cache, 0, 0, 80, 100, || {
             compute_called.set(true);
             vec![Line::from("fresh")]
         });
@@ -1514,11 +1481,37 @@ mod tests {
     }
 
     #[test]
+    fn cached_or_compute_lines_turn_id_mismatch_recomputes() {
+        let mut cache = vec![Some(RenderedCache {
+            turn_id: 7, // cached entry is for turn 7
+            lines: Arc::from(vec![Line::from("stale")]),
+            width: 80,
+            viewport_width: 100,
+            height: 99,
+            visual_offsets: Arc::from([1]),
+        })];
+        // Request turn_id 42 at the same index — should be a miss.
+        let compute_called = std::cell::Cell::new(false);
+        let (lines, _height, _offsets) =
+            cached_or_compute_lines(&mut cache, 0, 42, 80, 100, || {
+                compute_called.set(true);
+                vec![Line::from("fresh")]
+            });
+        assert!(compute_called.get(), "should recompute on turn_id mismatch");
+        assert_eq!(lines[0], Line::from("fresh"));
+        let cached = cache[0].as_ref().unwrap();
+        assert_eq!(
+            cached.turn_id, 42,
+            "cache entry should be updated to new turn_id"
+        );
+    }
+
+    #[test]
     fn cached_or_compute_lines_out_of_range_index_does_not_store() {
         let mut cache = vec![None]; // length 1
         // Request index 5 which is out of range
         let (lines, height, offsets) =
-            cached_or_compute_lines(&mut cache, 5, 80, 100, compute_one_line);
+            cached_or_compute_lines(&mut cache, 5, 0, 80, 100, compute_one_line);
         assert_eq!(lines.len(), 1, "should still return computed result");
         assert_eq!(height, 1);
         assert_eq!(&*offsets, &[1]);
@@ -1540,6 +1533,7 @@ mod tests {
         let expected_h = lines_height(&lines, 80);
         let (_, height, offsets) = cached_or_compute_lines(
             &mut cache,
+            0,
             0,
             70, // content_width
             80, // viewport_width
@@ -1567,14 +1561,13 @@ mod tests {
     fn cached_or_compute_lines_none_slot_treated_as_miss() {
         let mut cache: Vec<Option<RenderedCache>> = vec![None];
         let compute_called = std::cell::Cell::new(false);
-        let (lines, height, _offsets) = cached_or_compute_lines(&mut cache, 0, 80, 100, || {
+        let (lines, _height, _offsets) = cached_or_compute_lines(&mut cache, 0, 0, 80, 100, || {
             compute_called.set(true);
             compute_one_line()
         });
         assert!(compute_called.get(), "should compute when slot is None");
         assert!(cache[0].is_some(), "should fill the slot");
         drop(lines);
-        drop(height);
     }
 
     // ── compute_visual_offsets ─────────────────────────────────
