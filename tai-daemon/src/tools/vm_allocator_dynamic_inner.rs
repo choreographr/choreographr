@@ -11,9 +11,9 @@
 // Instead, the heap is initialised at runtime by `init_heap()` with bounds
 // passed by the host via registers A2 (heap_base) and A3 (heap_size).
 
-// The unsafe operations inside unsafe fn are intentional — wrapping each
-// in a redundant unsafe block adds noise without benefit.
-// Suppressed via #[allow] on each unsafe fn below.
+// Unsafe operations inside unsafe fn are permitted compiler-wide via
+// #![allow(unsafe_op_in_unsafe_fn)] in the boilerplate head, since every
+// unsafe fn in this generated crate contains intentional unsafe operations.
 
 // Items below marked `#[cfg(not(test))]` are guest-only (heap + global allocator).
 // When this file is compiled for host-side testing (via include! in vm.rs's
@@ -91,18 +91,24 @@ impl HoleList {
     }
 
     /// Write a single hole spanning the entire heap region.
-    #[allow(unsafe_op_in_unsafe_fn)]
-    pub unsafe fn init(&mut self, addr: *mut u8, size: usize) {
+    /// Returns `true` if the heap was successfully initialised, `false` if
+    /// `size` is too small to hold a Hole struct (and the hole list is left
+    /// empty so that all allocations will fail).
+    pub unsafe fn init(&mut self, addr: *mut u8, size: usize) -> bool {
+        if size < Hole::min_size() {
+            self.front = None;
+            return false;
+        }
         ptr::write(
             addr as *mut Hole,
             Hole { next: None, size, prev: None },
         );
         self.front = Some(NonNull::new_unchecked(addr as *mut Hole));
+        true
     }
 
     /// First-fit walk: return a pointer to `layout.size()` bytes (at least
     /// `Hole::min_size()`), aligned to `layout.align()`.
-    #[allow(unsafe_op_in_unsafe_fn)]
     pub unsafe fn allocate_first_fit(&mut self, layout: Layout) -> *mut u8 {
         // The allocation must be at least min_size and must maintain
         // Hole alignment so that any tail hole starts at a valid address.
@@ -170,7 +176,6 @@ impl HoleList {
     }
 
     /// Return a block of memory back to the free list, merging adjacent holes.
-    #[allow(unsafe_op_in_unsafe_fn)]
     pub unsafe fn deallocate(&mut self, ptr: *mut u8, layout: Layout) {
         // Must use the same rounded size as allocate_first_fit so that
         // the freed block exactly matches the consumed region.
@@ -185,7 +190,6 @@ impl HoleList {
     // ── list helpers ──────────────────────────────────────────────────
 
     /// Unlink `hole` from the doubly-linked list.
-    #[allow(unsafe_op_in_unsafe_fn)]
     pub unsafe fn remove(&mut self, hole: NonNull<Hole>) {
         let prev = (*hole.as_ptr()).prev;
         let next = (*hole.as_ptr()).next;
@@ -202,7 +206,6 @@ impl HoleList {
 
     /// Insert `hole` into the list at the correct address-sorted position,
     /// then merge with any adjacent holes.
-    #[allow(unsafe_op_in_unsafe_fn)]
     pub unsafe fn insert(&mut self, mut hole: NonNull<Hole>) {
         let hole_addr = hole.as_ptr() as usize;
 
@@ -319,10 +322,11 @@ static mut HEAP_INITIALIZED: bool = false;
 /// - Calling this function more than once without first exhausting all
 ///   allocations is undefined behaviour (the existing free list is
 ///   overwritten).
-pub unsafe fn init_heap(base: usize, size: usize) {
+pub unsafe fn init_heap(base: usize, size: usize) -> bool {
     let holes = &mut *ALLOC.0.get();
-    holes.init(base as *mut u8, size);
-    HEAP_INITIALIZED = true;
+    let ok = holes.init(base as *mut u8, size);
+    HEAP_INITIALIZED = ok;
+    ok
 }
 
 #[cfg(not(test))]
@@ -334,7 +338,6 @@ unsafe fn ensure_heap_initialized() -> bool {
 
 #[cfg(not(test))]
 unsafe impl GlobalAlloc for GlobalHeap {
-    #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if !ensure_heap_initialized() {
             return ptr::null_mut();
@@ -343,7 +346,6 @@ unsafe impl GlobalAlloc for GlobalHeap {
         holes.allocate_first_fit(layout)
     }
 
-    #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if !ensure_heap_initialized() {
             return;

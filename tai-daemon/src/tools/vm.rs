@@ -25,8 +25,8 @@ use tracing::{debug, error, info, trace, warn};
 const BOILERPLATE_HEAD: &str = r#"
 #![no_std]
 #![no_main]
-#![feature(asm_experimental_arch)]
 #![allow(unused_imports)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use core::panic::PanicInfo;
 
@@ -184,7 +184,11 @@ pub extern "C" fn _start() {
     // SAFETY: heap_base and heap_size come from the host via registers A2
     // and A3, populated with valid page-aligned bounds within the VM's
     // flat memory space before _start executes.
-    unsafe { init_heap(heap_base, heap_size); }
+    unsafe {
+        if !init_heap(heap_base, heap_size) {
+            tai::exit(1);
+        }
+    }
     main();
     tai::exit(0);
 }
@@ -813,13 +817,13 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
     let target = "riscv64imac-unknown-none-elf";
 
     let version = Command::new("rustc")
-        .arg("+nightly")
+        .arg("+stable")
         .arg("--version")
         .output()
         .map_err(|e| format!("rustc not found: {e}\nInstall from https://rustup.rs"))?;
     if !version.status.success() {
         let stderr = String::from_utf8_lossy(&version.stderr);
-        return Err(format!("rustc +nightly check failed: {stderr}"));
+        return Err(format!("rustc +stable check failed: {stderr}"));
     }
 
     let dir = tempdir().map_err(|e| format!("failed to create temp dir: {e}"))?;
@@ -834,7 +838,7 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
     info!("compiling guest program");
 
     let mut child = Command::new("rustc")
-        .arg("+nightly")
+        .arg("+stable")
         .args([
             "--target",
             target,
@@ -934,7 +938,7 @@ fn run_riscv_impl(
 
     let target = "riscv64imac-unknown-none-elf";
     let compile_cmd =
-        format!("rustc +nightly --target {target} -C opt-level=z --edition 2024 --color always");
+        format!("rustc +stable --target {target} -C opt-level=z --edition 2024 --color always");
 
     let elf = match (compile_source, input.program.as_deref()) {
         (Some(source), None) => {
@@ -968,6 +972,9 @@ fn run_riscv_impl(
     let memory_size = input.memory_size.unwrap_or(4 * 1024 * 1024);
     if !memory_size.is_multiple_of(4096) {
         return tool_err("memory_size must be a multiple of 4096");
+    }
+    if memory_size < 512 * 1024 {
+        return tool_err("memory_size must be at least 512KB");
     }
     if memory_size > 4 * 1024 * 1024 {
         return tool_err("memory_size cannot exceed 4MB");
@@ -1405,6 +1412,28 @@ mod tests {
     }
 
     #[test]
+    fn run_riscv_rejects_memory_too_small() {
+        let result = run_riscv_impl(
+            &RunRiscVInput {
+                program: Some("AAAA".to_string()),
+                memory_size: Some(4096),
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+            dummy_registry(),
+            None,
+        );
+        assert!(result.is_error, "expected error: {}", result.content);
+        assert!(
+            result.content.contains("at least 512KB"),
+            "{}",
+            result.content
+        );
+    }
+
+    #[test]
     fn run_riscv_rejects_memory_over_4mb() {
         let result = run_riscv_impl(
             &RunRiscVInput {
@@ -1434,7 +1463,7 @@ mod tests {
         let result = run_riscv_impl(
             &RunRiscVInput {
                 program: Some("AAAA".to_string()),
-                memory_size: Some(4096),
+                memory_size: Some(512 * 1024),
                 ..Default::default()
             },
             None,
@@ -1458,6 +1487,11 @@ mod tests {
         assert!(
             !result.content.contains("cannot exceed 4MB"),
             "should not be size error: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("at least 512KB"),
+            "should not be minimum size error: {}",
             result.content
         );
     }
@@ -1674,6 +1708,7 @@ mod tests {
         // Include the production allocator source for host-side testing.
         // Items marked #[cfg(not(test))] (e.g. the global allocator) are
         // excluded when compiled under `cargo test`.
+        #![allow(unsafe_op_in_unsafe_fn)]
         include!("vm_allocator_dynamic_inner.rs");
     }
 
@@ -1738,7 +1773,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             assert_eq!(list.hole_count(), 1, "should have exactly one hole");
             assert_eq!(list.total_free(), TEST_HEAP_SIZE);
@@ -1752,7 +1787,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
             let ptr = list.allocate_first_fit(layout);
@@ -1775,7 +1810,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let a = list.allocate_first_fit(Layout::from_size_align(64, 4).unwrap());
             let b = list.allocate_first_fit(Layout::from_size_align(128, 4).unwrap());
@@ -1812,7 +1847,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             // Allocate the entire heap.  The fixed allocator reuses the hole
             // header bytes as part of the allocation payload, so there is no
@@ -1833,7 +1868,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let a = list.allocate_first_fit(Layout::from_size_align(TEST_HEAP_SIZE, 1).unwrap());
             assert!(!a.is_null(), "first allocation should succeed");
@@ -1849,7 +1884,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             for align in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
                 let layout = Layout::from_size_align(16, align).unwrap();
@@ -1873,7 +1908,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             // Allocate a small block, then a large one, then free the small one.
             // The next small allocation should reuse the freed front hole
@@ -1915,7 +1950,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             // A 1-byte allocation rounds up to Hole::min_size() bytes.
             let ptr = list.allocate_first_fit(Layout::from_size_align(1, 1).unwrap());
@@ -1937,7 +1972,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
             let ptr = list.allocate_first_fit(layout);
@@ -1974,7 +2009,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
 
@@ -2005,7 +2040,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
 
@@ -2038,7 +2073,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
 
@@ -2064,7 +2099,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(32, 4).unwrap();
             let block_count = 16;
@@ -2120,7 +2155,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(32, 4).unwrap();
 
@@ -2162,7 +2197,7 @@ mod tests {
         unsafe {
             let mut list = HoleList::new();
             let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
-            list.init(heap, TEST_HEAP_SIZE);
+            assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let mut rng: u64 = 42;
             let mut allocations: Vec<(*mut u8, Layout)> = Vec::new();

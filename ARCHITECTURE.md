@@ -1555,9 +1555,9 @@ to the guest syscall handler.
 2. If `source` is provided, it is first formatted via `rustfmt` (silently skipped
    if `rustfmt` is unavailable).  The formatted source is then prepended with a
     `#![no_std]` boilerplate (panic handler, entry point, `tai` module with
-    `tool_call`, `write`, `exit` syscall wrappers, 1 MB linked-list allocator)
+     `tool_call`, `write`, `exit` syscall wrappers, dynamically-sized linked-list allocator)
     and compiled via a single
-   `rustc +nightly --target riscv64imac-unknown-none-elf` invocation in a temp
+    `rustc +stable --target riscv64imac-unknown-none-elf` invocation in a temp
    directory.
 3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory.
 4. Registers a `TaiSyscall` handler that intercepts three guest syscalls:
