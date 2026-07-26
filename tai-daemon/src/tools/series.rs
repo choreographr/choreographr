@@ -58,6 +58,10 @@ impl Tool for RunSeries {
          original arguments are resolved."
     }
 
+    fn supports_streaming_output() -> bool {
+        true
+    }
+
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let registry = self.registry.upgrade();
         let mut parts = vec![format!(

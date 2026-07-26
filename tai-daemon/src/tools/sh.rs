@@ -74,6 +74,10 @@ impl Tool for Sh {
         "Execute a shell command using a POSIX-compatible shell (bash, dash, or zsh). Supports pipes, redirects, glob expansion, and environment variables. Prefer this over `exec` when you need shell features. Non-interactive only — commands that read from stdin will hang. The `shell` parameter must be explicitly specified (bash, dash, or zsh)."
     }
 
+    fn supports_streaming_output() -> bool {
+        true
+    }
+
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Running shell command: `{}`.", args.command)];
         parts.push(format!(" Shell: {:?}.", args.shell));

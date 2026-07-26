@@ -46,6 +46,10 @@ impl Tool for Exec {
         "Execute a program directly — no shell parsing. The command is run as a subprocess without a shell, so pipes, redirects, glob expansion, and environment variable interpolation are NOT available. Do NOT use exec to run a shell interpreter — use the dedicated `sh`, `nushell`, or `fish` tools for shell commands. Prefer exec over shell tools when you only need to run a single program with arguments (lower risk of parsing issues)."
     }
 
+    fn supports_streaming_output() -> bool {
+        true
+    }
+
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let full_cmd: Vec<&str> = std::iter::once(&args.command)
             .chain(args.args.iter())

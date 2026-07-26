@@ -2006,6 +2006,10 @@ mod tests {
         ) -> Result<Self::Return, Self::Error> {
             Ok("exec result".into())
         }
+        fn supports_streaming_output() -> bool {
+            true
+        }
+
         fn execute_streaming(
             &self,
             _args: Self::Args,

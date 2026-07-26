@@ -316,6 +316,19 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// Whether this tool produces streaming output via `execute_streaming`.
+    ///
+    /// When `true`, `execute_streaming_json` sends the invocation description as
+    /// the first chunk so the client sees immediate context.  When `false` (the
+    /// default for non-streaming tools like `read_file`), sending the description
+    /// as a chunk would create a misleading stub `ToolResultRecord` on the client
+    /// side with the description in `content` and empty `invocation_description`.
+    /// The description arrives correctly through `ToolOutput.invocation_description`
+    /// in the subsequent `TurnAppended`.
+    fn supports_streaming_output() -> bool {
+        false
+    }
+
     /// Produce a human-readable string from the return value.
     ///
     /// Every `impl Tool` must define this. The `define_tool!` macro generates
@@ -336,6 +349,10 @@ pub trait ToolDyn: Send + Sync {
     fn allowed_callers(&self) -> Vec<AllowedCaller>;
 
     fn describe_invocation_json(&self, args_json: &str) -> String;
+
+    /// Whether this tool produces streaming output.
+    /// Delegates to `Tool::supports_streaming_output()` in the blanket impl.
+    fn supports_streaming_output(&self) -> bool;
 
     /// JSON path — takes JSON args, returns Result for the caller to handle.
     fn execute_json(
@@ -398,6 +415,10 @@ impl<T: Tool + 'static> ToolDyn for T {
             Ok(args) => T::describe_invocation(self, &args),
             Err(_) => Tool::description(self).to_string(),
         }
+    }
+
+    fn supports_streaming_output(&self) -> bool {
+        T::supports_streaming_output()
     }
 
     fn execute_json(
@@ -471,7 +492,15 @@ impl<T: Tool + 'static> ToolDyn for T {
     ) -> Result<ToolOutput, ToolError> {
         let args = serde_json::from_str::<T::Args>(args_json)?;
         let desc = T::describe_invocation(self, &args);
-        let _ = output_tx.send(desc.as_bytes().to_vec());
+        // Only send the invocation description as the first streaming chunk
+        // for tools that override `execute_streaming`.  For non-streaming tools
+        // the description arrives through `ToolOutput.invocation_description`
+        // in the `TurnAppended`; sending it as a chunk would create a stub
+        // `ToolResultRecord` on the client with the description in `content`
+        // and empty `invocation_description`, masking the real output.
+        if T::supports_streaming_output() {
+            let _ = output_tx.send(desc.as_bytes().to_vec());
+        }
         let ret = match self.execute_streaming(args, x_credentials, working_dir, output_tx, ctx) {
             Ok(r) => r,
             Err(e) => {
@@ -1666,5 +1695,40 @@ mod tests {
             "invocation_description should be populated: {:?}",
             result.invocation_description,
         );
+    }
+
+    #[test]
+    fn non_streaming_tool_sends_no_chunk() {
+        let tool = DefaultTool;
+        let wrapper: Box<dyn ToolDyn> = Box::new(tool);
+        let (output_tx, output_rx) = mpsc::channel();
+        let result = wrapper
+            .execute_streaming_json(
+                "null",
+                ToolOutputFormat::Text,
+                None,
+                None,
+                output_tx,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !result.invocation_description.is_empty(),
+            "invocation_description should be populated even for non-streaming tools: {:?}",
+            result.invocation_description,
+        );
+        assert!(!result.is_error, "tool should succeed: {}", result.content);
+        match output_rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {
+                // expected — no chunk sent (channel may already be closed)
+            }
+            Ok(chunk) => {
+                panic!(
+                    "non-streaming tool should NOT send streaming chunks, got: {:?}",
+                    chunk
+                );
+            }
+        }
     }
 }

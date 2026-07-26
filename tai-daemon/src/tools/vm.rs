@@ -1109,6 +1109,10 @@ impl Tool for RunRiscV {
         "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `tai` module. Use per-tool convenience wrappers (tai::read_file, tai::write_file, tai::db_get, tai::db_set, tai::sh, tai::exec, tai::grep, tai::find, tai::http_request) for tool calls — they handle the postcard encoding automatically. Use tai::write(b\"...\") for VM output and tai::exit(code) to finish. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported."
     }
 
+    fn supports_streaming_output() -> bool {
+        true
+    }
+
     fn describe_invocation(&self, args: &Self::Args) -> String {
         match (&args.source, &args.program) {
             (Some(source), None) => {

@@ -94,6 +94,9 @@ impl ToolDyn for McpToolWrapper {
     fn describe_invocation_json(&self, _args_json: &str) -> String {
         format!("{}.", self.description())
     }
+    fn supports_streaming_output(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &str {
         &self.name

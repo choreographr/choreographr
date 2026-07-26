@@ -186,6 +186,10 @@ impl Tool for Grep {
         "Search file contents for a pattern. Respects .gitignore, hidden, and binary files. Results in file:line:content format."
     }
 
+    fn supports_streaming_output() -> bool {
+        true
+    }
+
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Searching for `{}`.", args.pattern)];
         if args.regex {

@@ -182,6 +182,10 @@ impl Tool for Find {
         "Find files and directories by name. Glob auto-detected when pattern contains `*`, `?`, `[`, `{`, `!`, or `~`. Escape glob chars with `\\` to match literals. Respects .gitignore and hidden files."
     }
 
+    fn supports_streaming_output() -> bool {
+        true
+    }
+
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Searching for files matching `{}`.", args.pattern)];
         let use_glob = use_glob_pattern(&args.pattern, args.glob);

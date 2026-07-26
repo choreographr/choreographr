@@ -2253,11 +2253,25 @@ impl App {
     }
 }
 
+/// Invalidate the render cache entry for `turn_id` so the next
+/// `rebuild_height_prefix` re-renders from fresh data instead of
+/// returning stale cached lines (the turn's content may have changed
+/// via `TurnAppended`/`TurnFinalized` even though its `turn_id` is
+/// the same).
+fn invalidate_turn_cache(app: &mut App, turn_id: u32) {
+    if let Some(idx) = app.visible_turn_ids.iter().position(|id| *id == turn_id)
+        && let Some(slot) = app.render_cache.get_mut(idx)
+    {
+        *slot = None;
+    }
+}
+
 // ── TurnEventHandler implementation ──────────────────────────────────
 
 impl TurnEventHandler for App {
     fn handle_turn_appended(&mut self, turn_id: u32, turn: Turn) {
         tracing::trace!(%turn_id, "handle_turn_appended");
+        invalidate_turn_cache(self, turn_id);
         self.sync_turn_images(turn_id, &turn);
         self.session_view.insert_or_replace(turn_id, turn);
         self.mark_content_changed();
@@ -2265,6 +2279,7 @@ impl TurnEventHandler for App {
 
     fn handle_turn_finalized(&mut self, turn_id: u32, turn: Turn) {
         tracing::trace!(%turn_id, "handle_turn_finalized");
+        invalidate_turn_cache(self, turn_id);
         self.sync_turn_images(turn_id, &turn);
         self.session_view.insert_or_replace(turn_id, turn);
         self.mark_content_changed();
@@ -2273,6 +2288,7 @@ impl TurnEventHandler for App {
     fn handle_turns_undone(&mut self, turn_ids: &[u32]) {
         tracing::trace!(?turn_ids, "handle_turns_undone");
         for tid in turn_ids {
+            invalidate_turn_cache(self, *tid);
             if let Some(turn) = self.session_view.turns.get_mut(tid) {
                 turn.undone = true;
             }
@@ -2283,6 +2299,7 @@ impl TurnEventHandler for App {
     fn handle_turns_redone(&mut self, turns: std::collections::BTreeMap<u32, Turn>) {
         tracing::trace!(?turns, "handle_turns_redone");
         for (tid, turn) in turns {
+            invalidate_turn_cache(self, tid);
             self.sync_turn_images(tid, &turn);
             self.session_view.insert_or_replace(tid, turn);
         }

@@ -41,6 +41,10 @@ impl Tool for FishShell {
         "Execute a fish shell command. Supports fish pipes, globs, and variables. Prefer this over `exec` when you need fish shell features. Non-interactive only — commands that read from stdin will hang. For running a single program without shell features, use `exec` instead."
     }
 
+    fn supports_streaming_output() -> bool {
+        true
+    }
+
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Running fish command: `{}`.", args.command)];
         if let Some(ref wd) = args.workdir {
