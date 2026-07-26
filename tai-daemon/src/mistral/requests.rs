@@ -229,130 +229,119 @@ where
     let mut sse_reader = crate::openai::SseReader::from_reader(reader);
 
     loop {
-        let event_result = sse_reader.next_event();
-        match event_result {
-            Ok(Some(ref event)) => {
-                // The [DONE] marker signals end of stream.
-                if event.trim() == "[DONE]" {
-                    break;
+        retry::check_cancelled(cancel_rx)?;
+
+        let Some(event) = sse_reader.next_event()? else {
+            break;
+        };
+        if event.trim() == "[DONE]" {
+            break;
+        }
+        match serde_json::from_str::<super::CompletionChunk>(&event) {
+            Ok(chunk) => {
+                // Capture token usage if the chunk includes it
+                // (typically the final chunk before [DONE]).
+                if let Some(ref u) = chunk.usage {
+                    stream_usage = Some(TokenUsage {
+                        input_tokens: u.prompt_tokens,
+                        output_tokens: u.completion_tokens,
+                        total_tokens: u.total_tokens,
+                    });
                 }
-                match serde_json::from_str::<super::CompletionChunk>(event) {
-                    Ok(chunk) => {
-                        // Capture token usage if the chunk includes it
-                        // (typically the final chunk before [DONE]).
-                        if let Some(ref u) = chunk.usage {
-                            stream_usage = Some(TokenUsage {
-                                input_tokens: u.prompt_tokens,
-                                output_tokens: u.completion_tokens,
-                                total_tokens: u.total_tokens,
-                            });
-                        }
-                        for choice in chunk.choices {
-                            // Emit content deltas immediately so the caller can forward
-                            // them to subscribers without buffering the full response.
-                            if let Some(content) = choice.delta.content
-                                && !content.is_empty()
-                            {
-                                text_accumulated.push_str(&content);
-                                on_event(StreamEvent::Answer(content))?;
+                for choice in chunk.choices {
+                    // Emit content deltas immediately so the caller can forward
+                    // them to subscribers without buffering the full response.
+                    if let Some(content) = choice.delta.content
+                        && !content.is_empty()
+                    {
+                        text_accumulated.push_str(&content);
+                        on_event(StreamEvent::Answer(content))?;
+                    }
+                    // Merge tool call deltas by their index field.
+                    if let Some(delta_tool_calls) = choice.delta.tool_calls {
+                        for dtc in delta_tool_calls {
+                            // dtc.index is u64; convert to u32.
+                            // u32::MAX would cause a Vec allocation of 4B+ entries below,
+                            // so reject anything that doesn't fit in u32.
+                            let safe_index = u32::try_from(dtc.index).map_err(|e| {
+                                MistralError::Io(io::Error::other(format!(
+                                    "tool call index {} exceeds u32::MAX: {e}",
+                                    dtc.index
+                                )))
+                            })?;
+
+                            // Reject indices beyond the safety limit to prevent
+                            // an attacker from causing an oversized Vec allocation.
+                            let acc_idx = safe_index as usize;
+                            if acc_idx >= MAX_TOOL_CALLS {
+                                return Err(MistralError::Io(io::Error::other(format!(
+                                    "tool call index {acc_idx} exceeds maximum ({MAX_TOOL_CALLS})"
+                                ))));
                             }
-                            // Merge tool call deltas by their index field.
-                            if let Some(delta_tool_calls) = choice.delta.tool_calls {
-                                for dtc in delta_tool_calls {
-                                    // dtc.index is u64; convert to u32.
-                                    // u32::MAX would cause a Vec allocation of 4B+ entries below,
-                                    // so reject anything that doesn't fit in u32.
-                                    let safe_index = u32::try_from(dtc.index).map_err(|e| {
-                                        MistralError::Io(io::Error::other(format!(
-                                            "tool call index {} exceeds u32::MAX: {e}",
-                                            dtc.index
-                                        )))
-                                    })?;
 
-                                    // Reject indices beyond the safety limit to prevent
-                                    // an attacker from causing an oversized Vec allocation.
-                                    let acc_idx = safe_index as usize;
-                                    if acc_idx >= MAX_TOOL_CALLS {
-                                        return Err(MistralError::Io(io::Error::other(format!(
-                                            "tool call index {acc_idx} exceeds maximum ({MAX_TOOL_CALLS})"
-                                        ))));
-                                    }
-
-                                    // Ensure the accumulator vector is large enough.
-                                    while tool_calls_accumulated.len() <= acc_idx {
-                                        tool_calls_accumulated
-                                            .push(super::StreamToolCallDelta::default());
-                                    }
-                                    let entry = &mut tool_calls_accumulated[acc_idx];
-                                    if let Some(id_val) = dtc.id {
-                                        entry.id = Some(id_val);
-                                    }
-                                    if let Some(func) = dtc.function {
-                                        let f = entry.function.get_or_insert_default();
-                                        if let Some(name) = func.name {
-                                            f.name = Some(name);
-                                        }
-                                        if let Some(args) = func.arguments {
-                                            let current = f.arguments.get_or_insert_default();
-                                            current.push_str(&args);
-                                        }
-                                    }
+                            // Ensure the accumulator vector is large enough.
+                            while tool_calls_accumulated.len() <= acc_idx {
+                                tool_calls_accumulated.push(super::StreamToolCallDelta::default());
+                            }
+                            let entry = &mut tool_calls_accumulated[acc_idx];
+                            if let Some(id_val) = dtc.id {
+                                entry.id = Some(id_val);
+                            }
+                            if let Some(func) = dtc.function {
+                                let f = entry.function.get_or_insert_default();
+                                if let Some(name) = func.name {
+                                    f.name = Some(name);
                                 }
-                            }
-                            // If the finish_reason is "tool_calls", the stream has
-                            // delivered all deltas for this turn. Drain the
-                            // accumulated state into a ToolUse result now rather
-                            // than waiting for the [DONE] marker.
-                            if let Some(finish_reason) = choice._finish_reason
-                                && finish_reason == "tool_calls"
-                            {
-                                let calls: Vec<crate::providers::types::ChatToolCall> =
-                                    tool_calls_accumulated
-                                        .iter()
-                                        .filter_map(|tc| {
-                                            let id = tc.id.as_ref()?;
-                                            let func = tc.function.as_ref()?;
-                                            let name = func.name.as_ref()?;
-                                            let args = func
-                                                .arguments
-                                                .as_ref()
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            Some(crate::providers::types::ChatToolCall {
-                                                id: id.clone(),
-                                                name: name.clone(),
-                                                arguments_json: args,
-                                                caller: None,
-                                            })
-                                        })
-                                        .collect();
-                                if !calls.is_empty() {
-                                    return Ok(ChatTurnResult::ToolUse(
-                                        crate::providers::types::ChatAssistantToolUse {
-                                            content: if text_accumulated.is_empty() {
-                                                None
-                                            } else {
-                                                Some(text_accumulated.clone())
-                                            },
-                                            tool_calls: calls,
-                                            reasoning: None,
-                                            usage: stream_usage,
-                                            response_id: None,
-                                        },
-                                    ));
+                                if let Some(args) = func.arguments {
+                                    let current = f.arguments.get_or_insert_default();
+                                    current.push_str(&args);
                                 }
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("failed to parse Mistral SSE chunk: {e} — raw: {}", event);
+                    // If the finish_reason is "tool_calls", the stream has
+                    // delivered all deltas for this turn. Drain the
+                    // accumulated state into a ToolUse result now rather
+                    // than waiting for the [DONE] marker.
+                    if let Some(finish_reason) = choice._finish_reason
+                        && finish_reason == "tool_calls"
+                    {
+                        let calls: Vec<crate::providers::types::ChatToolCall> =
+                            tool_calls_accumulated
+                                .iter()
+                                .filter_map(|tc| {
+                                    let id = tc.id.as_ref()?;
+                                    let func = tc.function.as_ref()?;
+                                    let name = func.name.as_ref()?;
+                                    let args = func.arguments.as_ref().cloned().unwrap_or_default();
+                                    Some(crate::providers::types::ChatToolCall {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        arguments_json: args,
+                                        caller: None,
+                                    })
+                                })
+                                .collect();
+                        if !calls.is_empty() {
+                            return Ok(ChatTurnResult::ToolUse(
+                                crate::providers::types::ChatAssistantToolUse {
+                                    content: if text_accumulated.is_empty() {
+                                        None
+                                    } else {
+                                        Some(text_accumulated.clone())
+                                    },
+                                    tool_calls: calls,
+                                    reasoning: None,
+                                    usage: stream_usage,
+                                    response_id: None,
+                                },
+                            ));
+                        }
                     }
                 }
             }
-            Ok(None) => break,
             Err(e) => {
-                let err_msg = format!("SSE read error: {e}");
-                return Err(MistralError::Io(io::Error::other(err_msg)));
+                tracing::warn!("failed to parse Mistral SSE chunk: {e} — raw: {}", event);
             }
         }
     }

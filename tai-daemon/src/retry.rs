@@ -94,6 +94,20 @@ pub fn parse_retry_after_secs(value: Option<&str>) -> Option<u64> {
     value.and_then(|v| v.parse::<u64>().ok())
 }
 
+/// Check whether a cancellation signal has been received on `cancel_rx`.
+/// Returns `Err(ProviderHttpError::Cancelled)` if the channel contains a
+/// pending message, or `Ok(())` when no cancellation is pending (or when
+/// no channel is provided).
+pub fn check_cancelled(cancel_rx: Option<&mpsc::Receiver<()>>) -> Result<(), ProviderHttpError> {
+    if let Some(rx) = cancel_rx
+        && rx.try_recv().is_ok()
+    {
+        tracing::debug!("operation cancelled by user");
+        return Err(ProviderHttpError::Cancelled);
+    }
+    Ok(())
+}
+
 /// Block for `delay`, returning `Cancelled` early if a signal arrives on
 /// `cancel_rx`.  When no channel is provided, falls back to `thread::sleep`.
 pub fn sleep_or_cancel(
@@ -104,7 +118,9 @@ pub fn sleep_or_cancel(
         match rx.recv_timeout(delay) {
             Ok(()) => return Err(ProviderHttpError::Cancelled),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::trace!("cancel_rx sender dropped — proceeding without cancellation");
+            }
         }
     } else {
         thread::sleep(delay);
@@ -167,6 +183,8 @@ where
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
+
+        check_cancelled(cancel_rx)?;
 
         // With http_status_as_error(false), all HTTP responses (even 4xx/5xx)
         // arrive as Ok; only transport errors are Err.

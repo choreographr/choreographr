@@ -216,7 +216,12 @@ where
     let mut pending_tool_calls: Vec<super::ChatToolCall> = Vec::new();
     let mut stream_usage: Option<TokenUsage> = None;
 
-    while let Some(data) = reader.next_event()? {
+    loop {
+        retry::check_cancelled(cancel_rx)?;
+
+        let Some(data) = reader.next_event()? else {
+            break;
+        };
         let payload: GenerateContentResponse =
             serde_json::from_str(&data).map_err(|e| GoogleError::Io(io::Error::other(e)))?;
 

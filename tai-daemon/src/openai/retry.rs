@@ -1,6 +1,6 @@
 use std::sync::mpsc;
 
-pub use crate::retry::{RetryCallback, RetryConfig};
+pub use crate::retry::{RetryCallback, RetryConfig, check_cancelled};
 
 use super::{OpenAiError, ServiceConfig};
 use crate::retry;
@@ -53,27 +53,4 @@ pub(crate) fn retry_send_get(
         cancel_rx,
     )
     .map_err(OpenAiError::from)
-}
-
-/// Thin wrapper around [`retry_send`] that skips retry callbacks and
-/// cancellation.
-pub(crate) fn retry_send_simple(
-    agent: &ureq::Agent,
-    url: &str,
-    api_key: &str,
-    body: &serde_json::Value,
-    retry_cfg: &RetryConfig,
-) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
-    retry_send(agent, url, api_key, body, retry_cfg, &mut None, None)
-}
-
-/// Thin wrapper around [`retry_send_get`] that skips retry callbacks and
-/// cancellation.
-pub(crate) fn retry_send_get_simple(
-    agent: &ureq::Agent,
-    url: &str,
-    api_key: &str,
-    retry_cfg: &RetryConfig,
-) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
-    retry_send_get(agent, url, api_key, retry_cfg, &mut None, None)
 }

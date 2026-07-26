@@ -57,7 +57,8 @@ impl OpenAiClient {
         info!("listing models from {}", self.config.base_url);
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
         let retry = retry::retry_config_from_config(&self.config);
-        let response = retry::retry_send_get_simple(&self.http, &url, &self.api_key, &retry)?;
+        let response =
+            retry::retry_send_get(&self.http, &url, &self.api_key, &retry, &mut None, None)?;
         let payload: ModelListResponse = response
             .into_body()
             .read_json()
@@ -69,12 +70,22 @@ impl OpenAiClient {
 
     pub fn completion(&self, model: &str, prompt: &str) -> Result<String, super::OpenAiError> {
         match self.config.request_format_for_model(model) {
-            RequestFormat::Responses => {
-                responses_request(&self.http, &self.config, &self.api_key, model, prompt)
-            }
-            RequestFormat::ChatCompletions => {
-                chat_completions_request(&self.http, &self.config, &self.api_key, model, prompt)
-            }
+            RequestFormat::Responses => responses_request(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                model,
+                prompt,
+                None, // No cancellation for simple completion
+            ),
+            RequestFormat::ChatCompletions => chat_completions_request(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                model,
+                prompt,
+                None, // No cancellation for simple completion
+            ),
         }
     }
 
@@ -102,6 +113,7 @@ impl OpenAiClient {
                 &self.api_key,
                 model,
                 prompt,
+                None, // No cancellation for simple completion
                 &mut on_event,
             ),
             RequestFormat::ChatCompletions => chat_completions_request_streaming(
@@ -111,6 +123,7 @@ impl OpenAiClient {
                 model,
                 prompt,
                 None, // No reasoning_effort for simple completion
+                None, // No cancellation for simple completion
                 &mut on_event,
             ),
         }
@@ -133,6 +146,8 @@ impl OpenAiClient {
                 reasoning_effort,
                 params.previous_response_id,
                 params.tool_results,
+                params.on_retry,
+                params.cancel_rx,
                 params.programmatic_tool_calling,
             ),
             RequestFormat::ChatCompletions => chat_completions_request_with_tools(
@@ -208,10 +223,11 @@ fn responses_request(
     api_key: &str,
     model: &str,
     prompt: &str,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<String, super::OpenAiError> {
     let (url, body) = build_simple_responses_body(config, model, prompt, false)?;
     let retry = retry::retry_config_from_config(config);
-    let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut None, cancel_rx)?;
     let payload: ResponsesResponse = response
         .into_body()
         .read_json()
@@ -246,6 +262,7 @@ fn chat_completions_request(
     api_key: &str,
     model: &str,
     prompt: &str,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<String, super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
     let max_tokens = config.max_tokens_for_model(model);
@@ -267,7 +284,7 @@ fn chat_completions_request(
         reasoning_effort: None,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut None, cancel_rx)?;
     let payload: ChatCompletionsResponse = response
         .into_body()
         .read_json()
@@ -394,6 +411,7 @@ fn chat_completions_request_with_tools(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chat_completions_request_streaming<F>(
     agent: &ureq::Agent,
     config: &ServiceConfig,
@@ -401,6 +419,7 @@ fn chat_completions_request_streaming<F>(
     model: &str,
     prompt: &str,
     reasoning_effort: Option<&'static str>,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
     on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
@@ -428,10 +447,15 @@ where
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut None, cancel_rx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     let mut has_any_output = false;
-    while let Some(data) = reader.next_event()? {
+    loop {
+        retry::check_cancelled(cancel_rx)?;
+
+        let Some(data) = reader.next_event()? else {
+            break;
+        };
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
         for choice in payload.choices {
@@ -471,6 +495,7 @@ fn responses_request_streaming<F>(
     api_key: &str,
     model: &str,
     prompt: &str,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
     on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
 where
@@ -478,10 +503,15 @@ where
 {
     let (url, body) = build_simple_responses_body(config, model, prompt, true)?;
     let retry = retry::retry_config_from_config(config);
-    let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut None, cancel_rx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     let mut has_any_output = false;
-    while let Some(data) = reader.next_event()? {
+    loop {
+        retry::check_cancelled(cancel_rx)?;
+
+        let Some(data) = reader.next_event()? else {
+            break;
+        };
         let event = parse_responses_stream_event(&data)?;
         match event {
             Some(ResponsesStreamEvent::TextDelta(text)) => {
@@ -683,6 +713,8 @@ fn responses_request_with_tools(
     reasoning_effort: Option<&'static str>,
     previous_response_id: Option<&str>,
     tool_results: &[ToolResultItem],
+    on_retry: &mut Option<retry::RetryCallback>,
+    cancel_rx: Option<&mpsc::Receiver<()>>,
     programmatic_tool_calling: bool,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
     let start = std::time::Instant::now();
@@ -709,7 +741,7 @@ fn responses_request_with_tools(
     );
 
     let retry = retry::retry_config_from_config(config);
-    let response = retry::retry_send_simple(agent, &url, api_key, &body, &retry)?;
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
     let payload: ResponsesResponse = response
         .into_body()
         .read_json()
@@ -979,7 +1011,12 @@ where
     // Track usage from the final SSE chunk (OpenAI sends a usage chunk with
     // choices: [] when stream_options.include_usage is true).
     let mut last_usage: Option<TokenUsage> = None;
-    while let Some(data) = reader.next_event()? {
+    loop {
+        retry::check_cancelled(cancel_rx)?;
+
+        let Some(data) = reader.next_event()? else {
+            break;
+        };
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
 
@@ -1155,7 +1192,12 @@ where
     let mut next_tool_index: u32 = 0;
 
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
-    while let Some(data) = reader.next_event()? {
+    loop {
+        retry::check_cancelled(cancel_rx)?;
+
+        let Some(data) = reader.next_event()? else {
+            break;
+        };
         let event = parse_responses_stream_event(&data)?;
         match event {
             Some(ResponsesStreamEvent::TextDelta(text)) => {

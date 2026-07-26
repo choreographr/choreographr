@@ -216,7 +216,12 @@ where
     let mut input_tokens: Option<u32> = None;
     let mut output_tokens: Option<u32> = None;
 
-    while let Some((event_type, data)) = reader.next_event()? {
+    loop {
+        retry::check_cancelled(cancel_rx)?;
+
+        let Some((event_type, data)) = reader.next_event()? else {
+            break;
+        };
         match event_type.as_str() {
             "content_block_start" => {
                 let start: ContentBlockStart = serde_json::from_str(&data)
