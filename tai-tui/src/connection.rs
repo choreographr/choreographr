@@ -1621,9 +1621,10 @@ pub(crate) fn handle_daemon_message(
             ..
         } => {
             // Capture per-request token usage at turn end.
-            // Always set progress_dirty so the bar updates even when
-            // the provider omits token_usage/last_prompt_tokens (the
-            // values simply won't change in that case).
+            // Only set progress_dirty when we actually write data —
+            // a Done message without token info doesn't change state.
+            let has_data = token_usage.is_some() || last_prompt_tokens.is_some();
+
             if let Some(usage) = token_usage {
                 app.attached_token_usage = Some(*usage);
                 // Many providers only supply token_usage without the
@@ -1636,14 +1637,17 @@ pub(crate) fn handle_daemon_message(
             if let Some(tokens) = last_prompt_tokens {
                 app.attached_last_prompt_tokens = Some(*tokens);
             }
-            app.progress_dirty = true;
-            // Push the update directly instead of waiting for the
-            // render loop — bypasses any timing issues with the
-            // progress_dirty flag getting consumed before render.
-            if let (Some(cw), Some(tokens)) =
-                (app.attached_context_window, app.attached_last_prompt_tokens)
-            {
-                terminal_progress::update_terminal_progress(Some(tokens), Some(cw));
+
+            if has_data {
+                app.progress_dirty = true;
+                // Push the update directly instead of waiting for the
+                // render loop — bypasses any timing issues with the
+                // progress_dirty flag getting consumed before render.
+                if let (Some(cw), Some(tokens)) =
+                    (app.attached_context_window, app.attached_last_prompt_tokens)
+                {
+                    terminal_progress::update_terminal_progress(Some(tokens), Some(cw));
+                }
             }
             // Fall through to dispatch_daemon_message.
         }

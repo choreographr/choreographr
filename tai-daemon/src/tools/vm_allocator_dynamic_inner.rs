@@ -67,16 +67,6 @@ impl Hole {
     pub fn round_to_align(size: usize) -> usize {
         align_up(size, Self::align())
     }
-
-    /// Pointer to the first byte after this hole's embedded Hole struct.
-    pub fn start(&self) -> *mut u8 {
-        unsafe { (self as *const Self as *mut u8).add(Self::header_size()) }
-    }
-
-    /// One past the last byte of this hole.
-    pub fn end(&self) -> *mut u8 {
-        unsafe { (self as *const Self as *mut u8).add(self.size) }
-    }
 }
 
 // ── HoleList — sorted intrusive doubly-linked list of free holes ──────────
@@ -128,7 +118,7 @@ impl HoleList {
             // The allocation starts from the hole's own address (not after
             // the header) so the header bytes are reused as part of the
             // allocation payload, avoiding the leak that would occur if
-            // we started from hole.start().
+            // we started after the header.
             let aligned = align_up(hole_addr, effective_align) as *mut u8;
             let aligned_addr = aligned as usize;
             let alloc_end = aligned_addr.wrapping_add(size);
@@ -232,13 +222,15 @@ impl HoleList {
             (*c.as_ptr()).prev = Some(hole);
         }
 
-        // Merge with previous hole if adjacent.
+        // Merge with previous hole if adjacent or the gap is smaller than
+        // Hole::min_size() (meaning the gap can never hold its own hole
+        // and would be permanently stranded otherwise).
         if let Some(p) = prev {
             let p_off = p.as_ptr() as usize;
             let p_sz = (*p.as_ptr()).size;
             let h_off = hole.as_ptr() as usize;
             let h_sz = (*hole.as_ptr()).size;
-            if p_off.wrapping_add(p_sz) >= h_off {
+            if p_off.wrapping_add(p_sz).wrapping_add(Hole::min_size()) > h_off {
                 let new_sz = max(p_off.wrapping_add(p_sz), h_off.wrapping_add(h_sz)) - p_off;
                 (*p.as_ptr()).size = new_sz;
                 (*p.as_ptr()).next = (*hole.as_ptr()).next;
@@ -249,13 +241,14 @@ impl HoleList {
             }
         }
 
-        // Merge with next hole if adjacent.
+        // Merge with next hole if adjacent or the gap is smaller than
+        // Hole::min_size().
         if let Some(n) = (*hole.as_ptr()).next {
             let h_off = hole.as_ptr() as usize;
             let h_sz = (*hole.as_ptr()).size;
             let n_off = n.as_ptr() as usize;
             let n_sz = (*n.as_ptr()).size;
-            if h_off.wrapping_add(h_sz) >= n_off {
+            if h_off.wrapping_add(h_sz).wrapping_add(Hole::min_size()) > n_off {
                 let new_sz = max(h_off.wrapping_add(h_sz), n_off.wrapping_add(n_sz)) - h_off;
                 (*hole.as_ptr()).size = new_sz;
                 (*hole.as_ptr()).next = (*n.as_ptr()).next;

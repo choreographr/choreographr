@@ -1727,8 +1727,6 @@ mod tests {
     #[repr(C, align(16))]
     struct AlignedHeap([u8; TEST_HEAP_SIZE]);
 
-    static mut TEST_HEAP: AlignedHeap = AlignedHeap([0; TEST_HEAP_SIZE]);
-
     // ── align_up ───────────────────────────────────────────────────
 
     #[test]
@@ -1776,7 +1774,8 @@ mod tests {
     fn holelist_init_creates_single_hole() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             assert_eq!(list.hole_count(), 1, "should have exactly one hole");
@@ -1790,7 +1789,8 @@ mod tests {
     fn allocate_simple() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
@@ -1813,7 +1813,8 @@ mod tests {
     fn allocate_multiple() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let a = list.allocate_first_fit(Layout::from_size_align(64, 4).unwrap());
@@ -1850,7 +1851,8 @@ mod tests {
     fn allocate_exact_fit() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             // Allocate the entire heap.  The fixed allocator reuses the hole
@@ -1871,7 +1873,8 @@ mod tests {
     fn allocate_exhaustion_returns_null() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let a = list.allocate_first_fit(Layout::from_size_align(TEST_HEAP_SIZE, 1).unwrap());
@@ -1887,7 +1890,8 @@ mod tests {
     fn allocate_respects_alignment() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             for align in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
@@ -1911,7 +1915,8 @@ mod tests {
     fn allocate_uses_first_fit_strategy() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             // Allocate a small block, then a large one, then free the small one.
@@ -1953,7 +1958,8 @@ mod tests {
     fn allocate_minimum_size() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             // A 1-byte allocation rounds up to Hole::min_size() bytes.
@@ -1975,7 +1981,8 @@ mod tests {
     fn deallocate_and_reuse() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
@@ -2012,7 +2019,8 @@ mod tests {
     fn deallocate_merges_adjacent_holes() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
@@ -2043,7 +2051,8 @@ mod tests {
     fn deallocate_merges_front_and_back() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
@@ -2076,7 +2085,8 @@ mod tests {
     fn deallocate_non_adjacent_does_not_merge() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(64, 4).unwrap();
@@ -2096,13 +2106,65 @@ mod tests {
     }
 
     #[test]
+    fn deallocate_merges_across_small_alignment_gap() {
+        // Verify that deallocation merges holes even when a small gap
+        // (< Hole::min_size()) sits between them.  Such gaps arise from
+        // alignment padding that was too small to form its own hole and
+        // would be permanently stranded under strict adjacency merging.
+        unsafe {
+            let mut list = HoleList::new();
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
+            assert!(list.init(heap, TEST_HEAP_SIZE));
+
+            // Allocate a min-sized anchor block from the front.
+            let anchor = Layout::from_size_align(1, 1).unwrap();
+            let a = list.allocate_first_fit(anchor);
+            assert!(!a.is_null());
+            // State: allocated [0, 24), tail hole at [24, HEAP_SIZE).
+
+            // Allocate from the tail with alignment 32 — this creates an
+            // 8-byte front gap (align_up(24, 32) - 24) which is smaller
+            // than Hole::min_size(), so no front hole is formed.
+            let gap_align = Layout::from_size_align(1, 32).unwrap();
+            let b = list.allocate_first_fit(gap_align);
+            assert!(!b.is_null());
+            // State: allocated [0, 24), stranded [24, 32),
+            //        allocated [32, 56), tail hole [56, HEAP_SIZE).
+
+            // Free the anchor.  With or without the small-gap merge this
+            // creates a hole at [0, 24) — not yet merged (gap to [56, HEAP_SIZE)
+            // is 32 bytes >= min_size).
+            list.deallocate(a, anchor);
+
+            // Free the second block.  The new merge logic absorbs the 8-byte
+            // stranded gap because the previous hole ends at 24 and the freed
+            // block starts at 32, and 24 + min_size > 32.  The merged hole
+            // then coalesces with the tail, recovering every byte.
+            list.deallocate(b, gap_align);
+
+            assert_eq!(
+                list.hole_count(),
+                1,
+                "should merge across the small alignment gap"
+            );
+            assert_eq!(
+                list.total_free(),
+                TEST_HEAP_SIZE,
+                "all memory including the alignment gap should be reclaimed"
+            );
+        }
+    }
+
+    #[test]
     fn deallocate_reduces_fragmentation() {
         // Allocate many blocks, free every other one, then verify that
         // the free list has the expected number of holes (free blocks
         // separated by allocated ones).
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(32, 4).unwrap();
@@ -2158,7 +2220,8 @@ mod tests {
     fn multiple_alloc_dealloc_cycles() {
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let layout = Layout::from_size_align(32, 4).unwrap();
@@ -2200,7 +2263,8 @@ mod tests {
 
         unsafe {
             let mut list = HoleList::new();
-            let heap = core::ptr::addr_of_mut!(TEST_HEAP) as *mut u8;
+            let mut heap_buf = AlignedHeap([0u8; TEST_HEAP_SIZE]);
+            let heap = &mut heap_buf as *mut AlignedHeap as *mut u8;
             assert!(list.init(heap, TEST_HEAP_SIZE));
 
             let mut rng: u64 = 42;
@@ -2227,14 +2291,19 @@ mod tests {
                 list.deallocate(ptr, layout);
             }
 
-            // After freeing all, most of the heap should be reclaimable.
-            // Small alignment gaps (< Hole::min_size()) may strand a few
-            // bytes, but at least 99% must be free.
-            assert!(
-                list.total_free() >= TEST_HEAP_SIZE - 128,
-                "too much memory stranded after free-all: {} free, expected >= {}",
+            // The new merge logic absorbs alignment gaps smaller than
+            // Hole::min_size(), so after freeing all allocations the
+            // entire heap must be reclaimed as a single hole.
+            assert_eq!(
+                list.hole_count(),
+                1,
+                "all holes should merge into one after full free"
+            );
+            assert_eq!(
                 list.total_free(),
-                TEST_HEAP_SIZE - 128,
+                TEST_HEAP_SIZE,
+                "all memory should be reclaimed after free-all: got {}",
+                list.total_free(),
             );
         }
     }
