@@ -556,10 +556,7 @@ fn render_text_block(
     };
 
     frame.render_widget(
-        Paragraph::new(lines)
-            .style(paragraph_style)
-            .wrap(Wrap { trim: false })
-            .scroll((0, 0)),
+        Paragraph::new(lines).style(paragraph_style).scroll((0, 0)),
         rect,
     );
 }

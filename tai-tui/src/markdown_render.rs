@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use tai_proto::Turn;
@@ -986,116 +986,133 @@ fn inlines_to_lines(
         current_width += display_width(prefix);
     }
     let mut needs_separator = false;
-    render_inlines_to_lines(
-        inlines,
-        &mut lines,
-        &mut current_spans,
-        &mut current_width,
-        &mut needs_separator,
+    let mut ctx = RenderCtx {
+        lines: &mut lines,
+        current: &mut current_spans,
+        current_width: &mut current_width,
+        needs_separator: &mut needs_separator,
         indent,
         width,
-    );
+        modifier: Modifier::empty(),
+    };
+    render_inlines_to_lines(inlines, &mut ctx);
     if !current_spans.is_empty() || lines.is_empty() {
         lines.push(Line::from(std::mem::take(&mut current_spans)));
     }
     lines
 }
 
-fn flush_line(
-    lines: &mut Vec<Line<'static>>,
-    current: &mut Vec<Span<'static>>,
-    current_width: &mut usize,
+/// Bundles all mutable state and parameters needed to render a flat list of
+/// [`MarkdownInline`] nodes into Ratatui [`Line`]s, automatically wrapping
+/// and applying text styling (bold, italic, colours, etc.).
+///
+/// The `modifier` field accumulates [`Modifier`] flags as we descend into
+/// nested containers (emphasis inside bold, etc.).  Each container saves the
+/// current modifier, ORs in its own flag, calls back into the renderer, and
+/// then restores the original value — giving us correct modifier stacking
+/// with no heap allocation.
+struct RenderCtx<'a> {
+    /// Output buffer — completed lines are pushed here.
+    lines: &'a mut Vec<Line<'static>>,
+    /// Spans being accumulated for the line currently being built.
+    current: &'a mut Vec<Span<'static>>,
+    /// Display width of `current` (updated alongside every push).
+    current_width: &'a mut usize,
+    /// Whether the next word needs a space separator before it (set to
+    /// `true` after every word/code chunk, reset to `false` on line break
+    /// or flush).
+    needs_separator: &'a mut bool,
+    /// Left-margin width for blockquote / list nesting.
     indent: usize,
-) {
-    lines.push(Line::from(std::mem::take(current)));
-    *current_width = indent;
-    if indent > 0 {
-        current.push(Span::styled(" ".repeat(indent), Style::default()));
+    /// Maximum line width (in columns) before wrapping kicks in.
+    width: usize,
+    /// Active text modifiers inherited from enclosing containers (e.g.
+    /// `BOLD` inside `Strong`, `ITALIC` inside `Emphasis`).  Combined
+    /// via bitwise-OR when nesting.
+    modifier: Modifier,
+}
+
+impl<'a> RenderCtx<'a> {
+    fn base_style(&self) -> Style {
+        Style::default().add_modifier(self.modifier)
+    }
+
+    fn push_span(&mut self, content: String, style: Style) {
+        self.current.push(Span::styled(content, style));
+    }
+
+    /// Push the current line into the output and start a fresh line at indent.
+    /// Indent padding uses `Style::default()` (not `base_style()`) because
+    /// styling modifiers on whitespace are invisible and could confuse tests
+    /// or terminal renderers.
+    fn flush_line(&mut self) {
+        self.lines.push(Line::from(std::mem::take(self.current)));
+        *self.current_width = self.indent;
+        if self.indent > 0 {
+            self.current
+                .push(Span::styled(" ".repeat(self.indent), Style::default()));
+        }
+    }
+
+    /// Split `word` into grapheme-cluster chunks to fit the available width on the
+    /// *current* line. The caller is responsible for flushing before calling this
+    /// when the current line has content that won't leave enough room.
+    fn render_word_split(&mut self, word: &str, style: Style) {
+        *self.needs_separator = false;
+        let available = self.width.saturating_sub(*self.current_width);
+        let chunked = split_word_to_width(word, available);
+        for (ci, chunk) in chunked.iter().enumerate() {
+            if ci > 0 {
+                self.flush_line();
+            }
+            self.push_span(chunk.clone(), style);
+            *self.current_width += display_width(chunk);
+        }
+        *self.needs_separator = true;
     }
 }
 
-fn render_inlines_to_lines(
-    inlines: &[MarkdownInline],
-    lines: &mut Vec<Line<'static>>,
-    current: &mut Vec<Span<'static>>,
-    current_width: &mut usize,
-    needs_separator: &mut bool,
-    indent: usize,
-    width: usize,
-) {
+fn render_inlines_to_lines(inlines: &[MarkdownInline], ctx: &mut RenderCtx) {
     for inline in inlines {
         match inline {
             MarkdownInline::Text(text) => {
-                render_text_inline(
-                    text,
-                    lines,
-                    current,
-                    current_width,
-                    needs_separator,
-                    indent,
-                    width,
-                );
+                render_text_inline(text, ctx);
             }
-            MarkdownInline::Code(text)
-            | MarkdownInline::InlineMath(text)
-            | MarkdownInline::DisplayMath(text) => {
-                render_code_inline(
-                    text,
-                    lines,
-                    current,
-                    current_width,
-                    needs_separator,
-                    indent,
-                    width,
-                );
+            MarkdownInline::Code(text) => {
+                render_code_inline(text, ctx, Color::Cyan);
             }
-            MarkdownInline::Strikethrough(content)
-            | MarkdownInline::Emphasis(content)
-            | MarkdownInline::Strong(content) => {
-                render_style_inline(
-                    content,
-                    lines,
-                    current,
-                    current_width,
-                    needs_separator,
-                    indent,
-                    width,
-                );
+            MarkdownInline::InlineMath(text) => {
+                render_code_inline(text, ctx, Color::Yellow);
+            }
+            MarkdownInline::DisplayMath(text) => {
+                render_code_inline(text, ctx, Color::Magenta);
+            }
+            MarkdownInline::Strikethrough(content) => {
+                render_style_inline(content, ctx, Modifier::CROSSED_OUT);
+            }
+            MarkdownInline::Emphasis(content) => {
+                render_style_inline(content, ctx, Modifier::ITALIC);
+            }
+            MarkdownInline::Strong(content) => {
+                render_style_inline(content, ctx, Modifier::BOLD);
             }
             MarkdownInline::Link {
                 content,
                 destination,
             } => {
-                render_link_inline(
-                    content,
-                    destination,
-                    lines,
-                    current,
-                    current_width,
-                    needs_separator,
-                    indent,
-                    width,
-                );
+                render_link_inline(content, destination, ctx);
             }
             MarkdownInline::Image { alt, destination } => {
                 let prefix_text = "[image: ";
                 let prefix_width = display_width(prefix_text);
-                let projected = *current_width + prefix_width;
-                if projected > width && *current_width > indent {
-                    flush_line(lines, current, current_width, indent);
+                let projected = *ctx.current_width + prefix_width;
+                if projected > ctx.width && *ctx.current_width > ctx.indent {
+                    ctx.flush_line();
                 }
-                current.push(Span::styled(prefix_text.to_string(), Style::default()));
-                *current_width += prefix_width;
+                ctx.push_span(prefix_text.to_string(), Style::default());
+                *ctx.current_width += prefix_width;
 
-                render_inlines_to_lines(
-                    alt,
-                    lines,
-                    current,
-                    current_width,
-                    needs_separator,
-                    indent,
-                    width,
-                );
+                render_inlines_to_lines(alt, ctx);
 
                 let suffix = if !destination.is_empty() {
                     format!("] ({destination})")
@@ -1103,35 +1120,27 @@ fn render_inlines_to_lines(
                     "]".to_string()
                 };
                 let suffix_width = display_width(&suffix);
-                let projected = *current_width + suffix_width;
-                if projected > width && *current_width > indent {
-                    flush_line(lines, current, current_width, indent);
+                let projected = *ctx.current_width + suffix_width;
+                if projected > ctx.width && *ctx.current_width > ctx.indent {
+                    ctx.flush_line();
                 }
-                current.push(Span::styled(suffix, Style::default()));
-                *current_width += suffix_width;
-                *needs_separator = true;
+                ctx.push_span(suffix, Style::default());
+                *ctx.current_width += suffix_width;
+                *ctx.needs_separator = true;
             }
             MarkdownInline::LineBreak => {
-                flush_line(lines, current, current_width, indent);
-                *needs_separator = false;
+                ctx.flush_line();
+                *ctx.needs_separator = false;
             }
         }
     }
 }
 
-fn render_text_inline(
-    text: &str,
-    lines: &mut Vec<Line<'static>>,
-    current: &mut Vec<Span<'static>>,
-    current_width: &mut usize,
-    needs_separator: &mut bool,
-    indent: usize,
-    width: usize,
-) {
+fn render_text_inline(text: &str, ctx: &mut RenderCtx) {
     let trimmed = text.trim_start();
     let ends_with_space = text.ends_with(' ') || text.ends_with('\t');
     let words: Vec<&str> = if trimmed.is_empty() {
-        *needs_separator = true;
+        *ctx.needs_separator = true;
         return;
     } else {
         trimmed.split_whitespace().collect()
@@ -1139,120 +1148,110 @@ fn render_text_inline(
 
     for (i, word) in words.iter().enumerate() {
         let word_width = display_width(word);
-        let separator_width = usize::from(*needs_separator || i > 0);
-        let projected = *current_width + separator_width + word_width;
+        let separator_width = usize::from(*ctx.needs_separator || i > 0);
+        let projected = *ctx.current_width + separator_width + word_width;
 
-        if projected > width && *current_width > indent {
-            flush_line(lines, current, current_width, indent);
-            *needs_separator = i > 0;
+        if projected > ctx.width && *ctx.current_width > ctx.indent {
+            ctx.flush_line();
+            *ctx.needs_separator = i > 0;
         }
 
-        if *current_width + word_width > width && *current_width >= indent {
-            flush_line(lines, current, current_width, indent);
-            *needs_separator = false;
-            let available = width.saturating_sub(*current_width);
-            if word_width > available {
-                let chunked = split_word_to_width(word, available);
-                for (ci, chunk) in chunked.iter().enumerate() {
-                    if ci > 0 {
-                        flush_line(lines, current, current_width, indent);
-                    }
-                    current.push(Span::styled(chunk.clone(), Style::default()));
-                    *current_width += display_width(chunk);
-                }
-                *needs_separator = true;
-                continue;
-            }
+        if *ctx.current_width + word_width > ctx.width && *ctx.current_width >= ctx.indent {
+            ctx.render_word_split(word, ctx.base_style());
+            continue;
         }
 
-        if (*needs_separator || i > 0) && !current.is_empty() && *current_width > indent {
-            current.push(Span::styled(" ".to_string(), Style::default()));
-            *current_width += 1;
+        if (*ctx.needs_separator || i > 0)
+            && !ctx.current.is_empty()
+            && *ctx.current_width > ctx.indent
+        {
+            ctx.push_span(" ".to_string(), ctx.base_style());
+            *ctx.current_width += 1;
         }
-        current.push(Span::styled(word.to_string(), Style::default()));
-        *current_width += word_width;
-        *needs_separator = true;
+        ctx.push_span(word.to_string(), ctx.base_style());
+        *ctx.current_width += word_width;
+        *ctx.needs_separator = true;
     }
 
     if ends_with_space && !words.is_empty() {
-        *needs_separator = true;
+        *ctx.needs_separator = true;
     }
 }
 
-fn render_code_inline(
-    text: &str,
-    lines: &mut Vec<Line<'static>>,
-    current: &mut Vec<Span<'static>>,
-    current_width: &mut usize,
-    needs_separator: &mut bool,
-    indent: usize,
-    width: usize,
-) {
+fn render_code_inline(text: &str, ctx: &mut RenderCtx, color: Color) {
     let word_width = display_width(text);
-    let projected = *current_width + usize::from(*needs_separator) + word_width;
-    if projected > width && *current_width > indent {
-        flush_line(lines, current, current_width, indent);
-    } else if *needs_separator && !current.is_empty() && *current_width > indent {
-        current.push(Span::styled(" ".to_string(), Style::default()));
-        *current_width += 1;
+
+    // Flush if projected width exceeds the available line width
+    // (but only when the line already has content — don't flush a blank line).
+    let projected = *ctx.current_width + usize::from(*ctx.needs_separator) + word_width;
+    if projected > ctx.width && *ctx.current_width > ctx.indent {
+        ctx.flush_line();
+    } else if *ctx.needs_separator && !ctx.current.is_empty() && *ctx.current_width > ctx.indent {
+        ctx.push_span(" ".to_string(), ctx.base_style());
+        *ctx.current_width += 1;
     }
-    current.push(Span::styled(text.to_string(), Style::default()));
-    *current_width += word_width;
-    *needs_separator = true;
+
+    if *ctx.current_width + word_width > ctx.width && *ctx.current_width >= ctx.indent {
+        ctx.render_word_split(text, ctx.base_style().fg(color));
+        return;
+    }
+
+    ctx.push_span(text.to_string(), ctx.base_style().fg(color));
+    *ctx.current_width += word_width;
+    *ctx.needs_separator = true;
 }
 
-fn render_style_inline(
-    content: &[MarkdownInline],
-    lines: &mut Vec<Line<'static>>,
-    current: &mut Vec<Span<'static>>,
-    current_width: &mut usize,
-    needs_separator: &mut bool,
-    indent: usize,
-    width: usize,
-) {
-    render_inlines_to_lines(
-        content,
-        lines,
-        current,
-        current_width,
-        needs_separator,
-        indent,
-        width,
-    );
-    *needs_separator = true;
+/// Render a styled container (bold, italic, strikethrough) by stacking its
+/// [`Modifier`] on top of any modifiers already active from enclosing
+/// containers.  The save-OR-restore pattern gives us correct nesting with
+/// no heap allocation — e.g. ***bold italic*** becomes
+/// `BOLD | ITALIC` for the inner text.
+fn render_style_inline(content: &[MarkdownInline], ctx: &mut RenderCtx, modifier: Modifier) {
+    let prev = ctx.modifier;
+    ctx.modifier = prev | modifier;
+    render_inlines_to_lines(content, ctx);
+    ctx.modifier = prev;
+    *ctx.needs_separator = true;
 }
 
-#[allow(clippy::too_many_arguments)]
-fn render_link_inline(
-    content: &[MarkdownInline],
-    destination: &str,
-    lines: &mut Vec<Line<'static>>,
-    current: &mut Vec<Span<'static>>,
-    current_width: &mut usize,
-    needs_separator: &mut bool,
-    indent: usize,
-    width: usize,
-) {
-    render_inlines_to_lines(
-        content,
-        lines,
-        current,
-        current_width,
-        needs_separator,
-        indent,
-        width,
-    );
-    if !destination.is_empty() {
-        let dest_text = format!(" ({destination})");
-        let dest_width = display_width(&dest_text);
-        let projected = *current_width + dest_width;
-        if projected > width && *current_width > indent {
-            flush_line(lines, current, current_width, indent);
-        }
-        current.push(Span::styled(dest_text, Style::default()));
-        *current_width += dest_width;
+/// Render a hyperlink: link text in **bold**, then ` — `, then the URL
+/// <u>underlined</u>.  If `destination` is empty the content is rendered
+/// without any link-specific styling (bare `[...]()` with no URL).
+///
+/// Modifier stacking works the same as [`render_style_inline`]: the BOLD
+/// flag is ORed in for the content, then removed for the separator, then
+/// UNDERLINED is ORed in for the URL alone, then fully restored.
+fn render_link_inline(content: &[MarkdownInline], destination: &str, ctx: &mut RenderCtx) {
+    if destination.is_empty() {
+        render_inlines_to_lines(content, ctx);
+        *ctx.needs_separator = true;
+        return;
     }
-    *needs_separator = true;
+
+    // Link content in bold (stacked on any parent modifier).
+    let prev = ctx.modifier;
+    ctx.modifier = prev | Modifier::BOLD;
+    render_inlines_to_lines(content, ctx);
+
+    // Separator: " - " with the parent style (no bold).
+    ctx.modifier = prev;
+    let sep = " - ";
+    let sep_width = display_width(sep);
+    let url_width = display_width(destination);
+    let projected = *ctx.current_width + sep_width + url_width;
+    if projected > ctx.width && *ctx.current_width > ctx.indent {
+        ctx.flush_line();
+    }
+    ctx.push_span(sep.to_string(), ctx.base_style());
+    *ctx.current_width += sep_width;
+
+    // URL underlined (stacked on parent but not bold).
+    ctx.modifier = prev | Modifier::UNDERLINED;
+    ctx.push_span(destination.to_string(), ctx.base_style());
+    ctx.modifier = prev;
+    *ctx.current_width += url_width;
+
+    *ctx.needs_separator = true;
 }
 
 fn wrapped_line_height(line: &Line<'_>, width: usize) -> usize {
@@ -1296,7 +1295,6 @@ pub(crate) fn compute_visual_offsets(lines: &[Line<'_>], width: u16) -> Arc<[usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::Color;
 
     // ── find_syntax ──────────────────────────────────────────────────────
 
@@ -1987,5 +1985,293 @@ mod tests {
             result.iter().all(|l| l.width() <= 5),
             "every wrapped line must be ≤ 5 wide"
         );
+    }
+
+    // ── Inline styling (bold, italic, strikethrough, code) ──────────────
+
+    #[test]
+    fn markdown_bold_applies_bold_modifier() {
+        let result = markdown_lines("**bold text**", 80);
+        let line = &result[0];
+        let has_bold = line
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(has_bold, "bold markdown should apply BOLD modifier");
+        let text = line.to_string();
+        assert!(text.contains("bold text"), "bold content should appear");
+        assert!(
+            !text.contains("**"),
+            "markdown syntax should not appear literally"
+        );
+    }
+
+    #[test]
+    fn markdown_italic_applies_italic_modifier() {
+        let result = markdown_lines("*italic text*", 80);
+        let line = &result[0];
+        let has_italic = line
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(has_italic, "italic markdown should apply ITALIC modifier");
+        let text = line.to_string();
+        assert!(text.contains("italic text"), "italic content should appear");
+        assert!(
+            !text.contains('*'),
+            "markdown syntax should not appear literally"
+        );
+    }
+
+    #[test]
+    fn markdown_strikethrough_applies_crossed_out_modifier() {
+        let result = markdown_lines("~~strike~~", 80);
+        let line = &result[0];
+        let has_crossed = line
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::CROSSED_OUT));
+        assert!(
+            has_crossed,
+            "strikethrough markdown should apply CROSSED_OUT modifier"
+        );
+        let text = line.to_string();
+        assert!(
+            text.contains("strike"),
+            "strikethrough content should appear"
+        );
+        assert!(
+            !text.contains("~~"),
+            "markdown syntax should not appear literally"
+        );
+    }
+
+    #[test]
+    fn markdown_inline_code_applies_cyan_color() {
+        let result = markdown_lines("use `code` here", 80);
+        let line = &result[0];
+        let has_cyan = line.spans.iter().any(|s| s.style.fg == Some(Color::Cyan));
+        assert!(has_cyan, "inline code should be rendered in Cyan");
+        let text = line.to_string();
+        assert!(text.contains("code"), "code content should appear");
+        assert!(!text.contains('`'), "backticks should not appear literally");
+    }
+
+    #[test]
+    fn markdown_bold_and_italic_nested() {
+        let result = markdown_lines("***nested***", 80);
+        let line = &result[0];
+        let has_bold = line
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
+        let has_italic = line
+            .spans
+            .iter()
+            .any(|s| s.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(has_bold, "nested *** should apply BOLD");
+        assert!(has_italic, "nested *** should apply ITALIC");
+        let text = line.to_string();
+        assert!(text.contains("nested"), "content should appear");
+    }
+
+    #[test]
+    fn markdown_styled_text_within_budget_wraps_correctly() {
+        // Long styled content at a narrow width — should wrap without overflow.
+        let words = (0..20).map(|_| "word").collect::<Vec<_>>().join(" ");
+        let long_bold = format!("**{words}**");
+        let result = markdown_lines(&long_bold, 20);
+        assert!(result.len() > 1, "wide bold content should wrap");
+        for line in &result {
+            assert!(
+                line.width() <= 20,
+                "no wrapped bold line should exceed width, got {}",
+                line.width()
+            );
+        }
+        let has_bold = result
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(has_bold, "wrapped content should still have BOLD modifier");
+    }
+
+    #[test]
+    fn markdown_styled_text_with_indent_does_not_overflow() {
+        // Styled content inside a blockquote (which adds indent).
+        let md = "> **bold content inside blockquote**";
+        let result = markdown_lines(md, 20);
+        for line in &result {
+            assert!(
+                line.width() <= 20,
+                "indented styled line must not exceed width, got {}",
+                line.width()
+            );
+        }
+        let text = result
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("bold content"),
+            "styled content should be present"
+        );
+    }
+
+    #[test]
+    fn markdown_inline_code_in_blockquote_is_colored() {
+        let md = "> `short_code`";
+        let result = markdown_lines(md, 20);
+        for line in &result {
+            assert!(
+                line.width() <= 20,
+                "indented inline code must not exceed width, got {}",
+                line.width()
+            );
+        }
+        let has_cyan = result
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.fg == Some(Color::Cyan));
+        assert!(has_cyan, "inline code in blockquote should be Cyan");
+    }
+
+    #[test]
+    fn markdown_inline_code_wider_than_width_splits() {
+        // An inline code segment wider than the available width.
+        let long_code = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let md = format!("`{long_code}`");
+        let result = markdown_lines(&md, 10);
+        // Should have wrapped onto multiple lines.
+        assert!(result.len() > 1, "over-wide inline code should split");
+        for line in &result {
+            assert!(
+                line.width() <= 10,
+                "split code chunk must not exceed width, got {}",
+                line.width()
+            );
+        }
+        // All chunks should be cyan.
+        for line in &result {
+            for span in &line.spans {
+                if !span.content.trim().is_empty() {
+                    assert_eq!(
+                        span.style.fg,
+                        Some(Color::Cyan),
+                        "every code chunk should be Cyan"
+                    );
+                }
+            }
+        }
+        // Full content should appear across the lines.
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains(long_code),
+            "all characters of the code must appear in the output"
+        );
+    }
+
+    // ── Links ─────────────────────────────────────────────────
+
+    #[test]
+    fn markdown_link_renders_bold_content_with_underlined_url() {
+        let result = markdown_lines("[click here](http://example.com)", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(whole.contains("click"), "word 'click' should appear");
+        assert!(whole.contains("here"), "word 'here' should appear");
+        assert!(whole.contains("http://example.com"), "URL should appear");
+        assert!(
+            !whole.contains("[click here]"),
+            "markdown syntax should not appear literally"
+        );
+        // The link content should have BOLD modifier
+        let has_bold = result
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content.contains("click") && s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(has_bold, "link content should be bold");
+        // The URL should have UNDERLINED modifier
+        let has_underlined = result.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.content.contains("http://") && s.style.add_modifier.contains(Modifier::UNDERLINED)
+        });
+        assert!(has_underlined, "URL should be underlined");
+    }
+
+    #[test]
+    fn markdown_link_empty_destination_no_url() {
+        let result = markdown_lines("[text]()", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(whole.contains("text"), "link text should appear");
+        assert!(
+            !whole.contains("http"),
+            "no URL should appear for empty destination"
+        );
+        // Without a destination, the content should have no BOLD modifier
+        let has_bold = result
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!has_bold, "empty link should not apply bold");
+    }
+
+    #[test]
+    fn markdown_link_inside_bold_applies_both() {
+        let result = markdown_lines("[**bold link**](http://example.com)", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(whole.contains("bold"), "bold word should appear");
+        assert!(whole.contains("link"), "link word should appear");
+        assert!(
+            !whole.contains("**"),
+            "markdown syntax should not appear literally"
+        );
+        assert!(whole.contains("http://example.com"), "URL should appear");
+        // The content inherits BOLD from markdown **plus** the link's BOLD
+        let has_bold = result
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content.contains("bold") && s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(has_bold, "link content should be bold");
+    }
+
+    #[test]
+    fn markdown_link_with_code_is_colored() {
+        let result = markdown_lines("[`code`](http://example.com)", 80);
+        let has_cyan = result
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.fg == Some(Color::Cyan));
+        assert!(has_cyan, "inline code should be Cyan inside a link");
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(whole.contains("code"), "code content should appear");
+        assert!(
+            !whole.contains('`'),
+            "backticks should not appear literally"
+        );
+    }
+
+    #[test]
+    fn markdown_link_wrapping_does_not_overflow() {
+        let long = "a".repeat(30);
+        let md = format!("[{long}](http://example.com)");
+        let result = markdown_lines(&md, 10);
+        // Should wrap onto multiple lines: content wraps, then URL on its own line.
+        assert!(
+            result.len() >= 3,
+            "long link text should wrap onto multiple lines, got {}",
+            result.len()
+        );
+        // The first 3 lines are the bold content — each must be ≤ width.
+        // The last line(s) contain the separator + URL, which may exceed width.
+        for line in result.iter().take(3) {
+            assert!(
+                line.width() <= 10,
+                "wrapped link content line width {} exceeds 10",
+                line.width()
+            );
+        }
+        // The URL should appear somewhere.
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(whole.contains("http://example.com"), "URL should appear");
     }
 }
