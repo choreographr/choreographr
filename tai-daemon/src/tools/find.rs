@@ -179,7 +179,7 @@ impl Tool for Find {
     }
 
     fn description(&self) -> &'static str {
-        "Find files and directories by name. Glob auto-detected when pattern contains `*`, `?`, `[`, `{`, `!`, or `~`. Escape glob chars with `\\` to match literals. Respects .gitignore and hidden files."
+        "Find files and directories by name. Glob auto-detected when pattern contains wildcards — set glob:true to force glob mode or glob:false to force substring matching. Use path to scope the search directory and max_results to cap matches. Respects .gitignore and hidden files."
     }
 
     fn supports_streaming_output() -> bool {

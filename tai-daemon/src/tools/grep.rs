@@ -183,7 +183,7 @@ impl Tool for Grep {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents for a pattern. Respects .gitignore, hidden, and binary files. Results in file:line:content format."
+        "Search file contents for a pattern. Pattern is treated as a literal substring by default — set regex:true to use regular expressions. Use include to filter files by glob (e.g. \"*.rs\"), path to scope the search directory, and max_results to cap matches. Results in file:line:content format. Respects .gitignore, hidden, and binary files."
     }
 
     fn supports_streaming_output() -> bool {

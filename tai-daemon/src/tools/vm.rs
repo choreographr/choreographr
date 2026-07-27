@@ -532,26 +532,50 @@ const BOILERPLATE_TAIL_ENCODING: &str = r#"
         dec_double_str_result(&resp).unwrap_or_default()
     }
 
-    /// grep(pattern: &str) -> file content search results as string.
-    pub fn grep(pattern: &str) -> String {
+    /// grep(pattern, regex, include, path, max_results) -> file content search results as string.
+    ///
+    /// When `regex` is true the pattern is treated as a regular expression;
+    /// when false (default) it is matched as a literal substring.
+    /// `include` is an optional file glob filter (e.g. `Some("*.rs")`).
+    /// `path` scopes the search to a directory (None = working directory).
+    /// `max_results` caps the number of matches returned (None = default 50).
+    /// The host stores max_results as u32, so we cast to u64 for the postcard
+    /// varint encoder (postcard encodes both u32 and u64 as the same varint wire format).
+    pub fn grep(
+        pattern: &str,
+        regex: bool,
+        include: Option<&str>,
+        path: Option<&str>,
+        max_results: Option<u32>,
+    ) -> String {
         let mut args = Vec::new();
         enc_str(pattern, &mut args);
-        enc_bool(false, &mut args);       // regex (default: literal)
-        enc_option_str(None, &mut args);  // include
-        enc_option_str(None, &mut args);  // path
-        enc_option_u64(None, &mut args);  // max_results
+        enc_bool(regex, &mut args);
+        enc_option_str(include, &mut args);
+        enc_option_str(path, &mut args);
+        enc_option_u64(max_results.map(|n| n as u64), &mut args);
         let resp = call("grep", &args);
         dec_double_str_result(&resp).unwrap_or_default()
     }
 
-    /// find(pattern: &str) -> file name search results as string.
-    /// Glob mode is auto-detected — patterns with `*`, `?`, `[` are treated as globs.
-    pub fn find(pattern: &str) -> String {
+    /// find(pattern, glob, path, max_results) -> file name search results as string.
+    ///
+    /// When `glob` is true the pattern is treated as a glob (supports `*`, `?`, `[`).
+    /// When false (default), glob metacharacters are auto-detected — use `false`
+    /// to force substring matching for patterns that happen to contain wildcards.
+    /// `path` scopes the search to a directory (None = working directory).
+    /// `max_results` caps the number of matches returned (None = default 50).
+    pub fn find(
+        pattern: &str,
+        glob: bool,
+        path: Option<&str>,
+        max_results: Option<u32>,
+    ) -> String {
         let mut args = Vec::new();
         enc_str(pattern, &mut args);
-        enc_bool(false, &mut args);       // glob: false = auto-detect
-        enc_option_str(None, &mut args);  // path
-        enc_option_u64(None, &mut args);  // max_results
+        enc_bool(glob, &mut args);
+        enc_option_str(path, &mut args);
+        enc_option_u64(max_results.map(|n| n as u64), &mut args);
         let resp = call("find", &args);
         dec_double_str_result(&resp).unwrap_or_default()
     }
@@ -1106,7 +1130,7 @@ impl Tool for RunRiscV {
     }
 
     fn description(&self) -> &'static str {
-        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `tai` module. Use per-tool convenience wrappers (tai::read_file, tai::write_file, tai::db_get, tai::db_set, tai::sh, tai::exec, tai::grep, tai::find, tai::http_request) for tool calls — they handle the postcard encoding automatically. Use tai::write(b\"...\") for VM output and tai::exit(code) to finish. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported."
+        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `tai` module. Use per-tool convenience wrappers: tai::read_file(path), tai::write_file(path, content, overwrite), tai::db_get(key), tai::db_set(key, value), tai::db_delete(key), tai::sh(command, shell, workdir, timeout_ms), tai::exec(command, args, workdir, timeout_ms), tai::grep(pattern, regex, include, path, max_results), tai::find(pattern, glob, path, max_results), tai::http_request(method, url, headers, body, timeout_secs). CRITICAL: For grep, set regex:true when using regex patterns — the default is literal matching. The wrappers handle postcard encoding automatically. Use tai::write(b\"...\") for VM output and tai::exit(code) to finish. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported."
     }
 
     fn supports_streaming_output() -> bool {
@@ -1152,7 +1176,7 @@ impl Tool for RunRiscV {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `tai` module — these are auto-generated. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. Use the provided wrappers: tai::write(b\"...\"), tai::exit(code), and per-tool wrappers like tai::read_file(path), tai::write_file(path, content, overwrite), tai::db_get(key), tai::db_set(key, value), tai::sh(command, shell, ...), tai::exec(command, args, ...), tai::grep(pattern), tai::find(pattern), tai::http_request(method, url, headers, body, timeout). The wrappers handle postcard encoding automatically — no need to call tai::tool_call or tai::call directly. Example: `fn main() { let content = tai::read_file(\"Cargo.toml\"); tai::write(content.as_bytes()); }`. Alloc types are pre-imported: Vec, String, Box, format!, .to_string()."
+                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `tai` module — these are auto-generated. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. Use the provided wrappers (they handle postcard encoding automatically — no need to call tai::tool_call or tai::call directly):\n- tai::write(b\"...\"), tai::exit(code)\n- tai::read_file(path: &str) -> String\n- tai::write_file(path: &str, content: &str, overwrite: bool)\n- tai::db_get(key: &str) -> Vec<u8>, tai::db_set(key: &str, value: &[u8]), tai::db_delete(key: &str) -> bool\n- tai::sh(command: &str, shell: Shell, workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- tai::exec(command: &str, args: &[&str], workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- tai::grep(pattern: &str, regex: bool, include: Option<&str>, path: Option<&str>, max_results: Option<u32>) -> String — CRITICAL: set regex: true when pattern is a regular expression (default is literal substring match). include is a file glob filter (e.g. Some(\"*.rs\")). path scopes the search directory.\n- tai::find(pattern: &str, glob: bool, path: Option<&str>, max_results: Option<u32>) -> String — glob: true = glob mode; false = auto-detect.\n- tai::http_request(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&str>, timeout_secs: Option<u64>) -> String\nExample: `fn main() { let content = tai::read_file(\"Cargo.toml\"); tai::write(content.as_bytes()); }`. Alloc types are pre-imported: Vec, String, Box, format!, .to_string()."
                 },
                 "program": {
                     "type": "string",
@@ -1330,6 +1354,23 @@ mod tests {
         assert!(result.contains("TOOL_CALL"));
         assert!(result.contains("WRITE"));
         assert!(result.contains("EXIT"));
+        // Per-tool convenience wrappers and their key parameters
+        assert!(
+            result.contains("fn grep("),
+            "grep wrapper should be present"
+        );
+        assert!(
+            result.contains("regex: bool"),
+            "grep should expose regex param"
+        );
+        assert!(
+            result.contains("fn find("),
+            "find wrapper should be present"
+        );
+        assert!(
+            result.contains("glob: bool"),
+            "find should expose glob param"
+        );
     }
 
     fn dummy_registry() -> Arc<ToolRegistry> {
