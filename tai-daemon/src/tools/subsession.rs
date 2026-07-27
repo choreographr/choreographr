@@ -96,7 +96,7 @@ impl Tool for SpawnSubsession {
                 parent_session_id: Some(ctx.session_id),
                 working_dir: child_working_dir.clone(),
                 max_turns: args.max_turns,
-                reasoning_effort: ctx.reasoning_effort,
+                reasoning_effort: ctx.reasoning_effort.clone(),
                 selected_model: ctx.selected_model.clone(),
                 context_config: None,
                 account_name: None,

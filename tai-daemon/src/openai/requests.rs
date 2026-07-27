@@ -133,8 +133,8 @@ impl OpenAiClient {
         &self,
         params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, super::OpenAiError> {
-        let reasoning_effort = reasoning_effort_api_value(params.thinking_effort);
-        debug!(?params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
+        let reasoning_effort = reasoning_effort_api_value(&params.thinking_effort);
+        debug!(effort = %params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
         match self.config.request_format_for_model(params.model) {
             RequestFormat::Responses => responses_request_with_tools(
                 &self.http,
@@ -172,9 +172,9 @@ impl OpenAiClient {
     where
         F: FnMut(StreamEvent) -> io::Result<()>,
     {
-        let reasoning_effort = reasoning_effort_api_value(params.thinking_effort);
+        let reasoning_effort = reasoning_effort_api_value(&params.thinking_effort);
         debug!(
-            ?params.thinking_effort,
+            effort = %params.thinking_effort,
             ?reasoning_effort,
             "chat_completion_turn_streaming"
         );
@@ -314,7 +314,7 @@ fn chat_completions_request_with_tools(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&str>,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<ChatTurnResult, super::OpenAiError> {
@@ -418,7 +418,7 @@ fn chat_completions_request_streaming<F>(
     api_key: &str,
     model: &str,
     prompt: &str,
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&str>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
     on_event: &mut F,
 ) -> Result<(), super::OpenAiError>
@@ -608,7 +608,7 @@ fn build_responses_request_body(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&str>,
     previous_response_id: Option<&str>,
     tool_results: &[ToolResultItem],
     stream: bool,
@@ -710,7 +710,7 @@ fn responses_request_with_tools(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&str>,
     previous_response_id: Option<&str>,
     tool_results: &[ToolResultItem],
     on_retry: &mut Option<retry::RetryCallback>,
@@ -961,7 +961,7 @@ fn chat_completions_request_streaming_with_tools<F>(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&str>,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
     mut on_event: F,
@@ -1148,7 +1148,7 @@ fn responses_request_streaming_with_tools<F>(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&str>,
     previous_response_id: Option<&str>,
     tool_results: &[ToolResultItem],
     on_retry: &mut Option<retry::RetryCallback>,
@@ -1404,7 +1404,6 @@ mod tests {
     use crate::openai::{AllowedCaller, StreamToolCallFunctionDelta};
     use crate::providers::types::CallerInfo;
     use std::time::Duration;
-    use tai_proto::ThinkingEffort;
 
     // -- validate_tool_call_arguments tests --------------------------------
 
@@ -1741,26 +1740,23 @@ mod tests {
     #[test]
     fn reasoning_effort_serialization() {
         // Off → None (omitted from body)
-        assert_eq!(
-            crate::openai::reasoning_effort_api_value(ThinkingEffort::Off),
-            None
-        );
+        assert_eq!(crate::openai::reasoning_effort_api_value("off"), None);
 
         // Low → "low"
         assert_eq!(
-            crate::openai::reasoning_effort_api_value(ThinkingEffort::Low),
+            crate::openai::reasoning_effort_api_value("low"),
             Some("low")
         );
 
         // Medium → "medium"
         assert_eq!(
-            crate::openai::reasoning_effort_api_value(ThinkingEffort::Medium),
+            crate::openai::reasoning_effort_api_value("medium"),
             Some("medium")
         );
 
         // High → "high"
         assert_eq!(
-            crate::openai::reasoning_effort_api_value(ThinkingEffort::High),
+            crate::openai::reasoning_effort_api_value("high"),
             Some("high")
         );
     }
@@ -2065,19 +2061,18 @@ mod tests {
     }
 
     #[test]
-    fn chat_completion_turn_dispatches_to_responses_when_configured() {
+    fn chat_completion_turn_dispatches_to_responses_by_default() {
         let mut config = ServiceConfig::default();
         config.default_request_format = RequestFormat::Responses;
+        // Unknown model falls back to default_request_format.
         assert_eq!(
-            config.request_format_for_model("gpt-4"),
+            config.request_format_for_model("unknown-model"),
             RequestFormat::Responses
         );
-        // Per-model override to ChatCompletions should take precedence.
-        config
-            .model_request_formats
-            .insert("gpt-4".to_string(), RequestFormat::ChatCompletions);
+        // Known model with openai_responses: false returns ChatCompletions.
+        config.provider_slug = "openai";
         assert_eq!(
-            config.request_format_for_model("gpt-4"),
+            config.request_format_for_model("gpt-4.1"),
             RequestFormat::ChatCompletions
         );
     }

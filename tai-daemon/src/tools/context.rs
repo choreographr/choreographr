@@ -5,7 +5,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
 use crate::daemon::DaemonCommand;
-use tai_proto::ThinkingEffort;
 
 /// Session-level context passed through tool execution.
 ///
@@ -23,7 +22,7 @@ pub struct ToolContext {
     /// Tool groups active in the parent session (inherited by sub-sessions).
     pub active_tool_groups: HashSet<String>,
     /// Reasoning effort configured for the parent session.
-    pub reasoning_effort: Option<ThinkingEffort>,
+    pub reasoning_effort: Option<String>,
     /// Model selected for the parent session (inherited by sub-sessions).
     pub selected_model: Option<String>,
     /// Working directory for the parent session (used as fallback working_dir).

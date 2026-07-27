@@ -278,27 +278,27 @@ fn build_message_payloads_simple() {
 
 #[test]
 fn test_thinking_payload_off() {
-    let result = super::thinking_payload(tai_proto::ThinkingEffort::Off, 4096);
+    let result = super::thinking_payload("off", 4096);
     assert!(result.is_none());
 }
 
 #[test]
 fn test_thinking_payload_low() {
-    let result = super::thinking_payload(tai_proto::ThinkingEffort::Low, 4096);
+    let result = super::thinking_payload("low", 4096);
     assert!(result.is_some());
     assert_eq!(result.unwrap().budget_tokens, 2048);
 }
 
 #[test]
 fn test_thinking_payload_medium() {
-    let result = super::thinking_payload(tai_proto::ThinkingEffort::Medium, 8192);
+    let result = super::thinking_payload("medium", 8192);
     assert!(result.is_some());
     assert_eq!(result.unwrap().budget_tokens, 4096);
 }
 
 #[test]
 fn test_thinking_payload_high() {
-    let result = super::thinking_payload(tai_proto::ThinkingEffort::High, 32768);
+    let result = super::thinking_payload("high", 32768);
     assert!(result.is_some());
     assert_eq!(result.unwrap().budget_tokens, 16384);
 }
@@ -306,7 +306,7 @@ fn test_thinking_payload_high() {
 #[test]
 fn test_thinking_payload_clamped() {
     // max_tokens=3072 ⇒ budget_tokens can be at most 3072-1024=2048
-    let result = super::thinking_payload(tai_proto::ThinkingEffort::High, 3072);
+    let result = super::thinking_payload("high", 3072);
     assert!(result.is_some());
     assert_eq!(result.unwrap().budget_tokens, 2048);
 }
@@ -314,7 +314,7 @@ fn test_thinking_payload_clamped() {
 #[test]
 fn test_thinking_payload_low_max_tokens_exact() {
     // max_tokens=2048 ⇒ budget_tokens at most 2048-1024=1024
-    let result = super::thinking_payload(tai_proto::ThinkingEffort::Low, 2048);
+    let result = super::thinking_payload("low", 2048);
     assert!(result.is_some());
     assert_eq!(result.unwrap().budget_tokens, 1024);
 }
@@ -322,7 +322,7 @@ fn test_thinking_payload_low_max_tokens_exact() {
 #[test]
 fn test_thinking_payload_zero_max_tokens() {
     // max_tokens=1024 ⇒ budgets are clamped to 0
-    let result = super::thinking_payload(tai_proto::ThinkingEffort::High, 1024);
+    let result = super::thinking_payload("high", 1024);
     assert!(result.is_some());
     assert_eq!(result.unwrap().budget_tokens, 0);
 }

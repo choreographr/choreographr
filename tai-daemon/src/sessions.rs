@@ -1,9 +1,7 @@
 use crate::context::{LoadedSkill, SkillMeta};
 use crate::daemon::DaemonCommand;
 use crate::db::{self, SessionRecord, write_session_retry, write_turn_retry};
-use crate::providers::{
-    InferenceProvider, ReasoningSupport, effective_reasoning_support, lookup_provider,
-};
+use crate::providers::{InferenceProvider, model_reasoning_capability};
 use crate::requests::run_agent_loop;
 use crate::tools::ToolRegistry;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -13,7 +11,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tai_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, SessionStatus,
-    SessionSummary, ThinkingEffort, TimestampMs, TokenUsage, ToolResultRecord, Turn,
+    SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn,
 };
 use tracing::{debug, error, info, trace, warn};
 
@@ -60,10 +58,10 @@ pub enum SessionCommand {
         name: String,
     },
     SetReasoningEffort {
-        effort: ThinkingEffort,
+        effort: String,
     },
     GetReasoningEffort {
-        reply: mpsc::Sender<ThinkingEffort>,
+        reply: mpsc::Sender<String>,
     },
     Undo,
     Redo,
@@ -97,7 +95,7 @@ pub struct ChildResult {
 pub struct SessionMetadata {
     pub title: Option<String>,
     pub selected_model: Option<String>,
-    pub reasoning_effort: Option<ThinkingEffort>,
+    pub reasoning_effort: Option<String>,
     pub parent_session_id: Option<u64>,
     pub working_dir: Option<String>,
     pub created_at: i64,
@@ -177,7 +175,7 @@ impl SessionMetadata {
             session_id,
             title: self.title.clone(),
             selected_model: self.selected_model.clone(),
-            reasoning_effort: self.reasoning_effort,
+            reasoning_effort: self.reasoning_effort.clone(),
             parent_session_id: self.parent_session_id,
             working_dir: self.working_dir.clone(),
             created_at: self.created_at,
@@ -200,7 +198,7 @@ impl SessionMetadata {
 pub struct SessionConfig {
     pub title: Option<String>,
     pub selected_model: Option<String>,
-    pub reasoning_effort: Option<ThinkingEffort>,
+    pub reasoning_effort: Option<String>,
     pub parent_session_id: Option<u64>,
     pub working_dir: Option<PathBuf>,
     pub max_turns: Option<u32>,
@@ -243,7 +241,7 @@ impl From<&SessionConfig> for SessionMetadata {
         SessionMetadata {
             title: config.title.clone(),
             selected_model: config.selected_model.clone(),
-            reasoning_effort: config.reasoning_effort,
+            reasoning_effort: config.reasoning_effort.clone(),
             parent_session_id: config.parent_session_id,
             working_dir: config.working_dir.as_ref().map(|p| p.display().to_string()),
             created_at: config.created_at,
@@ -363,6 +361,10 @@ impl SessionState {
     /// for broadcasting to connected clients.  Centralises the field mapping
     /// so that every broadcast site stays consistent when new fields are added.
     pub(crate) fn session_state_message(&self, session_id: u64) -> DaemonMessage {
+        let reasoning_capability = self.config.selected_model.as_ref().and_then(|model| {
+            let slug = self.provider.as_ref()?.provider_slug();
+            Some(model_reasoning_capability(slug, model))
+        });
         DaemonMessage::SessionState {
             session_id,
             title: self.config.title.clone(),
@@ -380,6 +382,8 @@ impl SessionState {
             context_window: self.config.context_window,
             last_prompt_tokens: self.config.last_prompt_tokens,
             status: self.config.status.clone(),
+            reasoning_effort: self.config.reasoning_effort.clone(),
+            reasoning_capability,
         }
     }
 
@@ -584,7 +588,9 @@ pub fn session_main(
     let config = SessionConfig {
         title: init_record.as_ref().and_then(|r| r.title.clone()),
         selected_model: init_record.as_ref().and_then(|r| r.selected_model.clone()),
-        reasoning_effort: init_record.as_ref().and_then(|r| r.reasoning_effort),
+        reasoning_effort: init_record
+            .as_ref()
+            .and_then(|r| r.reasoning_effort.clone()),
         parent_session_id: init_record.as_ref().and_then(|r| r.parent_session_id),
         working_dir: init_record
             .as_ref()
@@ -962,6 +968,33 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
             },
         );
     }
+    let capability = state
+        .provider
+        .as_ref()
+        .map(|p| model_reasoning_capability(p.provider_slug(), &model));
+
+    // Re-validate the current reasoning effort against the new model's
+    // capability.  Slugs that were valid on the old model may not be
+    // supported by the new one — silently reset to "off" when that happens.
+    if let Some(ref cap) = capability
+        && let Some(ref effort) = state.config.reasoning_effort
+        && effort != "off"
+        && !cap.available_effort_levels.iter().any(|l| l == effort)
+    {
+        warn!(
+            session_id = ctx.session_id,
+            old_effort = %effort,
+            "reasoning effort not supported by new model, resetting to 'off'",
+        );
+        state.config.reasoning_effort = Some("off".to_string());
+        broadcast(
+            &mut state.subscribers,
+            DaemonMessage::ReasoningEffortSet {
+                effort: "off".to_string(),
+            },
+        );
+    }
+
     debug!(
         "session {}: broadcasting ModelSelected model={}",
         ctx.session_id, model
@@ -970,6 +1003,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         &mut state.subscribers,
         DaemonMessage::ModelSelected {
             model: model.clone(),
+            reasoning_capability: capability,
         },
     );
     let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
@@ -1081,7 +1115,7 @@ fn handle_get_summary(
         session_id: ctx.session_id,
         title: state.config.title.clone(),
         selected_model: state.config.selected_model.clone(),
-        reasoning_effort: state.config.reasoning_effort,
+        reasoning_effort: state.config.reasoning_effort.clone(),
         parent_session_id: state.config.parent_session_id,
         working_dir: state
             .config
@@ -1235,60 +1269,60 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
 
 /// Set the reasoning effort for this session, validating against the model.
 fn handle_set_reasoning_effort(
-    effort: ThinkingEffort,
+    effort: String,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
-    info!(
-        session_id = ctx.session_id,
-        effort = %effort.as_label(),
-        "setting reasoning effort"
-    );
+    // Reject overly long slugs early (defense in depth).
+    if effort.len() > 64 {
+        let msg = format!("reasoning effort slug too long ({} bytes)", effort.len());
+        warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
+        broadcast(
+            &mut state.subscribers,
+            DaemonMessage::ReasoningEffortSetFailed { effort, error: msg },
+        );
+        return false;
+    }
 
-    // Check if the current model supports reasoning
-    let supported = if let (Some(model), Some(provider)) = (
-        state.config.selected_model.as_ref(),
-        state.provider.as_ref(),
-    ) {
-        // Get the provider slug
-        let slug = provider.provider_slug();
-        let catalog_entry = lookup_provider(slug);
-        let reasoning_support = catalog_entry
-            .map(|e| e.reasoning)
-            .unwrap_or(ReasoningSupport::None);
-        let effective = effective_reasoning_support(model, reasoning_support);
-        effective != ReasoningSupport::None
-    } else {
-        // If no model or provider is set yet, accept the preference
-        // (it will be validated when inference actually runs)
-        true
-    };
+    // Compute capability for the current model (if any).
+    let capability = state.config.selected_model.as_ref().and_then(|model| {
+        let slug = state.provider.as_ref()?.provider_slug();
+        Some(model_reasoning_capability(slug, model))
+    });
 
-    if supported || effort == ThinkingEffort::Off {
-        state.config.reasoning_effort = Some(effort);
-        debug!(
+    // "off" is always valid — every model can disable reasoning. Otherwise
+    // check the slug is in the model's capability set.
+    let valid = effort == "off"
+        || capability
+            .as_ref()
+            .map(|c| c.available_effort_levels.contains(&effort))
+            .unwrap_or(false)
+        // No model selected yet: accept the preference optimistically (it
+        // will be validated when inference actually runs in
+        // resolve_reasoning_effort).
+        || capability.is_none();
+
+    if valid {
+        let changed = state.config.reasoning_effort.as_deref() != Some(effort.as_str());
+        state.config.reasoning_effort = Some(effort.clone());
+        info!(
             session_id = ctx.session_id,
-            effort = %effort.as_label(),
-            "reasoning effort stored"
+            effort = %effort,
+            model = ?state.config.selected_model,
+            "reasoning effort set",
         );
         broadcast(
             &mut state.subscribers,
             DaemonMessage::ReasoningEffortSet { effort },
         );
+        return changed;
     } else {
         let model = state.config.selected_model.as_deref().unwrap_or("(none)");
-        let msg = format!(
-            "model '{}' does not support reasoning effort '{}'",
-            model,
-            effort.as_label(),
-        );
+        let msg = format!("model '{model}' does not support reasoning effort '{effort}'",);
         warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
         broadcast(
             &mut state.subscribers,
-            DaemonMessage::ReasoningEffortSetFailed {
-                effort: effort.as_label().to_string(),
-                error: msg,
-            },
+            DaemonMessage::ReasoningEffortSetFailed { effort, error: msg },
         );
     }
     false
@@ -1296,12 +1330,16 @@ fn handle_set_reasoning_effort(
 
 /// Return the current reasoning effort via the reply channel.
 fn handle_get_reasoning_effort(
-    reply: mpsc::Sender<ThinkingEffort>,
+    reply: mpsc::Sender<String>,
     state: &SessionState,
     ctx: &RequestContext,
 ) -> bool {
     let _ = ctx;
-    let current = state.config.reasoning_effort.unwrap_or(ThinkingEffort::Off);
+    let current = state
+        .config
+        .reasoning_effort
+        .clone()
+        .unwrap_or_else(|| "off".to_string());
     let _ = reply.send(current);
     false
 }

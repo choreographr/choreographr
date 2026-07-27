@@ -8,28 +8,6 @@ const DEFAULT_MODEL_LIST_PATH: &str = "/models";
 const DEFAULT_RESPONSES_PATH: &str = "/responses";
 const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
-/// Deprecated provider-level fields that used to live in config.toml.
-/// They have been moved to accounts.toml — warn users who still have them.
-const DEPRECATED_PROVIDER_FIELDS: &[&str] = &[
-    "base_url",
-    "model_list_path",
-    "responses_path",
-    "chat_completions_path",
-    "default_request_format",
-    "model_request_formats",
-    "chat_completions_max_tokens",
-    "model_max_tokens",
-    "chat_completions_max_tokens_field",
-    "model_max_tokens_fields",
-    "streaming",
-    "stream_options",
-    "retry_max_attempts",
-    "retry_initial_backoff_ms",
-    "retry_max_backoff_ms",
-    "connect_timeout_secs",
-    "request_timeout_secs",
-];
-
 /// Daemon-level configuration from config.toml.
 ///
 /// Only truly global settings belong here.  All provider-level
@@ -50,7 +28,7 @@ pub struct ServiceConfig {
     pub responses_path: String,
     pub chat_completions_path: String,
     pub default_request_format: RequestFormat,
-    pub model_request_formats: HashMap<String, RequestFormat>,
+    pub provider_slug: &'static str,
     pub chat_completions_max_tokens: Option<u32>,
     pub model_max_tokens: HashMap<String, u32>,
     pub context_window_config: crate::providers::ContextWindowConfig,
@@ -78,7 +56,7 @@ impl Default for ServiceConfig {
             responses_path: DEFAULT_RESPONSES_PATH.to_string(),
             chat_completions_path: DEFAULT_CHAT_COMPLETIONS_PATH.to_string(),
             default_request_format: RequestFormat::ChatCompletions,
-            model_request_formats: HashMap::new(),
+            provider_slug: "openai",
             chat_completions_max_tokens: None,
             model_max_tokens: HashMap::new(),
             context_window_config: crate::providers::ContextWindowConfig::default(),
@@ -125,22 +103,8 @@ pub fn load_daemon_config() -> io::Result<DaemonConfig> {
             format!("failed to read config at {}: {error}", path.display()),
         )
     })?;
-    // First pass: check for deprecated provider-level fields.
-    if let Ok(value) = toml::from_str::<toml::Value>(&raw)
-        && let toml::Value::Table(table) = &value
-    {
-        for key in table.keys() {
-            if DEPRECATED_PROVIDER_FIELDS.contains(&key.as_str()) {
-                tracing::warn!(
-                    "config.toml contains deprecated provider-level field '{key}'. \
-                     This field is no longer read from config.toml; \
-                     move it to accounts.toml instead."
-                );
-            }
-        }
-    }
-    // Second pass: parse only the daemon-level fields (unknown fields are
-    // silently ignored thanks to #[serde(default)]).
+    // Parse only the daemon-level fields (unknown fields are silently
+    // ignored thanks to #[serde(default)]).
     let config: DaemonConfig = toml::from_str(&raw).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -181,10 +145,10 @@ pub(crate) fn endpoint_url(base_url: &str, path: &str) -> io::Result<String> {
 }
 
 impl ServiceConfig {
+    /// Resolve the request format for a model: catalog lookup first,
+    /// falling back to the configured default for unknown models.
     pub fn request_format_for_model(&self, model: &str) -> RequestFormat {
-        self.model_request_formats
-            .get(model)
-            .copied()
+        crate::providers::model_request_format(self.provider_slug, model)
             .unwrap_or(self.default_request_format)
     }
 
@@ -278,9 +242,12 @@ mod tests {
     fn programmatic_tool_calling_auto_enables_for_gpt_5_6_responses() {
         let mut config = ServiceConfig::default();
         config.default_request_format = RequestFormat::Responses;
-        // gpt-5.6 models auto-enable with Responses API format.
-        assert!(config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
+        // Models not in the catalog fall back to default_request_format.
+        // When the default is Responses, gpt-5.6 models auto-enable.
         assert!(config.programmatic_tool_calling_for_model("gpt-5.6-chat"));
+        // Known models with openai_responses: false use ChatCompletions
+        // instead, so auto-enable does not fire.
+        assert!(!config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
     }
 
     #[test]
@@ -301,16 +268,20 @@ mod tests {
     }
 
     #[test]
-    fn programmatic_tool_calling_auto_enable_respects_per_model_format() {
+    fn request_format_for_model_uses_catalog_lookup() {
         let mut config = ServiceConfig::default();
         config.default_request_format = RequestFormat::Responses;
-        // Per-model override to ChatCompletions should disable auto-enable.
-        config
-            .model_request_formats
-            .insert("gpt-5.6-sol".to_string(), RequestFormat::ChatCompletions);
-        assert!(!config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
-        // Other gpt-5.6 models without override still auto-enable.
-        assert!(config.programmatic_tool_calling_for_model("gpt-5.6-chat"));
+        // Known model with openai_responses: false should return ChatCompletions.
+        config.provider_slug = "openai";
+        assert_eq!(
+            config.request_format_for_model("gpt-4.1"),
+            RequestFormat::ChatCompletions
+        );
+        // Unknown model falls back to default_request_format.
+        assert_eq!(
+            config.request_format_for_model("totally-unknown-xyz"),
+            RequestFormat::Responses
+        );
     }
 
     #[test]

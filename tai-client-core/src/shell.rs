@@ -1,4 +1,4 @@
-use tai_proto::{ClientMessage, ThinkingEffort};
+use tai_proto::ClientMessage;
 use tracing::debug;
 
 const INVALID_ACCOUNT_NAME: &str =
@@ -341,19 +341,21 @@ fn parse_command(
     }
 
     if let Some(effort_s) = rest.strip_prefix("reasoning ") {
-        let effort_s = effort_s.trim();
-        let effort = match effort_s {
-            "off" => ThinkingEffort::Off,
-            "low" => ThinkingEffort::Low,
-            "medium" => ThinkingEffort::Medium,
-            "high" => ThinkingEffort::High,
-            _ => {
-                return ShellCommand::UnknownCommand(format!(
-                    "unknown reasoning effort '{effort_s}'. Usage: /reasoning off | low | medium | high"
-                ));
-            }
+        let raw = effort_s.trim();
+        let slug = raw.to_lowercase();
+        let effort = match slug.as_str() {
+            // Normalise common aliases to canonical slugs.
+            "off" | "none" | "disabled" => "off",
+            "med" => "medium",
+            // Pass through arbitrary slugs (e.g. "max", "xhigh") for
+            // models with custom effort sets (DeepSeek, etc.).
+            // The daemon validates the slug against the model's
+            // capability set and rejects unsupported values.
+            other => other,
         };
-        return ShellCommand::Send(ClientMessage::SetReasoningEffort { effort });
+        return ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: effort.to_string(),
+        });
     }
     if rest == "reasoning" {
         return ShellCommand::Send(ClientMessage::GetReasoningEffort);
@@ -368,7 +370,7 @@ pub fn shell_command_echo(command: &ShellCommand) -> Option<String> {
             ClientMessage::RunInput { .. } => None,
             ClientMessage::SetModel { model } => Some(format!("> set model: {model}")),
             ClientMessage::SetReasoningEffort { effort } => {
-                Some(format!("> set reasoning effort: {}", effort.as_label()))
+                Some(format!("> set reasoning effort: {effort}"))
             }
             ClientMessage::GetReasoningEffort => Some("> get reasoning effort".to_string()),
             _ => None,

@@ -9,7 +9,6 @@ use tai_daemon::openai::{
     ChatRequestMessage, OpenAiClient, OpenAiError, RetryCallback, ServiceConfig,
 };
 use tai_daemon::providers::{ChatTurnRequest, ChatTurnResult, StreamEvent};
-use tai_proto::ThinkingEffort;
 
 // ── Helpers ───────────────────────────────────────────────────────
 
@@ -97,7 +96,7 @@ fn retry_succeeds_with_callback() {
         model: "retry-model",
         messages: &messages,
         tools: &[], // no tools
-        thinking_effort: ThinkingEffort::Off,
+        thinking_effort: "off".to_string(),
         on_retry: &mut cb,
         cancel_rx: Some(&cancel_rx),
         previous_response_id: None,
@@ -162,7 +161,7 @@ fn retry_cancelled_during_backoff() {
         model: "retry-model",
         messages: &messages,
         tools: &[], // no tools
-        thinking_effort: ThinkingEffort::Off,
+        thinking_effort: "off".to_string(),
         on_retry: &mut cb,
         cancel_rx: Some(&cancel_rx),
         previous_response_id: None,
@@ -255,7 +254,7 @@ fn streaming_cancelled_during_sse_events() {
             model: "test-model",
             messages: &[ChatRequestMessage::simple("user", "hello".into())],
             tools: &[],
-            thinking_effort: ThinkingEffort::Off,
+            thinking_effort: "off".to_string(),
             on_retry: &mut None,
             cancel_rx: Some(&cancel_rx),
             previous_response_id: None,
@@ -290,7 +289,7 @@ fn streaming_cancelled_before_first_event() {
             model: "test-model",
             messages: &[ChatRequestMessage::simple("user", "hello".into())],
             tools: &[],
-            thinking_effort: ThinkingEffort::Off,
+            thinking_effort: "off".to_string(),
             on_retry: &mut None,
             cancel_rx: Some(&cancel_rx),
             previous_response_id: None,

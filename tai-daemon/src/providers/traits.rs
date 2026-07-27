@@ -6,7 +6,7 @@ use crate::openai::{ChatRequestMessage, ChatToolDefinition};
 use crate::providers::StreamEvent;
 use crate::providers::types::{CallerInfo, ChatTurnResult};
 use crate::retry::RetryCallback;
-use tai_proto::{InferenceError, ThinkingEffort};
+use tai_proto::InferenceError;
 
 /// A single tool result to feed back into a Responses API turn.
 #[derive(Debug, Clone)]
@@ -21,7 +21,7 @@ pub struct ChatTurnRequest<'a> {
     pub model: &'a str,
     pub messages: &'a [ChatRequestMessage],
     pub tools: &'a [ChatToolDefinition],
-    pub thinking_effort: ThinkingEffort,
+    pub thinking_effort: String,
     pub on_retry: &'a mut Option<RetryCallback>,
     pub cancel_rx: Option<&'a mpsc::Receiver<()>>,
     /// Response ID from a previous turn (Responses API).

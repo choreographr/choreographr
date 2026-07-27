@@ -367,6 +367,8 @@ fn session_state_none_optionals_round_trip() {
         context_window: None,
         last_prompt_tokens: None,
         status: SessionStatus::Inactive,
+        reasoning_effort: None,
+        reasoning_capability: None,
     };
     let frame = encode_frame(&state).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
@@ -400,22 +402,44 @@ fn sessions_with_none_optionals_round_trip() {
     assert_eq!(decoded, msg);
 }
 
-// ── ThinkingEffort tests ─────────────────────────────────────────────────
+// ── ReasoningCapability tests ─────────────────────────────────────────────
 
 #[test]
-fn thinking_effort_labels() {
-    assert_eq!(ThinkingEffort::Off.as_label(), "off");
-    assert_eq!(ThinkingEffort::Low.as_label(), "low");
-    assert_eq!(ThinkingEffort::Medium.as_label(), "medium");
-    assert_eq!(ThinkingEffort::High.as_label(), "high");
+fn reasoning_capability_cycle_from_basic() {
+    let cap = ReasoningCapability {
+        available_effort_levels: vec!["off".into(), "low".into(), "medium".into(), "high".into()],
+    };
+    assert_eq!(cap.cycle_from("off"), Some("low".to_string()));
+    assert_eq!(cap.cycle_from("low"), Some("medium".to_string()));
+    assert_eq!(cap.cycle_from("medium"), Some("high".to_string()));
+    assert_eq!(cap.cycle_from("high"), Some("off".to_string()));
 }
 
 #[test]
-fn thinking_effort_serialization() {
-    let json = serde_json::to_string(&ThinkingEffort::Medium).unwrap();
-    assert_eq!(json, "\"medium\"");
-    let deserialized: ThinkingEffort = serde_json::from_str(&json).unwrap();
-    assert_eq!(deserialized, ThinkingEffort::Medium);
+fn reasoning_capability_cycle_from_empty() {
+    let cap = ReasoningCapability {
+        available_effort_levels: vec![],
+    };
+    assert_eq!(cap.cycle_from("off"), None);
+}
+
+#[test]
+fn reasoning_capability_cycle_from_unknown_starts_at_zero() {
+    let cap = ReasoningCapability {
+        available_effort_levels: vec!["off".into(), "low".into(), "medium".into(), "high".into()],
+    };
+    // Unknown current slug starts at index 0, cycle_from returns the next ("low")
+    assert_eq!(cap.cycle_from("unknown"), Some("low".to_string()));
+}
+
+#[test]
+fn reasoning_capability_serde_round_trip() {
+    let cap = ReasoningCapability {
+        available_effort_levels: vec!["off".into(), "on".into()],
+    };
+    let frame = encode_frame(&cap).expect("encode");
+    let decoded: ReasoningCapability = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, cap);
 }
 
 // ── TurnAppended / TurnFinalized round-trip tests ───────────────────────

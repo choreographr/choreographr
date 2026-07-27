@@ -1,46 +1,61 @@
 use std::fmt;
 use tracing::debug;
 
+use tai_proto::ReasoningCapability;
+
+use crate::openai::RequestFormat;
 use crate::providers::shared::MaxTokensField;
 
+/// Per-model metadata in the provider catalog.
+/// A single source of truth for context window, reasoning support,
+/// and explicit effort levels.
+#[derive(Debug)]
+pub struct ModelEntry {
+    pub model: &'static str,
+    pub context_window: u32,
+    /// Whether this model supports reasoning/thinking at all.
+    /// Applicable across all protocols — OpenAi, AnthropicMessages,
+    /// and GoogleGenerativeAi all use this flag to enable/disable
+    /// their respective reasoning features per model.
+    /// When `false`, the model entry's `openai_reasoning_levels`
+    /// (if any) is ignored and the model is treated as non-reasoning.
+    pub reasoning_supported: bool,
+    /// Explicit reasoning effort level slugs for this model.
+    /// Only meaningful when `reasoning_supported` is true AND the
+    /// provider protocol is `OpenAi` (enforced by
+    /// `model_reasoning_capability()`).  Non-OpenAi protocols always
+    /// use their own default levels — see `protocol_default_levels()`.
+    ///
+    /// Resolution rules in `model_reasoning_capability()`:
+    ///   • `reasoning_supported = false` → empty capability (no reasoning)
+    ///   • `reasoning_supported = true` + `OpenAi` protocol + non-empty
+    ///     levels → use these levels
+    ///   • `reasoning_supported = true` + non-`OpenAi` protocol → use
+    ///     protocol defaults (the field is ignored)
+    ///   • `reasoning_supported = true` + any protocol + empty levels →
+    ///     use protocol defaults
+    pub openai_reasoning_levels: &'static [&'static str],
+    /// Whether this model uses OpenAI's Responses API vs Chat Completions.
+    /// Only relevant for OpenAi protocol providers.
+    pub openai_responses: bool,
+}
+
+/// Protocol variant — selects wire format and carries protocol-specific fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProtocol {
-    OpenAiCompatible,
+    OpenAi { max_tokens_field: MaxTokensField },
     AnthropicMessages,
     GoogleGenerativeAi,
-    Mistral,
 }
-
-/// Declares which reasoning parameter protocol a provider speaks.
-/// This is the wire-format level — model-level gating is done separately
-/// via `effective_reasoning_support()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReasoningSupport {
-    /// No reasoning parameter is supported by this provider.
-    None,
-    /// OpenAI-style `reasoning_effort` field in chat completions.
-    ReasoningEffort,
-    /// Anthropic-style `thinking` block with `budget_tokens`.
-    AnthropicThinking,
-    /// Google-style `thinkingConfig` with `includeThoughts`.
-    GoogleThinkingConfig,
-}
-
-/// A (model_slug, context_window) pair for catalog lookup.
-/// The model slug is matched exactly against the user-selected model.
-pub type ModelWindowEntry = (&'static str, u32);
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderEntry {
     pub slug: &'static str,
     pub display_name: &'static str,
     pub protocol: ProviderProtocol,
-    pub default_base_url: &'static str,
+    pub base_url: &'static str,
     pub default_model: &'static str,
-    pub reasoning: ReasoningSupport,
-    pub max_tokens_field: MaxTokensField,
-    /// Per-model context windows, matched exactly against the model slug.
-    pub model_context_windows: &'static [ModelWindowEntry],
+    pub models: &'static [ModelEntry],
 }
 
 /// Static catalog of all known providers.
@@ -48,392 +63,905 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
     ProviderEntry {
         slug: "openai",
         display_name: "OpenAI",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.openai.com/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.openai.com/v1",
         default_model: "gpt-4.1",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[
-            ("gpt-5.6-sol", 272_000),
-            ("gpt-5.6-terra", 272_000),
-            ("gpt-5.6-luna", 272_000),
-            ("gpt-5.5", 272_000),
-            ("gpt-5.5-pro", 1_050_000),
-            ("gpt-5.4", 272_000),
-            ("gpt-5.4-pro", 1_050_000),
-            ("gpt-5.4-mini", 400_000),
-            ("gpt-5.4-nano", 400_000),
-            ("gpt-5.3-codex-spark", 128_000),
-            ("gpt-5.3-codex", 400_000),
-            ("gpt-5.2", 400_000),
-            ("gpt-5.2-codex", 400_000),
-            ("gpt-5.1", 400_000),
-            ("gpt-5.1-codex-max", 400_000),
-            ("gpt-5.1-codex", 400_000),
-            ("gpt-5.1-codex-mini", 400_000),
-            ("gpt-5", 400_000),
-            ("gpt-5-codex", 400_000),
-            ("gpt-5-nano", 400_000),
-            ("gpt-4.1-nano", 1_048_576),
-            ("gpt-4.1-mini", 1_048_576),
-            ("gpt-4.1", 1_048_576),
-            ("gpt-4o", 128_000),
-            ("gpt-4o-mini", 128_000),
-            ("o1", 200_000),
-            ("o3", 200_000),
-            ("o4-mini", 200_000),
+        models: &[
+            ModelEntry {
+                model: "gpt-5.6-sol",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.6-terra",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.6-luna",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.5",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.5-pro",
+                context_window: 1_050_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["medium", "high"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.4",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.4-pro",
+                context_window: 1_050_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["low", "medium", "high"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.4-mini",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.4-nano",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.3-codex-spark",
+                context_window: 128_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.3-codex",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.2",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.2-codex",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.1",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.1-codex-max",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.1-codex",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.1-codex-mini",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5-codex",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5-nano",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-4.1-nano",
+                context_window: 1_048_576,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-4.1-mini",
+                context_window: 1_048_576,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-4.1",
+                context_window: 1_048_576,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-4o",
+                context_window: 128_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-4o-mini",
+                context_window: 128_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "o1",
+                context_window: 200_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "o3",
+                context_window: 200_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "o4-mini",
+                context_window: 200_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "o3-mini",
+                context_window: 200_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "o4-mini-2025-07-18",
+                context_window: 200_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: false,
+            },
         ],
     },
     ProviderEntry {
         slug: "openai_compatible",
         display_name: "OpenAI Compatible",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.openai.com/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.openai.com/v1",
         default_model: "custom-model",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "opencode",
         display_name: "OpenCode Zen",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://opencode.ai/zen/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxTokens,
+        },
+        base_url: "https://opencode.ai/zen/v1",
         default_model: "deepseek-v4-flash",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxTokens,
-        model_context_windows: &[("big-pickle", 200_000)],
+        models: &[ModelEntry {
+            model: "big-pickle",
+            context_window: 200_000,
+            reasoning_supported: false,
+            openai_reasoning_levels: &[],
+            openai_responses: false,
+        }],
     },
     ProviderEntry {
         slug: "opencode-go",
         display_name: "OpenCode Go",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://opencode.ai/zen/go/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxTokens,
+        },
+        base_url: "https://opencode.ai/zen/go/v1",
         default_model: "deepseek-v4-pro",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxTokens,
-        model_context_windows: &[("deepseek-v4-flash", 1_000_000)],
+        models: &[
+            ModelEntry {
+                model: "deepseek-v4-flash",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["high", "max"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "deepseek-v4-pro",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["high", "max"],
+                openai_responses: false,
+            },
+        ],
     },
     ProviderEntry {
         slug: "deepseek",
         display_name: "DeepSeek",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.deepseek.com",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.deepseek.com",
         default_model: "deepseek-chat",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[
-            ("deepseek-v4-flash", 1_000_000),
-            ("deepseek-v4-pro", 1_000_000),
-            ("deepseek-chat", 64_000),
-            ("deepseek-reasoner", 64_000),
+        models: &[
+            ModelEntry {
+                model: "deepseek-v4-flash",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["high", "max"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "deepseek-v4-pro",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["high", "max"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "deepseek-chat",
+                context_window: 64_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "deepseek-reasoner",
+                context_window: 64_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: false,
+            },
         ],
     },
     ProviderEntry {
         slug: "xai",
         display_name: "xAI Grok",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.x.ai/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.x.ai/v1",
         default_model: "grok-4",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[
-            ("grok-build-0.1", 256_000),
-            ("grok-4.5", 500_000),
-            ("grok-4.3", 1_000_000),
-            ("grok-4", 131_072),
-            ("grok-3", 131_072),
+        models: &[
+            ModelEntry {
+                model: "grok-build-0.1",
+                context_window: 256_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "grok-4.5",
+                context_window: 500_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "grok-4.3",
+                context_window: 1_000_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "grok-4",
+                context_window: 131_072,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "grok-3",
+                context_window: 131_072,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
         ],
     },
     ProviderEntry {
         slug: "groq",
         display_name: "Groq",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.groq.com/openai/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.groq.com/openai/v1",
         default_model: "llama-3.3-70b-versatile",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "together",
         display_name: "Together AI",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.together.xyz/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.together.xyz/v1",
         default_model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "mistral",
         display_name: "Mistral",
-        protocol: ProviderProtocol::Mistral,
-        default_base_url: "https://api.mistral.ai/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxTokens,
+        },
+        base_url: "https://api.mistral.ai/v1",
         default_model: "mistral-large-latest",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "ollama",
         display_name: "Ollama (Local)",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "http://localhost:11434/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "http://localhost:11434/v1",
         default_model: "llama3.1",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "ollama-cloud",
         display_name: "Ollama Cloud",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://ollama.com/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://ollama.com/v1",
         default_model: "qwen3-coder:480b",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "openrouter",
         display_name: "OpenRouter",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://openrouter.ai/api/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://openrouter.ai/api/v1",
         default_model: "openai/gpt-4.1",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "huggingface",
         display_name: "Hugging Face",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://router.huggingface.co/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://router.huggingface.co/v1",
         default_model: "meta-llama/Llama-3.3-70B-Instruct",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "github",
         display_name: "GitHub Models",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://models.inference.ai.azure.com",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://models.inference.ai.azure.com",
         default_model: "openai/gpt-4.1",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "nvidia",
         display_name: "NVIDIA NIM",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://integrate.api.nvidia.com/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://integrate.api.nvidia.com/v1",
         default_model: "nvidia/llama-3.1-nemotron-70b-instruct",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "cerebras",
         display_name: "Cerebras",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.cerebras.ai/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.cerebras.ai/v1",
         default_model: "cerebras",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "fireworks",
         display_name: "Fireworks AI",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.fireworks.ai/inference/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.fireworks.ai/inference/v1",
         default_model: "accounts/fireworks/models/llama-v3p3-70b-instruct",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "xiaomi-mimo",
         display_name: "Xiaomi MiMo",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.mimo.xiaomi.com/openai/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.mimo.xiaomi.com/openai/v1",
         default_model: "mimo-vl",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "dashscope",
         display_name: "DashScope (Alibaba)",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         default_model: "qwen-plus",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[
-            ("qwen3.6-plus", 1_000_000),
-            ("qwen3.5-plus", 1_000_000),
-            ("qwen-plus", 131_072),
-            ("qwen-max", 32_000),
-            ("qwen-turbo", 1_000_000),
-            ("qwen2.5", 131_072),
-            ("qwen2", 131_072),
-            ("qwen3", 131_072),
-            ("qwen-vl", 131_072),
+        models: &[
+            ModelEntry {
+                model: "qwen3.6-plus",
+                context_window: 1_000_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "qwen3.5-plus",
+                context_window: 1_000_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "qwen-plus",
+                context_window: 131_072,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "qwen-max",
+                context_window: 32_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "qwen-turbo",
+                context_window: 1_000_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "qwen2.5",
+                context_window: 131_072,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "qwen2",
+                context_window: 131_072,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "qwen3",
+                context_window: 131_072,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "qwen-vl",
+                context_window: 131_072,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
         ],
     },
     ProviderEntry {
         slug: "moonshot",
         display_name: "Moonshot AI (Kimi)",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.moonshot.ai/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.moonshot.ai/v1",
         default_model: "kimi-k2",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[
-            ("kimi-k2.7-code", 262_144),
-            ("kimi-k2.6", 262_144),
-            ("kimi-k2.5", 262_144),
-            ("kimi-k2", 128_000),
+        models: &[
+            ModelEntry {
+                model: "kimi-k2.7-code",
+                context_window: 262_144,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "kimi-k2.6",
+                context_window: 262_144,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "kimi-k2.5",
+                context_window: 262_144,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "kimi-k2",
+                context_window: 128_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
         ],
     },
     ProviderEntry {
         slug: "perplexity",
         display_name: "Perplexity",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.perplexity.ai",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.perplexity.ai",
         default_model: "sonar-pro",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[
-            ("sonar-pro", 127_000),
-            ("sonar-reasoning", 127_000),
-            ("sonar-deep-research", 127_000),
-            ("sonar", 127_000),
+        models: &[
+            ModelEntry {
+                model: "sonar-pro",
+                context_window: 127_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "sonar-reasoning",
+                context_window: 127_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "sonar-deep-research",
+                context_window: 127_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "sonar",
+                context_window: 127_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
         ],
     },
     ProviderEntry {
         slug: "zai",
         display_name: "Z.ai (GLM)",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.z.ai/api/paas/v4",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.z.ai/api/paas/v4",
         default_model: "glm-4.5",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[
-            ("glm-5.2", 202_752),
-            ("glm-5.1", 202_752),
-            ("glm-5", 202_752),
-            ("glm-4.5", 128_000),
-            ("glm-4", 128_000),
+        models: &[
+            ModelEntry {
+                model: "glm-5.2",
+                context_window: 202_752,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "glm-5.1",
+                context_window: 202_752,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "glm-5",
+                context_window: 202_752,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "glm-4.5",
+                context_window: 128_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "glm-4",
+                context_window: 128_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
         ],
     },
     ProviderEntry {
         slug: "venice",
         display_name: "Venice AI",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.venice.ai/api/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.venice.ai/api/v1",
         default_model: "qwen-2.5-qwq-32b",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "novita",
         display_name: "Novita AI",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.novita.ai/v3/openai",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.novita.ai/v3/openai",
         default_model: "deepseek-v3",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "lmstudio",
         display_name: "LM Studio",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "http://localhost:1234/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "http://localhost:1234/v1",
         default_model: "local-model",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "custom-openai",
         display_name: "Custom OpenAI-Compatible",
-        protocol: ProviderProtocol::OpenAiCompatible,
-        default_base_url: "https://api.openai.com/v1",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        },
+        base_url: "https://api.openai.com/v1",
         default_model: "custom-model",
-        reasoning: ReasoningSupport::ReasoningEffort,
-        max_tokens_field: MaxTokensField::MaxCompletionTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "anthropic",
         display_name: "Anthropic",
         protocol: ProviderProtocol::AnthropicMessages,
-        default_base_url: "https://api.anthropic.com",
+        base_url: "https://api.anthropic.com",
         default_model: "claude-sonnet-4-20250514",
-        reasoning: ReasoningSupport::AnthropicThinking,
-        max_tokens_field: MaxTokensField::MaxTokens,
-        model_context_windows: &[
-            ("claude-fable-5", 1_000_000),
-            ("claude-opus-4-8", 1_000_000),
-            ("claude-opus-4-7", 1_000_000),
-            ("claude-opus-4-6", 1_000_000),
-            ("claude-opus-4-5", 200_000),
-            ("claude-opus-4-1", 200_000),
-            ("claude-sonnet-5", 1_000_000),
-            ("claude-sonnet-4-6", 1_000_000),
-            ("claude-sonnet-4-5", 1_000_000),
-            ("claude-sonnet-4", 200_000),
-            ("claude-haiku-4-5", 200_000),
+        models: &[
+            ModelEntry {
+                model: "claude-fable-5",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "claude-opus-4-8",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "claude-opus-4-7",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "claude-opus-4-6",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "claude-opus-4-5",
+                context_window: 200_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "claude-opus-4-1",
+                context_window: 200_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "claude-sonnet-5",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "claude-sonnet-4-6",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "claude-sonnet-4-5",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "claude-sonnet-4",
+                context_window: 200_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "claude-haiku-4-5",
+                context_window: 200_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
         ],
     },
     ProviderEntry {
         slug: "minimax",
         display_name: "MiniMax",
         protocol: ProviderProtocol::AnthropicMessages,
-        default_base_url: "https://api.minimax.io/anthropic",
+        base_url: "https://api.minimax.io/anthropic",
         default_model: "MiniMax-M3",
-        reasoning: ReasoningSupport::AnthropicThinking,
-        max_tokens_field: MaxTokensField::MaxTokens,
-        model_context_windows: &[
-            ("minimax-m3", 128_000),
-            ("minimax-m2.7", 204_800),
-            ("minimax-m2.5", 204_800),
+        models: &[
+            ModelEntry {
+                model: "minimax-m3",
+                context_window: 128_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "minimax-m2.7",
+                context_window: 204_800,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "minimax-m2.5",
+                context_window: 204_800,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
         ],
     },
     ProviderEntry {
         slug: "custom-anthropic",
         display_name: "Custom Anthropic-Compatible",
         protocol: ProviderProtocol::AnthropicMessages,
-        default_base_url: "https://api.anthropic.com",
+        base_url: "https://api.anthropic.com",
         default_model: "custom-model",
-        reasoning: ReasoningSupport::AnthropicThinking,
-        max_tokens_field: MaxTokensField::MaxTokens,
-        model_context_windows: &[],
+        models: &[],
     },
     ProviderEntry {
         slug: "google",
         display_name: "Google Gemini",
         protocol: ProviderProtocol::GoogleGenerativeAi,
-        default_base_url: "https://generativelanguage.googleapis.com/v1beta",
+        base_url: "https://generativelanguage.googleapis.com/v1beta",
         default_model: "gemini-2.5-pro",
-        reasoning: ReasoningSupport::GoogleThinkingConfig,
-        max_tokens_field: MaxTokensField::MaxTokens,
-        model_context_windows: &[
-            ("gemini-3.5-flash", 1_048_576),
-            ("gemini-3.1-pro", 1_048_576),
-            ("gemini-3-flash", 1_048_576),
-            ("gemini-2.5-pro", 1_048_576),
-            ("gemini-2.5-flash", 1_048_576),
-            ("gemini-2.0-flash", 1_048_576),
-            ("gemini-1.5-pro", 2_097_152),
-            ("gemini-1.5-flash", 1_048_576),
+        models: &[
+            ModelEntry {
+                model: "gemini-3.5-flash",
+                context_window: 1_048_576,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gemini-3.1-pro",
+                context_window: 1_048_576,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gemini-3-flash",
+                context_window: 1_048_576,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gemini-2.5-pro",
+                context_window: 1_048_576,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gemini-2.5-flash",
+                context_window: 1_048_576,
+                reasoning_supported: true,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gemini-2.0-flash",
+                context_window: 1_048_576,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gemini-1.5-pro",
+                context_window: 2_097_152,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gemini-1.5-flash",
+                context_window: 1_048_576,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
         ],
     },
 ];
@@ -441,10 +969,9 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
 impl fmt::Display for ProviderProtocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProviderProtocol::OpenAiCompatible => write!(f, "OpenAI-compatible"),
-            ProviderProtocol::AnthropicMessages => write!(f, "Anthropic Messages"),
-            ProviderProtocol::GoogleGenerativeAi => write!(f, "Google Generative AI"),
-            ProviderProtocol::Mistral => write!(f, "Mistral"),
+            ProviderProtocol::OpenAi { .. } => write!(f, "Protocol: OpenAI"),
+            ProviderProtocol::AnthropicMessages => write!(f, "Protocol: Anthropic Messages"),
+            ProviderProtocol::GoogleGenerativeAi => write!(f, "Protocol: Google Generative AI"),
         }
     }
 }
@@ -459,67 +986,12 @@ pub fn lookup_provider(slug: &str) -> Option<&'static ProviderEntry> {
 /// Returns `None` if no entry matches or the provider is unknown.
 pub fn lookup_context_window(provider_slug: &str, model: &str) -> Option<u32> {
     let entry = lookup_provider(provider_slug)?;
-    for (slug, window) in entry.model_context_windows {
-        if model == *slug {
-            return Some(*window);
+    for m in entry.models {
+        if model == m.model {
+            return Some(m.context_window);
         }
     }
     None
-}
-
-/// Determine whether a specific model actually supports reasoning on a given
-/// provider. Uses model-name heuristics because the static catalog can't
-/// enumerate every model variant dynamically.
-///
-/// Returns `ReasoningSupport::None` when the model doesn't support reasoning,
-/// even if the provider protocol would allow it.
-pub fn effective_reasoning_support(model: &str, provider: ReasoningSupport) -> ReasoningSupport {
-    let lower = model.to_lowercase();
-    let result = match provider {
-        ReasoningSupport::ReasoningEffort => {
-            // OpenAI reasoning models: o-series (o1, o3, o4-mini, etc.)
-            // GPT-5 series
-            // DeepSeek reasoner
-            // xAI Grok reasoning models
-            if lower.starts_with("o")
-                || lower.starts_with("gpt-5")
-                || lower.contains("deepseek-reasoner")
-                || lower.contains("grok") && lower.contains("reasoning")
-                || lower.contains("mistral-large")
-            {
-                ReasoningSupport::ReasoningEffort
-            } else {
-                ReasoningSupport::None
-            }
-        }
-        ReasoningSupport::AnthropicThinking => {
-            // Claude Sonnet/Opus 4+ support extended thinking
-            if lower.contains("sonnet-4")
-                || lower.contains("opus-4")
-                || lower.contains("sonnet-3-5")
-            {
-                ReasoningSupport::AnthropicThinking
-            } else {
-                ReasoningSupport::None
-            }
-        }
-        ReasoningSupport::GoogleThinkingConfig => {
-            // Gemini 2.5 series supports thinking
-            if lower.contains("gemini-2.5") {
-                ReasoningSupport::GoogleThinkingConfig
-            } else {
-                ReasoningSupport::None
-            }
-        }
-        ReasoningSupport::None => ReasoningSupport::None,
-    };
-    debug!(
-        model = %model,
-        ?provider,
-        ?result,
-        "effective_reasoning_support"
-    );
-    result
 }
 
 /// Return all provider slugs.
@@ -530,6 +1002,78 @@ pub fn all_slugs() -> impl Iterator<Item = &'static str> {
 /// Return all display names.
 pub fn all_display_names() -> impl Iterator<Item = &'static str> {
     PROVIDER_CATALOG.iter().map(|e| e.display_name)
+}
+
+/// Compute the reasoning capability for a given model on a given provider.
+/// Falls back to protocol defaults for unknown models (best-effort
+/// compatibility with new/untracked models).
+pub fn model_reasoning_capability(provider_slug: &str, model: &str) -> ReasoningCapability {
+    let entry = lookup_provider(provider_slug);
+
+    let levels: Vec<String> = match entry {
+        Some(e) => {
+            let model_entry = e.models.iter().find(|m| m.model == model);
+            match model_entry {
+                // Known model that explicitly does not support reasoning
+                Some(m) if !m.reasoning_supported => vec![],
+                // Known model with explicit effort levels (OpenAi protocol only)
+                Some(m)
+                    if matches!(e.protocol, ProviderProtocol::OpenAi { .. })
+                        && !m.openai_reasoning_levels.is_empty() =>
+                {
+                    m.openai_reasoning_levels
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                }
+                // Known model with reasoning but no explicit levels → protocol defaults
+                Some(_) => protocol_default_levels(e.protocol),
+                // Unknown model → protocol defaults (best-effort for new models)
+                None => protocol_default_levels(e.protocol),
+            }
+        }
+        // Unknown provider — no protocol to infer defaults from
+        None => vec![],
+    };
+
+    debug!(
+        provider = %provider_slug,
+        model = %model,
+        ?levels,
+        "model_reasoning_capability"
+    );
+
+    ReasoningCapability {
+        available_effort_levels: levels,
+    }
+}
+
+/// Return the default reasoning-effort slugs for a given protocol.
+fn protocol_default_levels(protocol: ProviderProtocol) -> Vec<String> {
+    match protocol {
+        ProviderProtocol::OpenAi { .. } | ProviderProtocol::AnthropicMessages => {
+            vec!["off".into(), "low".into(), "medium".into(), "high".into()]
+        }
+        ProviderProtocol::GoogleGenerativeAi => {
+            vec!["off".into(), "on".into()]
+        }
+    }
+}
+
+/// Look up whether a model should use OpenAI's Responses API.
+/// Returns None for unknown models — caller falls back to default_request_format.
+pub fn model_request_format(provider_slug: &str, model: &str) -> Option<RequestFormat> {
+    let entry = lookup_provider(provider_slug)?;
+    for m in entry.models {
+        if model == m.model {
+            return if m.openai_responses {
+                Some(RequestFormat::Responses)
+            } else {
+                Some(RequestFormat::ChatCompletions)
+            };
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -580,7 +1124,7 @@ mod tests {
                 entry.slug
             );
             assert!(
-                !entry.default_base_url.is_empty(),
+                !entry.base_url.is_empty(),
                 "empty base_url for {}",
                 entry.slug
             );
@@ -589,12 +1133,13 @@ mod tests {
                 "empty model for {}",
                 entry.slug
             );
-            for (slug, window) in entry.model_context_windows {
-                assert!(!slug.is_empty(), "empty model slug in {}", entry.slug);
+            for m in entry.models {
+                assert!(!m.model.is_empty(), "empty model slug in {}", entry.slug);
                 assert!(
-                    *window > 0,
-                    "invalid context window {} for slug '{slug}' in {}",
-                    window,
+                    m.context_window > 0,
+                    "invalid context window {} for slug '{}' in {}",
+                    m.context_window,
+                    m.model,
                     entry.slug
                 );
             }
@@ -654,125 +1199,81 @@ mod tests {
     }
 
     #[test]
-    fn catalog_entries_have_reasoning_support() {
-        for entry in PROVIDER_CATALOG {
-            assert!(
-                matches!(
-                    entry.reasoning,
-                    ReasoningSupport::None
-                        | ReasoningSupport::ReasoningEffort
-                        | ReasoningSupport::AnthropicThinking
-                        | ReasoningSupport::GoogleThinkingConfig
-                ),
-                "missing reasoning for {}",
-                entry.slug
-            );
-        }
-    }
-
-    #[test]
-    fn reasoning_support_effort_models() {
-        // OpenAI reasoning models
-        assert_eq!(
-            effective_reasoning_support("o1", ReasoningSupport::ReasoningEffort),
-            ReasoningSupport::ReasoningEffort
-        );
-        assert_eq!(
-            effective_reasoning_support("o3-mini", ReasoningSupport::ReasoningEffort),
-            ReasoningSupport::ReasoningEffort
-        );
-        assert_eq!(
-            effective_reasoning_support("o4-mini-2025-07-18", ReasoningSupport::ReasoningEffort),
-            ReasoningSupport::ReasoningEffort
-        );
-        assert_eq!(
-            effective_reasoning_support("gpt-5.4", ReasoningSupport::ReasoningEffort),
-            ReasoningSupport::ReasoningEffort
-        );
-
-        // Non-reasoning models
-        assert_eq!(
-            effective_reasoning_support("gpt-4.1", ReasoningSupport::ReasoningEffort),
-            ReasoningSupport::None
-        );
-        assert_eq!(
-            effective_reasoning_support("gpt-4o", ReasoningSupport::ReasoningEffort),
-            ReasoningSupport::None
-        );
-        assert_eq!(
-            effective_reasoning_support("llama-3.3-70b", ReasoningSupport::ReasoningEffort),
-            ReasoningSupport::None
-        );
-    }
-
-    #[test]
-    fn reasoning_support_anthropic_models() {
-        assert_eq!(
-            effective_reasoning_support(
-                "claude-sonnet-4-20250514",
-                ReasoningSupport::AnthropicThinking
-            ),
-            ReasoningSupport::AnthropicThinking
-        );
-        assert_eq!(
-            effective_reasoning_support(
-                "claude-opus-4-20250514",
-                ReasoningSupport::AnthropicThinking
-            ),
-            ReasoningSupport::AnthropicThinking
-        );
-
-        // Non-reasoning Claude
-        assert_eq!(
-            effective_reasoning_support(
-                "claude-haiku-3-5-20241022",
-                ReasoningSupport::AnthropicThinking
-            ),
-            ReasoningSupport::None
-        );
-        assert_eq!(
-            effective_reasoning_support(
-                "claude-3-haiku-20240307",
-                ReasoningSupport::AnthropicThinking
-            ),
-            ReasoningSupport::None
-        );
-    }
-
-    #[test]
-    fn reasoning_support_google_models() {
-        assert_eq!(
-            effective_reasoning_support("gemini-2.5-pro", ReasoningSupport::GoogleThinkingConfig),
-            ReasoningSupport::GoogleThinkingConfig
-        );
-        assert_eq!(
-            effective_reasoning_support("gemini-2.5-flash", ReasoningSupport::GoogleThinkingConfig),
-            ReasoningSupport::GoogleThinkingConfig
-        );
-
-        // Non-reasoning Gemini
-        assert_eq!(
-            effective_reasoning_support("gemini-1.5-pro", ReasoningSupport::GoogleThinkingConfig),
-            ReasoningSupport::None
-        );
-        assert_eq!(
-            effective_reasoning_support("gemma-3-27b-it", ReasoningSupport::GoogleThinkingConfig),
-            ReasoningSupport::None
-        );
-    }
-
-    #[test]
-    fn reasoning_support_none_always_none() {
-        assert_eq!(
-            effective_reasoning_support("anything", ReasoningSupport::None),
-            ReasoningSupport::None
-        );
-    }
-
-    #[test]
     fn all_display_names_are_non_empty() {
         for name in all_display_names() {
             assert!(!name.is_empty());
         }
+    }
+
+    #[test]
+    fn model_reasoning_capability_openai_known_model() {
+        let cap = model_reasoning_capability("openai", "gpt-5.4");
+        assert_eq!(
+            cap.available_effort_levels,
+            vec!["off", "low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn model_reasoning_capability_openai_unknown_model() {
+        let cap = model_reasoning_capability("openai", "gpt-4.1");
+        assert!(cap.available_effort_levels.is_empty());
+    }
+
+    #[test]
+    fn model_reasoning_capability_deepseek_v4_flash() {
+        let cap = model_reasoning_capability("deepseek", "deepseek-v4-flash");
+        assert_eq!(cap.available_effort_levels, vec!["high", "max"]);
+    }
+
+    #[test]
+    fn model_reasoning_capability_anthropic_supported() {
+        let cap = model_reasoning_capability("anthropic", "claude-sonnet-4-20250514");
+        assert_eq!(
+            cap.available_effort_levels,
+            vec!["off", "low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn model_reasoning_capability_anthropic_unsupported() {
+        let cap = model_reasoning_capability("anthropic", "claude-haiku-4-5");
+        assert!(cap.available_effort_levels.is_empty());
+    }
+
+    #[test]
+    fn model_reasoning_capability_google_supported() {
+        let cap = model_reasoning_capability("google", "gemini-2.5-pro");
+        assert_eq!(cap.available_effort_levels, vec!["off", "on"]);
+    }
+
+    #[test]
+    fn model_reasoning_capability_google_unsupported() {
+        let cap = model_reasoning_capability("google", "gemini-1.5-pro");
+        assert!(cap.available_effort_levels.is_empty());
+    }
+
+    #[test]
+    fn model_reasoning_capability_none_provider() {
+        let cap = model_reasoning_capability("nonexistent", "any-model");
+        assert!(cap.available_effort_levels.is_empty());
+    }
+
+    #[test]
+    fn model_request_format_known_model() {
+        let fmt = model_request_format("openai", "gpt-4.1");
+        assert_eq!(fmt, Some(RequestFormat::ChatCompletions));
+    }
+
+    #[test]
+    fn model_request_format_unknown_model() {
+        let fmt = model_request_format("openai", "nonexistent-model");
+        assert_eq!(fmt, None);
+    }
+
+    #[test]
+    fn model_request_format_unknown_provider() {
+        let fmt = model_request_format("nope", "gpt-4.1");
+        assert_eq!(fmt, None);
     }
 }

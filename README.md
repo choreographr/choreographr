@@ -127,8 +127,9 @@ In `tai-tui`:
 - `/remove-key <service>` — remove a credential
 - `/account list` — list configured AI provider accounts
 - `/account remove <name>` — remove an AI provider account
-- `/reasoning` — show current reasoning effort
-- `/reasoning off|low|medium|high` — set reasoning/thinking effort for the session
+- `/reasoning` — show current reasoning effort slug
+- `/reasoning <slug>` — set reasoning effort (e.g. `off`, `low`, `medium`, `high`, `on`, `xhigh`, `max`; available values depend on the model)
+- `Ctrl+R` — cycle reasoning effort through available slugs for the attached session's model
 - `/account <name>` — set the session's AI provider account
 - `/continue` — continue a stopped/idle session by sending a "Please continue." prompt
 - `/stop` — cancel whatever request is currently active on the attached session (same as `/cancel 0`)
@@ -163,9 +164,6 @@ base_url = "http://localhost:11434/v1"
 streaming = false
 retry_max_attempts = 3
 
-[[account]]
-name = "mistral"
-provider = "mistral"
 ```
 
 Each provider from the catalog is pre-configured with sensible defaults (base_url, default model). Override any field per-account. Available per-account overrides:
@@ -184,7 +182,7 @@ Each provider from the catalog is pre-configured with sensible defaults (base_ur
 | `responses_path` | Custom responses endpoint path |
 | `chat_completions_path` | Custom chat completions endpoint path |
 | `default_request_format` | Request format: `"chat_completions"` or `"responses"` |
-| `model_request_formats` | Per-model request format overrides |
+| `model_request_formats` | *(removed — per-model format is now read from the provider catalog)* |
 | `chat_completions_max_tokens` | Default max tokens for chat completions |
 | `model_max_tokens` | Per-model max token caps |
 | `chat_completions_max_tokens_field` | Token field: `"max_tokens"` or `"max_completion_tokens"` |
@@ -195,7 +193,7 @@ Each provider from the catalog is pre-configured with sensible defaults (base_ur
 | `context_window` | Default context window for all models (overrides catalog defaults) |
 | `model_context_windows` | Per-model context window overrides (e.g. `{"gpt-4.1-nano": 1048576}`) |
 
-The Responses API is now fully supported — including tool use, streaming, reasoning effort, multi-turn chaining via `previous_response_id`, and **programmatic tool calling** (gpt-5.6+ models). When `default_request_format` is set to `"responses"`, the daemon uses the Responses endpoint for all requests (both simple completions and tool-assisted turns), with system messages placed into the `input` array (as `{role: "system"}` items) and tool results to `function_call_output` input items. Programmatic tool calling auto-enables for gpt-5.6 models using the Responses API; set `programmatic_tool_calling = true` in `accounts.toml` to override.
+The Responses API is now fully supported — including tool use, streaming, reasoning effort slugs (mapped from the session's string slug to the `reasoning_effort` wire field), multi-turn chaining via `previous_response_id`, and **programmatic tool calling** (gpt-5.6+ models). When `default_request_format` is set to `"responses"`, the daemon uses the Responses endpoint for all requests (both simple completions and tool-assisted turns), with system messages placed into the `input` array (as `{role: "system"}` items) and tool results to `function_call_output` input items. Programmatic tool calling auto-enables for gpt-5.6 models using the Responses API; set `programmatic_tool_calling = true` in `accounts.toml` to override.
 
 ## Monitoring
 

@@ -1,5 +1,3 @@
-use tai_proto::ThinkingEffort;
-
 use crate::acp_jsonrpc::{ConfigOption, ConfigOptionType, ConfigOptionValue, SelectOption};
 
 /// Build a `"model"` config option from the daemon's model list.
@@ -36,9 +34,9 @@ pub fn build_model_config(models: &[String], selected: &Option<String>) -> Confi
 ///
 /// The option type is `Select` with the standard off/low/medium/high
 /// choices.  Defaults to `"medium"` when no effort is set.
-pub fn build_reasoning_effort_config(current: Option<ThinkingEffort>) -> ConfigOption {
+pub fn build_reasoning_effort_config(current: Option<String>) -> ConfigOption {
     let current_value = match current {
-        Some(effort) => ConfigOptionValue::String(effort.as_label().to_string()),
+        Some(effort) => ConfigOptionValue::String(effort),
         None => ConfigOptionValue::String("medium".into()),
     };
 
@@ -95,7 +93,7 @@ pub fn build_tool_groups_config() -> ConfigOption {
 pub fn build_config_options(
     models: &[String],
     selected_model: &Option<String>,
-    reasoning_effort: Option<ThinkingEffort>,
+    reasoning_effort: Option<String>,
 ) -> Vec<ConfigOption> {
     vec![
         build_model_config(models, selected_model),
@@ -137,7 +135,7 @@ mod tests {
 
     #[test]
     fn reasoning_effort_config_has_all_choices() {
-        let config = build_reasoning_effort_config(Some(ThinkingEffort::High));
+        let config = build_reasoning_effort_config(Some("high".into()));
         assert_eq!(config.id, "reasoning_effort");
         let opts = config.options.unwrap();
         assert_eq!(opts.len(), 4);

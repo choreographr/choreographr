@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tai_proto::{ThinkingEffort, TokenUsage};
+use tai_proto::TokenUsage;
 use tracing::{debug, trace};
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition};
@@ -80,7 +80,7 @@ pub(super) fn messages_request(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-    thinking_effort: ThinkingEffort,
+    thinking_effort: &str,
     stream: bool,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
@@ -149,7 +149,7 @@ pub(super) fn messages_request_streaming<F>(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-    thinking_effort: ThinkingEffort,
+    thinking_effort: &str,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
     mut on_event: F,

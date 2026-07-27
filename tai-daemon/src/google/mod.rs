@@ -3,7 +3,7 @@ mod requests;
 mod tests;
 
 use std::io;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use serde::{Deserialize, Serialize};
 
@@ -122,7 +122,7 @@ impl GoogleClient {
         &self,
         params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, GoogleError> {
-        debug!(effort = %params.thinking_effort.as_label(), "Google chat completion turn");
+        debug!(effort = %params.thinking_effort, "Google chat completion turn");
         requests::generate_content_request(
             &self.http,
             &self.config,
@@ -130,7 +130,7 @@ impl GoogleClient {
             params.model,
             params.messages,
             params.tools,
-            params.thinking_effort,
+            &params.thinking_effort,
             params.on_retry,
             params.cancel_rx,
         )
@@ -145,7 +145,7 @@ impl GoogleClient {
     where
         F: FnMut(StreamEvent) -> io::Result<()>,
     {
-        debug!(?params.thinking_effort, "google chat_completion_turn_streaming");
+        debug!(effort = %params.thinking_effort, "google chat_completion_turn_streaming");
         if !self.config.streaming {
             let result = self.chat_completion_turn(params)?;
             let result =
@@ -160,7 +160,7 @@ impl GoogleClient {
             params.model,
             params.messages,
             params.tools,
-            params.thinking_effort,
+            &params.thinking_effort,
             params.on_retry,
             params.cancel_rx,
             on_event,
@@ -171,7 +171,7 @@ impl GoogleClient {
 // ── ProviderClient trait impl ───────────────────────────────────────────
 
 use crate::providers::ProviderClient;
-use tai_proto::{InferenceError, ThinkingEffort};
+use tai_proto::InferenceError;
 
 impl ProviderClient for GoogleClient {
     fn provider_slug(&self) -> &'static str {
@@ -485,19 +485,24 @@ fn build_tool_payloads(tools: &[ChatToolDefinition]) -> serde_json::Value {
     serde_json::json!([{"functionDeclarations": declarations}])
 }
 
-/// Map ThinkingEffort to Google's thinkingConfig.
-/// Off → None (omitted from body). Anything else → includeThoughts: true.
-fn thinking_config_payload(effort: ThinkingEffort) -> Option<ThinkingConfigPayload> {
-    match effort {
-        ThinkingEffort::Off => {
-            debug!("Google thinking: Off, omitting thinkingConfig");
+/// Map thinking effort slug to Google's thinkingConfig.
+/// Only `"on"` enables thinking; `"off"` omits the config block.
+/// Any other slug is rejected (returns None) and logged as a warning.
+fn thinking_config_payload(slug: &str) -> Option<ThinkingConfigPayload> {
+    match slug {
+        "off" => {
+            debug!("Google thinking: off, omitting thinkingConfig");
             None
         }
-        _ => {
-            debug!("Google thinking enabled with effort={}", effort.as_label());
+        "on" => {
+            debug!("Google thinking: on, sending thinkingConfig");
             Some(ThinkingConfigPayload {
                 include_thoughts: true,
             })
+        }
+        other => {
+            warn!("Google thinking: unsupported slug '{other}', valid values are 'on'/'off'");
+            None
         }
     }
 }

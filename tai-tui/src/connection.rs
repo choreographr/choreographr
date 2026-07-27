@@ -737,6 +737,33 @@ fn handle_chat_event(
             app.status = None;
             app.error = None;
             match key.code {
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let capability = app.attached_reasoning_capability.as_ref();
+                    match capability.and_then(|c| {
+                        let current = app
+                            .attached_reasoning_effort
+                            .clone()
+                            .unwrap_or_else(|| "off".to_string());
+                        c.cycle_from(&current).map(|next| (current, next))
+                    }) {
+                        Some((current, next)) => {
+                            app.attached_reasoning_effort = Some(next.clone());
+                            app.status = Some(format!("reasoning: {next}"));
+                            tracing::info!(
+                                session_id = ?app.attached_session_id,
+                                current = %current,
+                                next = %next,
+                                "Ctrl+R cycling reasoning effort",
+                            );
+                            client_tx
+                                .send(ClientMessage::SetReasoningEffort { effort: next })
+                                .map_err(broken_pipe)?;
+                        }
+                        None => {
+                            app.status = Some("model does not support reasoning".to_string());
+                        }
+                    }
+                }
                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.set_page(Page::SessionManager);
                     client_tx
@@ -795,6 +822,30 @@ fn handle_chat_event(
                         }
                         ShellCommand::UnknownCommand(error) => app.status = Some(error),
                         ShellCommand::Send(message) => {
+                            // Client-side validation: reject reasoning slugs that
+                            // the attached model's capability set does not include.
+                            // This provides faster feedback than waiting for the
+                            // daemon to reply with ReasoningEffortSetFailed.
+                            if let ClientMessage::SetReasoningEffort { ref effort } = message
+                                && effort != "off"
+                            {
+                                let valid = app
+                                    .attached_reasoning_capability
+                                    .as_ref()
+                                    .map(|c| c.available_effort_levels.iter().any(|l| l == effort))
+                                    .unwrap_or(true); // No capability cached → let daemon validate
+                                if !valid {
+                                    tracing::warn!(
+                                        %effort,
+                                        capability = ?app.attached_reasoning_capability,
+                                        "TUI rejected reasoning slug not in capability set",
+                                    );
+                                    app.status = Some(format!(
+                                        "model does not support reasoning '{effort}'"
+                                    ));
+                                    return Ok(());
+                                }
+                            }
                             let message = match message {
                                 ClientMessage::CreateSession {
                                     title,
@@ -819,7 +870,7 @@ fn handle_chat_event(
                                     selected_model: selected_model
                                         .or_else(|| app.attached_model.clone()),
                                     reasoning_effort: reasoning_effort
-                                        .or(app.attached_reasoning_effort),
+                                        .or_else(|| app.attached_reasoning_effort.clone()),
                                 },
                                 other => other,
                             };
@@ -1139,7 +1190,7 @@ fn handle_session_list_key(
                     context_config: None,
                     account_name: app.attached_account_name.clone(),
                     selected_model: app.attached_model.clone(),
-                    reasoning_effort: app.attached_reasoning_effort,
+                    reasoning_effort: app.attached_reasoning_effort.clone(),
                 })
                 .map_err(broken_pipe)?;
         }
@@ -1651,11 +1702,19 @@ pub(crate) fn handle_daemon_message(
             }
             // Fall through to dispatch_daemon_message.
         }
-        DaemonMessage::ModelSelected { model } => {
-            app.handle_model_selected(model);
+        DaemonMessage::ModelSelected {
+            model,
+            reasoning_capability,
+        } => {
+            app.handle_model_selected(model, reasoning_capability.clone());
         }
         DaemonMessage::ReasoningEffortSet { effort } => {
-            app.handle_reasoning_effort_set(*effort);
+            app.handle_reasoning_effort_set(effort.clone());
+        }
+        DaemonMessage::ReasoningEffortSetFailed { effort, error } => {
+            tracing::warn!(%effort, %error, "reasoning effort rejected by daemon");
+            app.attached_reasoning_effort = Some("off".to_string());
+            app.status = Some(format!("reasoning effort rejected: {error}"));
         }
         DaemonMessage::SessionAccountSet { account } => {
             app.handle_session_account_set(account);

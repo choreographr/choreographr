@@ -5,8 +5,7 @@ use crate::openai::{
 };
 use crate::providers::types::{ChatToolCall, ChatTurnResult};
 use crate::providers::{
-    ChatTurnRequest, InferenceProvider, ReasoningSupport, StreamEvent, ToolResultItem,
-    effective_reasoning_support, lookup_provider,
+    ChatTurnRequest, InferenceProvider, StreamEvent, ToolResultItem, model_reasoning_capability,
 };
 use crate::sessions::{RequestContext, SessionCommand, SessionMetadata, SessionState};
 use crate::tools::context::ToolContext;
@@ -25,7 +24,7 @@ use std::time::Instant;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
-    OutputStream, SessionStatus, ThinkingEffort, TokenUsage,
+    OutputStream, SessionStatus, TokenUsage,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -329,31 +328,35 @@ fn resolve_reasoning_effort(
     model: &str,
     session_id: u64,
     turn_iter: u32,
-    configured_effort: ThinkingEffort,
-) -> ThinkingEffort {
-    if configured_effort == ThinkingEffort::Off {
-        return ThinkingEffort::Off;
+    configured_effort: &str,
+) -> String {
+    if configured_effort == "off" {
+        return configured_effort.to_string();
     }
     let slug = client.provider_slug();
-    let catalog_entry = lookup_provider(slug);
-    let reasoning_support = catalog_entry
-        .map(|e| e.reasoning)
-        .unwrap_or(ReasoningSupport::None);
-    let effective = effective_reasoning_support(model, reasoning_support);
-    if effective == ReasoningSupport::None {
+    let capability = model_reasoning_capability(slug, model);
+    if capability.available_effort_levels.is_empty() {
         warn!(
             session_id, turn = turn_iter, model,
-            effort = %configured_effort.as_label(),
-            "model does not support reasoning effort, disabling",
+            effort = %configured_effort,
+            "model does not support reasoning, disabling",
         );
-        ThinkingEffort::Off
+        "off".to_string()
+    } else if !capability
+        .available_effort_levels
+        .iter()
+        .any(|l| l == configured_effort)
+    {
+        warn!(
+            session_id, turn = turn_iter, model,
+            effort = %configured_effort,
+            valid = ?capability.available_effort_levels,
+            "reasoning effort '{}' not in model's capability set, disabling",
+            configured_effort,
+        );
+        "off".to_string()
     } else {
-        debug!(
-            session_id, turn = turn_iter,
-            effort = %configured_effort.as_label(),
-            "reasoning effort active in agent loop",
-        );
-        configured_effort
+        configured_effort.to_string()
     }
 }
 
@@ -609,16 +612,9 @@ pub(crate) fn run_agent_loop(
             turn = turn_iter,
             "agent loop turn"
         );
-        let thinking_effort = resolve_reasoning_effort(
-            client,
-            model,
-            ctx.session_id,
-            turn_iter,
-            session
-                .config
-                .reasoning_effort
-                .unwrap_or(ThinkingEffort::Off),
-        );
+        let configured = session.config.reasoning_effort.as_deref().unwrap_or("off");
+        let thinking_effort =
+            resolve_reasoning_effort(client, model, ctx.session_id, turn_iter, configured);
         crate::metrics::record_turn(model);
         let tools = ctx
             .tool_registry
@@ -919,7 +915,7 @@ pub(crate) fn run_agent_loop(
                         db: Arc::clone(&ctx.db),
                         daemon_tx: ctx.daemon_tx.clone(),
                         active_tool_groups: session.config.active_tool_groups.clone(),
-                        reasoning_effort: session.config.reasoning_effort,
+                        reasoning_effort: session.config.reasoning_effort.clone(),
                         selected_model: session.config.selected_model.clone(),
                         working_dir: session.config.working_dir.clone(),
                         cancelled: Arc::clone(&cancel_flag),
@@ -1329,7 +1325,7 @@ fn execute_tool_with_timeout(
         db: Arc::clone(&ctx.db),
         daemon_tx: ctx.daemon_tx.clone(),
         active_tool_groups: session.config.active_tool_groups.clone(),
-        reasoning_effort: session.config.reasoning_effort,
+        reasoning_effort: session.config.reasoning_effort.clone(),
         selected_model: session.config.selected_model.clone(),
         working_dir: working_dir.map(|p| p.to_path_buf()),
         cancelled: Arc::new(AtomicBool::new(false)),
@@ -1654,16 +1650,16 @@ mod tests {
     #[test]
     fn resolve_reasoning_effort_off_returns_off() {
         let provider = make_test_provider();
-        let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, ThinkingEffort::Off);
-        assert_eq!(result, ThinkingEffort::Off);
+        let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, "off");
+        assert_eq!(result, "off");
     }
 
     #[test]
     fn resolve_reasoning_effort_unknown_provider_disables() {
         let provider = make_test_provider();
-        let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, ThinkingEffort::Low);
+        let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, "low");
         // "test-stub" slug is not in the catalog, so reasoning is unsupported.
-        assert_eq!(result, ThinkingEffort::Off);
+        assert_eq!(result, "off");
     }
 
     #[test]
@@ -1672,8 +1668,8 @@ mod tests {
         let client = crate::openai::OpenAiClient::new(config, "test-key".into()).unwrap();
         let provider = InferenceProvider::from_openai(client);
 
-        let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, ThinkingEffort::High);
-        assert_eq!(result, ThinkingEffort::High);
+        let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, "high");
+        assert_eq!(result, "high");
     }
 
     #[test]
@@ -1682,8 +1678,8 @@ mod tests {
         let client = crate::openai::OpenAiClient::new(config, "test-key".into()).unwrap();
         let provider = InferenceProvider::from_openai(client);
 
-        let result = resolve_reasoning_effort(&provider, "gpt-4.1", 1, 0, ThinkingEffort::Medium);
-        assert_eq!(result, ThinkingEffort::Off);
+        let result = resolve_reasoning_effort(&provider, "gpt-4.1", 1, 0, "medium");
+        assert_eq!(result, "off");
     }
 
     // -- estimate_prompt_tokens tests ------------------------------------

@@ -15,8 +15,7 @@ use std::thread;
 use std::time::Instant;
 use tai_keystore::ServiceCredential;
 use tai_proto::{
-    AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary, ThinkingEffort,
-    TokenUsage,
+    AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary, TokenUsage,
 };
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
@@ -53,7 +52,7 @@ pub enum DaemonCommand {
         parent_session_id: Option<u64>,
         working_dir: Option<PathBuf>,
         max_turns: Option<u32>,
-        reasoning_effort: Option<ThinkingEffort>,
+        reasoning_effort: Option<String>,
         selected_model: Option<String>,
         context_config: Option<ContextConfig>,
         account_name: Option<String>,
@@ -343,7 +342,7 @@ impl DaemonState {
         parent_session_id: Option<u64>,
         working_dir: Option<PathBuf>,
         max_turns: Option<u32>,
-        reasoning_effort: Option<ThinkingEffort>,
+        reasoning_effort: Option<String>,
         selected_model: Option<String>,
         context_config: Option<ContextConfig>,
         account_name: Option<String>,
@@ -399,7 +398,7 @@ impl DaemonState {
         let metadata = SessionMetadata {
             title: title.clone(),
             selected_model: record.selected_model.clone(),
-            reasoning_effort,
+            reasoning_effort: record.reasoning_effort.clone(),
             parent_session_id,
             working_dir: cwd_str.clone(),
             created_at: record.created_at,

@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use tai_proto::{DaemonMessage, OutputStream, SessionStatus, TokenUsage, Turn};
+use tai_proto::{
+    DaemonMessage, OutputStream, ReasoningCapability, SessionStatus, TokenUsage, Turn,
+};
 use tracing::debug;
 
 #[derive(Debug, Clone)]
@@ -33,6 +35,8 @@ pub struct SessionStateData {
     pub context_window: Option<u32>,
     pub last_prompt_tokens: Option<u32>,
     pub status: SessionStatus,
+    pub reasoning_effort: Option<String>,
+    pub reasoning_capability: Option<ReasoningCapability>,
 }
 
 pub trait TurnEventHandler {
@@ -103,6 +107,8 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             context_window,
             last_prompt_tokens,
             status,
+            reasoning_effort,
+            reasoning_capability,
             ..
         } => {
             handler.handle_session_state(SessionStateData {
@@ -115,6 +121,8 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
                 context_window: *context_window,
                 last_prompt_tokens: *last_prompt_tokens,
                 status: status.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+                reasoning_capability: reasoning_capability.clone(),
             });
         }
         DaemonMessage::TurnAppended { turn_id, turn } => {
@@ -244,7 +252,10 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
         DaemonMessage::ModelsFailed { error } => {
             handler.handle_error(format!("[daemon] models failed: {error}"));
         }
-        DaemonMessage::ModelSelected { model } => {
+        DaemonMessage::ModelSelected {
+            model,
+            reasoning_capability: _,
+        } => {
             handler.handle_status_text(format!("[daemon] selected model: {model}"));
         }
         DaemonMessage::ModelSelectionFailed { model, error } => {
@@ -311,7 +322,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
         }
         DaemonMessage::SessionWorkingDirSet { .. } => {}
         DaemonMessage::ReasoningEffortSet { effort } => {
-            handler.handle_status_text(format!("[daemon] reasoning effort: {}", effort.as_label()));
+            handler.handle_status_text(format!("[daemon] reasoning effort: {effort}"));
         }
         DaemonMessage::ReasoningEffortSetFailed { effort, error } => {
             handler.handle_error(format!(

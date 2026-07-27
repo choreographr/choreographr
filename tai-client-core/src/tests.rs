@@ -1,5 +1,5 @@
 use super::*;
-use tai_proto::{ClientMessage, ThinkingEffort};
+use tai_proto::ClientMessage;
 
 #[test]
 fn parses_empty_line() {
@@ -507,7 +507,7 @@ fn reasoning_set_off() {
     assert_eq!(
         parse_input_line("/reasoning off", &mut next, None),
         ShellCommand::Send(ClientMessage::SetReasoningEffort {
-            effort: ThinkingEffort::Off
+            effort: "off".to_string()
         })
     );
     assert_eq!(next, 3);
@@ -519,7 +519,7 @@ fn reasoning_set_low() {
     assert_eq!(
         parse_input_line("/reasoning low", &mut next, None),
         ShellCommand::Send(ClientMessage::SetReasoningEffort {
-            effort: ThinkingEffort::Low
+            effort: "low".to_string()
         })
     );
     assert_eq!(next, 3);
@@ -531,7 +531,7 @@ fn reasoning_set_medium() {
     assert_eq!(
         parse_input_line("/reasoning medium", &mut next, None),
         ShellCommand::Send(ClientMessage::SetReasoningEffort {
-            effort: ThinkingEffort::Medium
+            effort: "medium".to_string()
         })
     );
     assert_eq!(next, 3);
@@ -543,17 +543,81 @@ fn reasoning_set_high() {
     assert_eq!(
         parse_input_line("/reasoning high", &mut next, None),
         ShellCommand::Send(ClientMessage::SetReasoningEffort {
-            effort: ThinkingEffort::High
+            effort: "high".to_string()
         })
     );
     assert_eq!(next, 3);
 }
 
 #[test]
-fn reasoning_invalid_effort() {
+fn reasoning_set_none_alias() {
     let mut next = 3;
-    let result = parse_input_line("/reasoning turbo", &mut next, None);
-    assert!(matches!(result, ShellCommand::UnknownCommand(ref msg) if msg.contains("turbo")));
+    assert_eq!(
+        parse_input_line("/reasoning none", &mut next, None),
+        ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: "off".to_string()
+        })
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn reasoning_set_disabled_alias() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/reasoning disabled", &mut next, None),
+        ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: "off".to_string()
+        })
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn reasoning_set_med_alias() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/reasoning med", &mut next, None),
+        ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: "medium".to_string()
+        })
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn reasoning_set_on() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/reasoning on", &mut next, None),
+        ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: "on".to_string()
+        })
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn reasoning_unknown_slug_passes_through() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/reasoning turbo", &mut next, None),
+        ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: "turbo".to_string()
+        })
+    );
+    assert_eq!(next, 3);
+}
+
+#[test]
+fn reasoning_max_slug_passes_through() {
+    let mut next = 3;
+    assert_eq!(
+        parse_input_line("/reasoning max", &mut next, None),
+        ShellCommand::Send(ClientMessage::SetReasoningEffort {
+            effort: "max".to_string()
+        })
+    );
     assert_eq!(next, 3);
 }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tai_proto::ThinkingEffort;
+
 use tracing::{debug, warn};
 
 use crate::error::AcpError;
@@ -20,7 +20,7 @@ pub struct AcpSession {
     /// Currently selected model for this session.
     pub model: Option<String>,
     /// Reasoning effort setting.
-    pub reasoning_effort: Option<ThinkingEffort>,
+    pub reasoning_effort: Option<String>,
     /// Enabled tool groups (e.g. `["read", "edit", "terminal"]`).
     pub tool_groups: Vec<String>,
 }

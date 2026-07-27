@@ -225,7 +225,7 @@ fn daemon_to_bridge_events(
             models,
             selected_model: selected,
         } => Some(BridgeEvent::Models { models, selected }),
-        DaemonMessage::ModelSelected { model } => Some(BridgeEvent::ModelSelected(model)),
+        DaemonMessage::ModelSelected { model, .. } => Some(BridgeEvent::ModelSelected(model)),
         DaemonMessage::Unlocked => Some(BridgeEvent::Unlocked),
         DaemonMessage::Locked => Some(BridgeEvent::Locked),
         DaemonMessage::Pong => Some(BridgeEvent::Pong),

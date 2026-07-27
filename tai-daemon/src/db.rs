@@ -7,7 +7,7 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
-use tai_proto::{ContextConfig, ThinkingEffort, Turn};
+use tai_proto::{ContextConfig, Turn};
 use tracing::{debug, error, info, warn};
 
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
@@ -49,7 +49,7 @@ pub struct SessionRecord {
     #[serde(default)]
     pub account_name: Option<String>,
     #[serde(default)]
-    pub reasoning_effort: Option<ThinkingEffort>,
+    pub reasoning_effort: Option<String>,
 }
 
 pub fn db_path() -> io::Result<PathBuf> {

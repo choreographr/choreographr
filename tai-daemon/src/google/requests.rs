@@ -2,7 +2,6 @@ use std::io::{self, BufReader, Read};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use tai_proto::ThinkingEffort;
 use tai_proto::TokenUsage;
 use tracing::{debug, trace};
 
@@ -80,7 +79,7 @@ pub(super) fn generate_content_request(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-    thinking_effort: ThinkingEffort,
+    thinking_effort: &str,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<ChatTurnResult, GoogleError> {
@@ -151,7 +150,7 @@ pub(super) fn generate_content_request_streaming<F>(
     model: &str,
     messages: &[ChatRequestMessage],
     tools: &[ChatToolDefinition],
-    thinking_effort: ThinkingEffort,
+    thinking_effort: &str,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
     mut on_event: F,

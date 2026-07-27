@@ -5,8 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::sync::mpsc::SyncSender;
 use tai_proto::{
-    ClientMessage, ContextConfig, DaemonMessage, ProtoError, ThinkingEffort, read_message,
-    write_message,
+    ClientMessage, ContextConfig, DaemonMessage, ProtoError, read_message, write_message,
 };
 use tracing::{debug, error, info, warn};
 
@@ -183,7 +182,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
         }
         ClientMessage::SetReasoningEffort { effort } => {
             info!(
-                "client {}: SetReasoningEffort effort={:?} attached={}",
+                "client {}: SetReasoningEffort effort={} attached={}",
                 ctx.client_id,
                 effort,
                 ctx.attached_session_tx.is_some()
@@ -192,7 +191,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let _ = tx.send(SessionCommand::SetReasoningEffort { effort });
             } else {
                 let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSetFailed {
-                    effort: effort.as_label().to_string(),
+                    effort,
                     error: "no session attached".to_string(),
                 });
             }
@@ -208,7 +207,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 }
             } else {
                 let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSet {
-                    effort: ThinkingEffort::Off,
+                    effort: "off".to_string(),
                 });
             }
         }
@@ -489,7 +488,7 @@ fn handle_client_create_session(
     context_config: Option<ContextConfig>,
     account_name: Option<String>,
     selected_model: Option<String>,
-    reasoning_effort: Option<ThinkingEffort>,
+    reasoning_effort: Option<String>,
     ctx: &mut ClientCtx,
 ) -> bool {
     info!("client {}: CreateSession", ctx.client_id);

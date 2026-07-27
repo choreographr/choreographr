@@ -570,12 +570,12 @@ fn response_part_function_call_deserialises() {
 
 #[test]
 fn test_thinking_config_off() {
-    assert!(super::thinking_config_payload(tai_proto::ThinkingEffort::Off).is_none());
+    assert!(super::thinking_config_payload("off").is_none());
 }
 
 #[test]
 fn test_thinking_config_on() {
-    let payload = super::thinking_config_payload(tai_proto::ThinkingEffort::Medium);
+    let payload = super::thinking_config_payload("on");
     assert!(payload.is_some());
     assert!(payload.unwrap().include_thoughts);
 }

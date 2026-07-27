@@ -34,8 +34,6 @@ pub struct AccountConfig {
     // Request format overrides (OpenAI-compatible only)
     #[serde(default)]
     pub default_request_format: Option<RequestFormat>,
-    #[serde(default)]
-    pub model_request_formats: Option<HashMap<String, RequestFormat>>,
     // Token limit overrides (OpenAI-compatible only)
     #[serde(default)]
     pub chat_completions_max_tokens: Option<u32>,
@@ -81,7 +79,6 @@ impl AccountConfig {
             responses_path: None,
             chat_completions_path: None,
             default_request_format: None,
-            model_request_formats: None,
             chat_completions_max_tokens: None,
             model_max_tokens: None,
             chat_completions_max_tokens_field: None,
@@ -127,9 +124,6 @@ impl AccountConfig {
         }
         if let Some(fmt) = self.default_request_format {
             config.default_request_format = fmt;
-        }
-        if let Some(ref map) = self.model_request_formats {
-            config.model_request_formats = map.clone();
         }
         if let Some(n) = self.chat_completions_max_tokens {
             config.chat_completions_max_tokens = Some(n);
@@ -499,7 +493,10 @@ model = "claude-4"
             chat_completions_max_tokens: Some(2048),
             chat_completions_max_tokens_field: Some(crate::openai::MaxTokensField::MaxTokens),
             responses_max_output_tokens: Some(4096),
-            model_responses_max_output_tokens: Some(HashMap::from([("gpt-4".to_string(), 8192)])),
+            model_responses_max_output_tokens: Some(std::collections::HashMap::from([(
+                "gpt-4".to_string(),
+                8192,
+            )])),
             retry_initial_backoff_ms: Some(500),
             retry_max_backoff_ms: Some(60000),
             ..AccountConfig::simple("ovr", "openai")

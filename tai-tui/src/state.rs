@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tai_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use tai_client_core::{ClientError, SessionView, TurnEventHandler, broken_pipe};
 use tai_proto::{
-    AccountInfo, ClientMessage, OutputStream, SessionStatus, SessionSummary, ThinkingEffort,
+    AccountInfo, ClientMessage, OutputStream, ReasoningCapability, SessionStatus, SessionSummary,
     TokenUsage, Turn,
 };
 use tai_tui::RenderedImage;
@@ -137,10 +137,6 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
     ProviderInfo {
         slug: "lmstudio",
         display_name: "LM Studio",
-    },
-    ProviderInfo {
-        slug: "mistral",
-        display_name: "Mistral",
     },
     ProviderInfo {
         slug: "moonshot",
@@ -345,7 +341,7 @@ pub(crate) struct SessionDetailData {
     pub(crate) session_id: u64,
     pub(crate) title: String,
     pub(crate) selected_model: String,
-    pub(crate) reasoning_effort: Option<ThinkingEffort>,
+    pub(crate) reasoning_effort: Option<String>,
     pub(crate) parent_session_id: Option<u64>,
     pub(crate) working_dir: String,
     pub(crate) created_at: i64,
@@ -460,7 +456,8 @@ pub(crate) struct App {
     pub(crate) attached_session_id: Option<u64>,
     pub(crate) attached_account_name: Option<String>,
     pub(crate) attached_model: Option<String>,
-    pub(crate) attached_reasoning_effort: Option<ThinkingEffort>,
+    pub(crate) attached_reasoning_effort: Option<String>,
+    pub(crate) attached_reasoning_capability: Option<ReasoningCapability>,
     pub(crate) attached_provider_slug: Option<String>,
     pub(crate) attached_working_dir: Option<String>,
     pub(crate) attached_status: Option<SessionStatus>,
@@ -667,7 +664,7 @@ impl SessionManagerState {
                 session_id,
                 title,
                 selected_model,
-                reasoning_effort: s.reasoning_effort,
+                reasoning_effort: s.reasoning_effort.clone(),
                 parent_session_id,
                 working_dir,
                 created_at,
@@ -1305,6 +1302,7 @@ impl App {
             attached_account_name: None,
             attached_model: None,
             attached_reasoning_effort: None,
+            attached_reasoning_capability: None,
             attached_provider_slug: None,
             attached_working_dir: None,
             attached_status: None,
@@ -2090,7 +2088,7 @@ impl App {
             self.attached_last_prompt_tokens = s.last_prompt_tokens;
             self.attached_account_name = s.account_name.clone();
             self.attached_model = s.selected_model.clone();
-            self.attached_reasoning_effort = s.reasoning_effort;
+            self.attached_reasoning_effort = s.reasoning_effort.clone();
             self.attached_working_dir = s.working_dir.clone();
             self.attached_status = Some(s.status.clone());
         }
@@ -2108,25 +2106,30 @@ impl App {
         });
     }
 
-    fn attached_session_mut(&mut self) -> Option<&mut SessionSummary> {
+    pub(crate) fn attached_session_mut(&mut self) -> Option<&mut SessionSummary> {
         self.session_mgr
             .sessions
             .iter_mut()
             .find(|s| Some(s.session_id) == self.attached_session_id)
     }
 
-    pub(crate) fn handle_model_selected(&mut self, model: &str) {
+    pub(crate) fn handle_model_selected(
+        &mut self,
+        model: &str,
+        reasoning_capability: Option<ReasoningCapability>,
+    ) {
         if self.attached_session_id.is_some() {
             self.attached_model = Some(model.to_owned());
+            self.attached_reasoning_capability = reasoning_capability;
             if let Some(s) = self.attached_session_mut() {
                 s.selected_model = Some(model.to_owned());
             }
         }
     }
 
-    pub(crate) fn handle_reasoning_effort_set(&mut self, effort: ThinkingEffort) {
+    pub(crate) fn handle_reasoning_effort_set(&mut self, effort: String) {
         if self.attached_session_id.is_some() {
-            self.attached_reasoning_effort = Some(effort);
+            self.attached_reasoning_effort = Some(effort.clone());
             if let Some(s) = self.attached_session_mut() {
                 s.reasoning_effort = Some(effort);
             }
@@ -2425,6 +2428,8 @@ impl TurnEventHandler for App {
             context_window,
             last_prompt_tokens,
             status,
+            reasoning_effort,
+            reasoning_capability,
             ..
         } = state;
         // Sync images from the incoming turns before assigning to self,
@@ -2448,6 +2453,12 @@ impl TurnEventHandler for App {
         }
         self.attached_status = Some(status);
         self.attached_tool_groups = active_tool_groups;
+        if let Some(effort) = reasoning_effort {
+            self.attached_reasoning_effort = Some(effort);
+        }
+        if let Some(cap) = reasoning_capability {
+            self.attached_reasoning_capability = Some(cap);
+        }
         self.mark_content_changed();
     }
 

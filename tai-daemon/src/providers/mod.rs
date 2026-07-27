@@ -2,7 +2,6 @@ use std::io;
 use std::sync::Arc;
 
 use crate::anthropic::AnthropicClient;
-use crate::mistral::MistralClient;
 use crate::openai::OpenAiClient;
 use tai_proto::InferenceError;
 
@@ -13,9 +12,8 @@ mod traits;
 pub(crate) mod types;
 
 pub use catalog::{
-    ModelWindowEntry, PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, ReasoningSupport,
-    all_display_names, all_slugs, effective_reasoning_support, lookup_context_window,
-    lookup_provider,
+    ModelEntry, PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, all_display_names, all_slugs,
+    lookup_context_window, lookup_provider, model_reasoning_capability, model_request_format,
 };
 pub use context_window::ContextWindowConfig;
 pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
@@ -45,13 +43,6 @@ impl InferenceProvider {
         }
     }
 
-    pub fn from_mistral(client: MistralClient) -> Self {
-        Self {
-            client: Arc::new(client),
-            slug: "mistral",
-        }
-    }
-
     /// Create a provider from an account config + credential key.
     /// Applies all account-level overrides (base_url, streaming, timeouts)
     /// onto the service config before constructing the client.
@@ -63,10 +54,11 @@ impl InferenceProvider {
             .ok_or_else(|| format!("unknown provider: {}", config.provider))?;
 
         match entry.protocol {
-            ProviderProtocol::OpenAiCompatible => {
+            ProviderProtocol::OpenAi { max_tokens_field } => {
                 let mut svc_config = crate::openai::ServiceConfig {
-                    base_url: entry.default_base_url.to_string(),
-                    chat_completions_max_tokens_field: entry.max_tokens_field,
+                    base_url: entry.base_url.to_string(),
+                    chat_completions_max_tokens_field: max_tokens_field,
+                    provider_slug: entry.slug,
                     ..Default::default()
                 };
                 config.apply_overrides(&mut svc_config);
@@ -85,7 +77,7 @@ impl InferenceProvider {
                 let mut anthro_cfg = crate::anthropic::AnthropicConfig::default();
                 // If the account doesn't specify a base_url, use the catalog default.
                 if config.base_url.is_none() {
-                    anthro_cfg.base_url = entry.default_base_url.to_string();
+                    anthro_cfg.base_url = entry.base_url.to_string();
                 }
                 anthro_cfg.apply_overrides(config);
                 let client = AnthropicClient::new(anthro_cfg, key)
@@ -101,26 +93,11 @@ impl InferenceProvider {
                 let mut google_cfg = crate::google::GoogleConfig::default();
                 // If the account doesn't specify a base_url, use the catalog default.
                 if config.base_url.is_none() {
-                    google_cfg.base_url = entry.default_base_url.to_string();
+                    google_cfg.base_url = entry.base_url.to_string();
                 }
                 google_cfg.apply_overrides(config);
                 let client = crate::google::GoogleClient::new(google_cfg, key)
                     .map_err(|e| format!("failed to create Google client: {e}"))?;
-                Ok(Self {
-                    client: Arc::new(client),
-                    slug: entry.slug,
-                })
-            }
-            ProviderProtocol::Mistral => {
-                let key = api_key
-                    .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
-                let mut mistral_cfg = crate::mistral::MistralConfig::default();
-                if config.base_url.is_none() {
-                    mistral_cfg.base_url = entry.default_base_url.to_string();
-                }
-                mistral_cfg.apply_overrides(config);
-                let client = MistralClient::new(mistral_cfg, key)
-                    .map_err(|e| format!("failed to create Mistral client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
                     slug: entry.slug,
@@ -209,7 +186,7 @@ mod tests {
     use super::*;
     use crate::accounts::AccountConfig;
     use crate::anthropic::AnthropicConfig;
-    use crate::mistral::MistralClient;
+
     use crate::openai::ServiceConfig;
 
     #[test]
@@ -271,27 +248,6 @@ mod tests {
         let models = provider.list_models().unwrap();
         assert!(!models.is_empty());
         assert!(models.contains(&"claude-sonnet-4-20250514".to_string()));
-    }
-
-    #[test]
-    fn from_mistral_constructs_provider() {
-        let config = crate::mistral::MistralConfig::default();
-        let client = MistralClient::new(config, "test-key".into()).unwrap();
-        let _provider = InferenceProvider::from_mistral(client);
-    }
-
-    #[test]
-    fn from_account_config_mistral_missing_key_errors() {
-        let cfg = AccountConfig::simple("mistral", "mistral");
-        let err = InferenceProvider::from_account_config(&cfg, None).unwrap_err();
-        assert!(err.contains("no API key"), "{err}");
-    }
-
-    #[test]
-    fn from_account_config_mistral_succeeds() {
-        let cfg = AccountConfig::simple("mistral", "mistral");
-        let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
-        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]

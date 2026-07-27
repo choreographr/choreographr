@@ -91,7 +91,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 | `SessionMessage` | A single turn in a conversation with `message_id: u32` (monotonically increasing per-session), `parent_id: Option<u32>` (links to the triggering user/ATU message for undo subtree traversal), `deleted: bool` (soft-delete for undo), a `created_at: TimestampMs` field and a `kind: SessionMessageKind` enum. Variants (`SessionMessageKind`): `SystemText`, `UserText`, `AssistantText`, `AssistantToolUse`, `ToolResult`, `DisplayedImage` (persisted image replay) |
 | `ImageMetadata` | Mime type, dimensions, byte length for streamed images |
 | `DisplayedImageRecord` | Binary image data + `ImageMetadata` for persisted image replay (carried inside `SessionMessageKind::DisplayedImage`) |
-| `ThinkingEffort` | Enum controlling how much reasoning/thinking the model performs: `Off`, `Low`, `Medium`, `High`. Stored per-session and passed through to each provider's wire format. |
+| `ReasoningCapability` | Struct with `available_effort_levels: Vec<String>` — the reasoning effort slugs a model supports (e.g. `"off"`, `"low"`, `"medium"`, `"high"`, `"max"`). Empty means reasoning is not supported. Cycle helper validates/rotates through slugs. |
 | `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessageKind::AssistantText` and `SessionMessageKind::AssistantToolUse` for per-turn accounting, in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals, and in `DaemonMessage::Done` for per-request usage. |
 | `last_prompt_tokens` | `Option<u32>` field on session metadata and protocol messages tracking the `input_tokens` from the most recent API response — the actual context size being sent to the model, used for context-window progress displays. |
 | `SessionStatus` | Enum representing the current session state: `Inactive`, `Inference`, `ToolCall(String)`, `Retrying {…}`, `Sleeping`. Included in `SessionSummary` and `DaemonMessage::SessionState` for live status display in client toolbars. |
@@ -103,7 +103,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 `Lock`, `AddCredential`, `RemoveCredential`, `AddAccount`, `RemoveAccount`,
 `ListAccounts`, `SetSessionAccount`, `SetReasoningEffort`, `GetReasoningEffort`,
 `Undo`, `Redo`, `ContinueGeneration`
-- `CreateSession` now carries optional `context_config`, `account_name`, `selected_model`, and `reasoning_effort` fields
+- `CreateSession` now carries optional `context_config`, `account_name`, `selected_model`, and `reasoning_effort` (slug string) fields
 
 `DaemonMessage` variants:
 - Session: `SessionCreated`, `Sessions`, `SessionAttached`, `SessionState`, `SessionStatusChanged`, `SessionMessageAppended`, `SessionFailed`, `SessionDeleted`, `SessionDeleteFailed`
@@ -284,11 +284,11 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. |
-| `providers/` | `ProviderClient` trait + `ProviderCatalog` system. `InferenceProvider` struct wraps `Arc<dyn ProviderClient>`. Static `PROVIDER_CATALOG` maps ~31 slugs to protocol type, default base URL, and default model. Dispatches to the correct client based on protocol. |
+| `providers/` | `ProviderClient` trait + `ProviderCatalog` system. `InferenceProvider` struct wraps `Arc<dyn ProviderClient>`. Static `PROVIDER_CATALOG` maps ~30 slugs to protocol type, default base URL, and default model. Dispatches to the correct client based on protocol. |
 | `providers/shared.rs` | Shared provider infrastructure: `ProviderError` (unified error type used by all providers), `build_agent()` (ureq Agent construction with timeouts), `error_type_label()`, `provider_error_to_inference()`, `timed_result()` (metrics instrumentation wrapper), `emit_non_streaming_events()` (converts a non-streaming `ChatTurnResult` into `StreamEvent` callbacks so non-streaming configurations reuse the same event-driven path). Eliminates duplicated error types, `From<ProviderHttpError>` impls, and error conversion functions across provider implementations. |
 | `anthropic/` | Anthropic Messages API client (`AnthropicClient`). Implements `ProviderClient`. |
 | `google/` | Google Gemini API client (`GoogleClient`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
-| `mistral/` | Mistral API client (`MistralClient`). Implements `ProviderClient`. Uses OpenAI-compatible SSE reader for streaming. |
+
 | `retry/` | Shared HTTP retry logic extracted from the OpenAI module. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. All provider modules use this via the shared `ProviderError` type conversion. |
 | `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional working directory. |
 | `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
@@ -313,7 +313,7 @@ pub struct ChatTurnRequest<'a> {
     pub model: &'a str,
     pub messages: &'a [ChatRequestMessage],
     pub tools: &'a [ChatToolDefinition],
-    pub thinking_effort: ThinkingEffort,
+    pub thinking_effort: String,
     pub on_retry: &'a mut Option<RetryCallback>,
     pub cancel_rx: Option<&'a mpsc::Receiver<()>>,
     pub previous_response_id: Option<&'a str>,
@@ -336,11 +336,11 @@ to eliminate repetitive argument passing across all provider implementations.
 Uses `&mut dyn FnMut` for the streaming callback to keep the trait object-safe.
 `context_window_for_model()` returns the model's context window size, using a
 resolution chain: per-model config → global fallback → static catalog.
-Each client implementation maps `ThinkingEffort` to its wire format:
-- **OpenAI**: `reasoning_effort` field (`"low"`, `"medium"`, `"high"`)
-- **Anthropic**: `thinking` block with `budget_tokens` (clamped to `max_tokens - 1024`)
-- **Google**: `thinkingConfig` with `includeThoughts: true`
-- **Mistral**: `reasoning_effort` field (`"low"`, `"medium"`, `"high"`)
+Each client implementation maps the `&str` effort slug to its wire format:
+- **OpenAI**: `reasoning_effort` field (`None` for `"off"`, `"low"`/`"medium"`/`"high"` slug → API string)
+- **Anthropic**: `thinking` block with `budget_tokens` (slug ≠ `"off"` enables thinking, clamping to `max_tokens - 1024`)
+- **Google**: `thinkingConfig` with `includeThoughts: true` (slug ≠ `"off"` enables thinking)
+- **Mistral**: `reasoning_effort` field (`"off"` omits the field, otherwise slug → `"low"`/`"medium"`/`"high"`)
 
 **2. `InferenceProvider` struct (`providers/mod.rs`):**
 ```rust
@@ -390,7 +390,7 @@ A static `PROVIDER_CATALOG: &[ProviderEntry]` maps each provider slug to:
 - `reasoning` — `ReasoningSupport` variant declaring which reasoning parameter protocol the provider speaks
 - `model_context_windows` — static list of `(model_slug, window)` pairs for known models
 
-`ReasoningSupport` enum: `None`, `ReasoningEffort` (OpenAI-style), `AnthropicThinking` (thinking budget block), `GoogleThinkingConfig` (thinkingConfig field). Model-level gating is handled by `effective_reasoning_support()`, which uses name heuristics since the static catalog cannot enumerate every model variant dynamically.
+`ReasoningSupport` enum: `None`, `ReasoningEffort` (OpenAI-style), `AnthropicThinking` (thinking budget block), `GoogleThinkingConfig` (thinkingConfig field). Model-level reasoning is declared via a `ModelReasoningEntry { model, levels }` list on each `ProviderEntry.model_reasoning_levels` field, and resolved at runtime by `model_reasoning_capability()` which returns a `ReasoningCapability` with the model's available effort slugs. Providers without explicit entries fall back to heuristics inside `resolve_reasoning_effort()`.
 
 Currently supports ~30 providers. Adding a new OpenAI-compatible provider requires only a catalog entry — zero client code.
 
@@ -1100,7 +1100,7 @@ across snapshot/restore, metadata conversion, and record persistence:
 
 - `title: Option<String>` — display name
 - `selected_model: Option<String>` — AI model for this session
-- `reasoning_effort: Option<ThinkingEffort>` — per-session reasoning effort
+- `reasoning_effort: Option<String>` — per-session reasoning effort slug (e.g. `"off"`, `"low"`, `"medium"`, `"high"`)
 - `parent_session_id: Option<u64>` — parent session for sub-sessions
 - `working_dir: Option<PathBuf>` — working directory for filesystem tools
 - `max_turns: Option<u32>` — per-session tool loop iteration cap (inherits from parent). `0` = unlimited (loop runs until final answer, cancellation, or error).
@@ -1391,7 +1391,7 @@ User presses Enter on a session in the session manager
 10. **Flexible API format** — both OpenAI Chat Completions and Responses are first-class
     citizens, selectable per-model via a `RequestFormat` enum (`ChatCompletions` / `Responses`).
     The dispatch mechanism lives in `ServiceConfig::request_format_for_model()`: it checks
-    per-model overrides (`model_request_formats`) and falls back to `default_request_format`.
+    the provider catalog's per-model `openai_responses` flag and falls back to `default_request_format`.
     Every entry point (`completion`, `completion_stream`, `chat_completion_turn`,
     `chat_completion_turn_streaming`) matches on the resolved format and calls the appropriate
     request builder. Input/output mapping differs between the two: system messages go into the

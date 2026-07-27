@@ -2,7 +2,7 @@ use std::io::{BufWriter, Write};
 use std::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use tai_proto::{ClientMessage, DaemonMessage, ThinkingEffort};
+use tai_proto::{ClientMessage, DaemonMessage};
 
 use crate::acp_jsonrpc::{
     self, AgentCapabilities, AgentInfo, ConfigOptionValue, ContentBlock, InitializeResult,
@@ -460,20 +460,20 @@ fn handle_set_reasoning_effort(
     out: &mut BufWriter<std::io::StdoutLock<'_>>,
 ) -> Result<(), AcpError> {
     let effort = match &config_req.value {
-        ConfigOptionValue::String(s) => match s.as_str() {
-            "off" => ThinkingEffort::Off,
-            "low" => ThinkingEffort::Low,
-            "medium" => ThinkingEffort::Medium,
-            "high" => ThinkingEffort::High,
-            other => {
-                return respond_err(
-                    req.id,
-                    -32602,
-                    &format!("Unknown reasoning effort: {other}"),
-                    out,
-                );
+        ConfigOptionValue::String(s) => {
+            let lower = s.to_lowercase();
+            match lower.as_str() {
+                "off" | "low" | "medium" | "high" => lower,
+                other => {
+                    return respond_err(
+                        req.id,
+                        -32602,
+                        &format!("Unknown reasoning effort: {other}"),
+                        out,
+                    );
+                }
             }
-        },
+        }
         _ => return respond_err(req.id, -32602, "Reasoning effort must be a string", out),
     };
     send_to_daemon(daemon_writer, ClientMessage::SetReasoningEffort { effort })?;
@@ -867,12 +867,11 @@ fn handle_sync_message(
 
         DaemonMessage::ReasoningEffortSet { effort } => {
             if let Some(entry) = pending.take_sync(&PendingKind::SetReasoningEffort) {
-                // Daemon confirmed the effort — apply it to the session now.
                 if let Some(session_id) =
                     pending.take_pending_session(&PendingKind::SetReasoningEffort)
                     && let Some(s) = sessions.get_mut(&session_id)
                 {
-                    s.reasoning_effort = Some(*effort);
+                    s.reasoning_effort = Some(effort.clone());
                 }
                 respond(entry.jsonrpc_id, serde_json::json!({}), out)?;
             }

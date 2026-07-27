@@ -13,7 +13,7 @@ use ratatui::{
 };
 use ratatui_image::StatefulImage;
 use std::sync::Arc;
-use tai_proto::{SessionStatus, ThinkingEffort};
+use tai_proto::SessionStatus;
 use tai_tui::RenderedImage;
 
 use tui_prompts::{
@@ -326,11 +326,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         let wd = app.attached_working_dir.as_deref().unwrap_or("-");
         let provider = app.attached_provider_slug.as_deref().unwrap_or("-");
         let model = app.attached_model.as_deref().unwrap_or("-");
-        let reasoning = app
-            .attached_reasoning_effort
-            .as_ref()
-            .map(|e| e.as_label())
-            .unwrap_or("-");
+        let reasoning = app.attached_reasoning_effort.as_deref().unwrap_or("-");
 
         // Runtime metrics: tokens flow and context-window fill.
         let tokens = match &app.display_token_usage() {
@@ -712,14 +708,12 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             let att = if is_attached { "*" } else { " " };
             let title = session.title.as_deref().unwrap_or("untitled");
             let model = session.selected_model.as_deref().unwrap_or("-");
-            let model_display = if let Some(effort) = session
-                .reasoning_effort
-                .filter(|e| *e != ThinkingEffort::Off)
-            {
-                format!("({model}, {})", effort.as_label())
-            } else {
-                format!("({model})")
-            };
+            let model_display =
+                if let Some(effort) = session.reasoning_effort.as_deref().filter(|e| *e != "off") {
+                    format!("({model}, {effort})")
+                } else {
+                    format!("({model})")
+                };
             let status_str = match &session.status {
                 SessionStatus::Sleeping => "sleep",
                 SessionStatus::Inactive => "idle",
@@ -793,9 +787,9 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                 "Reasoning:     {}",
                 detail
                     .reasoning_effort
-                    .filter(|e| *e != ThinkingEffort::Off)
-                    .map(|e| e.as_label().to_string())
-                    .unwrap_or_else(|| "off".to_string())
+                    .as_deref()
+                    .filter(|e| *e != "off")
+                    .unwrap_or("off")
             )),
             Line::from(format!(
                 "Parent:        {}",

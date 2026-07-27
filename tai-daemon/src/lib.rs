@@ -7,7 +7,6 @@ pub mod diff_util;
 pub mod google;
 pub mod mcp;
 pub mod metrics;
-pub mod mistral;
 pub mod openai;
 pub mod providers;
 mod requests;

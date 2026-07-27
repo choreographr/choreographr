@@ -274,6 +274,7 @@ fn bridge_models() {
         &mut daemon_writer,
         &DaemonMessage::ModelSelected {
             model: "claude".into(),
+            reasoning_capability: None,
         },
     )
     .unwrap();

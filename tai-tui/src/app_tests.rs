@@ -6,8 +6,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Mouse
 use ratatui::text::Line;
 use tai_client_core::TurnEventHandler;
 use tai_proto::{
-    ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, SessionStatus, TokenUsage,
-    Turn,
+    ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, ReasoningCapability,
+    SessionStatus, TokenUsage, Turn,
 };
 use tui_prompts::State;
 
@@ -2242,6 +2242,8 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
             }),
             context_window: Some(4096),
             last_prompt_tokens: Some(1),
+            reasoning_effort: None,
+            reasoning_capability: None,
             status: SessionStatus::Inactive,
         },
         &mut app,
@@ -2281,6 +2283,8 @@ fn daemon_message_session_state_sets_tool_groups() {
             token_usage: None,
             context_window: None,
             last_prompt_tokens: None,
+            reasoning_effort: None,
+            reasoning_capability: None,
             status: SessionStatus::Inactive,
         },
         &mut app,
@@ -2314,6 +2318,8 @@ fn daemon_message_session_state_ignores_wrong_session() {
             }),
             context_window: Some(1024),
             last_prompt_tokens: None,
+            reasoning_effort: None,
+            reasoning_capability: None,
             status: SessionStatus::Inactive,
         },
         &mut app,
@@ -2754,5 +2760,223 @@ fn enter_stop_does_not_scroll() {
     assert!(
         app.effective_scroll() > 0,
         "should preserve scroll position"
+    );
+}
+
+// ── Ctrl+R reasoning effort cycling ──────────────────────────────
+
+#[test]
+fn ctrl_r_no_session_shows_message() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    app.attached_session_id = None;
+    app.attached_reasoning_capability = Some(ReasoningCapability {
+        available_effort_levels: vec![
+            "off".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+        ],
+    });
+
+    // Ctrl+R should show message even without session attached
+    // (the handler checks capability, not session_id).
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r");
+
+    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(app.status.as_deref(), Some("reasoning: low"));
+}
+
+#[test]
+fn ctrl_r_cycles_through_valid_slugs() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    app.attached_reasoning_capability = Some(ReasoningCapability {
+        available_effort_levels: vec![
+            "off".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+        ],
+    });
+
+    // First Ctrl+R: off -> low
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r 1");
+    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(app.status.as_deref(), Some("reasoning: low"));
+    let msg = rx.recv().expect("SetReasoningEffort 1");
+    assert_eq!(
+        msg,
+        ClientMessage::SetReasoningEffort {
+            effort: "low".to_string()
+        }
+    );
+
+    // Second Ctrl+R: low -> medium
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r 2");
+    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("medium"));
+    let msg = rx.recv().expect("SetReasoningEffort 2");
+    assert_eq!(
+        msg,
+        ClientMessage::SetReasoningEffort {
+            effort: "medium".to_string()
+        }
+    );
+
+    // Third: medium -> high
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r 3");
+    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("high"));
+    let msg = rx.recv().expect("SetReasoningEffort 3");
+    assert_eq!(
+        msg,
+        ClientMessage::SetReasoningEffort {
+            effort: "high".to_string()
+        }
+    );
+
+    // Fourth: high -> off (wraps around)
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r 4");
+    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("off"));
+    let msg = rx.recv().expect("SetReasoningEffort 4");
+    assert_eq!(
+        msg,
+        ClientMessage::SetReasoningEffort {
+            effort: "off".to_string()
+        }
+    );
+}
+
+#[test]
+fn ctrl_r_non_reasoning_model_shows_message() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    // No reasoning capability set (model does not support reasoning).
+    app.attached_reasoning_capability = None;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r");
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("model does not support reasoning")
+    );
+    // Effort should remain unchanged (still None).
+    assert!(app.attached_reasoning_effort.is_none());
+}
+
+#[test]
+fn ctrl_r_google_off_on() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // Google Gemini style: only "off" and "on".
+    app.attached_reasoning_capability = Some(ReasoningCapability {
+        available_effort_levels: vec!["off".to_string(), "on".to_string()],
+    });
+
+    // First Ctrl+R: off -> on
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r 1");
+    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("on"));
+    let msg = rx.recv().expect("SetReasoningEffort 1");
+    assert_eq!(
+        msg,
+        ClientMessage::SetReasoningEffort {
+            effort: "on".to_string()
+        }
+    );
+
+    // Second Ctrl+R: on -> off (wraps)
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r 2");
+    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("off"));
+    let msg = rx.recv().expect("SetReasoningEffort 2");
+    assert_eq!(
+        msg,
+        ClientMessage::SetReasoningEffort {
+            effort: "off".to_string()
+        }
+    );
+}
+
+#[test]
+fn reasoning_effort_set_updates_session_state() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    app.attached_session_id = Some(42);
+
+    handle_daemon_message(
+        DaemonMessage::ReasoningEffortSet {
+            effort: "high".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ReasoningEffortSet");
+
+    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("high"));
+}
+
+#[test]
+fn ctrl_r_with_empty_capability_shows_message() {
+    let mut app = test_app("/tmp/tai.sock");
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    // Capability exists but has empty available_effort_levels.
+    app.attached_reasoning_capability = Some(ReasoningCapability {
+        available_effort_levels: vec![],
+    });
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+r");
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("model does not support reasoning")
     );
 }

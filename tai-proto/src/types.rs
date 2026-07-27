@@ -1,25 +1,40 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use tracing::warn;
 
-/// ThinkingEffort — controls how much reasoning/thinking the model performs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThinkingEffort {
-    Off,
-    Low,
-    Medium,
-    High,
+/// Per-model reasoning capability information.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReasoningCapability {
+    /// The effort level slugs this model supports (e.g. "off", "low",
+    /// "medium", "high", "on", "xhigh", "max").
+    /// Empty means reasoning is not supported.
+    pub available_effort_levels: Vec<String>,
 }
 
-impl ThinkingEffort {
-    /// Human-readable label.
-    pub fn as_label(&self) -> &'static str {
-        match self {
-            ThinkingEffort::Off => "off",
-            ThinkingEffort::Low => "low",
-            ThinkingEffort::Medium => "medium",
-            ThinkingEffort::High => "high",
+impl ReasoningCapability {
+    /// Cycle from `current` to the next slug, wrapping around.
+    /// Logs a warning if `current` is not found — indicates a desync
+    /// between the caller's state and this capability set.
+    pub fn cycle_from(&self, current: &str) -> Option<String> {
+        if self.available_effort_levels.is_empty() {
+            return None;
         }
+        let pos = match self
+            .available_effort_levels
+            .iter()
+            .position(|e| e == current)
+        {
+            Some(p) => p,
+            None => {
+                warn!(
+                    "ReasoningCapability::cycle_from: current slug {current} not in available set {:?}, starting from 0",
+                    self.available_effort_levels,
+                );
+                0
+            }
+        };
+        let next = (pos + 1) % self.available_effort_levels.len();
+        Some(self.available_effort_levels[next].clone())
     }
 }
 
@@ -209,7 +224,7 @@ pub struct SessionSummary {
     pub session_id: u64,
     pub title: Option<String>,
     pub selected_model: Option<String>,
-    pub reasoning_effort: Option<ThinkingEffort>,
+    pub reasoning_effort: Option<String>,
     pub parent_session_id: Option<u64>,
     pub working_dir: Option<String>,
     pub created_at: i64,
@@ -242,7 +257,7 @@ pub enum ClientMessage {
         context_config: Option<ContextConfig>,
         account_name: Option<String>,
         selected_model: Option<String>,
-        reasoning_effort: Option<ThinkingEffort>,
+        reasoning_effort: Option<String>,
     },
     ListSessions,
     SubscribeSessionsSummary,
@@ -300,7 +315,7 @@ pub enum ClientMessage {
         name: String,
     },
     SetReasoningEffort {
-        effort: ThinkingEffort,
+        effort: String,
     },
     GetReasoningEffort,
     Undo,
@@ -366,6 +381,10 @@ pub enum DaemonMessage {
         /// Current session status (Inactive, Inference, ToolCall, etc.).
         #[serde(default)]
         status: SessionStatus,
+        #[serde(default)]
+        reasoning_effort: Option<String>,
+        #[serde(default)]
+        reasoning_capability: Option<ReasoningCapability>,
     },
     TurnAppended {
         turn_id: u32,
@@ -451,6 +470,8 @@ pub enum DaemonMessage {
     },
     ModelSelected {
         model: String,
+        #[serde(default)]
+        reasoning_capability: Option<ReasoningCapability>,
     },
     ModelSelectionFailed {
         model: String,
@@ -524,7 +545,7 @@ pub enum DaemonMessage {
         path: Option<String>,
     },
     ReasoningEffortSet {
-        effort: ThinkingEffort,
+        effort: String,
     },
     ReasoningEffortSetFailed {
         effort: String,

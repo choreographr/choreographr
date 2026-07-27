@@ -456,15 +456,10 @@ impl OpenAiClient {
     }
 }
 
-/// Map ThinkingEffort to the OpenAI `reasoning_effort` API string value.
-/// Returns None for Off (parameter should be omitted).
-pub(crate) fn reasoning_effort_api_value(effort: ThinkingEffort) -> Option<&'static str> {
-    match effort {
-        ThinkingEffort::Off => None,
-        ThinkingEffort::Low => Some("low"),
-        ThinkingEffort::Medium => Some("medium"),
-        ThinkingEffort::High => Some("high"),
-    }
+/// Map reasoning slug string to OpenAI's `reasoning_effort` API value.
+/// "off" → None (omit the field). Others → Some(slug).
+pub(crate) fn reasoning_effort_api_value(slug: &str) -> Option<&str> {
+    if slug == "off" { None } else { Some(slug) }
 }
 
 /// Convert ChatRequestMessage slice to Responses API input format.
@@ -523,7 +518,7 @@ pub(crate) fn messages_to_responses_input(
 // ── ProviderClient trait impl ───────────────────────────────────────────
 
 use crate::providers::{ChatTurnRequest, ProviderClient};
-use tai_proto::{InferenceError, ThinkingEffort};
+use tai_proto::InferenceError;
 
 impl ProviderClient for OpenAiClient {
     fn provider_slug(&self) -> &'static str {

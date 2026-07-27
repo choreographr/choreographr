@@ -94,7 +94,7 @@ pub struct AnthropicClient {
 // ── ProviderClient trait impl ───────────────────────────────────────────
 
 use crate::providers::ProviderClient;
-use tai_proto::{InferenceError, ThinkingEffort};
+use tai_proto::InferenceError;
 
 impl ProviderClient for AnthropicClient {
     fn provider_slug(&self) -> &'static str {
@@ -171,7 +171,7 @@ impl AnthropicClient {
         params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, AnthropicError> {
         debug!(
-            effort = %params.thinking_effort.as_label(),
+            effort = %params.thinking_effort,
             "Anthropic chat completion turn"
         );
         requests::messages_request(
@@ -181,7 +181,7 @@ impl AnthropicClient {
             params.model,
             params.messages,
             params.tools,
-            params.thinking_effort,
+            &params.thinking_effort,
             false,
             params.on_retry,
             params.cancel_rx,
@@ -197,7 +197,7 @@ impl AnthropicClient {
     where
         F: FnMut(StreamEvent) -> io::Result<()>,
     {
-        debug!(?params.thinking_effort, "anthropic chat_completion_turn_streaming");
+        debug!(effort = %params.thinking_effort, "anthropic chat_completion_turn_streaming");
         if !self.config.streaming {
             let result = self.chat_completion_turn(params)?;
             let result =
@@ -212,7 +212,7 @@ impl AnthropicClient {
             params.model,
             params.messages,
             params.tools,
-            params.thinking_effort,
+            &params.thinking_effort,
             params.on_retry,
             params.cancel_rx,
             on_event,
@@ -531,34 +531,36 @@ fn build_tool_payloads(tools: &[ChatToolDefinition]) -> Vec<ToolPayload<'_>> {
         .collect()
 }
 
-/// Map ThinkingEffort to Anthropic thinking budget tokens.
-/// Off → None (no thinking block sent).
-/// Low → 2048, Medium → 4096, High → 16384.
-/// Clamps budget_tokens so that max_tokens >= budget_tokens + 1024.
-pub(super) fn thinking_payload(effort: ThinkingEffort, max_tokens: u32) -> Option<ThinkingPayload> {
-    match effort {
-        ThinkingEffort::Off => None,
-        _ => {
-            let desired = match effort {
-                ThinkingEffort::Off => unreachable!(),
-                ThinkingEffort::Low => 2048,
-                ThinkingEffort::Medium => 4096,
-                ThinkingEffort::High => 16384,
-            };
-            let max_possible = max_tokens.saturating_sub(1024);
-            let budget = desired.min(max_possible);
-            if budget < desired {
-                warn!(
-                    desired,
-                    budget,
-                    max_tokens,
-                    "clamped Anthropic thinking budget_tokens to fit within max_tokens"
-                );
-            }
-            Some(ThinkingPayload {
-                kind: "enabled",
-                budget_tokens: budget,
-            })
+/// Map reasoning slug to Anthropic thinking config.
+/// "off" → None (no thinking block).
+/// Others → enabled thinking with budget_tokens.
+pub(super) fn thinking_payload(slug: &str, max_tokens: u32) -> Option<ThinkingPayload> {
+    match slug {
+        "off" => None,
+        "low" => Some(budget_payload(2048, max_tokens)),
+        "medium" => Some(budget_payload(4096, max_tokens)),
+        "high" => Some(budget_payload(16384, max_tokens)),
+        // Future: adaptive thinking for newer models
+        other => {
+            warn!(
+                slug = %other,
+                "unknown Anthropic reasoning slug, disabling thinking"
+            );
+            None
         }
+    }
+}
+
+fn budget_payload(desired: u32, max_tokens: u32) -> ThinkingPayload {
+    let budget = desired.min(max_tokens.saturating_sub(1024));
+    if budget < desired {
+        warn!(
+            desired,
+            budget, max_tokens, "clamped Anthropic thinking budget_tokens to fit within max_tokens"
+        );
+    }
+    ThinkingPayload {
+        kind: "enabled",
+        budget_tokens: budget,
     }
 }
