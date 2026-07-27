@@ -29,7 +29,7 @@ tai-mcp = { path = "tai-mcp" }
 tai-transport = { path = "tai-transport" }
 ureq = { version = "3", features = ["json"] }
 ammonia = "4"
-base64 = "0.22"
+base64 = "0.23"
 dirs = "6"
 redb = "4"
 image = "0.25"
@@ -50,7 +50,7 @@ hkdf = "0.13"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 tempfile = "3"
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.4", features = ["derive"] }
 snow = "0.10"
 url = "2"
 humfmt = "0.6.0"

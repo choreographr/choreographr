@@ -15,7 +15,7 @@ grep-searcher = "0.1"
 hex = "0.4"
 nix = { workspace = true, features = ["signal", "resource"] }
 
-gix = { version = "0.85", features = ["tree-editor", "revision"] }
+gix = { version = "0.86", features = ["tree-editor", "revision"] }
 gix-imara-diff = { version = "0.2", features = ["unified_diff"] }
 hmac = "0.13"
 image.workspace = true
@@ -63,4 +63,4 @@ notify-rust = { version = "4.18.0", default-features = false }
 
 [dev-dependencies]
 filetime = "0.2"
-serial_test = "3"
+serial_test = "4"
