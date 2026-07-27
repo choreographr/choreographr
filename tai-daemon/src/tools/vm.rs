@@ -167,15 +167,32 @@ pub extern "C" fn _start() {
     let heap_base: usize;
     let heap_size: usize;
     unsafe {
+        // Read the four startup registers using fixed temporary register
+        // names (t0 = x5, t1 = x6, t2 = x7, t3 = x28) for the output operands.
+        //
+        // CRITICAL: We must NOT use `out(reg)` here because the compiler can
+        // allocate a0-a3 (which we are READING in the `mv` instructions) as
+        // the output registers.  If the compiler assigns, say, a2 to `argc`,
+        // then `mv a2, a0` would overwrite the host-set value in a2 before
+        // the subsequent `mv {2}, a2` reads it — silently corrupting the
+        // heap_base/ heap_size parameters passed by the host.
+        //
+        // By fixing the outputs to t0-t3 (none of which are a0-a7 or the
+        // frame pointer), the `mv` instructions always read FROM the live
+        // a-registers and write TO disjoint temporary registers, eliminating
+        // the aliasing hazard.
+        //
+        // These registers are safe to clobber because _start is the entry
+        // point — there is no caller context to preserve.
         core::arch::asm!(
-            "mv {argc}, a0",
-            "mv {argv}, a1",
-            "mv {base}, a2",
-            "mv {size}, a3",
-            argc = out(reg) argc,
-            argv = out(reg) argv,
-            base = out(reg) heap_base,
-            size = out(reg) heap_size,
+            "mv t0, a0",
+            "mv t1, a1",
+            "mv t2, a2",
+            "mv t3, a3",
+            out("t0") argc,
+            out("t1") argv,
+            out("t2") heap_base,
+            out("t3") heap_size,
         );
     }
     tai::init_args(argc, argv);
