@@ -369,15 +369,12 @@ fn estimate_prompt_tokens(
         tiktoken::encoding_for_model(model).or_else(|| tiktoken::get_encoding("cl100k_base"));
     let estimated = match &encoding {
         Some(enc) => {
+            // Reasoning fields (reasoning_content, reasoning, reasoning_text)
+            // are deliberately excluded: they are response-only and are never
+            // populated in outgoing messages (see build_chat_request_messages).
             let content_tokens: u32 = messages
                 .iter()
                 .filter_map(|m| m.content.as_deref())
-                .map(|text| enc.count(text) as u32)
-                .sum();
-
-            let reasoning_tokens: u32 = messages
-                .iter()
-                .filter_map(|m| m.reasoning_content.as_deref())
                 .map(|text| enc.count(text) as u32)
                 .sum();
 
@@ -406,7 +403,7 @@ fn estimate_prompt_tokens(
                 })
                 .sum();
 
-            content_tokens + reasoning_tokens + tool_call_tokens + tool_def_tokens
+            content_tokens + tool_call_tokens + tool_def_tokens
         }
         None => {
             tracing::warn!("no tiktoken encoding available for {model}");
@@ -1447,9 +1444,13 @@ fn build_chat_request_messages(
         if let Some(text) = &turn.user_text {
             messages.push(ChatRequestMessage::simple("user", text.clone()));
         }
-        // Assistant message (text or tool calls)
+        // Assistant message (text or tool calls).
+        // Reasoning content from previous turns is intentionally excluded:
+        // - it is a response-only field for most APIs; sending it wastes bytes
+        // - reasoning text can be very long, inflating context with no signal
+        // - the token estimate (estimate_prompt_tokens) also excludes it
         let has_tool_calls = !turn.tool_calls.is_empty();
-        if turn.assistant_text.is_some() || has_tool_calls || turn.assistant_reasoning.is_some() {
+        if turn.assistant_text.is_some() || has_tool_calls {
             let tool_calls = if has_tool_calls {
                 Some(
                     turn.tool_calls
@@ -1472,7 +1473,7 @@ fn build_chat_request_messages(
                 content: turn.assistant_text.clone(),
                 tool_call_id: None,
                 tool_calls,
-                reasoning_content: turn.assistant_reasoning.clone(),
+                reasoning_content: None,
                 reasoning: None,
                 reasoning_text: None,
             });
@@ -1708,23 +1709,19 @@ mod tests {
     }
 
     #[test]
-    fn estimate_prompt_tokens_counts_reasoning_content() {
-        let messages = vec![
+    fn estimate_prompt_tokens_does_not_count_reasoning_content() {
+        let base_messages = vec![
             ChatRequestMessage::simple("user", "hello".into()),
-            ChatRequestMessage {
-                role: "assistant",
-                content: Some("visible".into()),
-                reasoning_content: Some("thinking deep...".into()),
-                tool_call_id: None,
-                tool_calls: None,
-                reasoning: None,
-                reasoning_text: None,
-            },
+            ChatRequestMessage::simple("assistant", "visible".into()),
         ];
-        let (_, estimated) = estimate_prompt_tokens("gpt-4", &messages, &[]);
-        assert!(
-            estimated > 0,
-            "expected positive token count, got {estimated}"
+        let mut with_reasoning = base_messages.clone();
+        with_reasoning[1].reasoning_content = Some("thinking deep...".into());
+
+        let (_, base_est) = estimate_prompt_tokens("gpt-4", &base_messages, &[]);
+        let (_, reason_est) = estimate_prompt_tokens("gpt-4", &with_reasoning, &[]);
+        assert_eq!(
+            base_est, reason_est,
+            "reasoning content should NOT count toward prompt token estimate"
         );
     }
 
