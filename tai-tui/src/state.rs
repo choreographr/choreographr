@@ -2349,6 +2349,12 @@ impl TurnEventHandler for App {
         self.active.remove(&request_id);
         if let Some(usage) = token_usage {
             self.attached_token_usage = Some(usage);
+            // Many providers only supply token_usage without the
+            // separate last_prompt_tokens field.  Fall back to
+            // input_tokens so the progress bar always updates.
+            if last_prompt_tokens.is_none() {
+                self.attached_last_prompt_tokens = Some(usage.input_tokens);
+            }
         }
         if let Some(tokens) = last_prompt_tokens {
             self.attached_last_prompt_tokens = Some(tokens);
@@ -2429,9 +2435,17 @@ impl TurnEventHandler for App {
         }
         self.session_view.turns = turns;
         self.attached_model = selected_model;
-        self.attached_token_usage = token_usage;
-        self.attached_context_window = context_window;
-        self.attached_last_prompt_tokens = last_prompt_tokens;
+        // Only overwrite with Some values — a SessionState that arrives
+        // after Done may not yet reflect the just-completed turn.
+        if let Some(usage) = token_usage {
+            self.attached_token_usage = Some(usage);
+        }
+        if let Some(cw) = context_window {
+            self.attached_context_window = Some(cw);
+        }
+        if let Some(tokens) = last_prompt_tokens {
+            self.attached_last_prompt_tokens = Some(tokens);
+        }
         self.attached_status = Some(status);
         self.attached_tool_groups = active_tool_groups;
         self.mark_content_changed();
@@ -2453,7 +2467,6 @@ impl TurnEventHandler for App {
         }
         self.live_input_estimate = 0;
         self.live_output_tokens = 0;
-        self.progress_dirty = true;
     }
 
     fn handle_status_text(&mut self, text: String) {
