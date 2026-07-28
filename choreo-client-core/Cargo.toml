@@ -1,0 +1,16 @@
+[package]
+name = "choreo-client-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+choreo-proto.workspace = true
+choreo-transport.workspace = true
+choreo-keystore.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

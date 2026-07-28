@@ -1,0 +1,66 @@
+[package]
+name = "choreographr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+base64.workspace = true
+dirs.workspace = true
+zlob = "1.6"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+hex = "0.4"
+nix = { workspace = true, features = ["signal", "resource"] }
+
+gix = { version = "0.86", features = ["tree-editor", "revision"] }
+gix-imara-diff = { version = "0.2", features = ["unified_diff"] }
+hmac = "0.13"
+image.workspace = true
+rand.workspace = true
+redb.workspace = true
+tiktoken = "3.5"
+ureq.workspace = true
+url.workspace = true
+resvg.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+yaml_serde.workspace = true
+thiserror.workspace = true
+sha1 = "0.11"
+sha2.workspace = true
+x25519-dalek.workspace = true
+hkdf.workspace = true
+zeroize.workspace = true
+humfmt.workspace = true
+choreo-keystore.workspace = true
+choreo-mcp.workspace = true
+choreo-proto.workspace = true
+choreo-transport.workspace = true
+signal-hook.workspace = true
+toml = "1.1"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# OpenMetrics / Prometheus monitoring.
+# The `process` feature exposes process-level metrics (RSS, CPU, FD count)
+# alongside our application-level gauges, counters, and histograms.
+prometheus = { version = "0.14", features = ["process"] }
+tiny_http = "0.12"
+ckb-vm = { version = "0.24.14", features = ["detect-asm"] }
+tempfile.workspace = true
+postcard.workspace = true
+
+# Desktop notifications — DBus on Linux, macOS Notification Center on macOS.
+# notify-rust auto-selects the macOS backend when target_os = "macos".
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { version = "4.18.0", default-features = false, features = ["d"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+notify-rust = { version = "4.18.0", default-features = false }
+
+[dev-dependencies]
+filetime = "0.2"
+serial_test = "4"

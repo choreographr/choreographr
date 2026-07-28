@@ -1,0 +1,16 @@
+[package]
+name = "choreo-transport"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+choreo-proto.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+snow.workspace = true
+dirs.workspace = true
+x25519-dalek.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

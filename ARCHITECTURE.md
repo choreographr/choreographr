@@ -1,21 +1,21 @@
-# tai Architecture
+# Choreographr Architecture
 
 ## Overview
 
-`tai` is a local-first AI assistant built as a Rust workspace. A **daemon** process
+`Choreographr` is a local-first AI assistant built as a Rust workspace. A **daemon** process
 communicates with multiple LLM providers through a pluggable trait-based provider
 system, while **clients** (terminal, desktop, and IM platforms) connect to the daemon
 over a Unix domain socket (or Noise IK encrypted TCP for remote connections) using a custom length-prefixed binary protocol.
 
 ```
 ┌──────────────┐    Unix socket     ┌──────────────┐    HTTP/SSE     ┌──────────────────────┐
-│   tai-tui     │◄──────────────────►│              │◄──────────────►│  OpenAI API          │
+│   choreo-tui     │◄──────────────────►│              │◄──────────────►│  OpenAI API          │
 │  (terminal)  │                    │              │                ├──────────────────────┤
-├──────────────┤                    │  tai-daemon  │◄──────────────►│  Anthropic Messages   │
-│ tai-gui       │◄──────────────────►│              │                ├──────────────────────┤
+├──────────────┤                    │  choreographr  │◄──────────────►│  Anthropic Messages   │
+│ choreo-gui       │◄──────────────────►│              │                ├──────────────────────┤
 │  (desktop)   │    Unix socket     │              │◄──────────────►│  Google Gemini API    │
 ├──────────────┤                    │              │                ├──────────────────────┤
-│   tai-im     │◄──────────────────►│              │◄──────────────►│  Mistral API          │
+│   choreo-im     │◄──────────────────►│              │◄──────────────►│  Mistral API          │
 │ (IM bridge)  │    Unix socket     │              │                ├──────────────────────┤
 └──────────────┘                    └──────────────┘                └──────────────────────┘
                                                                     │  30+ OpenAI-compat    │
@@ -30,47 +30,47 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 Eleven crates in a single Cargo workspace (resolver = "3"):
 
 ```
-tai (workspace)
-├── tai-proto           Wire protocol (shared types + framing)
-├── tai-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
-├── tai-transport       Noise IK encrypted TCP transport abstraction
-├── tai-client-core     Shared client logic (parsing, images, history, credentials)
-├── tai-markdown        Markdown parser and HTML renderer (pulldown-cmark + ammonia)
-├── tai-mcp             MCP (Model Context Protocol) client — spawns subprocess servers,
+Choreographr (workspace)
+├── choreo-proto           Wire protocol (shared types + framing)
+├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
+├── choreo-transport       Noise IK encrypted TCP transport abstraction
+├── choreo-client-core     Shared client logic (parsing, images, history, credentials)
+├── choreo-markdown        Markdown parser and HTML renderer (pulldown-cmark + ammonia)
+├── choreo-mcp             MCP (Model Context Protocol) client — spawns subprocess servers,
 │                       discovers tools, and dispatches tool calls over JSON-RPC stdio
-├── tai-daemon          Unix socket server — the core engine
-├── tai-acp             ACP bridge — translates the Agent Communication Protocol
-│                       (JSON-RPC over stdin/stdout) into tai-proto messages over the
+├── choreographr          Unix socket server — the core engine
+├── choreo-acp             ACP bridge — translates the Agent Communication Protocol
+│                       (JSON-RPC over stdin/stdout) into choreo-proto messages over the
 │                       daemon's Unix socket, enabling ACP-compatible editors (Claude
-│                       Code, Cline, etc.) to interact with tai sessions
-├── tai-tui             Terminal UI client (ratatui + crossterm)
-├── tai-gui             Desktop GUI client (Dioxus)
-└── tai-im              IM platform bridge (Telegram)
+│                       Code, Cline, etc.) to interact with Choreographr sessions
+├── choreo-tui             Terminal UI client (ratatui + crossterm)
+├── choreo-gui             Desktop GUI client (Dioxus)
+└── choreo-im              IM platform bridge (Telegram)
 ```
 
 ### Dependency graph
 
 ```
                     ┌─────────────────┐
-                    │    tai-proto    │ (no workspace deps)
+                    │    choreo-proto    │ (no workspace deps)
                     └────────┬────────┘
                              │
                     ┌────────▼────────┐
-                    │  tai-keystore   │ (no workspace deps)
+                    │  choreo-keystore   │ (no workspace deps)
                     └────────┬────────┘
                              │
               ┌──────────────┼──────────────────────┐
               │              │                      │
       ┌────────▼────────┐   │       ┌───────────────▼──────────┐
-      │ tai-client-core │   │       │        tai-daemon        │
+      │ choreo-client-core │   │       │        choreographr        │
       └────┬───────┬────┘   │       └───────────────┬──────────┘
            │       │        │                       │
            │  ┌────▼────────▼────┐                  │
-           │  │  tai-transport   │◄─────────────────│───────────┐
+           │  │  choreo-transport   │◄─────────────────│───────────┐
            │  └────────┬────────┘                  │           │
            │           │                   ┌───────▼──────┐ ┌──▼────────┐
-      ┌────▼───┐ ┌────▼────┐ ┌────▼───┐   │   tai-mcp    │ │  tai-acp  │
-      │tai-tui  │ │tai-gui   │ │tai-im  │   │ (MCP client)│ │(ACP bridge)│
+      ┌────▼───┐ ┌────▼────┐ ┌────▼───┐   │   choreo-mcp    │ │  choreo-acp  │
+      │choreo-tui  │ │choreo-gui   │ │choreo-im  │   │ (MCP client)│ │(ACP bridge)│
       └────────┘ └─────────┘ └────────┘   └──────────────┘ └───────────┘
 ```
 
@@ -78,7 +78,7 @@ tai (workspace)
 
 ## Crate details
 
-### `tai-proto` — Wire protocol
+### `choreo-proto` — Wire protocol
 
 Defines all shared message types and framing. No dependencies on other workspace crates.
 
@@ -132,18 +132,18 @@ Defines all shared message types and framing. No dependencies on other workspace
 - **Error type**: `ProtoError` (thiserror enum) — `Postcard`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io`
 
 
-### `tai-keystore` — Identity keypair & credential crypto
+### `choreo-keystore` — Identity keypair & credential crypto
 
 Provides the cryptographic primitives for credential management. No longer a standalone
-CLI binary — it is a library used by `tai-client-core` and `tai-daemon`.
+CLI binary — it is a library used by `choreo-client-core` and `choreographr`.
 
 **Identity keypair (X25519):**
 The daemon's identity is an X25519 keypair stored as two files:
-- `~/.config/tai-daemon/identity.pk` — raw 32-byte private key
-- `~/.config/tai-daemon/public.pk` — raw 32-byte public key
+- `~/.config/choreographr/identity.pk` — raw 32-byte private key
+- `~/.config/choreographr/public.pk` — raw 32-byte public key
 
 The private key can be stored encrypted at rest:
-- `~/.config/tai-daemon/identity.pk.enc` — Argon2 + AES-256-GCM encrypted private key
+- `~/.config/choreographr/identity.pk.enc` — Argon2 + AES-256-GCM encrypted private key
 
 **Credential encryption pipeline (client-side):**
 ```
@@ -172,30 +172,30 @@ in the `redb` database alongside sessions.
 **Error type:** `KeystoreError` (thiserror enum) — `Io`, `TooShort`, `InvalidKeyLength`, `EncryptionFailed`, `DecryptionFailed`, `ConfigDirNotFound`
 
 
-### `tai-transport` — Noise IK encrypted transport
+### `choreo-transport` — Noise IK encrypted transport
 
 A small crate providing Noise IK handshake and encrypted message I/O over
-TCP.  Used by both `tai-client-core` (client side) and `tai-daemon` (server side).
+TCP.  Used by both `choreo-client-core` (client side) and `choreographr` (server side).
 
 | Module | Purpose |
 |---|---|
 | `noise.rs` | `NoiseStream` — wraps `TcpStream` + `snow::TransportState` with length-prefixed AES-256-GCM framing. `handshake_initiator()` (client) and `handshake_responder()` (server) implement the Noise IK handshake with X25519 key agreement. |
 | `error.rs` | `TransportError` enum — `Io`, `Noise`, `Protocol`, `AuthFailed`, `ConnectionClosed`. |
 
-The server-side TCP/Noise handler lives in `tai-daemon/src/server/connection.rs`
+The server-side TCP/Noise handler lives in `choreographr/src/server/connection.rs`
 (`tcp_client_thread`), where the Noise IK handshake is performed and the
 encrypted stream enters the same dispatch loop as Unix socket clients.
 
 
-### `tai-client-core` — Shared client logic
+### `choreo-client-core` — Shared client logic
 
-Used by `tai-tui`, `tai-gui`, and `tai-im`.
+Used by `choreo-tui`, `choreo-gui`, and `choreo-im`.
 
 | Module | Purpose |
 |---|---|---|
 | `shell.rs` | Parses terminal input into `ShellCommand`: `/ping`, `/models`, `/model` (alias), `/cancel`, `/unlock`, `/lock`, `/image`, `/add-key`, `/add-x`, `/remove-key`, or `RunInput(prompt)`. All commands use `/` prefix exclusively; `parse_command()` is the single dispatch point. |
-| `credentials.rs` | Shared helpers: `resolve_private_key()` (read or decrypt the identity key), `build_add_credential_message()` (encrypt and package a credential for the daemon), `read_public_key_bytes()`. Eliminates duplicated logic across `tai-tui`, `tai-gui`, and `tai-im`. |
-| `image.rs` | `ImageAssembler` — kept for legacy `tai-im` use. No longer used by TUI/Dioxus (images delivered mid-turn as `DisplayedImage` via `SessionMessageAppended`). |
+| `credentials.rs` | Shared helpers: `resolve_private_key()` (read or decrypt the identity key), `build_add_credential_message()` (encrypt and package a credential for the daemon), `read_public_key_bytes()`. Eliminates duplicated logic across `choreo-tui`, `choreo-gui`, and `choreo-im`. |
+| `image.rs` | `ImageAssembler` — kept for legacy `choreo-im` use. No longer used by TUI/Dioxus (images delivered mid-turn as `DisplayedImage` via `SessionMessageAppended`). |
 | `history.rs` | `ClientHistory` ring buffer of `HistoryItem` entries (text, images, session messages, streaming text, structured diffs) |
 | `diff.rs` | Types for structured unified diff representation (`DiffLineKind`, `DiffLine`, `DiffHunk`, `FileDiff`) |
 | `dispatch.rs` | `DaemonMessageHandler` trait + `dispatch_daemon_message()` — categorizes incoming `DaemonMessage` variants into sub-dispatchers (`dispatch_session`, `dispatch_stream_lifecycle`, `dispatch_model`, `dispatch_keystore`, `dispatch_credential`, `dispatch_account`, `dispatch_reasoning`, `dispatch_misc`). Used by all UI clients to avoid duplicating the routing logic. Includes 50+ unit tests covering every message variant. |
@@ -204,10 +204,10 @@ Used by `tai-tui`, `tai-gui`, and `tai-im`.
 `DaemonMessageHandler` trait uses `ClientError` (thiserror enum) — `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch`, `PrivateKeyRead`, `PrivateKeyInvalid`, `PrivateKeyEncRead`, `PrivateKeyDecrypt`, `PublicKeyRead`, `PublicKeyInvalid`, `CredentialParse`, `Postcard`, `Encryption`.
 
 
-### `tai-mcp` — MCP client (Model Context Protocol)
+### `choreo-mcp` — MCP client (Model Context Protocol)
 
 Communicates with MCP server subprocesses over JSON-RPC 2.0 stdio transport.
-Used by `tai-daemon` to spawn external MCP servers and register their tools.
+Used by `choreographr` to spawn external MCP servers and register their tools.
 
 | Module | Purpose |
 |---|---|
@@ -217,15 +217,15 @@ Used by `tai-daemon` to spawn external MCP servers and register their tools.
 | `error.rs` | `McpError` enum — `SpawnFailed`, `InitializeFailed`, `JsonRpcError`, `ProtocolError`, `Timeout`, `Io`, `ServerShutdown`, `ToolNotFound`, `InvalidParams` |
 
 
-### `tai-acp` — ACP bridge (Agent Communication Protocol)
+### `choreo-acp` — ACP bridge (Agent Communication Protocol)
 
 Entry point: `src/main.rs` → initializes logging, connects to the daemon's Unix socket,
 spawns I/O threads, runs the main event loop.
 
 The ACP bridge translates the **Agent Communication Protocol** (JSON-RPC 2.0 over
-stdin/stdout) into `tai-proto` messages sent to the daemon over its Unix socket.
-This allows ACP-compatible editors (Claude Code, Cline, etc.) to manage tai sessions,
-send prompts, and receive streaming responses as if they were native tai clients.
+stdin/stdout) into `choreo-proto` messages sent to the daemon over its Unix socket.
+This allows ACP-compatible editors (Claude Code, Cline, etc.) to manage Choreographr sessions,
+send prompts, and receive streaming responses as if they were native Choreographr clients.
 
 **Thread topology:**
 
@@ -269,7 +269,7 @@ main()
   to ACP `session/update` notifications, and finalized with a JSON-RPC response on `Done`/`Failed`/`Cancelled`.
 
 
-### `tai-daemon` — Core server
+### `choreographr` — Core server
 
 Entry point: `src/main.rs` → initializes tracing, creates `DaemonState`, runs socket server.
 
@@ -299,7 +299,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, selected model, working directory) passed to tools that need DB or daemon access or parent config for sub-sessions. |
 | `tools/db.rs` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`). |
 | `tools/glob_util.rs` | `GlobFilter` — shared glob-matching utility used by `delete_files` and `grep` that follows gitignore conventions (patterns without `/` match basename, patterns with `/` match full path). |
-| `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`TaiSyscall`) for tool dispatch. |
+| `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`ChoreographrSyscall`) for tool dispatch. |
 | `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json`, spawns subprocesses via `McpClient`, wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) and registers them in the `ToolRegistry` under a `mcp/<slug>` group. |
 
 ### Provider Architecture
@@ -409,7 +409,7 @@ Currently supports ~30 providers. Adding a new OpenAI-compatible provider requir
 
 ```
 client_thread(socket)
-├── reads ClientMessages from socket via tai-proto read_message_sync
+├── reads ClientMessages from socket via choreo-proto read_message_sync
 ├── sends DaemonCommands via daemon_tx mpsc channel
 └── receives DaemonMessages via per-client mpsc receiver → writes to socket
 ```
@@ -472,13 +472,13 @@ LLM provider (API response)
      ChatTurnResult (FinalText | ToolUse).usage: Option<TokenUsage>
        │
        ▼
-      run_agent_loop (tai-daemon/src/requests.rs)
+      run_agent_loop (choreographr/src/requests.rs)
         ├─ embeds per-turn TokenUsage into SessionMessageKind::AssistantText / SessionMessageKind::AssistantToolUse
         ├─ tracks last_prompt_tokens = Some(usage.input_tokens) for context-window display
         └─ accumulates into SessionState.config.accumulated_usage (TokenUsage)
         │
         ▼
-      SessionState (tai-daemon/src/sessions.rs)
+      SessionState (choreographr/src/sessions.rs)
         ├─ persisted via SessionRecord.accumulated_usage (through SessionConfig)
         ├─ sent to subscribers via DaemonMessage::SessionState.token_usage
         ├─ sent to clients via DaemonMessage::Done.token_usage
@@ -490,14 +490,14 @@ LLM provider (API response)
            DaemonMessage::SessionStatusChanged for live toolbar display
         │
         ▼
-     Clients (tai-tui, tai-gui, tai-im)
-       ├─ tai-tui: displays in session detail view (render.rs:render_session_detail_view)
+     Clients (choreo-tui, choreo-gui, choreo-im)
+       ├─ choreo-tui: displays in session detail view (render.rs:render_session_detail_view)
        │  as "Context:  current / limit (pct%)"
-       └─ tai-tui: terminal progress bar uses last_prompt_tokens vs context_window
+       └─ choreo-tui: terminal progress bar uses last_prompt_tokens vs context_window
           for the OSC 9;4 percentage sequence
 ```
 
-**Key type** — `TokenUsage` (tai-proto/src/types.rs):
+**Key type** — `TokenUsage` (choreo-proto/src/types.rs):
 ```rust
 pub struct TokenUsage {
     pub input_tokens: u32,
@@ -537,7 +537,7 @@ applies its overrides through the shared `apply_overrides()` method.
 
 All new fields use `#[serde(default)]` so old persisted sessions remain compatible (deserialize to zero usage).
 
-### `tai-tui` — Terminal client
+### `choreo-tui` — Terminal client
 
 Entry point: `src/main.rs`
 
@@ -608,13 +608,13 @@ while !app.should_quit:
 | `state.rs` | `App` struct: input buffer, request tracking, `ClientHistory`, scroll state (`HistoryScrollState`), height prefix-sum array for O(1) total height and O(log n) item lookup via binary search, and the per-frame scroll accumulator (`scroll_accumulator`) consumed by `apply_scroll_delta()`. |
 | `render.rs` | Ratatui rendering: history pane (top) + command input + status bar (bottom), word wrap, Unicode width. Does **not** mutate scroll state or viewport dimensions — those are updated in the event loop before `terminal.draw()`. |
 | `syntax.rs` | Shared syntect helpers (`syntax_set`, `highlight_theme`, `to_ratatui_color`). Used by `markdown_render.rs` for code-block syntax highlighting. |
-| `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `tai-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Code blocks are syntax-highlighted via `syntect` (shared setup from `syntax.rs`). Tool call labels (`tool: name(args)`) have been removed from the assistant block — tool invocations are now visible through the `invocation_description` rendered as markdown before each tool result label, and through streaming output. |
+| `markdown_render.rs` | Terminal markdown renderer. Parses markdown (via `choreo-client-core`'s `pulldown-cmark` wrapper), renders blocks (paragraphs, headings, code, lists, tables, block quotes) into styled `ratatui::text::Line` vectors. Code blocks are syntax-highlighted via `syntect` (shared setup from `syntax.rs`). Tool call labels (`tool: name(args)`) have been removed from the assistant block — tool invocations are now visible through the `invocation_description` rendered as markdown before each tool result label, and through streaming output. |
 | `lib.rs` | `RenderedImage` struct, `build_picker()` helper, public re-exports |
 | `image_worker.rs` | Background worker thread for SVG rasterization and terminal protocol encoding. Communicates with the UI thread via `mpsc` channels; raw image data shared through `Arc<Vec<u8>>` to avoid copies. |
 | `terminal_progress.rs` | Terminal-native progress bar via OSC 9;4 escape sequences. Cached capability detection, percentage/indeterminate/remove modes based on `last_prompt_tokens` vs `context_window`. |
 
 
-### `tai-gui` — Desktop client
+### `choreo-gui` — Desktop client
 
 Entry point: `src/main.rs`
 
@@ -632,12 +632,12 @@ the Dioxus runtime.
 | `main.rs` | Dioxus `App` component, toolbar, history pane, textarea composer, CSS |
 
 
-### `tai-im` — IM platform bridge
+### `choreo-im` — IM platform bridge
 
 Entry point: `src/main.rs`
 
-Single binary (`tai-im`) that bridges IM platforms to the daemon.
-The binary accepts a platform subcommand: `tai-im telegram`.
+Single binary (`choreo-im`) that bridges IM platforms to the daemon.
+The binary accepts a platform subcommand: `choreo-im telegram`.
 
 **Credentials:** The daemon serves platform credentials via the `GetCredential` wire
 message. The admin stores credentials via `/add-key` or `/add-x` at runtime, which
@@ -882,7 +882,7 @@ enabling compact cross-VM communication.
 ### `define_tool!` macro
 
 The `define_tool!` macro reduces boilerplate for the common tool case
-(`Return = String`, no credentials needed). It lives in `tai-daemon/src/tools/mod.rs`.
+(`Return = String`, no credentials needed). It lives in `choreographr/src/tools/mod.rs`.
 The JSON schema is auto-derived from the args type via `schemars`, so no manual
 schema parameter is needed. The macro now takes 7 arguments — the 7th is a
 `fn(&Args) -> String` path that provides the invocation description:
@@ -1004,8 +1004,8 @@ Implementation details:
   registered in the default registry via `ToolRegistry::build()`, using `ToolContext.daemon_tx`
   to communicate with the daemon command loop
 - Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell}`)
-- `ToolGroup` struct and `GROUPS` constant live in `tai-daemon/src/tools/mod.rs`
-- Handler functions live in `tai-daemon/src/tools/groups.rs`
+- `ToolGroup` struct and `GROUPS` constant live in `choreographr/src/tools/mod.rs`
+- Handler functions live in `choreographr/src/tools/groups.rs`
 - Group metadata is appended to the system prompt in `context::build_base_prompt()`
 
 ### Concurrent tool dispatch
@@ -1077,7 +1077,7 @@ The child session uses `ToolContext` (`active_tool_groups`, `reasoning_effort`, 
 ### Data model
 
 Sessions are persisted to a `redb` (v4) embedded key-value store at
-`~/.local/share/tai-daemon/state.redb`. Five tables:
+`~/.local/share/choreographr/state.redb`. Five tables:
 
 | Table | Key | Value |
 |---|---|---|
@@ -1184,7 +1184,7 @@ uses `turn_id` to maintain a globally ordered history.
 ---
 
 
-**Service config:** `~/.config/tai-daemon/config.toml`
+**Service config:** `~/.config/choreographr/config.toml`
 
 ```toml
 max_turns = 25      # 0 = unlimited (loop runs until final answer or error)
@@ -1196,20 +1196,20 @@ context_file_max_bytes = 32768
 
 > **Note:** Provider-level settings (`base_url`, `streaming`, `retry_*`, timeouts, endpoint paths, request format) have moved to per-account overrides in `accounts.toml`. See `README.md` for the full list.
 
-**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Identity keys reside in `~/.config/tai-daemon/identity.pk` (private), `~/.config/tai-daemon/public.pk` (public), and optionally `~/.config/tai-daemon/identity.pk.enc` (passphrase-encrypted private key).
+**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Identity keys reside in `~/.config/choreographr/identity.pk` (private), `~/.config/choreographr/public.pk` (public), and optionally `~/.config/choreographr/identity.pk.enc` (passphrase-encrypted private key).
 
-**Database:** `~/.local/share/tai-daemon/state.redb` (override via `TAI_DB_PATH` env var)
+**Database:** `~/.local/share/choreographr/state.redb` (override via `CHOREOGRAPHR_DB_PATH` env var)
 
-**Socket path:** `/tmp/tai.sock` (override via `TAI_SOCKET_PATH` env var)
+**Socket path:** `/tmp/Choreographr.sock` (override via `CHOREOGRAPHR_SOCKET_PATH` env var)
 
-**Tool loop limit:** `TAI_MAX_TURNS` env var overrides `config.toml` `max_turns`. Resolution
-chain: per-session `max_turns` → `TAI_MAX_TURNS` env var → `config.toml` → default 25.
+**Tool loop limit:** `CHOREOGRAPHR_MAX_TURNS` env var overrides `config.toml` `max_turns`. Resolution
+chain: per-session `max_turns` → `CHOREOGRAPHR_MAX_TURNS` env var → `config.toml` → default 25.
 A value of `0` means *unlimited* — the agent loop runs indefinitely until the model
 produces a final answer, is cancelled, or hits an error.
 The `spawn_subsession` tool accepts an optional `max_turns` parameter; if not set, the
 child inherits the parent's value.
 
-**Logging:** `tai-daemon` uses `tracing` with `tracing-subscriber`. Default level is `info`.
+**Logging:** `choreographr` uses `tracing` with `tracing-subscriber`. Default level is `info`.
 CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level.
 `RUST_LOG` env var takes precedence over CLI flags.
 
@@ -1236,17 +1236,17 @@ absent no metrics server is started — the daemon runs exactly as before.
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `tai_sessions_active` | Gauge | — | Number of active sessions |
-| `tai_connections_active` | Gauge | — | Number of active client connections |
-| `tai_requests_total` | Counter | `status` (`done`, `failed`, `cancelled`) | Total requests processed |
-| `tai_tool_executions_total` | Counter | `tool`, `status` (`ok`, `error`) | Tool call count |
-| `tai_api_calls_total` | Counter | `model`, `endpoint` | API call count |
-| `tai_api_errors_total` | Counter | `model`, `error_type` | API error breakdown |
-| `tai_connections_total` | Counter | — | Total connections accepted |
-| `tai_turns_total` | Counter | `model` | Agent loop turns |
-| `tai_request_duration_seconds` | Histogram | `status` | Request latency |
-| `tai_tool_execution_duration_seconds` | Histogram | `tool` | Per-tool execution time |
-| `tai_api_call_duration_seconds` | Histogram | `model`, `endpoint` | API round-trip time |
+| `choreo_sessions_active` | Gauge | — | Number of active sessions |
+| `choreo_connections_active` | Gauge | — | Number of active client connections |
+| `choreo_requests_total` | Counter | `status` (`done`, `failed`, `cancelled`) | Total requests processed |
+| `choreo_tool_executions_total` | Counter | `tool`, `status` (`ok`, `error`) | Tool call count |
+| `choreo_api_calls_total` | Counter | `model`, `endpoint` | API call count |
+| `choreo_api_errors_total` | Counter | `model`, `error_type` | API error breakdown |
+| `choreo_connections_total` | Counter | — | Total connections accepted |
+| `choreo_turns_total` | Counter | `model` | Agent loop turns |
+| `choreo_request_duration_seconds` | Histogram | `status` | Request latency |
+| `choreo_tool_execution_duration_seconds` | Histogram | `tool` | Per-tool execution time |
+| `choreo_api_call_duration_seconds` | Histogram | `model`, `endpoint` | API round-trip time |
 
 Process-level metrics (RSS, CPU, FD count) are also exposed via the `prometheus`
 crate's `process` feature.
@@ -1263,11 +1263,11 @@ and exits cleanly when the daemon shuts down.
 
 | Location | Function | Metrics recorded |
 |---|---|---|
-| `daemon.rs` — `CreateSession` handler | `record_session_created` | `tai_sessions_active +1` |
-| `daemon.rs` — `SessionExited` handler | `record_session_exited` | `tai_sessions_active -1` |
-| `server/connection.rs` — `client_thread` start | `record_client_connected` | `tai_connections_active +1` |
-| `server/connection.rs` — `client_thread` end | `record_client_disconnected` | `tai_connections_active -1` |
-| `server/lifecycle.rs` — accept loop | `record_connection_accepted` | `tai_connections_total +1` |
+| `daemon.rs` — `CreateSession` handler | `record_session_created` | `choreo_sessions_active +1` |
+| `daemon.rs` — `SessionExited` handler | `record_session_exited` | `choreo_sessions_active -1` |
+| `server/connection.rs` — `client_thread` start | `record_client_connected` | `choreo_connections_active +1` |
+| `server/connection.rs` — `client_thread` end | `record_client_disconnected` | `choreo_connections_active -1` |
+| `server/lifecycle.rs` — accept loop | `record_connection_accepted` | `choreo_connections_total +1` |
 | `sessions.rs` — `run_request_worker` | `record_request_total`, `record_request_duration` | request status + latency |
 | `requests.rs` — `run_agent_loop` turn | `record_turn` | turn count per model |
 | `requests.rs` — `execute_tool_with_timeout` | `record_tool_execution` | tool duration + status |
@@ -1278,14 +1278,14 @@ and exits cleanly when the daemon shuts down.
 ## Data flow: a prompt from input to response
 
 ```
-1. User types "hello" in tai-tui
+1. User types "hello" in choreo-tui
         │
-2. tai-client-core::shell::parse_input_line("hello")
+2. choreo-client-core::shell::parse_input_line("hello")
    → ClientMessage::RunInput { request_id: 1, input: "hello" }
         │
-3. tai-tui writer task serializes + frames → Unix socket → tai-daemon
+3. choreo-tui writer task serializes + frames → Unix socket → choreographr
         │
-4. tai-daemon server.rs handles RunInput:
+4. choreographr server.rs handles RunInput:
    - validates session exists and is attached
    - checks no duplicate active request_id
    - sends DaemonMessage::Started { request_id: 1 }
@@ -1298,15 +1298,15 @@ and exits cleanly when the daemon shuts down.
 6. openai::requests streams SSE chunks
    → per chunk: DaemonMessage::OutputChunk { request_id: 1, stream: true, data: "Hello" }
         │
-7. DaemonMessage is serialized + framed → socket → tai-tui
+7. DaemonMessage is serialized + framed → socket → choreo-tui
         │
-8. tai-tui reader task receives OutputChunk
+8. choreo-tui reader task receives OutputChunk
    → pushes to UI event stream
         │
 9. UI loop consumes event → updates ClientHistory → re-renders
         │
 10. Final chunk arrives → DaemonMessage::Done { request_id: 1 }
-    tai-tui marks request complete, adds session message
+    choreo-tui marks request complete, adds session message
 ```
 
 ### Image flow (tool-triggered)
@@ -1386,7 +1386,7 @@ User presses Enter on a session in the session manager
 
 9. **Markdown as the intermediate format** — all text (tool output, assistant text, error
     messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
-    (tai-tui), providing a consistent rendering layer.
+    (choreo-tui), providing a consistent rendering layer.
 
 10. **Flexible API format** — both OpenAI Chat Completions and Responses are first-class
     citizens, selectable per-model via a `RequestFormat` enum (`ChatCompletions` / `Responses`).
@@ -1457,7 +1457,7 @@ discovered subdirectory hints are visible to the model immediately.
 ### Discovery algorithm
 
 1. **Global files** (loaded first, prepended):
-   - `~/.config/tai-daemon/AGENTS.md`
+   - `~/.config/choreographr/AGENTS.md`
    - `~/.claude/CLAUDE.md` (unless `disable_claude_code_prompt` is set)
    - `~/.agents/AGENTS.md`
 2. **Project files** (walking from session working directory up to the git repository root):
@@ -1498,7 +1498,7 @@ added, removed, or modified), the context is rebuilt and the cache is updated.
 ### Configuration
 
 ```toml
-# ~/.config/tai-daemon/config.toml
+# ~/.config/choreographr/config.toml
 [context]
 context_file_names = ["AGENTS.md", "CLAUDE.md"]   # ordered list; first match per directory
 context_file_max_bytes = 32768                     # max combined context size
@@ -1508,13 +1508,13 @@ disable_claude_code_prompt = false                 # skip ~/.claude/CLAUDE.md
 ### User system prompt override
 
 The stable base prompt (`messages[0]`) is loaded from
-`~/.config/tai-daemon/system.md` if it exists. Otherwise, a built-in default is
-used. The default lives at `tai-daemon/system.md` in the repository and is
+`~/.config/choreographr/system.md` if it exists. Otherwise, a built-in default is
+used. The default lives at `choreographr/system.md` in the repository and is
 embedded at compile time via `include_str!`.
 
 ### Module
 
-Implementation lives in `tai-daemon/src/context.rs`. Key entry points:
+Implementation lives in `choreographr/src/context.rs`. Key entry points:
 
 | Function | Purpose |
 |---|---|
@@ -1554,13 +1554,13 @@ to the guest syscall handler.
 1. Accepts either Rust `source` or pre-compiled base64 `program`.
 2. If `source` is provided, it is first formatted via `rustfmt` (silently skipped
    if `rustfmt` is unavailable).  The formatted source is then prepended with a
-    `#![no_std]` boilerplate (panic handler, entry point, `tai` module with
+    `#![no_std]` boilerplate (panic handler, entry point, `Choreographr` module with
      `tool_call`, `write`, `exit` syscall wrappers, dynamically-sized linked-list allocator)
     and compiled via a single
     `rustc +stable --target riscv64imac-unknown-none-elf` invocation in a temp
    directory.
 3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory.
-4. Registers a `TaiSyscall` handler that intercepts three guest syscalls:
+4. Registers a `ChoreographrSyscall` handler that intercepts three guest syscalls:
    - **Syscall #0 (TOOL_CALL)** — reads a postcard-encoded frame `[tool_name: String][args: bytes]`
      from guest memory, dispatches it via the `ToolRegistry::execute_dyn()`, and writes the
      postcard-encoded `Result<Return, String>` result to the guest's output buffer.
@@ -1579,7 +1579,7 @@ to the guest syscall handler.
 **Guest ABI** (auto-generated in the boilerplate):
 
 ```rust
-pub mod tai {
+pub mod Choreographr {
     pub unsafe fn tool_call(request: &[u8], output: &mut [u8]) -> usize;
     pub fn write(data: &[u8]);
     pub fn exit(code: i32) -> !;
@@ -1636,15 +1636,15 @@ Sandboxing (shared across all shell/exec tools via `shell_util.rs`):
 
 | Layer | What's tested | Location |
 |---|---|---|
-| Protocol | Framing, version handling, round-trip encode/decode | `tai-proto/src/tests.rs` |
-| Client core | Shell parsing, markdown→HTML, image assembly, history | `tai-client-core/src/tests.rs` |
-| Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `tai-daemon/src/tests.rs`, `tai-daemon/tests/integration.rs` |
-| MCP (tai-mcp) | Server spawn, tool discovery, echo tool call/response | `tai-mcp/tests/mcp_integration.rs` |
-| MCP (daemon) | McpManager + ToolRegistry integration, dynamic group registration, tool execution | `tai-daemon/tests/mcp_integration.rs` |
-| Daemon OpenAI | SSE parsing, HTTP request construction, config loading | `tai-daemon/src/openai/tests.rs` |
-| Daemon Anthropic | Content block deserialisation, response→turn result conversion, message payload building, config overrides | `tai-daemon/src/anthropic/tests.rs` |
-| tai-tui | SVG rasterization, Unicode width, app state | `tai-tui/src/app_tests.rs`, `tai-tui/src/lib_tests.rs` |
-| tai-gui | App state, render helpers | `tai-gui/src/app_tests.rs` |
+| Protocol | Framing, version handling, round-trip encode/decode | `choreo-proto/src/tests.rs` |
+| Client core | Shell parsing, markdown→HTML, image assembly, history | `choreo-client-core/src/tests.rs` |
+| Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `choreographr/src/tests.rs`, `choreographr/tests/integration.rs` |
+| MCP (choreo-mcp) | Server spawn, tool discovery, echo tool call/response | `choreo-mcp/tests/mcp_integration.rs` |
+| MCP (daemon) | McpManager + ToolRegistry integration, dynamic group registration, tool execution | `choreographr/tests/mcp_integration.rs` |
+| Daemon OpenAI | SSE parsing, HTTP request construction, config loading | `choreographr/src/openai/tests.rs` |
+| Daemon Anthropic | Content block deserialisation, response→turn result conversion, message payload building, config overrides | `choreographr/src/anthropic/tests.rs` |
+| choreo-tui | SVG rasterization, Unicode width, app state | `choreo-tui/src/app_tests.rs`, `choreo-tui/src/lib_tests.rs` |
+| choreo-gui | App state, render helpers | `choreo-gui/src/app_tests.rs` |
 
 **Test infrastructure:** Tests use `UnixStream::pair()` for socket-less daemon↔client
 communication, and mock HTTP servers for API simulation.
@@ -1667,16 +1667,16 @@ cargo build
 cargo build --release
 
 # Run daemon
-cargo run -p tai-daemon
+cargo run -p choreographr
 
 # Run terminal client
-cargo run -p tai-tui
+cargo run -p choreo-tui
 
 # Run desktop client
-cargo run -p tai-gui
+cargo run -p choreo-gui
 
 # Run IM bridge (Telegram)
-cargo run -p tai-im -- telegram
+cargo run -p choreo-im -- telegram
 ```
 
 
@@ -1691,10 +1691,10 @@ cargo run -p tai-im -- telegram
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
 | `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
-| `ratatui` + `crossterm` | tai-tui | Terminal UI |
-| `dioxus` | tai-gui | Desktop UI |
-| `image` + `resvg` | daemon, tai-tui | Image decoding, SVG rasterization |
-| `syntect` | tai-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
+| `ratatui` + `crossterm` | choreo-tui | Terminal UI |
+| `dioxus` | choreo-gui | Desktop UI |
+| `image` + `resvg` | daemon, choreo-tui | Image decoding, SVG rasterization |
+| `syntect` | choreo-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `x25519-dalek` + `hkdf` + `sha2` | keystore | X25519 ECDH key agreement, HKDF key derivation |
 | `ckb-vm` | daemon | RISC-V VM interpreter for sandboxed code execution |
@@ -1713,9 +1713,9 @@ Each library crate defines a structured error enum:
 
 | Crate | Error type | Key variants |
 |---|---|---|
-| `tai-proto` | `ProtoError` | `Postcard`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io` |
-| `tai-keystore` | `KeystoreError` | `Io`, `TooShort`, `DecryptionFailed`, `InvalidKeyLength`, `EncryptionFailed`, `ConfigDirNotFound` |
-| `tai-client-core` | `ClientError` | `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch` |
+| `choreo-proto` | `ProtoError` | `Postcard`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io` |
+| `choreo-keystore` | `KeystoreError` | `Io`, `TooShort`, `DecryptionFailed`, `InvalidKeyLength`, `EncryptionFailed`, `ConfigDirNotFound` |
+| `choreo-client-core` | `ClientError` | `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch` |
 
 Every library error type implements `From<ErrorType> for io::Error` for backward compatibility
 with code that still uses `io::Result`. Binary crates convert library errors to `anyhow::Error`
@@ -1751,13 +1751,13 @@ for programmatic consumers.
 The postcard binary path encodes all outcomes as a nested
 `Result<Result<R, E>, ToolError>`: `Ok(Ok(ret))` for success, `Ok(Err(e))` for a
 structured tool error, and `Err(e)` for an infrastructure failure. The `encode_outer()`
-helper in `tai-daemon/src/tools/mod.rs` handles this serialization.
+helper in `choreographr/src/tools/mod.rs` handles this serialization.
 
 `ToolOutput` replaces the old `ToolExecutionOutput` and `ToolResult` types. The `ToolOutputFormat`
 enum lets callers choose between `Text` (human-readable via `return_string`) and `Json`
 (JSON-encoded via `serde_json::to_string`) output formats.
 | `gix` | daemon | Git operations |
-| `teloxide` | tai-im | Telegram Bot API client |
+| `teloxide` | choreo-im | Telegram Bot API client |
 | `prometheus` | daemon | OpenMetrics instrumentation, process metrics |
 | `tiny_http` | daemon | Metrics HTTP server for `/metrics` endpoint |
 | `tracing` | daemon | Structured logging |

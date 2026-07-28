@@ -1,4 +1,4 @@
-# tai
+# Choreographr
 
 A local AI terminal interface in Rust. Supports multiple LLM providers (OpenAI-compatible, Anthropic, Google Gemini, and 30+ others via a pluggable catalog), runs tools, and streams responses over a Unix socket.
 
@@ -6,15 +6,15 @@ A local AI terminal interface in Rust. Supports multiple LLM providers (OpenAI-c
 
 | Crate | Description |
 |---|---|---|
-| `tai-daemon` | Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directory), runs requests with tool-call loop, and streams responses |
-| `tai-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio |
-| `tai-acp` | ACP (Agent Communication Protocol) bridge — translates JSON-RPC 2.0 over stdin/stdout into tai-proto messages, enabling ACP-compatible editors (Claude Code, Cline, etc.) to interact with tai sessions |
-| `tai-tui` | Full-screen terminal UI client (ratatui + crossterm) |
-| `tai-gui` | Minimal desktop GUI client |
-| `tai-im` | Instant messaging bridge (Telegram) that connects to the daemon |
-| `tai-client-core` | Shared parsing, markdown, and image assembly for UI clients |
-| `tai-proto` | Framed binary protocol used between client and daemon |
-| `tai-keystore` | X25519 keypair crypto library for credential encryption |
+| `choreographr` | Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directory), runs requests with tool-call loop, and streams responses |
+| `choreo-mcp` | MCP (Model Context Protocol) client — spawns subprocess servers, discovers tools, dispatches calls over JSON-RPC stdio |
+| `choreo-acp` | ACP (Agent Communication Protocol) bridge — translates JSON-RPC 2.0 over stdin/stdout into choreo-proto messages, enabling ACP-compatible editors (Claude Code, Cline, etc.) to interact with Choreographr sessions |
+| `choreo-tui` | Full-screen terminal UI client (ratatui + crossterm) |
+| `choreo-gui` | Minimal desktop GUI client |
+| `choreo-im` | Instant messaging bridge (Telegram) that connects to the daemon |
+| `choreo-client-core` | Shared parsing, markdown, and image assembly for UI clients |
+| `choreo-proto` | Framed binary protocol used between client and daemon |
+| `choreo-keystore` | X25519 keypair crypto library for credential encryption |
 
 ## Concepts
 
@@ -64,34 +64,34 @@ cargo build
 Start the daemon:
 
 ```bash
-cargo run -p tai-daemon         # default log level: info
-cargo run -p tai-daemon -- -v   # debug
-cargo run -p tai-daemon -- -vv  # trace
-cargo run -p tai-daemon -- -q   # warnings only
+cargo run -p choreographr         # default log level: info
+cargo run -p choreographr -- -v   # debug
+cargo run -p choreographr -- -vv  # trace
+cargo run -p choreographr -- -q   # warnings only
 ```
 
 Alternatively, set `RUST_LOG` (takes precedence over CLI flags):
 
 ```bash
-RUST_LOG=debug cargo run -p tai-daemon
+RUST_LOG=debug cargo run -p choreographr
 ```
 
 Then a client:
 
 ```bash
-cargo run -p tai-tui     # terminal UI
-cargo run -p tai-gui  # desktop app
-cargo run -p tai-im      # IM bridge
+cargo run -p choreo-tui     # terminal UI
+cargo run -p choreo-gui  # desktop app
+cargo run -p choreo-im      # IM bridge
 ```
 
 Available provider options in the TUI's "AI Provider Accounts" page include OpenAI, Anthropic, Google Gemini, DeepSeek, xAI Grok, Groq, Together AI, Mistral, Ollama, OpenRouter, Hugging Face, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, DashScope, Moonshot AI, Perplexity, Z.ai, Venice AI, Novita AI, LM Studio, OpenRouter, MiniMax, and DM Enterprise. Use `n` to add a new account, select provider in the form, enter an API key, and press Enter to save.
 
-In `tai-tui`, `Ctrl+C` exits the local client and disconnects from the daemon without
+In `choreo-tui`, `Ctrl+C` exits the local client and disconnects from the daemon without
 requesting daemon shutdown.
 
 ## Configuration
 
-The daemon reads config from `~/.config/tai-daemon/config.toml` (all fields optional):
+The daemon reads config from `~/.config/choreographr/config.toml` (all fields optional):
 
 ```toml
 max_turns = 25      # 0 = unlimited (loop runs until final answer or error)
@@ -104,13 +104,13 @@ disable_claude_code_prompt = false
 
 > **Note:** Provider-level settings (`base_url`, `streaming`, `retry_*`, timeouts, endpoint paths, request format, etc.) have moved to per-account overrides in `accounts.toml`. They are no longer read from `config.toml`.
 
-Credentials are encrypted per-credential with the daemon's X25519 public key and stored in the `redb` database. Identity keys reside in `~/.config/tai-daemon/identity.pk` (private), `~/.config/tai-daemon/public.pk` (public), and optionally `~/.config/tai-daemon/identity.pk.enc` (passphrase-encrypted private key).
+Credentials are encrypted per-credential with the daemon's X25519 public key and stored in the `redb` database. Identity keys reside in `~/.config/choreographr/identity.pk` (private), `~/.config/choreographr/public.pk` (public), and optionally `~/.config/choreographr/identity.pk.enc` (passphrase-encrypted private key).
 
-The socket path defaults to `/tmp/tai.sock` and can be overridden via `TAI_SOCKET_PATH`. The database path defaults to `~/.local/share/tai-daemon/state.redb` and can be overridden via `TAI_DB_PATH`.
+The socket path defaults to `/tmp/Choreographr.sock` and can be overridden via `CHOREOGRAPHR_SOCKET_PATH`. The database path defaults to `~/.local/share/choreographr/state.redb` and can be overridden via `CHOREOGRAPHR_DB_PATH`.
 
 ## Shell commands
 
-In `tai-tui`:
+In `choreo-tui`:
 
 - `/ping` — health check
 - `/models` — list and select models
@@ -138,12 +138,12 @@ In `tai-tui`:
 - any other input — sent as a prompt
 
 Account names must be lowercase alphanumeric with hyphens or underscores (`[a-z0-9_-]`).
-Supported providers: all entries in the provider catalog — ~30 providers across OpenAI-compatible, Anthropic-compatible, and Google Gemini protocols. See `tai-daemon/src/providers/catalog.rs` for the full list.
+Supported providers: all entries in the provider catalog — ~30 providers across OpenAI-compatible, Anthropic-compatible, and Google Gemini protocols. See `choreographr/src/providers/catalog.rs` for the full list.
 Each session may have its own account, set via `/account <name>`. There is no global default
 account. Sessions can be created and browsed while the daemon is locked — credentials are
 only required when running prompts.
 
-Accounts are configured via `~/.config/tai-daemon/accounts.toml`:
+Accounts are configured via `~/.config/choreographr/accounts.toml`:
 ```toml
 [[account]]
 name = "main"
@@ -200,7 +200,7 @@ The Responses API is now fully supported — including tool use, streaming, reas
 The daemon can expose an OpenMetrics (Prometheus) endpoint:
 
 ```bash
-cargo run -p tai-daemon -- --metrics-addr 127.0.0.1:9464
+cargo run -p choreographr -- --metrics-addr 127.0.0.1:9464
 ```
 
 When `--metrics-addr` is provided, a dedicated HTTP thread serves `GET /metrics`

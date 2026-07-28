@@ -1,16 +1,16 @@
 [workspace]
 members = [
-    "tai-acp",
-    "tai-client-core",
-    "tai-daemon",
-    "tai-keystore",
-    "tai-markdown",
-    "tai-mcp",
-    "tai-proto",
-    "tai-tui",
-    "tai-gui",
-    "tai-im",
-    "tai-transport",
+    "choreo-acp",
+    "choreo-client-core",
+    "choreographr",
+    "choreo-keystore",
+    "choreo-markdown",
+    "choreo-mcp",
+    "choreo-proto",
+    "choreo-tui",
+    "choreo-gui",
+    "choreo-im",
+    "choreo-transport",
 ]
 resolver = "3"
 
@@ -20,13 +20,13 @@ thiserror = "2"
 futures-channel = "0.3"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
-tai-client-core = { path = "tai-client-core" }
-tai-keystore = { path = "tai-keystore" }
-tai-proto = { path = "tai-proto" }
-tai-im = { path = "tai-im" }
-tai-markdown = { path = "tai-markdown" }
-tai-mcp = { path = "tai-mcp" }
-tai-transport = { path = "tai-transport" }
+choreo-client-core = { path = "choreo-client-core" }
+choreo-keystore = { path = "choreo-keystore" }
+choreo-proto = { path = "choreo-proto" }
+choreo-im = { path = "choreo-im" }
+choreo-markdown = { path = "choreo-markdown" }
+choreo-mcp = { path = "choreo-mcp" }
+choreo-transport = { path = "choreo-transport" }
 ureq = { version = "3", features = ["json"] }
 ammonia = "4"
 base64 = "0.23"

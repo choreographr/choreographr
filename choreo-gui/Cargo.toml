@@ -1,0 +1,17 @@
+[package]
+name = "choreo-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64.workspace = true
+clap.workspace = true
+dioxus = { version = "0.7", features = ["desktop"] }
+futures-channel.workspace = true
+futures-util.workspace = true
+humfmt.workspace = true
+choreo-client-core.workspace = true
+choreo-keystore.workspace = true
+choreo-markdown.workspace = true
+choreo-proto.workspace = true
+tracing.workspace = true

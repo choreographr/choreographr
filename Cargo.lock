@@ -750,6 +750,220 @@ dependencies = [
 ]
 
 [[package]]
+name = "choreo-acp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "choreo-proto",
+ "clap",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "choreo-client-core"
+version = "0.1.0"
+dependencies = [
+ "choreo-keystore",
+ "choreo-proto",
+ "choreo-transport",
+ "postcard",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "choreo-gui"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.0",
+ "choreo-client-core",
+ "choreo-keystore",
+ "choreo-markdown",
+ "choreo-proto",
+ "clap",
+ "dioxus",
+ "futures-channel",
+ "futures-util",
+ "humfmt",
+ "tracing",
+]
+
+[[package]]
+name = "choreo-im"
+version = "0.1.0"
+dependencies = [
+ "ammonia",
+ "anyhow",
+ "choreo-client-core",
+ "choreo-keystore",
+ "choreo-markdown",
+ "choreo-proto",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+]
+
+[[package]]
+name = "choreo-keystore"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm 0.11.0",
+ "argon2",
+ "dirs",
+ "hkdf",
+ "rand 0.10.2",
+ "rand_core 0.10.1",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "choreo-markdown"
+version = "0.1.0"
+dependencies = [
+ "ammonia",
+ "pulldown-cmark",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "choreo-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "choreo-proto"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "choreo-transport"
+version = "0.1.0"
+dependencies = [
+ "choreo-proto",
+ "dirs",
+ "rand 0.10.2",
+ "snow",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "choreo-tui"
+version = "0.1.0"
+dependencies = [
+ "ansi-to-tui",
+ "anstyle-progress",
+ "anyhow",
+ "choreo-client-core",
+ "choreo-keystore",
+ "choreo-markdown",
+ "choreo-proto",
+ "chrono",
+ "clap",
+ "crossbeam",
+ "crossterm",
+ "dirs",
+ "humfmt",
+ "image",
+ "lru",
+ "mio",
+ "nix 0.31.3",
+ "ratatui",
+ "ratatui-image",
+ "resvg",
+ "serde",
+ "signal-hook 0.4.4",
+ "syntect",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "tui-prompts",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "choreographr"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.0",
+ "choreo-keystore",
+ "choreo-mcp",
+ "choreo-proto",
+ "choreo-transport",
+ "chrono",
+ "ckb-vm",
+ "clap",
+ "dirs",
+ "filetime",
+ "gix",
+ "gix-imara-diff",
+ "grep-regex",
+ "grep-searcher",
+ "hex",
+ "hkdf",
+ "hmac",
+ "humfmt",
+ "image",
+ "nix 0.31.3",
+ "notify-rust",
+ "postcard",
+ "prometheus",
+ "rand 0.10.2",
+ "redb",
+ "resvg",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "signal-hook 0.4.4",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tiktoken",
+ "tiny_http",
+ "toml 1.1.3+spec-1.1.0",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "url",
+ "x25519-dalek",
+ "yaml_serde",
+ "zeroize",
+ "zlob",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7727,220 +7941,6 @@ dependencies = [
  "pkg-config",
  "toml 0.8.2",
  "version-compare",
-]
-
-[[package]]
-name = "tai-acp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "serde",
- "serde_json",
- "tai-proto",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tai-client-core"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "tai-keystore",
- "tai-proto",
- "tai-transport",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "tai-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.23.0",
- "chrono",
- "ckb-vm",
- "clap",
- "dirs",
- "filetime",
- "gix",
- "gix-imara-diff",
- "grep-regex",
- "grep-searcher",
- "hex",
- "hkdf",
- "hmac",
- "humfmt",
- "image",
- "nix 0.31.3",
- "notify-rust",
- "postcard",
- "prometheus",
- "rand 0.10.2",
- "redb",
- "resvg",
- "schemars",
- "serde",
- "serde_json",
- "serial_test",
- "sha1 0.11.0",
- "sha2 0.11.0",
- "signal-hook 0.4.4",
- "tai-keystore",
- "tai-mcp",
- "tai-proto",
- "tai-transport",
- "tempfile",
- "thiserror 2.0.18",
- "tiktoken",
- "tiny_http",
- "toml 1.1.3+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "url",
- "x25519-dalek",
- "yaml_serde",
- "zeroize",
- "zlob",
-]
-
-[[package]]
-name = "tai-gui"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.0",
- "clap",
- "dioxus",
- "futures-channel",
- "futures-util",
- "humfmt",
- "tai-client-core",
- "tai-keystore",
- "tai-markdown",
- "tai-proto",
- "tracing",
-]
-
-[[package]]
-name = "tai-im"
-version = "0.1.0"
-dependencies = [
- "ammonia",
- "anyhow",
- "serde",
- "serde_json",
- "tai-client-core",
- "tai-keystore",
- "tai-markdown",
- "tai-proto",
- "thiserror 2.0.18",
- "tracing",
- "tracing-subscriber",
- "ureq",
-]
-
-[[package]]
-name = "tai-keystore"
-version = "0.1.0"
-dependencies = [
- "aes-gcm 0.11.0",
- "argon2",
- "dirs",
- "hkdf",
- "rand 0.10.2",
- "rand_core 0.10.1",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "tai-markdown"
-version = "0.1.0"
-dependencies = [
- "ammonia",
- "pulldown-cmark",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "tai-mcp"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "tai-proto"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "tai-transport"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "rand 0.10.2",
- "snow",
- "tai-proto",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "x25519-dalek",
-]
-
-[[package]]
-name = "tai-tui"
-version = "0.1.0"
-dependencies = [
- "ansi-to-tui",
- "anstyle-progress",
- "anyhow",
- "chrono",
- "clap",
- "crossbeam",
- "crossterm",
- "dirs",
- "humfmt",
- "image",
- "lru",
- "mio",
- "nix 0.31.3",
- "ratatui",
- "ratatui-image",
- "resvg",
- "serde",
- "signal-hook 0.4.4",
- "syntect",
- "tai-client-core",
- "tai-keystore",
- "tai-markdown",
- "tai-proto",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "tui-prompts",
- "unicode-segmentation",
- "unicode-width",
 ]
 
 [[package]]
