@@ -1,8 +1,9 @@
 use crate::markdown_render::{display_width, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
-    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, HOME_MENU_ITEMS, PROVIDER_OPTIONS, Page,
-    STATUS_BAR_HEIGHT, SessionManagerView, cached_or_compute_lines, cached_visual_lines,
+    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, CTRL_HELP_LINE1, CTRL_HELP_LINE2,
+    PROVIDER_OPTIONS, Page, STATUS_BAR_HEIGHT, SessionManagerView, cached_or_compute_lines,
+    cached_visual_lines,
 };
 use ratatui::{
     Frame,
@@ -54,8 +55,6 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         Page::Chat => render_chat(frame, app),
         Page::SessionManager => render_session_manager(frame, app),
         Page::AIProviders => render_ai_providers(frame, app),
-        Page::Settings => render_settings(frame, app),
-        Page::Home => render_home(frame, app),
     }
 }
 
@@ -153,67 +152,16 @@ fn render_fullscreen_image(frame: &mut Frame<'_>, turn_id: u32, img_idx: usize, 
     render_fullscreen_placeholder(frame);
 }
 
-fn render_settings(frame: &mut Frame<'_>, _app: &mut App) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
-
-    let block = Block::default().title(" Settings ").borders(Borders::ALL);
-    frame.render_widget(block, chunks[0]);
-
-    let status = Paragraph::new(Line::from(" <Esc home>  <Ctrl+C quit>"));
-    frame.render_widget(status, chunks[1]);
-}
-
-fn render_home(frame: &mut Frame<'_>, app: &mut App) {
-    let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(12),
-            Constraint::Length(3),
-            Constraint::Min(1),
-        ])
-        .split(area);
-
-    let menu_area = chunks[0];
-    let menu_items: Vec<Line> = HOME_MENU_ITEMS
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let is_selected = i == app.home_selection;
-            let prefix = if is_selected { " > " } else { "   " };
-            let label = item.label();
-            let hint = item.key_hint();
-            let text = format!("{prefix}{label} {hint}");
-            let style = if is_selected {
-                Style::default().fg(Color::Yellow).bold()
-            } else {
-                Style::default().fg(Color::White)
-            };
-            Line::from(Span::styled(text, style))
-        })
-        .collect();
-
-    let menu = Paragraph::new(menu_items).alignment(Alignment::Center);
-    frame.render_widget(menu, menu_area);
-
-    let status = Paragraph::new(Line::from(
-        " <j/k nav>  <Enter select>  <s sessions>  <p ai providers>  <t settings>  <q quit>  <Esc back>",
-    ));
-    frame.render_widget(status, chunks[1]);
-}
-
 fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     let status_error_height = app.status_error_height(frame.area().width);
+    let help_height = if app.show_ctrl_help { 2u16 } else { 0u16 };
     let input_height = app.input_bar_height(frame.area().width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(status_error_height),
+            Constraint::Length(help_height),
             Constraint::Length(input_height),
             Constraint::Length(STATUS_BAR_HEIGHT),
         ])
@@ -249,22 +197,47 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     // ── Status/error bar (above command box) ──────────────────
+    let notify_area = Rect {
+        x: chunks[1].x + 1,
+        width: chunks[1].width.saturating_sub(2),
+        ..chunks[1]
+    };
     if let Some(ref err) = app.error {
         let err_para = Paragraph::new(Text::from(err.clone()))
             .style(Style::default().fg(Color::Red))
             .wrap(Wrap { trim: false });
-        frame.render_widget(err_para, chunks[1]);
+        frame.render_widget(err_para, notify_area);
     } else if let Some(ref status) = app.status {
         let status_para = Paragraph::new(Text::from(status.clone()))
-            .style(Style::default().fg(Color::Cyan))
+            .style(Style::default().fg(Color::Green))
             .wrap(Wrap { trim: false });
-        frame.render_widget(status_para, chunks[1]);
+        frame.render_widget(status_para, notify_area);
+    }
+
+    // ── Help overlay (2 lines, conditional) ───────────────────
+    if app.show_ctrl_help {
+        let help_area = Rect {
+            x: chunks[2].x + 1,
+            width: chunks[2].width.saturating_sub(2),
+            ..chunks[2]
+        };
+        let help = Paragraph::new(Text::from(vec![
+            Line::from(Span::styled(
+                CTRL_HELP_LINE1,
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(Span::styled(
+                CTRL_HELP_LINE2,
+                Style::default().fg(Color::Cyan),
+            )),
+        ]));
+        frame.render_widget(help, help_area);
     }
 
     // ── Command input box ──────────────────────────────────────
     // Account for INPUT_PAD padding on both sides (left + right = 2 * INPUT_PAD).
-    let inner_width = chunks[2].width.saturating_sub(INPUT_PAD * 2) as usize;
-    let visible_height = (chunks[2].height.saturating_sub(2)) as usize;
+    let inner_width = chunks[3].width.saturating_sub(INPUT_PAD * 2) as usize;
+    let visible_height = (chunks[3].height.saturating_sub(2)) as usize;
 
     // Compute cursor position first (populates the lines cache) so we
     // can then borrow separate fields of app.input for the cached lines.
@@ -303,18 +276,18 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
             .borders(Borders::TOP | Borders::BOTTOM)
             .padding(Padding::new(INPUT_PAD, INPUT_PAD, 0, 0)),
     );
-    frame.render_widget(input, chunks[2]);
+    frame.render_widget(input, chunks[3]);
     // Clamp to visible area so the cursor is always inside the box,
     // even when scroll_offset hasn't been adjusted yet (e.g. after
     // loading a long history entry that ends at scroll_offset = 0).
     let max_display_row = (visible_count as u16).saturating_sub(1);
     let display_vrow = vrow.saturating_sub(offset as u16).min(max_display_row);
-    let cursor_x = chunks[2].x.saturating_add(INPUT_PAD).saturating_add(vcol);
-    let cursor_y = chunks[2].y.saturating_add(1).saturating_add(display_vrow);
+    let cursor_x = chunks[3].x.saturating_add(INPUT_PAD).saturating_add(vcol);
+    let cursor_y = chunks[3].y.saturating_add(1).saturating_add(display_vrow);
     frame.set_cursor_position((cursor_x, cursor_y));
 
     // ── Status bar (single line) ───────────────────────────────
-    let status_area = chunks[3];
+    let status_area = chunks[4];
 
     let has_session = app.attached_session_id.is_some();
 

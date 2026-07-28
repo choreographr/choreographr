@@ -1,8 +1,8 @@
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
-    AIProvidersView, App, HOME_MENU_ITEMS, HomeMenuItem, InputBuffer, PAGE_SCROLL_LINES, Page,
-    SessionManagerView, UiEvent, find_turn_at_row,
+    AIProvidersView, App, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent,
+    find_turn_at_row,
 };
 use crossbeam::channel;
 use crossbeam::select;
@@ -533,6 +533,17 @@ pub(crate) fn handle_terminal_event(
         app.mark_terminal_resized();
     }
 
+    // Global Ctrl+Q quits from any page before page-specific dispatch and
+    // fullscreen overlay so the user can always quit.
+    if let Event::Key(key) = &event
+        && key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('q')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        tracing::info!("Ctrl+Q requested quit");
+        app.should_quit = true;
+        return Ok(());
+    }
     // Fullscreen image overlay takes priority over page content.
     if app.fullscreen_image_target.is_some() {
         return handle_fullscreen_event(event, app, client_tx);
@@ -541,8 +552,6 @@ pub(crate) fn handle_terminal_event(
         Page::SessionManager => handle_session_manager_event(event, app, client_tx),
         Page::AIProviders => handle_ai_providers_event(event, app, client_tx),
         Page::Chat => handle_chat_event(event, app, client_tx),
-        Page::Settings => handle_settings_event(event, app, client_tx),
-        Page::Home => handle_home_event(event, app, client_tx),
     }
 }
 
@@ -609,97 +618,10 @@ fn paste_into_text_state(state: &mut impl tui_prompts::State, data: &str) {
     *state.position_mut() = pos + data.chars().count();
 }
 
-fn handle_home_event(
-    event: Event,
-    app: &mut App,
-    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
-) -> Result<(), ClientError> {
-    let Event::Key(key) = event else {
-        return Ok(());
-    };
-    if key.kind != KeyEventKind::Press {
-        return Ok(());
-    }
-    match key.code {
-        // Esc returns to the previous page the user was on.
-        KeyCode::Esc => {
-            app.set_page(app.previous_page);
-        }
-        // Navigate menu with j/k or Up/Down
-        KeyCode::Up | KeyCode::Char('k') => {
-            if app.home_selection > 0 {
-                app.home_selection -= 1;
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.home_selection < HOME_MENU_ITEMS.len() - 1 {
-                app.home_selection += 1;
-            }
-        }
-        // Select a menu item
-        KeyCode::Enter => match HOME_MENU_ITEMS[app.home_selection] {
-            HomeMenuItem::Sessions => {
-                app.set_page(Page::SessionManager);
-                let _ = client_tx.send(ClientMessage::ListSessions);
-                let _ = client_tx.send(ClientMessage::SubscribeSessionsSummary);
-            }
-            HomeMenuItem::AIProviders => {
-                app.set_page(Page::AIProviders);
-                let _ = client_tx.send(ClientMessage::ListAccounts);
-            }
-            HomeMenuItem::Settings => {
-                app.set_page(Page::Settings);
-            }
-            HomeMenuItem::Exit => {
-                app.should_quit = true;
-            }
-        },
-        // Letter shortcuts for each menu item
-        KeyCode::Char('s') => {
-            app.set_page(Page::SessionManager);
-            let _ = client_tx.send(ClientMessage::ListSessions);
-            let _ = client_tx.send(ClientMessage::SubscribeSessionsSummary);
-        }
-        KeyCode::Char('t') => {
-            app.set_page(Page::Settings);
-        }
-        KeyCode::Char('q') => {
-            app.should_quit = true;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn handle_settings_event(
-    event: Event,
-    app: &mut App,
-    _client_tx: &std::sync::mpsc::Sender<ClientMessage>,
-) -> Result<(), ClientError> {
-    let Event::Key(key) = event else {
-        return Ok(());
-    };
-    if key.kind != KeyEventKind::Press {
-        return Ok(());
-    }
-    match key.code {
-        // Ctrl+C quits from the settings page
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
-        // Esc returns to the home page
-        KeyCode::Esc => {
-            app.set_page(Page::Home);
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 /// Handle events while the fullscreen image overlay is active.
 ///
-/// Only `Esc` (dismiss) and `Ctrl+C` (quit) are accepted; all other events
-/// are silently consumed.
+/// Only `Esc` (dismiss) is accepted; all other events are silently
+/// consumed.  Quit is handled via Ctrl+Q on the Chat page.
 fn handle_fullscreen_event(
     event: Event,
     app: &mut App,
@@ -711,14 +633,8 @@ fn handle_fullscreen_event(
     if key.kind != KeyEventKind::Press {
         return Ok(());
     }
-    match key.code {
-        KeyCode::Esc => {
-            app.fullscreen_image_target = None;
-        }
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
-        _ => {}
+    if key.code == KeyCode::Esc {
+        app.fullscreen_image_target = None;
     }
     Ok(())
 }
@@ -736,51 +652,41 @@ fn handle_chat_event(
             // Any keypress clears transient status/error messages.
             app.status = None;
             app.error = None;
+            // Don't clear help on Ctrl+H itself — let the toggle arm handle it.
+            if key.code != KeyCode::Char('h') || !key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.show_ctrl_help = false;
+            }
             match key.code {
-                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let capability = app.attached_reasoning_capability.as_ref();
-                    match capability.and_then(|c| {
-                        let current = app
-                            .attached_reasoning_effort
-                            .clone()
-                            .unwrap_or_else(|| "off".to_string());
-                        c.cycle_from(&current).map(|next| (current, next))
-                    }) {
-                        Some((current, next)) => {
-                            app.attached_reasoning_effort = Some(next.clone());
-                            app.status = Some(format!("reasoning: {next}"));
-                            tracing::info!(
-                                session_id = ?app.attached_session_id,
-                                current = %current,
-                                next = %next,
-                                "Ctrl+R cycling reasoning effort",
-                            );
-                            client_tx
-                                .send(ClientMessage::SetReasoningEffort { effort: next })
-                                .map_err(broken_pipe)?;
-                        }
-                        None => {
-                            app.status = Some("model does not support reasoning".to_string());
-                        }
+                // All Ctrl+ combinations delegated to a dedicated handler.
+                _ if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    handle_chat_ctrl_key(key, app, client_tx)?;
+                }
+                // Alt+Enter → continue generation
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if app.attached_session_id.is_some() {
+                        tracing::debug!("Alt+Enter continuing generation");
+                        let request_id = app.next_request_id;
+                        app.next_request_id = app.next_request_id.wrapping_add(1);
+                        app.active.insert(request_id);
+                        client_tx
+                            .send(ClientMessage::ContinueGeneration { request_id })
+                            .map_err(broken_pipe)?;
+                        app.scroll_to(0);
+                    } else {
+                        tracing::debug!("Alt+Enter ignored — no session attached");
+                        app.status = Some("no session attached".to_string());
                     }
                 }
-                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.set_page(Page::SessionManager);
-                    client_tx
-                        .send(ClientMessage::ListSessions)
-                        .map_err(broken_pipe)?;
-                    client_tx
-                        .send(ClientMessage::SubscribeSessionsSummary)
-                        .map_err(broken_pipe)?;
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.set_page(Page::Settings);
-                }
                 KeyCode::Esc => {
-                    // Save where we came from so Home can return to Chat.
-                    app.previous_page = Page::Chat;
-                    app.home_selection = 0;
-                    app.set_page(Page::Home);
+                    if app.attached_session_id.is_some() {
+                        tracing::debug!("Esc stopping generation");
+                        client_tx
+                            .send(ClientMessage::Cancel { request_id: 0 })
+                            .map_err(broken_pipe)?;
+                    } else {
+                        tracing::debug!("Esc ignored — no session attached");
+                        app.status = Some("no session attached".to_string());
+                    }
                 }
                 KeyCode::Up => {
                     let inner = app
@@ -968,7 +874,9 @@ fn handle_chat_event(
                             // to stop whatever request is currently active on the
                             // attached session and all its children.
                             if app.attached_session_id.is_some() {
-                                let _ = client_tx.send(ClientMessage::Cancel { request_id: 0 });
+                                client_tx
+                                    .send(ClientMessage::Cancel { request_id: 0 })
+                                    .map_err(broken_pipe)?;
                             } else {
                                 app.status = Some("no session attached".to_string());
                             }
@@ -1105,6 +1013,90 @@ fn handle_chat_event(
     Ok(())
 }
 
+/// Handle Ctrl+key combinations on the Chat page.
+///
+/// Each arm logs a `tracing::debug!` event for observability. Unknown
+/// Ctrl+combinations (e.g. Ctrl+Backspace, Ctrl+Home) are forwarded to
+/// the input handler so standard text-editing shortcuts still work.
+fn handle_chat_ctrl_key(
+    key: KeyEvent,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    match key.code {
+        KeyCode::Char('r') => {
+            let capability = app.attached_reasoning_capability.as_ref();
+            match capability.and_then(|c| {
+                let current = app
+                    .attached_reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| "off".to_string());
+                c.cycle_from(&current).map(|next| (current, next))
+            }) {
+                Some((current, next)) => {
+                    app.attached_reasoning_effort = Some(next.clone());
+                    app.status = Some(format!("reasoning: {next}"));
+                    tracing::info!(
+                        session_id = ?app.attached_session_id,
+                        current = %current,
+                        next = %next,
+                        "Ctrl+R cycling reasoning effort",
+                    );
+                    client_tx
+                        .send(ClientMessage::SetReasoningEffort { effort: next })
+                        .map_err(broken_pipe)?;
+                }
+                None => {
+                    app.status = Some("model does not support reasoning".to_string());
+                }
+            }
+        }
+        KeyCode::Char('h') => {
+            tracing::debug!("Ctrl+H toggling help overlay");
+            app.show_ctrl_help = !app.show_ctrl_help;
+        }
+        KeyCode::Char('s') => {
+            tracing::debug!("Ctrl+S navigating to session manager");
+            app.set_page(Page::SessionManager);
+            client_tx
+                .send(ClientMessage::ListSessions)
+                .map_err(broken_pipe)?;
+            client_tx
+                .send(ClientMessage::SubscribeSessionsSummary)
+                .map_err(broken_pipe)?;
+        }
+        KeyCode::Char('a') => {
+            tracing::debug!("Ctrl+A navigating to AI provider accounts");
+            app.set_page(Page::AIProviders);
+            client_tx
+                .send(ClientMessage::ListAccounts)
+                .map_err(broken_pipe)?;
+        }
+        // Ctrl+C is a deliberate no-op on the chat page (no copy/sigint
+        // in raw mode). Absorb it here so it doesn't fall through to the
+        // input handler which would insert a literal 'c'.
+        KeyCode::Char('c') => {
+            tracing::debug!("Ctrl+C ignored on chat page");
+        }
+        KeyCode::Up => {
+            tracing::debug!("Ctrl+Up undo");
+            client_tx.send(ClientMessage::Undo).map_err(broken_pipe)?;
+        }
+        KeyCode::Down => {
+            tracing::debug!("Ctrl+Down redo");
+            client_tx.send(ClientMessage::Redo).map_err(broken_pipe)?;
+        }
+        // Ctrl+Left, Ctrl+Right, Ctrl+Backspace, Ctrl+Delete, Ctrl+Home,
+        // Ctrl+End, etc. are text-editing shortcuts that should still work
+        // in the input box.
+        _ => {
+            handle_input_key(key, &mut app.input);
+            app.ensure_input_cursor_visible();
+        }
+    }
+    Ok(())
+}
+
 fn handle_input_key(key: crossterm::event::KeyEvent, input: &mut InputBuffer) {
     // All editing logic moved into InputBuffer::handle_key.
     input.handle_key(key);
@@ -1152,9 +1144,6 @@ fn handle_session_list_key(
     }
 
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
         KeyCode::Up | KeyCode::Char('k') => app.session_mgr.select_up(),
         KeyCode::Down | KeyCode::Char('j') => app.session_mgr.select_down(),
         KeyCode::PageUp => {
@@ -1204,9 +1193,7 @@ fn handle_session_list_key(
             }
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.previous_page = Page::SessionManager;
-            app.home_selection = 0;
-            app.set_page(Page::Home);
+            app.set_page(Page::Chat);
             let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
         }
         _ => {}
@@ -1220,9 +1207,6 @@ fn handle_session_detail_key(
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
         KeyCode::Char('b') | KeyCode::Esc => {
             app.session_mgr.leave_detail();
         }
@@ -1289,9 +1273,6 @@ fn handle_ai_providers_list_key(
     }
 
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
         KeyCode::Up | KeyCode::Char('k') => app.ai_providers.select_up(),
         KeyCode::Down | KeyCode::Char('j') => app.ai_providers.select_down(),
         KeyCode::PageUp => {
@@ -1322,9 +1303,7 @@ fn handle_ai_providers_list_key(
             }
         }
         KeyCode::Esc | KeyCode::Char('q') => {
-            app.previous_page = Page::AIProviders;
-            app.home_selection = 0;
-            app.set_page(Page::Home);
+            app.set_page(Page::Chat);
         }
         _ => {}
     }
@@ -1346,9 +1325,6 @@ fn handle_ai_providers_credential_key(
     }
 
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.should_quit = true;
-        }
         // Enter saves the credential
         KeyCode::Enter => {
             let account_name = match app.ai_providers.credential_target.take() {
@@ -1408,15 +1384,6 @@ fn handle_ai_providers_new_form_key(
         return Ok(());
     };
     if key.kind != KeyEventKind::Press {
-        return Ok(());
-    }
-
-    // Ctrl+C -> quit (overrides everything)
-    if matches!(
-        key.code,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL)
-    ) {
-        app.should_quit = true;
         return Ok(());
     }
 

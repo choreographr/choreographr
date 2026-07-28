@@ -219,6 +219,18 @@ pub enum SessionStatus {
     },
 }
 
+impl SessionStatus {
+    /// Returns `true` when the session is actively processing (inference,
+    /// tool call, or retrying).  Returns `false` for idle states (inactive,
+    /// sleeping).
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            SessionStatus::Inference | SessionStatus::ToolCall(_) | SessionStatus::Retrying { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSummary {
     pub session_id: u64,

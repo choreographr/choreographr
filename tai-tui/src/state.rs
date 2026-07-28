@@ -25,50 +25,18 @@ pub(crate) const MIN_INPUT_CONTENT_LINES: u16 = 1;
 pub(crate) const MAX_INPUT_CONTENT_LINES: u16 = 10;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
+pub(crate) const CTRL_HELP_LINE1: &str =
+    "ctrl+h help  ctrl+q quit  ctrl+a accounts  ctrl+s sessions  ctrl+r reasoning";
+pub(crate) const CTRL_HELP_LINE2: &str =
+    "esc stop  alt+enter continue  ctrl+up undo  ctrl+down redo";
+
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HomeMenuItem {
-    Sessions,
-    AIProviders,
-    Settings,
-    Exit,
-}
-
-impl HomeMenuItem {
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            HomeMenuItem::Sessions => "Sessions",
-            HomeMenuItem::AIProviders => "AI Provider Accounts",
-            HomeMenuItem::Settings => "Settings",
-            HomeMenuItem::Exit => "Exit",
-        }
-    }
-
-    pub(crate) fn key_hint(&self) -> &'static str {
-        match self {
-            HomeMenuItem::Sessions => "(s)",
-            HomeMenuItem::AIProviders => "(p)",
-            HomeMenuItem::Settings => "(t)",
-            HomeMenuItem::Exit => "(q)",
-        }
-    }
-}
-
-pub(crate) const HOME_MENU_ITEMS: &[HomeMenuItem] = &[
-    HomeMenuItem::Sessions,
-    HomeMenuItem::AIProviders,
-    HomeMenuItem::Settings,
-    HomeMenuItem::Exit,
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Page {
     Chat,
     SessionManager,
     AIProviders,
-    Settings,
-    Home,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -463,8 +431,7 @@ pub(crate) struct App {
     pub(crate) attached_status: Option<SessionStatus>,
     pub(crate) attached_tool_groups: Vec<String>,
     pub(crate) page: Page,
-    pub(crate) previous_page: Page,
-    pub(crate) home_selection: usize,
+    pub(crate) show_ctrl_help: bool,
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
     pub(crate) scroll_accumulator: isize,
@@ -952,7 +919,11 @@ impl InputBuffer {
                 self.delete_to_start();
                 true
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 self.insert_char_at_cursor(c);
                 true
             }
@@ -1308,8 +1279,7 @@ impl App {
             attached_status: None,
             attached_tool_groups: Vec::new(),
             page: Page::Chat,
-            previous_page: Page::Chat,
-            home_selection: 0,
+            show_ctrl_help: true,
             session_mgr: SessionManagerState::new(),
             ai_providers: AIProvidersState::new(),
             scroll_accumulator: 0,
@@ -2093,6 +2063,7 @@ impl App {
             self.attached_status = Some(s.status.clone());
         }
         self.refresh_attached_provider_slug();
+        self.show_ctrl_help = true;
         self.progress_dirty = true;
     }
 
@@ -3084,7 +3055,6 @@ mod tests {
     fn status_error_height_empty_after_clearing() {
         let mut app = test_app("/tmp/tai.sock");
         app.error = Some("error".into());
-        // Clear it
         app.error = None;
         assert_eq!(app.status_error_height(80), 0);
     }

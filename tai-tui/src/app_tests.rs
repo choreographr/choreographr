@@ -151,7 +151,7 @@ fn terminal_event_submits_run_input() {
 }
 
 #[test]
-fn terminal_event_esc_opens_home() {
+fn terminal_event_esc_noop_on_chat() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     let mut app = test_app("/tmp/tai.sock");
@@ -162,12 +162,12 @@ fn terminal_event_esc_opens_home() {
     )
     .expect("handle esc");
 
-    assert_eq!(app.page, Page::Home);
-    assert_eq!(app.previous_page, Page::Chat);
+    assert_eq!(app.page, Page::Chat);
+    assert!(!app.should_quit);
 }
 
 #[test]
-fn terminal_event_ctrl_c_opens_settings() {
+fn terminal_event_ctrl_c_noop_on_chat() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app("/tmp/tai.sock");
 
@@ -178,7 +178,269 @@ fn terminal_event_ctrl_c_opens_settings() {
     )
     .expect("handle ctrl+c");
 
-    assert_eq!(app.page, Page::Settings);
+    assert_eq!(app.page, Page::Chat);
+    assert!(!app.should_quit);
+    assert!(
+        app.input.text.is_empty(),
+        "Ctrl+C should not insert literal 'c'"
+    );
+    assert_eq!(app.input.cursor, 0, "cursor should remain at 0");
+}
+
+#[test]
+fn global_ctrl_q_quits_from_chat() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+q");
+
+    assert!(app.should_quit);
+}
+
+#[test]
+fn global_ctrl_q_quits_from_session_manager() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+    app.page = Page::SessionManager;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+q from session manager");
+
+    assert!(app.should_quit);
+}
+
+#[test]
+fn global_ctrl_q_quits_from_ai_providers() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+    app.page = Page::AIProviders;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+q from ai providers");
+
+    assert!(app.should_quit);
+}
+
+#[test]
+fn ctrl_p_does_not_insert_char_on_chat() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+    app.input.text = "hello".to_string();
+    app.input.cursor = 5;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+p");
+
+    assert_eq!(app.input.text, "hello", "Ctrl+P should not insert 'p'");
+    assert_eq!(app.input.cursor, 5);
+    assert!(!app.should_quit);
+}
+
+#[test]
+fn alt_x_does_not_insert_char_on_chat() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+    app.input.text = "hello".to_string();
+    app.input.cursor = 5;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle alt+x");
+
+    assert_eq!(app.input.text, "hello", "Alt+X should not insert 'x'");
+    assert_eq!(app.input.cursor, 5);
+    assert!(!app.should_quit);
+}
+
+#[test]
+fn chat_ctrl_h_toggles_help() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+    app.show_ctrl_help = false;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+h");
+
+    assert!(app.show_ctrl_help, "first press should enable help");
+}
+
+#[test]
+fn chat_ctrl_h_double_toggle_returns_to_off() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+    app.show_ctrl_help = false;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+h (first)");
+    assert!(app.show_ctrl_help, "first press should enable help");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+h (second)");
+    assert!(!app.show_ctrl_help, "second press should disable help");
+}
+
+#[test]
+fn chat_ctrl_a_enters_ai_providers() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+a");
+
+    assert_eq!(app.page, Page::AIProviders);
+    let msg = rx.recv().expect("sent message");
+    assert_eq!(msg, ClientMessage::ListAccounts);
+}
+
+#[test]
+fn chat_ctrl_up_sends_undo() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+up");
+
+    let msg = rx.recv().expect("sent message");
+    assert_eq!(msg, ClientMessage::Undo);
+}
+
+#[test]
+fn chat_ctrl_down_sends_redo() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+down");
+
+    let msg = rx.recv().expect("sent message");
+    assert_eq!(msg, ClientMessage::Redo);
+}
+
+#[test]
+fn chat_esc_stops_active_session() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+    app.attached_session_id = Some(42);
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle esc");
+
+    let msg = rx.recv().expect("sent message");
+    assert_eq!(msg, ClientMessage::Cancel { request_id: 0 });
+    assert!(app.status.is_none(), "no status message on success");
+}
+
+#[test]
+fn chat_esc_no_session_shows_status() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+    app.attached_session_id = None;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle esc");
+
+    assert_eq!(app.status.as_deref(), Some("no session attached"));
+}
+
+#[test]
+fn chat_alt_enter_continues_generation() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+    app.attached_session_id = Some(42);
+    let next_id = app.next_request_id;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle alt+enter");
+
+    let msg = rx.recv().expect("sent message");
+    assert_eq!(
+        msg,
+        ClientMessage::ContinueGeneration {
+            request_id: next_id
+        }
+    );
+    assert!(
+        app.active.contains(&next_id),
+        "request_id should be in active set"
+    );
+    assert_eq!(
+        app.next_request_id,
+        next_id.wrapping_add(1),
+        "next_request_id should be incremented"
+    );
+    assert!(app.status.is_none(), "no status message on success");
+}
+
+#[test]
+fn chat_alt_enter_no_session_shows_status() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app("/tmp/tai.sock");
+    app.attached_session_id = None;
+
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle alt+enter");
+
+    assert_eq!(app.status.as_deref(), Some("no session attached"));
 }
 
 // ── Cursor & editing tests ────────────────────────────────────
@@ -353,12 +615,12 @@ fn paste_event_noop_on_unhandled_page() {
     let mut app = test_app("/tmp/tai.sock");
     let (tx, _rx) = std::sync::mpsc::channel();
 
-    // Settings page has no paste handler — should be a no-op.
-    app.page = Page::Settings;
+    // SessionManager page has no paste handler — should be a no-op.
+    app.page = Page::SessionManager;
     app.input.text = "unchanged".to_string();
     app.input.cursor = 9;
     handle_terminal_event(Event::Paste("data".to_string()), &mut app, &tx)
-        .expect("handle paste on settings page");
+        .expect("handle paste on session manager page");
     assert_eq!(app.input.text, "unchanged");
     assert_eq!(app.input.cursor, 9);
 }
@@ -1314,6 +1576,10 @@ fn word_delete_within_whitespace_does_not_panic() {
 fn app_starts_in_chat_page() {
     let app = test_app("/tmp/tai.sock");
     assert_eq!(app.page, Page::Chat);
+    assert!(
+        app.show_ctrl_help,
+        "help overlay should be visible by default"
+    );
 }
 
 #[test]
@@ -1470,7 +1736,7 @@ mod session_manager_key_tests {
     }
 
     #[test]
-    fn session_manager_esc_returns_to_home() {
+    fn session_manager_esc_returns_to_chat() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
 
@@ -1481,12 +1747,11 @@ mod session_manager_key_tests {
         )
         .expect("handle esc");
 
-        assert_eq!(app.page, Page::Home);
-        assert_eq!(app.previous_page, Page::SessionManager);
+        assert_eq!(app.page, Page::Chat);
     }
 
     #[test]
-    fn session_manager_q_returns_to_home() {
+    fn session_manager_q_returns_to_chat() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
 
@@ -1497,8 +1762,7 @@ mod session_manager_key_tests {
         )
         .expect("handle q");
 
-        assert_eq!(app.page, Page::Home);
-        assert_eq!(app.previous_page, Page::SessionManager);
+        assert_eq!(app.page, Page::Chat);
     }
 
     #[test]
@@ -1538,7 +1802,7 @@ mod session_manager_key_tests {
     }
 
     #[test]
-    fn session_manager_ctrl_c_still_quits() {
+    fn session_manager_ctrl_c_does_nothing() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();
 
@@ -1549,7 +1813,8 @@ mod session_manager_key_tests {
         )
         .expect("handle ctrl+c");
 
-        assert!(app.should_quit);
+        assert!(!app.should_quit);
+        assert_eq!(app.page, Page::SessionManager);
     }
 
     #[test]
