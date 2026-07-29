@@ -161,9 +161,7 @@ fn run_grep_walk(
         let lines: Vec<String> = sink
             .results
             .iter()
-            .map(|(_, line_num, content)| {
-                format!("{}:{}:{}", file_name, line_num, content)
-            })
+            .map(|(_, line_num, content)| format!("{}:{}:{}", file_name, line_num, content))
             .collect();
         let output = if let Some(h) = hint {
             format!("{}\n{}", h, lines.join("\n"))
@@ -795,10 +793,7 @@ mod tests {
             max_results: None,
         };
         let result = tool.execute(args, None, None, None).unwrap();
-        assert!(
-            !result.is_empty(),
-            "expected results, got empty"
-        );
+        assert!(!result.is_empty(), "expected results, got empty");
         // Should not contain a hint about regex.
         assert!(
             !result.contains("regex"),

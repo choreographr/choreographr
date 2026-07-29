@@ -1690,8 +1690,7 @@ impl App {
         // true top of the history.  Without this, the viewport is 2 rows too
         // tall when help is shown, making the top 2 rows of history unreachable.
         let help_height: u16 = if self.show_ctrl_help { 2 } else { 0 };
-        let bottom_height =
-            self.input_bar_height(width)
+        let bottom_height = self.input_bar_height(width)
             + STATUS_BAR_HEIGHT
             + self.status_error_height(width)
             + help_height;

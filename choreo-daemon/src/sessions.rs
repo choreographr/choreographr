@@ -821,15 +821,13 @@ fn handle_run_input(
         },
     );
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
-    state
-        .active_requests
-        .insert(
-            request_id,
-            ActiveRequest {
-                cancel_tx,
-                turn_id: state.next_turn_id,
-            },
-        );
+    state.active_requests.insert(
+        request_id,
+        ActiveRequest {
+            cancel_tx,
+            turn_id: state.next_turn_id,
+        },
+    );
 
     // Workers don't need their own subscriber map — all broadcasts
     // are routed through SessionCommand::Broadcast to this main
@@ -889,15 +887,13 @@ fn handle_run_child_input(
         },
     );
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
-    state
-        .active_requests
-        .insert(
-            request_id,
-            ActiveRequest {
-                cancel_tx,
-                turn_id: state.next_turn_id,
-            },
-        );
+    state.active_requests.insert(
+        request_id,
+        ActiveRequest {
+            cancel_tx,
+            turn_id: state.next_turn_id,
+        },
+    );
     let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
     let ctx = ctx.clone();
     let provider = provider.clone();
@@ -1750,9 +1746,13 @@ mod tests {
     fn cancel_sends_through_channel() {
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
         let (mut state, ctx) = broadcast_setup();
-        state
-            .active_requests
-            .insert(1, ActiveRequest { cancel_tx, turn_id: 1 });
+        state.active_requests.insert(
+            1,
+            ActiveRequest {
+                cancel_tx,
+                turn_id: 1,
+            },
+        );
 
         let mut shutdown = false;
         process_command(

@@ -746,7 +746,10 @@ mod tests {
         // Content should be truncated with … not dropped entirely.
         let text: String = spans.iter().flat_map(|s| s.content.chars()).collect();
         assert_eq!(text.chars().count(), 5, "should be 5 chars wide");
-        assert!(text.ends_with('…'), "truncated content should end with ellipsis");
+        assert!(
+            text.ends_with('…'),
+            "truncated content should end with ellipsis"
+        );
     }
 
     #[test]
@@ -757,8 +760,7 @@ mod tests {
             Span::styled("        ".to_string(), Style::default().fg(Color::Blue)),
             Span::styled("\"".to_string(), Style::default().fg(Color::Green)),
             Span::styled(
-                "very long string content that exceeds the available width by a lot"
-                    .to_string(),
+                "very long string content that exceeds the available width by a lot".to_string(),
                 Style::default().fg(Color::Yellow),
             ),
             Span::styled("\"".to_string(), Style::default().fg(Color::Green)),
@@ -773,27 +775,35 @@ mod tests {
         // Remaining after 8 (indent) + 1 (quote) = 9 columns used; 11 remaining.
         // So the third span should occupy 11 columns and end with ….
         let third = &spans[2];
-        assert_eq!(third.width(), 11, "overflowing span should fill remaining width");
+        assert_eq!(
+            third.width(),
+            11,
+            "overflowing span should fill remaining width"
+        );
         assert!(
             third.content.ends_with('…'),
             "truncated span should end with …"
         );
         // There should be no fourth span — it's beyond the overflow cutoff.
-        assert_eq!(spans.len(), 3, "should have exactly 3 spans after truncation");
+        assert_eq!(
+            spans.len(),
+            3,
+            "should have exactly 3 spans after truncation"
+        );
     }
 
     #[test]
     fn spans_truncated_single_span_too_wide() {
         // Single span wider than the target — should be truncated, not dropped.
-        let mut spans = vec![Span::styled(
-            "aaabbbcccddd".to_string(),
-            Style::default(),
-        )];
+        let mut spans = vec![Span::styled("aaabbbcccddd".to_string(), Style::default())];
         spans_fixed_width(&mut spans, 6);
         assert_eq!(spans.iter().map(|s| s.width()).sum::<usize>(), 6);
         let text: String = spans.iter().flat_map(|s| s.content.chars()).collect();
         assert_eq!(text.chars().count(), 6, "should be 6 chars wide");
-        assert!(text.ends_with('…'), "truncated content should end with ellipsis");
+        assert!(
+            text.ends_with('…'),
+            "truncated content should end with ellipsis"
+        );
     }
 
     // ── is_meta_line ──

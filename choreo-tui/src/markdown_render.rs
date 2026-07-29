@@ -505,6 +505,16 @@ pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+/// Push a blank (zero-width) line onto `lines` unless the last line is
+/// already blank.  This gives us CSS-like margin collapsing: multiple
+/// adjacent blocks that each want vertical space produce at most one
+/// blank line between them.
+fn ensure_blank_line(lines: &mut Vec<Line<'static>>) {
+    if lines.last().is_none_or(|l| l.width() > 0) {
+        lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    }
+}
+
 fn render_markdown_blocks(
     blocks: &[MarkdownBlock],
     lines: &mut Vec<Line<'static>>,
@@ -513,7 +523,7 @@ fn render_markdown_blocks(
 ) {
     for (index, block) in blocks.iter().enumerate() {
         if index > 0 {
-            lines.push(Line::from(Span::styled(String::new(), Style::default())));
+            ensure_blank_line(lines);
         }
         render_markdown_block(block, lines, indent, width);
     }
@@ -526,12 +536,27 @@ fn render_markdown_block(
     width: usize,
 ) {
     match block {
-        MarkdownBlock::Paragraph(content) => {
-            lines.extend(inlines_to_lines(content, indent, None, width))
-        }
+        MarkdownBlock::Paragraph(content) => lines.extend(inlines_to_lines(
+            content,
+            indent,
+            None,
+            width,
+            Modifier::empty(),
+        )),
         MarkdownBlock::Heading { level, content } => {
+            // Two blank lines before every heading for visual separation.
+            // render_markdown_blocks already supplies one via ensure_blank_line;
+            // the unconditional push here adds the second.
+            lines.push(Line::from(Span::styled(String::new(), Style::default())));
             let prefix = Some(format!("{} ", "#".repeat(*level as usize)));
-            lines.extend(inlines_to_lines(content, indent, prefix, width));
+            // Headings are rendered bold + underlined for visual distinction.
+            lines.extend(inlines_to_lines(
+                content,
+                indent,
+                prefix,
+                width,
+                Modifier::BOLD | Modifier::UNDERLINED,
+            ));
         }
         MarkdownBlock::CodeBlock { language, code } => {
             let header = language
@@ -540,9 +565,33 @@ fn render_markdown_block(
                 .unwrap_or_else(|| "```".to_string());
             lines.push(indented_line(indent, header));
 
+            let max_code_width = width.saturating_sub(indent);
             let highlighted = highlight_code(language.as_deref(), code);
             for hl_line in highlighted {
-                if indent > 0 {
+                // Wrap code block lines that exceed the available width so
+                // they don't overflow the terminal.  Uses word-wrap via
+                // wrap_styled_line which falls back to grapheme-cluster
+                // splitting for words that don't fit.
+                if hl_line.width() > max_code_width {
+                    let mut wrapped: Vec<Line<'static>> = Vec::new();
+                    wrap_styled_line(&hl_line, max_code_width, &mut wrapped);
+                    for wl in wrapped {
+                        // Strip trailing space spans so they don't get rendered
+                        // with shading as an extra column outside the code box.
+                        let mut spans = wl.spans;
+                        while spans.last().is_some_and(|s| s.content.trim().is_empty()) {
+                            spans.pop();
+                        }
+                        if indent > 0 {
+                            let mut with_indent =
+                                vec![Span::styled(" ".repeat(indent), Style::default())];
+                            with_indent.extend(spans);
+                            lines.push(Line::from(with_indent));
+                        } else {
+                            lines.push(Line::from(spans));
+                        }
+                    }
+                } else if indent > 0 {
                     let mut spans = vec![Span::styled(" ".repeat(indent), Style::default())];
                     spans.extend(hl_line.spans.clone());
                     lines.push(Line::from(spans));
@@ -605,6 +654,14 @@ fn render_markdown_block(
                     )];
                     spans.extend(line.spans);
                     lines.push(Line::from(spans));
+                }
+
+                // Blank line between sibling items for visual separation.
+                // Uses ensure_blank_line so consecutive blanks collapse into
+                // one (e.g. when the preceding item ends with a nested list
+                // that already produced a blank line).
+                if index + 1 < items.len() {
+                    ensure_blank_line(lines);
                 }
             }
         }
@@ -973,6 +1030,7 @@ fn inlines_to_lines(
     indent: usize,
     prefix: Option<String>,
     width: usize,
+    modifier: Modifier,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
@@ -993,7 +1051,7 @@ fn inlines_to_lines(
         needs_separator: &mut needs_separator,
         indent,
         width,
-        modifier: Modifier::empty(),
+        modifier,
     };
     render_inlines_to_lines(inlines, &mut ctx);
     if !current_spans.is_empty() || lines.is_empty() {
@@ -1136,7 +1194,28 @@ fn render_inlines_to_lines(inlines: &[MarkdownInline], ctx: &mut RenderCtx) {
     }
 }
 
+/// Returns `true` if `text` starts with closing punctuation that should
+/// directly follow the preceding word without a space (e.g. "." in "**bold**!").
+/// Opening quotes, brackets, and alphanumeric/text keep the space.
+fn starts_with_closing_punct(text: &str) -> bool {
+    text.chars().next().is_some_and(|c| {
+        matches!(
+            c,
+            '.' | ',' | '!' | '?' | ':' | ';' | ')' | ']' | '}' | '\u{2019}' | '\u{201d}'
+        )
+    })
+}
+
 fn render_text_inline(text: &str, ctx: &mut RenderCtx) {
+    // If the original text does NOT start with whitespace (e.g. "**bold**!"
+    // where "!" directly follows the bold), check whether it starts with
+    // trailing/closing punctuation that should attach to the preceding word.
+    // Opening quotes and brackets should still get a space before them.
+    let has_leading_space = text.starts_with(' ') || text.starts_with('\t');
+    if !has_leading_space && starts_with_closing_punct(text) {
+        *ctx.needs_separator = false;
+    }
+
     let trimmed = text.trim_start();
     let ends_with_space = text.ends_with(' ') || text.ends_with('\t');
     let words: Vec<&str> = if trimmed.is_empty() {
@@ -2273,5 +2352,414 @@ mod tests {
         // The URL should appear somewhere.
         let whole: String = result.iter().map(|l| l.to_string()).collect();
         assert!(whole.contains("http://example.com"), "URL should appear");
+    }
+
+    // ── starts_with_closing_punct ────────────────────────────────────────
+
+    #[test]
+    fn starts_with_closing_punct_period() {
+        assert!(starts_with_closing_punct("."));
+        assert!(starts_with_closing_punct("..."));
+        assert!(starts_with_closing_punct(".not"));
+    }
+
+    #[test]
+    fn starts_with_closing_punct_comma() {
+        assert!(starts_with_closing_punct(","));
+        assert!(starts_with_closing_punct(", "));
+    }
+
+    #[test]
+    fn starts_with_closing_punct_exclamation() {
+        assert!(starts_with_closing_punct("!"));
+        assert!(starts_with_closing_punct("!important"));
+    }
+
+    #[test]
+    fn starts_with_closing_punct_question() {
+        assert!(starts_with_closing_punct("?"));
+        assert!(starts_with_closing_punct("? "));
+    }
+
+    #[test]
+    fn starts_with_closing_punct_colon_semicolon() {
+        assert!(starts_with_closing_punct(":"));
+        assert!(starts_with_closing_punct(";"));
+    }
+
+    #[test]
+    fn starts_with_closing_punct_brackets() {
+        assert!(starts_with_closing_punct(")"));
+        assert!(starts_with_closing_punct("]"));
+        assert!(starts_with_closing_punct("}"));
+    }
+
+    #[test]
+    fn starts_with_closing_punct_unicode_quotes() {
+        assert!(starts_with_closing_punct("\u{2019}")); // right single quote
+        assert!(starts_with_closing_punct("\u{201d}")); // right double quote
+    }
+
+    #[test]
+    fn starts_with_closing_punct_non_closing_chars() {
+        assert!(!starts_with_closing_punct("hello"));
+        assert!(!starts_with_closing_punct(""));
+        assert!(!starts_with_closing_punct("("));
+        assert!(!starts_with_closing_punct("["));
+        assert!(!starts_with_closing_punct("{"));
+        assert!(!starts_with_closing_punct("\u{2018}")); // left single quote
+        assert!(!starts_with_closing_punct("\u{201c}")); // left double quote
+    }
+
+    // ── punctuation attachment (closing punct after styled text) ──────────
+
+    #[test]
+    fn bold_with_exclamation_no_extra_space() {
+        // "**bold**!" should render as "bold!", not "bold !"
+        let result = markdown_lines("hello **bold**!", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("bold!"),
+            "expected 'bold!' without space, got: {whole:?}"
+        );
+        assert!(
+            !whole.contains("bold !"),
+            "should not have space before '!'"
+        );
+        assert!(
+            !whole.contains("**bold**"),
+            "markdown syntax should not appear"
+        );
+    }
+
+    #[test]
+    fn italic_with_period_no_extra_space() {
+        let result = markdown_lines("I said *italic*.", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("italic."),
+            "expected 'italic.' without space, got: {whole:?}"
+        );
+        assert!(
+            !whole.contains("italic ."),
+            "should not have space before '.'"
+        );
+    }
+
+    #[test]
+    fn strong_and_link_with_comma_no_extra_space() {
+        let result = markdown_lines("see **bold**, and [link](http://x.com).", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(whole.contains("bold,"), "expected 'bold,' without space");
+        assert!(
+            whole.contains("link - http://x.com."),
+            "link content and trailing period"
+        );
+        assert!(
+            !whole.contains("bold ,"),
+            "should not have space before ','"
+        );
+    }
+
+    #[test]
+    fn closing_punct_after_strikethrough() {
+        let result = markdown_lines("done ~~strike~~!", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("strike!"),
+            "expected 'strike!' without space"
+        );
+        assert!(
+            !whole.contains("strike !"),
+            "should not have space before '!'"
+        );
+    }
+
+    #[test]
+    fn opening_bracket_keeps_space() {
+        // Opening brackets should still get a space before them
+        let result = markdown_lines("word (paren)", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("word ("),
+            "expected space before opening paren"
+        );
+    }
+
+    // ── heading modifiers ────────────────────────────────────────────────
+
+    #[test]
+    fn heading_has_bold_and_underlined_modifier() {
+        let result = markdown_lines("# heading text", 80);
+        let has_modifiers = result.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.style.add_modifier.contains(Modifier::BOLD)
+                && s.style.add_modifier.contains(Modifier::UNDERLINED)
+        });
+        assert!(
+            has_modifiers,
+            "heading spans should have BOLD | UNDERLINED modifiers"
+        );
+    }
+
+    #[test]
+    fn heading_content_not_literal() {
+        let result = markdown_lines("# **bold** heading", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            !whole.contains("**bold**"),
+            "markdown syntax should not appear"
+        );
+        assert!(whole.contains("bold"), "bold content should appear");
+    }
+
+    #[test]
+    fn heading_has_two_blank_lines_before() {
+        // Two blank lines should precede a heading when preceded by content.
+        let result = markdown_lines("some text\n# heading\nmore text", 80);
+        // Walk through lines and find the heading line.
+        let heading_idx = result
+            .iter()
+            .position(|l| l.to_string().contains("heading"));
+        assert!(heading_idx.is_some(), "heading text should appear");
+        let idx = heading_idx.unwrap();
+        // Verify two blank lines precede it.
+        assert!(
+            idx >= 2 && result[idx - 1].width() == 0 && result[idx - 2].width() == 0,
+            "expected two blank lines before heading, got lines around index {idx}: \
+             lines[{}]='{}' lines[{}]='{}' lines[{}]='{}'",
+            idx.saturating_sub(2),
+            result
+                .get(idx - 2)
+                .map(|l| format!("{l}"))
+                .unwrap_or_default(),
+            idx - 1,
+            result[idx - 1],
+            idx,
+            result[idx]
+        );
+    }
+
+    #[test]
+    fn first_heading_no_extra_blank_on_top() {
+        // A heading at the very start of the document should not have two
+        // blank lines above it (there's no content before it).
+        let result = markdown_lines("# first heading", 80);
+        let heading_idx = result.iter().position(|l| l.to_string().contains("first"));
+        assert!(heading_idx.is_some(), "heading should appear");
+        // The heading should be the first non-empty line, or at line 0.
+        // There shouldn't be two blank lines before it.
+        let idx = heading_idx.unwrap();
+        assert!(
+            idx < 2,
+            "first heading should not have two blank lines above, got {idx} lines before it"
+        );
+    }
+
+    // ── ensure_blank_line ──────────────────────────────────────────────────
+
+    #[test]
+    fn ensure_blank_line_empty() {
+        let mut lines = vec![];
+        ensure_blank_line(&mut lines);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].width(), 0);
+    }
+
+    #[test]
+    fn ensure_blank_line_after_nonblank() {
+        let mut lines = vec![Line::from("hello")];
+        ensure_blank_line(&mut lines);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].width(), 0);
+    }
+
+    #[test]
+    fn ensure_blank_line_collapses() {
+        let mut lines = vec![
+            Line::from("hello"),
+            Line::from(Span::styled(String::new(), Style::default())),
+        ];
+        ensure_blank_line(&mut lines);
+        assert_eq!(lines.len(), 2, "should not add another blank line");
+    }
+
+    #[test]
+    fn ensure_blank_line_twice_collapses() {
+        let mut lines = vec![Line::from("hello")];
+        ensure_blank_line(&mut lines); // adds blank
+        ensure_blank_line(&mut lines); // should collapse
+        assert_eq!(lines.len(), 2);
+    }
+
+    // ── list blank-line collapsing ────────────────────────────────────────
+
+    #[test]
+    fn list_items_separated_by_blank_lines() {
+        let result = markdown_lines("- alpha\n- beta\n- gamma", 80);
+        let whole: String = result
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(whole.contains("• alpha"), "first item should render");
+        assert!(whole.contains("• beta"), "second item should render");
+        assert!(whole.contains("• gamma"), "third item should render");
+        // Each pair of items should have exactly one blank line between them.
+        let blank_lines: Vec<bool> = result
+            .windows(2)
+            .map(|w| w[0].width() == 0 && w[1].width() > 0)
+            .collect();
+        assert_eq!(
+            blank_lines.iter().filter(|&&b| b).count(),
+            2,
+            "should have blank lines between 3 items"
+        );
+    }
+
+    #[test]
+    fn nested_list_does_not_produce_double_blank_line() {
+        // Item 1 has a nested list (which ends with a blank line)
+        // Item 2 follows — should not have two blank lines between them.
+        let md = "- outer\n  - inner\n  - inner2\n- next";
+        let result = markdown_lines(md, 80);
+        let whole: String = result
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(whole.contains("• outer"), "first outer item");
+        assert!(whole.contains("• inner"), "first inner item");
+        assert!(whole.contains("• next"), "second outer item");
+        // Count consecutive blank lines — there shouldn't be any pairs of
+        // consecutive blank lines.
+        let has_double_blank = result
+            .windows(2)
+            .any(|w| w[0].width() == 0 && w[1].width() == 0);
+        assert!(
+            !has_double_blank,
+            "should not have two consecutive blank lines\n{whole}"
+        );
+    }
+
+    #[test]
+    fn ordered_list_items_separated() {
+        let result = markdown_lines("1. first\n2. second\n3. third", 80);
+        let blank: Vec<bool> = result
+            .windows(2)
+            .map(|w| w[0].width() == 0 && w[1].width() > 0)
+            .collect();
+        assert_eq!(
+            blank.iter().filter(|&&b| b).count(),
+            2,
+            "should have blank lines between ordered items"
+        );
+    }
+
+    #[test]
+    fn mixed_list_and_paragraph_separated_by_one_blank() {
+        let md = "paragraph\n- list";
+        let result = markdown_lines(md, 80);
+        let blank: Vec<bool> = result
+            .windows(2)
+            .map(|w| w[0].width() == 0 && w[1].width() > 0)
+            .collect();
+        assert_eq!(
+            blank.iter().filter(|&&b| b).count(),
+            1,
+            "one blank line between para and list"
+        );
+    }
+
+    // ── code block wrapping ───────────────────────────────────────────────
+
+    #[test]
+    fn code_block_wraps_long_line() {
+        let long = "x".repeat(200);
+        let md = format!("```rust\n{long}\n```");
+        let result = markdown_lines(&md, 40);
+        // The code content should be wrapped. Each wrapped segment should be
+        // at most 40 columns wide.
+        for line in &result {
+            let text = line.to_string();
+            // Skip fence lines
+            if text.starts_with("```") {
+                continue;
+            }
+            assert!(
+                line.width() <= 40,
+                "wrapped code line width {} exceeds 40: {text:?}",
+                line.width()
+            );
+        }
+        // Count non-fence lines to verify wrapping actually happened.
+        let content_line_count = result
+            .iter()
+            .filter(|l| !l.to_string().starts_with("```"))
+            .count();
+        assert!(
+            content_line_count > 3,
+            "long code line should wrap into {content_line_count} lines, expected > 3"
+        );
+    }
+
+    #[test]
+    fn code_block_wrap_trailing_whitespace_stripped() {
+        // A line that *exactly* fills the width produces a trailing space
+        // span from the word-wrapper; the code-block renderer should strip it.
+        let md = format!("```\n{}\n```", "a".repeat(30));
+        let result = markdown_lines(&md, 30);
+        // The code line should not end with a visible trailing whitespace span.
+        // Every span's content should be non-empty or absent.
+        for line in &result {
+            let text = line.to_string();
+            if text.starts_with("```") {
+                continue;
+            }
+            // The string representation of ratatui trims trailing whitespace
+            // but the spans are what matter.  Verify no span is pure whitespace.
+            for span in &line.spans {
+                let trimmed = span.content.trim();
+                if trimmed.is_empty() {
+                    // Allow empty spans only at width 0 (blank lines)
+                    assert_eq!(
+                        span.width(),
+                        0,
+                        "non-empty whitespace-only span should not exist"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn code_block_no_wrap_when_fits() {
+        let md = "```\nshort\n```";
+        let result = markdown_lines(md, 80);
+        assert!(!result.is_empty());
+        let code_line = result.get(1).expect("second line should be code");
+        assert_eq!(
+            code_line.to_string(),
+            "short",
+            "code should not wrap when short"
+        );
+    }
+
+    #[test]
+    fn code_block_indented_wrapping() {
+        let long = "x".repeat(100);
+        let md = format!("> ```\n> {long}\n> ```");
+        let result = markdown_lines(&md, 40);
+        // Each code content line in the blockquote should be ≤ 40 (indent 2 + " > " prefix).
+        for line in &result {
+            let text = line.to_string();
+            if text.starts_with(" ```") || text.starts_with("> ```") || text.starts_with(">  ```") {
+                continue;
+            }
+            assert!(
+                line.width() <= 40,
+                "indented code line width {} exceeds 40: {text:?}",
+                line.width()
+            );
+        }
     }
 }
