@@ -90,6 +90,7 @@ fn spawn_subsession_happy_path() {
         selected_model: None,
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
+        account_name: None,
     };
 
     // ── Execute the tool ─────────────────────────────────────────────
@@ -148,6 +149,7 @@ fn spawn_subsession_daemon_rejects_creation() {
         selected_model: None,
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
+        account_name: None,
     };
 
     let result = SpawnSubsession.execute(
@@ -194,6 +196,7 @@ fn spawn_subsession_daemon_disconnected() {
         selected_model: None,
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
+        account_name: None,
     };
 
     let result = SpawnSubsession.execute(
@@ -301,6 +304,7 @@ fn spawn_subsession_inherits_categories() {
         selected_model: None,
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
+        account_name: None,
     };
 
     let result = SpawnSubsession.execute(
@@ -369,6 +373,7 @@ fn spawn_subsession_overrides_categories() {
         selected_model: None,
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
+        account_name: None,
     };
 
     let result = SpawnSubsession.execute(
@@ -437,6 +442,7 @@ fn spawn_subsession_inherits_selected_model() {
         selected_model: Some("gpt-4o".into()),
         working_dir: None,
         cancelled: Arc::new(AtomicBool::new(false)),
+        account_name: None,
     };
 
     let result = SpawnSubsession.execute(

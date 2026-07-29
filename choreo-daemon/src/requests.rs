@@ -919,6 +919,7 @@ pub(crate) fn run_agent_loop(
                         selected_model: session.config.selected_model.clone(),
                         working_dir: session.config.working_dir.clone(),
                         cancelled: Arc::clone(&cancel_flag),
+                        account_name: session.config.account_name.clone(),
                     };
 
                     let cmd_tx = ctx.cmd_tx.clone();
@@ -1329,6 +1330,7 @@ fn execute_tool_with_timeout(
         selected_model: session.config.selected_model.clone(),
         working_dir: working_dir.map(|p| p.to_path_buf()),
         cancelled: Arc::new(AtomicBool::new(false)),
+        account_name: session.config.account_name.clone(),
     };
     std::thread::spawn(move || {
         let result = tr.execute_streaming_json(
@@ -2120,6 +2122,7 @@ mod tests {
             selected_model: None,
             working_dir: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            account_name: None,
         };
 
         let invocation_description = registry

@@ -99,7 +99,7 @@ impl Tool for SpawnSubsession {
                 reasoning_effort: ctx.reasoning_effort.clone(),
                 selected_model: ctx.selected_model.clone(),
                 context_config: None,
-                account_name: None,
+                account_name: ctx.account_name.clone(),
                 active_tool_groups: categories,
                 reply: reply_tx,
             })

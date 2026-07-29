@@ -31,12 +31,15 @@ pub struct ToolContext {
     /// Tools that block indefinitely (e.g. `spawn_subsession`) should poll this
     /// and abort when it becomes `true`.
     pub cancelled: Arc<AtomicBool>,
+    /// Account name used by the parent session (inherited by sub-sessions so
+    /// they can resolve the provider for model inference).
+    pub account_name: Option<String>,
 }
 
 impl ToolContext {
     /// Convenience constructor for tests and simple usage where only the
     /// session ID, database, and daemon channel are needed.
-    /// New config fields (`active_tool_groups`, `reasoning_effort`, `selected_model`, `working_dir`)
+    /// New config fields (`active_tool_groups`, `reasoning_effort`, `selected_model`, `working_dir`, `account_name`)
     /// default to empty/None.
     pub fn new(
         session_id: u64,
@@ -52,6 +55,7 @@ impl ToolContext {
             selected_model: None,
             working_dir: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            account_name: None,
         }
     }
 }
