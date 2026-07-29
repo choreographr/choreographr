@@ -183,7 +183,7 @@ impl Tool for Grep {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents for a pattern. Pattern is treated as a literal substring by default — set regex:true to use regular expressions. Use include to filter files by glob (e.g. \"*.rs\"), path to scope the search directory, and max_results to cap matches. Results in file:line:content format. Respects .gitignore, hidden, and binary files."
+        "Search file contents for a pattern. Pattern is treated as a literal substring by default — set regex:true to use regular expressions (be sure to set regex:true if your pattern contains regex metacharacters like |, (, ), ^, $, +, etc. — without it they are matched literally). Use include to filter files by glob (e.g. \"*.rs\"), path to scope the search directory, and max_results to cap matches. Results in file:line:content format. Respects .gitignore, hidden, and binary files."
     }
 
     fn supports_streaming_output() -> bool {
@@ -194,6 +194,14 @@ impl Tool for Grep {
         let mut parts = vec![format!("Searching for `{}`.", args.pattern)];
         if args.regex {
             parts.push(" Using regex.".to_string());
+        } else if args.pattern.contains('|')
+            || args.pattern.contains('(')
+            || args.pattern.contains(')')
+        {
+            parts.push(
+                " Warning: pattern looks like a regex (e.g. contains |, (, )) but regex:false (default). Pass regex:true to treat metacharacters as regex."
+                    .to_string(),
+            );
         }
         if let Some(ref incl) = args.include {
             parts.push(format!(" Include pattern: `{}`.", incl));
