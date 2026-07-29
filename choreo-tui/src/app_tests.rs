@@ -104,7 +104,7 @@ fn oversized_history_item_keeps_visible_tail() {
 
 #[test]
 fn terminal_event_appends_characters() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
 
     handle_terminal_event(
@@ -127,7 +127,7 @@ fn terminal_event_appends_characters() {
 
 #[test]
 fn terminal_event_submits_run_input() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -154,7 +154,7 @@ fn terminal_event_submits_run_input() {
 fn terminal_event_esc_noop_on_chat() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         &mut app,
@@ -169,7 +169,7 @@ fn terminal_event_esc_noop_on_chat() {
 #[test]
 fn terminal_event_ctrl_c_noop_on_chat() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
@@ -190,7 +190,7 @@ fn terminal_event_ctrl_c_noop_on_chat() {
 #[test]
 fn global_ctrl_q_quits_from_chat() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
@@ -205,7 +205,7 @@ fn global_ctrl_q_quits_from_chat() {
 #[test]
 fn global_ctrl_q_quits_from_session_manager() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.page = Page::SessionManager;
 
     handle_terminal_event(
@@ -221,7 +221,7 @@ fn global_ctrl_q_quits_from_session_manager() {
 #[test]
 fn global_ctrl_q_quits_from_ai_providers() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.page = Page::AIProviders;
 
     handle_terminal_event(
@@ -237,7 +237,7 @@ fn global_ctrl_q_quits_from_ai_providers() {
 #[test]
 fn ctrl_p_does_not_insert_char_on_chat() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
 
@@ -256,7 +256,7 @@ fn ctrl_p_does_not_insert_char_on_chat() {
 #[test]
 fn alt_x_does_not_insert_char_on_chat() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
 
@@ -275,7 +275,7 @@ fn alt_x_does_not_insert_char_on_chat() {
 #[test]
 fn chat_ctrl_h_toggles_help() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.show_ctrl_help = false;
 
     handle_terminal_event(
@@ -291,7 +291,7 @@ fn chat_ctrl_h_toggles_help() {
 #[test]
 fn chat_ctrl_h_double_toggle_returns_to_off() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.show_ctrl_help = false;
 
     handle_terminal_event(
@@ -314,7 +314,7 @@ fn chat_ctrl_h_double_toggle_returns_to_off() {
 #[test]
 fn chat_ctrl_a_enters_ai_providers() {
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
@@ -331,7 +331,7 @@ fn chat_ctrl_a_enters_ai_providers() {
 #[test]
 fn chat_ctrl_up_sends_undo() {
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
@@ -347,7 +347,7 @@ fn chat_ctrl_up_sends_undo() {
 #[test]
 fn chat_ctrl_down_sends_redo() {
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL)),
@@ -363,7 +363,7 @@ fn chat_ctrl_down_sends_redo() {
 #[test]
 fn chat_esc_stops_active_session() {
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.attached_session_id = Some(42);
 
     handle_terminal_event(
@@ -381,7 +381,7 @@ fn chat_esc_stops_active_session() {
 #[test]
 fn chat_esc_no_session_shows_status() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.attached_session_id = None;
 
     handle_terminal_event(
@@ -397,7 +397,7 @@ fn chat_esc_no_session_shows_status() {
 #[test]
 fn chat_alt_enter_continues_generation() {
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.attached_session_id = Some(42);
     let next_id = app.next_request_id;
 
@@ -430,7 +430,7 @@ fn chat_alt_enter_continues_generation() {
 #[test]
 fn chat_alt_enter_no_session_shows_status() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.attached_session_id = None;
 
     handle_terminal_event(
@@ -447,7 +447,7 @@ fn chat_alt_enter_no_session_shows_status() {
 
 #[test]
 fn insert_char_at_cursor_appends_when_at_end() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.insert_char_at_cursor('a');
     app.input.insert_char_at_cursor('b');
     app.input.insert_char_at_cursor('c');
@@ -457,7 +457,7 @@ fn insert_char_at_cursor_appends_when_at_end() {
 
 #[test]
 fn insert_char_at_cursor_inserts_in_middle() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abde".to_string();
     app.input.cursor = 2;
     app.input.insert_char_at_cursor('c');
@@ -467,7 +467,7 @@ fn insert_char_at_cursor_inserts_in_middle() {
 
 #[test]
 fn insert_char_at_cursor_works_at_start() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "bc".to_string();
     app.input.cursor = 0;
     app.input.insert_char_at_cursor('a');
@@ -477,7 +477,7 @@ fn insert_char_at_cursor_works_at_start() {
 
 #[test]
 fn insert_str_at_cursor_appends_at_end() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "ab".to_string();
     app.input.cursor = 2;
     app.input.insert_str_at_cursor("cd");
@@ -487,7 +487,7 @@ fn insert_str_at_cursor_appends_at_end() {
 
 #[test]
 fn insert_str_at_cursor_inserts_in_middle() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abcd".to_string();
     app.input.cursor = 2;
     app.input.insert_str_at_cursor("XY");
@@ -497,7 +497,7 @@ fn insert_str_at_cursor_inserts_in_middle() {
 
 #[test]
 fn insert_str_at_cursor_works_at_start() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "bc".to_string();
     app.input.cursor = 0;
     app.input.insert_str_at_cursor("a");
@@ -507,7 +507,7 @@ fn insert_str_at_cursor_works_at_start() {
 
 #[test]
 fn insert_str_at_cursor_handles_newlines() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "ab".to_string();
     app.input.cursor = 1;
     app.input.insert_str_at_cursor("\ncd");
@@ -517,7 +517,7 @@ fn insert_str_at_cursor_handles_newlines() {
 
 #[test]
 fn insert_str_at_cursor_empty_string_no_op() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "ab".to_string();
     app.input.cursor = 1;
     app.input.insert_str_at_cursor("");
@@ -529,7 +529,7 @@ fn insert_str_at_cursor_empty_string_no_op() {
 
 #[test]
 fn paste_event_inserts_into_chat_input() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.input.text = "hel".to_string();
@@ -542,7 +542,7 @@ fn paste_event_inserts_into_chat_input() {
 
 #[test]
 fn paste_event_inserts_into_chat_input_at_cursor() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.input.text = "heorld".to_string();
@@ -554,7 +554,7 @@ fn paste_event_inserts_into_chat_input_at_cursor() {
 
 #[test]
 fn paste_event_ignored_during_fullscreen_overlay() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.input.text = "original".to_string();
@@ -569,7 +569,7 @@ fn paste_event_ignored_during_fullscreen_overlay() {
 
 #[test]
 fn paste_event_inserts_into_credential_input() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.page = Page::AIProviders;
@@ -582,7 +582,7 @@ fn paste_event_inserts_into_credential_input() {
 
 #[test]
 fn paste_event_inserts_into_new_form_name_field() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.page = Page::AIProviders;
@@ -596,7 +596,7 @@ fn paste_event_inserts_into_new_form_name_field() {
 
 #[test]
 fn paste_event_inserts_into_new_form_api_key_field() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.page = Page::AIProviders;
@@ -612,7 +612,7 @@ fn paste_event_inserts_into_new_form_api_key_field() {
 
 #[test]
 fn paste_event_noop_on_unhandled_page() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     // SessionManager page has no paste handler — should be a no-op.
@@ -627,7 +627,7 @@ fn paste_event_noop_on_unhandled_page() {
 
 #[test]
 fn cursor_left_moves_back_by_one_grapheme() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abcd".to_string();
     app.input.cursor = 4;
     app.input.cursor_left();
@@ -638,7 +638,7 @@ fn cursor_left_moves_back_by_one_grapheme() {
 
 #[test]
 fn cursor_left_stops_at_start() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "a".to_string();
     app.input.cursor = 1;
     app.input.cursor_left();
@@ -649,7 +649,7 @@ fn cursor_left_stops_at_start() {
 
 #[test]
 fn cursor_left_is_grapheme_aware() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "a😀b".to_string();
     app.input.cursor = 6;
     app.input.cursor_left();
@@ -662,7 +662,7 @@ fn cursor_left_is_grapheme_aware() {
 
 #[test]
 fn cursor_right_moves_forward_by_one_grapheme() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abcd".to_string();
     app.input.cursor = 0;
     app.input.cursor_right();
@@ -673,7 +673,7 @@ fn cursor_right_moves_forward_by_one_grapheme() {
 
 #[test]
 fn cursor_right_stops_at_end() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "a".to_string();
     app.input.cursor = 0;
     app.input.cursor_right();
@@ -684,7 +684,7 @@ fn cursor_right_stops_at_end() {
 
 #[test]
 fn cursor_right_is_grapheme_aware() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "a😀b".to_string();
     app.input.cursor = 0;
     app.input.cursor_right();
@@ -695,7 +695,7 @@ fn cursor_right_is_grapheme_aware() {
 
 #[test]
 fn cursor_home_moves_to_start() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     app.input.cursor_home();
@@ -704,7 +704,7 @@ fn cursor_home_moves_to_start() {
 
 #[test]
 fn cursor_end_moves_to_end() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 0;
     app.input.cursor_end();
@@ -990,7 +990,7 @@ fn cursor_down_from_wrapped_line() {
 
 #[test]
 fn navigate_history_up_down_with_multi_line() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     // Insert a turn with user_text so history exists
     let id = app.next_request_id;
     app.session_view.insert_or_replace(
@@ -1018,7 +1018,7 @@ fn navigate_history_up_down_with_multi_line() {
 
 #[test]
 fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.last_terminal_size = Some((80, 24));
     // Short text currently in input
     app.input.text = "x".to_string();
@@ -1067,7 +1067,7 @@ fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
 
 #[test]
 fn navigate_history_down_adjusts_scroll_offset_for_long_draft() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.last_terminal_size = Some((80, 24));
     // A long multi-line draft saved in history state
     let long_draft: String = (0..20).map(|i| format!("line {i}\n")).collect();
@@ -1115,7 +1115,7 @@ fn navigate_history_down_adjusts_scroll_offset_for_long_draft() {
 
 #[test]
 fn backspace_at_cursor_removes_before_cursor() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abcd".to_string();
     app.input.cursor = 3;
     app.input.backspace_at_cursor();
@@ -1125,7 +1125,7 @@ fn backspace_at_cursor_removes_before_cursor() {
 
 #[test]
 fn backspace_at_cursor_does_nothing_at_start() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "a".to_string();
     app.input.cursor = 0;
     app.input.backspace_at_cursor();
@@ -1135,7 +1135,7 @@ fn backspace_at_cursor_does_nothing_at_start() {
 
 #[test]
 fn backspace_at_cursor_is_grapheme_aware() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "a😀".to_string();
     app.input.cursor = 5;
     app.input.backspace_at_cursor();
@@ -1145,7 +1145,7 @@ fn backspace_at_cursor_is_grapheme_aware() {
 
 #[test]
 fn delete_at_cursor_removes_at_cursor() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abcd".to_string();
     app.input.cursor = 1;
     app.input.delete_at_cursor();
@@ -1155,7 +1155,7 @@ fn delete_at_cursor_removes_at_cursor() {
 
 #[test]
 fn delete_at_cursor_does_nothing_at_end() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "a".to_string();
     app.input.cursor = 1;
     app.input.delete_at_cursor();
@@ -1165,7 +1165,7 @@ fn delete_at_cursor_does_nothing_at_end() {
 
 #[test]
 fn delete_at_cursor_is_grapheme_aware() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "a😀b".to_string();
     app.input.cursor = 1;
     app.input.delete_at_cursor();
@@ -1175,7 +1175,7 @@ fn delete_at_cursor_is_grapheme_aware() {
 
 #[test]
 fn word_left_moves_to_previous_word() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello world foo".to_string();
     app.input.cursor = 15;
     app.input.word_left();
@@ -1188,7 +1188,7 @@ fn word_left_moves_to_previous_word() {
 
 #[test]
 fn word_left_stays_at_zero() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 0;
     app.input.word_left();
@@ -1197,7 +1197,7 @@ fn word_left_stays_at_zero() {
 
 #[test]
 fn word_right_moves_to_next_word() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello world foo".to_string();
     app.input.cursor = 0;
     app.input.word_right();
@@ -1210,7 +1210,7 @@ fn word_right_moves_to_next_word() {
 
 #[test]
 fn word_right_stays_at_end() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     app.input.word_right();
@@ -1219,7 +1219,7 @@ fn word_right_stays_at_end() {
 
 #[test]
 fn word_right_skips_whitespace() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "  hello  ".to_string();
     app.input.cursor = 0;
     app.input.word_right();
@@ -1228,7 +1228,7 @@ fn word_right_skips_whitespace() {
 
 #[test]
 fn delete_word_backward_removes_previous_word() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello world".to_string();
     app.input.cursor = 11;
     app.input.delete_word_backward();
@@ -1238,7 +1238,7 @@ fn delete_word_backward_removes_previous_word() {
 
 #[test]
 fn delete_word_backward_at_start_does_nothing() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 0;
     app.input.delete_word_backward();
@@ -1248,7 +1248,7 @@ fn delete_word_backward_at_start_does_nothing() {
 
 #[test]
 fn delete_word_forward_removes_next_word() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello world foo".to_string();
     app.input.cursor = 6;
     app.input.delete_word_forward();
@@ -1258,7 +1258,7 @@ fn delete_word_forward_removes_next_word() {
 
 #[test]
 fn delete_word_forward_at_end_does_nothing() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     app.input.delete_word_forward();
@@ -1268,7 +1268,7 @@ fn delete_word_forward_at_end_does_nothing() {
 
 #[test]
 fn delete_to_start_removes_from_beginning_to_cursor() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello world".to_string();
     app.input.cursor = 6;
     app.input.delete_to_start();
@@ -1278,7 +1278,7 @@ fn delete_to_start_removes_from_beginning_to_cursor() {
 
 #[test]
 fn delete_to_start_when_at_end_clears_input() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     app.input.delete_to_start();
@@ -1288,7 +1288,7 @@ fn delete_to_start_when_at_end_clears_input() {
 
 #[test]
 fn delete_to_start_when_at_zero_does_nothing() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 0;
     app.input.delete_to_start();
@@ -1298,7 +1298,7 @@ fn delete_to_start_when_at_zero_does_nothing() {
 
 #[test]
 fn terminal_event_enter_scrolls_to_bottom_from_scrolled_up() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     // Set a small viewport so even a few turns are scrollable.
@@ -1347,7 +1347,7 @@ fn terminal_event_enter_scrolls_to_bottom_from_scrolled_up() {
 
 #[test]
 fn terminal_event_submit_resets_cursor() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
     app.input.cursor = 5;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1365,7 +1365,7 @@ fn terminal_event_submit_resets_cursor() {
 
 #[test]
 fn terminal_event_arrow_keys_move_cursor() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abc".to_string();
     app.input.cursor = 3;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1389,7 +1389,7 @@ fn terminal_event_arrow_keys_move_cursor() {
 
 #[test]
 fn terminal_event_home_end_move_cursor() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abc".to_string();
     app.input.cursor = 1;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1413,7 +1413,7 @@ fn terminal_event_home_end_move_cursor() {
 
 #[test]
 fn terminal_event_delete_removes_at_cursor() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abcd".to_string();
     app.input.cursor = 1;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1431,7 +1431,7 @@ fn terminal_event_delete_removes_at_cursor() {
 
 #[test]
 fn terminal_event_backspace_uses_cursor() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abcd".to_string();
     app.input.cursor = 3;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1449,7 +1449,7 @@ fn terminal_event_backspace_uses_cursor() {
 
 #[test]
 fn terminal_event_inserts_char_at_cursor() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "abd".to_string();
     app.input.cursor = 2;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1467,7 +1467,7 @@ fn terminal_event_inserts_char_at_cursor() {
 
 #[test]
 fn terminal_event_ctrl_backspace_deletes_word_backward() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello world".to_string();
     app.input.cursor = 11;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1485,7 +1485,7 @@ fn terminal_event_ctrl_backspace_deletes_word_backward() {
 
 #[test]
 fn terminal_event_ctrl_w_deletes_word_backward() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello world".to_string();
     app.input.cursor = 11;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1503,7 +1503,7 @@ fn terminal_event_ctrl_w_deletes_word_backward() {
 
 #[test]
 fn terminal_event_ctrl_u_deletes_to_start() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello world".to_string();
     app.input.cursor = 6;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1521,7 +1521,7 @@ fn terminal_event_ctrl_u_deletes_to_start() {
 
 #[test]
 fn terminal_event_ctrl_delete_deletes_word_forward() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello world foo".to_string();
     app.input.cursor = 6;
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -1560,7 +1560,7 @@ fn word_right_respects_punctuation_boundaries() {
 
 #[test]
 fn word_delete_within_whitespace_does_not_panic() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "  hello  world  ".to_string();
     app.input.cursor = 8;
     // Must not panic when cursor sits within whitespace between words.
@@ -1574,7 +1574,7 @@ fn word_delete_within_whitespace_does_not_panic() {
 
 #[test]
 fn app_starts_in_chat_page() {
-    let app = test_app("/tmp/choreographr.sock");
+    let app = test_app();
     assert_eq!(app.page, Page::Chat);
     assert!(
         app.show_ctrl_help,
@@ -1726,7 +1726,7 @@ mod session_manager_key_tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn make_sm_app() -> App {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.page = Page::SessionManager;
         app.session_mgr.set_sessions(vec![
             make_session(1, "first", "gpt-4", 3),
@@ -1820,7 +1820,7 @@ mod session_manager_key_tests {
     #[test]
     fn chat_ctrl_s_enters_session_manager() {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         assert_eq!(app.page, Page::Chat);
 
         handle_terminal_event(
@@ -1925,7 +1925,7 @@ mod session_manager_key_tests {
 
 #[test]
 fn navigate_history_up_loads_most_recent() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     // Oldest first, newest last — user_texts() reverses so texts[0] = newest.
     add_user_text(&mut app, "cmd-2");
     add_user_text(&mut app, "cmd-1");
@@ -1943,7 +1943,7 @@ fn navigate_history_up_loads_most_recent() {
 
 #[test]
 fn navigate_history_up_moves_to_older() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     add_user_text(&mut app, "c");
     add_user_text(&mut app, "b");
     add_user_text(&mut app, "a");
@@ -1960,7 +1960,7 @@ fn navigate_history_up_moves_to_older() {
 
 #[test]
 fn navigate_history_up_stops_at_oldest() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     add_user_text(&mut app, "c");
     add_user_text(&mut app, "b");
     app.history_index = Some(1);
@@ -1974,7 +1974,7 @@ fn navigate_history_up_stops_at_oldest() {
 
 #[test]
 fn navigate_history_up_empty_history_does_nothing() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "hello".to_string();
 
     app.navigate_history_up();
@@ -1984,7 +1984,7 @@ fn navigate_history_up_empty_history_does_nothing() {
 
 #[test]
 fn navigate_history_down_restores_draft() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     add_user_text(&mut app, "cmd");
     app.history_index = Some(0);
     app.saved_draft = "draft".to_string();
@@ -1999,7 +1999,7 @@ fn navigate_history_down_restores_draft() {
 
 #[test]
 fn navigate_history_down_moves_to_newer() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     add_user_text(&mut app, "c");
     add_user_text(&mut app, "b");
     add_user_text(&mut app, "a");
@@ -2020,7 +2020,7 @@ fn navigate_history_down_moves_to_newer() {
 
 #[test]
 fn history_nav_resets_after_commit() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     add_user_text(&mut app, "old");
     app.history_index = Some(0);
     app.saved_draft = "draft".to_string();
@@ -2036,7 +2036,7 @@ fn terminal_event_up_down_navigates_history() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     add_user_text(&mut app, "older");
     add_user_text(&mut app, "recent");
 
@@ -2082,7 +2082,7 @@ fn terminal_event_up_down_navigates_history() {
 #[test]
 fn terminal_event_history_up_empty_does_nothing() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
@@ -2095,7 +2095,7 @@ fn terminal_event_history_up_empty_does_nothing() {
 
 #[test]
 fn commit_does_not_duplicate_user_text() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     add_user_text(&mut app, "hello");
 
     app.commit_to_history();
@@ -2107,7 +2107,7 @@ fn commit_does_not_duplicate_user_text() {
 #[test]
 fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
     let (tx, _rx) = std::sync::mpsc::channel();
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.history_viewport.height = 1;
 
     let (_, height) = crossterm::terminal::size().expect("terminal size");
@@ -2140,7 +2140,7 @@ fn setup_providers_new_form(app: &mut App) {
 
 #[test]
 fn ai_providers_new_form_entering_focuses_name() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     setup_providers_new_form(&mut app);
     assert!(app.ai_providers.new_name_state.is_focused());
     assert!(!app.ai_providers.new_provider_state.is_focused());
@@ -2149,7 +2149,7 @@ fn ai_providers_new_form_entering_focuses_name() {
 
 #[test]
 fn ai_providers_new_form_enter_advances_name_to_provider() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2183,7 +2183,7 @@ fn ai_providers_new_form_enter_advances_name_to_provider() {
 
 #[test]
 fn ai_providers_new_form_enter_advances_provider_to_apikey() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2217,7 +2217,7 @@ fn ai_providers_new_form_enter_advances_provider_to_apikey() {
 
 #[test]
 fn ai_providers_new_form_name_validation_empty() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2241,7 +2241,7 @@ fn ai_providers_new_form_name_validation_empty() {
 
 #[test]
 fn ai_providers_new_form_name_validation_invalid() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2268,7 +2268,7 @@ fn ai_providers_new_form_name_validation_invalid() {
 
 #[test]
 fn ai_providers_new_form_esc_cancels() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2286,7 +2286,7 @@ fn ai_providers_new_form_esc_cancels() {
 
 #[test]
 fn ai_providers_new_form_enter_on_apikey_submits() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2342,7 +2342,7 @@ fn ai_providers_new_form_enter_on_apikey_submits() {
 
 #[test]
 fn ai_providers_new_form_keys_go_to_correct_field() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2388,7 +2388,7 @@ fn ai_providers_new_form_keys_go_to_correct_field() {
 
 #[test]
 fn ai_providers_new_form_jk_remapped_to_up_down_on_provider() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2446,7 +2446,7 @@ fn ai_providers_new_form_jk_remapped_to_up_down_on_provider() {
 
 #[test]
 fn ai_providers_new_form_down_up_navigates_provider() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     setup_providers_new_form(&mut app);
 
@@ -2486,7 +2486,7 @@ fn ai_providers_new_form_down_up_navigates_provider() {
 
 #[test]
 fn daemon_message_session_state_updates_progress_for_attached_session() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     app.attached_session_id = Some(7);
 
@@ -2532,7 +2532,7 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
 
 #[test]
 fn daemon_message_session_state_sets_tool_groups() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     handle_daemon_message(
@@ -2562,7 +2562,7 @@ fn daemon_message_session_state_sets_tool_groups() {
 
 #[test]
 fn daemon_message_session_state_ignores_wrong_session() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
     app.attached_session_id = Some(7);
 
@@ -2611,7 +2611,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
 
 #[test]
 fn daemon_message_done_with_token_usage_updates_progress() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     handle_daemon_message(
@@ -2642,7 +2642,7 @@ fn daemon_message_done_with_token_usage_updates_progress() {
 
 #[test]
 fn daemon_message_done_without_token_usage_does_not_change_progress() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     handle_daemon_message(
@@ -2663,7 +2663,7 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
 
 #[test]
 fn handle_session_status_changed_updates_attached_status() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     assert!(app.attached_status.is_none());
 
     // With no attached session, status should not be cached.
@@ -2689,7 +2689,7 @@ fn handle_session_status_changed_updates_attached_status() {
 
 #[test]
 fn handle_turn_appended_with_displayed_image_populates_rendered_images() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let metadata = ImageMetadata {
         mime_type: "image/png".to_string(),
         width: 640,
@@ -2862,7 +2862,7 @@ fn scroll_offset_clamped_to_valid_range() {
 
 #[test]
 fn enter_continue_when_attached_sends_continue_generation() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.attached_session_id = Some(1);
     app.input.text = "/continue".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2882,7 +2882,7 @@ fn enter_continue_when_attached_sends_continue_generation() {
 
 #[test]
 fn enter_continue_when_not_attached_shows_error() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.attached_session_id = None;
     app.input.text = "/continue".to_string();
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -2899,7 +2899,7 @@ fn enter_continue_when_not_attached_shows_error() {
 
 #[test]
 fn enter_continue_scrolls_to_bottom() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.attached_session_id = Some(1);
     app.history_viewport = HistoryViewport {
         width: 80,
@@ -2928,7 +2928,7 @@ fn enter_continue_scrolls_to_bottom() {
 
 #[test]
 fn enter_stop_when_attached_sends_cancel_all() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.attached_session_id = Some(1);
     app.input.text = "/stop".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2947,7 +2947,7 @@ fn enter_stop_when_attached_sends_cancel_all() {
 
 #[test]
 fn enter_stop_when_not_attached_shows_error() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.attached_session_id = None;
     app.input.text = "/stop".to_string();
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -2964,7 +2964,7 @@ fn enter_stop_when_not_attached_shows_error() {
 
 #[test]
 fn enter_undo_sends_undo() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "/undo".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -2982,7 +2982,7 @@ fn enter_undo_sends_undo() {
 
 #[test]
 fn enter_redo_sends_redo() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.input.text = "/redo".to_string();
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -3000,7 +3000,7 @@ fn enter_redo_sends_redo() {
 
 #[test]
 fn enter_stop_does_not_scroll() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     app.attached_session_id = Some(1);
     app.history_viewport = HistoryViewport {
         width: 80,
@@ -3032,7 +3032,7 @@ fn enter_stop_does_not_scroll() {
 
 #[test]
 fn ctrl_r_no_session_shows_message() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.attached_session_id = None;
@@ -3060,7 +3060,7 @@ fn ctrl_r_no_session_shows_message() {
 
 #[test]
 fn ctrl_r_cycles_through_valid_slugs() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
 
     app.attached_reasoning_capability = Some(ReasoningCapability {
@@ -3140,7 +3140,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
 
 #[test]
 fn ctrl_r_non_reasoning_model_shows_message() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     // No reasoning capability set (model does not support reasoning).
@@ -3163,7 +3163,7 @@ fn ctrl_r_non_reasoning_model_shows_message() {
 
 #[test]
 fn ctrl_r_google_off_on() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
 
     // Google Gemini style: only "off" and "on".
@@ -3206,7 +3206,7 @@ fn ctrl_r_google_off_on() {
 
 #[test]
 fn reasoning_effort_set_updates_session_state() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.attached_session_id = Some(42);
@@ -3225,7 +3225,7 @@ fn reasoning_effort_set_updates_session_state() {
 
 #[test]
 fn ctrl_r_with_empty_capability_shows_message() {
-    let mut app = test_app("/tmp/choreographr.sock");
+    let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     // Capability exists but has empty available_effort_levels.

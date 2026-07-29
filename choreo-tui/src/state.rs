@@ -1256,7 +1256,7 @@ fn ceil_div(a: usize, b: usize) -> usize {
 }
 
 impl App {
-    pub(crate) fn new(_socket_path: String) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             input: InputBuffer::new(),
             next_request_id: 1,
@@ -1685,8 +1685,16 @@ impl App {
             }
         };
         let (width, height) = size;
+        // The help overlay takes 2 rows when visible — it must be subtracted
+        // from the viewport so that max_scroll_offset allows scrolling to the
+        // true top of the history.  Without this, the viewport is 2 rows too
+        // tall when help is shown, making the top 2 rows of history unreachable.
+        let help_height: u16 = if self.show_ctrl_help { 2 } else { 0 };
         let bottom_height =
-            self.input_bar_height(width) + STATUS_BAR_HEIGHT + self.status_error_height(width);
+            self.input_bar_height(width)
+            + STATUS_BAR_HEIGHT
+            + self.status_error_height(width)
+            + help_height;
         if width > 1 && height > bottom_height {
             let old_width = self.history_viewport.width;
             let old_height = self.history_viewport.height;
@@ -2658,7 +2666,7 @@ mod tests {
 
     #[test]
     fn scroll_to_content_line_scrolls_to_content_line() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
@@ -2690,13 +2698,13 @@ mod tests {
 
     #[test]
     fn find_turn_at_row_returns_none_out_of_bounds() {
-        let app = test_app("/tmp/choreographr.sock");
+        let app = test_app();
         assert!(find_turn_at_row(&app, 999).is_none());
     }
 
     #[test]
     fn find_turn_at_row_returns_turn_idx_and_offset() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 200;
         let turn = Turn {
@@ -2724,7 +2732,7 @@ mod tests {
 
     #[test]
     fn scrollbar_notch_no_content() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
         // No content → total_height = 0 → max_scroll = 0 → notch clamps to 1
@@ -2733,7 +2741,7 @@ mod tests {
 
     #[test]
     fn scrollbar_notch_track_one() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 1;
         app.height_prefix.push(50);
@@ -2744,7 +2752,7 @@ mod tests {
 
     #[test]
     fn scrollbar_notch_ceiling_division() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 50;
         app.height_prefix.push(150);
@@ -2755,7 +2763,7 @@ mod tests {
 
     #[test]
     fn scrollbar_notch_rounds_up() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 30;
         app.height_prefix.push(105);
@@ -2768,7 +2776,7 @@ mod tests {
 
     #[test]
     fn scrollbar_scroll_up_increases_scroll_by_notch() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.height_prefix.push(110);
@@ -2786,7 +2794,7 @@ mod tests {
 
     #[test]
     fn scrollbar_scroll_up_clamps_at_max_scroll() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.height_prefix.push(110);
@@ -2803,7 +2811,7 @@ mod tests {
 
     #[test]
     fn scrollbar_scroll_down_decreases_scroll_by_notch() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.height_prefix.push(110);
@@ -2820,7 +2828,7 @@ mod tests {
 
     #[test]
     fn scrollbar_scroll_down_clamps_at_zero() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.height_prefix.push(110);
@@ -2839,7 +2847,7 @@ mod tests {
 
     #[test]
     fn scroll_to_track_row_at_bottom() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
         app.height_prefix.push(110);
@@ -2857,7 +2865,7 @@ mod tests {
 
     #[test]
     fn scroll_to_track_row_at_top() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
         app.height_prefix.push(110);
@@ -2875,7 +2883,7 @@ mod tests {
 
     #[test]
     fn scroll_to_track_row_midpoint() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.height_prefix.push(110);
@@ -2890,7 +2898,7 @@ mod tests {
 
     #[test]
     fn scroll_to_track_row_zero_viewport() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 0;
         app.height_prefix.push(110);
@@ -2905,7 +2913,7 @@ mod tests {
 
     #[test]
     fn scroll_to_track_row_track_one() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
         app.height_prefix.push(110);
@@ -2920,7 +2928,7 @@ mod tests {
 
     #[test]
     fn scroll_to_track_row_mouse_row_clamped() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
         app.height_prefix.push(110);
@@ -2938,7 +2946,7 @@ mod tests {
 
     #[test]
     fn scroll_to_content_line_idempotent_when_already_visible() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 200;
 
@@ -2966,7 +2974,7 @@ mod tests {
 
     #[test]
     fn scroll_to_content_line_large_content_line_saturates() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
@@ -2996,27 +3004,27 @@ mod tests {
 
     #[test]
     fn status_error_height_neither_set_returns_zero() {
-        let app = test_app("/tmp/choreographr.sock");
+        let app = test_app();
         assert_eq!(app.status_error_height(80), 0);
     }
 
     #[test]
     fn status_error_height_short_error_returns_one() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.error = Some("oops".into());
         assert_eq!(app.status_error_height(80), 1);
     }
 
     #[test]
     fn status_error_height_short_status_returns_one() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.status = Some("all good".into());
         assert_eq!(app.status_error_height(80), 1);
     }
 
     #[test]
     fn status_error_height_error_preferred_over_status() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.error = Some("error".into());
         app.status = Some("status".into());
         // Should use error text, not status text
@@ -3025,7 +3033,7 @@ mod tests {
 
     #[test]
     fn status_error_height_wrapping() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         // A 10-char line at width 5 wraps to 2 lines
         app.error = Some("12345 7890".into());
         assert_eq!(app.status_error_height(5), 2);
@@ -3033,7 +3041,7 @@ mod tests {
 
     #[test]
     fn status_error_height_multi_line() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         // Three explicit lines via \n
         app.status = Some("line a\nline b\nline c".into());
         // Each line fits in width 80, so total = 3
@@ -3042,7 +3050,7 @@ mod tests {
 
     #[test]
     fn status_error_height_multi_line_with_wrapping() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         // Two lines, second wraps
         app.error = Some("hello\n12345 7890".into());
         // line 1: "hello" → 1 line
@@ -3053,7 +3061,7 @@ mod tests {
 
     #[test]
     fn status_error_height_empty_after_clearing() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.error = Some("error".into());
         app.error = None;
         assert_eq!(app.status_error_height(80), 0);
@@ -3061,14 +3069,14 @@ mod tests {
 
     #[test]
     fn status_error_height_status_takes_over_when_error_cleared() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.status = Some("status".into());
         assert_eq!(app.status_error_height(80), 1);
     }
 
     #[test]
     fn sync_turn_images_populates_rendered_images() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         let metadata = choreo_proto::ImageMetadata {
             mime_type: "image/svg+xml".to_string(),
             width: 100,
@@ -3114,7 +3122,7 @@ mod tests {
 
     #[test]
     fn turn_layout_empty_when_no_images() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
         let turn = Turn {
@@ -3138,7 +3146,7 @@ mod tests {
 
     #[test]
     fn turn_layout_populates_image_ranges_with_fallback_height() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
         let metadata = choreo_proto::ImageMetadata {
@@ -3204,7 +3212,7 @@ mod tests {
     fn apply_image_result_clears_pending_job_and_records_failure() {
         use choreo_tui::image_worker::next_job_id;
 
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
         let metadata = choreo_proto::ImageMetadata {
@@ -3261,7 +3269,7 @@ mod tests {
     fn apply_image_result_records_failure_at_any_size() {
         use choreo_tui::image_worker::next_job_id;
 
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
         let metadata = choreo_proto::ImageMetadata {
@@ -3335,7 +3343,7 @@ mod tests {
 
     #[test]
     fn scroll_preserved_when_scrolled_up_and_content_changes() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
@@ -3382,7 +3390,7 @@ mod tests {
 
     #[test]
     fn scroll_not_preserved_when_at_bottom_and_content_changes() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
@@ -3413,7 +3421,7 @@ mod tests {
 
     #[test]
     fn markers_empty_when_no_user_text_turns() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
 
@@ -3441,7 +3449,7 @@ mod tests {
 
     #[test]
     fn markers_created_for_each_user_text_turn() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
 
@@ -3492,7 +3500,7 @@ mod tests {
 
     #[test]
     fn marker_virtual_slot_uses_final_total_height() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
         let virtual_track = 2 * app.history_viewport.height as usize;
@@ -3531,7 +3539,7 @@ mod tests {
 
     #[test]
     fn marker_virtual_slot_proportional_to_position() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
         let virtual_track = 2 * app.history_viewport.height as usize;
@@ -3561,7 +3569,7 @@ mod tests {
 
     #[test]
     fn scroll_not_preserved_when_content_dirty_is_false() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
@@ -3588,8 +3596,60 @@ mod tests {
     // ── update_viewport_from_terminal_size ──
 
     #[test]
+    fn help_overlay_reduces_viewport_height() {
+        let mut app = test_app();
+
+        // Establish a known viewport first.
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 26;
+
+        // Set up a terminal size where the 2-row help overlay makes
+        // a measurable difference in the viewport.  With an empty input
+        // and no status/error, bottom_height is 4 without help and 6
+        // with help, so a terminal of (80, 30) yields viewports of
+        // 26 and 24 respectively.
+        app.last_terminal_size = Some((80, 30));
+        app.terminal_resized = false;
+
+        // First with help hidden.
+        app.show_ctrl_help = false;
+        app.update_viewport_from_terminal_size();
+        let height_without_help = app.history_viewport.height;
+
+        // Reset state so the second call also uses the cached terminal size.
+        app.last_terminal_size = Some((80, 30));
+        app.terminal_resized = false;
+        app.show_ctrl_help = true;
+        app.update_viewport_from_terminal_size();
+        let height_with_help = app.history_viewport.height;
+
+        assert_eq!(
+            height_without_help - height_with_help,
+            2,
+            "help overlay should reduce viewport by 2 (was {}, now {})",
+            height_without_help,
+            height_with_help,
+        );
+
+        // Verify max_scroll_offset also reflects the correct viewport:
+        // with help visible, content should be scrollable to the true top
+        // (max_scroll_offset + viewport == total when total > viewport).
+        // Without the help_height fix, max_scroll_offset would be 2 less
+        // than it should be.
+        let total = app.total_history_height();
+        let max_scroll = app.max_scroll_offset();
+        if total > height_with_help as usize {
+            assert_eq!(
+                max_scroll + height_with_help as usize,
+                total,
+                "with help visible, max_scroll_offset + viewport should equal total height"
+            );
+        }
+    }
+
+    #[test]
     fn width_change_clears_content_dirty() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
 
         // Establish a "current" viewport with the old width.
         app.history_viewport.width = 80;
@@ -3630,7 +3690,7 @@ mod tests {
 
     #[test]
     fn height_only_change_does_not_clear_content_dirty() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
 
         // Establish a "current" viewport matching terminal_width - 1 (scrollbar column).
         app.history_viewport.width = 79;
@@ -3668,7 +3728,7 @@ mod tests {
 
     #[test]
     fn content_removed_scrolls_to_bottom() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
@@ -3704,7 +3764,7 @@ mod tests {
 
     #[test]
     fn content_added_shifts_scroll_down() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
@@ -3736,7 +3796,7 @@ mod tests {
 
     #[test]
     fn mark_streaming_changed_sets_flags() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         assert!(!app.streaming_dirty);
         assert!(!app.content_dirty);
 
@@ -3748,7 +3808,7 @@ mod tests {
 
     #[test]
     fn mark_content_changed_resets_streaming_turn_index() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         // markers_dirty is initially true; clear it so we can verify it's set.
         app.markers_dirty = false;
         app.streaming_turn_index = Some(0);
@@ -3765,7 +3825,7 @@ mod tests {
 
     #[test]
     fn streaming_update_without_turn_index_falls_back() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         insert_turn(&mut app, 0, "hello", "world");
         app.rebuild_height_prefix();
 
@@ -3786,7 +3846,7 @@ mod tests {
 
     #[test]
     fn streaming_update_recalculates_turn_height() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 200;
 
@@ -3822,7 +3882,7 @@ mod tests {
 
     #[test]
     fn streaming_update_preserves_height_prefix_invariant() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 200;
 
@@ -3885,7 +3945,7 @@ mod tests {
 
     #[test]
     fn handle_started_sets_streaming_turn_index() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 200;
 
@@ -3911,7 +3971,7 @@ mod tests {
 
     #[test]
     fn handle_done_fires_full_rebuild() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 200;
 
@@ -3942,7 +4002,7 @@ mod tests {
 
     #[test]
     fn handle_failed_clears_streaming() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.streaming_turn_index = Some(0);
         app.streaming_dirty = false;
         app.content_dirty = false;

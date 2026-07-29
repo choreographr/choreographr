@@ -66,10 +66,6 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         tracing::error!("[choreo-tui] failed to ensure keystore keypair: {e}");
     }
 
-    let app_socket_path = match &mode {
-        ConnectionMode::UnixSocket(path) => path.clone(),
-        ConnectionMode::Tcp { addr, .. } => addr.clone(),
-    };
     let (client_tx, client_rx) = std::sync::mpsc::channel::<ClientMessage>();
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
     let (ui_tx, ui_rx) = channel::bounded::<UiEvent>(UI_EVENT_CHANNEL_SIZE);
@@ -263,7 +259,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         }
     });
 
-    let mut app = App::new(app_socket_path);
+    let mut app = App::new();
     app.image_job_tx = Some(worker.job_tx);
 
     // ── Auto-unlock the daemon on connect ──────────────────────────
@@ -1781,7 +1777,7 @@ mod tests {
 
     #[test]
     fn marker_lookup_finds_marker_at_mouse_row() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
 
@@ -1814,7 +1810,7 @@ mod tests {
 
     #[test]
     fn marker_click_scrolls_to_content_line() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1850,7 +1846,7 @@ mod tests {
 
     #[test]
     fn marker_click_after_content_change_still_correct() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
@@ -1888,7 +1884,7 @@ mod tests {
 
     #[test]
     fn marker_slot_uses_final_total_as_denominator() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
 
@@ -1912,7 +1908,7 @@ mod tests {
 
     #[test]
     fn marker_lookup_no_match_on_empty_track() {
-        let mut app = test_app("/tmp/choreographr.sock");
+        let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
 
