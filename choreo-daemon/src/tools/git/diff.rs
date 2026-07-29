@@ -68,6 +68,10 @@ pub(crate) fn git_diff_impl(
                 *spec = format!("{}/{}", prefix, spec.trim_start_matches("./"));
             }
         }
+    } else {
+        // No prefix needed -- we are at the repo root, so filter out
+        // "." and "./" which gix doesn't interpret as "match all".
+        pathspec = super::filter_repo_root_pathspecs(pathspec);
     }
     let workdir = repo_work_dir_display(&repo);
 
@@ -195,8 +199,8 @@ pub(crate) fn git_diff_impl(
 
 /// Walk from HEAD commit → tree → entry by path, then return the file content.
 ///
-/// The `??` on the `peel_to_entry_by_path` line unwraps the outer `Result` (I/O error)
-/// and then the inner `Option` (path not found in tree).
+/// The nested `?` on the `peel_to_entry_by_path` line unwraps the outer `Result`
+/// (I/O error) and then the inner `Option` (path not found in tree).
 fn head_content_by_path(repo: &gix::Repository, path: &str) -> Option<String> {
     let head_id = repo.head().ok()?.id()?;
     let object = head_id.object().ok()?;

@@ -279,6 +279,19 @@ pub(crate) fn resolve_pathspec_prefix(
     ))
 }
 
+/// Filter out the special `"."` and `"./"` pathspecs since gix does not interpret
+/// them the way real git does ("everything in the current directory").  With an
+/// empty pathspec list, gix matches all files, which is the correct behaviour.
+///
+/// Called by both `git_diff` and `git_add` when the user's working directory
+/// coincides with the repo root (no prefix to prepend).
+pub(crate) fn filter_repo_root_pathspecs(pathspec: Vec<String>) -> Vec<String> {
+    pathspec
+        .into_iter()
+        .filter(|spec| spec != "." && spec != "./")
+        .collect()
+}
+
 pub(crate) fn format_tree_index_change(change: &gix::diff::index::Change) -> String {
     use gix::diff::index::ChangeRef;
     match change {
@@ -459,6 +472,50 @@ mod tests {
         let (_tmp, sub, repo) = init_repo_with_subdir("sub");
         let result = resolve_pathspec_prefix(&repo, Some(sub.to_str().unwrap()), None).unwrap();
         assert_eq!(result.as_deref(), Some("sub"));
+    }
+
+    #[test]
+    fn test_filter_repo_root_pathspecs_removes_dot() {
+        let result = filter_repo_root_pathspecs(vec![".".into()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_repo_root_pathspecs_removes_dot_slash() {
+        let result = filter_repo_root_pathspecs(vec!["./".into()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_repo_root_pathspecs_preserves_other() {
+        let result = filter_repo_root_pathspecs(vec!["src/".into(), "Cargo.toml".into()]);
+        assert_eq!(result, vec!["src/", "Cargo.toml"]);
+    }
+
+    #[test]
+    fn test_filter_repo_root_pathspecs_mixed() {
+        let result = filter_repo_root_pathspecs(vec![".".into(), "src/".into(), "./".into()]);
+        assert_eq!(result, vec!["src/"]);
+    }
+
+    #[test]
+    fn test_filter_repo_root_pathspecs_empty() {
+        let result = filter_repo_root_pathspecs(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_filter_repo_root_pathspecs_keeps_dot_prefix() {
+        // Only exact "." and "./" are filtered — not "./foo".
+        let result = filter_repo_root_pathspecs(vec!["./foo.rs".into()]);
+        assert_eq!(result, vec!["./foo.rs"]);
+    }
+
+    #[test]
+    fn test_filter_repo_root_pathspecs_keeps_subdir_dot() {
+        // "./bar/.gitkeep" is not a bare "./" — it must be kept.
+        let result = filter_repo_root_pathspecs(vec!["./bar/.gitkeep".into()]);
+        assert_eq!(result, vec!["./bar/.gitkeep"]);
     }
 
     #[test]

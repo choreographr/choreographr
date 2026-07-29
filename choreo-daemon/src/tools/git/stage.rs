@@ -195,7 +195,11 @@ fn prefix_pathspecs(
     // both git_add and git_diff handle pathspec-prefixing consistently.
     let prefix = match super::resolve_pathspec_prefix(repo, repo_path, working_dir)? {
         Some(p) => p,
-        None => return Ok(pathspec.to_vec()),
+        None => {
+            // No prefix needed -- we are at the repo root, so filter out
+            // "." and "./" which gix doesn't interpret as "match all".
+            return Ok(super::filter_repo_root_pathspecs(pathspec.to_vec()));
+        }
     };
 
     Ok(pathspec
