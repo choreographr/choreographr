@@ -2,7 +2,7 @@
 members = [
     "choreo-acp",
     "choreo-client-core",
-    "choreographr",
+    "choreo-daemon",
     "choreo-keystore",
     "choreo-markdown",
     "choreo-mcp",
