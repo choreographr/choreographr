@@ -37,6 +37,36 @@ pub struct GrepArgs {
 /// Respects `.gitignore`, hidden files, and binary files by default.
 pub struct Grep;
 
+/// Produce a hint string when the pattern looks like a regex but `regex` is
+/// not enabled and no results were found.  Returns `None` when there is no
+/// hint to give (results found, regex enabled, or pattern is plain text).
+fn regex_mode_hint(pattern: &str, regex: bool, has_results: bool) -> Option<String> {
+    if regex || has_results {
+        return None;
+    }
+    // Check for common regex metacharacters that indicate the caller
+    // likely intended regex semantics.
+    let has_regex_chars = pattern.contains('|')
+        || pattern.contains('(')
+        || pattern.contains(')')
+        || pattern.contains('^')
+        || pattern.contains('$')
+        || pattern.contains('+')
+        || pattern.contains('*')
+        || pattern.contains('?')
+        || pattern.contains('[')
+        || pattern.contains(']')
+        || pattern.contains('\\');
+    if !has_regex_chars {
+        return None;
+    }
+    Some(format!(
+        "Note: pattern contains regex metacharacters but regex:false (default). \
+         These characters were matched literally: `|`, `(`, `)`, `^`, `$`, `+`, `*`, `?`, `[`, `]`, `\\`. \
+         If you intended regex, set regex:true."
+    ))
+}
+
 /// Run the grep walk with the given parameters, optionally streaming each
 /// match to `output_tx` in real time for incremental client display.
 fn run_grep_walk(
@@ -123,8 +153,10 @@ fn run_grep_walk(
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_default();
-        if sink.results.is_empty() {
-            return Ok(String::new());
+        let has_results = !sink.results.is_empty();
+        let hint = regex_mode_hint(pattern, regex, has_results);
+        if !has_results {
+            return Ok(hint.unwrap_or_default());
         }
         let lines: Vec<String> = sink
             .results
@@ -133,7 +165,12 @@ fn run_grep_walk(
                 format!("{}:{}:{}", file_name, line_num, content)
             })
             .collect();
-        return Ok(truncate_tool_output(&lines.join("\n")));
+        let output = if let Some(h) = hint {
+            format!("{}\n{}", h, lines.join("\n"))
+        } else {
+            lines.join("\n")
+        };
+        return Ok(truncate_tool_output(&output));
     }
 
     // Walk the directory tree with gitignore-aware traversal.
@@ -183,8 +220,10 @@ fn run_grep_walk(
             ToolExecError(format!("walk error: {e}"))
         })?;
 
-    if sink.results.is_empty() {
-        return Ok(String::new());
+    let has_results = !sink.results.is_empty();
+    let hint = regex_mode_hint(pattern, regex, has_results);
+    if !has_results {
+        return Ok(hint.unwrap_or_default());
     }
 
     let lines: Vec<String> = sink
@@ -196,7 +235,12 @@ fn run_grep_walk(
         })
         .collect();
 
-    Ok(truncate_tool_output(&lines.join("\n")))
+    let output = if let Some(h) = hint {
+        format!("{}\n{}", h, lines.join("\n"))
+    } else {
+        lines.join("\n")
+    };
+    Ok(truncate_tool_output(&output))
 }
 
 pub fn execute_grep_tool(
@@ -240,14 +284,6 @@ impl Tool for Grep {
         let mut parts = vec![format!("Searching for `{}`.", args.pattern)];
         if args.regex {
             parts.push(" Using regex.".to_string());
-        } else if args.pattern.contains('|')
-            || args.pattern.contains('(')
-            || args.pattern.contains(')')
-        {
-            parts.push(
-                " Warning: pattern looks like a regex (e.g. contains |, (, )) but regex:false (default). Pass regex:true to treat metacharacters as regex."
-                    .to_string(),
-            );
         }
         if let Some(ref incl) = args.include {
             parts.push(format!(" Include pattern: `{}`.", incl));
@@ -698,6 +734,75 @@ mod tests {
         assert!(
             result.contains("test1.rs:1:fn hello()"),
             "expected match in test1.rs:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_regex_hint_on_empty_result() {
+        let dir = setup_test_dir();
+        let tool = Grep;
+        // Pattern contains | but regex:false — no file contains literal "foo|bar".
+        let args = GrepArgs {
+            pattern: "foo|bar".to_string(),
+            regex: false,
+            include: None,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+        // Should get the hint, not empty.
+        assert!(
+            !result.is_empty(),
+            "expected a hint about regex metacharacters, got empty"
+        );
+        assert!(
+            result.contains("regex metacharacters"),
+            "expected hint containing 'regex metacharacters', got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_no_hint_when_regex_enabled() {
+        let dir = setup_test_dir();
+        let tool = Grep;
+        // regex:true, so no hint should be given even if pattern has metacharacters.
+        // Pattern doesn't match anything as a regex either.
+        let args = GrepArgs {
+            pattern: "zxyz|quux".to_string(),
+            regex: true,
+            include: None,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+        // Empty because foo|bar as regex matches nothing in the test dir.
+        assert!(
+            result.is_empty(),
+            "expected empty result with regex:true (no match), got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_no_hint_on_successful_match() {
+        let dir = setup_test_dir();
+        let tool = Grep;
+        // Pattern has no regex chars and returns results — no hint.
+        let args = GrepArgs {
+            pattern: "hello".to_string(),
+            regex: false,
+            include: None,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            !result.is_empty(),
+            "expected results, got empty"
+        );
+        // Should not contain a hint about regex.
+        assert!(
+            !result.contains("regex"),
+            "expected no hint about regex, got:\n{result}"
         );
     }
 }
