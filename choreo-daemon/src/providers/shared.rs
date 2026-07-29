@@ -123,12 +123,19 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
     }
 }
 
-/// Build a ureq agent with connect and request timeouts.
-pub(crate) fn build_agent(connect_timeout_secs: u64, request_timeout_secs: u64) -> ureq::Agent {
+/// Build a ureq agent with connect and read (inactivity) timeouts.
+///
+/// `read_timeout_secs` is an *idle* timeout — it resets each time a new
+/// chunk arrives on a streaming response.  A value of `0` means no limit.
+pub(crate) fn build_agent(connect_timeout_secs: u64, read_timeout_secs: u64) -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_connect(Some(std::time::Duration::from_secs(connect_timeout_secs)))
-            .timeout_global(Some(std::time::Duration::from_secs(request_timeout_secs)))
+            .timeout_recv_body(if read_timeout_secs > 0 {
+                Some(std::time::Duration::from_secs(read_timeout_secs))
+            } else {
+                None
+            })
             .http_status_as_error(false)
             .build(),
     )

@@ -1897,7 +1897,7 @@ mod tests {
             db: Arc::new(db),
             tool_registry: registry,
             daemon_tx,
-            max_turns_default: 25,
+            max_turns_default: 0,
         };
         let result = execute_tool_with_timeout(
             &tool_call,

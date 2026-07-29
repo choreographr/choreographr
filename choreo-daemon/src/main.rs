@@ -34,11 +34,11 @@ struct Cli {
     tcp_addr: Option<String>,
 }
 
-const DEFAULT_MAX_TURNS: u32 = 25;
+const DEFAULT_MAX_TURNS: u32 = 0;
 
 /// Resolve the tool-loop iteration limit.
 ///
-/// Resolution chain: `CHOREOGRAPHR_MAX_TURNS` env var → `config.toml` → default 25.
+/// Resolution chain: `CHOREOGRAPHR_MAX_TURNS` env var → `config.toml` → default 0 (unlimited).
 /// A value of `0` means *unlimited* — the agent loop will run until the
 /// model produces a final answer, is cancelled, or hits an error.
 fn resolve_max_turns() -> u32 {

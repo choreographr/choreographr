@@ -1641,7 +1641,7 @@ mod tests {
             db,
             tool_registry,
             daemon_tx,
-            max_turns_default: 25,
+            max_turns_default: 0,
         };
         (test_state(), ctx)
     }
