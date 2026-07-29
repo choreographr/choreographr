@@ -652,6 +652,10 @@ fn render_markdown_block(
                     0,
                     width.saturating_sub(indent + marker_width),
                 );
+                // Track whether the item spans more than one visual line.
+                // Multi-line items get a blank line after them; single-line
+                // items are compact (no gap) for a tight list feel.
+                let item_multi_line = rendered.len() > 1;
                 let mut rendered_iter = rendered.into_iter();
                 if let Some(first) = rendered_iter.next() {
                     let mut spans = vec![Span::styled(
@@ -672,11 +676,12 @@ fn render_markdown_block(
                     lines.push(Line::from(spans));
                 }
 
-                // Blank line between sibling items for visual separation.
-                // Uses ensure_blank_line so consecutive blanks collapse into
-                // one (e.g. when the preceding item ends with a nested list
-                // that already produced a blank line).
-                if index + 1 < items.len() {
+                // Blank line after multi-line items only, so simple
+                // single-line items stay compact (no gaps).  Uses
+                // ensure_blank_line so consecutive blanks collapse into
+                // one (e.g. when a multi-line item ends with a nested
+                // list that already produced a blank line).
+                if index + 1 < items.len() && item_multi_line {
                     ensure_blank_line(lines);
                 }
             }
@@ -2614,7 +2619,8 @@ mod tests {
     // ── list blank-line collapsing ────────────────────────────────────────
 
     #[test]
-    fn list_items_separated_by_blank_lines() {
+    fn list_items_compact_when_single_line() {
+        // Single-line list items should not have blank lines between them.
         let result = markdown_lines("- alpha\n- beta\n- gamma", 80);
         let whole: String = result
             .iter()
@@ -2624,22 +2630,40 @@ mod tests {
         assert!(whole.contains("• alpha"), "first item should render");
         assert!(whole.contains("• beta"), "second item should render");
         assert!(whole.contains("• gamma"), "third item should render");
-        // Each pair of items should have exactly one blank line between them.
+        // No blank lines between single-line items.
         let blank_lines: Vec<bool> = result
             .windows(2)
             .map(|w| w[0].width() == 0 && w[1].width() > 0)
             .collect();
         assert_eq!(
             blank_lines.iter().filter(|&&b| b).count(),
-            2,
-            "should have blank lines between 3 items"
+            0,
+            "single-line list items should have no blank lines between them\n{whole}"
         );
     }
 
     #[test]
-    fn nested_list_does_not_produce_double_blank_line() {
-        // Item 1 has a nested list (which ends with a blank line)
-        // Item 2 follows — should not have two blank lines between them.
+    fn multi_line_list_item_has_blank_after() {
+        // A multi-line (wrapping) item should get a blank line after it.
+        let long = "a".repeat(60);
+        let md = format!("- {long}\n- short");
+        let result = markdown_lines(&md, 40);
+        // The long item wraps to multiple visual lines → blank line before "• short".
+        let short_idx = result.iter().position(|l| l.to_string().contains("short"));
+        assert!(short_idx.is_some(), "second item should appear");
+        let idx = short_idx.unwrap();
+        assert!(
+            idx >= 1 && result[idx - 1].width() == 0,
+            "expected a blank line before multi-line item's successor, got lines[{}]='{}'",
+            idx - 1,
+            result[idx - 1]
+        );
+    }
+
+    #[test]
+    fn nested_list_outer_gets_blank_inner_compact() {
+        // Outer item spans multiple lines (nested list) so it gets a blank line
+        // after it.  Inner items are single-line so they stay compact (no gaps).
         let md = "- outer\n  - inner\n  - inner2\n- next";
         let result = markdown_lines(md, 80);
         let whole: String = result
@@ -2650,8 +2674,26 @@ mod tests {
         assert!(whole.contains("• outer"), "first outer item");
         assert!(whole.contains("• inner"), "first inner item");
         assert!(whole.contains("• next"), "second outer item");
-        // Count consecutive blank lines — there shouldn't be any pairs of
-        // consecutive blank lines.
+        // Inner items should be compact (no blank between "• inner" and "• inner2").
+        let inner_idx = result.iter().position(|l| l.to_string().contains("inner2"));
+        assert!(inner_idx.is_some(), "inner2 should appear");
+        let i = inner_idx.unwrap();
+        // The line before inner2 should be "  • inner", not a blank line.
+        assert!(
+            i >= 1 && result[i - 1].width() > 0,
+            "inner items should be compact (no blank before inner2)"
+        );
+        // But there should be one blank line before "• next" (outer is multi-line).
+        let next_idx = result.iter().position(|l| l.to_string().contains("next"));
+        assert!(next_idx.is_some(), "next should appear");
+        let n = next_idx.unwrap();
+        assert!(
+            n >= 1 && result[n - 1].width() == 0,
+            "expected blank line before '• next', got lines[{}]='{}'",
+            n - 1,
+            result[n - 1]
+        );
+        // No consecutive blank lines anywhere.
         let has_double_blank = result
             .windows(2)
             .any(|w| w[0].width() == 0 && w[1].width() == 0);
@@ -2662,7 +2704,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_list_items_separated() {
+    fn ordered_list_items_compact_when_single_line() {
         let result = markdown_lines("1. first\n2. second\n3. third", 80);
         let blank: Vec<bool> = result
             .windows(2)
@@ -2670,8 +2712,8 @@ mod tests {
             .collect();
         assert_eq!(
             blank.iter().filter(|&&b| b).count(),
-            2,
-            "should have blank lines between ordered items"
+            0,
+            "single-line ordered items should have no blank lines between them"
         );
     }
 
