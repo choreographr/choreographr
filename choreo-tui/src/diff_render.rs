@@ -320,16 +320,24 @@ fn spans_fixed_width(spans: &mut Vec<Span<'static>>, width: usize) {
     if total > width {
         let mut remaining = width;
         let mut keep = 0usize;
-        for s in spans.iter() {
-            let w = s.width();
-            if remaining >= w {
+        for i in 0..spans.len() {
+            let w = spans[i].width();
+            if w <= remaining {
                 remaining -= w;
-                keep += 1;
+                keep = i + 1;
             } else {
+                // This span is wider than the remaining space.  Truncate its
+                // content to fit rather than dropping it entirely (which would
+                // lose the text the user needs to see).
+                spans.truncate(keep + 1);
+                spans[keep] = Span::styled(
+                    truncate_str(&spans[keep].content, remaining),
+                    spans[keep].style.clone(),
+                );
+                remaining = 0;
                 break;
             }
         }
-        spans.truncate(keep);
         if remaining > 0 {
             spans.push(Span::styled(" ".repeat(remaining), Style::default()));
         }
@@ -735,6 +743,57 @@ mod tests {
         let mut spans = vec![Span::styled("hello world", Style::default())];
         spans_fixed_width(&mut spans, 5);
         assert_eq!(spans.iter().map(|s| s.width()).sum::<usize>(), 5);
+        // Content should be truncated with … not dropped entirely.
+        let text: String = spans.iter().flat_map(|s| s.content.chars()).collect();
+        assert_eq!(text.chars().count(), 5, "should be 5 chars wide");
+        assert!(text.ends_with('…'), "truncated content should end with ellipsis");
+    }
+
+    #[test]
+    fn spans_truncated_multi_span_with_overflow() {
+        // Simulates a syntax-highlighted line where the first few small
+        // spans (indent, punctuation) fit, but a large content span overflows.
+        let mut spans = vec![
+            Span::styled("        ".to_string(), Style::default().fg(Color::Blue)),
+            Span::styled("\"".to_string(), Style::default().fg(Color::Green)),
+            Span::styled(
+                "very long string content that exceeds the available width by a lot"
+                    .to_string(),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled("\"".to_string(), Style::default().fg(Color::Green)),
+        ];
+        spans_fixed_width(&mut spans, 20);
+        // Total width should be exactly 20.
+        assert_eq!(spans.iter().map(|s| s.width()).sum::<usize>(), 20);
+        // The first two spans should be preserved as-is.
+        assert_eq!(spans[0].content, "        ", "indent span preserved");
+        assert_eq!(spans[1].content, "\"", "opening quote preserved");
+        // The third (overflowing) span should be truncated to fit the remaining width.
+        // Remaining after 8 (indent) + 1 (quote) = 9 columns used; 11 remaining.
+        // So the third span should occupy 11 columns and end with ….
+        let third = &spans[2];
+        assert_eq!(third.width(), 11, "overflowing span should fill remaining width");
+        assert!(
+            third.content.ends_with('…'),
+            "truncated span should end with …"
+        );
+        // There should be no fourth span — it's beyond the overflow cutoff.
+        assert_eq!(spans.len(), 3, "should have exactly 3 spans after truncation");
+    }
+
+    #[test]
+    fn spans_truncated_single_span_too_wide() {
+        // Single span wider than the target — should be truncated, not dropped.
+        let mut spans = vec![Span::styled(
+            "aaabbbcccddd".to_string(),
+            Style::default(),
+        )];
+        spans_fixed_width(&mut spans, 6);
+        assert_eq!(spans.iter().map(|s| s.width()).sum::<usize>(), 6);
+        let text: String = spans.iter().flat_map(|s| s.content.chars()).collect();
+        assert_eq!(text.chars().count(), 6, "should be 6 chars wide");
+        assert!(text.ends_with('…'), "truncated content should end with ellipsis");
     }
 
     // ── is_meta_line ──
