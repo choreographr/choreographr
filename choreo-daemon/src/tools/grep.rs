@@ -90,6 +90,52 @@ fn run_grep_walk(
 
     let mut searcher = SearcherBuilder::new().build();
 
+    // When the path points directly to a file (not a directory), search it
+    // directly rather than going through the directory walker. zlob's
+    // WalkBuilder does not yield the root entry when it is a file, so the
+    // walk loop skips it silently. This also avoids .gitignore filtering
+    // for explicitly-requested files.
+    if resolved.is_file() {
+        // Apply the include glob filter if one was configured — matching
+        // by basename, consistent with the file-glob code path.
+        if let Some(ref filter) = include_filter
+            && !filter.matches(resolved)
+        {
+            // File doesn't match the glob — return empty.
+            return Ok(String::new());
+        }
+
+        // Search the file. `GrepSink` handles both streaming (when
+        // `output_tx` is set) and collecting modes transparently.
+        sink.current_path = resolved.to_path_buf();
+        if let Err(e) = searcher.search_path(&matcher, resolved, &mut sink) {
+            tracing::debug!(
+                path = %resolved.display(),
+                error = %e,
+                "grep search error on file, skipping"
+            );
+        }
+
+        // Format the (single-file) results.
+        // Use the file name as the display prefix since there's no
+        // directory structure to derive a relative path from.
+        let file_name = resolved
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        if sink.results.is_empty() {
+            return Ok(String::new());
+        }
+        let lines: Vec<String> = sink
+            .results
+            .iter()
+            .map(|(_, line_num, content)| {
+                format!("{}:{}:{}", file_name, line_num, content)
+            })
+            .collect();
+        return Ok(truncate_tool_output(&lines.join("\n")));
+    }
+
     // Walk the directory tree with gitignore-aware traversal.
     // WalkFlags::RECOMMENDED skips hidden files and respects .gitignore rules.
     WalkBuilder::new(resolved)
@@ -183,7 +229,7 @@ impl Tool for Grep {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents for a pattern. Pattern is treated as a literal substring by default — set regex:true to use regular expressions (be sure to set regex:true if your pattern contains regex metacharacters like |, (, ), ^, $, +, etc. — without it they are matched literally). Use include to filter files by glob (e.g. \"*.rs\"), path to scope the search directory, and max_results to cap matches. Results in file:line:content format. Respects .gitignore, hidden, and binary files."
+        "Search file contents for a pattern. Pattern is treated as a literal substring by default — set regex:true to use regular expressions (be sure to set regex:true if your pattern contains regex metacharacters like |, (, ), ^, $, +, etc. — without it they are matched literally). Use include to filter files by glob (e.g. \"*.rs\"), path to scope the search (a file or directory), and max_results to cap matches. Results in file:line:content format. Respects .gitignore, hidden, and binary files."
     }
 
     fn supports_streaming_output() -> bool {
@@ -629,5 +675,29 @@ mod tests {
         // so `*` consumes the prefix, then `/data.txt` matches literally.
         // Both `/tmp/xxx/data.txt` and `/tmp/xxx/sub/data.txt` should match.
         assert_eq!(result.lines().count(), 2, "expected 2 matches:\n{result}");
+    }
+
+    #[test]
+    fn test_file_path_direct() {
+        let dir = setup_test_dir();
+        let tool = Grep;
+        // Point path directly at a single file, not a directory.
+        let file_path = dir.path().join("test1.rs");
+        let args = GrepArgs {
+            pattern: "hello".to_string(),
+            regex: false,
+            include: None,
+            path: Some(file_path.to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            !result.is_empty(),
+            "expected match when path points directly to a file, got empty"
+        );
+        assert!(
+            result.contains("test1.rs:1:fn hello()"),
+            "expected match in test1.rs:\n{result}"
+        );
     }
 }
