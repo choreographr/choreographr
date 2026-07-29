@@ -63,6 +63,13 @@ impl SessionView {
                 }
             }
             OutputStream::Answer => {
+                // When the first response (Answer) chunk arrives, clear the
+                // reasoning content — the reasoning phase is over and the
+                // final response has begun.  This makes the TUI switch from
+                // showing reasoning to showing the response seamlessly.
+                if turn.assistant_text.is_none() {
+                    turn.assistant_reasoning = None;
+                }
                 if let Some(ref mut text) = turn.assistant_text {
                     text.push_str(data);
                 } else {

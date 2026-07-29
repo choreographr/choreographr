@@ -303,25 +303,32 @@ pub(crate) fn render_turn_lines(
     }
 
     // ── Assistant response block (blue accent) ───────────────
+    //
+    // During streaming the reasoning section is shown first.  When the
+    // response starts streaming, `assistant_reasoning` is cleared (see
+    // `stream_chunk` in history.rs) so only the response appears.
+    // After completion, if both fields exist, only the response text
+    // is shown; if no response exists, the reasoning is shown instead.
+    // No "Reasoning:" or "Response:" headings are rendered.
     let has_assistant = turn.assistant_text.is_some() || turn.assistant_reasoning.is_some();
     if has_assistant {
         let mut body: Vec<Line<'static>> = Vec::new();
 
-        // Reasoning sub-section
-        if let Some(ref reasoning) = turn.assistant_reasoning {
-            let trimmed = reasoning.trim();
-            if !trimmed.is_empty() {
-                heading_line(&mut body, "Reasoning", Color::DarkGray);
-                body.extend(markdown_lines(trimmed, content_width));
-            }
-        }
-
-        // Response sub-section
+        // Show response text preferentially — if present, it replaces
+        // any reasoning content that was shown during streaming.
         if let Some(ref text) = turn.assistant_text {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                heading_line(&mut body, "Response", Color::Cyan);
                 body.extend(markdown_lines(trimmed, content_width));
+            }
+        }
+        // Only show reasoning when there is no response text.
+        if turn.assistant_text.is_none() {
+            if let Some(ref reasoning) = turn.assistant_reasoning {
+                let trimmed = reasoning.trim();
+                if !trimmed.is_empty() {
+                    body.extend(markdown_lines(trimmed, content_width));
+                }
             }
         }
 
@@ -493,16 +500,6 @@ fn add_margin_lines(
 
     let total_rows = result.len();
     (result, total_rows)
-}
-
-fn heading_line(lines: &mut Vec<Line<'static>>, heading: &'static str, color: Color) {
-    if !lines.is_empty() {
-        lines.push(Line::from(Span::styled(String::new(), Style::default())));
-    }
-    lines.push(Line::from(Span::styled(
-        format!("{heading}:"),
-        Style::default().fg(color),
-    )));
 }
 
 pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
@@ -1751,15 +1748,20 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        // When response text is present, only the response is shown;
+        // reasoning is hidden and no headings are rendered.
         assert!(
-            text.contains("Reasoning:"),
-            "reasoning header should appear"
+            !text.contains("Reasoning:"),
+            "reasoning header should NOT appear"
         );
         assert!(
-            text.contains("Let me think"),
-            "reasoning body should appear"
+            !text.contains("Let me think"),
+            "reasoning body should NOT appear"
         );
-        assert!(text.contains("Response:"), "response header should appear");
+        assert!(
+            !text.contains("Response:"),
+            "response header should NOT appear"
+        );
         assert!(
             text.contains("The answer is 42."),
             "response body should appear"
@@ -1786,11 +1788,19 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        // Response text is present, so only the response shows.
         assert!(
-            text.contains("Reasoning:"),
-            "reasoning header should appear"
+            !text.contains("Reasoning:"),
+            "reasoning header should NOT appear"
         );
-        assert!(text.contains("bold"), "bold text content should appear");
+        assert!(
+            !text.contains("Use **bold"),
+            "reasoning body should NOT appear"
+        );
+        assert!(
+            text.contains("Okay."),
+            "response text should appear"
+        );
         assert!(
             !text.contains("**bold**"),
             "markdown bold syntax should not appear literally in output"
@@ -1817,9 +1827,10 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        // No response text, so reasoning is shown. No heading rendered.
         assert!(
-            text.contains("Reasoning:"),
-            "reasoning header should appear"
+            !text.contains("Reasoning:"),
+            "reasoning header should NOT appear"
         );
         assert!(text.contains("code"), "code content should appear");
         assert!(
@@ -1848,11 +1859,20 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        // Response is present, whitespace-only reasoning is skipped.
+        // No headings rendered.
         assert!(
             !text.contains("Reasoning:"),
-            "whitespace-only reasoning should not produce a Reasoning header"
+            "reasoning header should NOT appear"
         );
-        assert!(text.contains("Response:"), "response header should appear");
+        assert!(
+            !text.contains("Response:"),
+            "response header should NOT appear"
+        );
+        assert!(
+            text.contains("Response text."),
+            "response body should appear"
+        );
     }
 
     #[test]
@@ -1875,9 +1895,10 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        // No response text, so reasoning is shown. No heading rendered.
         assert!(
-            text.contains("Reasoning:"),
-            "reasoning header should appear"
+            !text.contains("Reasoning:"),
+            "reasoning header should NOT appear"
         );
         assert!(
             text.contains("fn main() {}"),
