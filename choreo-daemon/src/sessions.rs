@@ -1303,7 +1303,6 @@ fn handle_set_reasoning_effort(
         || capability.is_none();
 
     if valid {
-        let changed = state.config.reasoning_effort.as_deref() != Some(effort.as_str());
         state.config.reasoning_effort = Some(effort.clone());
         info!(
             session_id = ctx.session_id,
@@ -1315,7 +1314,7 @@ fn handle_set_reasoning_effort(
             &mut state.subscribers,
             DaemonMessage::ReasoningEffortSet { effort },
         );
-        return changed;
+        return false;
     } else {
         let model = state.config.selected_model.as_deref().unwrap_or("(none)");
         let msg = format!("model '{model}' does not support reasoning effort '{effort}'",);
