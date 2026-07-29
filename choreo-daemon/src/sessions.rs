@@ -281,6 +281,9 @@ pub struct SessionSnapshot {
 
 pub(crate) struct ActiveRequest {
     pub(crate) cancel_tx: mpsc::Sender<()>,
+    /// The turn_id associated with this request, so that late-joining
+    /// subscribers can route streaming chunks to the correct turn.
+    pub(crate) turn_id: u32,
 }
 
 pub struct ActiveSessionEntry {
@@ -820,7 +823,13 @@ fn handle_run_input(
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     state
         .active_requests
-        .insert(request_id, ActiveRequest { cancel_tx });
+        .insert(
+            request_id,
+            ActiveRequest {
+                cancel_tx,
+                turn_id: state.next_turn_id,
+            },
+        );
 
     // Workers don't need their own subscriber map — all broadcasts
     // are routed through SessionCommand::Broadcast to this main
@@ -882,7 +891,13 @@ fn handle_run_child_input(
     let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
     state
         .active_requests
-        .insert(request_id, ActiveRequest { cancel_tx });
+        .insert(
+            request_id,
+            ActiveRequest {
+                cancel_tx,
+                turn_id: state.next_turn_id,
+            },
+        );
     let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
     let ctx = ctx.clone();
     let provider = provider.clone();
@@ -1077,6 +1092,12 @@ fn handle_status_changed(
 }
 
 /// Attach a client to this session, sending the full session state snapshot.
+///
+/// If the session has active requests when the client attaches (i.e. the new
+/// client is joining mid-stream), synthetic `Started` messages are sent first
+/// so the client can populate its `request_id → turn_id` mapping and route
+/// subsequent streaming chunks (`OutputChunk`, `ToolResultChunk`, etc.) to
+/// the correct turn — without this, those chunks would be silently dropped.
 fn handle_attach(
     client_id: u64,
     tx: std::sync::mpsc::SyncSender<DaemonMessage>,
@@ -1085,6 +1106,23 @@ fn handle_attach(
 ) -> bool {
     info!("session {}: client {} attached", ctx.session_id, client_id);
     state.subscribers.insert(client_id, tx);
+
+    // Send synthetic Started messages for every active request so the
+    // new subscriber can route in-flight streaming chunks to the correct
+    // turn.  The subscriber will then populate its request_to_turn map
+    // and begin accumulating streaming content from this point forward.
+    if !state.active_requests.is_empty() {
+        if let Some(tx) = state.subscribers.get(&client_id) {
+            for (&request_id, active) in &state.active_requests {
+                let _ = tx.send(DaemonMessage::Started {
+                    request_id,
+                    turn_id: active.turn_id,
+                    estimated_prompt_tokens: 0,
+                });
+            }
+        }
+    }
+
     let snapshot = state.session_state_message(ctx.session_id);
     if let Some(tx) = state.subscribers.get(&client_id) {
         let _ = tx.send(snapshot);
@@ -1712,7 +1750,9 @@ mod tests {
     fn cancel_sends_through_channel() {
         let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
         let (mut state, ctx) = broadcast_setup();
-        state.active_requests.insert(1, ActiveRequest { cancel_tx });
+        state
+            .active_requests
+            .insert(1, ActiveRequest { cancel_tx, turn_id: 1 });
 
         let mut shutdown = false;
         process_command(
@@ -1735,12 +1775,14 @@ mod tests {
             1,
             ActiveRequest {
                 cancel_tx: cancel_tx1,
+                turn_id: 1,
             },
         );
         state.active_requests.insert(
             2,
             ActiveRequest {
                 cancel_tx: cancel_tx2,
+                turn_id: 2,
             },
         );
 
@@ -2067,6 +2109,95 @@ mod tests {
             }
             other => panic!("expected SessionState, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn attach_with_active_requests_sends_started_to_new_subscriber() {
+        let (mut state, ctx) = broadcast_setup();
+
+        // Populate active requests as if a request is in flight.
+        let (cancel_tx1, _cancel_rx1) = mpsc::channel::<()>();
+        let (cancel_tx2, _cancel_rx2) = mpsc::channel::<()>();
+        state.active_requests.insert(
+            10,
+            ActiveRequest {
+                cancel_tx: cancel_tx1,
+                turn_id: 3,
+            },
+        );
+        state.active_requests.insert(
+            20,
+            ActiveRequest {
+                cancel_tx: cancel_tx2,
+                turn_id: 7,
+            },
+        );
+
+        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Attach {
+                client_id: 42,
+                tx: sub_tx,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        // Expect Start messages for each active request, in insertion order.
+        match sub_rx.recv().unwrap() {
+            DaemonMessage::Started {
+                request_id: 10,
+                turn_id: 3,
+                estimated_prompt_tokens: 0,
+            } => {}
+            other => panic!("expected Started(10, turn=3), got {other:?}"),
+        }
+        match sub_rx.recv().unwrap() {
+            DaemonMessage::Started {
+                request_id: 20,
+                turn_id: 7,
+                estimated_prompt_tokens: 0,
+            } => {}
+            other => panic!("expected Started(20, turn=7), got {other:?}"),
+        }
+
+        // Followed by SessionState.
+        match sub_rx.recv().unwrap() {
+            DaemonMessage::SessionState { .. } => {}
+            other => panic!("expected SessionState, got {other:?}"),
+        }
+
+        assert!(!shutdown);
+    }
+
+    #[test]
+    fn attach_without_active_requests_does_not_send_started() {
+        let (mut state, ctx) = broadcast_setup();
+        // No active_requests — default empty.
+
+        let (sub_tx, sub_rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::Attach {
+                client_id: 42,
+                tx: sub_tx,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        // Only SessionState — no Started messages.
+        match sub_rx.recv().unwrap() {
+            DaemonMessage::SessionState { .. } => {}
+            other => panic!("expected SessionState, got {other:?}"),
+        }
+
+        // No more messages.
+        assert!(sub_rx.try_recv().is_err());
+        assert!(!shutdown);
     }
 
     // -- start_turn / undo_turns / redo_turns tests -----------------------
