@@ -16,7 +16,7 @@ When making changes, ensure [ARCHITECTURE.md](./ARCHITECTURE.md) and [README.md]
 
 ## Task Execution
 
-When implementing a list of code changes across multiple files, delegate each task to a subagent and run them in series (one at a time), not in parallel. This avoids filesystem conflicts from concurrent edits to overlapping files and keeps each subagent's context focused. Subagents should verify their work by running `cargo check --workspace` and `cargo test --workspace` after making changes.
+When implementing a list of code changes across multiple files, delegate each task to a subagent and run them in series (one at a time), not in parallel. This avoids filesystem conflicts from concurrent edits to overlapping files and keeps each subagent's context focused. Subagents should verify their work by running `cargo test -p <crates>` on only the crates they modified.
 
 ## Dependency Management
 
@@ -54,6 +54,11 @@ Do not share mutable state between threads. Use message passing (`mpsc` channels
 
 Always write inline comments around new code explaining how it works. Focus on the "why" — the reasoning, intent, and non-obvious details — rather than restating what the code literally does.
 
-## Linting and Formatting
+## Pre-Commit Workflow
 
-Always run `cargo clippy --workspace` and `cargo fmt --check` after writing or modifying code. Fix any clippy warnings and ensure formatting is correct before considering work complete.
+Before committing:
+1. Run `cargo test --workspace` — full test suite must pass
+2. Stage changes with `git add`
+3. Commit with `git commit`
+
+A `.githooks/pre-commit` hook auto-fixes `clippy` and `fmt` on every commit. The model should not run clippy or fmt manually during development — the hook handles them.
