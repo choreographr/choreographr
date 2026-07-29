@@ -333,12 +333,25 @@ pub(crate) fn render_turn_lines(
     }
 
     // ── Tool results block (red accent if error, gray otherwise) ─
+    //
+    // Quiet tools are those whose content is only meaningful to the LLM
+    // and would spam the user's session history if rendered in full.
+    // Their invocation description (e.g. "Reading file `main.rs`.") is
+    // shown instead, giving the user enough context without the verbatim
+    // content.
+    const QUIET_TOOLS: &[&str] = &["read_file", "read_file_range"];
+
     for tr in &turn.tool_results {
         let accent = if tr.is_error {
             Color::Red
         } else {
             Color::Reset
         };
+        // Quiet tools suppress their full content body from the UI (the
+        // invocation description is sufficient context), but the label
+        // remains the standard "tool result" — only error results get
+        // a distinct label.
+        let is_quiet = !tr.is_error && QUIET_TOOLS.contains(&tr.name.as_str());
         let label = if tr.is_error {
             "tool error"
         } else {
@@ -363,7 +376,10 @@ pub(crate) fn render_turn_lines(
             Style::default().fg(accent),
         )));
 
-        if !tr.content.is_empty() {
+        // Skip rendering the full content body for quiet tools — the
+        // invocation description above already tells the user what was
+        // read, and the raw file contents are only needed by the LLM.
+        if !is_quiet && !tr.content.is_empty() {
             body.push(Line::from(Span::styled(String::new(), Style::default())));
             // Content with ANSI escape codes gets colored rendering.
             if tr.content.contains("\x1b[") {
@@ -1911,7 +1927,7 @@ mod tests {
                 name: "read_file".into(),
                 content: "file contents".into(),
                 is_error: false,
-                invocation_description: String::new(),
+                invocation_description: "Reading file `src/main.rs`.".into(),
             }],
             displayed_images: vec![],
         };
@@ -1921,8 +1937,12 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        // Quiet tools show the standard "tool result" label and the
+        // invocation description but suppress the full content body
+        // — the LLM still gets it.
         assert!(text.contains("tool result: read_file"));
-        assert!(text.contains("file contents"));
+        assert!(text.contains("src/main.rs"));
+        assert!(!text.contains("file contents"));
     }
 
     #[test]
