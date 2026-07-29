@@ -120,9 +120,9 @@ pub fn execute_notify_send(
     }
 
     // Build the notification with a fixed app name so the desktop environment
-    // groups Tai's notifications under a single application entry.
+    // groups Choreographr's notifications under a single application entry.
     let mut notification = Notification::new();
-    notification.summary(&args.summary).appname("Tai");
+    notification.summary(&args.summary).appname("Choreographr");
 
     // All fields except `summary` are optional; each is mapped to the
     // notify-rust builder method only when present.
