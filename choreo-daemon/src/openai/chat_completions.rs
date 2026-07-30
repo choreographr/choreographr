@@ -244,7 +244,16 @@ pub(crate) fn chat_completions_request_with_tools(
     }
 
     if !discarded.is_empty() {
-        return Err(super::OpenAiError::TruncatedToolCall { discarded });
+        // All calls had invalid arguments. Return the text if the model
+        // produced any, so the session continues gracefully and the LLM
+        // can retry with valid arguments on the next turn.
+        let content = choice.message.content.unwrap_or_default().trim().to_string();
+        return Ok(ChatTurnResult::FinalText(FinalTextResult {
+            content,
+            reasoning,
+            usage: turn_usage,
+            response_id: None,
+        }));
     }
 
     let content = choice
@@ -552,7 +561,14 @@ where
             }));
         }
         if !discarded.is_empty() {
-            return Err(super::OpenAiError::TruncatedToolCall { discarded });
+            // All calls had invalid arguments. Return accumulated text so the
+            // session can continue gracefully.
+            return Ok(ChatTurnResult::FinalText(FinalTextResult {
+                content: full_content,
+                reasoning: if full_reasoning.is_empty() { None } else { Some(full_reasoning) },
+                usage: last_usage,
+                response_id: None,
+            }));
         }
     }
 
@@ -571,7 +587,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     // -- validate_tool_call_arguments tests --------------------------------
 
@@ -981,21 +996,5 @@ mod tests {
         assert_eq!(delta.reasoning_text.as_deref(), Some("think"));
     }
 
-    // -- sleep_or_cancel tests -------------------------------------------
 
-    #[test]
-    fn sleep_or_cancel_signal_returns_cancelled() {
-        let (tx, rx) = mpsc::channel::<()>();
-        tx.send(()).unwrap();
-        let result = crate::retry::sleep_or_cancel(Duration::from_secs(10), Some(&rx));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn sleep_or_cancel_disconnected_returns_ok() {
-        let (tx, rx) = mpsc::channel::<()>();
-        drop(tx);
-        let result = crate::retry::sleep_or_cancel(Duration::from_millis(1), Some(&rx));
-        assert!(result.is_ok());
-    }
 }

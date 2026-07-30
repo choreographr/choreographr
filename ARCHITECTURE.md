@@ -291,7 +291,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 
 | `retry/` | Shared HTTP retry logic extracted from the OpenAI module. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. All provider modules use this via the shared `ProviderError` type conversion. |
 | `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional working directory. |
-| `requests.rs` | Prompt execution: builds messages from session history, runs model requests, drives tool-call loop. |
+| `chat_completions.rs` / `responses.rs` | Chat Completions and Responses API wire types, request functions, SSE streaming, tool call accumulation. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
 | `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading, programmatic tool calling (Responses API). |
@@ -1293,9 +1293,9 @@ and exits cleanly when the daemon shuts down.
    - calls requests.rs to execute
         │
 5. requests.rs builds message array from session history
-   → calls openai::requests to hit the API
+   → calls openai::chat_completions or openai::responses (based on request_format_for_model)
         │
-6. openai::requests streams SSE chunks
+6. openai::chat_completions / openai::responses streams SSE chunks
    → per chunk: DaemonMessage::OutputChunk { request_id: 1, stream: true, data: "Hello" }
         │
 7. DaemonMessage is serialized + framed → socket → choreo-tui
@@ -1641,7 +1641,7 @@ Sandboxing (shared across all shell/exec tools via `shell_util.rs`):
 | Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `choreographr/src/tests.rs`, `choreographr/tests/integration.rs` |
 | MCP (choreo-mcp) | Server spawn, tool discovery, echo tool call/response | `choreo-mcp/tests/mcp_integration.rs` |
 | MCP (daemon) | McpManager + ToolRegistry integration, dynamic group registration, tool execution | `choreographr/tests/mcp_integration.rs` |
-| Daemon OpenAI | SSE parsing, HTTP request construction, config loading | `choreographr/src/openai/tests.rs` |
+| Daemon OpenAI | SSE parsing, HTTP request construction, config loading | `choreographr/src/openai/tests.rs`, `choreographr/src/openai/chat_completions.rs`, `choreographr/src/openai/config.rs` |
 | Daemon Anthropic | Content block deserialisation, response→turn result conversion, message payload building, config overrides | `choreographr/src/anthropic/tests.rs` |
 | choreo-tui | SVG rasterization, Unicode width, app state | `choreo-tui/src/app_tests.rs`, `choreo-tui/src/lib_tests.rs` |
 | choreo-gui | App state, render helpers | `choreo-gui/src/app_tests.rs` |

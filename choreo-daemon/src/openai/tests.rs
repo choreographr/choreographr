@@ -1,4 +1,7 @@
 use super::*;
+use std::sync::mpsc;
+use std::time::Duration;
+
 
 #[test]
 fn build_sse_event_joins_multiple_data_lines() {
@@ -342,4 +345,22 @@ fn parse_responses_stream_event_program_output_done_defaults() {
 fn parse_responses_stream_event_program_output_done_missing_call_id() {
     let result = parse_responses_stream_event(r#"{"type":"response.program_output.done"}"#);
     assert!(result.is_err(), "missing call_id should be an error");
+}
+
+// -- sleep_or_cancel tests -------------------------------------------
+
+#[test]
+fn sleep_or_cancel_signal_returns_cancelled() {
+    let (tx, rx) = mpsc::channel::<()>();
+    tx.send(()).unwrap();
+    let result = crate::retry::sleep_or_cancel(Duration::from_secs(10), Some(&rx));
+    assert!(result.is_err());
+}
+
+#[test]
+fn sleep_or_cancel_disconnected_returns_ok() {
+    let (tx, rx) = mpsc::channel::<()>();
+    drop(tx);
+    let result = crate::retry::sleep_or_cancel(Duration::from_millis(1), Some(&rx));
+    assert!(result.is_ok());
 }

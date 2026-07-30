@@ -31,8 +31,6 @@ pub(crate) use crate::retry::{
 };
 pub use retry::RetryCallback;
 
-
-
 use serde::{Deserialize, Serialize};
 use std::io;
 
