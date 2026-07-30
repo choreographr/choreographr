@@ -431,6 +431,10 @@ impl DaemonState {
             })
         });
 
+        // Clone before moving into record — needed for created_msg below.
+        let selected_model_clone = selected_model.clone();
+        let reasoning_effort_clone = reasoning_effort.clone();
+
         let record = SessionRecord {
             title: title.clone(),
             selected_model,
@@ -484,6 +488,9 @@ impl DaemonState {
             parent_session_id,
             working_dir: cwd_str,
             max_turns,
+            account_name,
+            selected_model: selected_model_clone,
+            reasoning_effort: reasoning_effort_clone,
         };
         let status_msg = DaemonMessage::SessionStatusChanged {
             session_id: sid,
@@ -2212,6 +2219,9 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 max_turns: None,
+                account_name: None,
+                selected_model: None,
+                reasoning_effort: None,
             },
             DaemonMessage::SessionAttached { session_id: 42 },
             DaemonMessage::SessionState {

@@ -66,6 +66,9 @@ pub trait TurnEventHandler {
         title: Option<String>,
         working_dir: Option<String>,
         max_turns: Option<u32>,
+        account_name: Option<String>,
+        selected_model: Option<String>,
+        reasoning_effort: Option<String>,
     );
     fn handle_session_status_changed(&mut self, session_id: u64, status: SessionStatus);
     fn handle_token_usage_update(
@@ -84,6 +87,9 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             title,
             working_dir,
             max_turns,
+            account_name,
+            selected_model,
+            reasoning_effort,
             ..
         } => {
             handler.handle_session_created(
@@ -91,6 +97,9 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
                 title.clone(),
                 working_dir.clone(),
                 *max_turns,
+                account_name.clone(),
+                selected_model.clone(),
+                reasoning_effort.clone(),
             );
         }
         DaemonMessage::Sessions { .. } => {

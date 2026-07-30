@@ -476,6 +476,9 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 max_turns: None,
+                account_name: None,
+                selected_model: None,
+                reasoning_effort: None,
             },
             DaemonMessage::Sessions { sessions: vec![] },
             DaemonMessage::Models {

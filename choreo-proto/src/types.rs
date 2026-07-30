@@ -366,6 +366,9 @@ pub enum DaemonMessage {
         parent_session_id: Option<u64>,
         working_dir: Option<String>,
         max_turns: Option<u32>,
+        account_name: Option<String>,
+        selected_model: Option<String>,
+        reasoning_effort: Option<String>,
     },
     Sessions {
         sessions: Vec<SessionSummary>,

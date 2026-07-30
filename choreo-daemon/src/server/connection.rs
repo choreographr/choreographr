@@ -518,10 +518,10 @@ fn handle_client_create_session(
         parent_session_id,
         working_dir: working_dir.map(std::path::PathBuf::from),
         max_turns,
-        reasoning_effort,
-        selected_model,
+        reasoning_effort: reasoning_effort.clone(),
+        selected_model: selected_model.clone(),
         context_config,
-        account_name,
+        account_name: account_name.clone(),
         active_tool_groups: Vec::new(),
         reply,
     });
@@ -544,6 +544,9 @@ fn handle_client_create_session(
                 parent_session_id,
                 working_dir: cwd_str,
                 max_turns,
+                account_name,
+                selected_model,
+                reasoning_effort,
             });
         }
         Ok(Err(e)) => {

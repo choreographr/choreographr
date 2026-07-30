@@ -1733,13 +1733,31 @@ impl App {
     pub(crate) fn handle_session_created(
         &mut self,
         session_id: u64,
+        account_name: Option<String>,
+        selected_model: Option<String>,
+        reasoning_effort: Option<String>,
         client_tx: &std::sync::mpsc::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
         if self.page == Page::SessionManager {
             let _ = client_tx.send(ClientMessage::ListSessions);
         } else {
+            // When creating from the Chat page, send ListSessions before
+            // AttachSession so the session summary list is populated before
+            // SessionAttached triggers handle_session_attached.
+            client_tx
+                .send(ClientMessage::ListSessions)
+                .map_err(broken_pipe)?;
             self.reset_for_session_switch(session_id);
             self.attached_session_id = Some(session_id);
+            // Set display fields immediately so they're available when
+            // SessionAttached arrives — check the session summary first,
+            // then fall back to the creation parameters.
+            {
+                let display = self.display_for(session_id);
+                display.account_name = account_name;
+                display.selected_model = selected_model;
+                display.reasoning_effort = reasoning_effort;
+            }
             client_tx
                 .send(ClientMessage::AttachSession { session_id })
                 .map_err(broken_pipe)?;
@@ -1925,6 +1943,14 @@ impl App {
                         })
                         .map_err(broken_pipe)?;
                 } else {
+                    // Inherit account_name from the first available account,
+                    // so the auto-created default session doesn't lose the
+                    // account selection that was already configured.
+                    let default_account = self
+                        .ai_providers
+                        .accounts
+                        .first()
+                        .map(|a| a.name.clone());
                     client_tx
                         .send(ClientMessage::CreateSession {
                             title: Some("default".to_string()),
@@ -1932,7 +1958,7 @@ impl App {
                             working_dir: None,
                             max_turns: None,
                             context_config: None,
-                            account_name: None,
+                            account_name: default_account,
                             selected_model: None,
                             reasoning_effort: None,
                         })
@@ -2530,6 +2556,9 @@ impl TurnEventHandler for App {
         _title: Option<String>,
         _working_dir: Option<String>,
         _max_turns: Option<u32>,
+        _account_name: Option<String>,
+        _selected_model: Option<String>,
+        _reasoning_effort: Option<String>,
     ) {
     }
 

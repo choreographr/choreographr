@@ -143,6 +143,9 @@ impl TurnEventHandler for AppState {
         title: Option<String>,
         working_dir: Option<String>,
         max_turns: Option<u32>,
+        _account_name: Option<String>,
+        _selected_model: Option<String>,
+        _reasoning_effort: Option<String>,
     ) {
         debug!(
             session_id,
