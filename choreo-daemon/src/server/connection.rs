@@ -40,8 +40,7 @@ fn cleanup_client(
     if let Some(ref tx) = attached_session_tx {
         let _ = tx.send(SessionCommand::Detach { client_id });
     }
-    let _ = daemon_tx.send(DaemonCommand::UnregisterSummarySubscriber { client_id });
-    let _ = daemon_tx.send(DaemonCommand::UnregisterActivitySubscriber { client_id });
+    let _ = daemon_tx.send(DaemonCommand::ClientDisconnected { client_id });
     drop(writer_tx);
     let _ = writer_handle.join();
     crate::metrics::record_client_disconnected();

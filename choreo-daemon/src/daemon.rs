@@ -131,6 +131,12 @@ pub enum DaemonCommand {
         client_id: u64,
         session_id: u64,
     },
+    /// Clean up all per-client tracking when a client disconnects.
+    /// Removes from summary subscribers, activity subscribers, and session
+    /// subscription tracking in a single atomic command.
+    ClientDisconnected {
+        client_id: u64,
+    },
     BroadcastActivity(DaemonMessage),
     BroadcastSessionStatus {
         session_id: u64,
@@ -256,6 +262,9 @@ impl DaemonState {
             }
             DaemonCommand::UntrackSessionSubscription { client_id, session_id } => {
                 self.handle_untrack_session_subscription(client_id, session_id)
+            }
+            DaemonCommand::ClientDisconnected { client_id } => {
+                self.handle_client_disconnected(client_id)
             }
             DaemonCommand::BroadcastActivity(msg) => self.handle_broadcast_activity(msg),
             DaemonCommand::BroadcastSessionStatus { session_id, status } => {
@@ -780,20 +789,45 @@ impl DaemonState {
         client_id: u64,
         writer: std::sync::mpsc::SyncSender<DaemonMessage>,
     ) {
+        info!("registering activity subscriber: client_id={}", client_id);
         self.activity_subscribers.insert(client_id, writer);
     }
 
     /// Unregister a client from all session activity broadcasts.
+    ///
+    /// Only removes from the activity subscriber map — does NOT clear
+    /// `client_subscribed_sessions`.  Session subscription tracking is
+    /// cleaned up by explicit `UntrackSessionSubscription` messages sent
+    /// from session threads on client detach, and by `handle_client_disconnected`
+    /// when the client fully disconnects.
+    ///
+    /// This preserves the invariant that a client that explicitly unsubscribes
+    /// from all activity but remains attached to sessions can re-subscribe
+    /// without causing duplicate delivery (the dedup filter in
+    /// `handle_broadcast_activity` still knows about their session subscriptions).
     fn handle_unregister_activity_subscriber(&mut self, client_id: u64) {
+        debug!("unregistering activity subscriber: client_id={}", client_id);
         self.activity_subscribers.remove(&client_id);
-        // Also clean up the session subscription tracking for this client
-        // so stale entries don't accumulate.
+    }
+
+    /// Clean up all per-client tracking when a client disconnects.
+    /// Removes from summary subscribers, activity subscribers, and session
+    /// subscription tracking in a single atomic operation so stale entries
+    /// don't accumulate.
+    fn handle_client_disconnected(&mut self, client_id: u64) {
+        info!("client disconnected cleanup: client_id={}", client_id);
+        self.summary_subscribers.remove(&client_id);
+        self.activity_subscribers.remove(&client_id);
         self.client_subscribed_sessions.remove(&client_id);
     }
 
     /// Track that `client_id` is a direct subscriber of `session_id`.
     /// Idempotent — re-attach to the same session is a no-op.
     fn handle_track_session_subscription(&mut self, client_id: u64, session_id: u64) {
+        debug!(
+            "track session subscription: client_id={}, session_id={}",
+            client_id, session_id
+        );
         self.client_subscribed_sessions
             .entry(client_id)
             .or_default()
@@ -802,6 +836,10 @@ impl DaemonState {
 
     /// Untrack that `client_id` is no longer a direct subscriber of `session_id`.
     fn handle_untrack_session_subscription(&mut self, client_id: u64, session_id: u64) {
+        debug!(
+            "untrack session subscription: client_id={}, session_id={}",
+            client_id, session_id
+        );
         if let std::collections::hash_map::Entry::Occupied(mut entry) =
             self.client_subscribed_sessions.entry(client_id)
         {
@@ -822,7 +860,12 @@ impl DaemonState {
     /// the originating session — those clients receive the message through
     /// the per-session subscriber path, avoiding duplicate delivery.
     fn handle_broadcast_activity(&mut self, msg: DaemonMessage) {
-        let origin_session_id = message_session_id(&msg);
+        let origin_session_id = msg.session_id();
+        debug!(
+            "BroadcastActivity: session_id={:?}, subscriber_count={}",
+            origin_session_id,
+            self.activity_subscribers.len(),
+        );
         self.activity_subscribers
             .retain(|client_id, tx| {
                 // Skip if this client is also a direct subscriber of the
@@ -1274,73 +1317,14 @@ fn handle_list_models_inner(
     Ok((models, selected_model))
 }
 
-/// Extract the `session_id` field from a [`DaemonMessage`] variant, if it has one.
-/// Used by `handle_broadcast_activity` to filter duplicates by origin session.
-fn message_session_id(msg: &DaemonMessage) -> Option<u64> {
-    match msg {
-        DaemonMessage::SessionCreated { session_id, .. }
-        | DaemonMessage::SessionAttached { session_id }
-        | DaemonMessage::SessionState { session_id, .. }
-        | DaemonMessage::SessionStatusChanged { session_id, .. }
-        | DaemonMessage::SessionFailed { session_id, .. }
-        | DaemonMessage::SessionDeleted { session_id }
-        | DaemonMessage::SessionDeleteFailed { session_id, .. }
-        | DaemonMessage::TurnAppended { session_id, .. }
-        | DaemonMessage::TurnFinalized { session_id, .. }
-        | DaemonMessage::TurnsUndone { session_id, .. }
-        | DaemonMessage::TurnsRedone { session_id, .. }
-        | DaemonMessage::Started { session_id, .. }
-        | DaemonMessage::OutputChunk { session_id, .. }
-        | DaemonMessage::ToolCallStarted { session_id, .. }
-        | DaemonMessage::ToolCallFinished { session_id, .. }
-        | DaemonMessage::ToolCallFailed { session_id, .. }
-        | DaemonMessage::ToolResultChunk { session_id, .. }
-        | DaemonMessage::Done { session_id, .. }
-        | DaemonMessage::Failed { session_id, .. }
-        | DaemonMessage::Cancelled { session_id, .. }
-        | DaemonMessage::ModelSelected { session_id, .. }
-        | DaemonMessage::ModelSelectionFailed { session_id, .. }
-        | DaemonMessage::TokenUsageUpdate { session_id, .. }
-        | DaemonMessage::LiveOutputTokenCount { session_id, .. }
-        | DaemonMessage::SessionAccountSet { session_id, .. }
-        | DaemonMessage::ContextWindowResolved { session_id, .. }
-        | DaemonMessage::SessionWorkingDirSet { session_id, .. }
-        | DaemonMessage::SessionTitleSet { session_id, .. }
-        | DaemonMessage::ReasoningEffortSet { session_id, .. }
-        | DaemonMessage::ReasoningEffortSetFailed { session_id, .. } => Some(*session_id),
-        // The following variants do not carry a session_id.
-        DaemonMessage::Sessions { .. }
-        | DaemonMessage::Pong
-        | DaemonMessage::Models { .. }
-        | DaemonMessage::ModelsFailed { .. }
-        | DaemonMessage::Unlocked
-        | DaemonMessage::Locked
-        | DaemonMessage::LockedError { .. }
-        | DaemonMessage::CredentialAdded { .. }
-        | DaemonMessage::CredentialAddFailed { .. }
-        | DaemonMessage::CredentialRemoved { .. }
-        | DaemonMessage::CredentialRemoveFailed { .. }
-        | DaemonMessage::Credential { .. }
-        | DaemonMessage::AccountAdded { .. }
-        | DaemonMessage::AccountAddFailed { .. }
-        | DaemonMessage::AccountRemoved { .. }
-        | DaemonMessage::AccountRemoveFailed { .. }
-        | DaemonMessage::Accounts { .. }
-        | DaemonMessage::AccountListFailed { .. }
-        | DaemonMessage::ShuttingDown => None,
-        // Catch-all for any future variants added to this #[non_exhaustive] enum.
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::providers::test_util::make_test_provider;
     use crate::server::connection::SUBSCRIBER_CHANNEL_CAPACITY;
     use crate::sessions::SessionMetadata;
-    use choreo_proto::{DaemonMessage, SessionStatus};
-    use std::collections::HashMap;
+    use choreo_proto::{DaemonMessage, SessionStatus, TimestampMs, Turn};
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::mpsc;
     use std::time::Instant;
 
@@ -1805,5 +1789,614 @@ mod tests {
             title: "ghost title".into(),
         });
         // No active session = no message to verify; just checking no panic.
+    }
+
+    // ── Activity subscriber tests ───────────────────────────────────────
+
+    #[test]
+    fn handle_register_activity_subscriber_adds_to_map() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx, _) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx,
+        });
+
+        assert!(state.activity_subscribers.contains_key(&10));
+    }
+
+    #[test]
+    fn handle_register_activity_subscriber_replaces_existing() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx1, _) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx2, _) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx1,
+        });
+        // Re-register with a different writer — should replace without error
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx2,
+        });
+
+        assert!(state.activity_subscribers.contains_key(&10));
+    }
+
+    #[test]
+    fn handle_unregister_activity_subscriber_preserves_session_tracking() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx, _) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        // Set up: client 10 is subscribed to activity AND subscribed to session 42
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx,
+        });
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 42,
+        });
+
+        // Unsubscribe from all activity — this should NOT clear session tracking
+        state.handle_command(DaemonCommand::UnregisterActivitySubscriber { client_id: 10 });
+
+        // Verify: activity subscriber is gone
+        assert!(!state.activity_subscribers.contains_key(&10));
+        // Verify: session tracking is PRESERVED
+        assert!(state.client_subscribed_sessions.contains_key(&10));
+        let sessions = state.client_subscribed_sessions.get(&10).unwrap();
+        assert!(sessions.contains(&42));
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn handle_client_disconnected_clears_all_tracking() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx, _) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        // Set up: client 10 is registered in all three maps
+        state.handle_command(DaemonCommand::RegisterSummarySubscriber {
+            client_id: 10,
+            writer: tx.clone(),
+        });
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx,
+        });
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 1,
+        });
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 2,
+        });
+
+        assert!(state.summary_subscribers.contains_key(&10));
+        assert!(state.activity_subscribers.contains_key(&10));
+        assert!(state.client_subscribed_sessions.contains_key(&10));
+
+        // Disconnect: clears everything
+        state.handle_command(DaemonCommand::ClientDisconnected { client_id: 10 });
+
+        assert!(!state.summary_subscribers.contains_key(&10));
+        assert!(!state.activity_subscribers.contains_key(&10));
+        assert!(!state.client_subscribed_sessions.contains_key(&10));
+    }
+
+    #[test]
+    fn handle_client_disconnected_noop_for_unknown_client() {
+        let (mut state, _rx) = make_daemon_state();
+        state.handle_command(DaemonCommand::ClientDisconnected { client_id: 999 });
+        // Just checking no panic
+    }
+
+    #[test]
+    fn handle_track_session_subscription_adds_entry() {
+        let (mut state, _rx) = make_daemon_state();
+
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 42,
+        });
+
+        let sessions = state
+            .client_subscribed_sessions
+            .get(&10)
+            .expect("client should have entry");
+        assert!(sessions.contains(&42));
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn handle_track_session_subscription_idempotent_re_attach() {
+        let (mut state, _rx) = make_daemon_state();
+
+        // Attach to same session twice — should be idempotent
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 42,
+        });
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 42,
+        });
+
+        let sessions = state
+            .client_subscribed_sessions
+            .get(&10)
+            .expect("client should have entry");
+        assert!(sessions.contains(&42));
+        assert_eq!(sessions.len(), 1, "should not duplicate session_id");
+    }
+
+    #[test]
+    fn handle_track_session_subscription_tracks_multiple_sessions() {
+        let (mut state, _rx) = make_daemon_state();
+
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 42,
+        });
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 99,
+        });
+
+        let sessions = state
+            .client_subscribed_sessions
+            .get(&10)
+            .expect("client should have entry");
+        assert!(sessions.contains(&42));
+        assert!(sessions.contains(&99));
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn handle_untrack_session_subscription_removes_session() {
+        let (mut state, _rx) = make_daemon_state();
+
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 42,
+        });
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 99,
+        });
+
+        // Untrack one session
+        state.handle_command(DaemonCommand::UntrackSessionSubscription {
+            client_id: 10,
+            session_id: 42,
+        });
+
+        let sessions = state
+            .client_subscribed_sessions
+            .get(&10)
+            .expect("client should still have entry");
+        assert!(!sessions.contains(&42));
+        assert!(sessions.contains(&99));
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn handle_untrack_session_subscription_removes_client_when_empty() {
+        let (mut state, _rx) = make_daemon_state();
+
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 42,
+        });
+
+        // Untrack the only session
+        state.handle_command(DaemonCommand::UntrackSessionSubscription {
+            client_id: 10,
+            session_id: 42,
+        });
+
+        // Client entry should be removed entirely when empty
+        assert!(!state.client_subscribed_sessions.contains_key(&10));
+    }
+
+    #[test]
+    fn handle_untrack_session_subscription_noop_for_unknown_session() {
+        let (mut state, _rx) = make_daemon_state();
+
+        // Untrack a session that was never tracked — should be a no-op
+        state.handle_command(DaemonCommand::UntrackSessionSubscription {
+            client_id: 10,
+            session_id: 42,
+        });
+
+        assert!(!state.client_subscribed_sessions.contains_key(&10));
+    }
+
+    #[test]
+    fn handle_untrack_session_subscription_noop_for_unknown_client() {
+        let (mut state, _rx) = make_daemon_state();
+        state.handle_command(DaemonCommand::UntrackSessionSubscription {
+            client_id: 999,
+            session_id: 42,
+        });
+        // Just checking no panic
+    }
+
+    #[test]
+    fn handle_broadcast_activity_sends_to_subscriber() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx,
+        });
+
+        let msg = DaemonMessage::OutputChunk {
+            session_id: 1,
+            request_id: 5,
+            stream: choreo_proto::OutputStream::Answer,
+            data: b"hello".to_vec(),
+        };
+        state.handle_command(DaemonCommand::BroadcastActivity(msg.clone()));
+
+        let received = rx.recv().unwrap();
+        assert_eq!(received, msg);
+        // Subscriber should still be registered
+        assert!(state.activity_subscribers.contains_key(&10));
+    }
+
+    #[test]
+    fn handle_broadcast_activity_skips_dedup_for_session_subscriber() {
+        let (mut state, _rx) = make_daemon_state();
+        // Use a sync_channel with capacity 1 so we can detect if a message
+        // was sent vs skipped.
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        // Client 10 is both an activity subscriber AND a subscriber of session 1
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx,
+        });
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 1,
+        });
+
+        // Broadcast a message FROM session 1 — should be SKIPPED for client 10
+        // because they're already a direct subscriber of session 1.
+        let msg = DaemonMessage::OutputChunk {
+            session_id: 1,
+            request_id: 5,
+            stream: choreo_proto::OutputStream::Answer,
+            data: b"hello".to_vec(),
+        };
+        state.handle_command(DaemonCommand::BroadcastActivity(msg));
+
+        // The client should NOT have received the message (it was suppressed
+        // by the dedup filter).  The retain closure returned true, so the
+        // subscriber remains registered.
+        assert!(
+            rx.try_recv().is_err(),
+            "message should have been suppressed for session subscriber"
+        );
+        assert!(state.activity_subscribers.contains_key(&10));
+    }
+
+    #[test]
+    fn handle_broadcast_activity_no_dedup_for_different_session() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        // Client 10 subscribes to session 1, but the broadcast is about session 2
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx,
+        });
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 1,
+        });
+
+        // Broadcast a message FROM session 2 — client 10 is NOT a subscriber
+        // of session 2, so the message should be delivered.
+        let msg = DaemonMessage::OutputChunk {
+            session_id: 2,
+            request_id: 5,
+            stream: choreo_proto::OutputStream::Answer,
+            data: b"hello".to_vec(),
+        };
+        state.handle_command(DaemonCommand::BroadcastActivity(msg.clone()));
+
+        let received = rx.recv().unwrap();
+        assert_eq!(received, msg);
+    }
+
+    #[test]
+    fn handle_broadcast_activity_sends_when_no_session_id() {
+        // Messages without a session_id (Models, Pong, etc.) should always
+        // be delivered to all activity subscribers.
+        let (mut state, _rx) = make_daemon_state();
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx,
+        });
+
+        let msg = DaemonMessage::Models {
+            models: vec!["gpt-4".into()],
+            selected_model: Some("gpt-4".into()),
+        };
+        state.handle_command(DaemonCommand::BroadcastActivity(msg.clone()));
+
+        let received = rx.recv().unwrap();
+        assert_eq!(received, msg);
+    }
+
+    #[test]
+    fn handle_broadcast_activity_removes_disconnected_subscriber() {
+        let (mut state, _rx) = make_daemon_state();
+        // Use a sync_channel so we can drop the receiver
+        let (tx, rx) = mpsc::sync_channel::<DaemonMessage>(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx,
+        });
+
+        // Drop the receiver to simulate a disconnected client
+        drop(rx);
+
+        // Broadcast should detect the dead subscriber and remove it
+        let msg = DaemonMessage::SessionStatusChanged {
+            session_id: 1,
+            status: SessionStatus::Inactive,
+        };
+        state.handle_command(DaemonCommand::BroadcastActivity(msg));
+
+        // Dead subscriber should be removed
+        assert!(!state.activity_subscribers.contains_key(&10));
+    }
+
+    #[test]
+    fn handle_broadcast_activity_handles_multiple_clients() {
+        let (mut state, _rx) = make_daemon_state();
+        let (tx1, rx1) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        let (tx2, rx2) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+
+        // Client 10: activity subscriber + session 1 subscriber
+        // Client 20: activity subscriber only
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 10,
+            writer: tx1,
+        });
+        state.handle_command(DaemonCommand::RegisterActivitySubscriber {
+            client_id: 20,
+            writer: tx2,
+        });
+        state.handle_command(DaemonCommand::TrackSessionSubscription {
+            client_id: 10,
+            session_id: 1,
+        });
+
+        let msg = DaemonMessage::OutputChunk {
+            session_id: 1,
+            request_id: 5,
+            stream: choreo_proto::OutputStream::Answer,
+            data: b"data".to_vec(),
+        };
+        state.handle_command(DaemonCommand::BroadcastActivity(msg.clone()));
+
+        // Client 10 (session subscriber) should be skipped
+        assert!(
+            rx1.try_recv().is_err(),
+            "client 10 is a session subscriber, should be suppressed"
+        );
+        // Client 20 (activity only) should receive the message
+        let received = rx2.recv().unwrap();
+        assert_eq!(received, msg);
+    }
+
+    // ── DaemonMessage::session_id() tests ───────────────────────────────
+
+    #[test]
+    fn session_id_returns_some_for_session_scoped_variants() {
+        let cases: Vec<DaemonMessage> = vec![
+            DaemonMessage::SessionCreated {
+                session_id: 42,
+                title: None,
+                parent_session_id: None,
+                working_dir: None,
+                max_turns: None,
+            },
+            DaemonMessage::SessionAttached { session_id: 42 },
+            DaemonMessage::SessionState {
+                session_id: 42,
+                title: None,
+                selected_model: None,
+                parent_session_id: None,
+                working_dir: None,
+                max_turns: None,
+                turns: BTreeMap::new(),
+                active_tool_groups: vec![],
+                token_usage: None,
+                context_window: None,
+                last_prompt_tokens: None,
+                status: SessionStatus::Inactive,
+                reasoning_effort: None,
+                reasoning_capability: None,
+            },
+            DaemonMessage::SessionStatusChanged {
+                session_id: 42,
+                status: SessionStatus::Inactive,
+            },
+            DaemonMessage::SessionFailed {
+                session_id: 42,
+                operation: "test".into(),
+                error: "err".into(),
+            },
+            DaemonMessage::SessionDeleted { session_id: 42 },
+            DaemonMessage::SessionDeleteFailed {
+                session_id: 42,
+                error: "err".into(),
+            },
+            DaemonMessage::TurnAppended {
+                session_id: 42,
+                turn_id: 1,
+                turn: Turn {
+                    created_at: TimestampMs::now(),
+                    undone: false,
+                    error: None,
+                    user_text: None,
+                    assistant_text: None,
+                    assistant_reasoning: None,
+                    tool_calls: vec![],
+                    token_usage: None,
+                    tool_results: vec![],
+                    displayed_images: vec![],
+                },
+            },
+            DaemonMessage::TurnFinalized {
+                session_id: 42,
+                turn_id: 1,
+                turn: Turn {
+                    created_at: TimestampMs::now(),
+                    undone: false,
+                    error: None,
+                    user_text: None,
+                    assistant_text: None,
+                    assistant_reasoning: None,
+                    tool_calls: vec![],
+                    token_usage: None,
+                    tool_results: vec![],
+                    displayed_images: vec![],
+                },
+            },
+            DaemonMessage::Started {
+                session_id: 42,
+                request_id: 1,
+                turn_id: 0,
+                estimated_prompt_tokens: 0,
+            },
+            DaemonMessage::OutputChunk {
+                session_id: 42,
+                request_id: 1,
+                stream: choreo_proto::OutputStream::Answer,
+                data: vec![],
+            },
+            DaemonMessage::Done {
+                session_id: 42,
+                request_id: 1,
+                token_usage: None,
+                last_prompt_tokens: None,
+            },
+            DaemonMessage::Failed {
+                session_id: 42,
+                request_id: 1,
+                error: "e".into(),
+            },
+            DaemonMessage::Cancelled {
+                session_id: 42,
+                request_id: 1,
+            },
+            DaemonMessage::ModelSelected {
+                session_id: 42,
+                model: "gpt-4".into(),
+                reasoning_capability: None,
+            },
+            DaemonMessage::ModelSelectionFailed {
+                session_id: 42,
+                model: "gpt-4".into(),
+                error: "e".into(),
+            },
+            DaemonMessage::ReasoningEffortSet {
+                session_id: 42,
+                effort: "off".into(),
+            },
+            DaemonMessage::SessionAccountSet {
+                session_id: 42,
+                account: "test".into(),
+            },
+            DaemonMessage::ContextWindowResolved {
+                session_id: 42,
+                context_window: 128000,
+            },
+            DaemonMessage::SessionTitleSet {
+                session_id: 42,
+                title: "test".into(),
+            },
+        ];
+
+        for msg in cases {
+            assert_eq!(
+                msg.session_id(),
+                Some(42),
+                "expected session_id=42 for {:?}",
+                std::mem::discriminant(&msg)
+            );
+        }
+    }
+
+    #[test]
+    fn session_id_returns_none_for_non_session_variants() {
+        let cases: Vec<DaemonMessage> = vec![
+            DaemonMessage::Sessions {
+                sessions: vec![],
+            },
+            DaemonMessage::Pong,
+            DaemonMessage::Models {
+                models: vec![],
+                selected_model: None,
+            },
+            DaemonMessage::ModelsFailed {
+                error: "e".into(),
+            },
+            DaemonMessage::Unlocked,
+            DaemonMessage::Locked,
+            DaemonMessage::LockedError {
+                error: "e".into(),
+            },
+            DaemonMessage::CredentialAdded {
+                service: "s".into(),
+            },
+            DaemonMessage::CredentialAddFailed {
+                service: "s".into(),
+                error: "e".into(),
+            },
+            DaemonMessage::Credential {
+                service: "s".into(),
+                key: None,
+            },
+            DaemonMessage::AccountAdded {
+                name: "a".into(),
+            },
+            DaemonMessage::Accounts {
+                accounts: vec![],
+            },
+            DaemonMessage::ShuttingDown,
+        ];
+
+        for msg in cases {
+            assert!(
+                msg.session_id().is_none(),
+                "expected no session_id for {:?}",
+                std::mem::discriminant(&msg)
+            );
+        }
+    }
+
+    #[test]
+    fn session_id_extracts_correct_value() {
+        let msg = DaemonMessage::OutputChunk {
+            session_id: 12345,
+            request_id: 1,
+            stream: choreo_proto::OutputStream::Answer,
+            data: vec![],
+        };
+        assert_eq!(msg.session_id(), Some(12345));
     }
 }
