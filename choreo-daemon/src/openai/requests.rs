@@ -2062,8 +2062,10 @@ mod tests {
 
     #[test]
     fn chat_completion_turn_dispatches_to_responses_by_default() {
-        let mut config = ServiceConfig::default();
-        config.default_request_format = RequestFormat::Responses;
+        let mut config = ServiceConfig {
+            default_request_format: RequestFormat::Responses,
+            ..Default::default()
+        };
         // Unknown model falls back to default_request_format.
         assert_eq!(
             config.request_format_for_model("unknown-model"),

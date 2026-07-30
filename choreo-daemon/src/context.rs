@@ -504,7 +504,7 @@ mod tests {
         write_file(tmp.path(), "AGENTS.md", "version 1");
 
         filetime::set_file_mtime(
-            &tmp.path().join("AGENTS.md"),
+            tmp.path().join("AGENTS.md"),
             filetime::FileTime::from_unix_time(0, 0),
         )
         .unwrap();

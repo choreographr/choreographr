@@ -60,11 +60,12 @@ fn regex_mode_hint(pattern: &str, regex: bool, has_results: bool) -> Option<Stri
     if !has_regex_chars {
         return None;
     }
-    Some(format!(
+    Some(
         "Note: pattern contains regex metacharacters but regex:false (default). \
          These characters were matched literally: `|`, `(`, `)`, `^`, `$`, `+`, `*`, `?`, `[`, `]`, `\\`. \
          If you intended regex, set regex:true."
-    ))
+            .to_string(),
+    )
 }
 
 /// Run the grep walk with the given parameters, optionally streaming each

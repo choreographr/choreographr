@@ -821,6 +821,7 @@ dependencies = [
  "toml 1.1.4+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "unicode-segmentation",
  "ureq",
  "url",
  "x25519-dalek",

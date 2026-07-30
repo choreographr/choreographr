@@ -556,6 +556,10 @@ pub enum DaemonMessage {
         session_id: u64,
         path: Option<String>,
     },
+    SessionTitleSet {
+        session_id: u64,
+        title: String,
+    },
     ReasoningEffortSet {
         effort: String,
     },

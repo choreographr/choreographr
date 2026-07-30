@@ -52,6 +52,7 @@ signal-hook.workspace = true
 toml = "1.1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+unicode-segmentation.workspace = true
 # OpenMetrics / Prometheus monitoring.
 # The `process` feature exposes process-level metrics (RSS, CPU, FD count)
 # alongside our application-level gauges, counters, and histograms.

@@ -1694,6 +1694,9 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::SessionWorkingDirSet { session_id, path } => {
             app.handle_session_working_dir_set(*session_id, path);
         }
+        DaemonMessage::SessionTitleSet { session_id, title } => {
+            app.handle_session_title_set(*session_id, title);
+        }
         // TokenUsageUpdate is dispatched through the generic handler below.
         DaemonMessage::LiveOutputTokenCount { output_tokens, .. } => {
             app.live_output_tokens = *output_tokens;

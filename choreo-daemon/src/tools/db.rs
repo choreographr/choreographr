@@ -600,8 +600,8 @@ mod tests {
     fn test_context() -> (tempfile::TempDir, ToolContext) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
-        let _ = db::kv_set(&db, 0, "__init__", b"").unwrap();
-        let _ = db::kv_delete(&db, 0, "__init__").unwrap();
+        db::kv_set(&db, 0, "__init__", b"").unwrap();
+        db::kv_delete(&db, 0, "__init__").unwrap();
         let (daemon_tx, _daemon_rx) = std::sync::mpsc::channel();
         let ctx = ToolContext::new(42, db, daemon_tx);
         (dir, ctx)

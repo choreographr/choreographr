@@ -1591,7 +1591,7 @@ mod tests {
     #[test]
     fn partition_point_finds_line_at_row_zero() {
         let offsets = [2, 5, 7];
-        assert_eq!(offsets.partition_point(|&o| o <= 0), 0);
+        assert_eq!(offsets.partition_point(|&o| o == 0), 0);
     }
 
     #[test]
@@ -1620,7 +1620,7 @@ mod tests {
     #[test]
     fn partition_point_empty_offsets_returns_zero() {
         let offsets: [usize; 0] = [];
-        assert_eq!(offsets.partition_point(|&o| o <= 0), 0);
+        assert_eq!(offsets.partition_point(|&o| o == 0), 0);
         assert_eq!(offsets.partition_point(|&o| o <= 99), 0);
     }
 }

@@ -161,5 +161,5 @@ fn daemon_io_send_and_receive() {
     writer_handle.join().unwrap();
 
     // Clean up temp dir.
-    let _ = std::fs::remove_dir_all(&socket_path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(socket_path.parent().unwrap());
 }

@@ -69,6 +69,7 @@ macro_rules! define_tool {
 
 pub(crate) mod admin;
 mod error;
+pub(crate) mod set_session_title;
 pub use error::ToolError;
 pub use error::ToolExecError;
 pub(crate) use error::{tool_err, tool_ok};
@@ -365,6 +366,7 @@ pub trait ToolDyn: Send + Sync {
         image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError>;
 
+    #[allow(clippy::too_many_arguments)]
     /// Streaming JSON path.
     fn execute_streaming_json(
         &self,
@@ -625,6 +627,7 @@ impl ToolRegistry {
         reg.register(admin::ListSessions);
         reg.register(admin::GetSession);
         reg.register(admin::LoadSkill);
+        reg.register(set_session_title::SetSessionTitle);
         reg.register(subsession::SpawnSubsession);
         reg
     }
@@ -673,6 +676,7 @@ impl ToolRegistry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// Streaming JSON path.
     pub fn execute_streaming_json(
         &self,

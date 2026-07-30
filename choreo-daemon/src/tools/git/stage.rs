@@ -317,7 +317,7 @@ mod tests {
             id,
             mode,
             flags,
-            stat: stat.clone(),
+            stat,
             path: path.clone(),
         };
         let b = IndexEntrySnapshot {

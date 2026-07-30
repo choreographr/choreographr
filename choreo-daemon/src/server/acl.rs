@@ -103,8 +103,8 @@ pubkey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
 
         // The base64-decoded key is 0x01..0x20 (32 bytes).
         let mut expected = [0u8; 32];
-        for i in 0..32 {
-            expected[i] = (i as u8) + 1;
+        for (i, elem) in expected.iter_mut().enumerate() {
+            *elem = (i as u8) + 1;
         }
         assert!(acl.contains(&expected));
 
@@ -137,8 +137,8 @@ pubkey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
         let acl = Acl::load(tmp.path());
 
         let mut expected = [0u8; 32];
-        for i in 0..32 {
-            expected[i] = (i as u8) + 1;
+        for (i, elem) in expected.iter_mut().enumerate() {
+            *elem = (i as u8) + 1;
         }
         assert!(acl.contains(&expected));
     }
@@ -161,8 +161,8 @@ pubkey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
         let acl = Acl::load(tmp.path());
 
         let mut expected = [0u8; 32];
-        for i in 0..32 {
-            expected[i] = (i as u8) + 1;
+        for (i, elem) in expected.iter_mut().enumerate() {
+            *elem = (i as u8) + 1;
         }
         assert!(acl.contains(&expected));
     }

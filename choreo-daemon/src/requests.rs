@@ -428,6 +428,9 @@ struct SystemContentParams<'a> {
     loaded_skill_bodies: &'a [LoadedSkill],
     tool_registry: &'a ToolRegistry,
     pending_hints: &'a [String],
+    /// The session title, if one has been set, so the LLM can maintain
+    /// awareness of the agreed-upon session purpose.
+    session_title: Option<&'a str>,
 }
 
 fn build_system_content(
@@ -468,6 +471,16 @@ fn build_system_content(
             content.push_str("\n\n");
             content.push_str(&context_str);
         }
+    }
+
+    // Inject the current session title so the LLM can see the agreed-upon
+    // session purpose across turns without re-deriving it from conversation
+    // history.  Only included when a title has been explicitly set.
+    if let Some(title) = params.session_title
+        && !title.is_empty()
+    {
+        content.push_str("\n\n## Current Session Title\n");
+        content.push_str(title);
     }
 
     // Pending subdirectory hints
@@ -651,6 +664,7 @@ pub(crate) fn run_agent_loop(
                     loaded_skill_bodies: &session.loaded_skill_bodies,
                     tool_registry: &ctx.tool_registry,
                     pending_hints: &pending_hints,
+                    session_title: session.config.title.as_deref(),
                 },
                 &mut session.context_cache,
             )
@@ -2288,6 +2302,7 @@ Hello, this is the skill body.\n\
                 loaded_skill_bodies: &session.loaded_skill_bodies,
                 tool_registry: registry,
                 pending_hints,
+                session_title: session.config.title.as_deref(),
             },
             &mut session.context_cache,
         )
@@ -2350,5 +2365,33 @@ Hello, this is the skill body.\n\
         let content = content.unwrap();
         assert!(content.contains("New context from project subdirectories"));
         assert!(content.contains("Hint about subdirectory config."));
+    }
+
+    #[test]
+    fn build_system_content_includes_session_title() {
+        let (mut session, registry, _dir) = setup_build_system_content_session();
+        session.config.title = Some("Refactoring the database layer".into());
+        let content = test_build_content(&mut session, &registry, &[]);
+        assert!(content.is_some());
+        let content = content.unwrap();
+        assert!(content.contains("## Current Session Title"));
+        assert!(content.contains("Refactoring the database layer"));
+    }
+
+    #[test]
+    fn build_system_content_omits_empty_title() {
+        let (mut session, registry, _dir) = setup_build_system_content_session();
+        // Title is None by default — no "Current Session Title" section.
+        let content = test_build_content(&mut session, &registry, &[]);
+        assert!(content.is_some());
+        let content = content.unwrap();
+        assert!(!content.contains("## Current Session Title"));
+
+        // Also omit when the title is an empty string.
+        session.config.title = Some("".into());
+        let content2 = test_build_content(&mut session, &registry, &[]);
+        assert!(content2.is_some());
+        let content2 = content2.unwrap();
+        assert!(!content2.contains("## Current Session Title"));
     }
 }

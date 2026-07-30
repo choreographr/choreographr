@@ -332,7 +332,7 @@ fn spans_fixed_width(spans: &mut Vec<Span<'static>>, width: usize) {
                 spans.truncate(keep + 1);
                 spans[keep] = Span::styled(
                     truncate_str(&spans[keep].content, remaining),
-                    spans[keep].style.clone(),
+                    spans[keep].style,
                 );
                 remaining = 0;
                 break;

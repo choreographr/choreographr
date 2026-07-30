@@ -26,8 +26,8 @@ fn encrypt_decrypt_credential_round_trip_with_key_files() {
     // Write key files as the system would
     let pk_path = dir.join("identity.pk");
     let pub_path = dir.join("public.pk");
-    fs::write(&pk_path, &secret).expect("write private key");
-    fs::write(&pub_path, &public).expect("write public key");
+    fs::write(&pk_path, secret).expect("write private key");
+    fs::write(&pub_path, public).expect("write public key");
 
     // Read them back through the paths module (with overridden config)
     let stored_private = fs::read(&pk_path).expect("read private key");
@@ -60,8 +60,8 @@ fn encrypt_decrypt_credential_round_trip_with_key_files() {
 #[ignore]
 fn encrypt_decrypt_private_key_with_passphrase_round_trip() {
     let mut key = [0u8; 32];
-    for i in 0..32 {
-        key[i] = i as u8;
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = i as u8;
     }
     let passphrase = "test-passphrase-for-integration-test";
 
@@ -81,8 +81,8 @@ fn encrypt_decrypt_private_key_with_passphrase_round_trip() {
 #[ignore]
 fn decrypt_private_key_with_wrong_passphrase_fails() {
     let mut key = [0u8; 32];
-    for i in 0..32 {
-        key[i] = i as u8;
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = i as u8;
     }
 
     let encrypted =

@@ -279,7 +279,7 @@ fn daemon_message_done_with_usage_round_trip() {
     };
     let msg = DaemonMessage::Done {
         request_id: 3,
-        token_usage: Some(usage.clone()),
+        token_usage: Some(usage),
         last_prompt_tokens: None,
     };
     let frame = encode_frame(&msg).expect("encode");
@@ -343,7 +343,7 @@ fn session_summary_some_token_usage_round_trip() {
         status: SessionStatus::Inactive,
         active_tool_groups: vec![],
         account_name: None,
-        token_usage: Some(usage.clone()),
+        token_usage: Some(usage),
         context_window: None,
         last_prompt_tokens: None,
     };

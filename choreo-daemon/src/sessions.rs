@@ -14,10 +14,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Sentinel `request_id` meaning "cancel whatever is currently active, regardless of its ID".
 /// Used in child-session cancellation where we don't know the child's active request ID.
 pub(crate) const CANCEL_ALL: u32 = 0;
+
+/// Maximum length of a session title in grapheme clusters (user-perceived
+/// characters), not bytes or Unicode scalar values.  Titles are user-facing
+/// display strings shown in session listings and the TUI sidebar, so
+/// multi-byte scripts and composed emoji (e.g. "👨‍👩‍👧‍👦" = 1 grapheme, 7
+/// `char` values) are treated fairly.  Defined here as the single source
+/// of truth; the tool-level validator in set_session_title.rs imports
+/// this constant to avoid duplication.
+pub(crate) const MAX_TITLE_CHARS: usize = 200;
 
 pub enum SessionCommand {
     RunInput {
@@ -54,6 +64,9 @@ pub enum SessionCommand {
     /// map so that workers always broadcast to the live subscriber set
     /// rather than a stale clone of it.
     Broadcast(DaemonMessage),
+    SetTitle {
+        title: String,
+    },
     SetAccount {
         name: String,
     },
@@ -230,6 +243,24 @@ impl Default for SessionConfig {
             context_window: None,
             last_prompt_tokens: None,
         }
+    }
+}
+
+impl SessionConfig {
+    /// Apply fields from a worker snapshot, preserving any fields
+    /// that may have been mutated mid-request through direct
+    /// `SessionCommand` calls (SetTitle, SetAccount, SetReasoningEffort)
+    /// that the worker snapshot wouldn't know about.
+    ///
+    /// This is an allowlist — only fields the worker actually owns
+    /// (accumulated usage, context window, last prompt tokens) are
+    /// copied from the snapshot.  All other configuration (title,
+    /// account, model, working dir, etc.) is preserved so that
+    /// mid-request mutations are not silently clobbered.
+    fn apply_worker_snapshot(&mut self, snapshot: &SessionConfig) {
+        self.accumulated_usage = snapshot.accumulated_usage;
+        self.context_window = snapshot.context_window;
+        self.last_prompt_tokens = snapshot.last_prompt_tokens;
     }
 }
 
@@ -581,6 +612,21 @@ fn fail_request(
     false
 }
 
+/// Notify the daemon of updated metadata and persist the session record
+/// to the database.  Shared boilerplate used by session mutation handlers
+/// (SetTitle, SetAccount, SetModel, etc.) so that changes are reflected
+/// in session listings immediately and survive daemon restarts.
+fn persist_session_metadata(state: &SessionState, ctx: &RequestContext, label: &str) {
+    let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
+        session_id: ctx.session_id,
+        metadata: SessionMetadata::from(state),
+    });
+    let record = SessionRecord::from(state);
+    if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
+        warn!(error = %e, "failed to persist session record after {label}");
+    }
+}
+
 pub fn session_main(
     rx: std::sync::mpsc::Receiver<SessionCommand>,
     provider: Option<InferenceProvider>,
@@ -716,6 +762,7 @@ fn process_command(
             snapshot,
         } => handle_request_finished(request_id, snapshot, state, shutdown_requested, ctx),
         SessionCommand::Broadcast(message) => handle_broadcast(message, state, ctx),
+        SessionCommand::SetTitle { title } => handle_set_title(title, state, ctx),
         SessionCommand::SetAccount { name } => handle_set_account(name, state, ctx),
         SessionCommand::SetReasoningEffort { effort } => {
             handle_set_reasoning_effort(effort, state, ctx)
@@ -1017,16 +1064,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
             reasoning_capability: capability,
         },
     );
-    let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
-        session_id: ctx.session_id,
-        metadata: SessionMetadata::from(&*state),
-    });
-    // Persist the updated session record so resolved context_window
-    // survives daemon restarts.
-    let record = SessionRecord::from(&*state);
-    if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
-        warn!(error = %e, "failed to persist session record after SetModel");
-    }
+    persist_session_metadata(state, ctx, "SetModel");
     false
 }
 
@@ -1107,15 +1145,15 @@ fn handle_attach(
     // new subscriber can route in-flight streaming chunks to the correct
     // turn.  The subscriber will then populate its request_to_turn map
     // and begin accumulating streaming content from this point forward.
-    if !state.active_requests.is_empty() {
-        if let Some(tx) = state.subscribers.get(&client_id) {
-            for (&request_id, active) in &state.active_requests {
-                let _ = tx.send(DaemonMessage::Started {
-                    request_id,
-                    turn_id: active.turn_id,
-                    estimated_prompt_tokens: 0,
-                });
-            }
+    if !state.active_requests.is_empty()
+        && let Some(tx) = state.subscribers.get(&client_id)
+    {
+        for (&request_id, active) in &state.active_requests {
+            let _ = tx.send(DaemonMessage::Started {
+                request_id,
+                turn_id: active.turn_id,
+                estimated_prompt_tokens: 0,
+            });
         }
     }
 
@@ -1177,8 +1215,11 @@ fn handle_request_finished(
     shutdown_requested: &bool,
     ctx: &RequestContext,
 ) -> bool {
-    // Apply config changes from worker (accumulated usage, context_window, etc.)
-    state.config = snapshot.config;
+    // Apply config changes from the worker snapshot using the allowlist
+    // on `SessionConfig` so that fields mutated mid-request through direct
+    // SessionCommand calls (SetTitle, SetAccount, SetReasoningEffort) are
+    // preserved without needing an explicit save/restore list.
+    state.config.apply_worker_snapshot(&snapshot.config);
 
     // Persist the updated session config (accumulated usage, context_window, etc.)
     // so resolved values survive daemon restarts.
@@ -1248,6 +1289,49 @@ fn handle_broadcast(
     false
 }
 
+/// Set the session title, broadcasting the change to subscribers and
+/// notifying the daemon so session listings reflect the new title
+/// immediately.
+fn handle_set_title(title: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
+    // Defense-in-depth: cap title length by grapheme clusters so
+    // multi-byte scripts and composed emoji are treated as single
+    // user-perceived characters.  The tool-level validation in
+    // set_session_title.rs catches this first; the session handler
+    // is the second line of defence against any code path that sends
+    // SetTitle directly (e.g. future internal commands).
+    if title.graphemes(true).count() > MAX_TITLE_CHARS {
+        warn!(
+            session_id = ctx.session_id,
+            length = title.graphemes(true).count(),
+            max = MAX_TITLE_CHARS,
+            "rejecting SetTitle: title too long (defense-in-depth)",
+        );
+        return false;
+    }
+
+    info!(
+        session_id = ctx.session_id,
+        old_title = ?state.config.title,
+        new_title = %title,
+        "session title changed",
+    );
+    state.config.title = Some(title.clone());
+
+    // Broadcast to session subscribers (e.g. TUI) so they reflect the
+    // new title immediately, without waiting for the next persist cycle.
+    broadcast(
+        &mut state.subscribers,
+        DaemonMessage::SessionTitleSet {
+            session_id: ctx.session_id,
+            title: title.clone(),
+        },
+    );
+
+    persist_session_metadata(state, ctx, "SetTitle");
+
+    false
+}
+
 /// Set the account for this session and try to resolve its provider.
 fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
     info!("session {}: SetAccount account={}", ctx.session_id, name);
@@ -1288,16 +1372,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
         &mut state.subscribers,
         DaemonMessage::SessionAccountSet { account: name },
     );
-    let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
-        session_id: ctx.session_id,
-        metadata: SessionMetadata::from(&*state),
-    });
-    // Persist the updated session record so resolved context_window
-    // survives daemon restarts.
-    let record = SessionRecord::from(&*state);
-    if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
-        warn!(error = %e, "failed to persist session record after SetAccount");
-    }
+    persist_session_metadata(state, ctx, "SetAccount");
     false
 }
 

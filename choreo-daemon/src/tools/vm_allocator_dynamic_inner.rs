@@ -21,6 +21,7 @@
 // host's global allocator and to suppress unused-import warnings.
 
 #[allow(dead_code, unused_imports)]
+#[allow(clippy::useless_attribute)]
 extern crate alloc;
 
 #[allow(dead_code, unused_imports)]

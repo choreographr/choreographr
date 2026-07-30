@@ -218,7 +218,7 @@ mod tests {
         ];
         let cred = parse_credential("x", &fields).unwrap();
         let view = cred.as_x().unwrap();
-        assert_eq!(view.bearer_token.as_deref(), Some("bt"));
+        assert_eq!(view.bearer_token, Some("bt"));
     }
 
     #[test]
@@ -244,7 +244,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("choreographr")).unwrap();
 
         let (_, sk) = choreo_keystore::crypto::generate_keypair();
-        std::fs::write(dir.path().join("choreographr/identity.pk"), &sk).unwrap();
+        std::fs::write(dir.path().join("choreographr/identity.pk"), sk).unwrap();
 
         assert_eq!(try_auto_unlock_key(), Some(sk.to_vec()));
     }

@@ -233,7 +233,7 @@ mod tests {
                 assert!(
                     bearer_token
                         .as_ref()
-                        .map_or(true, |s| s.as_bytes().iter().all(|&b| b == 0))
+                        .is_none_or(|s| s.as_bytes().iter().all(|&b| b == 0))
                 );
             }
             _ => panic!("expected X variant"),

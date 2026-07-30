@@ -259,8 +259,8 @@ mod tests {
         let symbols = render_to_symbols(5, 10, 3, 0);
         assert_eq!(symbols[0], "█", "row 0 should be full thumb");
         assert_eq!(symbols[1], "▀", "row 1 should be upper half");
-        for i in 2..5 {
-            assert_eq!(symbols[i], " ", "row {i} should be track");
+        for (i, sym) in symbols.iter().enumerate().skip(2).take(3) {
+            assert_eq!(sym, " ", "row {i} should be track");
         }
     }
 
@@ -274,8 +274,8 @@ mod tests {
         let symbols = render_to_symbols(5, 10, 3, 7);
         assert_eq!(symbols[3], "▄", "row 3 should be lower half");
         assert_eq!(symbols[4], "█", "row 4 should be full thumb");
-        for i in 0..3 {
-            assert_eq!(symbols[i], " ", "row {i} should be track");
+        for (i, sym) in symbols.iter().enumerate().take(3) {
+            assert_eq!(sym, " ", "row {i} should be track");
         }
     }
 
@@ -287,9 +287,9 @@ mod tests {
         // virtual [4,5) → row 2: top half (slot 4) → "▀"
         let symbols = render_to_symbols(5, 10, 1, 4);
         assert_eq!(symbols[2], "▀", "row 2 should be upper half (slot 4)");
-        for i in 0..5 {
+        for (i, sym) in symbols.iter().enumerate().take(5) {
             if i != 2 {
-                assert_eq!(symbols[i], " ", "row {i} should be track");
+                assert_eq!(sym, " ", "row {i} should be track");
             }
         }
     }
@@ -302,9 +302,9 @@ mod tests {
         // virtual [3,4) → row 1: bottom half (slot 3) → "▄"
         let symbols = render_to_symbols(5, 10, 1, 3);
         assert_eq!(symbols[1], "▄", "row 1 should be lower half (slot 3)");
-        for i in 0..5 {
+        for (i, sym) in symbols.iter().enumerate().take(5) {
             if i != 1 {
-                assert_eq!(symbols[i], " ", "row {i} should be track");
+                assert_eq!(sym, " ", "row {i} should be track");
             }
         }
     }
@@ -333,8 +333,8 @@ mod tests {
         // content=10, viewport=10 → thumb_slots = 10*10/10 = 10
         // (fills the whole 5-cell track).  scroll_range = max(1) = 1.
         let symbols = render_to_symbols(5, 10, 10, 0);
-        for i in 0..5 {
-            assert_eq!(symbols[i as usize], "█", "row {i} should be full thumb");
+        for (i, sym) in symbols.iter().enumerate() {
+            assert_eq!(sym, "█", "row {i} should be full thumb");
         }
     }
 
@@ -344,11 +344,11 @@ mod tests {
         //   thumb_slots = 50*20/100 = 10 (5 cells out of 10).
         let symbols = render_to_symbols(10, 100, 50, 0);
         // First 5 rows are thumb (10 virtual slots = 5 cells).
-        for i in 0..5 {
-            assert_eq!(symbols[i], "█", "row {i} should be full thumb");
+        for (i, sym) in symbols.iter().enumerate().take(5) {
+            assert_eq!(sym, "█", "row {i} should be full thumb");
         }
-        for i in 5..10 {
-            assert_eq!(symbols[i], " ", "row {i} should be track");
+        for (i, sym) in symbols.iter().enumerate().skip(5).take(5) {
+            assert_eq!(sym, " ", "row {i} should be track");
         }
     }
 
@@ -430,8 +430,8 @@ mod tests {
         let symbols = render_to_symbols_with_markers(5, 10, 3, 0, &[]);
         assert_eq!(symbols[0], "█", "row 0 thumb");
         assert_eq!(symbols[1], "▀", "row 1 thumb upper half");
-        for i in 2..5 {
-            assert_eq!(symbols[i], " ", "row {i} track (no markers)");
+        for (i, sym) in symbols.iter().enumerate().skip(2).take(3) {
+            assert_eq!(sym, " ", "row {i} track (no markers)");
         }
     }
 

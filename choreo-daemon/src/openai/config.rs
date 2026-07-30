@@ -231,8 +231,10 @@ mod tests {
 
     #[test]
     fn programmatic_tool_calling_account_override() {
-        let mut config = ServiceConfig::default();
-        config.programmatic_tool_calling = true;
+        let config = ServiceConfig {
+            programmatic_tool_calling: true,
+            ..Default::default()
+        };
         // Override takes precedence regardless of model.
         assert!(config.programmatic_tool_calling_for_model("gpt-4.1"));
         assert!(config.programmatic_tool_calling_for_model("claude-3"));
@@ -240,8 +242,10 @@ mod tests {
 
     #[test]
     fn programmatic_tool_calling_auto_enables_for_gpt_5_6_responses() {
-        let mut config = ServiceConfig::default();
-        config.default_request_format = RequestFormat::Responses;
+        let config = ServiceConfig {
+            default_request_format: RequestFormat::Responses,
+            ..Default::default()
+        };
         // Models not in the catalog fall back to default_request_format.
         // When the default is Responses, gpt-5.6 models auto-enable.
         assert!(config.programmatic_tool_calling_for_model("gpt-5.6-chat"));
@@ -252,16 +256,20 @@ mod tests {
 
     #[test]
     fn programmatic_tool_calling_not_auto_enabled_for_gpt_5_6_chat_completions() {
-        let mut config = ServiceConfig::default();
-        config.default_request_format = RequestFormat::ChatCompletions;
+        let config = ServiceConfig {
+            default_request_format: RequestFormat::ChatCompletions,
+            ..Default::default()
+        };
         // No auto-enable when using Chat Completions format.
         assert!(!config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
     }
 
     #[test]
     fn programmatic_tool_calling_not_auto_enabled_for_other_models() {
-        let mut config = ServiceConfig::default();
-        config.default_request_format = RequestFormat::Responses;
+        let config = ServiceConfig {
+            default_request_format: RequestFormat::Responses,
+            ..Default::default()
+        };
         assert!(!config.programmatic_tool_calling_for_model("gpt-4.1"));
         assert!(!config.programmatic_tool_calling_for_model("gpt-5.5"));
         assert!(!config.programmatic_tool_calling_for_model("claude-3-opus"));
@@ -269,10 +277,11 @@ mod tests {
 
     #[test]
     fn request_format_for_model_uses_catalog_lookup() {
-        let mut config = ServiceConfig::default();
-        config.default_request_format = RequestFormat::Responses;
-        // Known model with openai_responses: false should return ChatCompletions.
-        config.provider_slug = "openai";
+        let config = ServiceConfig {
+            default_request_format: RequestFormat::Responses,
+            provider_slug: "openai",
+            ..Default::default()
+        };
         assert_eq!(
             config.request_format_for_model("gpt-4.1"),
             RequestFormat::ChatCompletions
@@ -286,9 +295,11 @@ mod tests {
 
     #[test]
     fn programmatic_tool_calling_override_wins_over_auto_disable() {
-        let mut config = ServiceConfig::default();
-        config.default_request_format = RequestFormat::ChatCompletions;
-        config.programmatic_tool_calling = true;
+        let config = ServiceConfig {
+            default_request_format: RequestFormat::ChatCompletions,
+            programmatic_tool_calling: true,
+            ..Default::default()
+        };
         // Account-level override takes precedence even when auto-enable
         // would not trigger (ChatCompletions format).
         assert!(config.programmatic_tool_calling_for_model("gpt-5.6-sol"));

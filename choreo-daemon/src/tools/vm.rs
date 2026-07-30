@@ -2332,7 +2332,7 @@ mod tests {
                 let size = (lcg(&mut rng) % 128).max(1);
                 let align = 1usize << (lcg(&mut rng) % 5); // 1, 2, 4, 8, 16
 
-                if lcg(&mut rng) % 2 == 0 && !allocations.is_empty() {
+                if lcg(&mut rng).is_multiple_of(2) && !allocations.is_empty() {
                     let idx = lcg(&mut rng) % allocations.len();
                     let (ptr, layout) = allocations.swap_remove(idx);
                     list.deallocate(ptr, layout);

@@ -321,6 +321,11 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             handler.handle_status_text(format!("[daemon] session account set: {account}"));
         }
         DaemonMessage::SessionWorkingDirSet { .. } => {}
+        DaemonMessage::SessionTitleSet { .. } => {
+            // Session title changes are metadata-only (no conversation
+            // content) and are handled at the TUI layer directly via
+            // the connection.rs routing — no generic dispatch needed.
+        }
         DaemonMessage::ReasoningEffortSet { effort } => {
             handler.handle_status_text(format!("[daemon] reasoning effort: {effort}"));
         }

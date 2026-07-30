@@ -1013,7 +1013,7 @@ mod tests {
         };
         std::thread::spawn(move || {
             if let Ok(DaemonCommand::DeleteSession { reply, .. }) = daemon_rx.recv() {
-                let _ = reply.send(Err(io::Error::new(io::ErrorKind::Other, "db error")));
+                let _ = reply.send(Err(io::Error::other("db error")));
             }
         });
         handle_delete_session_sync(&mut ctx, 42);

@@ -2128,6 +2128,17 @@ impl App {
         }
     }
 
+    pub(crate) fn handle_session_title_set(&mut self, session_id: u64, title: &str) {
+        if self.attached_session_id == Some(session_id) {
+            self.status = Some(format!("Session title changed to '{title}'"));
+            // Keep the session list in sync so the sidebar shows the updated
+            // title immediately — same pattern as handle_session_account_set.
+            if let Some(s) = self.attached_session_mut() {
+                s.title = Some(title.to_owned());
+            }
+        }
+    }
+
     pub(crate) fn handle_session_account_set(&mut self, account: &str) {
         if self.attached_session_id.is_some() {
             self.attached_account_name = Some(account.to_owned());

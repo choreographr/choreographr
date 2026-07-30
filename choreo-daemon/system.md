@@ -16,3 +16,6 @@ All shell tools run in a sandboxed child process with resource limits, path conf
 
 ## Skills
 Use the `load_skill` tool to load detailed instructions for a skill when a task matches its description. Load the skill before attempting the task it covers.
+
+## Session Title
+The session title **must** be set once the user's intent is discovered and **must** be kept up to date. Use the `set_session_title` tool to update the title — the first time you understand the task, and whenever the context or task focus changes significantly. A good title helps the user identify the session in listings.

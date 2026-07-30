@@ -151,6 +151,12 @@ pub enum DaemonCommand {
         session_id: u64,
         request_id: u32,
     },
+    /// Set the display title for a session, forwarded to the session's
+    /// main loop for in-memory update, broadcast, and persistence.
+    SetSessionTitle {
+        session_id: u64,
+        title: String,
+    },
 }
 
 impl DaemonState {
@@ -255,6 +261,9 @@ impl DaemonState {
                 session_id,
                 request_id,
             } => self.handle_cancel_request(session_id, request_id),
+            DaemonCommand::SetSessionTitle { session_id, title } => {
+                self.handle_set_session_title(session_id, title)
+            }
             DaemonCommand::Shutdown => {
                 warn!("unexpected Shutdown command in handle_command; handled at loop level");
             }
@@ -796,6 +805,20 @@ impl DaemonState {
         }
     }
 
+    /// Forward a title change to the session thread for in-memory update,
+    /// subscriber broadcast, and persistence.
+    fn handle_set_session_title(&mut self, session_id: u64, title: String) {
+        debug!(session_id, title = %title, "forwarding title change to session");
+        match self.active_sessions.get(&session_id) {
+            Some(entry) => {
+                let _ = entry.cmd_tx.send(SessionCommand::SetTitle { title });
+            }
+            None => {
+                warn!(session_id, "cannot set title: session is not active");
+            }
+        }
+    }
+
     /// Delete a session, shutting down its thread and removing it from the DB.
     /// If the session has children, they are cascade-deleted first.
     ///
@@ -1290,7 +1313,7 @@ mod tests {
     fn handle_session_exited_nonexistent() {
         let (mut state, _rx) = make_daemon_state();
         state.handle_command(DaemonCommand::SessionExited { session_id: 999 });
-        assert!(state.session_metadata.get(&999).is_none());
+        assert!(!state.session_metadata.contains_key(&999));
     }
 
     #[test]
@@ -1545,5 +1568,77 @@ mod tests {
         });
         let result = rx.recv().unwrap();
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn handle_set_session_title_forwards_to_session() {
+        let (mut state, _daemon_rx) = make_daemon_state();
+
+        // Create an active session entry with a cmd_tx so the daemon
+        // can forward the title change.
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            // Block until told to stop — we just need the entry to exist.
+            let _ = handle_rx.recv();
+        });
+        state
+            .active_sessions
+            .insert(1, ActiveSessionEntry { cmd_tx, handle });
+        state.session_metadata.insert(
+            1,
+            SessionMetadata {
+                title: Some("old title".into()),
+                selected_model: None,
+                reasoning_effort: None,
+                parent_session_id: None,
+                working_dir: None,
+                created_at: 1000,
+                turn_count: 0,
+                max_turns: None,
+                status: SessionStatus::Inactive,
+                active_tool_groups: vec!["core".into()],
+                account_name: None,
+                accumulated_usage: TokenUsage::default(),
+                context_window: None,
+                last_prompt_tokens: None,
+            },
+        );
+
+        state.handle_command(DaemonCommand::SetSessionTitle {
+            session_id: 1,
+            title: "new title".into(),
+        });
+
+        // Verify the session thread received a SetTitle command.
+        // The send is synchronous (handle_command sends on cmd_tx), so
+        // try_recv is deterministic — no time-based wait needed.
+        match cmd_rx.try_recv() {
+            Ok(SessionCommand::SetTitle { title }) => {
+                assert_eq!(title, "new title");
+            }
+            Ok(_) => {
+                panic!("expected SetTitle, got a different SessionCommand variant");
+            }
+            Err(e) => {
+                panic!("expected SetTitle, got error: {e}");
+            }
+        }
+
+        // Clean up the session thread.
+        let _ = handle_tx.send(());
+    }
+
+    #[test]
+    fn handle_set_session_title_nonexistent_session_logs_warning() {
+        let (mut state, _rx) = make_daemon_state();
+
+        // Sending SetSessionTitle for a session that doesn't exist should
+        // log a warning and not panic.
+        state.handle_command(DaemonCommand::SetSessionTitle {
+            session_id: 999,
+            title: "ghost title".into(),
+        });
+        // No active session = no message to verify; just checking no panic.
     }
 }

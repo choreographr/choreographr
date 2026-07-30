@@ -323,12 +323,12 @@ pub(crate) fn render_turn_lines(
             }
         }
         // Only show reasoning when there is no response text.
-        if turn.assistant_text.is_none() {
-            if let Some(ref reasoning) = turn.assistant_reasoning {
-                let trimmed = reasoning.trim();
-                if !trimmed.is_empty() {
-                    body.extend(markdown_lines(trimmed, content_width));
-                }
+        if turn.assistant_text.is_none()
+            && let Some(ref reasoning) = turn.assistant_reasoning
+        {
+            let trimmed = reasoning.trim();
+            if !trimmed.is_empty() {
+                body.extend(markdown_lines(trimmed, content_width));
             }
         }
 
@@ -1797,10 +1797,7 @@ mod tests {
             !text.contains("Use **bold"),
             "reasoning body should NOT appear"
         );
-        assert!(
-            text.contains("Okay."),
-            "response text should appear"
-        );
+        assert!(text.contains("Okay."), "response text should appear");
         assert!(
             !text.contains("**bold**"),
             "markdown bold syntax should not appear literally in output"

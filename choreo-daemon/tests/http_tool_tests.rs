@@ -36,33 +36,28 @@ fn spawn_http_tool_server() -> (String, std::thread::JoinHandle<()>) {
                             let headers_str =
                                 std::str::from_utf8(&data[..headers_end]).unwrap_or("");
                             for line in headers_str.lines() {
-                                if line.to_ascii_lowercase().starts_with("content-length:") {
-                                    if let Some(len_str) = line.split_once(':') {
-                                        let len_str = len_str.1.trim();
-                                        if let Ok(len) = len_str.parse::<usize>() {
-                                            content_length = Some(len);
-                                        }
+                                if line.to_ascii_lowercase().starts_with("content-length:")
+                                    && let Some(len_str) = line.split_once(':')
+                                {
+                                    let len_str = len_str.1.trim();
+                                    if let Ok(len) = len_str.parse::<usize>() {
+                                        content_length = Some(len);
                                     }
                                 }
                             }
                             let body_received = data.len().saturating_sub(headers_end);
-                            if let Some(expected) = content_length {
-                                if body_received >= expected {
-                                    break;
-                                }
-                            } else {
+                            if content_length.is_none() || body_received >= content_length.unwrap()
+                            {
                                 break;
                             }
                         }
-                    } else {
+                    } else if let Some(expected) = content_length {
                         let data = &buf[..total_read];
                         if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
                             let headers_end = pos + 4;
                             let body_received = data.len().saturating_sub(headers_end);
-                            if let Some(expected) = content_length {
-                                if body_received >= expected {
-                                    break;
-                                }
+                            if body_received >= expected {
+                                break;
                             }
                         }
                     }
