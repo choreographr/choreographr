@@ -36,6 +36,7 @@ fn test_daemon_state() -> DaemonState {
         client_streams: Vec::new(),
         summary_subscribers: HashMap::new(),
         activity_subscribers: HashMap::new(),
+        client_subscribed_sessions: HashMap::new(),
         model_cache: HashMap::new(),
         mcp_manager: choreographr::mcp::McpManager::empty(),
     }

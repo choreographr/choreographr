@@ -339,7 +339,11 @@ impl SessionState {
     /// Re-resolve context window from the catalog when the stored value
     /// is `None` (e.g. sessions created before a model was added to the
     /// catalog, or after the provider was lazily resolved on unlock).
-    fn resolve_context_window_if_missing(&mut self, session_id: u64) {
+    fn resolve_context_window_if_missing(
+        &mut self,
+        session_id: u64,
+        daemon_tx: &mpsc::Sender<DaemonCommand>,
+    ) {
         if self.config.context_window.is_some() {
             return;
         }
@@ -354,6 +358,7 @@ impl SessionState {
             self.config.context_window = Some(cw);
             broadcast(
                 &mut self.subscribers,
+                daemon_tx,
                 DaemonMessage::ContextWindowResolved {
                     session_id,
                     context_window: cw,
@@ -566,8 +571,15 @@ impl SessionState {
 
 fn broadcast(
     subscribers: &mut HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
     message: DaemonMessage,
 ) {
+    // Forward to daemon-level activity subscribers so clients subscribed
+    // to all session activity (e.g. the TUI after SubscribeAllActivity)
+    // receive every session-scoped event without having to attach to every
+    // session individually.
+    let _ = daemon_tx.send(DaemonCommand::BroadcastActivity(message.clone()));
+
     subscribers.retain(|client_id, tx| {
         match tx.try_send(message.clone()) {
             Ok(()) => true,
@@ -589,22 +601,16 @@ fn broadcast(
     });
 }
 
-/// Forward a DaemonMessage to all activity subscribers via the daemon
-/// command channel.  This allows session-scoped events (streaming chunks,
-/// status changes, etc.) to be received by clients subscribed to all
-/// session activity.
-fn broadcast_activity(daemon_tx: &mpsc::Sender<DaemonCommand>, message: &DaemonMessage) {
-    let _ = daemon_tx.send(DaemonCommand::BroadcastActivity(message.clone()));
-}
-
 fn fail_request(
     subscribers: &mut HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
+    daemon_tx: &mpsc::Sender<DaemonCommand>,
     session_id: u64,
     request_id: u32,
     error: impl Into<String>,
 ) -> bool {
     broadcast(
         subscribers,
+        daemon_tx,
         DaemonMessage::Started {
             session_id,
             request_id,
@@ -614,6 +620,7 @@ fn fail_request(
     );
     broadcast(
         subscribers,
+        daemon_tx,
         DaemonMessage::Failed {
             session_id,
             request_id,
@@ -691,7 +698,7 @@ pub fn session_main(
     // Re-resolve context window from the catalog when loading an existing
     // session whose stored context_window is None (e.g. sessions created
     // before a model was added to the catalog).
-    state.resolve_context_window_if_missing(ctx.session_id);
+    state.resolve_context_window_if_missing(ctx.session_id, &ctx.daemon_tx);
 
     match db::read_turns(&ctx.db, ctx.session_id) {
         Ok(turns) => {
@@ -806,7 +813,7 @@ fn handle_run_input(
         "session received input",
     );
     if text.is_empty() {
-        return fail_request(&mut state.subscribers, ctx.session_id, request_id, "empty input");
+        return fail_request(&mut state.subscribers, &ctx.daemon_tx, ctx.session_id, request_id, "empty input");
     }
     let provider = if let Some(p) = state.provider.as_ref() {
         p.clone()
@@ -822,10 +829,11 @@ fn handle_run_input(
                 state.provider = Some(provider);
                 // Re-resolve context window now that the provider is
                 // available (e.g. after unlocking the daemon).
-                state.resolve_context_window_if_missing(ctx.session_id);
+                state.resolve_context_window_if_missing(ctx.session_id, &ctx.daemon_tx);
                 let Some(p) = state.provider.as_ref() else {
                     return fail_request(
                         &mut state.subscribers,
+                        &ctx.daemon_tx,
                         ctx.session_id,
                         request_id,
                         "internal error: provider not set after resolution".to_string(),
@@ -836,6 +844,7 @@ fn handle_run_input(
             _ => {
                 return fail_request(
                     &mut state.subscribers,
+                    &ctx.daemon_tx,
                     ctx.session_id,
                     request_id,
                     format!(
@@ -847,6 +856,7 @@ fn handle_run_input(
     } else {
         return fail_request(
             &mut state.subscribers,
+            &ctx.daemon_tx,
             ctx.session_id,
             request_id,
             "no account configured on this session — use /account <name> to set one",
@@ -855,12 +865,13 @@ fn handle_run_input(
     let model = match &state.config.selected_model {
         Some(m) => m.clone(),
         None => {
-            return fail_request(&mut state.subscribers, ctx.session_id, request_id, "no model selected");
+            return fail_request(&mut state.subscribers, &ctx.daemon_tx, ctx.session_id, request_id, "no model selected");
         }
     };
     if *shutdown_requested {
         return fail_request(
             &mut state.subscribers,
+            &ctx.daemon_tx,
             ctx.session_id,
             request_id,
             "session is shutting down",
@@ -869,6 +880,7 @@ fn handle_run_input(
     if !state.active_requests.is_empty() {
         return fail_request(
             &mut state.subscribers,
+            &ctx.daemon_tx,
             ctx.session_id,
             request_id,
             "session already has an active request",
@@ -877,6 +889,7 @@ fn handle_run_input(
 
     broadcast(
         &mut state.subscribers,
+        &ctx.daemon_tx,
         DaemonMessage::Started {
             session_id: ctx.session_id,
             request_id,
@@ -944,6 +957,7 @@ fn handle_run_child_input(
     }
     broadcast(
         &mut state.subscribers,
+        &ctx.daemon_tx,
         DaemonMessage::Started {
             session_id: ctx.session_id,
             request_id,
@@ -999,6 +1013,7 @@ fn handle_cancel(request_id: u32, state: &mut SessionState, ctx: &RequestContext
             let _ = active.cancel_tx.send(());
             broadcast(
                 &mut state.subscribers,
+                &ctx.daemon_tx,
                 DaemonMessage::Cancelled {
                     session_id: ctx.session_id,
                     request_id: rid,
@@ -1023,6 +1038,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         );
         broadcast(
             &mut state.subscribers,
+            &ctx.daemon_tx,
             DaemonMessage::ModelSelectionFailed {
                 session_id: ctx.session_id,
                 model,
@@ -1045,6 +1061,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
     if let Some(cw) = cw {
         broadcast(
             &mut state.subscribers,
+            &ctx.daemon_tx,
             DaemonMessage::ContextWindowResolved {
                 session_id: ctx.session_id,
                 context_window: cw,
@@ -1072,6 +1089,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         state.config.reasoning_effort = Some("off".to_string());
         broadcast(
             &mut state.subscribers,
+            &ctx.daemon_tx,
             DaemonMessage::ReasoningEffortSet {
                 session_id: ctx.session_id,
                 effort: "off".to_string(),
@@ -1085,6 +1103,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
     );
     broadcast(
         &mut state.subscribers,
+        &ctx.daemon_tx,
         DaemonMessage::ModelSelected {
             session_id: ctx.session_id,
             model: model.clone(),
@@ -1140,6 +1159,7 @@ fn handle_status_changed(
     state.config.status = new_status.clone();
     broadcast(
         &mut state.subscribers,
+        &ctx.daemon_tx,
         DaemonMessage::SessionStatusChanged {
             session_id: ctx.session_id,
             status: new_status.clone(),
@@ -1168,10 +1188,23 @@ fn handle_attach(
     info!("session {}: client {} attached", ctx.session_id, client_id);
     state.subscribers.insert(client_id, tx);
 
+    // Notify the daemon so it can filter duplicate delivery through the
+    // activity subscriber path for this client/session pair.
+    let _ = ctx.daemon_tx.send(DaemonCommand::TrackSessionSubscription {
+        client_id,
+        session_id: ctx.session_id,
+    });
+
     // Send synthetic Started messages for every active request so the
     // new subscriber can route in-flight streaming chunks to the correct
     // turn.  The subscriber will then populate its request_to_turn map
     // and begin accumulating streaming content from this point forward.
+    //
+    // These are sent directly to the joining client only — the message
+    // is not forwarded through broadcast_activity because the client is
+    // already a subscriber of this session via the per-session path, and
+    // the broadcast_activity filter in the daemon won't see this message
+    // anyway (it's sent directly, not through session's broadcast()).
     if !state.active_requests.is_empty()
         && let Some(tx) = state.subscribers.get(&client_id)
     {
@@ -1200,8 +1233,14 @@ fn handle_detach(
     ctx: &RequestContext,
 ) -> bool {
     info!("session {}: client {} detached", ctx.session_id, client_id);
-    let _ = ctx;
     state.subscribers.remove(&client_id);
+
+    // Notify the daemon so it can stop filtering duplicates through
+    // the activity subscriber path for this client/session pair.
+    let _ = ctx.daemon_tx.send(DaemonCommand::UntrackSessionSubscription {
+        client_id,
+        session_id: ctx.session_id,
+    });
     state.active_requests.is_empty() && (state.subscribers.is_empty() || *shutdown_requested)
 }
 
@@ -1292,6 +1331,7 @@ fn handle_request_finished(
     });
     broadcast(
         &mut state.subscribers,
+        &ctx.daemon_tx,
         DaemonMessage::SessionStatusChanged {
             session_id: ctx.session_id,
             status: SessionStatus::Inactive,
@@ -1310,10 +1350,9 @@ fn handle_broadcast(
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
-    let _ = ctx;
     // Broadcast through the main session thread's live subscriber
     // map so that in-flight worker broadcasts respect detach.
-    broadcast(&mut state.subscribers, message);
+    broadcast(&mut state.subscribers, &ctx.daemon_tx, message);
     false
 }
 
@@ -1349,6 +1388,7 @@ fn handle_set_title(title: String, state: &mut SessionState, ctx: &RequestContex
     // new title immediately, without waiting for the next persist cycle.
     broadcast(
         &mut state.subscribers,
+        &ctx.daemon_tx,
         DaemonMessage::SessionTitleSet {
             session_id: ctx.session_id,
             title: title.clone(),
@@ -1381,6 +1421,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
             if let Some(cw) = cw {
                 broadcast(
                     &mut state.subscribers,
+                    &ctx.daemon_tx,
                     DaemonMessage::ContextWindowResolved {
                         session_id: ctx.session_id,
                         context_window: cw,
@@ -1398,6 +1439,7 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
     state.config.account_name = Some(name.clone());
     broadcast(
         &mut state.subscribers,
+        &ctx.daemon_tx,
         DaemonMessage::SessionAccountSet {
             session_id: ctx.session_id,
             account: name,
@@ -1419,6 +1461,7 @@ fn handle_set_reasoning_effort(
         warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
         broadcast(
             &mut state.subscribers,
+            &ctx.daemon_tx,
             DaemonMessage::ReasoningEffortSetFailed {
                 session_id: ctx.session_id,
                 effort,
@@ -1456,6 +1499,7 @@ fn handle_set_reasoning_effort(
         );
         broadcast(
             &mut state.subscribers,
+            &ctx.daemon_tx,
             DaemonMessage::ReasoningEffortSet {
                 session_id: ctx.session_id,
                 effort,
@@ -1468,6 +1512,7 @@ fn handle_set_reasoning_effort(
         warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
         broadcast(
             &mut state.subscribers,
+            &ctx.daemon_tx,
             DaemonMessage::ReasoningEffortSetFailed {
                 session_id: ctx.session_id,
                 effort,
@@ -1519,6 +1564,7 @@ fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     }
     broadcast(
         &mut state.subscribers,
+        &ctx.daemon_tx,
         DaemonMessage::TurnsUndone {
             session_id: ctx.session_id,
             turn_ids,
@@ -1549,6 +1595,7 @@ fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     }
     broadcast(
         &mut state.subscribers,
+        &ctx.daemon_tx,
         DaemonMessage::TurnsRedone {
             session_id: ctx.session_id,
             turns,
@@ -1564,6 +1611,7 @@ fn handle_shutdown(state: &mut SessionState, shutdown_requested: &mut bool, ctx:
         let _ = active.cancel_tx.send(());
         broadcast(
             &mut state.subscribers,
+            &ctx.daemon_tx,
             DaemonMessage::Cancelled {
                 session_id: ctx.session_id,
                 request_id,

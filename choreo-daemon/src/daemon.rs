@@ -9,7 +9,7 @@ use choreo_keystore::ServiceCredential;
 use choreo_proto::{
     AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary, TokenUsage,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -42,6 +42,11 @@ pub struct DaemonState {
     pub client_streams: Vec<UnixStream>,
     pub summary_subscribers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
     pub activity_subscribers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
+    /// Tracks which clients are direct session subscribers of which sessions.
+    /// Used by `handle_broadcast_activity` to skip duplicate delivery to
+    /// clients that are both activity subscribers AND session subscribers
+    /// — the message reaches them through the per-session subscriber path.
+    pub client_subscribed_sessions: HashMap<u64, HashSet<u64>>,
     pub model_cache: HashMap<String, (Vec<String>, Instant)>,
     pub mcp_manager: McpManager,
 }
@@ -113,6 +118,18 @@ pub enum DaemonCommand {
     },
     UnregisterActivitySubscriber {
         client_id: u64,
+    },
+    /// Track that a client is now a direct subscriber of a session.
+    /// The daemon uses this to avoid duplicate delivery through the
+    /// activity subscriber path (see `handle_broadcast_activity`).
+    TrackSessionSubscription {
+        client_id: u64,
+        session_id: u64,
+    },
+    /// Untrack that a client is no longer a direct subscriber of a session.
+    UntrackSessionSubscription {
+        client_id: u64,
+        session_id: u64,
     },
     BroadcastActivity(DaemonMessage),
     BroadcastSessionStatus {
@@ -233,6 +250,12 @@ impl DaemonState {
             }
             DaemonCommand::UnregisterActivitySubscriber { client_id } => {
                 self.handle_unregister_activity_subscriber(client_id)
+            }
+            DaemonCommand::TrackSessionSubscription { client_id, session_id } => {
+                self.handle_track_session_subscription(client_id, session_id)
+            }
+            DaemonCommand::UntrackSessionSubscription { client_id, session_id } => {
+                self.handle_untrack_session_subscription(client_id, session_id)
             }
             DaemonCommand::BroadcastActivity(msg) => self.handle_broadcast_activity(msg),
             DaemonCommand::BroadcastSessionStatus { session_id, status } => {
@@ -763,12 +786,57 @@ impl DaemonState {
     /// Unregister a client from all session activity broadcasts.
     fn handle_unregister_activity_subscriber(&mut self, client_id: u64) {
         self.activity_subscribers.remove(&client_id);
+        // Also clean up the session subscription tracking for this client
+        // so stale entries don't accumulate.
+        self.client_subscribed_sessions.remove(&client_id);
+    }
+
+    /// Track that `client_id` is a direct subscriber of `session_id`.
+    /// Idempotent — re-attach to the same session is a no-op.
+    fn handle_track_session_subscription(&mut self, client_id: u64, session_id: u64) {
+        self.client_subscribed_sessions
+            .entry(client_id)
+            .or_default()
+            .insert(session_id);
+    }
+
+    /// Untrack that `client_id` is no longer a direct subscriber of `session_id`.
+    fn handle_untrack_session_subscription(&mut self, client_id: u64, session_id: u64) {
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.client_subscribed_sessions.entry(client_id)
+        {
+            entry.get_mut().remove(&session_id);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
     }
 
     /// Broadcast a message to all activity subscribers, removing dead ones.
+    ///
+    /// Uses `try_send` so a slow subscriber does not block the daemon's
+    /// single-threaded command loop (mirroring the behaviour in the per-session
+    /// `broadcast()` function in sessions.rs).
+    ///
+    /// Skips delivery to clients that are also direct session subscribers of
+    /// the originating session — those clients receive the message through
+    /// the per-session subscriber path, avoiding duplicate delivery.
     fn handle_broadcast_activity(&mut self, msg: DaemonMessage) {
+        let origin_session_id = message_session_id(&msg);
         self.activity_subscribers
-            .retain(|_id, tx| tx.send(msg.clone()).is_ok());
+            .retain(|client_id, tx| {
+                // Skip if this client is also a direct subscriber of the
+                // session that originated this message — they'll receive it
+                // through the per-session broadcast path.
+                if let Some(ref sid) = origin_session_id {
+                    if let Some(sessions) = self.client_subscribed_sessions.get(client_id) {
+                        if sessions.contains(sid) {
+                            return true;
+                        }
+                    }
+                }
+                tx.try_send(msg.clone()).is_ok()
+            });
     }
 
     /// Handle a cancel request from a client.  Sends `SessionCommand::Cancel`
@@ -1206,6 +1274,65 @@ fn handle_list_models_inner(
     Ok((models, selected_model))
 }
 
+/// Extract the `session_id` field from a [`DaemonMessage`] variant, if it has one.
+/// Used by `handle_broadcast_activity` to filter duplicates by origin session.
+fn message_session_id(msg: &DaemonMessage) -> Option<u64> {
+    match msg {
+        DaemonMessage::SessionCreated { session_id, .. }
+        | DaemonMessage::SessionAttached { session_id }
+        | DaemonMessage::SessionState { session_id, .. }
+        | DaemonMessage::SessionStatusChanged { session_id, .. }
+        | DaemonMessage::SessionFailed { session_id, .. }
+        | DaemonMessage::SessionDeleted { session_id }
+        | DaemonMessage::SessionDeleteFailed { session_id, .. }
+        | DaemonMessage::TurnAppended { session_id, .. }
+        | DaemonMessage::TurnFinalized { session_id, .. }
+        | DaemonMessage::TurnsUndone { session_id, .. }
+        | DaemonMessage::TurnsRedone { session_id, .. }
+        | DaemonMessage::Started { session_id, .. }
+        | DaemonMessage::OutputChunk { session_id, .. }
+        | DaemonMessage::ToolCallStarted { session_id, .. }
+        | DaemonMessage::ToolCallFinished { session_id, .. }
+        | DaemonMessage::ToolCallFailed { session_id, .. }
+        | DaemonMessage::ToolResultChunk { session_id, .. }
+        | DaemonMessage::Done { session_id, .. }
+        | DaemonMessage::Failed { session_id, .. }
+        | DaemonMessage::Cancelled { session_id, .. }
+        | DaemonMessage::ModelSelected { session_id, .. }
+        | DaemonMessage::ModelSelectionFailed { session_id, .. }
+        | DaemonMessage::TokenUsageUpdate { session_id, .. }
+        | DaemonMessage::LiveOutputTokenCount { session_id, .. }
+        | DaemonMessage::SessionAccountSet { session_id, .. }
+        | DaemonMessage::ContextWindowResolved { session_id, .. }
+        | DaemonMessage::SessionWorkingDirSet { session_id, .. }
+        | DaemonMessage::SessionTitleSet { session_id, .. }
+        | DaemonMessage::ReasoningEffortSet { session_id, .. }
+        | DaemonMessage::ReasoningEffortSetFailed { session_id, .. } => Some(*session_id),
+        // The following variants do not carry a session_id.
+        DaemonMessage::Sessions { .. }
+        | DaemonMessage::Pong
+        | DaemonMessage::Models { .. }
+        | DaemonMessage::ModelsFailed { .. }
+        | DaemonMessage::Unlocked
+        | DaemonMessage::Locked
+        | DaemonMessage::LockedError { .. }
+        | DaemonMessage::CredentialAdded { .. }
+        | DaemonMessage::CredentialAddFailed { .. }
+        | DaemonMessage::CredentialRemoved { .. }
+        | DaemonMessage::CredentialRemoveFailed { .. }
+        | DaemonMessage::Credential { .. }
+        | DaemonMessage::AccountAdded { .. }
+        | DaemonMessage::AccountAddFailed { .. }
+        | DaemonMessage::AccountRemoved { .. }
+        | DaemonMessage::AccountRemoveFailed { .. }
+        | DaemonMessage::Accounts { .. }
+        | DaemonMessage::AccountListFailed { .. }
+        | DaemonMessage::ShuttingDown => None,
+        // Catch-all for any future variants added to this #[non_exhaustive] enum.
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,6 +1367,7 @@ mod tests {
             client_streams: Vec::new(),
             summary_subscribers: HashMap::new(),
             activity_subscribers: HashMap::new(),
+            client_subscribed_sessions: HashMap::new(),
             model_cache: HashMap::new(),
             mcp_manager: crate::mcp::McpManager::empty(),
         };

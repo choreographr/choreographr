@@ -283,6 +283,9 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     client_tx
         .send(ClientMessage::ListAccounts)
         .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
+    client_tx
+        .send(ClientMessage::SubscribeAllActivity)
+        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
     let result = run_ui_loop(
         &mut terminal,
         &mut app,

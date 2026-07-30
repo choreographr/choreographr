@@ -153,6 +153,7 @@ fn main() -> anyhow::Result<()> {
         client_streams: Vec::new(),
         summary_subscribers: std::collections::HashMap::new(),
         activity_subscribers: std::collections::HashMap::new(),
+        client_subscribed_sessions: std::collections::HashMap::new(),
         model_cache: HashMap::new(),
         mcp_manager,
     };
