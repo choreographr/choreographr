@@ -36,24 +36,6 @@ fn extracts_responses_text_delta() {
 }
 
 #[test]
-fn chat_completions_stream_delta_keeps_reasoning_separate() {
-    let payload: ChatCompletionsStreamResponse = serde_json::from_str(
-        r#"{"choices":[{"delta":{"content":"answer","reasoning_text":"think"}}]}"#,
-    )
-    .expect("parse");
-
-    let delta = payload
-        .choices
-        .into_iter()
-        .next()
-        .expect("choice")
-        .delta
-        .expect("delta");
-    assert_eq!(delta.content.as_deref(), Some("answer"));
-    assert_eq!(delta.reasoning_text.as_deref(), Some("think"));
-}
-
-#[test]
 fn retryable_statuses() {
     assert!(is_retryable_status(429)); // TOO_MANY_REQUESTS
     assert!(is_retryable_status(500)); // INTERNAL_SERVER_ERROR
@@ -116,62 +98,9 @@ fn parse_retry_after_non_integer() {
 }
 
 #[test]
-fn assistant_message_take_reasoning_returns_none_when_all_fields_empty() {
-    let mut msg = AssistantMessage {
-        content: Some("hello".to_string()),
-        tool_calls: Vec::new(),
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: None,
-    };
-    assert_eq!(msg.take_reasoning(), None);
-}
-
-#[test]
-fn assistant_message_take_reasoning_uses_reasoning_content_first() {
-    let mut msg = AssistantMessage {
-        content: None,
-        tool_calls: Vec::new(),
-        reasoning_content: Some("think 1".to_string()),
-        reasoning: Some("think 2".to_string()),
-        reasoning_text: Some("think 3".to_string()),
-    };
-    // take_reasoning should return reasoning_content (first in priority)
-    assert_eq!(msg.take_reasoning(), Some("think 1".to_string()));
-    // After taking, all fields should be consumed
-    assert_eq!(msg.reasoning_content, None);
-    assert_eq!(msg.reasoning, Some("think 2".to_string()));
-    assert_eq!(msg.reasoning_text, Some("think 3".to_string()));
-}
-
-#[test]
-fn assistant_message_take_reasoning_falls_back_to_reasoning() {
-    let mut msg = AssistantMessage {
-        content: None,
-        tool_calls: Vec::new(),
-        reasoning_content: None,
-        reasoning: Some("think 2".to_string()),
-        reasoning_text: None,
-    };
-    assert_eq!(msg.take_reasoning(), Some("think 2".to_string()));
-}
-
-#[test]
-fn assistant_message_take_reasoning_falls_back_to_reasoning_text() {
-    let mut msg = AssistantMessage {
-        content: None,
-        tool_calls: Vec::new(),
-        reasoning_content: None,
-        reasoning: None,
-        reasoning_text: Some("think 3".to_string()),
-    };
-    assert_eq!(msg.take_reasoning(), Some("think 3".to_string()));
-}
-
-#[test]
 fn daemon_config_deserializes_max_turns() {
     let raw = "max_turns = 42\n";
-    let config: crate::openai::DaemonConfig = toml::from_str(raw).unwrap();
+    let config: DaemonConfig = toml::from_str(raw).unwrap();
     assert_eq!(config.max_turns, Some(42));
 }
 
@@ -183,7 +112,7 @@ context_file_names = ["AGENTS.md"]
 context_file_max_bytes = 16384
 disable_claude_code_prompt = true
 "#;
-    let config: crate::openai::DaemonConfig = toml::from_str(raw).unwrap();
+    let config: DaemonConfig = toml::from_str(raw).unwrap();
     assert_eq!(config.context.context_file_names, vec!["AGENTS.md"]);
     assert_eq!(config.context.context_file_max_bytes, 16384);
     assert!(config.context.disable_claude_code_prompt);
@@ -196,19 +125,19 @@ max_turns = 10
 base_url = "https://example.com"
 streaming = false
 "#;
-    let config: crate::openai::DaemonConfig = toml::from_str(raw).unwrap();
+    let config: DaemonConfig = toml::from_str(raw).unwrap();
     assert_eq!(config.max_turns, Some(10));
 }
 
 #[test]
 fn daemon_config_defaults_when_empty() {
-    let config: crate::openai::DaemonConfig = toml::from_str("").unwrap();
+    let config: DaemonConfig = toml::from_str("").unwrap();
     assert_eq!(config.max_turns, None);
 }
 
 #[test]
 fn daemon_config_errors_on_invalid_toml() {
-    let result: Result<crate::openai::DaemonConfig, _> = toml::from_str("[[[");
+    let result: Result<DaemonConfig, _> = toml::from_str("[[[");
     assert!(result.is_err());
 }
 

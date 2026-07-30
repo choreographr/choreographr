@@ -1,12 +1,13 @@
+mod chat_completions;
 mod config;
-mod requests;
+mod responses;
 mod retry;
 mod sse;
 #[cfg(test)]
 mod tests;
 pub use crate::providers::shared::MaxTokensField;
-use crate::providers::types::CallerInfo;
 use crate::providers::{ChatTurnResult, StreamEvent};
+use tracing::warn;
 
 pub(crate) use config::endpoint_url;
 // Re-export deprecated load_service_config for backward compatibility
@@ -23,11 +24,14 @@ pub(crate) use sse::build_sse_event;
 pub(crate) use sse::extract_responses_text_delta;
 pub(crate) use sse::{ResponsesStreamEvent, parse_responses_stream_event};
 
+// Re-export common retry types for use by sub-modules and tests.
 #[cfg(test)]
 pub(crate) use crate::retry::{
     RetryConfig, backoff_duration, is_retryable_status, parse_retry_after_secs,
 };
 pub use retry::RetryCallback;
+
+
 
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -60,193 +64,6 @@ struct ModelInfo {
     id: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ResponsesInputItem {
-    Message {
-        role: String,
-        content: String,
-    },
-    #[serde(rename = "function_call_output")]
-    FunctionCallOutput {
-        call_id: String,
-        output: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        caller: Option<CallerInfo>,
-    },
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesRequest<'a> {
-    model: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    input: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ResponsesTool>>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'a str>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    store: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_response_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    include: Option<Vec<&'a str>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parallel_tool_calls: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<serde_json::Value>,
-}
-
-/// Raw Responses API response envelope.
-///
-/// Fields like `id` come from the wire but aren't always read in the
-/// current code path — they're kept for deserialization completeness
-/// and future use (streaming contexts, resumption, etc.).
-/// Ref: https://developers.openai.com/api/reference/resources/responses/methods/create
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct ResponsesResponse {
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    output: Vec<ResponseOutputItem>,
-    #[serde(default)]
-    usage: Option<Usage>,
-}
-
-/// Items in a Responses API response output array.
-///
-/// Variant fields marked `#[serde(default)]` are part of the wire spec
-/// but only read when the current code path needs them — keeping them
-/// allows forward-compatible deserialization without discarding data
-/// that may be needed for retries, resumption, or future features.
-/// `#[allow(dead_code)]` suppresses warnings on spec fields we don't
-/// actively read yet.
-/// Ref: https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-#[allow(dead_code)]
-enum ResponseOutputItem {
-    Message {
-        #[serde(default)]
-        content: Vec<ResponseContentPart>,
-        #[serde(default)]
-        role: Option<String>,
-    },
-    Reasoning {
-        #[serde(default)]
-        summary: Vec<serde_json::Value>,
-    },
-    #[serde(rename = "function_call")]
-    FunctionCall {
-        call_id: String,
-        name: String,
-        arguments: String,
-        #[serde(default)]
-        caller: Option<CallerInfo>,
-    },
-    Program {
-        #[serde(default)]
-        id: Option<String>,
-        call_id: String,
-        #[serde(default)]
-        code: Option<String>,
-        #[serde(default)]
-        fingerprint: Option<String>,
-    },
-    #[serde(rename = "program_output")]
-    ProgramOutput {
-        #[serde(default)]
-        id: Option<String>,
-        call_id: String,
-        #[serde(default)]
-        result: Option<String>,
-        #[serde(default)]
-        status: Option<String>,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseContentPart {
-    #[serde(rename = "type")]
-    kind: String,
-    text: Option<String>,
-}
-
-/// A tool definition in a Responses API request.
-///
-/// For regular function tools all fields are used; for the
-/// `programmatic_tool_calling` hosted tool only `type` is needed — the
-/// empty name/description/parameters are omitted via `skip_serializing_if`
-/// so the wire format matches the OpenAI spec (just `{"type":"programmatic_tool_calling"}`).
-/// See <https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>
-#[derive(Debug, Serialize)]
-pub(crate) struct ResponsesTool {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    name: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    description: String,
-    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
-    parameters: serde_json::Value,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    strict: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output_schema: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allowed_callers: Option<Vec<AllowedCaller>>,
-}
-
-impl From<&ChatToolDefinition> for ResponsesTool {
-    fn from(tool: &ChatToolDefinition) -> Self {
-        Self {
-            kind: "function".to_string(),
-            name: tool.function.name.to_string(),
-            description: tool.function.description.to_string(),
-            parameters: tool.function.parameters.clone(),
-            strict: false,
-            output_schema: tool.function.output_schema.clone(),
-            allowed_callers: tool.function.allowed_callers.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct ChatCompletionsRequest<'a, M>
-where
-    M: Serialize,
-{
-    model: &'a str,
-    #[serde(bound(serialize = "M: Serialize"))]
-    messages: &'a [M],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<&'a [ChatToolDefinition]>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream_options: Option<ChatCompletionsStreamOptions>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_completion_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatCompletionsStreamOptions {
-    include_usage: bool,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Usage {
     prompt_tokens: u32,
@@ -270,6 +87,20 @@ pub struct ChatToolFunction {
     pub output_schema: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_callers: Option<Vec<AllowedCaller>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: AssistantToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantToolFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -301,91 +132,6 @@ impl ChatRequestMessage {
             reasoning_text: None,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AssistantToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub function: AssistantToolFunction,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AssistantToolFunction {
-    pub name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletionsResponse {
-    choices: Vec<Choice>,
-    usage: Option<Usage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Choice {
-    message: AssistantMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct AssistantMessage {
-    content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<AssistantToolCall>,
-    reasoning_content: Option<String>,
-    reasoning: Option<String>,
-    reasoning_text: Option<String>,
-}
-
-impl AssistantMessage {
-    /// Extract reasoning content from whichever field the model populated
-    /// (reasoning_content, reasoning, or reasoning_text).
-    fn take_reasoning(&mut self) -> Option<String> {
-        self.reasoning_content
-            .take()
-            .or_else(|| self.reasoning.take())
-            .or_else(|| self.reasoning_text.take())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatCompletionsStreamResponse {
-    choices: Vec<StreamChoice>,
-    #[serde(default)]
-    usage: Option<Usage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamChoice {
-    delta: Option<StreamDelta>,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamDelta {
-    content: Option<String>,
-    tool_calls: Option<Vec<StreamToolCallDelta>>,
-    reasoning_content: Option<String>,
-    reasoning: Option<String>,
-    reasoning_text: Option<String>,
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
-struct StreamToolCallDelta {
-    index: u32,
-    id: Option<String>,
-    // Deserialised from the API's "type" field but never read in Rust — kept
-    // so serde doesn't choke on unknown fields and to document the wire format.
-    #[allow(dead_code)]
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    function: Option<StreamToolCallFunctionDelta>,
-}
-
-#[derive(Debug, Default, Clone, Deserialize)]
-struct StreamToolCallFunctionDelta {
-    name: Option<String>,
-    arguments: Option<String>,
 }
 
 impl ChatToolDefinition {
@@ -454,6 +200,136 @@ impl OpenAiClient {
     pub fn api_key(&self) -> &str {
         &self.api_key
     }
+
+    // ── High-level dispatch methods ────────────────────────────────────
+    //
+    // Each method inspects `self.config.request_format_for_model(model)` to
+    // delegate to either Chat Completions or Responses API logic.
+
+    pub fn validate_and_list_models(&self) -> Result<Vec<String>, OpenAiError> {
+        use tracing::info;
+        info!("listing models from {}", self.config.base_url);
+        let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
+        let retry = retry::retry_config_from_config(&self.config);
+        let response = retry::retry_send_get(
+            &self.http,
+            &url,
+            &self.api_key,
+            &retry,
+            &mut None,
+            None,
+        )?;
+        let payload: ModelListResponse = response
+            .into_body()
+            .read_json()
+            .map_err(|e| OpenAiError::Io(io::Error::other(e)))?;
+        let models: Vec<String> = payload.data.into_iter().map(|model| model.id).collect();
+        info!("models returned: {}", models.len());
+        Ok(models)
+    }
+
+    pub fn completion(&self, model: &str, prompt: &str) -> Result<String, OpenAiError> {
+        match self.config.request_format_for_model(model) {
+            RequestFormat::Responses => {
+                responses::responses_request(&self.http, &self.config, &self.api_key, model, prompt, None)
+            }
+            RequestFormat::ChatCompletions => {
+                chat_completions::chat_completions_request(
+                    &self.http, &self.config, &self.api_key, model, prompt, None,
+                )
+            }
+        }
+    }
+
+    pub fn completion_stream<F>(&self, model: &str, prompt: &str, mut on_event: F) -> Result<(), OpenAiError>
+    where
+        F: FnMut(StreamEvent) -> io::Result<()>,
+    {
+        if !self.config.streaming {
+            let content = self.completion(model, prompt)?;
+            if !content.is_empty() {
+                on_event(StreamEvent::Answer(content))?;
+            }
+            return Ok(());
+        }
+
+        match self.config.request_format_for_model(model) {
+            RequestFormat::Responses => responses::responses_request_streaming(
+                &self.http, &self.config, &self.api_key, model, prompt, None, &mut on_event,
+            ),
+            RequestFormat::ChatCompletions => chat_completions::chat_completions_request_streaming(
+                &self.http, &self.config, &self.api_key, model, prompt,
+                None, None, &mut on_event,
+            ),
+        }
+    }
+
+    pub fn chat_completion_turn(
+        &self,
+        params: crate::providers::ChatTurnRequest<'_>,
+    ) -> Result<ChatTurnResult, OpenAiError> {
+        let reasoning_effort = reasoning_effort_api_value(&params.thinking_effort);
+        tracing::debug!(effort = %params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
+        match self.config.request_format_for_model(params.model) {
+            RequestFormat::Responses => responses::responses_request_with_tools(
+                &self.http, &self.config, &self.api_key,
+                params.model, params.messages, params.tools,
+                reasoning_effort,
+                params.previous_response_id, params.tool_results,
+                params.on_retry, params.cancel_rx,
+                params.programmatic_tool_calling,
+            ),
+            RequestFormat::ChatCompletions => chat_completions::chat_completions_request_with_tools(
+                &self.http, &self.config, &self.api_key,
+                params.model, params.messages, params.tools,
+                reasoning_effort,
+                params.on_retry, params.cancel_rx,
+            ),
+        }
+    }
+
+    pub fn chat_completion_turn_streaming<F>(
+        &self,
+        params: crate::providers::ChatTurnRequest<'_>,
+        mut on_event: F,
+    ) -> Result<ChatTurnResult, OpenAiError>
+    where
+        F: FnMut(StreamEvent) -> io::Result<()>,
+    {
+        let reasoning_effort = reasoning_effort_api_value(&params.thinking_effort);
+        tracing::debug!(
+            effort = %params.thinking_effort,
+            ?reasoning_effort,
+            "chat_completion_turn_streaming"
+        );
+        if !self.config.streaming {
+            let result = self.chat_completion_turn(params)?;
+            let result =
+                crate::providers::shared::emit_non_streaming_events(result, &mut on_event)?;
+            return Ok(result);
+        }
+
+        match self.config.request_format_for_model(params.model) {
+            RequestFormat::Responses => responses::responses_request_streaming_with_tools(
+                &self.http, &self.config, &self.api_key,
+                params.model, params.messages, params.tools,
+                reasoning_effort,
+                params.previous_response_id, params.tool_results,
+                params.on_retry, params.cancel_rx,
+                params.programmatic_tool_calling,
+                on_event,
+            ),
+            RequestFormat::ChatCompletions => {
+                chat_completions::chat_completions_request_streaming_with_tools(
+                    &self.http, &self.config, &self.api_key,
+                    params.model, params.messages, params.tools,
+                    reasoning_effort,
+                    params.on_retry, params.cancel_rx,
+                    on_event,
+                )
+            }
+        }
+    }
 }
 
 /// Map reasoning slug string to OpenAI's `reasoning_effort` API value.
@@ -468,14 +344,14 @@ pub(crate) fn reasoning_effort_api_value(slug: &str) -> Option<&str> {
 /// parameter set via explicit provider configuration.
 pub(crate) fn messages_to_responses_input(
     messages: &[ChatRequestMessage],
-) -> Vec<ResponsesInputItem> {
+) -> Vec<responses::ResponsesInputItem> {
     let mut items = Vec::new();
 
     for msg in messages {
         match msg.role {
             "system" => {
                 if let Some(ref content) = msg.content {
-                    items.push(ResponsesInputItem::Message {
+                    items.push(responses::ResponsesInputItem::Message {
                         role: "system".to_string(),
                         content: content.clone(),
                     });
@@ -483,7 +359,7 @@ pub(crate) fn messages_to_responses_input(
             }
             "user" | "assistant" => {
                 if let Some(ref content) = msg.content {
-                    items.push(ResponsesInputItem::Message {
+                    items.push(responses::ResponsesInputItem::Message {
                         role: msg.role.to_string(),
                         content: content.clone(),
                     });
@@ -494,7 +370,7 @@ pub(crate) fn messages_to_responses_input(
                 if let Some(ref call_id) = msg.tool_call_id
                     && let Some(ref content) = msg.content
                 {
-                    items.push(ResponsesInputItem::FunctionCallOutput {
+                    items.push(responses::ResponsesInputItem::FunctionCallOutput {
                         call_id: call_id.clone(),
                         output: content.clone(),
                         caller: None,
@@ -513,6 +389,37 @@ pub(crate) fn messages_to_responses_input(
     tracing::debug!("messages_to_responses_input: {} items", items.len());
 
     items
+}
+
+/// Filter tool calls whose `arguments_json` is not valid JSON (e.g. truncated
+/// mid-stream by the provider).  Returns the discarded calls so the caller can
+/// surface the cropped JSON in error messages.
+/// Providers (especially cheaper models via OpenAI-compatible APIs) sometimes
+/// return incomplete `function.arguments` strings, which would cause tool
+/// execution to fail with a JSON parse error and trigger an error-recovery
+/// loop that inflates the context and eventually hits the provider's 400/500.
+pub(crate) fn validate_tool_call_arguments(
+    tool_calls: &mut Vec<crate::providers::types::ChatToolCall>,
+) -> Vec<choreo_proto::DiscardedToolCall> {
+    let all = std::mem::take(tool_calls);
+    let (valid, discarded): (Vec<_>, Vec<_>) = all
+        .into_iter()
+        .partition(|tc| serde_json::from_str::<serde_json::Value>(&tc.arguments_json).is_ok());
+    for tc in &discarded {
+        warn!(
+            name = %tc.name,
+            args_len = tc.arguments_json.len(),
+            "discarding tool call with invalid (truncated) arguments JSON",
+        );
+    }
+    *tool_calls = valid;
+    discarded
+        .into_iter()
+        .map(|tc| choreo_proto::DiscardedToolCall {
+            name: tc.name,
+            arguments_json: tc.arguments_json,
+        })
+        .collect()
 }
 
 // ── ProviderClient trait impl ───────────────────────────────────────────
