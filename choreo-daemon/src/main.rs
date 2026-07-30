@@ -152,6 +152,7 @@ fn main() -> anyhow::Result<()> {
         tool_registry,
         client_streams: Vec::new(),
         summary_subscribers: std::collections::HashMap::new(),
+        activity_subscribers: std::collections::HashMap::new(),
         model_cache: HashMap::new(),
         mcp_manager,
     };

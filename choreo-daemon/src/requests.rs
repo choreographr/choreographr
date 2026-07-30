@@ -33,10 +33,12 @@ use tracing::{debug, info, trace, warn};
 fn broadcast_turn_appended(
     cmd_tx: &mpsc::Sender<SessionCommand>,
     session: &SessionState,
+    session_id: u64,
     turn_id: u32,
 ) {
     if let Some(turn) = session.turns.get(&turn_id)
         && let Err(e) = cmd_tx.send(SessionCommand::Broadcast(DaemonMessage::TurnAppended {
+            session_id,
             turn_id,
             turn: turn.clone(),
         }))
@@ -54,6 +56,7 @@ fn emit_image(
     image: PreparedImage,
     tool_call_id: Option<String>,
     session: &mut SessionState,
+    session_id: u64,
     turn_id: u32,
 ) {
     let record = DisplayedImageRecord {
@@ -68,7 +71,7 @@ fn emit_image(
         tool_call_id,
     };
     session.add_displayed_image(turn_id, record.clone());
-    broadcast_turn_appended(cmd_tx, session, turn_id);
+    broadcast_turn_appended(cmd_tx, session, session_id, turn_id);
 }
 
 /// Spawn a forwarding thread that relays streaming output chunks to session
@@ -76,6 +79,7 @@ fn emit_image(
 /// (tool finished) or a kill signal is received (caller stopped waiting).
 fn spawn_forwarding_thread(
     cmd_tx: mpsc::Sender<SessionCommand>,
+    session_id: u64,
     request_id: u32,
     call_id: String,
     output_rx: mpsc::Receiver<Vec<u8>>,
@@ -88,6 +92,7 @@ fn spawn_forwarding_thread(
                 Ok(data) => {
                     if cmd_tx
                         .send(SessionCommand::Broadcast(DaemonMessage::ToolResultChunk {
+                            session_id,
                             request_id,
                             call_id: call_id.clone(),
                             data,
@@ -144,10 +149,11 @@ fn accumulate_token_usage(
 
 /// Broadcast the session's accumulated token usage to all subscribers so the
 /// UI can update its final token display at the end of a turn.
-fn broadcast_token_usage(ctx: &RequestContext, session: &SessionState) {
+fn broadcast_token_usage(session_id: u64, ctx: &RequestContext, session: &SessionState) {
     let _ = ctx
         .cmd_tx
         .send(SessionCommand::Broadcast(DaemonMessage::TokenUsageUpdate {
+            session_id,
             token_usage: session.config.accumulated_usage,
             last_prompt_tokens: session.config.last_prompt_tokens,
         }));
@@ -184,6 +190,7 @@ struct SpawnToolArgs {
     tool_call: ChatToolCall,
     timeout: Option<Duration>,
     request_id: u32,
+    session_id: u64,
     registry: Arc<ToolRegistry>,
     cmd_tx: mpsc::Sender<SessionCommand>,
     x_credentials: Option<ServiceCredential>,
@@ -203,6 +210,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
         tool_call,
         timeout,
         request_id,
+        session_id,
         registry,
         cmd_tx,
         x_credentials,
@@ -227,7 +235,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
     // Forwards streaming output chunks to subscribers as they arrive.
     // Exits when the output channel is disconnected (tool finished) or
     // a kill signal is received (we stopped waiting).
-    spawn_forwarding_thread(cmd_tx, request_id, tool_call.id.clone(), output_rx, kill_rx);
+    spawn_forwarding_thread(cmd_tx, session_id, request_id, tool_call.id.clone(), output_rx, kill_rx);
 
     // ── Execution thread ───────────────────────────────────────────
     let tc = tool_call.clone();
@@ -643,7 +651,7 @@ pub(crate) fn run_agent_loop(
             None
         };
         let (current_turn_id, _) = session.start_turn(turn_user_text);
-        broadcast_turn_appended(&ctx.cmd_tx, session, current_turn_id);
+        broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, current_turn_id);
         if ctx
             .cmd_tx
             .send(SessionCommand::StatusChanged(SessionStatus::Inference))
@@ -677,6 +685,7 @@ pub(crate) fn run_agent_loop(
         let _ = ctx
             .cmd_tx
             .send(SessionCommand::Broadcast(DaemonMessage::Started {
+                session_id: ctx.session_id,
                 request_id,
                 turn_id: current_turn_id,
                 estimated_prompt_tokens,
@@ -716,6 +725,7 @@ pub(crate) fn run_agent_loop(
                         }
                         let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::OutputChunk {
+                                session_id: ctx.session_id,
                                 request_id,
                                 stream: OutputStream::Answer,
                                 data: text.into_bytes(),
@@ -725,6 +735,7 @@ pub(crate) fn run_agent_loop(
                         // chunk so the count feels responsive.
                         let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::LiveOutputTokenCount {
+                                session_id: ctx.session_id,
                                 request_id,
                                 output_tokens: output_token_count,
                             },
@@ -736,6 +747,7 @@ pub(crate) fn run_agent_loop(
                         }
                         let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::OutputChunk {
+                                session_id: ctx.session_id,
                                 request_id,
                                 stream: OutputStream::Reasoning,
                                 data: text.into_bytes(),
@@ -743,6 +755,7 @@ pub(crate) fn run_agent_loop(
                         ));
                         let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::LiveOutputTokenCount {
+                                session_id: ctx.session_id,
                                 request_id,
                                 output_tokens: output_token_count,
                             },
@@ -762,7 +775,7 @@ pub(crate) fn run_agent_loop(
                 );
                 let token_usage = final_text.usage;
                 accumulate_token_usage(session, &token_usage, turn_iter, ctx);
-                broadcast_token_usage(ctx, session);
+                broadcast_token_usage(ctx.session_id, ctx, session);
                 session.set_assistant_response(
                     current_turn_id,
                     Some(final_text.content),
@@ -777,7 +790,7 @@ pub(crate) fn run_agent_loop(
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
                 let token_usage = tool_use.usage;
                 accumulate_token_usage(session, &token_usage, turn_iter, ctx);
-                broadcast_token_usage(ctx, session);
+                broadcast_token_usage(ctx.session_id, ctx, session);
                 session.set_assistant_response(
                     current_turn_id,
                     tool_use.content.clone(),
@@ -793,7 +806,7 @@ pub(crate) fn run_agent_loop(
                         .collect(),
                     token_usage,
                 );
-                broadcast_turn_appended(&ctx.cmd_tx, session, current_turn_id);
+                broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, current_turn_id);
                 // Store response_id for chaining tool results back to this turn
                 prev_resp_id = tool_use.response_id;
                 tool_results.clear();
@@ -816,6 +829,7 @@ pub(crate) fn run_agent_loop(
                     if let Err(e) =
                         ctx.cmd_tx
                             .send(SessionCommand::Broadcast(DaemonMessage::ToolCallStarted {
+                                session_id: ctx.session_id,
                                 request_id,
                                 call_id: tool_call.id.clone(),
                                 tool_name: tool_call.name.clone(),
@@ -855,6 +869,7 @@ pub(crate) fn run_agent_loop(
                         turn_working_dir.as_deref(),
                         tool_timeout,
                         request_id,
+                        ctx.session_id,
                         session,
                         cancel_rx,
                         ctx,
@@ -867,6 +882,7 @@ pub(crate) fn run_agent_loop(
                             image,
                             Some(tool_call.id.clone()),
                             session,
+                            ctx.session_id,
                             current_turn_id,
                         );
                     }
@@ -894,6 +910,7 @@ pub(crate) fn run_agent_loop(
                     for tc in concurrent.iter() {
                         if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(
                             DaemonMessage::ToolCallStarted {
+                                session_id: ctx.session_id,
                                 request_id,
                                 call_id: tc.id.clone(),
                                 tool_name: tc.name.clone(),
@@ -955,6 +972,7 @@ pub(crate) fn run_agent_loop(
                                 tool_call,
                                 timeout,
                                 request_id,
+                                session_id: ctx.session_id,
                                 registry: Arc::clone(&reg),
                                 cmd_tx: cmd_tx.clone(),
                                 x_credentials: None,
@@ -1015,6 +1033,7 @@ pub(crate) fn run_agent_loop(
                                 image,
                                 Some(tool_call.id.clone()),
                                 session,
+                                ctx.session_id,
                                 current_turn_id,
                             );
                         }
@@ -1078,6 +1097,7 @@ fn finalize_and_broadcast_turn(
         let _ = ctx
             .cmd_tx
             .send(SessionCommand::Broadcast(DaemonMessage::TurnFinalized {
+                session_id: ctx.session_id,
                 turn_id: current_turn_id,
                 turn: turn.clone(),
             }));
@@ -1106,10 +1126,11 @@ fn finish_tool_call(
         invocation_description,
     );
 
-    broadcast_turn_appended(&ctx.cmd_tx, session, turn_id);
+    broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, turn_id);
 
     let event = if is_error {
         DaemonMessage::ToolCallFailed {
+            session_id: ctx.session_id,
             request_id,
             call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
@@ -1117,6 +1138,7 @@ fn finish_tool_call(
         }
     } else {
         DaemonMessage::ToolCallFinished {
+            session_id: ctx.session_id,
             request_id,
             call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
@@ -1134,6 +1156,7 @@ fn execute_tool_with_timeout(
     working_dir: Option<&Path>,
     timeout_dur: Duration,
     request_id: u32,
+    session_id: u64,
     session: &mut SessionState,
     cancel_rx: &mpsc::Receiver<()>,
     ctx: &RequestContext,
@@ -1314,6 +1337,7 @@ fn execute_tool_with_timeout(
     // arrives (main loop exited).
     spawn_forwarding_thread(
         ctx.cmd_tx.clone(),
+        session_id,
         request_id,
         tool_call.id.clone(),
         output_rx,
@@ -1629,7 +1653,7 @@ mod tests {
         let mut session = SessionState::empty();
         let (turn_id, _) = session.start_turn(Some("hello".into()));
 
-        broadcast_turn_appended(&tx, &session, turn_id);
+        broadcast_turn_appended(&tx, &session, 0, turn_id);
 
         match rx.try_recv() {
             Ok(SessionCommand::Broadcast(DaemonMessage::TurnAppended { turn_id: id, .. })) => {
@@ -1645,7 +1669,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<SessionCommand>();
         let session = SessionState::empty();
 
-        broadcast_turn_appended(&tx, &session, 999);
+        broadcast_turn_appended(&tx, &session, 0, 999);
 
         assert!(rx.try_recv().is_err(), "expected no message");
     }
@@ -1658,7 +1682,7 @@ mod tests {
         drop(rx);
 
         // Disconnected receiver should not panic — warn! is logged instead.
-        broadcast_turn_appended(&tx, &session, turn_id);
+        broadcast_turn_appended(&tx, &session, 0, turn_id);
     }
 
     // -- resolve_reasoning_effort tests ------------------------------------
@@ -1921,6 +1945,7 @@ mod tests {
             None,
             timeout_dur,
             1,
+            1,
             &mut session,
             &cancel_rx,
             &ctx,
@@ -2147,6 +2172,7 @@ mod tests {
             tool_call,
             timeout,
             request_id: 1,
+            session_id: 1,
             registry,
             cmd_tx,
             x_credentials: None,

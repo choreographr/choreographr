@@ -60,20 +60,16 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
 
 /// Look up the fullscreen image by (turn_id, img_idx) and render it.
 pub(crate) fn render_fullscreen_only(frame: &mut Frame<'_>, app: &mut App) -> bool {
-    let Some((turn_id, img_idx)) = app.fullscreen_image_target else {
+    let Some((session_id, turn_id, img_idx)) = app.fullscreen_image_target else {
         return false;
     };
-    if !app.rendered_images.contains_key(&turn_id)
-        && !app
-            .session_view
-            .turns
-            .get(&turn_id)
-            .is_some_and(|t| !t.displayed_images.is_empty())
+    if !app.rendered_images.get(&session_id).is_some_and(|m| m.contains_key(&turn_id))
+        && !app.display_for(session_id).view.turns.get(&turn_id).is_some_and(|t| !t.displayed_images.is_empty())
     {
         app.fullscreen_image_target = None;
         return false;
     }
-    render_fullscreen_image(frame, turn_id, img_idx, app);
+    render_fullscreen_image(frame, session_id, turn_id, img_idx, app);
     true
 }
 
@@ -85,13 +81,13 @@ fn render_fullscreen_placeholder(frame: &mut Frame<'_>) {
     frame.render_widget(block, area);
 }
 
-fn render_fullscreen_image(frame: &mut Frame<'_>, turn_id: u32, img_idx: usize, app: &mut App) {
+fn render_fullscreen_image(frame: &mut Frame<'_>, session_id: u64, turn_id: u32, img_idx: usize, app: &mut App) {
     let area = frame.area();
     let full = Size::new(area.width, area.height);
 
     // Ensure the rendered_images entry exists — create from turn data if missing.
-    if !app.rendered_images.contains_key(&turn_id) {
-        let Some(turn) = app.session_view.turns.get(&turn_id) else {
+    if !app.rendered_images.contains_key(&session_id) {
+        let Some(turn) = app.display_for(session_id).view.turns.get(&turn_id) else {
             return;
         };
         let Some(record) = turn.displayed_images.get(img_idx) else {
@@ -100,6 +96,8 @@ fn render_fullscreen_image(frame: &mut Frame<'_>, turn_id: u32, img_idx: usize, 
         let placeholder =
             RenderedImage::new_placeholder(record.metadata.clone(), Arc::from(record.data.clone()));
         app.rendered_images
+            .entry(session_id)
+            .or_default()
             .entry(turn_id)
             .or_default()
             .insert(img_idx, placeholder);
@@ -108,7 +106,8 @@ fn render_fullscreen_image(frame: &mut Frame<'_>, turn_id: u32, img_idx: usize, 
     // Fast path — already encoded at full size.
     let should_submit = match app
         .rendered_images
-        .get_mut(&turn_id)
+        .get_mut(&session_id)
+        .and_then(|imgs| imgs.get_mut(&turn_id))
         .and_then(|images| images.get_mut(&img_idx))
     {
         Some(img) => {
@@ -136,10 +135,12 @@ fn render_fullscreen_image(frame: &mut Frame<'_>, turn_id: u32, img_idx: usize, 
     };
 
     if should_submit
-        && let Some(images) = app.rendered_images.get(&turn_id)
-        && let Some(img) = images.get(&img_idx)
+        && let Some(images) = app.rendered_images.get(&session_id)
+        && let Some(imgs) = images.get(&turn_id)
+        && let Some(img) = imgs.get(&img_idx)
     {
         app.submit_image_job(
+            session_id,
             turn_id,
             img_idx,
             img.data.clone(),
@@ -186,7 +187,9 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         let position = app
             .max_scroll_offset()
             .saturating_sub(app.effective_scroll());
-        let marker_slots: Vec<usize> = app.markers.iter().map(|m| m.virtual_slot).collect();
+        let marker_slots: Vec<usize> = app.active_display_ref()
+            .map(|d| d.markers.iter().map(|m| m.virtual_slot).collect())
+            .unwrap_or_default();
         frame.render_stateful_widget(
             vertical_scrollbar().with_markers(&marker_slots),
             history_chunks[1],
@@ -296,17 +299,17 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         // across the session — go first (left side) so the bar's leading edge
         // stays fixed.  Runtime metrics (tokens, context fill) follow on the
         // right where their per-turn updates don't shift the identity fields.
-        let wd = app.attached_working_dir.as_deref().unwrap_or("-");
+        let wd = app.active_display_ref().and_then(|d| d.working_dir.as_deref()).unwrap_or("-");
         let provider = app.attached_provider_slug.as_deref().unwrap_or("-");
-        let model = app.attached_model.as_deref().unwrap_or("-");
-        let reasoning = app.attached_reasoning_effort.as_deref().unwrap_or("-");
+        let model = app.active_display_ref().and_then(|d| d.selected_model.as_deref()).unwrap_or("-");
+        let reasoning = app.active_display_ref().and_then(|d| d.reasoning_effort.as_deref()).unwrap_or("-");
 
         // Runtime metrics: tokens flow and context-window fill.
         let tokens = match &app.display_token_usage() {
             Some(usage) => format!("↑{} ↓{}", usage.input_tokens, usage.output_tokens),
             None => String::new(),
         };
-        let context = match (app.attached_context_window, app.attached_last_prompt_tokens) {
+        let context = match (app.active_display_ref().and_then(|d| d.context_window), app.active_display_ref().and_then(|d| d.last_prompt_tokens)) {
             (Some(limit), Some(current)) => {
                 let ratio = if limit > 0 {
                     current as f64 / limit as f64
@@ -392,14 +395,21 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let mut y = area.y + area.height;
     let mut rows_to_skip = app.effective_scroll();
 
-    let len = app.visible_turn_ids.len();
+    // Clone visible turn IDs upfront to avoid borrow conflicts when
+    // accessing display state via app.display_for inside the loop.
+    let session_id = match app.active_session_id {
+        Some(sid) => sid,
+        None => return,
+    };
+    let visible_turn_ids: Vec<u32> = app.display_for(session_id).visible_turn_ids.clone();
+    let len = visible_turn_ids.len();
 
     // Iterate visible turns from newest to oldest.  clipped_area consumes
     // rows_to_skip from the bottom (newest end) so that turns fully below
     // the viewport are skipped before any content is rendered.
     for raw_i in 0..len {
         let i = len - 1 - raw_i;
-        let turn_id = app.visible_turn_ids[i];
+        let turn_id = visible_turn_ids[i];
 
         if rows_remaining == 0 {
             break;
@@ -408,7 +418,8 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // Get cached lines (Arc clone is O(1)), the pre-computed height,
         // and cumulative visual-row offsets for O(log n) row→line lookups.
         let (text_lines_arc, text_height, text_offsets, img_count) = {
-            let Some(turn) = app.session_view.turns.get(&turn_id) else {
+            let display = app.display_for(session_id);
+            let Some(turn) = display.view.turns.get(&turn_id) else {
                 continue;
             };
             if turn.undone {
@@ -416,7 +427,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             }
             let count = turn.displayed_images.len();
             let (arc, height, offsets) = cached_or_compute_lines(
-                &mut app.render_cache,
+                &mut display.render_cache,
                 i,
                 turn_id,
                 content_width,
@@ -442,7 +453,7 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     width: area.width,
                     height: visible_height as u16,
                 };
-                render_turn_image(frame, img_rect, turn_id, img_idx, app, fully_visible);
+                render_turn_image(frame, img_rect, session_id, turn_id, img_idx, app, fully_visible);
             }
         }
 
@@ -542,6 +553,7 @@ fn render_text_block(
 fn render_turn_image(
     frame: &mut Frame<'_>,
     area: Rect,
+    session_id: u64,
     turn_id: u32,
     img_idx: usize,
     app: &mut App,
@@ -552,7 +564,8 @@ fn render_turn_image(
     // Extract data we need while the borrow is active.
     let (needs_job, data, meta) = match app
         .rendered_images
-        .get_mut(&turn_id)
+        .get_mut(&session_id)
+        .and_then(|imgs| imgs.get_mut(&turn_id))
         .and_then(|images| images.get_mut(&img_idx))
     {
         Some(img) => {
@@ -600,6 +613,7 @@ fn render_turn_image(
 
     if needs_job {
         app.submit_image_job(
+            session_id,
             turn_id,
             img_idx,
             data,

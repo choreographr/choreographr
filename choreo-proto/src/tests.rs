@@ -235,7 +235,7 @@ fn token_usage_in_session_summary_backward_compat() {
 
 #[test]
 fn token_usage_in_daemon_message_done_backward_compat() {
-    let json = r#"{"Done":{"request_id":42}}"#;
+    let json = r#"{"Done":{"session_id":1,"request_id":42}}"#;
     let msg: DaemonMessage = serde_json::from_str(json).unwrap();
     match msg {
         DaemonMessage::Done {
@@ -253,6 +253,7 @@ fn token_usage_in_daemon_message_done_backward_compat() {
 #[test]
 fn daemon_message_done_without_usage() {
     let msg = DaemonMessage::Done {
+        session_id: 1,
         request_id: 7,
         token_usage: None,
         last_prompt_tokens: None,
@@ -278,6 +279,7 @@ fn daemon_message_done_with_usage_round_trip() {
         total_tokens: 150,
     };
     let msg = DaemonMessage::Done {
+        session_id: 1,
         request_id: 3,
         token_usage: Some(usage),
         last_prompt_tokens: None,
@@ -459,6 +461,7 @@ fn turn_appended_serde_round_trip() {
         displayed_images: vec![],
     };
     let msg = DaemonMessage::TurnAppended {
+        session_id: 1,
         turn_id: 1,
         turn: turn.clone(),
     };
@@ -486,6 +489,7 @@ fn turn_finalized_serde_round_trip() {
         displayed_images: vec![],
     };
     let msg = DaemonMessage::TurnFinalized {
+        session_id: 1,
         turn_id: 2,
         turn: turn.clone(),
     };

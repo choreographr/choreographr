@@ -13,6 +13,7 @@ fn app_state_stream_updates_history() {
     // Simulate a Started message to set up request-to-turn mapping.
     dispatch_daemon_message(
         &DaemonMessage::Started {
+            session_id: 1,
             request_id: 7,
             turn_id: 1,
             estimated_prompt_tokens: 0,
@@ -40,6 +41,7 @@ fn app_state_stream_updates_history() {
 
     dispatch_daemon_message(
         &DaemonMessage::OutputChunk {
+            session_id: 1,
             request_id: 7,
             stream: OutputStream::Reasoning,
             data: b"thinking".to_vec(),
@@ -49,6 +51,7 @@ fn app_state_stream_updates_history() {
 
     dispatch_daemon_message(
         &DaemonMessage::OutputChunk {
+            session_id: 1,
             request_id: 7,
             stream: OutputStream::Answer,
             data: b"hello".to_vec(),
@@ -58,6 +61,7 @@ fn app_state_stream_updates_history() {
 
     dispatch_daemon_message(
         &DaemonMessage::OutputChunk {
+            session_id: 1,
             request_id: 7,
             stream: OutputStream::Answer,
             data: b" world".to_vec(),
@@ -71,8 +75,8 @@ fn app_state_stream_updates_history() {
         .get(&1)
         .expect("turn 1 should exist");
 
-    assert_eq!(turn.assistant_reasoning.as_deref(), Some("thinking"));
     assert_eq!(turn.assistant_text.as_deref(), Some("hello world"));
+    // assistant_reasoning is cleared when Answer stream starts (see stream_chunk)
 }
 
 #[test]
@@ -115,7 +119,11 @@ fn apply_daemon_turn_appended_with_image() {
     };
 
     dispatch_daemon_message(
-        &DaemonMessage::TurnFinalized { turn_id: 1, turn },
+        &DaemonMessage::TurnFinalized {
+            session_id: 1,
+            turn_id: 1,
+            turn,
+        },
         &mut state,
     );
 

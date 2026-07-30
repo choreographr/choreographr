@@ -38,6 +38,7 @@ pub fn translate_message(
             request_id: _,
             stream: _,
             data,
+            ..
         } => {
             let text = String::from_utf8_lossy(data).to_string();
             let message_id = next_message_id();
@@ -86,6 +87,7 @@ pub fn translate_message(
             request_id: _,
             call_id,
             data,
+            ..
         } => {
             let text = String::from_utf8_lossy(data).to_string();
             Some(vec![SessionUpdateParams {
@@ -105,6 +107,7 @@ pub fn translate_message(
             request_id: _,
             call_id,
             tool_name: _,
+            ..
         } => Some(vec![SessionUpdateParams {
             session_id: session_acp_id.to_string(),
             variant: SessionUpdateVariant::ToolCallUpdate {
@@ -122,6 +125,7 @@ pub fn translate_message(
             call_id,
             tool_name: _,
             error,
+            ..
         } => Some(vec![SessionUpdateParams {
             session_id: session_acp_id.to_string(),
             variant: SessionUpdateVariant::ToolCallUpdate {
@@ -141,6 +145,7 @@ pub fn translate_message(
             request_id: _,
             token_usage,
             last_prompt_tokens: _,
+            ..
         } => {
             let mut updates = Vec::with_capacity(2);
 
@@ -172,6 +177,7 @@ pub fn translate_message(
         DaemonMessage::Failed {
             request_id: _,
             error: _,
+            ..
         } => Some(vec![SessionUpdateParams {
             session_id: session_acp_id.to_string(),
             variant: SessionUpdateVariant::StatusUpdate {
@@ -224,6 +230,7 @@ mod tests {
 
     fn output_chunk(stream: choreo_proto::OutputStream, data: &str) -> DaemonMessage {
         DaemonMessage::OutputChunk {
+            session_id: 0,
             request_id: 1,
             stream,
             data: data.as_bytes().to_vec(),
@@ -232,6 +239,7 @@ mod tests {
 
     fn tool_call_started(call_id: &str, tool_name: &str, args: &str) -> DaemonMessage {
         DaemonMessage::ToolCallStarted {
+            session_id: 0,
             request_id: 1,
             call_id: call_id.into(),
             tool_name: tool_name.into(),
@@ -241,6 +249,7 @@ mod tests {
 
     fn tool_result_chunk(call_id: &str, data: &str) -> DaemonMessage {
         DaemonMessage::ToolResultChunk {
+            session_id: 0,
             request_id: 1,
             call_id: call_id.into(),
             data: data.as_bytes().to_vec(),
@@ -249,6 +258,7 @@ mod tests {
 
     fn tool_call_finished(call_id: &str, tool_name: &str) -> DaemonMessage {
         DaemonMessage::ToolCallFinished {
+            session_id: 0,
             request_id: 1,
             call_id: call_id.into(),
             tool_name: tool_name.into(),
@@ -257,6 +267,7 @@ mod tests {
 
     fn tool_call_failed(call_id: &str, tool_name: &str, error: &str) -> DaemonMessage {
         DaemonMessage::ToolCallFailed {
+            session_id: 0,
             request_id: 1,
             call_id: call_id.into(),
             tool_name: tool_name.into(),
@@ -266,6 +277,7 @@ mod tests {
 
     fn done() -> DaemonMessage {
         DaemonMessage::Done {
+            session_id: 0,
             request_id: 1,
             token_usage: Some(choreo_proto::TokenUsage {
                 input_tokens: 10,
@@ -278,6 +290,7 @@ mod tests {
 
     fn failed() -> DaemonMessage {
         DaemonMessage::Failed {
+            session_id: 0,
             request_id: 1,
             error: "model refused".into(),
         }
@@ -428,6 +441,7 @@ mod tests {
     #[test]
     fn done_without_token_usage_omits_usage_update() {
         let msg = DaemonMessage::Done {
+            session_id: 0,
             request_id: 1,
             token_usage: None,
             last_prompt_tokens: None,

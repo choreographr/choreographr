@@ -411,23 +411,78 @@ pub(crate) fn cached_or_compute_lines(
     (lines, height, visual_offsets)
 }
 
+pub(crate) struct SessionDisplayState {
+    pub(crate) view: SessionView,
+    pub(crate) visible_turn_ids: Vec<u32>,
+    pub(crate) turn_heights: Vec<usize>,
+    pub(crate) height_prefix: Vec<usize>,
+    pub(crate) markers: Vec<Marker>,
+    pub(crate) markers_dirty: bool,
+    pub(crate) streaming_turn_index: Option<usize>,
+    pub(crate) streaming_dirty: bool,
+    pub(crate) content_dirty: bool,
+    pub(crate) history_scroll: HistoryScrollState,
+    pub(crate) turn_layouts: Vec<TurnImageLayout>,
+    pub(crate) render_cache: Vec<Option<RenderedCache>>,
+    pub(crate) active: HashSet<u32>,
+    pub(crate) live_input_estimate: u32,
+    pub(crate) live_output_tokens: u32,
+    pub(crate) progress_dirty: bool,
+    pub(crate) status: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) selected_model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) reasoning_capability: Option<ReasoningCapability>,
+    pub(crate) account_name: Option<String>,
+    pub(crate) working_dir: Option<String>,
+    pub(crate) token_usage: Option<TokenUsage>,
+    pub(crate) context_window: Option<u32>,
+    pub(crate) last_prompt_tokens: Option<u32>,
+}
+
+impl Default for SessionDisplayState {
+    fn default() -> Self {
+        Self {
+            view: SessionView::new(),
+            visible_turn_ids: Vec::new(),
+            turn_heights: Vec::new(),
+            height_prefix: Vec::new(),
+            markers: Vec::new(),
+            markers_dirty: true,
+            streaming_turn_index: None,
+            streaming_dirty: false,
+            content_dirty: false,
+            history_scroll: HistoryScrollState::new(),
+            turn_layouts: Vec::new(),
+            render_cache: Vec::new(),
+            active: HashSet::new(),
+            live_input_estimate: 0,
+            live_output_tokens: 0,
+            progress_dirty: false,
+            status: None,
+            error: None,
+            selected_model: None,
+            reasoning_effort: None,
+            reasoning_capability: None,
+            account_name: None,
+            working_dir: None,
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+        }
+    }
+}
+
 pub(crate) struct App {
     pub(crate) input: InputBuffer,
     pub(crate) next_request_id: u32,
-    pub(crate) active: HashSet<u32>,
-    pub(crate) session_view: SessionView,
-    pub(crate) rendered_images: HashMap<u32, HashMap<usize, RenderedImage>>,
-    pub(crate) history_scroll: HistoryScrollState,
+    pub(crate) rendered_images: HashMap<u64, HashMap<u32, HashMap<usize, RenderedImage>>>,
+    pub(crate) pending_job_idx: HashMap<ImageId, (u64, u32, usize)>,
     pub(crate) history_viewport: HistoryViewport,
     pub(crate) should_quit: bool,
     pub(crate) image_job_tx: Option<crossbeam::channel::Sender<ImageJob>>,
     pub(crate) attached_session_id: Option<u64>,
-    pub(crate) attached_account_name: Option<String>,
-    pub(crate) attached_model: Option<String>,
-    pub(crate) attached_reasoning_effort: Option<String>,
-    pub(crate) attached_reasoning_capability: Option<ReasoningCapability>,
     pub(crate) attached_provider_slug: Option<String>,
-    pub(crate) attached_working_dir: Option<String>,
     pub(crate) attached_status: Option<SessionStatus>,
     pub(crate) attached_tool_groups: Vec<String>,
     pub(crate) page: Page,
@@ -436,50 +491,15 @@ pub(crate) struct App {
     pub(crate) ai_providers: AIProvidersState,
     pub(crate) scroll_accumulator: isize,
     pub(crate) scrollbar_dragging: bool,
-    pub(crate) markers: Vec<Marker>,
-    pub(crate) height_prefix: Vec<usize>,
-    pub(crate) markers_dirty: bool,
     pub(crate) last_terminal_size: Option<(u16, u16)>,
     pub(crate) terminal_resized: bool,
     pub(crate) history_index: Option<usize>,
     pub(crate) saved_draft: String,
-    pub(crate) render_cache: Vec<Option<RenderedCache>>,
-    pub(crate) fullscreen_image_target: Option<(u32, usize)>,
-    pub(crate) attached_token_usage: Option<TokenUsage>,
-    pub(crate) attached_context_window: Option<u32>,
-    pub(crate) attached_last_prompt_tokens: Option<u32>,
-    /// Estimated input tokens for the current streaming turn (set at request start).
-    pub(crate) live_input_estimate: u32,
-    /// Cumulative output-token estimate for the current turn, updated by
-    /// `LiveOutputTokenCount` messages from the daemon (which tokenizes
-    /// each stream chunk via tiktoken).
-    pub(crate) live_output_tokens: u32,
-    pub(crate) progress_dirty: bool,
-    /// True when turn content has changed and we need to re-layout.
-    /// Set alongside `markers_dirty` for content mutations (stream chunks,
-    /// turn appends, tool results, etc.) but NOT for terminal resize.
-    /// Used by `compute_total_height_and_markers` to decide whether to
-    /// preserve the effective scroll position for users who have scrolled up.
-    pub(crate) content_dirty: bool,
+    pub(crate) fullscreen_image_target: Option<(u64, u32, usize)>,
     pub(crate) status: Option<String>,
     pub(crate) error: Option<String>,
-    pub(crate) visible_turn_ids: Vec<u32>,
-    /// Maps in-flight job IDs to their (turn_id, img_idx) for O(1) result dispatch.
-    pub(crate) pending_job_idx: HashMap<ImageId, (u32, usize)>,
-    /// Per-turn layout metadata (image content-line ranges), populated by
-    /// `rebuild_height_prefix`.  Used by the click handler to determine
-    /// which image was clicked without re-rendering text lines.
-    pub(crate) turn_layouts: Vec<TurnImageLayout>,
-    /// Per-turn heights in `visible_turn_ids` order.
-    /// Invariant: `turn_heights.len() == height_prefix.len()` and
-    /// `height_prefix[i] = turn_heights[0..=i].sum()`.
-    pub(crate) turn_heights: Vec<usize>,
-    /// Index into `visible_turn_ids` / `turn_heights` for the turn that is
-    /// currently receiving streaming chunks. `None` when no request is active.
-    pub(crate) streaming_turn_index: Option<usize>,
-    /// True when only the streaming turn's height may have changed.
-    /// Skips the full rebuild and instead applies an incremental update.
-    pub(crate) streaming_dirty: bool,
+    pub(crate) session_displays: HashMap<u64, SessionDisplayState>,
+    pub(crate) active_session_id: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -1260,22 +1280,13 @@ impl App {
         Self {
             input: InputBuffer::new(),
             next_request_id: 1,
-            active: HashSet::new(),
-            session_view: SessionView::new(),
             rendered_images: HashMap::new(),
-            render_cache: Vec::new(),
-            history_scroll: HistoryScrollState::new(),
             history_viewport: HistoryViewport::new(),
             should_quit: false,
             image_job_tx: None,
             pending_job_idx: HashMap::new(),
             attached_session_id: None,
-            attached_account_name: None,
-            attached_model: None,
-            attached_reasoning_effort: None,
-            attached_reasoning_capability: None,
             attached_provider_slug: None,
-            attached_working_dir: None,
             attached_status: None,
             attached_tool_groups: Vec::new(),
             page: Page::Chat,
@@ -1284,351 +1295,26 @@ impl App {
             ai_providers: AIProvidersState::new(),
             scroll_accumulator: 0,
             scrollbar_dragging: false,
-            markers: Vec::new(),
             history_index: None,
             saved_draft: String::new(),
             fullscreen_image_target: None,
-            attached_token_usage: None,
-            attached_context_window: None,
-            attached_last_prompt_tokens: None,
-            live_input_estimate: 0,
-            live_output_tokens: 0,
-            progress_dirty: false,
-            content_dirty: false,
             status: None,
             error: None,
-            height_prefix: Vec::new(),
-            turn_layouts: Vec::new(),
-            turn_heights: Vec::new(),
-            streaming_turn_index: None,
-            streaming_dirty: false,
-            markers_dirty: true,
             last_terminal_size: None,
             terminal_resized: false,
-            visible_turn_ids: Vec::new(),
+            session_displays: HashMap::new(),
+            active_session_id: None,
         }
     }
 
-    pub(crate) fn total_history_height(&self) -> usize {
-        self.height_prefix.last().copied().unwrap_or(0)
+    pub(crate) fn display_for(&mut self, session_id: u64) -> &mut SessionDisplayState {
+        self.session_displays.entry(session_id).or_default()
     }
-
-    /// Rebuild height_prefix, markers, visible_turn_ids, and populate render_cache from
-    /// the current session_view.turns.  Called whenever turns change.
-    pub(crate) fn rebuild_height_prefix(&mut self) {
-        self.height_prefix.clear();
-        self.visible_turn_ids.clear();
-        self.markers.clear();
-        self.turn_layouts.clear();
-        self.turn_heights.clear();
-        let mut total = 0usize;
-        let virtual_track = self.virtual_track_slots();
-        let fallback_img_height = self.image_block_height() as usize;
-        let turn_count = self.session_view.turns.len();
-        tracing::trace!(turn_count, "rebuild_height_prefix");
-
-        // Count visible (non-undone) turns so we can pre-size render_cache,
-        // avoiding the push-or-replace branching on every iteration.
-        let visible_count = self
-            .session_view
-            .turns
-            .iter()
-            .filter(|(_, t)| !t.undone)
-            .count();
-        self.render_cache.resize(visible_count, None);
-
-        // Collect start lines of user-text turns for marker computation
-        // after we know the final total height.
-        let mut user_text_start_lines: Vec<usize> = Vec::with_capacity(turn_count);
-        // `visible_idx` tracks the position in `visible_turn_ids` / `render_cache`,
-        // incrementing only for non-undone turns.
-        let mut visible_idx = 0usize;
-        // Iterate turns in order (oldest first).
-        for (&turn_id, turn) in self.session_view.turns.iter() {
-            if turn.undone {
-                continue;
-            }
-            // Compute height for this turn.
-            let content_width = self.history_viewport.width.saturating_sub(9);
-            let tool_content_width = self.history_viewport.width.saturating_sub(4);
-
-            let (_text_lines, text_height, _visual_offsets) = cached_or_compute_lines(
-                &mut self.render_cache,
-                visible_idx,
-                turn_id,
-                content_width,
-                self.history_viewport.width,
-                || render_turn_lines(turn, content_width, tool_content_width),
-            );
-
-            // Image blocks always use `image_block_height()` — this must
-            // match the render allocation in `render_turn_image` so that
-            // click-to-fullscreen detection (via `image_ranges`) and scroll
-            // positions (via `height_prefix`) stay in sync.
-            let mut image_ranges: Vec<(usize, usize)> = Vec::new();
-            let mut total_img_height: usize = 0;
-            for _ in 0..turn.displayed_images.len() {
-                let start = text_height + total_img_height;
-                image_ranges.push((start, start + fallback_img_height));
-                total_img_height += fallback_img_height;
-            }
-            self.turn_layouts.push(TurnImageLayout { image_ranges });
-            let turn_height = text_height + total_img_height;
-            // Store per-turn height for incremental updates.
-            self.turn_heights.push(turn_height);
-            // Record the content-line start for user-text markers.
-            // Virtual-slot computation is deferred to after the loop so
-            // the denominator is the FINAL total height, matching the
-            // scrollbar's coordinate system.
-            if turn.user_text.is_some() {
-                user_text_start_lines.push(total);
-            }
-            total += turn_height;
-            self.height_prefix.push(total);
-            self.visible_turn_ids.push(turn_id);
-            visible_idx += 1;
-        }
-        // Compute marker virtual slots using the final total height so they
-        // match the scrollbar's coordinate system (which uses total_history_height
-        // as content_length).
-        let final_total = total.max(1);
-        tracing::trace!(
-            marker_count = user_text_start_lines.len(),
-            final_total,
-            "computed markers"
-        );
-        self.markers.reserve(user_text_start_lines.len());
-        for &start_line in &user_text_start_lines {
-            let slot = start_line * virtual_track / final_total;
-            self.markers.push(Marker {
-                content_line: start_line,
-                virtual_slot: slot,
-            });
-        }
-        self.markers_dirty = false;
+    pub(crate) fn active_display(&mut self) -> Option<&mut SessionDisplayState> {
+        self.session_displays.get_mut(&self.active_session_id?)
     }
-
-    /// Called when only the streaming turn's content has changed.
-    /// Triggers the incremental update path instead of a full rebuild.
-    fn mark_streaming_changed(&mut self) {
-        self.streaming_dirty = true;
-        self.content_dirty = true;
-    }
-
-    /// Called when turns are added/removed/finalized/undone/redone.
-    /// Triggers a full O(N) rebuild.
-    fn mark_content_changed(&mut self) {
-        self.markers_dirty = true;
-        self.content_dirty = true;
-        // If we were tracking a streaming turn, it's now stale.
-        self.streaming_turn_index = None;
-        self.streaming_dirty = false;
-    }
-
-    /// Try to resolve the streaming turn index from the request-to-turn
-    /// mapping.  No-op if the index is already set or the turn isn't yet
-    /// visible (TurnAppended may arrive separately).
-    fn resolve_streaming_turn_index(&mut self, request_id: u32) {
-        if self.streaming_turn_index.is_none()
-            && let Some(&turn_id) = self.session_view.request_to_turn.get(&request_id)
-        {
-            self.streaming_turn_index = self.visible_turn_ids.iter().position(|id| *id == turn_id);
-        }
-    }
-
-    pub(crate) fn compute_total_height_and_markers(&mut self) -> usize {
-        if self.streaming_dirty && !self.markers_dirty {
-            // Fast path: only the streaming turn changed.
-            self.apply_streaming_update();
-        } else if self.markers_dirty {
-            // Full rebuild: turns were added/removed or viewport changed.
-            let at_bottom = self.effective_scroll() == 0;
-            let preserve_scroll = self.content_dirty && !at_bottom;
-            let old_total = if preserve_scroll {
-                self.total_history_height()
-            } else {
-                0
-            };
-
-            self.rebuild_height_prefix();
-
-            if preserve_scroll {
-                let new_total = self.total_history_height();
-                if new_total > old_total {
-                    // Content was added — shift scroll down by the delta so
-                    // the same content stays at the top of the viewport.
-                    self.history_scroll.scroll = self
-                        .history_scroll
-                        .scroll
-                        .saturating_add(new_total - old_total);
-                } else if old_total > new_total {
-                    // Content was removed (e.g. undo) — scroll to bottom so the
-                    // user doesn't stare at blank space.
-                    tracing::trace!(old_total, new_total, "content removed, scrolling to bottom");
-                    self.history_scroll.scroll = 0;
-                }
-            }
-
-            self.content_dirty = false;
-            self.streaming_dirty = false;
-        }
-
-        self.total_history_height().max(1)
-    }
-
-    /// Fast path for streaming: recompute only the streaming turn's height,
-    /// then update the suffix of `height_prefix` and the markers.
-    ///
-    /// Does not update `turn_layouts` because displayed images only change
-    /// through `TurnAppended`/`TurnFinalized`, which trigger a full rebuild
-    /// via `mark_content_changed`. During streaming only text content grows,
-    /// so `image_ranges` in `turn_layouts` remain valid.
-    fn apply_streaming_update(&mut self) {
-        let Some(turn_idx) = self.streaming_turn_index else {
-            return self.rebuild_height_prefix_preserving_scroll();
-        };
-        if turn_idx >= self.visible_turn_ids.len() {
-            return self.rebuild_height_prefix_preserving_scroll();
-        }
-
-        let turn_id = self.visible_turn_ids[turn_idx];
-        let Some(turn) = self.session_view.turns.get(&turn_id) else {
-            return self.rebuild_height_prefix_preserving_scroll();
-        };
-
-        // Recompute height for the streaming turn only.
-        let content_width = self.history_viewport.width.saturating_sub(9);
-        let tool_content_width = self.history_viewport.width.saturating_sub(4);
-
-        // Re-render the turn lines and update the cache entry in a single lookup.
-        if let Some(Some(cached)) = self.render_cache.get_mut(turn_idx)
-            && cached.turn_id == turn_id
-            && cached.width == content_width
-            && cached.viewport_width == self.history_viewport.width
-        {
-            // Update cached lines, height, and visual offsets.
-            let text_lines = render_turn_lines(turn, content_width, tool_content_width);
-            let text_height = lines_height(&text_lines, self.history_viewport.width).max(1);
-            let visual_offsets = compute_visual_offsets(&text_lines, self.history_viewport.width);
-
-            cached.lines = Arc::from(text_lines);
-            cached.height = text_height;
-            cached.visual_offsets = visual_offsets;
-
-            // Update the per-turn height.
-            let full_img_height = self.image_block_height() as usize;
-            let img_count = turn.displayed_images.len();
-            let turn_height = text_height + img_count * full_img_height;
-
-            let old_height = self.turn_heights[turn_idx];
-
-            if turn_height > old_height {
-                let delta = turn_height - old_height;
-                self.turn_heights[turn_idx] = turn_height;
-                // Shift the height_prefix suffix forward by delta.
-                for i in turn_idx..self.height_prefix.len() {
-                    self.height_prefix[i] = self.height_prefix[i].saturating_add(delta);
-                }
-                // Preserve scroll position when user has scrolled up and
-                // streaming content grows from the bottom.  Without this the
-                // viewport shifts because the total height increased but the
-                // absolute scroll value stayed the same.
-                // We add delta to raw `scroll` rather than effective_scroll.
-                // This is correct because effective_scroll = scroll + scroll_compensation,
-                // so (scroll + delta) + compensation = (scroll + compensation) + delta.
-                // scroll_compensation, if non-zero, is left untouched.
-                let at_bottom = self.effective_scroll() == 0;
-                if !at_bottom {
-                    self.history_scroll.scroll = self.history_scroll.scroll.saturating_add(delta);
-                }
-                // Markers' absolute positions shifted — rebuild them from the
-                // updated turn_heights so click-to-scroll and scrollbar rendering
-                // stay correct.
-                self.rebuild_markers();
-            } else if old_height > turn_height {
-                // Should not happen during streaming (content only grows),
-                // but if it does, fall back to a full rebuild with scroll
-                // preservation so scroll position stays valid.
-                return self.rebuild_height_prefix_preserving_scroll();
-            }
-        } else {
-            // Cache is stale (viewport changed). Fall back to full rebuild.
-            return self.rebuild_height_prefix_preserving_scroll();
-        }
-
-        self.streaming_dirty = false;
-        self.content_dirty = false;
-    }
-
-    /// Full `rebuild_height_prefix` with scroll-position preservation.
-    /// Mirrors the scroll-adjustment logic in `compute_total_height_and_markers`
-    /// so that fallbacks from the streaming fast path don't cause scroll jumps.
-    fn rebuild_height_prefix_preserving_scroll(&mut self) {
-        let at_bottom = self.effective_scroll() == 0;
-        let preserve_scroll = self.content_dirty && !at_bottom;
-        let old_total = if preserve_scroll {
-            self.total_history_height()
-        } else {
-            0
-        };
-
-        self.rebuild_height_prefix();
-
-        if preserve_scroll {
-            let new_total = self.total_history_height();
-            if new_total > old_total {
-                self.history_scroll.scroll = self
-                    .history_scroll
-                    .scroll
-                    .saturating_add(new_total - old_total);
-            } else if old_total > new_total {
-                tracing::trace!(old_total, new_total, "content removed, scrolling to bottom");
-                self.history_scroll.scroll = 0;
-            }
-        }
-
-        self.streaming_dirty = false;
-        self.content_dirty = false;
-    }
-
-    /// Recompute scrollbar markers from current turn_heights.
-    /// Called by `apply_streaming_update` after a height change to keep
-    /// markers in sync without a full `rebuild_height_prefix`.
-    fn rebuild_markers(&mut self) {
-        self.markers.clear();
-        let total = self.total_history_height().max(1);
-        let virtual_track = self.virtual_track_slots();
-        let mut accum = 0usize;
-        for (i, &turn_id) in self.visible_turn_ids.iter().enumerate() {
-            let turn_height = self.turn_heights[i];
-            if let Some(turn) = self.session_view.turns.get(&turn_id)
-                && turn.user_text.is_some()
-            {
-                let slot = accum * virtual_track / total;
-                self.markers.push(Marker {
-                    content_line: accum,
-                    virtual_slot: slot,
-                });
-            }
-            accum += turn_height;
-        }
-    }
-
-    pub(crate) fn max_scroll_offset(&self) -> usize {
-        let viewport_height = self.history_viewport.height as usize;
-        let total_height = self.total_history_height();
-        total_height.saturating_sub(viewport_height)
-    }
-
-    /// Number of virtual half-height slots on the scrollbar track.
-    /// The scrollbar is rendered with half-height blocks (`▀`/`▄`/`█`), giving
-    /// 2× the terminal row count in virtual slots for finer granularity.
-    pub(crate) fn virtual_track_slots(&self) -> usize {
-        2 * self.history_viewport.height as usize
-    }
-
-    pub(crate) fn clamp_scroll_state(&mut self) {
-        self.history_scroll.clamp(self.max_scroll_offset());
+    pub(crate) fn active_display_ref(&self) -> Option<&SessionDisplayState> {
+        self.session_displays.get(&self.active_session_id?)
     }
 
     /// Number of lines needed for the status/error bar, based on the current
@@ -1668,8 +1354,6 @@ impl App {
     }
 
     pub(crate) fn update_viewport_from_terminal_size(&mut self) {
-        // Resolve the terminal size first so we have a width to pass to
-        // status_error_height for the wrapped-line calculation.
         let size = if self.terminal_resized || self.last_terminal_size.is_none() {
             if let Ok(size) = crossterm::terminal::size() {
                 self.last_terminal_size = Some(size);
@@ -1685,10 +1369,6 @@ impl App {
             }
         };
         let (width, height) = size;
-        // The help overlay takes 2 rows when visible — it must be subtracted
-        // from the viewport so that max_scroll_offset allows scrolling to the
-        // true top of the history.  Without this, the viewport is 2 rows too
-        // tall when help is shown, making the top 2 rows of history unreachable.
         let help_height: u16 = if self.show_ctrl_help { 2 } else { 0 };
         let bottom_height = self.input_bar_height(width)
             + STATUS_BAR_HEIGHT
@@ -1705,24 +1385,20 @@ impl App {
                 height: new_height,
             });
             if old_width != width.saturating_sub(1) || old_height != self.history_viewport.height {
-                for cached in &mut self.render_cache {
-                    *cached = None;
-                }
-                self.markers_dirty = true;
-                if old_width != width.saturating_sub(1) {
-                    // Width changed — the old layout is at a different wrapping
-                    // width, so the old total height is meaningless for scroll
-                    // preservation.  Clear content_dirty to prevent the stale
-                    // flag (left over from a prior content change in the same
-                    // event batch) from triggering preserve_scroll with an
-                    // incompatible old_total.
-                    let new_vp_width = width.saturating_sub(1);
-                    tracing::debug!(
-                        "width changed ({} → {}), clearing content_dirty",
-                        old_width,
-                        new_vp_width,
-                    );
-                    self.content_dirty = false;
+                for display in self.session_displays.values_mut() {
+                    for cached in &mut display.render_cache {
+                        *cached = None;
+                    }
+                    display.markers_dirty = true;
+                    if old_width != width.saturating_sub(1) {
+                        let new_vp_width = width.saturating_sub(1);
+                        tracing::debug!(
+                            "width changed ({} → {}), clearing content_dirty",
+                            old_width,
+                            new_vp_width,
+                        );
+                        display.content_dirty = false;
+                    }
                 }
             }
         }
@@ -1732,21 +1408,78 @@ impl App {
         self.terminal_resized = true;
     }
 
-    pub(crate) fn effective_scroll(&self) -> usize {
-        self.history_scroll
-            .effective_scroll(self.max_scroll_offset())
+    pub(crate) fn total_history_height(&self) -> usize {
+        self.active_display_ref()
+            .map(|d| d.total_history_height())
+            .unwrap_or(0)
     }
 
-    /// Populate `rendered_images` from a turn's `displayed_images`.
-    ///
-    /// Each `DisplayedImageRecord` is converted to a `RenderedImage::new_placeholder`
-    /// so the inline/fullscreen render path can find it and submit encoding jobs
-    /// to the background worker.  Called whenever a turn arrives.
-    pub(crate) fn sync_turn_images(&mut self, turn_id: u32, turn: &Turn) {
-        let images = self.rendered_images.entry(turn_id).or_default();
+    pub(crate) fn rebuild_height_prefix(&mut self) {
+        let vp = self.history_viewport;
+        if let Some(d) = self.active_display() {
+            d.rebuild_height_prefix(&vp);
+        }
+    }
+
+    pub(crate) fn compute_total_height_and_markers(&mut self) -> usize {
+        let vp = self.history_viewport;
+        self.active_display()
+            .map(|d| d.compute_total_height_and_markers(&vp))
+            .unwrap_or(1)
+    }
+
+    pub(crate) fn mark_streaming_changed(&mut self) {
+        if let Some(d) = self.active_display() {
+            d.mark_streaming_changed();
+        }
+    }
+
+    pub(crate) fn mark_content_changed(&mut self) {
+        if let Some(d) = self.active_display() {
+            d.mark_content_changed();
+        }
+    }
+
+    pub(crate) fn resolve_streaming_turn_index(&mut self, request_id: u32) {
+        if let Some(d) = self.active_display() {
+            d.resolve_streaming_turn_index(request_id);
+        }
+    }
+
+    pub(crate) fn max_scroll_offset(&self) -> usize {
+        self.active_display_ref()
+            .map(|d| d.max_scroll_offset(&self.history_viewport))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn virtual_track_slots(&self) -> usize {
+        self.active_display_ref()
+            .map(|d| d.virtual_track_slots(&self.history_viewport))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn clamp_scroll_state(&mut self) {
+        let vp = self.history_viewport;
+        if let Some(d) = self.active_display() {
+            d.clamp_scroll_state(&vp);
+        }
+    }
+
+    pub(crate) fn image_block_height(&self) -> u16 {
+        self.active_display_ref()
+            .map(|d| d.image_block_height(&self.history_viewport))
+            .unwrap_or(1)
+    }
+
+    pub(crate) fn ensure_cache_synced(&mut self) {
+        if let Some(d) = self.active_display() {
+            d.ensure_cache_synced();
+        }
+    }
+
+    pub(crate) fn sync_turn_images(&mut self, session_id: u64, turn_id: u32, turn: &Turn) {
+        let images = self.rendered_images.entry(session_id).or_default().entry(turn_id).or_default();
         for (idx, record) in turn.displayed_images.iter().enumerate() {
-            // Only insert missing entries — preserve cached protocols across
-            // re-syncs (e.g. TurnAppended → TurnFinalized with same images).
             images.entry(idx).or_insert_with(|| {
                 RenderedImage::new_placeholder(
                     record.metadata.clone(),
@@ -1754,59 +1487,33 @@ impl App {
                 )
             });
         }
-        // Remove entries for images that no longer exist in the turn.
         images.retain(|&idx, _| idx < turn.displayed_images.len());
     }
 
-    /// Stable image block height for layout and scroll calculations.
-    ///
-    /// Uses half the viewport height as a heuristic.  This value is stable
-    /// within a given terminal size so scroll positions don't shift when
-    /// encoding completes.
-    pub(crate) fn image_block_height(&self) -> u16 {
-        (self.history_viewport.height / 2).max(1)
-    }
-
-    pub(crate) fn ensure_cache_synced(&mut self) {
-        let turns_len = self.visible_turn_ids.len();
-        let cache_len = self.render_cache.len();
-        if cache_len == turns_len {
-            return;
-        }
-        if cache_len > turns_len {
-            self.render_cache.truncate(turns_len);
-            return;
-        }
-        self.render_cache.resize(turns_len, None);
-    }
-
-    /// Apply a completed ImageResult to the corresponding rendered_images entry.
     pub(crate) fn apply_image_result(&mut self, result: ImageResult) {
-        let (turn_id, img_idx) = match self.pending_job_idx.remove(&result.id) {
+        let (session_id, turn_id, img_idx) = match self.pending_job_idx.remove(&result.id) {
             Some(key) => key,
             None => return,
         };
-        if let Some(images) = self.rendered_images.get_mut(&turn_id)
+        if let Some(session_images) = self.rendered_images.get_mut(&session_id)
+            && let Some(images) = session_images.get_mut(&turn_id)
             && let Some(img) = images.get_mut(&img_idx)
             && img.pending_job == Some(result.id)
         {
             tracing::trace!(
-                "[choreo-tui] image job {} completed for turn {} img {}",
+                "[choreo-tui] image job {} completed for session {} turn {} img {}",
                 result.id,
+                session_id,
                 turn_id,
                 img_idx,
             );
             img.apply_result(result);
-            // Image encoding completes without changing block sizes
-            // (`image_block_height()` depends only on viewport height),
-            // so height_prefix / turn_layouts remain valid.  No need to
-            // trigger a rebuild.
         }
     }
 
-    /// Submit an encoding job for a turn-displayed image.
     pub(crate) fn submit_image_job(
         &mut self,
+        session_id: u64,
         turn_id: u32,
         img_idx: usize,
         data: std::sync::Arc<[u8]>,
@@ -1818,8 +1525,9 @@ impl App {
         let id = next_job_id();
 
         tracing::trace!(
-            "[choreo-tui] submitting image job {} for turn {} img {} ({} {}x{} @ {}x{})",
+            "[choreo-tui] submitting image job {} for session {} turn {} img {} ({} {}x{} @ {}x{})",
             id,
+            session_id,
             turn_id,
             img_idx,
             metadata.mime_type,
@@ -1829,9 +1537,10 @@ impl App {
             cell_size.height,
         );
 
-        self.pending_job_idx.insert(id, (turn_id, img_idx));
+        self.pending_job_idx.insert(id, (session_id, turn_id, img_idx));
 
-        if let Some(images) = self.rendered_images.get_mut(&turn_id)
+        if let Some(session_images) = self.rendered_images.get_mut(&session_id)
+            && let Some(images) = session_images.get_mut(&turn_id)
             && let Some(img) = images.get_mut(&img_idx)
         {
             img.pending_job = Some(id);
@@ -1847,105 +1556,88 @@ impl App {
         Some(id)
     }
 
-    /// Clear all per-session state when switching to a different session.
-    pub(crate) fn reset_for_session_switch(&mut self) {
-        self.session_view = SessionView::new();
-        self.rendered_images.clear();
-        self.render_cache.clear();
-        self.visible_turn_ids.clear();
-        self.history_scroll = HistoryScrollState::new();
-        self.pending_job_idx.clear();
-        self.active.clear();
-        self.markers.clear();
-        self.height_prefix.clear();
-        self.turn_heights.clear();
-        self.turn_layouts.clear();
-        self.streaming_turn_index = None;
-        self.streaming_dirty = false;
-        self.markers_dirty = true;
-        // Clear the content-dirty flag: a session switch resets scroll
-        // position to the bottom, so we should not attempt to preserve
-        // the old scroll position when the new content arrives.
-        self.content_dirty = false;
-        self.status = None;
-        self.error = None;
+    pub(crate) fn reset_for_session_switch(&mut self, session_id: u64) {
+        self.active_session_id = Some(session_id);
+        self.rendered_images.remove(&session_id);
+        let display = self.display_for(session_id);
+        display.view = SessionView::new();
+        display.render_cache.clear();
+        display.visible_turn_ids.clear();
+        display.history_scroll = HistoryScrollState::new();
+        display.active.clear();
+        display.markers.clear();
+        display.height_prefix.clear();
+        display.turn_heights.clear();
+        display.turn_layouts.clear();
+        display.streaming_turn_index = None;
+        display.streaming_dirty = false;
+        display.markers_dirty = true;
+        display.content_dirty = false;
+        display.status = None;
+        display.error = None;
+        display.progress_dirty = true;
         self.fullscreen_image_target = None;
     }
 
+    pub(crate) fn effective_scroll(&self) -> usize {
+        self.active_display_ref()
+            .map(|d| d.effective_scroll(&self.history_viewport))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn scrollbar_notch(&self) -> usize {
+        self.active_display_ref()
+            .map(|d| d.scrollbar_notch(&self.history_viewport))
+            .unwrap_or(1)
+    }
+
     pub(crate) fn scroll_up(&mut self, amount: usize) {
-        self.history_scroll
-            .scroll_up(amount, self.max_scroll_offset());
+        let vp = self.history_viewport;
+        if let Some(d) = self.active_display() {
+            d.scroll_up(amount, &vp);
+        }
     }
 
     pub(crate) fn scroll_down(&mut self, amount: usize) {
-        self.history_scroll
-            .scroll_down(amount, self.max_scroll_offset());
+        let vp = self.history_viewport;
+        if let Some(d) = self.active_display() {
+            d.scroll_down(amount, &vp);
+        }
     }
 
     pub(crate) fn scroll_to(&mut self, row: usize) {
-        let max_scroll = self.max_scroll_offset();
-        let amount = row.min(max_scroll);
-        self.history_scroll.scroll = amount;
-        self.history_scroll.scroll_compensation = 0;
+        let vp = self.history_viewport;
+        if let Some(d) = self.active_display() {
+            d.scroll_to(row, &vp);
+        }
     }
 
     pub(crate) fn scroll_to_track_row(&mut self, mouse_row: u16, track_height: u16) {
-        let track_height = track_height as usize;
-        if track_height > 1 {
-            let row = (mouse_row as usize).min(track_height.saturating_sub(1));
-            let max_scroll = self.max_scroll_offset();
-            let denom = track_height.saturating_sub(1);
-            // Rounding division: round(row / denom * max_scroll).
-            // Equivalent to float: round(row / (track_height-1) * max_scroll).
-            let target = row.saturating_mul(max_scroll).saturating_add(denom / 2) / denom;
-            self.scroll_to(max_scroll.saturating_sub(target.min(max_scroll)));
+        let vp = self.history_viewport;
+        if let Some(d) = self.active_display() {
+            d.scroll_to_track_row(mouse_row, track_height, &vp);
         }
     }
 
     pub(crate) fn scroll_to_content_line(&mut self, content_line: usize) {
-        let total = self.total_history_height();
-        let viewport = self.history_viewport.height as usize;
-        let target = total.saturating_sub(content_line + viewport);
-        self.scroll_to(target.min(self.max_scroll_offset()));
-    }
-
-    /// Scroll up by one scrollbar notch — the amount the viewport moves when
-    /// the user clicks or scroll-wheels one "row" on the scrollbar track.
-    /// Each notch is the smallest movement that visibly shifts the content,
-    /// matching the half-height virtual-slot resolution:
-    /// `ceil(max_scroll / (2 * track_height))`, at least 1.
-    pub(crate) fn scrollbar_scroll_up(&mut self) {
-        let notch = self.scrollbar_notch();
-        self.scroll_up(notch);
-    }
-
-    /// Scroll down by one scrollbar notch.
-    pub(crate) fn scrollbar_scroll_down(&mut self) {
-        let notch = self.scrollbar_notch();
-        self.scroll_down(notch);
-    }
-
-    /// Compute the scrollbar notch size — the amount of content lines that
-    /// a single virtual half-height slot on the scrollbar track corresponds to.
-    /// The scrollbar is rendered with half-height blocks (`▀`/`▄`/`█`), so it
-    /// has 2× the terminal row count in virtual slots.  The notch uses this
-    /// finer granularity so each wheel click moves the thumb by one virtual
-    /// slot rather than one full terminal row.
-    fn scrollbar_notch(&self) -> usize {
-        let max_scroll = self.max_scroll_offset();
-        let virtual_track = self.virtual_track_slots();
-        if virtual_track > 0 {
-            // ceil_div is safe here because virtual_track > 0 after the
-            // check above — when the viewport has non-zero height,
-            // virtual_track_slots returns at least 2.
-            ceil_div(max_scroll, virtual_track)
-        } else {
-            // Degenerate case: viewport has zero height.  Just use
-            // max_scroll — the .max(1) below ensures we always move at
-            // least one line.
-            max_scroll
+        let vp = self.history_viewport;
+        if let Some(d) = self.active_display() {
+            d.scroll_to_content_line(content_line, &vp);
         }
-        .max(1)
+    }
+
+    pub(crate) fn scrollbar_scroll_up(&mut self) {
+        let vp = self.history_viewport;
+        if let Some(d) = self.active_display() {
+            d.scrollbar_scroll_up(&vp);
+        }
+    }
+
+    pub(crate) fn scrollbar_scroll_down(&mut self) {
+        let vp = self.history_viewport;
+        if let Some(d) = self.active_display() {
+            d.scrollbar_scroll_down(&vp);
+        }
     }
 
     pub(crate) fn apply_scroll_delta(&mut self) {
@@ -1958,14 +1650,17 @@ impl App {
         }
     }
 
-    /// Collect user_text contents from session_view.turns, newest first.
     pub(crate) fn user_texts(&self) -> Vec<String> {
-        self.session_view
-            .turns
-            .iter()
-            .rev()
-            .filter_map(|(_, turn)| turn.user_text.clone())
-            .collect()
+        self.active_display_ref()
+            .map(|d| {
+                d.view
+                    .turns
+                    .iter()
+                    .rev()
+                    .filter_map(|(_, turn)| turn.user_text.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn navigate_history_up(&mut self) {
@@ -2018,8 +1713,6 @@ impl App {
         self.saved_draft.clear();
     }
 
-    /// After loading a history entry (or restoring a draft), adjust the
-    /// scroll offset so the cursor is visible within the input box.
     pub(crate) fn ensure_input_cursor_visible(&mut self) {
         if let Some((term_w, _)) = self.last_terminal_size {
             let inner = term_w.saturating_sub(2) as usize;
@@ -2030,7 +1723,9 @@ impl App {
 
     pub(crate) fn set_page(&mut self, page: Page) {
         self.page = page;
-        self.progress_dirty = true;
+        if let Some(d) = self.active_display() {
+            d.progress_dirty = true;
+        }
     }
 
     // ── Legacy per-session daemon message handlers ─────────────────────
@@ -2043,7 +1738,7 @@ impl App {
         if self.page == Page::SessionManager {
             let _ = client_tx.send(ClientMessage::ListSessions);
         } else {
-            self.reset_for_session_switch();
+            self.reset_for_session_switch(session_id);
             self.attached_session_id = Some(session_id);
             client_tx
                 .send(ClientMessage::AttachSession { session_id })
@@ -2053,34 +1748,48 @@ impl App {
     }
 
     pub(crate) fn handle_session_attached(&mut self, session_id: u64) {
+        self.active_session_id = Some(session_id);
         self.attached_session_id = Some(session_id);
-        if let Some(s) = self
+        // Copy session summary fields before borrowing display.
+        let (token_usage, context_window, last_prompt_tokens, account_name, selected_model, reasoning_effort, working_dir, status) = self
             .session_mgr
             .sessions
             .iter()
             .find(|s| s.session_id == session_id)
+            .map(|s| {
+                (s.token_usage, s.context_window, s.last_prompt_tokens, s.account_name.clone(), s.selected_model.clone(), s.reasoning_effort.clone(), s.working_dir.clone(), Some(s.status.clone()))
+            })
+            .unwrap_or((None, None, None, None, None, None, None, None));
         {
-            self.attached_token_usage = s.token_usage;
-            self.attached_context_window = s.context_window;
-            self.attached_last_prompt_tokens = s.last_prompt_tokens;
-            self.attached_account_name = s.account_name.clone();
-            self.attached_model = s.selected_model.clone();
-            self.attached_reasoning_effort = s.reasoning_effort.clone();
-            self.attached_working_dir = s.working_dir.clone();
-            self.attached_status = Some(s.status.clone());
+            let display = self.display_for(session_id);
+            display.token_usage = token_usage;
+            display.context_window = context_window;
+            display.last_prompt_tokens = last_prompt_tokens;
+            display.account_name = account_name;
+            display.selected_model = selected_model;
+            display.reasoning_effort = reasoning_effort;
+            display.working_dir = working_dir;
+            if let Some(ref st) = status {
+                display.status = Some(format!("{:?}", st));
+            }
         }
+        self.attached_status = status;
         self.refresh_attached_provider_slug();
         self.show_ctrl_help = true;
-        self.progress_dirty = true;
+        if let Some(d) = self.active_display() {
+            d.progress_dirty = true;
+        }
     }
 
     pub(crate) fn refresh_attached_provider_slug(&mut self) {
-        self.attached_provider_slug = self.attached_account_name.as_ref().and_then(|name| {
-            self.ai_providers
-                .accounts
-                .iter()
-                .find(|a| a.name == *name)
-                .map(|a| a.provider.clone())
+        self.attached_provider_slug = self.active_display_ref().and_then(|d| {
+            d.account_name.as_ref().and_then(|name| {
+                self.ai_providers
+                    .accounts
+                    .iter()
+                    .find(|a| a.name == *name)
+                    .map(|a| a.provider.clone())
+            })
         });
     }
 
@@ -2096,9 +1805,11 @@ impl App {
         model: &str,
         reasoning_capability: Option<ReasoningCapability>,
     ) {
+        if let Some(d) = self.active_display() {
+            d.selected_model = Some(model.to_owned());
+            d.reasoning_capability = reasoning_capability;
+        }
         if self.attached_session_id.is_some() {
-            self.attached_model = Some(model.to_owned());
-            self.attached_reasoning_capability = reasoning_capability;
             if let Some(s) = self.attached_session_mut() {
                 s.selected_model = Some(model.to_owned());
             }
@@ -2106,8 +1817,10 @@ impl App {
     }
 
     pub(crate) fn handle_reasoning_effort_set(&mut self, effort: String) {
+        if let Some(d) = self.active_display() {
+            d.reasoning_effort = Some(effort.clone());
+        }
         if self.attached_session_id.is_some() {
-            self.attached_reasoning_effort = Some(effort.clone());
             if let Some(s) = self.attached_session_mut() {
                 s.reasoning_effort = Some(effort);
             }
@@ -2120,8 +1833,10 @@ impl App {
         path: &Option<String>,
     ) {
         if self.attached_session_id == Some(session_id) {
-            self.attached_working_dir = path.clone();
-            self.progress_dirty = true;
+            if let Some(d) = self.active_display() {
+                d.working_dir = path.clone();
+                d.progress_dirty = true;
+            }
             if let Some(s) = self.attached_session_mut() {
                 s.working_dir = path.clone();
             }
@@ -2131,8 +1846,6 @@ impl App {
     pub(crate) fn handle_session_title_set(&mut self, session_id: u64, title: &str) {
         if self.attached_session_id == Some(session_id) {
             self.status = Some(format!("Session title changed to '{title}'"));
-            // Keep the session list in sync so the sidebar shows the updated
-            // title immediately — same pattern as handle_session_account_set.
             if let Some(s) = self.attached_session_mut() {
                 s.title = Some(title.to_owned());
             }
@@ -2140,8 +1853,10 @@ impl App {
     }
 
     pub(crate) fn handle_session_account_set(&mut self, account: &str) {
+        if let Some(d) = self.active_display() {
+            d.account_name = Some(account.to_owned());
+        }
         if self.attached_session_id.is_some() {
-            self.attached_account_name = Some(account.to_owned());
             self.refresh_attached_provider_slug();
             if let Some(s) = self.attached_session_mut() {
                 s.account_name = Some(account.to_owned());
@@ -2230,13 +1945,12 @@ impl App {
 
     pub(crate) fn handle_session_deleted(&mut self, session_id: u64) {
         self.session_mgr.remove_session(session_id);
+        self.session_displays.remove(&session_id);
+        self.rendered_images.remove(&session_id);
         if self.attached_session_id == Some(session_id) {
             self.attached_session_id = None;
-            self.attached_account_name = None;
-            self.attached_model = None;
-            self.attached_reasoning_effort = None;
+            self.active_session_id = None;
             self.attached_provider_slug = None;
-            self.attached_working_dir = None;
         }
     }
 
@@ -2248,23 +1962,353 @@ impl App {
     }
 
     pub(crate) fn display_token_usage(&self) -> Option<TokenUsage> {
-        let auth = self.attached_token_usage.as_ref()?;
+        let display = self.active_display_ref()?;
+        let usage = display.token_usage.as_ref()?;
         Some(TokenUsage {
-            input_tokens: auth.input_tokens + self.live_input_estimate,
-            output_tokens: auth.output_tokens + self.live_output_tokens,
-            total_tokens: auth.total_tokens + self.live_input_estimate + self.live_output_tokens,
+            input_tokens: usage.input_tokens + display.live_input_estimate,
+            output_tokens: usage.output_tokens + display.live_output_tokens,
+            total_tokens: usage.total_tokens + display.live_input_estimate + display.live_output_tokens,
         })
     }
 }
 
-/// Invalidate the render cache entry for `turn_id` so the next
-/// `rebuild_height_prefix` re-renders from fresh data instead of
-/// returning stale cached lines (the turn's content may have changed
-/// via `TurnAppended`/`TurnFinalized` even though its `turn_id` is
-/// the same).
-fn invalidate_turn_cache(app: &mut App, turn_id: u32) {
-    if let Some(idx) = app.visible_turn_ids.iter().position(|id| *id == turn_id)
-        && let Some(slot) = app.render_cache.get_mut(idx)
+// ── SessionDisplayState methods ─────────────────────────────────────
+
+impl SessionDisplayState {
+    pub(crate) fn total_history_height(&self) -> usize {
+        self.height_prefix.last().copied().unwrap_or(0)
+    }
+
+    /// Rebuild height_prefix, markers, visible_turn_ids, and populate render_cache.
+    pub(crate) fn rebuild_height_prefix(&mut self, viewport: &HistoryViewport) {
+        self.height_prefix.clear();
+        self.visible_turn_ids.clear();
+        self.markers.clear();
+        self.turn_layouts.clear();
+        self.turn_heights.clear();
+        let mut total = 0usize;
+        let virtual_track = self.virtual_track_slots(viewport);
+        let fallback_img_height = self.image_block_height(viewport) as usize;
+        let turn_count = self.view.turns.len();
+        tracing::trace!(turn_count, "rebuild_height_prefix");
+
+        let visible_count = self
+            .view
+            .turns
+            .iter()
+            .filter(|(_, t)| !t.undone)
+            .count();
+        self.render_cache.resize(visible_count, None);
+
+        let mut user_text_start_lines: Vec<usize> = Vec::with_capacity(turn_count);
+        let mut visible_idx = 0usize;
+        for (&turn_id, turn) in self.view.turns.iter() {
+            if turn.undone {
+                continue;
+            }
+            let content_width = viewport.width.saturating_sub(9);
+            let tool_content_width = viewport.width.saturating_sub(4);
+
+            let (_text_lines, text_height, _visual_offsets) = cached_or_compute_lines(
+                &mut self.render_cache,
+                visible_idx,
+                turn_id,
+                content_width,
+                viewport.width,
+                || render_turn_lines(turn, content_width, tool_content_width),
+            );
+
+            let mut image_ranges: Vec<(usize, usize)> = Vec::new();
+            let mut total_img_height: usize = 0;
+            for _ in 0..turn.displayed_images.len() {
+                let start = text_height + total_img_height;
+                image_ranges.push((start, start + fallback_img_height));
+                total_img_height += fallback_img_height;
+            }
+            self.turn_layouts.push(TurnImageLayout { image_ranges });
+            let turn_height = text_height + total_img_height;
+            self.turn_heights.push(turn_height);
+            if turn.user_text.is_some() {
+                user_text_start_lines.push(total);
+            }
+            total += turn_height;
+            self.height_prefix.push(total);
+            self.visible_turn_ids.push(turn_id);
+            visible_idx += 1;
+        }
+        let final_total = total.max(1);
+        tracing::trace!(
+            marker_count = user_text_start_lines.len(),
+            final_total,
+            "computed markers"
+        );
+        self.markers.reserve(user_text_start_lines.len());
+        for &start_line in &user_text_start_lines {
+            let slot = start_line * virtual_track / final_total;
+            self.markers.push(Marker {
+                content_line: start_line,
+                virtual_slot: slot,
+            });
+        }
+        self.markers_dirty = false;
+    }
+
+    pub(crate) fn mark_streaming_changed(&mut self) {
+        self.streaming_dirty = true;
+        self.content_dirty = true;
+    }
+
+    pub(crate) fn mark_content_changed(&mut self) {
+        self.markers_dirty = true;
+        self.content_dirty = true;
+        self.streaming_turn_index = None;
+        self.streaming_dirty = false;
+    }
+
+    pub(crate) fn resolve_streaming_turn_index(&mut self, request_id: u32) {
+        if self.streaming_turn_index.is_none()
+            && let Some(&turn_id) = self.view.request_to_turn.get(&request_id)
+        {
+            self.streaming_turn_index = self.visible_turn_ids.iter().position(|id| *id == turn_id);
+        }
+    }
+
+    pub(crate) fn compute_total_height_and_markers(&mut self, viewport: &HistoryViewport) -> usize {
+        if self.streaming_dirty && !self.markers_dirty {
+            self.apply_streaming_update(viewport);
+        } else if self.markers_dirty {
+            let at_bottom = self.effective_scroll(viewport) == 0;
+            let preserve_scroll = self.content_dirty && !at_bottom;
+            let old_total = if preserve_scroll {
+                self.total_history_height()
+            } else {
+                0
+            };
+
+            self.rebuild_height_prefix(viewport);
+
+            if preserve_scroll {
+                let new_total = self.total_history_height();
+                if new_total > old_total {
+                    self.history_scroll.scroll = self
+                        .history_scroll
+                        .scroll
+                        .saturating_add(new_total - old_total);
+                } else if old_total > new_total {
+                    tracing::trace!(old_total, new_total, "content removed, scrolling to bottom");
+                    self.history_scroll.scroll = 0;
+                }
+            }
+
+            self.content_dirty = false;
+            self.streaming_dirty = false;
+        }
+
+        self.total_history_height().max(1)
+    }
+
+    fn apply_streaming_update(&mut self, viewport: &HistoryViewport) {
+        let Some(turn_idx) = self.streaming_turn_index else {
+            return self.rebuild_height_prefix_preserving_scroll(viewport);
+        };
+        if turn_idx >= self.visible_turn_ids.len() {
+            return self.rebuild_height_prefix_preserving_scroll(viewport);
+        }
+
+        let turn_id = self.visible_turn_ids[turn_idx];
+        let Some(turn) = self.view.turns.get(&turn_id) else {
+            return self.rebuild_height_prefix_preserving_scroll(viewport);
+        };
+
+        let content_width = viewport.width.saturating_sub(9);
+        let tool_content_width = viewport.width.saturating_sub(4);
+
+        if let Some(Some(cached)) = self.render_cache.get_mut(turn_idx)
+            && cached.turn_id == turn_id
+            && cached.width == content_width
+            && cached.viewport_width == viewport.width
+        {
+            let text_lines = render_turn_lines(turn, content_width, tool_content_width);
+            let text_height = lines_height(&text_lines, viewport.width).max(1);
+            let visual_offsets = compute_visual_offsets(&text_lines, viewport.width);
+
+            cached.lines = Arc::from(text_lines);
+            cached.height = text_height;
+            cached.visual_offsets = visual_offsets;
+
+            let full_img_height = self.image_block_height(viewport) as usize;
+            let img_count = turn.displayed_images.len();
+            let turn_height = text_height + img_count * full_img_height;
+
+            let old_height = self.turn_heights[turn_idx];
+
+            if turn_height > old_height {
+                let delta = turn_height - old_height;
+                self.turn_heights[turn_idx] = turn_height;
+                for i in turn_idx..self.height_prefix.len() {
+                    self.height_prefix[i] = self.height_prefix[i].saturating_add(delta);
+                }
+                let at_bottom = self.effective_scroll(viewport) == 0;
+                if !at_bottom {
+                    self.history_scroll.scroll = self.history_scroll.scroll.saturating_add(delta);
+                }
+                self.rebuild_markers(viewport);
+            } else if old_height > turn_height {
+                return self.rebuild_height_prefix_preserving_scroll(viewport);
+            }
+        } else {
+            return self.rebuild_height_prefix_preserving_scroll(viewport);
+        }
+
+        self.streaming_dirty = false;
+        self.content_dirty = false;
+    }
+
+    fn rebuild_height_prefix_preserving_scroll(&mut self, viewport: &HistoryViewport) {
+        let at_bottom = self.effective_scroll(viewport) == 0;
+        let preserve_scroll = self.content_dirty && !at_bottom;
+        let old_total = if preserve_scroll {
+            self.total_history_height()
+        } else {
+            0
+        };
+
+        self.rebuild_height_prefix(viewport);
+
+        if preserve_scroll {
+            let new_total = self.total_history_height();
+            if new_total > old_total {
+                self.history_scroll.scroll = self
+                    .history_scroll
+                    .scroll
+                    .saturating_add(new_total - old_total);
+            } else if old_total > new_total {
+                tracing::trace!(old_total, new_total, "content removed, scrolling to bottom");
+                self.history_scroll.scroll = 0;
+            }
+        }
+
+        self.streaming_dirty = false;
+        self.content_dirty = false;
+    }
+
+    fn rebuild_markers(&mut self, viewport: &HistoryViewport) {
+        self.markers.clear();
+        let total = self.total_history_height().max(1);
+        let virtual_track = self.virtual_track_slots(viewport);
+        let mut accum = 0usize;
+        for (i, &turn_id) in self.visible_turn_ids.iter().enumerate() {
+            let turn_height = self.turn_heights[i];
+            if let Some(turn) = self.view.turns.get(&turn_id)
+                && turn.user_text.is_some()
+            {
+                let slot = accum * virtual_track / total;
+                self.markers.push(Marker {
+                    content_line: accum,
+                    virtual_slot: slot,
+                });
+            }
+            accum += turn_height;
+        }
+    }
+
+    pub(crate) fn max_scroll_offset(&self, viewport: &HistoryViewport) -> usize {
+        let viewport_height = viewport.height as usize;
+        let total_height = self.total_history_height();
+        total_height.saturating_sub(viewport_height)
+    }
+
+    pub(crate) fn virtual_track_slots(&self, viewport: &HistoryViewport) -> usize {
+        2 * viewport.height as usize
+    }
+
+    pub(crate) fn clamp_scroll_state(&mut self, viewport: &HistoryViewport) {
+        self.history_scroll.clamp(self.max_scroll_offset(viewport));
+    }
+
+    pub(crate) fn effective_scroll(&self, viewport: &HistoryViewport) -> usize {
+        self.history_scroll
+            .effective_scroll(self.max_scroll_offset(viewport))
+    }
+
+    pub(crate) fn image_block_height(&self, viewport: &HistoryViewport) -> u16 {
+        (viewport.height / 2).max(1)
+    }
+
+    pub(crate) fn ensure_cache_synced(&mut self) {
+        let turns_len = self.visible_turn_ids.len();
+        let cache_len = self.render_cache.len();
+        if cache_len == turns_len {
+            return;
+        }
+        if cache_len > turns_len {
+            self.render_cache.truncate(turns_len);
+            return;
+        }
+        self.render_cache.resize(turns_len, None);
+    }
+
+    pub(crate) fn scrollbar_notch(&self, viewport: &HistoryViewport) -> usize {
+        let max_scroll = self.max_scroll_offset(viewport);
+        let virtual_track = self.virtual_track_slots(viewport);
+        if virtual_track > 0 {
+            ceil_div(max_scroll, virtual_track)
+        } else {
+            max_scroll
+        }
+        .max(1)
+    }
+
+    pub(crate) fn scroll_up(&mut self, amount: usize, viewport: &HistoryViewport) {
+        self.history_scroll
+            .scroll_up(amount, self.max_scroll_offset(viewport));
+    }
+
+    pub(crate) fn scroll_down(&mut self, amount: usize, viewport: &HistoryViewport) {
+        self.history_scroll
+            .scroll_down(amount, self.max_scroll_offset(viewport));
+    }
+
+    pub(crate) fn scroll_to(&mut self, row: usize, viewport: &HistoryViewport) {
+        let max_scroll = self.max_scroll_offset(viewport);
+        let amount = row.min(max_scroll);
+        self.history_scroll.scroll = amount;
+        self.history_scroll.scroll_compensation = 0;
+    }
+
+    pub(crate) fn scroll_to_track_row(&mut self, mouse_row: u16, track_height: u16, viewport: &HistoryViewport) {
+        let track_height = track_height as usize;
+        if track_height > 1 {
+            let row = (mouse_row as usize).min(track_height.saturating_sub(1));
+            let max_scroll = self.max_scroll_offset(viewport);
+            let denom = track_height.saturating_sub(1);
+            let target = row.saturating_mul(max_scroll).saturating_add(denom / 2) / denom;
+            self.scroll_to(max_scroll.saturating_sub(target.min(max_scroll)), viewport);
+        }
+    }
+
+    pub(crate) fn scroll_to_content_line(&mut self, content_line: usize, viewport: &HistoryViewport) {
+        let total = self.total_history_height();
+        let vh = viewport.height as usize;
+        let target = total.saturating_sub(content_line + vh);
+        self.scroll_to(target.min(self.max_scroll_offset(viewport)), viewport);
+    }
+
+    pub(crate) fn scrollbar_scroll_up(&mut self, viewport: &HistoryViewport) {
+        let notch = self.scrollbar_notch(viewport);
+        self.scroll_up(notch, viewport);
+    }
+
+    pub(crate) fn scrollbar_scroll_down(&mut self, viewport: &HistoryViewport) {
+        let notch = self.scrollbar_notch(viewport);
+        self.scroll_down(notch, viewport);
+    }
+}
+
+/// Invalidate the render cache entry for `turn_id`.
+fn invalidate_turn_cache(display: &mut SessionDisplayState, turn_id: u32) {
+    if let Some(idx) = display.visible_turn_ids.iter().position(|id| *id == turn_id)
+        && let Some(slot) = display.render_cache.get_mut(idx)
     {
         *slot = None;
     }
@@ -2273,141 +2317,138 @@ fn invalidate_turn_cache(app: &mut App, turn_id: u32) {
 // ── TurnEventHandler implementation ──────────────────────────────────
 
 impl TurnEventHandler for App {
-    fn handle_turn_appended(&mut self, turn_id: u32, turn: Turn) {
+    fn handle_turn_appended(&mut self, session_id: u64, turn_id: u32, turn: Turn) {
         tracing::trace!(%turn_id, "handle_turn_appended");
-        invalidate_turn_cache(self, turn_id);
-        self.sync_turn_images(turn_id, &turn);
-        self.session_view.insert_or_replace(turn_id, turn);
-        self.mark_content_changed();
+        self.sync_turn_images(session_id, turn_id, &turn);
+        let display = self.display_for(session_id);
+        invalidate_turn_cache(display, turn_id);
+        display.view.insert_or_replace(turn_id, turn);
+        display.mark_content_changed();
     }
 
-    fn handle_turn_finalized(&mut self, turn_id: u32, turn: Turn) {
+    fn handle_turn_finalized(&mut self, session_id: u64, turn_id: u32, turn: Turn) {
         tracing::trace!(%turn_id, "handle_turn_finalized");
-        invalidate_turn_cache(self, turn_id);
-        self.sync_turn_images(turn_id, &turn);
-        self.session_view.insert_or_replace(turn_id, turn);
-        self.mark_content_changed();
+        self.sync_turn_images(session_id, turn_id, &turn);
+        let display = self.display_for(session_id);
+        invalidate_turn_cache(display, turn_id);
+        display.view.insert_or_replace(turn_id, turn);
+        display.mark_content_changed();
     }
 
-    fn handle_turns_undone(&mut self, turn_ids: &[u32]) {
+    fn handle_turns_undone(&mut self, session_id: u64, turn_ids: &[u32]) {
         tracing::trace!(?turn_ids, "handle_turns_undone");
+        let display = self.display_for(session_id);
         for tid in turn_ids {
-            invalidate_turn_cache(self, *tid);
-            if let Some(turn) = self.session_view.turns.get_mut(tid) {
+            invalidate_turn_cache(display, *tid);
+            if let Some(turn) = display.view.turns.get_mut(tid) {
                 turn.undone = true;
             }
         }
-        self.mark_content_changed();
+        display.mark_content_changed();
     }
 
-    fn handle_turns_redone(&mut self, turns: std::collections::BTreeMap<u32, Turn>) {
+    fn handle_turns_redone(&mut self, session_id: u64, turns: std::collections::BTreeMap<u32, Turn>) {
         tracing::trace!(?turns, "handle_turns_redone");
-        for (tid, turn) in turns {
-            invalidate_turn_cache(self, tid);
-            self.sync_turn_images(tid, &turn);
-            self.session_view.insert_or_replace(tid, turn);
+        // Sync images first, then get display to avoid borrow conflict.
+        for (tid, turn) in &turns {
+            self.sync_turn_images(session_id, *tid, turn);
         }
-        self.mark_content_changed();
+        let display = self.display_for(session_id);
+        for (tid, turn) in turns {
+            invalidate_turn_cache(display, tid);
+            display.view.insert_or_replace(tid, turn);
+        }
+        display.mark_content_changed();
     }
 
-    fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: Cow<'_, str>) {
-        self.session_view.stream_chunk(request_id, stream, &data);
-        self.resolve_streaming_turn_index(request_id);
-        self.mark_streaming_changed();
+    fn handle_request_stream(&mut self, session_id: u64, request_id: u32, stream: OutputStream, data: Cow<'_, str>) {
+        let display = self.display_for(session_id);
+        display.view.stream_chunk(request_id, stream, &data);
+        display.resolve_streaming_turn_index(request_id);
+        display.mark_streaming_changed();
     }
 
-    fn handle_started(&mut self, request_id: u32, turn_id: u32, estimated_prompt_tokens: u32) {
+    fn handle_started(&mut self, session_id: u64, request_id: u32, turn_id: u32, estimated_prompt_tokens: u32) {
         tracing::trace!(%request_id, %turn_id, %estimated_prompt_tokens, "handle_started");
-        self.session_view
-            .request_to_turn
-            .insert(request_id, turn_id);
-        self.active.insert(request_id);
-        self.live_input_estimate = estimated_prompt_tokens;
-        self.live_output_tokens = 0;
-        // Resolve the streaming turn index. It may not exist yet if the
-        // turn hasn't arrived (TurnAppended may arrive separately or the
-        // turn was already in the session_view from SessionState).
-        self.streaming_turn_index = self.visible_turn_ids.iter().position(|id| *id == turn_id);
+        let display = self.display_for(session_id);
+        display.view.request_to_turn.insert(request_id, turn_id);
+        display.active.insert(request_id);
+        display.live_input_estimate = estimated_prompt_tokens;
+        display.live_output_tokens = 0;
+        display.streaming_turn_index = display.visible_turn_ids.iter().position(|id| *id == turn_id);
     }
 
     fn handle_done(
         &mut self,
+        session_id: u64,
         request_id: u32,
         token_usage: Option<TokenUsage>,
         last_prompt_tokens: Option<u32>,
     ) {
         tracing::trace!(%request_id, "handle_done");
-        self.session_view.request_to_turn.remove(&request_id);
-        self.active.remove(&request_id);
+        let display = self.display_for(session_id);
+        display.view.request_to_turn.remove(&request_id);
+        display.active.remove(&request_id);
         if let Some(usage) = token_usage {
-            self.attached_token_usage = Some(usage);
-            // Many providers only supply token_usage without the
-            // separate last_prompt_tokens field.  Fall back to
-            // input_tokens so the progress bar always updates.
+            display.token_usage = Some(usage);
             if last_prompt_tokens.is_none() {
-                self.attached_last_prompt_tokens = Some(usage.input_tokens);
+                display.last_prompt_tokens = Some(usage.input_tokens);
             }
         }
         if let Some(tokens) = last_prompt_tokens {
-            self.attached_last_prompt_tokens = Some(tokens);
+            display.last_prompt_tokens = Some(tokens);
         }
-        self.live_input_estimate = 0;
-        self.live_output_tokens = 0;
-        self.streaming_turn_index = None;
-        // Full rebuild: `handle_done` fires once per request so the O(N)
-        // cost is negligible, and `streaming_turn_index` is no longer valid
-        // for an incremental update.
-        self.mark_content_changed();
+        display.live_input_estimate = 0;
+        display.live_output_tokens = 0;
+        display.streaming_turn_index = None;
+        display.mark_content_changed();
     }
 
-    fn handle_failed(&mut self, request_id: u32, error: String) {
+    fn handle_failed(&mut self, session_id: u64, request_id: u32, error: String) {
         tracing::trace!(%request_id, %error, "handle_failed");
-        self.error = Some(error);
-        self.session_view.request_to_turn.remove(&request_id);
-        self.active.remove(&request_id);
-        self.streaming_turn_index = None;
-        self.mark_content_changed();
+        let display = self.display_for(session_id);
+        display.error = Some(error);
+        display.view.request_to_turn.remove(&request_id);
+        display.active.remove(&request_id);
+        display.streaming_turn_index = None;
+        display.mark_content_changed();
     }
 
-    fn handle_tool_call_event(&mut self, request_id: u32, event: ToolCallEvent) {
+    fn handle_tool_call_event(&mut self, session_id: u64, request_id: u32, event: ToolCallEvent) {
+        let display = self.display_for(session_id);
         match event {
             ToolCallEvent::Started {
                 call_id,
                 tool_name,
                 arguments_json,
             } => {
-                self.session_view
-                    .tool_call_started(request_id, call_id, tool_name, arguments_json);
-                self.resolve_streaming_turn_index(request_id);
-                self.mark_streaming_changed();
+                display.view.tool_call_started(request_id, call_id, tool_name, arguments_json);
+                display.resolve_streaming_turn_index(request_id);
+                display.mark_streaming_changed();
             }
-            ToolCallEvent::Finished { .. } => {
-                // Finished events are informational — tool results arrive via
-                // TurnAppended/TurnFinalized.
-            }
-            ToolCallEvent::Failed { .. } => {
-                // Failed events are informational — is_error will be set in
-                // the Turn's tool_results via TurnAppended/TurnFinalized.
-            }
+            ToolCallEvent::Finished { .. } => {}
+            ToolCallEvent::Failed { .. } => {}
         }
     }
 
-    fn handle_tool_result_chunk(&mut self, request_id: u32, call_id: String, data: Vec<u8>) {
+    fn handle_tool_result_chunk(&mut self, session_id: u64, request_id: u32, call_id: String, data: Vec<u8>) {
         let text = String::from_utf8_lossy(&data).into_owned();
-        self.session_view
-            .tool_result_chunk(request_id, &call_id, &text);
-        self.resolve_streaming_turn_index(request_id);
-        self.mark_streaming_changed();
+        let display = self.display_for(session_id);
+        display.view.tool_result_chunk(request_id, &call_id, &text);
+        display.resolve_streaming_turn_index(request_id);
+        display.mark_streaming_changed();
     }
 
     fn handle_session_state(&mut self, state: SessionStateData) {
         tracing::debug!(
             turn_count = %state.turns.len(),
-            ?state.title,
             ?state.selected_model,
             ?state.status,
             "handle_session_state"
         );
+        let session_id = self.attached_session_id.unwrap_or(0);
+        self.active_session_id = Some(session_id);
+
         let SessionStateData {
             turns,
             title: _,
@@ -2421,38 +2462,38 @@ impl TurnEventHandler for App {
             reasoning_capability,
             ..
         } = state;
-        // Sync images from the incoming turns before assigning to self,
-        // avoiding a borrow conflict between &mut self and &self.session_view.
-        self.rendered_images.clear();
+        // Sync images before getting display to avoid borrow conflict.
+        self.rendered_images.remove(&session_id);
         for (tid, turn) in &turns {
-            self.sync_turn_images(*tid, turn);
+            self.sync_turn_images(session_id, *tid, turn);
         }
-        self.session_view.turns = turns;
-        self.attached_model = selected_model;
-        // Only overwrite with Some values — a SessionState that arrives
-        // after Done may not yet reflect the just-completed turn.
+        let display = self.display_for(session_id);
+        display.view.turns = turns;
+        display.selected_model = selected_model;
         if let Some(usage) = token_usage {
-            self.attached_token_usage = Some(usage);
+            display.token_usage = Some(usage);
         }
         if let Some(cw) = context_window {
-            self.attached_context_window = Some(cw);
+            display.context_window = Some(cw);
         }
         if let Some(tokens) = last_prompt_tokens {
-            self.attached_last_prompt_tokens = Some(tokens);
+            display.last_prompt_tokens = Some(tokens);
         }
-        self.attached_status = Some(status);
-        self.attached_tool_groups = active_tool_groups;
         if let Some(effort) = reasoning_effort {
-            self.attached_reasoning_effort = Some(effort);
+            display.reasoning_effort = Some(effort);
         }
         if let Some(cap) = reasoning_capability {
-            self.attached_reasoning_capability = Some(cap);
+            display.reasoning_capability = Some(cap);
         }
-        self.mark_content_changed();
+        display.mark_content_changed();
+        let _ = display;
+        self.attached_status = Some(status);
+        self.attached_tool_groups = active_tool_groups;
     }
 
     fn handle_token_usage_update(
         &mut self,
+        session_id: u64,
         token_usage: TokenUsage,
         last_prompt_tokens: Option<u32>,
     ) {
@@ -2461,12 +2502,13 @@ impl TurnEventHandler for App {
             ?last_prompt_tokens,
             "handle_token_usage_update"
         );
-        self.attached_token_usage = Some(token_usage);
+        let display = self.display_for(session_id);
+        display.token_usage = Some(token_usage);
         if let Some(tokens) = last_prompt_tokens {
-            self.attached_last_prompt_tokens = Some(tokens);
+            display.last_prompt_tokens = Some(tokens);
         }
-        self.live_input_estimate = 0;
-        self.live_output_tokens = 0;
+        display.live_input_estimate = 0;
+        display.live_output_tokens = 0;
     }
 
     fn handle_status_text(&mut self, text: String) {
@@ -2478,6 +2520,7 @@ impl TurnEventHandler for App {
     }
 
     fn handle_session_attached(&mut self, session_id: u64) {
+        self.active_session_id = Some(session_id);
         self.attached_session_id = Some(session_id);
     }
 
@@ -2519,13 +2562,14 @@ pub(crate) fn history_text_height(text: &str, width: u16) -> usize {
 /// turn for a given screen row.  Binary search on `height_prefix`.
 /// Returns `(turn_idx, offset_within_turn)`.
 pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<(usize, usize)> {
+    let display = app.active_display_ref()?;
     let vh = app.history_viewport.height;
     if screen_row >= vh {
         return None;
     }
 
-    let effective_scroll = app.effective_scroll();
-    let total_height = app.total_history_height();
+    let effective_scroll = display.effective_scroll(&app.history_viewport);
+    let total_height = display.total_history_height();
 
     let content_line = total_height
         .saturating_sub(effective_scroll + vh as usize)
@@ -2535,12 +2579,11 @@ pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<(usize, usi
         return None;
     }
 
-    // Binary search on the prefix-sum array.
-    let i = app.height_prefix.partition_point(|&p| p <= content_line);
-    if i < app.height_prefix.len() {
+    let i = display.height_prefix.partition_point(|&p| p <= content_line);
+    if i < display.height_prefix.len() {
         let turn_start = i
             .checked_sub(1)
-            .and_then(|prev| app.height_prefix.get(prev))
+            .and_then(|prev| display.height_prefix.get(prev))
             .copied()
             .unwrap_or(0);
         let offset = content_line.saturating_sub(turn_start);
@@ -2680,7 +2723,6 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
-        // Fill with enough turn content.
         for i in 0..5u32 {
             let turn = Turn {
                 created_at: choreo_proto::TimestampMs::now(),
@@ -2694,13 +2736,12 @@ mod tests {
                 tool_results: vec![],
                 displayed_images: vec![],
             };
-            app.session_view.insert_or_replace(i, turn);
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(i, turn);
         }
         app.rebuild_height_prefix();
 
-        // content_line=0 → first visible turn
         app.scroll_to_content_line(0);
-        // Should scroll to top (max scroll)
         assert_eq!(app.effective_scroll(), app.max_scroll_offset());
     }
 
@@ -2729,10 +2770,10 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        app.session_view.insert_or_replace(1, turn);
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, turn);
         app.rebuild_height_prefix();
 
-        // Screen row 0 should map to turn_idx 0 and offset 0.
         let (turn_idx, offset) = find_turn_at_row(&app, 0).unwrap();
         assert_eq!(turn_idx, 0);
         assert_eq!(offset, 0);
@@ -2745,7 +2786,6 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
-        // No content → total_height = 0 → max_scroll = 0 → notch clamps to 1
         assert_eq!(app.scrollbar_notch(), 1);
     }
 
@@ -2754,9 +2794,9 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 1;
-        app.height_prefix.push(50);
-        // max_scroll = 50 - 1 = 49, virtual_track = 2
-        // notch = ceil(49 / 2) = 25
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(50);
+        // max_scroll = 50 - 1 = 49, virtual_track = 2, notch = ceil(49 / 2) = 25
         assert_eq!(app.scrollbar_notch(), 25);
     }
 
@@ -2765,9 +2805,9 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 50;
-        app.height_prefix.push(150);
-        // max_scroll = 150 - 50 = 100, virtual_track = 100
-        // notch = ceil(100 / 100) = 1
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(150);
+        // max_scroll = 150 - 50 = 100, virtual_track = 100, notch = ceil(100 / 100) = 1
         assert_eq!(app.scrollbar_notch(), 1);
     }
 
@@ -2776,9 +2816,9 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 30;
-        app.height_prefix.push(105);
-        // max_scroll = 105 - 30 = 75, virtual_track = 60
-        // notch = ceil(75 / 60) = 2
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(105);
+        // max_scroll = 105 - 30 = 75, virtual_track = 60, notch = ceil(75 / 60) = 2
         assert_eq!(app.scrollbar_notch(), 2);
     }
 
@@ -2789,12 +2829,10 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
-        app.height_prefix.push(110);
-        // max_scroll = 100, virtual_track = 20
-        // notch = ceil(100 / 20) = 5
-
-        // Start at the bottom (scroll = 0).
-        app.history_scroll.scroll = 0;
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(110);
+        // max_scroll = 100, virtual_track = 20, notch = 5
+        display.history_scroll.scroll = 0;
         let before = app.effective_scroll();
 
         app.scrollbar_scroll_up();
@@ -2807,15 +2845,13 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
-        app.height_prefix.push(110);
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(110);
         // max_scroll = 100, virtual_track = 20, notch = 5
-
-        // Start at the top (scroll = 100) — already at max.
-        app.history_scroll.scroll = 100;
+        display.history_scroll.scroll = 100;
 
         app.scrollbar_scroll_up();
 
-        // Should not exceed max_scroll.
         assert_eq!(app.effective_scroll(), 100);
     }
 
@@ -2824,11 +2860,10 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
-        app.height_prefix.push(110);
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(110);
         // max_scroll = 100, virtual_track = 20, notch = 5
-
-        // Start at the top (scroll = 100).
-        app.history_scroll.scroll = 100;
+        display.history_scroll.scroll = 100;
         let before = app.effective_scroll();
 
         app.scrollbar_scroll_down();
@@ -2841,15 +2876,13 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
-        app.height_prefix.push(110);
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(110);
         // max_scroll = 100, virtual_track = 20, notch = 5
-
-        // Start at scroll = 5 — exactly one notch from bottom.
-        app.history_scroll.scroll = 5;
+        display.history_scroll.scroll = 5;
 
         app.scrollbar_scroll_down();
 
-        // Should clamp to 0 (not underflow).
         assert_eq!(app.effective_scroll(), 0);
     }
 
@@ -2860,14 +2893,11 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
-        app.height_prefix.push(110);
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(110);
         // max_scroll = 90, denom = 19
-        // row 0 → target = round(0/19 * 90) = 0 → scroll = 90 - 0 = 90
+        display.history_scroll.scroll = 90;
 
-        // Start scrolled to the top.
-        app.history_scroll.scroll = 90;
-
-        // Click at bottom of scrollbar (row 0).
         app.scroll_to_track_row(0, 20);
 
         assert_eq!(app.effective_scroll(), 90);
@@ -2878,14 +2908,11 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
-        app.height_prefix.push(110);
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(110);
         // max_scroll = 90, denom = 19
-        // row 19 → target = round(19/19 * 90) = 90 → scroll = 90 - 90 = 0
+        display.history_scroll.scroll = 0;
 
-        // Start scrolled to the bottom.
-        app.history_scroll.scroll = 0;
-
-        // Click at top of scrollbar (row 19).
         app.scroll_to_track_row(19, 20);
 
         assert_eq!(app.effective_scroll(), 0);
@@ -2896,10 +2923,9 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
-        app.height_prefix.push(110);
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(110);
         // max_scroll = 100, denom = 9
-        // row 4 → target = round(4/9 * 100) = 44
-        // scroll = 100 - 44 = 56
 
         app.scroll_to_track_row(4, 10);
 
@@ -2911,11 +2937,10 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 0;
-        app.height_prefix.push(110);
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(110);
+        display.history_scroll.scroll = 42;
 
-        app.history_scroll.scroll = 42;
-
-        // Zero-height viewport → track_height = 0 → no-op.
         app.scroll_to_track_row(0, 0);
 
         assert_eq!(app.effective_scroll(), 42);
@@ -2926,11 +2951,10 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 10;
-        app.height_prefix.push(110);
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(110);
+        display.history_scroll.scroll = 42;
 
-        app.history_scroll.scroll = 42;
-
-        // track_height = 1 → early return (track_height > 1 is false).
         app.scroll_to_track_row(0, 1);
 
         assert_eq!(app.effective_scroll(), 42);
@@ -2941,12 +2965,11 @@ mod tests {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
-        app.height_prefix.push(110);
+        let display = app.active_display().unwrap();
+        display.height_prefix.push(110);
         // max_scroll = 90, denom = 19
-        // mouse_row=30 clamped to 19 → target = round(19/19 * 90) = 90
-        // scroll = 90 - 90 = 0
+        display.history_scroll.scroll = 0;
 
-        app.history_scroll.scroll = 0;
         app.scroll_to_track_row(30, 20);
 
         assert_eq!(app.effective_scroll(), 0);
@@ -2960,7 +2983,6 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 200;
 
-        // Single short turn that fits entirely in the viewport.
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
@@ -2973,9 +2995,9 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        app.session_view.insert_or_replace(0, turn);
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(0, turn);
         app.rebuild_height_prefix();
-        // total_height <= viewport_height → max_scroll = 0 → already at top.
 
         let before = app.effective_scroll();
         app.scroll_to_content_line(0);
@@ -3001,11 +3023,11 @@ mod tests {
                 tool_results: vec![],
                 displayed_images: vec![],
             };
-            app.session_view.insert_or_replace(i, turn);
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(i, turn);
         }
         app.rebuild_height_prefix();
 
-        // content_line larger than total height → should saturate to scroll=0.
         app.scroll_to_content_line(9999);
         assert_eq!(app.effective_scroll(), 0);
     }
@@ -3117,15 +3139,15 @@ mod tests {
                 },
             ],
         };
-        app.sync_turn_images(42, &turn);
+        app.sync_turn_images(0, 42, &turn);
 
-        let images = app.rendered_images.get(&42).unwrap();
+        let images = app.rendered_images.get(&0).unwrap().get(&42).unwrap();
         assert_eq!(images.len(), 2);
         assert_eq!(images[&0].data.as_ref(), b"svg-data");
         assert_eq!(images[&1].data.as_ref(), b"more-svg");
         // Second call is idempotent — preserves existing entries
-        app.sync_turn_images(42, &turn);
-        assert_eq!(app.rendered_images.get(&42).unwrap().len(), 2);
+        app.sync_turn_images(0, 42, &turn);
+        assert_eq!(app.rendered_images.get(&0).unwrap().get(&42).unwrap().len(), 2);
     }
 
     // ── TurnImageLayout image_ranges ──
@@ -3147,11 +3169,11 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        app.session_view.insert_or_replace(1, turn);
+        app.active_display().unwrap().view.insert_or_replace(1, turn);
         app.rebuild_height_prefix();
 
-        assert_eq!(app.turn_layouts.len(), 1);
-        assert!(app.turn_layouts[0].image_ranges.is_empty());
+        assert_eq!(app.active_display().unwrap().turn_layouts.len(), 1);
+        assert!(app.active_display().unwrap().turn_layouts[0].image_ranges.is_empty());
     }
 
     #[test]
@@ -3190,22 +3212,24 @@ mod tests {
             ],
         };
         let turn_clone = turn.clone();
-        app.session_view.insert_or_replace(2, turn);
-        app.sync_turn_images(2, &turn_clone);
+        app.active_display().unwrap().view.insert_or_replace(2, turn);
+        app.sync_turn_images(0, 2, &turn_clone);
         app.rebuild_height_prefix();
 
-        assert_eq!(app.turn_layouts.len(), 1);
-        let layout = &app.turn_layouts[0];
-        assert_eq!(layout.image_ranges.len(), 2);
+        assert_eq!(app.active_display().unwrap().turn_layouts.len(), 1);
+        // Mutable borrow dropped.
 
-        // Fallback height: viewport_height / 2 = 10.
+        // Capture needed values before taking another mutable borrow for layout.
         let fallback_h = app.image_block_height() as usize;
-        // Text "short" renders at least 1 line.
-        let text_h = lines_height(
-            &render_turn_lines(&app.session_view.turns[&2], 71, 76),
-            app.history_viewport.width,
-        )
-        .max(1);
+        let vp_width = app.history_viewport.width;
+        let text_h = {
+            let display = app.active_display().unwrap();
+            let turn = &display.view.turns[&2];
+            lines_height(&render_turn_lines(turn, 71, vp_width), vp_width).max(1)
+        };
+
+        let layout = &app.active_display().unwrap().turn_layouts[0];
+        assert_eq!(layout.image_ranges.len(), 2);
 
         let (s0, e0) = layout.image_ranges[0];
         assert_eq!(s0, text_h);
@@ -3249,13 +3273,15 @@ mod tests {
             }],
         };
         let turn_clone = turn.clone();
-        app.session_view.insert_or_replace(4, turn);
-        app.sync_turn_images(4, &turn_clone);
+        app.active_display().unwrap().view.insert_or_replace(4, turn);
+        app.sync_turn_images(0, 4, &turn_clone);
 
         let img_id = next_job_id();
-        app.pending_job_idx.insert(img_id, (4, 0));
+        app.pending_job_idx.insert(img_id, (0, 4, 0));
         let img = app
             .rendered_images
+            .get_mut(&0)
+            .unwrap()
             .get_mut(&4)
             .unwrap()
             .get_mut(&0)
@@ -3270,7 +3296,7 @@ mod tests {
         };
         app.apply_image_result(result);
 
-        let img = app.rendered_images.get(&4).unwrap().get(&0).unwrap();
+        let img = app.rendered_images.get(&0).unwrap().get(&4).unwrap().get(&0).unwrap();
         assert!(img.failed_sizes.contains(&inline_size));
         assert!(img.pending_job.is_none());
     }
@@ -3306,13 +3332,15 @@ mod tests {
             }],
         };
         let turn_clone = turn.clone();
-        app.session_view.insert_or_replace(5, turn);
-        app.sync_turn_images(5, &turn_clone);
+        app.active_display().unwrap().view.insert_or_replace(5, turn);
+        app.sync_turn_images(0, 5, &turn_clone);
 
         let img_id = next_job_id();
-        app.pending_job_idx.insert(img_id, (5, 0));
+        app.pending_job_idx.insert(img_id, (0, 5, 0));
         let img = app
             .rendered_images
+            .get_mut(&0)
+            .unwrap()
             .get_mut(&5)
             .unwrap()
             .get_mut(&0)
@@ -3328,7 +3356,7 @@ mod tests {
         };
         app.apply_image_result(result);
 
-        let img = app.rendered_images.get(&5).unwrap().get(&0).unwrap();
+        let img = app.rendered_images.get(&0).unwrap().get(&5).unwrap().get(&0).unwrap();
         assert!(img.failed_sizes.contains(&non_inline_size));
     }
 
@@ -3348,7 +3376,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        app.session_view.insert_or_replace(id, turn);
+        app.display_for(0).view.insert_or_replace(id, turn);
     }
 
     #[test]
@@ -3357,45 +3385,41 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
-        // Add initial turns and rebuild layout.
         insert_turn(&mut app, 0, "a", "a");
         insert_turn(&mut app, 1, "b", "b");
         app.rebuild_height_prefix();
 
-        // Total height after 2 short turns.
-        let initial_total = app.total_history_height();
+        // Capture viewport height before taking a mutable borrow.
+        let viewport_height = app.history_viewport.height;
+        let mut display = app.active_display().unwrap();
+        let initial_total = display.total_history_height();
 
-        // Scroll up so the user is NOT at the bottom.
-        app.history_scroll.scroll =
-            initial_total.saturating_sub(app.history_viewport.height as usize) / 2;
+        display.history_scroll.scroll =
+            initial_total.saturating_sub(viewport_height as usize) / 2;
+        // Drop mutable borrow so we can access app again.
+        drop(display);
         assert!(app.effective_scroll() > 0, "should be scrolled up");
 
-        // Simulate a content mutation: add a turn that increases total height.
         insert_turn(&mut app, 2, "new content", "new content");
         let old_total = app.total_history_height();
-        let old_scroll = app.history_scroll.scroll;
+        let mut display = app.active_display().unwrap();
+        let old_scroll = display.history_scroll.scroll;
 
-        // Mark content as changed (like TurnEventHandler methods do).
-        app.mark_content_changed();
+        display.mark_content_changed();
+        drop(display);
 
-        // Recompute — should preserve scroll by shifting it for the new content.
         app.compute_total_height_and_markers();
 
-        let new_total = app.total_history_height();
+        let display = app.active_display_ref().unwrap();
+        let new_total = display.total_history_height();
         let delta = new_total.saturating_sub(old_total);
-        assert!(
-            delta > 0,
-            "total height should increase after adding content"
-        );
+        assert!(delta > 0, "total height should increase after adding content");
         assert_eq!(
-            app.history_scroll.scroll,
+            display.history_scroll.scroll,
             old_scroll + delta,
             "scroll should be adjusted by the content delta"
         );
-        assert!(
-            !app.content_dirty,
-            "content_dirty should be cleared after computation"
-        );
+        assert!(!display.content_dirty, "content_dirty should be cleared after computation");
     }
 
     #[test]
@@ -3404,27 +3428,26 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
-        // Add initial turns.
         insert_turn(&mut app, 0, "a", "a");
         insert_turn(&mut app, 1, "b", "b");
         app.rebuild_height_prefix();
 
-        // Scroll to bottom (effective_scroll == 0).
-        app.history_scroll.scroll = 0;
+        let mut display = app.active_display().unwrap();
+        display.history_scroll.scroll = 0;
+        // Drop mutable borrow so we can access app again.
+        drop(display);
         assert_eq!(app.effective_scroll(), 0, "should be at bottom");
 
-        // Add new content.
         insert_turn(&mut app, 2, "more", "more");
-        let old_scroll = app.history_scroll.scroll;
+        let mut display = app.active_display().unwrap();
+        let old_scroll = display.history_scroll.scroll;
+        display.mark_content_changed();
+        drop(display);
 
-        app.mark_content_changed();
         app.compute_total_height_and_markers();
 
-        // Scroll should remain 0 (no adjustment when at bottom).
-        assert_eq!(
-            app.history_scroll.scroll, old_scroll,
-            "scroll should stay at 0 when user is at bottom"
-        );
+        let display = app.active_display_ref().unwrap();
+        assert_eq!(display.history_scroll.scroll, old_scroll, "scroll should stay at 0 when user is at bottom");
     }
 
     // ── marker computation ──
@@ -3435,7 +3458,6 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
 
-        // Insert a turn with assistant_text only (no user_text).
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
@@ -3448,13 +3470,13 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        app.session_view.insert_or_replace(0, turn);
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(0, turn);
+        drop(display);
         app.rebuild_height_prefix();
 
-        assert!(
-            app.markers.is_empty(),
-            "no markers should be created when no turn has user_text"
-        );
+        let display = app.active_display_ref().unwrap();
+        assert!(display.markers.is_empty(), "no markers should be created when no turn has user_text");
     }
 
     #[test]
@@ -3463,9 +3485,7 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 20;
 
-        // Turn 0: has user_text.
         insert_turn(&mut app, 0, "user a", "assistant a");
-        // Turn 1: NO user_text (assistant-only turn).
         let turn_no_user = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
@@ -3478,28 +3498,23 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        app.session_view.insert_or_replace(1, turn_no_user);
-        // Turn 2: has user_text.
+        {
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(1, turn_no_user);
+        }
         insert_turn(&mut app, 2, "user c", "assistant c");
 
         app.rebuild_height_prefix();
 
-        // Only the two user-text turns should have markers.
-        assert_eq!(
-            app.markers.len(),
-            2,
-            "expected 2 markers for 2 user-text turns"
-        );
-
-        // content_line values should be strictly increasing (turn order).
+        let display = app.active_display_ref().unwrap();
+        assert_eq!(display.markers.len(), 2, "expected 2 markers for 2 user-text turns");
         assert!(
-            app.markers[0].content_line < app.markers[1].content_line,
+            display.markers[0].content_line < display.markers[1].content_line,
             "first user-text turn should appear before the second"
         );
 
-        // Every content_line must be within the total history.
-        let total = app.total_history_height();
-        for marker in &app.markers {
+        let total = display.total_history_height();
+        for marker in &display.markers {
             assert!(
                 marker.content_line < total,
                 "marker content_line {0} should be < total history {total}",
@@ -3515,30 +3530,24 @@ mod tests {
         app.history_viewport.height = 20;
         let virtual_track = 2 * app.history_viewport.height as usize;
 
-        // Two user-text turns; their heights depend on content/wrapping but
-        // we verify the slot formula directly.
         insert_turn(&mut app, 0, "x", "y");
         insert_turn(&mut app, 1, "x", "y");
         app.rebuild_height_prefix();
 
-        let total = app.total_history_height();
+        let display = app.active_display_ref().unwrap();
+        let total = display.total_history_height();
         assert!(total > 0, "total history should be positive");
 
-        // Re-derive start_line for each marker from height_prefix.
-        // height_prefix[i] == cumulative height up to and including turn i.
         let mut prev_end = 0usize;
-        for (i, marker) in app.markers.iter().enumerate() {
-            // The marker's content_line should be the cumulative offset
-            // of that turn (where it starts).
+        for (i, marker) in display.markers.iter().enumerate() {
             assert_eq!(
                 marker.content_line, prev_end,
                 "marker {i} content_line should equal the start of the turn"
             );
-            if let Some(&end) = app.height_prefix.get(i) {
+            if let Some(&end) = display.height_prefix.get(i) {
                 prev_end = end;
             }
 
-            // virtual_slot = content_line * virtual_track / total.
             let expected_slot = marker.content_line * virtual_track / total;
             assert_eq!(
                 marker.virtual_slot, expected_slot,
@@ -3554,25 +3563,22 @@ mod tests {
         app.history_viewport.height = 20;
         let virtual_track = 2 * app.history_viewport.height as usize;
 
-        // Add three user-text turns at once, then rebuild.
         insert_turn(&mut app, 0, "a", "a");
         insert_turn(&mut app, 1, "b", "b");
         insert_turn(&mut app, 2, "c", "c");
         app.rebuild_height_prefix();
 
-        // A turn that starts later must have a proportionally larger slot.
+        let display = app.active_display_ref().unwrap();
         assert!(
-            app.markers[0].virtual_slot <= app.markers[1].virtual_slot,
+            display.markers[0].virtual_slot <= display.markers[1].virtual_slot,
             "second marker slot should be >= first marker slot"
         );
         assert!(
-            app.markers[1].virtual_slot <= app.markers[2].virtual_slot,
+            display.markers[1].virtual_slot <= display.markers[2].virtual_slot,
             "third marker slot should be >= second marker slot"
         );
-
-        // The last marker's slot must be within the virtual track.
         assert!(
-            app.markers[2].virtual_slot < virtual_track,
+            display.markers[2].virtual_slot < virtual_track,
             "last marker slot should be less than virtual_track={virtual_track}"
         );
     }
@@ -3586,21 +3592,17 @@ mod tests {
         insert_turn(&mut app, 0, "a", "a");
         app.rebuild_height_prefix();
 
-        // Scroll up.
-        app.history_scroll.scroll = 10;
-        let old_scroll = app.history_scroll.scroll;
+        let mut display = app.active_display().unwrap();
+        display.history_scroll.scroll = 10;
+        let old_scroll = display.history_scroll.scroll;
 
-        // Rebuild with markers_dirty but NOT content_dirty (e.g. terminal resize).
-        // content_dirty is false by default.
-        app.markers_dirty = true;
-        assert!(!app.content_dirty, "content should not be dirty");
+        display.markers_dirty = true;
+        assert!(!display.content_dirty, "content should not be dirty");
+        drop(display);
         app.compute_total_height_and_markers();
 
-        // Scroll should stay at the old value (no delta adjustment applied).
-        assert_eq!(
-            app.history_scroll.scroll, old_scroll,
-            "scroll should not change when content_dirty is false"
-        );
+        let display = app.active_display_ref().unwrap();
+        assert_eq!(display.history_scroll.scroll, old_scroll, "scroll should not change when content_dirty is false");
     }
 
     // ── update_viewport_from_terminal_size ──
@@ -3608,25 +3610,16 @@ mod tests {
     #[test]
     fn help_overlay_reduces_viewport_height() {
         let mut app = test_app();
-
-        // Establish a known viewport first.
         app.history_viewport.width = 80;
         app.history_viewport.height = 26;
 
-        // Set up a terminal size where the 2-row help overlay makes
-        // a measurable difference in the viewport.  With an empty input
-        // and no status/error, bottom_height is 4 without help and 6
-        // with help, so a terminal of (80, 30) yields viewports of
-        // 26 and 24 respectively.
         app.last_terminal_size = Some((80, 30));
         app.terminal_resized = false;
 
-        // First with help hidden.
         app.show_ctrl_help = false;
         app.update_viewport_from_terminal_size();
         let height_without_help = app.history_viewport.height;
 
-        // Reset state so the second call also uses the cached terminal size.
         app.last_terminal_size = Some((80, 30));
         app.terminal_resized = false;
         app.show_ctrl_help = true;
@@ -3636,23 +3629,14 @@ mod tests {
         assert_eq!(
             height_without_help - height_with_help,
             2,
-            "help overlay should reduce viewport by 2 (was {}, now {})",
-            height_without_help,
-            height_with_help,
         );
 
-        // Verify max_scroll_offset also reflects the correct viewport:
-        // with help visible, content should be scrollable to the true top
-        // (max_scroll_offset + viewport == total when total > viewport).
-        // Without the help_height fix, max_scroll_offset would be 2 less
-        // than it should be.
         let total = app.total_history_height();
         let max_scroll = app.max_scroll_offset();
         if total > height_with_help as usize {
             assert_eq!(
                 max_scroll + height_with_help as usize,
                 total,
-                "with help visible, max_scroll_offset + viewport should equal total height"
             );
         }
     }
@@ -3661,20 +3645,16 @@ mod tests {
     fn width_change_clears_content_dirty() {
         let mut app = test_app();
 
-        // Establish a "current" viewport with the old width.
         app.history_viewport.width = 80;
         app.history_viewport.height = 26;
 
-        // Set last_terminal_size to a new size with larger width.
-        // terminal_resized is false so the function uses the cached size.
         app.last_terminal_size = Some((100, 30));
         app.terminal_resized = false;
 
-        // Set content_dirty and markers_dirty to verify changes.
-        app.content_dirty = true;
-        app.markers_dirty = true;
-        // Add a cached entry to verify it gets cleared.
-        app.render_cache = vec![Some(RenderedCache {
+        let mut display = app.active_display().unwrap();
+        display.content_dirty = true;
+        display.markers_dirty = true;
+        display.render_cache = vec![Some(RenderedCache {
             turn_id: 0,
             lines: Arc::from(Vec::<Line<'static>>::new()),
             width: 0,
@@ -3682,19 +3662,14 @@ mod tests {
             height: 0,
             visual_offsets: Arc::from([]),
         })];
+        drop(display);
 
         app.update_viewport_from_terminal_size();
 
-        assert!(
-            !app.content_dirty,
-            "content_dirty should be cleared on width change"
-        );
-        assert!(app.markers_dirty, "markers_dirty should remain true");
-        assert!(
-            app.render_cache.iter().all(|c| c.is_none()),
-            "render_cache should be cleared"
-        );
-        // Viewport should have been updated to the new dimensions.
+        let display = app.active_display_ref().unwrap();
+        assert!(!display.content_dirty, "content_dirty should be cleared on width change");
+        assert!(display.markers_dirty, "markers_dirty should remain true");
+        assert!(display.render_cache.iter().all(|c| c.is_none()), "render_cache should be cleared");
         assert_eq!(app.history_viewport.width, 99);
     }
 
@@ -3702,17 +3677,16 @@ mod tests {
     fn height_only_change_does_not_clear_content_dirty() {
         let mut app = test_app();
 
-        // Establish a "current" viewport matching terminal_width - 1 (scrollbar column).
         app.history_viewport.width = 79;
         app.history_viewport.height = 20;
 
-        // Set last_terminal_size to a new size with larger height, same width.
         app.last_terminal_size = Some((80, 30));
         app.terminal_resized = false;
 
-        app.content_dirty = true;
-        app.markers_dirty = true;
-        app.render_cache = vec![Some(RenderedCache {
+        let mut display = app.active_display().unwrap();
+        display.content_dirty = true;
+        display.markers_dirty = true;
+        display.render_cache = vec![Some(RenderedCache {
             turn_id: 0,
             lines: Arc::from(Vec::<Line<'static>>::new()),
             width: 0,
@@ -3720,18 +3694,14 @@ mod tests {
             height: 0,
             visual_offsets: Arc::from([]),
         })];
+        drop(display);
 
         app.update_viewport_from_terminal_size();
 
-        assert!(
-            app.content_dirty,
-            "content_dirty should NOT be cleared on height-only change"
-        );
-        assert!(app.markers_dirty, "markers_dirty should remain true");
-        assert!(
-            app.render_cache.iter().all(|c| c.is_none()),
-            "render_cache should be cleared"
-        );
+        let display = app.active_display_ref().unwrap();
+        assert!(display.content_dirty, "content_dirty should NOT be cleared on height-only change");
+        assert!(display.markers_dirty, "markers_dirty should remain true");
+        assert!(display.render_cache.iter().all(|c| c.is_none()), "render_cache should be cleared");
     }
 
     // ── compute_total_height_and_markers: scroll-to-bottom on content removal ──
@@ -3742,7 +3712,6 @@ mod tests {
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
 
-        // Add initial turns and establish a height_prefix.
         insert_turn(&mut app, 0, "user text", "assistant text");
         insert_turn(&mut app, 1, "more user", "more assistant");
         app.rebuild_height_prefix();
@@ -3750,26 +3719,24 @@ mod tests {
         let old_total = app.total_history_height();
         assert!(old_total > 0, "should have content");
 
-        // Scroll up so effective_scroll > 0 (not at bottom).
-        app.history_scroll.scroll =
-            old_total.saturating_sub(app.history_viewport.height as usize) / 2;
+        let viewport_height = app.history_viewport.height;
+        let mut display = app.active_display().unwrap();
+        display.history_scroll.scroll =
+            old_total.saturating_sub(viewport_height as usize) / 2;
+        drop(display);
         assert!(app.effective_scroll() > 0, "should be scrolled up");
 
-        // Remove a turn — height_prefix is now stale (larger than actual).
-        app.session_view.turns.remove(&1);
-        assert_eq!(app.session_view.turns.len(), 1);
+        let mut display = app.active_display().unwrap();
+        display.view.turns.remove(&1);
+        assert_eq!(display.view.turns.len(), 1);
 
-        // Mark both dirty so compute_total_height_and_markers runs.
-        app.mark_content_changed();
+        display.mark_content_changed();
+        drop(display);
 
         app.compute_total_height_and_markers();
 
-        // After content removal, scroll should be 0 (bottom).
-        assert_eq!(
-            app.effective_scroll(),
-            0,
-            "scroll should be at bottom after content removal"
-        );
+        let display = app.active_display_ref().unwrap();
+        assert_eq!(display.effective_scroll(&app.history_viewport), 0, "scroll should be at bottom after content removal");
     }
 
     #[test]
@@ -3781,25 +3748,26 @@ mod tests {
         insert_turn(&mut app, 0, "a", "b");
         app.rebuild_height_prefix();
 
-        let old_total = app.total_history_height();
-        // Scroll up.
-        app.history_scroll.scroll =
-            old_total.saturating_sub(app.history_viewport.height as usize) / 2;
-        let old_scroll = app.history_scroll.scroll;
+        let viewport_height = app.history_viewport.height;
+        let mut display = app.active_display().unwrap();
+        let old_total = display.total_history_height();
+        display.history_scroll.scroll =
+            old_total.saturating_sub(viewport_height as usize) / 2;
+        let old_scroll = display.history_scroll.scroll;
+        drop(display);
 
-        // Add a turn that increases total height.
         insert_turn(&mut app, 1, "c", "d");
-        app.mark_content_changed();
+        let mut display = app.active_display().unwrap();
+        display.mark_content_changed();
+        drop(display);
+
         app.compute_total_height_and_markers();
 
-        let new_total = app.total_history_height();
+        let display = app.active_display_ref().unwrap();
+        let new_total = display.total_history_height();
         let delta = new_total.saturating_sub(old_total);
         assert!(delta > 0, "total height should increase");
-        assert_eq!(
-            app.history_scroll.scroll,
-            old_scroll + delta,
-            "scroll should be shifted down by the content delta"
-        );
+        assert_eq!(display.history_scroll.scroll, old_scroll + delta, "scroll should be shifted down by the content delta");
     }
 
     // ── streaming (incremental update) ──
@@ -3807,30 +3775,30 @@ mod tests {
     #[test]
     fn mark_streaming_changed_sets_flags() {
         let mut app = test_app();
-        assert!(!app.streaming_dirty);
-        assert!(!app.content_dirty);
+        let display = app.active_display_ref().unwrap();
+        assert!(!display.streaming_dirty);
+        assert!(!display.content_dirty);
+        drop(display);
 
         app.mark_streaming_changed();
 
-        assert!(app.streaming_dirty, "streaming_dirty should be set");
-        assert!(app.content_dirty, "content_dirty should be set");
+        let display = app.active_display_ref().unwrap();
+        assert!(display.streaming_dirty, "streaming_dirty should be set");
+        assert!(display.content_dirty, "content_dirty should be set");
     }
 
     #[test]
     fn mark_content_changed_resets_streaming_turn_index() {
         let mut app = test_app();
-        // markers_dirty is initially true; clear it so we can verify it's set.
-        app.markers_dirty = false;
-        app.streaming_turn_index = Some(0);
+        let mut display = app.active_display().unwrap();
+        display.markers_dirty = false;
+        display.streaming_turn_index = Some(0);
 
-        app.mark_content_changed();
+        display.mark_content_changed();
 
-        assert!(app.markers_dirty, "markers_dirty should be set");
-        assert!(app.content_dirty, "content_dirty should be set");
-        assert!(
-            app.streaming_turn_index.is_none(),
-            "streaming_turn_index should be cleared"
-        );
+        assert!(display.markers_dirty, "markers_dirty should be set");
+        assert!(display.content_dirty, "content_dirty should be set");
+        assert!(display.streaming_turn_index.is_none(), "streaming_turn_index should be cleared");
     }
 
     #[test]
@@ -3839,18 +3807,22 @@ mod tests {
         insert_turn(&mut app, 0, "hello", "world");
         app.rebuild_height_prefix();
 
-        let old_total = app.total_history_height();
+        let display = app.active_display_ref().unwrap();
+        let old_total = display.total_history_height();
         assert!(old_total > 0);
 
         // Simulate streaming without a streaming_turn_index.
-        app.streaming_turn_index = None;
-        app.streaming_dirty = true;
-        app.content_dirty = true;
+        // Capture viewport before mutable borrow.
+        let viewport = app.history_viewport;
+        let display = app.active_display().unwrap();
+        display.streaming_turn_index = None;
+        display.streaming_dirty = true;
+        display.content_dirty = true;
 
-        let total = app.compute_total_height_and_markers();
+        let total = display.compute_total_height_and_markers(&viewport);
 
-        assert!(!app.streaming_dirty, "streaming_dirty cleared");
-        assert!(!app.content_dirty, "content_dirty cleared");
+        assert!(!display.streaming_dirty, "streaming_dirty cleared");
+        assert!(!display.content_dirty, "content_dirty cleared");
         assert_eq!(total, old_total, "full rebuild produces same total");
     }
 
@@ -3863,31 +3835,34 @@ mod tests {
         insert_turn(&mut app, 0, "hello", "world");
         app.rebuild_height_prefix();
 
-        let before_height = app.turn_heights[0];
-        let before_total = app.total_history_height();
+        let display = app.active_display_ref().unwrap();
+        let before_height = display.turn_heights[0];
+        let before_total = display.total_history_height();
 
         // Simulate streaming: append to assistant_text.
-        let turn = app.session_view.turns.get_mut(&0).unwrap();
+        let viewport = app.history_viewport;
+        let display = app.active_display().unwrap();
+        let turn = display.view.turns.get_mut(&0).unwrap();
         turn.assistant_text
             .as_mut()
             .unwrap()
             .push_str("\n\nnew streaming content");
-        app.streaming_turn_index = Some(0);
-        app.streaming_dirty = true;
-        app.content_dirty = true;
+        display.streaming_turn_index = Some(0);
+        display.streaming_dirty = true;
+        display.content_dirty = true;
 
-        let total = app.compute_total_height_and_markers();
+        let total = display.compute_total_height_and_markers(&viewport);
 
         assert!(
-            app.turn_heights[0] > before_height,
+            display.turn_heights[0] > before_height,
             "turn height should increase after content added"
         );
         assert!(
             total >= before_total,
             "total height should increase or stay same"
         );
-        assert!(!app.streaming_dirty, "streaming_dirty cleared");
-        assert!(!app.content_dirty, "content_dirty cleared");
+        assert!(!display.streaming_dirty, "streaming_dirty cleared");
+        assert!(!display.content_dirty, "content_dirty cleared");
     }
 
     #[test]
@@ -3901,54 +3876,54 @@ mod tests {
         insert_turn(&mut app, 2, "e", "f");
         app.rebuild_height_prefix();
 
-        // Save old prefix values.
-        let old_prefix = app.height_prefix.clone();
-        let old_heights = app.turn_heights.clone();
+        let viewport = app.history_viewport;
+        let display = app.active_display().unwrap();
+        let old_prefix = display.height_prefix.clone();
+        let old_heights = display.turn_heights.clone();
 
         // Stream content into turn 1.
-        let turn = app.session_view.turns.get_mut(&1).unwrap();
+        let turn = display.view.turns.get_mut(&1).unwrap();
         turn.assistant_text
             .as_mut()
             .unwrap()
             .push_str("\n\nlots of new content that should increase height");
-        app.streaming_turn_index = Some(1);
-        app.streaming_dirty = true;
-        app.content_dirty = true;
+        display.streaming_turn_index = Some(1);
+        display.streaming_dirty = true;
+        display.content_dirty = true;
 
-        app.compute_total_height_and_markers();
+        display.compute_total_height_and_markers(&viewport);
 
         // Verify invariant: height_prefix[i] == sum(turn_heights[0..=i]).
         let mut accum = 0usize;
-        for i in 0..app.turn_heights.len() {
-            accum += app.turn_heights[i];
+        for i in 0..display.turn_heights.len() {
+            accum += display.turn_heights[i];
             assert_eq!(
-                app.height_prefix[i], accum,
+                display.height_prefix[i], accum,
                 "invariant failed at index {i}: height_prefix[i] should equal cumulative turn_heights"
             );
         }
 
         // Turn 0 height unchanged.
         assert_eq!(
-            app.turn_heights[0], old_heights[0],
+            display.turn_heights[0], old_heights[0],
             "turn 0 height should not change"
         );
         assert_eq!(
-            app.height_prefix[0], old_prefix[0],
+            display.height_prefix[0], old_prefix[0],
             "height_prefix[0] should not change"
         );
         // Markers must also be correct after the streaming update.
-        // Turn 0 and 1 have user_text — verify their content_line values.
         assert_eq!(
-            app.markers[0].content_line, 0,
+            display.markers[0].content_line, 0,
             "marker[0] content_line should be 0"
         );
         assert_eq!(
-            app.markers[1].content_line, app.turn_heights[0],
+            display.markers[1].content_line, display.turn_heights[0],
             "marker[1] content_line should equal turn 0 height"
         );
         assert_eq!(
-            app.markers[2].content_line,
-            app.turn_heights[0] + app.turn_heights[1],
+            display.markers[2].content_line,
+            display.turn_heights[0] + display.turn_heights[1],
             "marker[2] content_line should reflect updated turn 1 height"
         );
     }
@@ -3964,16 +3939,20 @@ mod tests {
         insert_turn(&mut app, 20, "another user", "another assistant");
         app.rebuild_height_prefix();
 
-        assert_eq!(app.visible_turn_ids.len(), 2);
-        assert_eq!(app.visible_turn_ids[0], 10);
-        assert_eq!(app.visible_turn_ids[1], 20);
+        {
+            let display = app.active_display_ref().unwrap();
+            assert_eq!(display.visible_turn_ids.len(), 2);
+            assert_eq!(display.visible_turn_ids[0], 10);
+            assert_eq!(display.visible_turn_ids[1], 20);
+            assert!(display.streaming_turn_index.is_none());
+        }
 
-        assert!(app.streaming_turn_index.is_none());
+        // handle_started now requires session_id
+        app.handle_started(0, 1, 10, 100);
 
-        app.handle_started(1, 10, 100);
-
+        let display = app.active_display_ref().unwrap();
         assert_eq!(
-            app.streaming_turn_index,
+            display.streaming_turn_index,
             Some(0),
             "should find turn 10 at index 0"
         );
@@ -3987,42 +3966,45 @@ mod tests {
 
         insert_turn(&mut app, 10, "user", "assistant");
         app.rebuild_height_prefix();
-        // Clear the markers_dirty flag that rebuild_height_prefix sets via
-        // mark_content_changed is not called by rebuild_height_prefix, but
-        // markers_dirty is set to false at the end of rebuild_height_prefix.
-        // We need markers_dirty to be false to verify it gets set.
-        app.markers_dirty = false;
+        {
+            let display = app.active_display().unwrap();
+            display.markers_dirty = false;
+            display.streaming_turn_index = Some(0);
+            display.streaming_dirty = false;
+            display.content_dirty = false;
+        }
 
-        app.streaming_turn_index = Some(0);
-        app.streaming_dirty = false;
-        app.content_dirty = false;
+        app.handle_done(0, 1, None, None);
 
-        app.handle_done(1, None, None);
-
+        let display = app.active_display_ref().unwrap();
         assert!(
-            app.streaming_turn_index.is_none(),
+            display.streaming_turn_index.is_none(),
             "streaming_turn_index should be cleared"
         );
         assert!(
-            app.markers_dirty,
+            display.markers_dirty,
             "markers_dirty should be set (full rebuild)"
         );
-        assert!(app.content_dirty, "content_dirty should be set");
+        assert!(display.content_dirty, "content_dirty should be set");
     }
 
     #[test]
     fn handle_failed_clears_streaming() {
         let mut app = test_app();
-        app.streaming_turn_index = Some(0);
-        app.streaming_dirty = false;
-        app.content_dirty = false;
-        app.markers_dirty = false;
+        {
+            let display = app.active_display().unwrap();
+            display.streaming_turn_index = Some(0);
+            display.streaming_dirty = false;
+            display.content_dirty = false;
+            display.markers_dirty = false;
+        }
 
-        app.handle_failed(1, "oops".into());
+        app.handle_failed(0, 1, "oops".into());
 
-        assert!(app.streaming_turn_index.is_none());
-        assert!(app.error.is_some());
-        assert!(app.markers_dirty, "markers_dirty should be set");
-        assert!(app.content_dirty, "content_dirty should be set");
+        let display = app.active_display_ref().unwrap();
+        assert!(display.streaming_turn_index.is_none());
+        assert!(display.error.is_some());
+        assert!(display.markers_dirty, "markers_dirty should be set");
+        assert!(display.content_dirty, "content_dirty should be set");
     }
 }

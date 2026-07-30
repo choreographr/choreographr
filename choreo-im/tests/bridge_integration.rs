@@ -60,6 +60,7 @@ fn bridge_text_streaming() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::OutputChunk {
+            session_id: 0,
             request_id: 1,
             stream: OutputStream::Answer,
             data: b"hello ".to_vec(),
@@ -70,6 +71,7 @@ fn bridge_text_streaming() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::OutputChunk {
+            session_id: 0,
             request_id: 1,
             stream: OutputStream::Answer,
             data: b"world".to_vec(),
@@ -80,6 +82,7 @@ fn bridge_text_streaming() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Done {
+            session_id: 0,
             request_id: 1,
             token_usage: None,
             last_prompt_tokens: None,
@@ -102,6 +105,7 @@ fn bridge_tool_call_events() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::ToolCallStarted {
+            session_id: 0,
             request_id: 1,
             call_id: "call_1".into(),
             tool_name: "read_file".into(),
@@ -121,6 +125,7 @@ fn bridge_tool_call_events() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::ToolResultChunk {
+            session_id: 0,
             request_id: 1,
             call_id: "call_1".into(),
             data: b"file contents".to_vec(),
@@ -130,6 +135,7 @@ fn bridge_tool_call_events() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::ToolCallFinished {
+            session_id: 0,
             request_id: 1,
             call_id: "call_1".into(),
             tool_name: "read_file".into(),
@@ -154,6 +160,7 @@ fn bridge_tool_call_failed() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::ToolCallFailed {
+            session_id: 0,
             request_id: 1,
             call_id: "call_1".into(),
             tool_name: "read_file".into(),
@@ -200,7 +207,7 @@ fn bridge_turn_images() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::TurnAppended { turn_id: 1, turn },
+        &DaemonMessage::TurnAppended { session_id: 0, turn_id: 1, turn },
     )
     .unwrap();
     use std::io::Write;
@@ -220,6 +227,7 @@ fn bridge_error_variants() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::Failed {
+            session_id: 0,
             request_id: 1,
             error: "something went wrong".into(),
         },
@@ -273,6 +281,7 @@ fn bridge_models() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::ModelSelected {
+            session_id: 0,
             model: "claude".into(),
             reasoning_capability: None,
         },
@@ -293,6 +302,7 @@ fn bridge_cancelled_clears_buffer() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::OutputChunk {
+            session_id: 0,
             request_id: 42,
             stream: OutputStream::Answer,
             data: b"buffered data".to_vec(),
@@ -302,7 +312,7 @@ fn bridge_cancelled_clears_buffer() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Cancelled { request_id: 42 },
+        &DaemonMessage::Cancelled { session_id: 0, request_id: 42 },
     )
     .unwrap();
     use std::io::Write;

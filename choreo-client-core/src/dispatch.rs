@@ -40,21 +40,22 @@ pub struct SessionStateData {
 }
 
 pub trait TurnEventHandler {
-    fn handle_turn_appended(&mut self, turn_id: u32, turn: Turn);
-    fn handle_turn_finalized(&mut self, turn_id: u32, turn: Turn);
-    fn handle_turns_undone(&mut self, turn_ids: &[u32]);
-    fn handle_turns_redone(&mut self, turns: BTreeMap<u32, Turn>);
-    fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: Cow<'_, str>);
-    fn handle_started(&mut self, request_id: u32, turn_id: u32, estimated_prompt_tokens: u32);
+    fn handle_turn_appended(&mut self, session_id: u64, turn_id: u32, turn: Turn);
+    fn handle_turn_finalized(&mut self, session_id: u64, turn_id: u32, turn: Turn);
+    fn handle_turns_undone(&mut self, session_id: u64, turn_ids: &[u32]);
+    fn handle_turns_redone(&mut self, session_id: u64, turns: BTreeMap<u32, Turn>);
+    fn handle_request_stream(&mut self, session_id: u64, request_id: u32, stream: OutputStream, data: Cow<'_, str>);
+    fn handle_started(&mut self, session_id: u64, request_id: u32, turn_id: u32, estimated_prompt_tokens: u32);
     fn handle_done(
         &mut self,
+        session_id: u64,
         request_id: u32,
         token_usage: Option<TokenUsage>,
         last_prompt_tokens: Option<u32>,
     );
-    fn handle_failed(&mut self, request_id: u32, error: String);
-    fn handle_tool_call_event(&mut self, request_id: u32, event: ToolCallEvent);
-    fn handle_tool_result_chunk(&mut self, request_id: u32, call_id: String, data: Vec<u8>);
+    fn handle_failed(&mut self, session_id: u64, request_id: u32, error: String);
+    fn handle_tool_call_event(&mut self, session_id: u64, request_id: u32, event: ToolCallEvent);
+    fn handle_tool_result_chunk(&mut self, session_id: u64, request_id: u32, call_id: String, data: Vec<u8>);
     fn handle_session_state(&mut self, state: SessionStateData);
     fn handle_status_text(&mut self, text: String);
     fn handle_error(&mut self, error: String);
@@ -69,6 +70,7 @@ pub trait TurnEventHandler {
     fn handle_session_status_changed(&mut self, session_id: u64, status: SessionStatus);
     fn handle_token_usage_update(
         &mut self,
+        session_id: u64,
         token_usage: TokenUsage,
         last_prompt_tokens: Option<u32>,
     );
@@ -125,99 +127,105 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
                 reasoning_capability: reasoning_capability.clone(),
             });
         }
-        DaemonMessage::TurnAppended { turn_id, turn } => {
-            handler.handle_turn_appended(*turn_id, turn.clone());
-        }
-        DaemonMessage::TurnFinalized { turn_id, turn } => {
-            handler.handle_turn_finalized(*turn_id, turn.clone());
-        }
-        DaemonMessage::TurnsUndone { turn_ids } => {
-            handler.handle_turns_undone(turn_ids);
-        }
-        DaemonMessage::TurnsRedone { turns } => {
-            handler.handle_turns_redone(turns.clone());
-        }
+        DaemonMessage::TurnAppended {
+            session_id,
+            turn_id,
+            turn,
+        } => handler.handle_turn_appended(*session_id, *turn_id, turn.clone()),
+        DaemonMessage::TurnFinalized {
+            session_id,
+            turn_id,
+            turn,
+        } => handler.handle_turn_finalized(*session_id, *turn_id, turn.clone()),
+        DaemonMessage::TurnsUndone {
+            session_id,
+            turn_ids,
+        } => handler.handle_turns_undone(*session_id, turn_ids),
+        DaemonMessage::TurnsRedone {
+            session_id,
+            turns,
+        } => handler.handle_turns_redone(*session_id, turns.clone()),
         DaemonMessage::Started {
+            session_id,
             request_id,
             turn_id,
             estimated_prompt_tokens,
-        } => {
-            handler.handle_started(*request_id, *turn_id, *estimated_prompt_tokens);
-        }
+        } => handler.handle_started(*session_id, *request_id, *turn_id, *estimated_prompt_tokens),
         DaemonMessage::OutputChunk {
+            session_id,
             request_id,
             stream,
             data,
-        } => {
-            handler.handle_request_stream(
-                *request_id,
-                stream.clone(),
-                String::from_utf8_lossy(data),
-            );
-        }
+        } => handler.handle_request_stream(
+            *session_id,
+            *request_id,
+            stream.clone(),
+            String::from_utf8_lossy(data),
+        ),
         DaemonMessage::ToolCallStarted {
+            session_id,
             request_id,
             call_id,
             tool_name,
             arguments_json,
-        } => {
-            handler.handle_tool_call_event(
-                *request_id,
-                ToolCallEvent::Started {
-                    call_id: call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    arguments_json: arguments_json.clone(),
-                },
-            );
-        }
+        } => handler.handle_tool_call_event(
+            *session_id,
+            *request_id,
+            ToolCallEvent::Started {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments_json: arguments_json.clone(),
+            },
+        ),
         DaemonMessage::ToolCallFinished {
+            session_id,
             request_id,
             call_id,
             tool_name,
-        } => {
-            handler.handle_tool_call_event(
-                *request_id,
-                ToolCallEvent::Finished {
-                    call_id: call_id.clone(),
-                    tool_name: tool_name.clone(),
-                },
-            );
-        }
+        } => handler.handle_tool_call_event(
+            *session_id,
+            *request_id,
+            ToolCallEvent::Finished {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+            },
+        ),
         DaemonMessage::ToolCallFailed {
+            session_id,
             request_id,
             call_id,
             tool_name,
             error,
-        } => {
-            handler.handle_tool_call_event(
-                *request_id,
-                ToolCallEvent::Failed {
-                    call_id: call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    error: error.clone(),
-                },
-            );
-        }
+        } => handler.handle_tool_call_event(
+            *session_id,
+            *request_id,
+            ToolCallEvent::Failed {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                error: error.clone(),
+            },
+        ),
         DaemonMessage::ToolResultChunk {
+            session_id,
             request_id,
             call_id,
             data,
-        } => {
-            handler.handle_tool_result_chunk(*request_id, call_id.clone(), data.clone());
-        }
+        } => handler.handle_tool_result_chunk(*session_id, *request_id, call_id.clone(), data.clone()),
         DaemonMessage::Done {
+            session_id,
             request_id,
             token_usage,
             last_prompt_tokens,
-        } => {
-            handler.handle_done(*request_id, *token_usage, *last_prompt_tokens);
-        }
-        DaemonMessage::Failed { request_id, error } => {
-            handler.handle_failed(*request_id, error.clone());
-        }
-        DaemonMessage::Cancelled { request_id } => {
-            handler.handle_failed(*request_id, "cancelled".to_string());
-        }
+        } => handler.handle_done(*session_id, *request_id, *token_usage, *last_prompt_tokens),
+        DaemonMessage::Failed {
+            session_id,
+            request_id,
+            error,
+        } => handler.handle_failed(*session_id, *request_id, error.clone()),
+        DaemonMessage::Cancelled {
+            session_id,
+            request_id,
+        } => handler.handle_failed(*session_id, *request_id, "cancelled".to_string()),
         DaemonMessage::SessionStatusChanged { session_id, status } => {
             handler.handle_session_status_changed(*session_id, status.clone());
         }
@@ -255,10 +263,11 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
         DaemonMessage::ModelSelected {
             model,
             reasoning_capability: _,
+            ..
         } => {
             handler.handle_status_text(format!("[daemon] selected model: {model}"));
         }
-        DaemonMessage::ModelSelectionFailed { model, error } => {
+        DaemonMessage::ModelSelectionFailed { model, error, .. } => {
             handler.handle_error(format!("[daemon] failed to select model {model}: {error}"));
         }
         DaemonMessage::Unlocked => {
@@ -317,7 +326,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
         DaemonMessage::AccountListFailed { error } => {
             handler.handle_error(format!("[daemon] failed to list accounts: {error}"));
         }
-        DaemonMessage::SessionAccountSet { account } => {
+        DaemonMessage::SessionAccountSet { account, .. } => {
             handler.handle_status_text(format!("[daemon] session account set: {account}"));
         }
         DaemonMessage::SessionWorkingDirSet { .. } => {}
@@ -326,20 +335,19 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             // content) and are handled at the TUI layer directly via
             // the connection.rs routing — no generic dispatch needed.
         }
-        DaemonMessage::ReasoningEffortSet { effort } => {
+        DaemonMessage::ReasoningEffortSet { effort, .. } => {
             handler.handle_status_text(format!("[daemon] reasoning effort: {effort}"));
         }
-        DaemonMessage::ReasoningEffortSetFailed { effort, error } => {
+        DaemonMessage::ReasoningEffortSetFailed { effort, error, .. } => {
             handler.handle_error(format!(
                 "[daemon] failed to set reasoning effort {effort}: {error}"
             ));
         }
         DaemonMessage::TokenUsageUpdate {
+            session_id,
             token_usage,
             last_prompt_tokens,
-        } => {
-            handler.handle_token_usage_update(*token_usage, *last_prompt_tokens);
-        }
+        } => handler.handle_token_usage_update(*session_id, *token_usage, *last_prompt_tokens),
         DaemonMessage::LiveOutputTokenCount { .. } => {
             // Handled at the TUI layer in connection.rs — no generic dispatch needed.
         }

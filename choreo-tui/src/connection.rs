@@ -450,8 +450,10 @@ fn run_ui_loop(
         // Clear the terminal-native progress bar when leaving Chat.
         // Updates are driven directly by the event handlers (Done,
         // SessionState) rather than through progress_dirty.
-        if app.progress_dirty {
-            app.progress_dirty = false;
+        if app.active_display_ref().map(|d| d.progress_dirty).unwrap_or(false) {
+            if let Some(d) = app.active_display() {
+                d.progress_dirty = false;
+            }
             if app.page != Page::Chat {
                 terminal_progress::update_terminal_progress(None, None);
             }
@@ -663,7 +665,7 @@ fn handle_chat_event(
                         tracing::debug!("Alt+Enter continuing generation");
                         let request_id = app.next_request_id;
                         app.next_request_id = app.next_request_id.wrapping_add(1);
-                        app.active.insert(request_id);
+                        app.active_display().unwrap().active.insert(request_id);
                         client_tx
                             .send(ClientMessage::ContinueGeneration { request_id })
                             .map_err(broken_pipe)?;
@@ -732,14 +734,13 @@ fn handle_chat_event(
                                 && effort != "off"
                             {
                                 let valid = app
-                                    .attached_reasoning_capability
-                                    .as_ref()
+                                    .active_display_ref()
+                                    .and_then(|d| d.reasoning_capability.as_ref())
                                     .map(|c| c.available_effort_levels.iter().any(|l| l == effort))
                                     .unwrap_or(true); // No capability cached → let daemon validate
                                 if !valid {
                                     tracing::warn!(
                                         %effort,
-                                        capability = ?app.attached_reasoning_capability,
                                         "TUI rejected reasoning slug not in capability set",
                                     );
                                     app.status = Some(format!(
@@ -764,15 +765,15 @@ fn handle_chat_event(
                                     // Inherit fields from the currently attached session
                                     // when not explicitly provided by the user.
                                     working_dir: working_dir
-                                        .or_else(|| app.attached_working_dir.clone()),
+                                        .or_else(|| app.active_display_ref().and_then(|d| d.working_dir.clone())),
                                     max_turns,
                                     context_config,
                                     account_name: account_name
-                                        .or_else(|| app.attached_account_name.clone()),
+                                        .or_else(|| app.active_display_ref().and_then(|d| d.account_name.clone())),
                                     selected_model: selected_model
-                                        .or_else(|| app.attached_model.clone()),
+                                        .or_else(|| app.active_display_ref().and_then(|d| d.selected_model.clone())),
                                     reasoning_effort: reasoning_effort
-                                        .or_else(|| app.attached_reasoning_effort.clone()),
+                                        .or_else(|| app.active_display_ref().and_then(|d| d.reasoning_effort.clone())),
                                 },
                                 other => other,
                             };
@@ -783,7 +784,7 @@ fn handle_chat_event(
                             }
                             if let ClientMessage::RunInput { request_id, .. } = &message {
                                 app.error = None;
-                                app.active.insert(*request_id);
+                                app.active_display().unwrap().active.insert(*request_id);
                             }
                             client_tx.send(message).map_err(broken_pipe)?;
 
@@ -853,7 +854,7 @@ fn handle_chat_event(
                             if app.attached_session_id.is_some() {
                                 let request_id = app.next_request_id;
                                 app.next_request_id = app.next_request_id.wrapping_add(1);
-                                app.active.insert(request_id);
+                                app.active_display().unwrap().active.insert(request_id);
                                 client_tx
                                     .send(ClientMessage::ContinueGeneration { request_id })
                                     .map_err(broken_pipe)?;
@@ -922,6 +923,8 @@ fn handle_chat_event(
                     let bot_slot = top_slot + 1;
 
                     let marker_hit = app
+                        .active_display_ref()
+                        .unwrap()
                         .markers
                         .iter()
                         .find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot);
@@ -990,14 +993,16 @@ fn handle_chat_event(
                 // or cache dependency needed.
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some((turn_idx, offset)) = find_turn_at_row(app, mouse.row)
-                        && let Some(layout) = app.turn_layouts.get(turn_idx)
+                        && let Some(layout) = app.active_display_ref().unwrap().turn_layouts.get(turn_idx)
                         && let Some(img_idx) = layout
                             .image_ranges
                             .iter()
                             .position(|&(start, end)| offset >= start && offset < end)
-                        && let Some(turn_id) = app.visible_turn_ids.get(turn_idx).copied()
+                        && let Some(turn_id) = app.active_display_ref().unwrap().visible_turn_ids.get(turn_idx).copied()
                     {
-                        app.fullscreen_image_target = Some((turn_id, img_idx));
+                        if let Some(session_id) = app.active_session_id {
+                            app.fullscreen_image_target = Some((session_id, turn_id, img_idx));
+                        }
                     }
                 }
                 _ => {}
@@ -1021,16 +1026,18 @@ fn handle_chat_ctrl_key(
 ) -> Result<(), ClientError> {
     match key.code {
         KeyCode::Char('r') => {
-            let capability = app.attached_reasoning_capability.as_ref();
-            match capability.and_then(|c| {
-                let current = app
-                    .attached_reasoning_effort
-                    .clone()
+            let (capability, current_effort) = app.active_display_ref()
+                .map(|d| (d.reasoning_capability.clone(), d.reasoning_effort.clone()))
+                .unwrap_or_default();
+            match capability.as_ref().and_then(|c| {
+                let current = current_effort
                     .unwrap_or_else(|| "off".to_string());
                 c.cycle_from(&current).map(|next| (current, next))
             }) {
                 Some((current, next)) => {
-                    app.attached_reasoning_effort = Some(next.clone());
+                    if let Some(d) = app.active_display() {
+                        d.reasoning_effort = Some(next.clone());
+                    }
                     app.status = Some(format!("reasoning: {next}"));
                     tracing::info!(
                         session_id = ?app.attached_session_id,
@@ -1155,7 +1162,7 @@ fn handle_session_list_key(
                 let session_id = session.session_id;
                 app.set_page(Page::Chat);
                 let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
-                app.reset_for_session_switch();
+                app.reset_for_session_switch(session_id);
                 app.attached_session_id = Some(session_id);
                 client_tx
                     .send(ClientMessage::AttachSession { session_id })
@@ -1170,12 +1177,12 @@ fn handle_session_list_key(
                     title: None,
                     parent_session_id: None,
                     // Inherit fields from the currently attached session.
-                    working_dir: app.attached_working_dir.clone(),
+                    working_dir: app.active_display_ref().and_then(|d| d.working_dir.clone()),
                     max_turns: None,
                     context_config: None,
-                    account_name: app.attached_account_name.clone(),
-                    selected_model: app.attached_model.clone(),
-                    reasoning_effort: app.attached_reasoning_effort.clone(),
+                    account_name: app.active_display_ref().and_then(|d| d.account_name.clone()),
+                    selected_model: app.active_display_ref().and_then(|d| d.selected_model.clone()),
+                    reasoning_effort: app.active_display_ref().and_then(|d| d.reasoning_effort.clone()),
                 })
                 .map_err(broken_pipe)?;
         }
@@ -1211,7 +1218,7 @@ fn handle_session_detail_key(
                 let session_id = detail.session_id;
                 app.set_page(Page::Chat);
                 let _ = client_tx.send(ClientMessage::UnsubscribeSessionsSummary);
-                app.reset_for_session_switch();
+                app.reset_for_session_switch(session_id);
                 app.attached_session_id = Some(session_id);
                 client_tx
                     .send(ClientMessage::AttachSession { session_id })
@@ -1558,7 +1565,7 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::SessionDeleteFailed { session_id, error } => {
             app.handle_session_delete_failed(*session_id, error);
         }
-        DaemonMessage::SessionFailed { operation, error } => {
+        DaemonMessage::SessionFailed { operation, error, .. } => {
             app.error = Some(format!("[daemon] {operation} failed: {error}"));
             // If we're on the Session Manager page, also show the error
             // right on that page so the user has immediate feedback.
@@ -1614,18 +1621,21 @@ pub(crate) fn handle_daemon_message(
             // usage, and a blind `= *last_prompt_tokens` would wipe the
             // value Done just set.
             if app.attached_session_id == Some(*session_id) {
-                if let Some(usage) = token_usage {
-                    app.attached_token_usage = Some(*usage);
+                {
+                    let display = app.display_for(*session_id);
+                    if let Some(usage) = token_usage {
+                        display.token_usage = Some(*usage);
+                    }
+                    if let Some(cw) = context_window {
+                        display.context_window = Some(*cw);
+                    }
+                    if let Some(tokens) = last_prompt_tokens {
+                        display.last_prompt_tokens = Some(*tokens);
+                    }
+                    display.working_dir = working_dir.clone();
+                    display.progress_dirty = true;
                 }
-                if let Some(cw) = context_window {
-                    app.attached_context_window = Some(*cw);
-                }
-                if let Some(tokens) = last_prompt_tokens {
-                    app.attached_last_prompt_tokens = Some(*tokens);
-                }
-                app.attached_working_dir = working_dir.clone();
                 app.attached_status = Some(status.clone());
-                app.progress_dirty = true;
             }
             // Fall through to dispatch_daemon_message for message processing.
         }
@@ -1640,25 +1650,28 @@ pub(crate) fn handle_daemon_message(
             let has_data = token_usage.is_some() || last_prompt_tokens.is_some();
 
             if let Some(usage) = token_usage {
-                app.attached_token_usage = Some(*usage);
+                let display = app.display_for(app.attached_session_id.unwrap_or(0));
+                display.token_usage = Some(*usage);
                 // Many providers only supply token_usage without the
                 // separate last_prompt_tokens field.  Fall back to
                 // input_tokens so the progress bar always updates.
                 if last_prompt_tokens.is_none() {
-                    app.attached_last_prompt_tokens = Some(usage.input_tokens);
+                    display.last_prompt_tokens = Some(usage.input_tokens);
                 }
             }
             if let Some(tokens) = last_prompt_tokens {
-                app.attached_last_prompt_tokens = Some(*tokens);
+                let display = app.display_for(app.attached_session_id.unwrap_or(0));
+                display.last_prompt_tokens = Some(*tokens);
             }
 
             if has_data {
-                app.progress_dirty = true;
+                let display = app.display_for(app.attached_session_id.unwrap_or(0));
+                display.progress_dirty = true;
                 // Push the update directly instead of waiting for the
                 // render loop — bypasses any timing issues with the
                 // progress_dirty flag getting consumed before render.
                 if let (Some(cw), Some(tokens)) =
-                    (app.attached_context_window, app.attached_last_prompt_tokens)
+                    (display.context_window, display.last_prompt_tokens)
                 {
                     terminal_progress::update_terminal_progress(Some(tokens), Some(cw));
                 }
@@ -1668,27 +1681,31 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::ModelSelected {
             model,
             reasoning_capability,
+            ..
         } => {
             app.handle_model_selected(model, reasoning_capability.clone());
         }
-        DaemonMessage::ReasoningEffortSet { effort } => {
+        DaemonMessage::ReasoningEffortSet { effort, .. } => {
             app.handle_reasoning_effort_set(effort.clone());
         }
-        DaemonMessage::ReasoningEffortSetFailed { effort, error } => {
+        DaemonMessage::ReasoningEffortSetFailed { effort, error, .. } => {
             tracing::warn!(%effort, %error, "reasoning effort rejected by daemon");
-            app.attached_reasoning_effort = Some("off".to_string());
+            {
+                let display = app.active_display().unwrap();
+                display.reasoning_effort = Some("off".to_string());
+            }
             app.status = Some(format!("reasoning effort rejected: {error}"));
         }
-        DaemonMessage::SessionAccountSet { account } => {
+        DaemonMessage::SessionAccountSet { account, .. } => {
             app.handle_session_account_set(account);
         }
         DaemonMessage::ContextWindowResolved {
             session_id,
             context_window,
         } => {
-            // Update context window for the attached session.
             if app.attached_session_id == Some(*session_id) {
-                app.attached_context_window = Some(*context_window);
+                let display = app.active_display().unwrap();
+                display.context_window = Some(*context_window);
             }
         }
         DaemonMessage::SessionWorkingDirSet { session_id, path } => {
@@ -1699,7 +1716,7 @@ pub(crate) fn handle_daemon_message(
         }
         // TokenUsageUpdate is dispatched through the generic handler below.
         DaemonMessage::LiveOutputTokenCount { output_tokens, .. } => {
-            app.live_output_tokens = *output_tokens;
+            app.active_display().unwrap().live_output_tokens = *output_tokens;
         }
 
         _ => {}
@@ -1764,7 +1781,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        app.session_view.insert_or_replace(id, turn);
+        app.display_for(0).view.insert_or_replace(id, turn);
     }
 
     /// Simulate the scrollbar click handler's marker lookup: compute
@@ -1773,9 +1790,8 @@ mod tests {
     fn find_marker_by_row(app: &App, mouse_row: u16) -> Option<&Marker> {
         let top_slot = 2 * mouse_row as usize;
         let bot_slot = top_slot + 1;
-        app.markers
-            .iter()
-            .find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot)
+        app.active_display_ref()
+            .and_then(|d| d.markers.iter().find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot))
     }
 
     #[test]
@@ -1789,11 +1805,12 @@ mod tests {
         insert_turn(&mut app, 1, "user b", "assistant b");
         app.rebuild_height_prefix();
 
-        assert_eq!(app.markers.len(), 2, "should have 2 markers");
+        assert_eq!(app.active_display_ref().unwrap().markers.len(), 2, "should have 2 markers");
 
         // Each marker's virtual_slot must be findable by the click handler's
         // row-to-slot mapping (slot = 2*row or slot = 2*row+1).
-        for marker in &app.markers {
+        let markers: Vec<Marker> = app.active_display_ref().unwrap().markers.clone();
+        for marker in &markers {
             let row = marker.virtual_slot / 2;
             let found = find_marker_by_row(&app, row as u16);
             assert!(
@@ -1828,7 +1845,7 @@ mod tests {
 
         // Collect content_lines first to avoid borrow conflict with
         // scroll_to_content_line which takes &mut self.
-        let content_lines: Vec<usize> = app.markers.iter().map(|m| m.content_line).collect();
+        let content_lines: Vec<usize> = app.active_display_ref().unwrap().markers.iter().map(|m| m.content_line).collect();
 
         // Clicking on each marker should scroll so that the marker's
         // content_line is at the top of the viewport.
@@ -1863,13 +1880,13 @@ mod tests {
         app.rebuild_height_prefix();
 
         assert_eq!(
-            app.markers.len(),
+            app.active_display_ref().unwrap().markers.len(),
             3,
             "should have 3 markers after adding content"
         );
 
         // Collect content_lines first to avoid borrow conflict.
-        let content_lines: Vec<usize> = app.markers.iter().map(|m| m.content_line).collect();
+        let content_lines: Vec<usize> = app.active_display_ref().unwrap().markers.iter().map(|m| m.content_line).collect();
 
         // Each marker should scroll to the correct content_line.
         for &cl in &content_lines {
@@ -1899,7 +1916,8 @@ mod tests {
         let total = app.total_history_height();
         let virtual_track = 2 * app.history_viewport.height as usize;
 
-        for marker in &app.markers {
+        let markers: Vec<Marker> = app.active_display_ref().unwrap().markers.clone();
+        for marker in &markers {
             let expected_slot = marker.content_line * virtual_track / total.max(1);
             assert_eq!(
                 marker.virtual_slot,
@@ -1916,7 +1934,7 @@ mod tests {
         app.history_viewport.height = 10;
 
         // No markers (no user_text turns).
-        app.session_view.turns.clear();
+        app.display_for(0).view.turns.clear();
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
@@ -1929,9 +1947,9 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        app.session_view.insert_or_replace(0, turn);
+        app.display_for(0).view.insert_or_replace(0, turn);
         app.rebuild_height_prefix();
-        assert!(app.markers.is_empty(), "should have no markers");
+        assert!(app.display_for(0).markers.is_empty(), "should have no markers");
 
         // No marker should be found at any row.
         for row in 0..10 {

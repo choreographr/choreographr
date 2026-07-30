@@ -60,6 +60,7 @@ fn daemon_io_send_and_receive() {
             };
 
             let echo = DaemonMessage::OutputChunk {
+                session_id: 0,
                 request_id,
                 stream: choreo_proto::OutputStream::Answer,
                 data: b"echo".to_vec(),
@@ -69,6 +70,7 @@ fn daemon_io_send_and_receive() {
 
             // Send Done to terminate the stream.
             let done = DaemonMessage::Done {
+                session_id: 0,
                 request_id,
                 token_usage: Some(choreo_proto::TokenUsage {
                     input_tokens: 5,
@@ -127,6 +129,7 @@ fn daemon_io_send_and_receive() {
             request_id,
             stream,
             data,
+            ..
         }) => {
             assert_eq!(request_id, 42);
             assert!(matches!(stream, choreo_proto::OutputStream::Answer));

@@ -28,7 +28,7 @@ fn add_user_text(app: &mut App, content: &str) {
         tool_results: vec![],
         displayed_images: vec![],
     };
-    app.session_view.insert_or_replace(turn_id, turn);
+    app.display_for(0).view.insert_or_replace(turn_id, turn);
     app.rebuild_height_prefix();
 }
 
@@ -416,7 +416,7 @@ fn chat_alt_enter_continues_generation() {
         }
     );
     assert!(
-        app.active.contains(&next_id),
+        app.display_for(0).active.contains(&next_id),
         "request_id should be in active set"
     );
     assert_eq!(
@@ -559,7 +559,7 @@ fn paste_event_ignored_during_fullscreen_overlay() {
 
     app.input.text = "original".to_string();
     app.input.cursor = 8;
-    app.fullscreen_image_target = Some((0, 0));
+    app.fullscreen_image_target = Some((0, 0, 0));
     handle_terminal_event(Event::Paste("should be ignored".to_string()), &mut app, &tx)
         .expect("handle paste during fullscreen");
     // Text should be unchanged.
@@ -993,7 +993,7 @@ fn navigate_history_up_down_with_multi_line() {
     let mut app = test_app();
     // Insert a turn with user_text so history exists
     let id = app.next_request_id;
-    app.session_view.insert_or_replace(
+    app.display_for(0).view.insert_or_replace(
         id,
         choreo_proto::Turn {
             created_at: choreo_proto::TimestampMs::now(),
@@ -1027,7 +1027,7 @@ fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
     // Insert a long multi-line history entry (20 visual lines at 80-wide terminal)
     let long_text: String = (0..20).map(|i| format!("line {i}\n")).collect();
     let id = app.next_request_id;
-    app.session_view.insert_or_replace(
+    app.display_for(0).view.insert_or_replace(
         id,
         choreo_proto::Turn {
             created_at: choreo_proto::TimestampMs::now(),
@@ -1077,7 +1077,7 @@ fn navigate_history_down_adjusts_scroll_offset_for_long_draft() {
     // Simulate being at the first history entry (so Down restores draft)
     app.history_index = Some(0);
     let id = app.next_request_id;
-    app.session_view.insert_or_replace(
+    app.display_for(0).view.insert_or_replace(
         id,
         choreo_proto::Turn {
             created_at: choreo_proto::TimestampMs::now(),
@@ -2517,17 +2517,17 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
     .expect("handle_daemon_message should succeed");
 
     assert_eq!(
-        app.attached_token_usage,
+        app.display_for(7).token_usage,
         Some(TokenUsage {
             input_tokens: 1,
             output_tokens: 2,
             total_tokens: 3,
         })
     );
-    assert_eq!(app.attached_context_window, Some(4096));
+    assert_eq!(app.display_for(7).context_window, Some(4096));
     assert_eq!(app.attached_status, Some(SessionStatus::Inactive));
     assert!(app.attached_tool_groups.is_empty());
-    assert!(app.progress_dirty);
+    assert!(app.display_for(7).progress_dirty);
 }
 
 #[test]
@@ -2596,17 +2596,17 @@ fn daemon_message_session_state_ignores_wrong_session() {
     // (it does not check session_id), while progress_dirty is only set by the
     // manual guard in connection.rs which skips non-attached sessions.
     assert_eq!(
-        app.attached_token_usage,
+        app.display_for(7).token_usage,
         Some(TokenUsage {
             input_tokens: 99,
             output_tokens: 99,
             total_tokens: 99,
         })
     );
-    assert_eq!(app.attached_context_window, Some(1024));
+    assert_eq!(app.display_for(7).context_window, Some(1024));
     assert_eq!(app.attached_status, Some(SessionStatus::Inactive));
     assert!(app.attached_tool_groups.is_empty());
-    assert!(!app.progress_dirty);
+    assert!(!app.display_for(7).progress_dirty);
 }
 
 #[test]
@@ -2616,6 +2616,7 @@ fn daemon_message_done_with_token_usage_updates_progress() {
 
     handle_daemon_message(
         DaemonMessage::Done {
+            session_id: 0,
             request_id: 1,
             token_usage: Some(TokenUsage {
                 input_tokens: 5,
@@ -2630,14 +2631,14 @@ fn daemon_message_done_with_token_usage_updates_progress() {
     .expect("handle_daemon_message should succeed");
 
     assert_eq!(
-        app.attached_token_usage,
+        app.display_for(0).token_usage,
         Some(TokenUsage {
             input_tokens: 5,
             output_tokens: 10,
             total_tokens: 15,
         })
     );
-    assert!(app.progress_dirty);
+    assert!(app.display_for(0).progress_dirty);
 }
 
 #[test]
@@ -2647,6 +2648,7 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
 
     handle_daemon_message(
         DaemonMessage::Done {
+            session_id: 0,
             request_id: 1,
             token_usage: None,
             last_prompt_tokens: None,
@@ -2657,8 +2659,8 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
     .expect("handle_daemon_message should succeed");
 
     // Must remain at defaults — no data written, no dirty flag set.
-    assert!(app.attached_token_usage.is_none());
-    assert!(!app.progress_dirty);
+    assert!(app.display_for(0).token_usage.is_none());
+    assert!(!app.display_for(0).progress_dirty);
 }
 
 #[test]
@@ -2713,9 +2715,9 @@ fn handle_turn_appended_with_displayed_image_populates_rendered_images() {
             tool_call_id: None,
         }],
     };
-    app.handle_turn_appended(1, turn);
+    app.handle_turn_appended(0, 1, turn);
 
-    let images = app.rendered_images.get(&1).unwrap();
+    let images = app.rendered_images.get(&0).and_then(|m| m.get(&1)).unwrap();
     assert_eq!(images.len(), 1);
     let img = images.get(&0).unwrap();
     assert_eq!(img.metadata.mime_type, "image/png");
@@ -2875,7 +2877,7 @@ fn enter_continue_when_attached_sends_continue_generation() {
     .expect("handle enter");
 
     assert_eq!(app.status.as_deref(), Some("> continue"));
-    assert!(app.active.contains(&1));
+    assert!(app.display_for(0).active.contains(&1));
     let msg = rx.recv().expect("should send ContinueGeneration");
     assert_eq!(msg, ClientMessage::ContinueGeneration { request_id: 1 });
 }
@@ -3036,7 +3038,7 @@ fn ctrl_r_no_session_shows_message() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.attached_session_id = None;
-    app.attached_reasoning_capability = Some(ReasoningCapability {
+    app.display_for(0).reasoning_capability = Some(ReasoningCapability {
         available_effort_levels: vec![
             "off".to_string(),
             "low".to_string(),
@@ -3054,7 +3056,7 @@ fn ctrl_r_no_session_shows_message() {
     )
     .expect("handle ctrl+r");
 
-    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("low"));
     assert_eq!(app.status.as_deref(), Some("reasoning: low"));
 }
 
@@ -3063,7 +3065,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
 
-    app.attached_reasoning_capability = Some(ReasoningCapability {
+    app.display_for(0).reasoning_capability = Some(ReasoningCapability {
         available_effort_levels: vec![
             "off".to_string(),
             "low".to_string(),
@@ -3079,7 +3081,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
         &tx,
     )
     .expect("handle ctrl+r 1");
-    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("low"));
     assert_eq!(app.status.as_deref(), Some("reasoning: low"));
     let msg = rx.recv().expect("SetReasoningEffort 1");
     assert_eq!(
@@ -3096,7 +3098,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
         &tx,
     )
     .expect("handle ctrl+r 2");
-    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("medium"));
+    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("medium"));
     let msg = rx.recv().expect("SetReasoningEffort 2");
     assert_eq!(
         msg,
@@ -3112,7 +3114,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
         &tx,
     )
     .expect("handle ctrl+r 3");
-    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("high"));
     let msg = rx.recv().expect("SetReasoningEffort 3");
     assert_eq!(
         msg,
@@ -3128,7 +3130,7 @@ fn ctrl_r_cycles_through_valid_slugs() {
         &tx,
     )
     .expect("handle ctrl+r 4");
-    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("off"));
+    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("off"));
     let msg = rx.recv().expect("SetReasoningEffort 4");
     assert_eq!(
         msg,
@@ -3144,7 +3146,7 @@ fn ctrl_r_non_reasoning_model_shows_message() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     // No reasoning capability set (model does not support reasoning).
-    app.attached_reasoning_capability = None;
+    app.display_for(0).reasoning_capability = None;
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
@@ -3158,7 +3160,7 @@ fn ctrl_r_non_reasoning_model_shows_message() {
         Some("model does not support reasoning")
     );
     // Effort should remain unchanged (still None).
-    assert!(app.attached_reasoning_effort.is_none());
+    assert!(app.display_for(0).reasoning_effort.is_none());
 }
 
 #[test]
@@ -3167,7 +3169,7 @@ fn ctrl_r_google_off_on() {
     let (tx, rx) = std::sync::mpsc::channel();
 
     // Google Gemini style: only "off" and "on".
-    app.attached_reasoning_capability = Some(ReasoningCapability {
+    app.display_for(0).reasoning_capability = Some(ReasoningCapability {
         available_effort_levels: vec!["off".to_string(), "on".to_string()],
     });
 
@@ -3178,7 +3180,7 @@ fn ctrl_r_google_off_on() {
         &tx,
     )
     .expect("handle ctrl+r 1");
-    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("on"));
+    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("on"));
     let msg = rx.recv().expect("SetReasoningEffort 1");
     assert_eq!(
         msg,
@@ -3194,7 +3196,7 @@ fn ctrl_r_google_off_on() {
         &tx,
     )
     .expect("handle ctrl+r 2");
-    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("off"));
+    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("off"));
     let msg = rx.recv().expect("SetReasoningEffort 2");
     assert_eq!(
         msg,
@@ -3213,6 +3215,7 @@ fn reasoning_effort_set_updates_session_state() {
 
     handle_daemon_message(
         DaemonMessage::ReasoningEffortSet {
+            session_id: 0,
             effort: "high".to_string(),
         },
         &mut app,
@@ -3220,7 +3223,7 @@ fn reasoning_effort_set_updates_session_state() {
     )
     .expect("handle ReasoningEffortSet");
 
-    assert_eq!(app.attached_reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("high"));
 }
 
 #[test]
@@ -3229,7 +3232,7 @@ fn ctrl_r_with_empty_capability_shows_message() {
     let (tx, _rx) = std::sync::mpsc::channel();
 
     // Capability exists but has empty available_effort_levels.
-    app.attached_reasoning_capability = Some(ReasoningCapability {
+    app.display_for(0).reasoning_capability = Some(ReasoningCapability {
         available_effort_levels: vec![],
     });
 

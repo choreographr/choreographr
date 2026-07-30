@@ -36,17 +36,17 @@ impl AppState {
 }
 
 impl TurnEventHandler for AppState {
-    fn handle_turn_appended(&mut self, turn_id: u32, turn: Turn) {
+    fn handle_turn_appended(&mut self, _session_id: u64, turn_id: u32, turn: Turn) {
         debug!(%turn_id, "turn appended");
         self.session_view.insert_or_replace(turn_id, turn);
     }
 
-    fn handle_turn_finalized(&mut self, turn_id: u32, turn: Turn) {
+    fn handle_turn_finalized(&mut self, _session_id: u64, turn_id: u32, turn: Turn) {
         debug!(%turn_id, "turn finalized");
         self.session_view.insert_or_replace(turn_id, turn);
     }
 
-    fn handle_turns_undone(&mut self, turn_ids: &[u32]) {
+    fn handle_turns_undone(&mut self, _session_id: u64, turn_ids: &[u32]) {
         trace!(?turn_ids, "handle_turns_undone");
         for &id in turn_ids {
             if let Some(turn) = self.session_view.turns.get_mut(&id) {
@@ -55,19 +55,19 @@ impl TurnEventHandler for AppState {
         }
     }
 
-    fn handle_turns_redone(&mut self, turns: BTreeMap<u32, Turn>) {
+    fn handle_turns_redone(&mut self, _session_id: u64, turns: BTreeMap<u32, Turn>) {
         trace!(count = %turns.len(), "handle_turns_redone");
         for (id, turn) in turns {
             self.session_view.insert_or_replace(id, turn);
         }
     }
 
-    fn handle_request_stream(&mut self, request_id: u32, stream: OutputStream, data: Cow<'_, str>) {
+    fn handle_request_stream(&mut self, _session_id: u64, request_id: u32, stream: OutputStream, data: Cow<'_, str>) {
         trace!(%request_id, ?stream, len = %data.len(), "handle_request_stream");
         self.session_view.stream_chunk(request_id, stream, &data);
     }
 
-    fn handle_started(&mut self, request_id: u32, turn_id: u32, _estimated_prompt_tokens: u32) {
+    fn handle_started(&mut self, _session_id: u64, request_id: u32, turn_id: u32, _estimated_prompt_tokens: u32) {
         debug!(%request_id, %turn_id, "stream started");
         self.session_view
             .request_to_turn
@@ -76,6 +76,7 @@ impl TurnEventHandler for AppState {
 
     fn handle_done(
         &mut self,
+        _session_id: u64,
         request_id: u32,
         _token_usage: Option<TokenUsage>,
         _last_prompt_tokens: Option<u32>,
@@ -84,13 +85,13 @@ impl TurnEventHandler for AppState {
         self.session_view.request_to_turn.remove(&request_id);
     }
 
-    fn handle_failed(&mut self, request_id: u32, error: String) {
+    fn handle_failed(&mut self, _session_id: u64, request_id: u32, error: String) {
         trace!(%request_id, %error, "handle_failed");
         self.session_view.request_to_turn.remove(&request_id);
         self.status_texts.push(format!("[error] {error}"));
     }
 
-    fn handle_tool_call_event(&mut self, request_id: u32, event: ToolCallEvent) {
+    fn handle_tool_call_event(&mut self, _session_id: u64, request_id: u32, event: ToolCallEvent) {
         trace!(%request_id, ?event, "handle_tool_call_event");
         match event {
             ToolCallEvent::Started {
@@ -105,7 +106,7 @@ impl TurnEventHandler for AppState {
         }
     }
 
-    fn handle_tool_result_chunk(&mut self, request_id: u32, call_id: String, data: Vec<u8>) {
+    fn handle_tool_result_chunk(&mut self, _session_id: u64, request_id: u32, call_id: String, data: Vec<u8>) {
         trace!(%request_id, %call_id, len = %data.len(), "handle_tool_result_chunk");
         match String::from_utf8(data) {
             Ok(text) => {
@@ -159,6 +160,7 @@ impl TurnEventHandler for AppState {
 
     fn handle_token_usage_update(
         &mut self,
+        _session_id: u64,
         token_usage: TokenUsage,
         last_prompt_tokens: Option<u32>,
     ) {

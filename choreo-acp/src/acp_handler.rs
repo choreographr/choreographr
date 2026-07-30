@@ -633,7 +633,7 @@ fn handle_streaming_message(
         | DaemonMessage::ToolCallFailed { request_id, .. }
         | DaemonMessage::Done { request_id, .. }
         | DaemonMessage::Failed { request_id, .. }
-        | DaemonMessage::Cancelled { request_id } => *request_id,
+        | DaemonMessage::Cancelled { request_id, .. } => *request_id,
         _ => return Ok(()),
     };
 
@@ -865,7 +865,7 @@ fn handle_sync_message(
             }
         }
 
-        DaemonMessage::ReasoningEffortSet { effort } => {
+        DaemonMessage::ReasoningEffortSet { effort, .. } => {
             if let Some(entry) = pending.take_sync(&PendingKind::SetReasoningEffort) {
                 if let Some(session_id) =
                     pending.take_pending_session(&PendingKind::SetReasoningEffort)

@@ -41,6 +41,7 @@ pub struct DaemonState {
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
     pub client_streams: Vec<UnixStream>,
     pub summary_subscribers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
+    pub activity_subscribers: HashMap<u64, mpsc::SyncSender<DaemonMessage>>,
     pub model_cache: HashMap<String, (Vec<String>, Instant)>,
     pub mcp_manager: McpManager,
 }
@@ -106,6 +107,14 @@ pub enum DaemonCommand {
     UnregisterSummarySubscriber {
         client_id: u64,
     },
+    RegisterActivitySubscriber {
+        client_id: u64,
+        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
+    },
+    UnregisterActivitySubscriber {
+        client_id: u64,
+    },
+    BroadcastActivity(DaemonMessage),
     BroadcastSessionStatus {
         session_id: u64,
         status: SessionStatus,
@@ -219,6 +228,13 @@ impl DaemonState {
             DaemonCommand::UnregisterSummarySubscriber { client_id } => {
                 self.handle_unregister_summary_subscriber(client_id)
             }
+            DaemonCommand::RegisterActivitySubscriber { client_id, writer } => {
+                self.handle_register_activity_subscriber(client_id, writer)
+            }
+            DaemonCommand::UnregisterActivitySubscriber { client_id } => {
+                self.handle_unregister_activity_subscriber(client_id)
+            }
+            DaemonCommand::BroadcastActivity(msg) => self.handle_broadcast_activity(msg),
             DaemonCommand::BroadcastSessionStatus { session_id, status } => {
                 self.handle_broadcast_session_status(session_id, status)
             }
@@ -735,6 +751,26 @@ impl DaemonState {
         self.broadcast(msg);
     }
 
+    /// Register a client to receive all session activity broadcasts.
+    fn handle_register_activity_subscriber(
+        &mut self,
+        client_id: u64,
+        writer: std::sync::mpsc::SyncSender<DaemonMessage>,
+    ) {
+        self.activity_subscribers.insert(client_id, writer);
+    }
+
+    /// Unregister a client from all session activity broadcasts.
+    fn handle_unregister_activity_subscriber(&mut self, client_id: u64) {
+        self.activity_subscribers.remove(&client_id);
+    }
+
+    /// Broadcast a message to all activity subscribers, removing dead ones.
+    fn handle_broadcast_activity(&mut self, msg: DaemonMessage) {
+        self.activity_subscribers
+            .retain(|_id, tx| tx.send(msg.clone()).is_ok());
+    }
+
     /// Handle a cancel request from a client.  Sends `SessionCommand::Cancel`
     /// to the target session and then propagates cancellation to any child
     /// sub-sessions directly — avoiding a round-trip message from the session
@@ -1203,6 +1239,7 @@ mod tests {
             daemon_tx,
             client_streams: Vec::new(),
             summary_subscribers: HashMap::new(),
+            activity_subscribers: HashMap::new(),
             model_cache: HashMap::new(),
             mcp_manager: crate::mcp::McpManager::empty(),
         };

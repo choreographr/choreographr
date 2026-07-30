@@ -41,6 +41,7 @@ fn cleanup_client(
         let _ = tx.send(SessionCommand::Detach { client_id });
     }
     let _ = daemon_tx.send(DaemonCommand::UnregisterSummarySubscriber { client_id });
+    let _ = daemon_tx.send(DaemonCommand::UnregisterActivitySubscriber { client_id });
     drop(writer_tx);
     let _ = writer_handle.join();
     crate::metrics::record_client_disconnected();
@@ -115,6 +116,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let _ = tx.send(SessionCommand::RunInput { request_id, input });
             } else {
                 let _ = ctx.writer_tx.send(DaemonMessage::Failed {
+                    session_id: 0,
                     request_id,
                     error: "no session attached".to_string(),
                 });
@@ -155,6 +157,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 });
             } else {
                 let _ = ctx.writer_tx.send(DaemonMessage::Failed {
+                    session_id: 0,
                     request_id,
                     error: "no session attached".to_string(),
                 });
@@ -175,6 +178,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let _ = tx.send(SessionCommand::SetModel { model });
             } else {
                 let _ = ctx.writer_tx.send(DaemonMessage::ModelSelectionFailed {
+                    session_id: 0,
                     model,
                     error: "no session attached".to_string(),
                 });
@@ -191,6 +195,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let _ = tx.send(SessionCommand::SetReasoningEffort { effort });
             } else {
                 let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSetFailed {
+                    session_id: 0,
                     effort,
                     error: "no session attached".to_string(),
                 });
@@ -203,10 +208,14 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 if let Ok(effort) = rx.recv() {
                     let _ = ctx
                         .writer_tx
-                        .send(DaemonMessage::ReasoningEffortSet { effort });
+                        .send(DaemonMessage::ReasoningEffortSet {
+                            session_id: 0,
+                            effort,
+                        });
                 }
             } else {
                 let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSet {
+                    session_id: 0,
                     effort: "off".to_string(),
                 });
             }
@@ -310,6 +319,17 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
         }
         ClientMessage::SetSessionAccount { name } => {
             handle_client_set_session_account(name, ctx);
+        }
+        ClientMessage::SubscribeAllActivity => {
+            let _ = ctx.daemon_tx.send(DaemonCommand::RegisterActivitySubscriber {
+                client_id: ctx.client_id,
+                writer: ctx.writer_tx.clone(),
+            });
+        }
+        ClientMessage::UnsubscribeAllActivity => {
+            let _ = ctx.daemon_tx.send(DaemonCommand::UnregisterActivitySubscriber {
+                client_id: ctx.client_id,
+            });
         }
         _ => {
             warn!(
@@ -529,6 +549,7 @@ fn handle_client_create_session(
         }
         Ok(Err(e)) => {
             let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
+                session_id: 0,
                 operation: "create_session".into(),
                 error: e.to_string(),
             });
@@ -558,6 +579,7 @@ fn handle_client_attach_session(session_id: u64, ctx: &mut ClientCtx) -> bool {
         }
         Ok(Err(e)) => {
             let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
+                session_id: 0,
                 operation: "attach_session".into(),
                 error: e.to_string(),
             });
@@ -583,6 +605,7 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
             }
             _ => {
                 let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
+                    session_id: 0,
                     operation: "set_account".into(),
                     error: format!("account '{name}' not found"),
                 });
@@ -590,6 +613,7 @@ fn handle_client_set_session_account(name: String, ctx: &mut ClientCtx) {
         }
     } else {
         let _ = ctx.writer_tx.send(DaemonMessage::SessionFailed {
+            session_id: 0,
             operation: "set_account".into(),
             error: "no session attached".to_string(),
         });
@@ -1220,6 +1244,7 @@ mod tests {
         assert!(matches!(
             &msg,
             DaemonMessage::Failed {
+                session_id: 0,
                 request_id: 7,
                 error,
             } if error == "no session attached"

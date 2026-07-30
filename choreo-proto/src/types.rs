@@ -337,6 +337,8 @@ pub enum ClientMessage {
     ContinueGeneration {
         request_id: u32,
     },
+    SubscribeAllActivity,
+    UnsubscribeAllActivity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -399,10 +401,12 @@ pub enum DaemonMessage {
         reasoning_capability: Option<ReasoningCapability>,
     },
     TurnAppended {
+        session_id: u64,
         turn_id: u32,
         turn: Turn,
     },
     TurnFinalized {
+        session_id: u64,
         turn_id: u32,
         turn: Turn,
     },
@@ -411,52 +415,62 @@ pub enum DaemonMessage {
         status: SessionStatus,
     },
     SessionFailed {
+        session_id: u64,
         operation: String,
         error: String,
     },
     Started {
+        session_id: u64,
         request_id: u32,
         turn_id: u32,
         estimated_prompt_tokens: u32,
     },
     ToolCallStarted {
+        session_id: u64,
         request_id: u32,
         call_id: String,
         tool_name: String,
         arguments_json: String,
     },
     ToolCallFinished {
+        session_id: u64,
         request_id: u32,
         call_id: String,
         tool_name: String,
     },
     ToolResultChunk {
+        session_id: u64,
         request_id: u32,
         call_id: String,
         data: Vec<u8>,
     },
     ToolCallFailed {
+        session_id: u64,
         request_id: u32,
         call_id: String,
         tool_name: String,
         error: String,
     },
     TokenUsageUpdate {
+        session_id: u64,
         token_usage: TokenUsage,
         last_prompt_tokens: Option<u32>,
     },
     /// Cumulative output-token estimate for the current turn, updated as
     /// each stream chunk arrives.  Used by the TUI for live token display.
     LiveOutputTokenCount {
+        session_id: u64,
         request_id: u32,
         output_tokens: u32,
     },
     OutputChunk {
+        session_id: u64,
         request_id: u32,
         stream: OutputStream,
         data: Vec<u8>,
     },
     Done {
+        session_id: u64,
         request_id: u32,
         /// Token usage for the completed request, if reported by the provider.
         token_usage: Option<TokenUsage>,
@@ -466,10 +480,12 @@ pub enum DaemonMessage {
         last_prompt_tokens: Option<u32>,
     },
     Failed {
+        session_id: u64,
         request_id: u32,
         error: String,
     },
     Cancelled {
+        session_id: u64,
         request_id: u32,
     },
     Pong,
@@ -481,11 +497,13 @@ pub enum DaemonMessage {
         error: String,
     },
     ModelSelected {
+        session_id: u64,
         model: String,
         #[serde(default)]
         reasoning_capability: Option<ReasoningCapability>,
     },
     ModelSelectionFailed {
+        session_id: u64,
         model: String,
         error: String,
     },
@@ -516,9 +534,11 @@ pub enum DaemonMessage {
         error: String,
     },
     TurnsUndone {
+        session_id: u64,
         turn_ids: Vec<u32>,
     },
     TurnsRedone {
+        session_id: u64,
         turns: BTreeMap<u32, Turn>,
     },
     Credential {
@@ -546,6 +566,7 @@ pub enum DaemonMessage {
         error: String,
     },
     SessionAccountSet {
+        session_id: u64,
         account: String,
     },
     ContextWindowResolved {
@@ -561,9 +582,11 @@ pub enum DaemonMessage {
         title: String,
     },
     ReasoningEffortSet {
+        session_id: u64,
         effort: String,
     },
     ReasoningEffortSetFailed {
+        session_id: u64,
         effort: String,
         error: String,
     },

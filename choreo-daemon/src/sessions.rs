@@ -589,14 +589,24 @@ fn broadcast(
     });
 }
 
+/// Forward a DaemonMessage to all activity subscribers via the daemon
+/// command channel.  This allows session-scoped events (streaming chunks,
+/// status changes, etc.) to be received by clients subscribed to all
+/// session activity.
+fn broadcast_activity(daemon_tx: &mpsc::Sender<DaemonCommand>, message: &DaemonMessage) {
+    let _ = daemon_tx.send(DaemonCommand::BroadcastActivity(message.clone()));
+}
+
 fn fail_request(
     subscribers: &mut HashMap<u64, std::sync::mpsc::SyncSender<DaemonMessage>>,
+    session_id: u64,
     request_id: u32,
     error: impl Into<String>,
 ) -> bool {
     broadcast(
         subscribers,
         DaemonMessage::Started {
+            session_id,
             request_id,
             turn_id: 0,
             estimated_prompt_tokens: 0,
@@ -605,6 +615,7 @@ fn fail_request(
     broadcast(
         subscribers,
         DaemonMessage::Failed {
+            session_id,
             request_id,
             error: error.into(),
         },
@@ -772,7 +783,7 @@ fn process_command(
         }
         SessionCommand::Undo => handle_undo(state, ctx),
         SessionCommand::Redo => handle_redo(state, ctx),
-        SessionCommand::Shutdown => handle_shutdown(state, shutdown_requested),
+        SessionCommand::Shutdown => handle_shutdown(state, shutdown_requested, ctx),
     }
 }
 
@@ -795,7 +806,7 @@ fn handle_run_input(
         "session received input",
     );
     if text.is_empty() {
-        return fail_request(&mut state.subscribers, request_id, "empty input");
+        return fail_request(&mut state.subscribers, ctx.session_id, request_id, "empty input");
     }
     let provider = if let Some(p) = state.provider.as_ref() {
         p.clone()
@@ -815,6 +826,7 @@ fn handle_run_input(
                 let Some(p) = state.provider.as_ref() else {
                     return fail_request(
                         &mut state.subscribers,
+                        ctx.session_id,
                         request_id,
                         "internal error: provider not set after resolution".to_string(),
                     );
@@ -824,6 +836,7 @@ fn handle_run_input(
             _ => {
                 return fail_request(
                     &mut state.subscribers,
+                    ctx.session_id,
                     request_id,
                     format!(
                         "no credential stored for account '{name}' — add one via the AI Providers page or /add-key"
@@ -834,6 +847,7 @@ fn handle_run_input(
     } else {
         return fail_request(
             &mut state.subscribers,
+            ctx.session_id,
             request_id,
             "no account configured on this session — use /account <name> to set one",
         );
@@ -841,12 +855,13 @@ fn handle_run_input(
     let model = match &state.config.selected_model {
         Some(m) => m.clone(),
         None => {
-            return fail_request(&mut state.subscribers, request_id, "no model selected");
+            return fail_request(&mut state.subscribers, ctx.session_id, request_id, "no model selected");
         }
     };
     if *shutdown_requested {
         return fail_request(
             &mut state.subscribers,
+            ctx.session_id,
             request_id,
             "session is shutting down",
         );
@@ -854,6 +869,7 @@ fn handle_run_input(
     if !state.active_requests.is_empty() {
         return fail_request(
             &mut state.subscribers,
+            ctx.session_id,
             request_id,
             "session already has an active request",
         );
@@ -862,6 +878,7 @@ fn handle_run_input(
     broadcast(
         &mut state.subscribers,
         DaemonMessage::Started {
+            session_id: ctx.session_id,
             request_id,
             turn_id: state.next_turn_id,
             estimated_prompt_tokens: 0,
@@ -928,6 +945,7 @@ fn handle_run_child_input(
     broadcast(
         &mut state.subscribers,
         DaemonMessage::Started {
+            session_id: ctx.session_id,
             request_id,
             turn_id: state.next_turn_id,
             estimated_prompt_tokens: 0,
@@ -970,7 +988,7 @@ fn handle_run_child_input(
 /// request is cancelled — this is used by child-session cancellation
 /// where the parent doesn't know the child's specific request ID.
 /// Otherwise only the matching request is cancelled.
-fn handle_cancel(request_id: u32, state: &mut SessionState, _ctx: &RequestContext) -> bool {
+fn handle_cancel(request_id: u32, state: &mut SessionState, ctx: &RequestContext) -> bool {
     let targets: Vec<u32> = if request_id == 0 {
         state.active_requests.keys().copied().collect()
     } else {
@@ -981,7 +999,10 @@ fn handle_cancel(request_id: u32, state: &mut SessionState, _ctx: &RequestContex
             let _ = active.cancel_tx.send(());
             broadcast(
                 &mut state.subscribers,
-                DaemonMessage::Cancelled { request_id: rid },
+                DaemonMessage::Cancelled {
+                    session_id: ctx.session_id,
+                    request_id: rid,
+                },
             );
         }
     }
@@ -1002,7 +1023,11 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         );
         broadcast(
             &mut state.subscribers,
-            DaemonMessage::ModelSelectionFailed { model, error: msg },
+            DaemonMessage::ModelSelectionFailed {
+                session_id: ctx.session_id,
+                model,
+                error: msg,
+            },
         );
         return false;
     }
@@ -1048,6 +1073,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
         broadcast(
             &mut state.subscribers,
             DaemonMessage::ReasoningEffortSet {
+                session_id: ctx.session_id,
                 effort: "off".to_string(),
             },
         );
@@ -1060,6 +1086,7 @@ fn handle_set_model(model: String, state: &mut SessionState, ctx: &RequestContex
     broadcast(
         &mut state.subscribers,
         DaemonMessage::ModelSelected {
+            session_id: ctx.session_id,
             model: model.clone(),
             reasoning_capability: capability,
         },
@@ -1150,6 +1177,7 @@ fn handle_attach(
     {
         for (&request_id, active) in &state.active_requests {
             let _ = tx.send(DaemonMessage::Started {
+                session_id: ctx.session_id,
                 request_id,
                 turn_id: active.turn_id,
                 estimated_prompt_tokens: 0,
@@ -1370,7 +1398,10 @@ fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestConte
     state.config.account_name = Some(name.clone());
     broadcast(
         &mut state.subscribers,
-        DaemonMessage::SessionAccountSet { account: name },
+        DaemonMessage::SessionAccountSet {
+            session_id: ctx.session_id,
+            account: name,
+        },
     );
     persist_session_metadata(state, ctx, "SetAccount");
     false
@@ -1388,7 +1419,11 @@ fn handle_set_reasoning_effort(
         warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
         broadcast(
             &mut state.subscribers,
-            DaemonMessage::ReasoningEffortSetFailed { effort, error: msg },
+            DaemonMessage::ReasoningEffortSetFailed {
+                session_id: ctx.session_id,
+                effort,
+                error: msg,
+            },
         );
         return false;
     }
@@ -1421,16 +1456,23 @@ fn handle_set_reasoning_effort(
         );
         broadcast(
             &mut state.subscribers,
-            DaemonMessage::ReasoningEffortSet { effort },
+            DaemonMessage::ReasoningEffortSet {
+                session_id: ctx.session_id,
+                effort,
+            },
         );
         return false;
     } else {
         let model = state.config.selected_model.as_deref().unwrap_or("(none)");
-        let msg = format!("model '{model}' does not support reasoning effort '{effort}'",);
+        let msg = format!("model '{model}' does not support reasoning effort '{effort}'");
         warn!(session_id = ctx.session_id, error = %msg, "reasoning effort rejected");
         broadcast(
             &mut state.subscribers,
-            DaemonMessage::ReasoningEffortSetFailed { effort, error: msg },
+            DaemonMessage::ReasoningEffortSetFailed {
+                session_id: ctx.session_id,
+                effort,
+                error: msg,
+            },
         );
     }
     false
@@ -1477,7 +1519,10 @@ fn handle_undo(state: &mut SessionState, ctx: &RequestContext) -> bool {
     }
     broadcast(
         &mut state.subscribers,
-        DaemonMessage::TurnsUndone { turn_ids },
+        DaemonMessage::TurnsUndone {
+            session_id: ctx.session_id,
+            turn_ids,
+        },
     );
     false
 }
@@ -1502,18 +1547,27 @@ fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
             tracing::warn!(turn_id = id, error = %e, "failed to persist redone turn");
         }
     }
-    broadcast(&mut state.subscribers, DaemonMessage::TurnsRedone { turns });
+    broadcast(
+        &mut state.subscribers,
+        DaemonMessage::TurnsRedone {
+            session_id: ctx.session_id,
+            turns,
+        },
+    );
     false
 }
 
 /// Signal shutdown: cancel all active requests and check if the loop should exit.
-fn handle_shutdown(state: &mut SessionState, shutdown_requested: &mut bool) -> bool {
+fn handle_shutdown(state: &mut SessionState, shutdown_requested: &mut bool, ctx: &RequestContext) -> bool {
     *shutdown_requested = true;
     for (&request_id, active) in &state.active_requests {
         let _ = active.cancel_tx.send(());
         broadcast(
             &mut state.subscribers,
-            DaemonMessage::Cancelled { request_id },
+            DaemonMessage::Cancelled {
+                session_id: ctx.session_id,
+                request_id,
+            },
         );
     }
     state.active_requests.is_empty()
@@ -1574,6 +1628,7 @@ fn run_request_worker(
             let _ = ctx
                 .cmd_tx
                 .send(SessionCommand::Broadcast(DaemonMessage::Done {
+                    session_id: ctx.session_id,
                     request_id,
                     token_usage: Some(*usage),
                     last_prompt_tokens: session.config.last_prompt_tokens,
@@ -1585,6 +1640,7 @@ fn run_request_worker(
             let _ = ctx
                 .cmd_tx
                 .send(SessionCommand::Broadcast(DaemonMessage::Failed {
+                    session_id: ctx.session_id,
                     request_id,
                     error: error.to_string(),
                 }));
@@ -1753,6 +1809,7 @@ mod tests {
         let mut shutdown = false;
         process_command(
             SessionCommand::Broadcast(DaemonMessage::Done {
+                session_id: ctx.session_id,
                 request_id: 5,
                 token_usage: None,
                 last_prompt_tokens: None,
@@ -1765,6 +1822,7 @@ mod tests {
         assert_eq!(
             rx1.recv().unwrap(),
             DaemonMessage::Done {
+                session_id: ctx.session_id,
                 request_id: 5,
                 token_usage: None,
                 last_prompt_tokens: None,
@@ -1773,6 +1831,7 @@ mod tests {
         assert_eq!(
             rx2.recv().unwrap(),
             DaemonMessage::Done {
+                session_id: ctx.session_id,
                 request_id: 5,
                 token_usage: None,
                 last_prompt_tokens: None,
@@ -1787,6 +1846,7 @@ mod tests {
         let mut shutdown = false;
         process_command(
             SessionCommand::Broadcast(DaemonMessage::Done {
+                session_id: ctx.session_id,
                 request_id: 0,
                 token_usage: None,
                 last_prompt_tokens: None,
@@ -2223,6 +2283,7 @@ mod tests {
         // Expect Start messages for each active request, in insertion order.
         match sub_rx.recv().unwrap() {
             DaemonMessage::Started {
+                session_id: 1,
                 request_id: 10,
                 turn_id: 3,
                 estimated_prompt_tokens: 0,
@@ -2231,6 +2292,7 @@ mod tests {
         }
         match sub_rx.recv().unwrap() {
             DaemonMessage::Started {
+                session_id: 1,
                 request_id: 20,
                 turn_id: 7,
                 estimated_prompt_tokens: 0,
