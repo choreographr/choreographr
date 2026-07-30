@@ -202,6 +202,21 @@ impl ServiceConfig {
         );
         field
     }
+
+    /// Resolve the `(max_tokens, max_completion_tokens)` pair for a model.
+    ///
+    /// Which field to use depends on the model family (o-series uses
+    /// `max_completion_tokens`, gpt-series uses `max_tokens`).
+    /// Returns `(Some(n), None)` or `(None, Some(n))` depending on the
+    /// resolved field.  If `max_tokens_for_model` returns `None`, both
+    /// fields are `None` (the API will use its own default).
+    pub(crate) fn max_tokens_field_pair(&self, model: &str) -> (Option<u32>, Option<u32>) {
+        let max_tokens = self.max_tokens_for_model(model);
+        match self.max_tokens_field_for_model(model) {
+            MaxTokensField::MaxTokens => (max_tokens, None),
+            MaxTokensField::MaxCompletionTokens => (None, max_tokens),
+        }
+    }
 }
 
 pub fn validate_and_list_models(config: &ServiceConfig, api_key: &str) -> io::Result<Vec<String>> {

@@ -317,7 +317,7 @@ impl OpenAiClient {
                 params.previous_response_id, params.tool_results,
                 params.on_retry, params.cancel_rx,
                 params.programmatic_tool_calling,
-                on_event,
+                &mut on_event,
             ),
             RequestFormat::ChatCompletions => {
                 chat_completions::chat_completions_request_streaming_with_tools(
@@ -325,7 +325,7 @@ impl OpenAiClient {
                     params.model, params.messages, params.tools,
                     reasoning_effort,
                     params.on_retry, params.cancel_rx,
-                    on_event,
+                    &mut on_event,
                 )
             }
         }

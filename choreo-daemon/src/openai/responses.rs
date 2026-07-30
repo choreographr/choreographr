@@ -561,7 +561,7 @@ pub(crate) fn responses_request_with_tools(
 
     let discarded = validate_tool_call_arguments(&mut tool_calls);
     if !tool_calls.is_empty() {
-        Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
+        return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
             content: if full_text.is_empty() {
                 None
             } else {
@@ -575,42 +575,60 @@ pub(crate) fn responses_request_with_tools(
             },
             usage: turn_usage,
             response_id,
-        }))
-    } else if !discarded.is_empty() && !full_text.is_empty() {
-        // All calls were discarded but the model also produced text —
-        // return the text instead of failing.
-        Ok(ChatTurnResult::FinalText(FinalTextResult {
-            content: full_text,
-            reasoning: if full_reasoning.is_empty() {
-                None
-            } else {
-                Some(full_reasoning)
-            },
-            usage: turn_usage,
-            response_id,
-        }))
-    } else if !discarded.is_empty() {
-        Err(super::OpenAiError::TruncatedToolCall { discarded })
-    } else if full_text.is_empty() {
-        Err(super::OpenAiError::EmptyResponse)
-    } else {
-        Ok(ChatTurnResult::FinalText(FinalTextResult {
-            content: full_text,
-            reasoning: if full_reasoning.is_empty() {
-                None
-            } else {
-                Some(full_reasoning)
-            },
-            usage: turn_usage,
-            response_id,
-        }))
+        }));
     }
+
+    // All calls had invalid arguments — surface the error unless the
+    // model also produced text, in which case return the text.
+    if !discarded.is_empty() {
+        if !full_text.is_empty() {
+            return Ok(ChatTurnResult::FinalText(FinalTextResult {
+                content: full_text,
+                reasoning: if full_reasoning.is_empty() {
+                    None
+                } else {
+                    Some(full_reasoning)
+                },
+                usage: turn_usage,
+                response_id,
+            }));
+        }
+        return Err(super::OpenAiError::TruncatedToolCall { discarded });
+    }
+
+    if full_text.is_empty() {
+        return Err(super::OpenAiError::EmptyResponse);
+    }
+
+    Ok(ChatTurnResult::FinalText(FinalTextResult {
+        content: full_text,
+        reasoning: if full_reasoning.is_empty() {
+            None
+        } else {
+            Some(full_reasoning)
+        },
+        usage: turn_usage,
+        response_id,
+    }))
 }
 
 // ── Responses tool call accumulator ──────────────────────────────────────
 
 /// Accumulator for Responses API tool call arguments keyed by call_id.
 /// Used in `responses_request_streaming_with_tools` to merge delta chunks.
+///
+/// # Delta-vs-Done semantics
+///
+/// The Responses API sends tool call arguments via two SSE event types:
+///
+/// - `FunctionCallArgumentsDelta` — a chunk of JSON to **append** to the
+///   existing arguments accumulator (`arguments.push_str(&delta)`).
+/// - `FunctionCallArgumentsDone` — the **complete** final arguments string.
+///   When received, `arguments` is **replaced** (not appended), overwriting
+///   any partial accumulation from prior delta events.
+///
+/// This matches the OpenAI spec: the done event carries the full final
+/// arguments JSON, while delta events carry incremental fragments.
 struct AccCall {
     name: Option<String>,
     arguments: String,
@@ -653,7 +671,7 @@ pub(crate) fn responses_request_streaming_with_tools<F>(
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
     programmatic_tool_calling: bool,
-    mut on_event: F,
+    on_event: &mut F,
 ) -> Result<ChatTurnResult, super::OpenAiError>
 where
     F: FnMut(StreamEvent) -> io::Result<()>,
@@ -716,6 +734,9 @@ where
                 }
             }
             Some(ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta }) => {
+                // `call_id` is provided by the trusted API server — no validation
+                // needed; it's used directly as a HashMap key to accumulate deltas
+                // for this specific tool call.
                 has_any_output = true;
                 if acc_calls.len() >= MAX_TOOL_CALLS {
                     return Err(super::OpenAiError::Io(io::Error::other(format!(
@@ -734,6 +755,9 @@ where
                 name,
                 arguments,
             }) => {
+                // `call_id` comes from the trusted API server — safe to use as a
+                // HashMap key.  `arguments` is the complete final JSON string
+                // (not a delta), so it replaces any accumulated partial value.
                 has_any_output = true;
                 let entry = acc_calls.entry(call_id).or_insert_with(|| {
                     let i = next_tool_index;

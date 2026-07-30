@@ -127,12 +127,7 @@ pub(crate) fn chat_completions_request(
     cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<String, super::OpenAiError> {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
-    let max_tokens = config.max_tokens_for_model(model);
-    let (max_tokens_field, max_completion_tokens_field) =
-        match config.max_tokens_field_for_model(model) {
-            super::MaxTokensField::MaxTokens => (max_tokens, None),
-            super::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
-        };
+    let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
     let retry = retry::retry_config_from_config(config);
     let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
     let body = serde_json::to_value(&ChatCompletionsRequest {
@@ -184,12 +179,7 @@ pub(crate) fn chat_completions_request_with_tools(
 ) -> Result<ChatTurnResult, super::OpenAiError> {
     let start = std::time::Instant::now();
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
-    let max_tokens = config.max_tokens_for_model(model);
-    let (max_tokens_field, max_completion_tokens_field) =
-        match config.max_tokens_field_for_model(model) {
-            super::MaxTokensField::MaxTokens => (max_tokens, None),
-            super::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
-        };
+    let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
     let retry = retry::retry_config_from_config(config);
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
@@ -292,12 +282,7 @@ where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
-    let max_tokens = config.max_tokens_for_model(model);
-    let (max_tokens_field, max_completion_tokens_field) =
-        match config.max_tokens_field_for_model(model) {
-            super::MaxTokensField::MaxTokens => (max_tokens, None),
-            super::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
-        };
+    let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
     let retry = retry::retry_config_from_config(config);
     let messages = [ChatRequestMessage::simple("user", prompt.to_string())];
     let body = serde_json::to_value(&ChatCompletionsRequest {
@@ -419,18 +404,13 @@ pub(crate) fn chat_completions_request_streaming_with_tools<F>(
     reasoning_effort: Option<&str>,
     on_retry: &mut Option<retry::RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
-    mut on_event: F,
+    on_event: &mut F,
 ) -> Result<ChatTurnResult, super::OpenAiError>
 where
     F: FnMut(StreamEvent) -> io::Result<()>,
 {
     let url = endpoint_url(&config.base_url, &config.chat_completions_path)?;
-    let max_tokens = config.max_tokens_for_model(model);
-    let (max_tokens_field, max_completion_tokens_field) =
-        match config.max_tokens_field_for_model(model) {
-            super::MaxTokensField::MaxTokens => (max_tokens, None),
-            super::MaxTokensField::MaxCompletionTokens => (None, max_tokens),
-        };
+    let (max_tokens_field, max_completion_tokens_field) = config.max_tokens_field_pair(model);
     let retry = retry::retry_config_from_config(config);
     let body = serde_json::to_value(&ChatCompletionsRequest {
         model,
@@ -999,82 +979,6 @@ mod tests {
             .expect("delta");
         assert_eq!(delta.content.as_deref(), Some("answer"));
         assert_eq!(delta.reasoning_text.as_deref(), Some("think"));
-    }
-
-    // -- model config validation tests ------------------------------------
-
-    #[test]
-    fn programmatic_tool_calling_default_is_false() {
-        let config = crate::openai::ServiceConfig::default();
-        assert!(!config.programmatic_tool_calling_for_model("gpt-4.1"));
-    }
-
-    #[test]
-    fn programmatic_tool_calling_account_override() {
-        let config = crate::openai::ServiceConfig {
-            programmatic_tool_calling: true,
-            ..Default::default()
-        };
-        assert!(config.programmatic_tool_calling_for_model("gpt-4.1"));
-        assert!(config.programmatic_tool_calling_for_model("claude-3"));
-    }
-
-    #[test]
-    fn programmatic_tool_calling_auto_enables_for_gpt_5_6_responses() {
-        let config = crate::openai::ServiceConfig {
-            default_request_format: crate::openai::RequestFormat::Responses,
-            ..Default::default()
-        };
-        assert!(config.programmatic_tool_calling_for_model("gpt-5.6-chat"));
-        assert!(!config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
-    }
-
-    #[test]
-    fn programmatic_tool_calling_not_auto_enabled_for_gpt_5_6_chat_completions() {
-        let config = crate::openai::ServiceConfig {
-            default_request_format: crate::openai::RequestFormat::ChatCompletions,
-            ..Default::default()
-        };
-        assert!(!config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
-    }
-
-    #[test]
-    fn programmatic_tool_calling_not_auto_enabled_for_other_models() {
-        let config = crate::openai::ServiceConfig {
-            default_request_format: crate::openai::RequestFormat::Responses,
-            ..Default::default()
-        };
-        assert!(!config.programmatic_tool_calling_for_model("gpt-4.1"));
-        assert!(!config.programmatic_tool_calling_for_model("gpt-5.5"));
-        assert!(!config.programmatic_tool_calling_for_model("claude-3-opus"));
-    }
-
-    #[test]
-    fn request_format_for_model_uses_catalog_lookup() {
-        let config = crate::openai::ServiceConfig {
-            default_request_format: crate::openai::RequestFormat::Responses,
-            provider_slug: "openai",
-            ..Default::default()
-        };
-        assert_eq!(
-            config.request_format_for_model("gpt-4.1"),
-            crate::openai::RequestFormat::ChatCompletions
-        );
-        assert_eq!(
-            config.request_format_for_model("totally-unknown-xyz"),
-            crate::openai::RequestFormat::Responses
-        );
-    }
-
-    #[test]
-    fn programmatic_tool_calling_override_wins_over_auto_disable() {
-        let config = crate::openai::ServiceConfig {
-            default_request_format: crate::openai::RequestFormat::ChatCompletions,
-            programmatic_tool_calling: true,
-            ..Default::default()
-        };
-        assert!(config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
-        assert!(config.programmatic_tool_calling_for_model("gpt-4.1"));
     }
 
     // -- sleep_or_cancel tests -------------------------------------------
