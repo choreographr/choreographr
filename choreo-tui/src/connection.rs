@@ -1534,7 +1534,13 @@ pub(crate) fn handle_daemon_message(
     // dispatch in choreo_client_core handle the rest (text notifications,
     // stream appends, image assembly, etc.).
     match &message {
-        DaemonMessage::SessionCreated { session_id, .. } => {
+        DaemonMessage::SessionCreated {
+            session_id,
+            account_name,
+            selected_model,
+            reasoning_effort,
+            ..
+        } => {
             // Already known — nothing to do, and skip the generic dispatch too.
             if app
                 .session_mgr
@@ -1544,7 +1550,13 @@ pub(crate) fn handle_daemon_message(
             {
                 return Ok(());
             }
-            app.handle_session_created(*session_id, client_tx)?;
+            app.handle_session_created(
+                *session_id,
+                account_name.clone(),
+                selected_model.clone(),
+                reasoning_effort.clone(),
+                client_tx,
+            )?;
             // Early return so we don't fall through to dispatch_daemon_message,
             // which would push text to the chat history (duplicate / invisible
             // on the Session Manager page).
@@ -1693,8 +1705,7 @@ pub(crate) fn handle_daemon_message(
         }
         DaemonMessage::ReasoningEffortSetFailed { effort, error, .. } => {
             tracing::warn!(%effort, %error, "reasoning effort rejected by daemon");
-            {
-                let display = app.active_display().unwrap();
+            if let Some(display) = app.active_display() {
                 display.reasoning_effort = Some("off".to_string());
             }
             app.status = Some(format!("reasoning effort rejected: {error}"));
@@ -1707,8 +1718,9 @@ pub(crate) fn handle_daemon_message(
             context_window,
         } => {
             if app.attached_session_id == Some(*session_id) {
-                let display = app.active_display().unwrap();
-                display.context_window = Some(*context_window);
+                if let Some(display) = app.active_display() {
+                    display.context_window = Some(*context_window);
+                }
             }
         }
         DaemonMessage::SessionWorkingDirSet { session_id, path } => {
@@ -1719,7 +1731,9 @@ pub(crate) fn handle_daemon_message(
         }
         // TokenUsageUpdate is dispatched through the generic handler below.
         DaemonMessage::LiveOutputTokenCount { output_tokens, .. } => {
-            app.active_display().unwrap().live_output_tokens = *output_tokens;
+            if let Some(display) = app.active_display() {
+                display.live_output_tokens = *output_tokens;
+            }
         }
 
         _ => {}
