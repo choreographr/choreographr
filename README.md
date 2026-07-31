@@ -195,6 +195,8 @@ Each provider from the catalog is pre-configured with sensible defaults (base_ur
 
 The Responses API is now fully supported — including tool use, streaming, reasoning effort slugs (mapped from the session's string slug to the `reasoning_effort` wire field), multi-turn chaining via `previous_response_id`, and **programmatic tool calling** (gpt-5.6+ models). When `default_request_format` is set to `"responses"`, the daemon uses the Responses endpoint for all requests (both simple completions and tool-assisted turns), with system messages placed into the `input` array (as `{role: "system"}` items) and tool results to `function_call_output` input items. Programmatic tool calling auto-enables for gpt-5.6 models using the Responses API; set `programmatic_tool_calling = true` in `accounts.toml` to override.
 
+On the `opencode-go` gateway (`https://opencode.ai/zen/go/v1`), the `deepseek-v4-flash` and `deepseek-v4-pro` models are served via Chat Completions (`@ai-sdk/openai-compatible`), while `gpt-5.6-luna` is the Responses API model (`POST {base_url}/responses`). On the `opencode` (Zen) gateway (`https://opencode.ai/zen/v1`), the entire GPT 5.x family (`gpt-5`, `gpt-5-codex`, `gpt-5.1`…`gpt-5.6`) is Responses-capable, and the deepseek-v4 models use Chat Completions. Per-model format is resolved from the provider catalog via `ServiceConfig::request_format_for_model()`; set `default_request_format` in `accounts.toml` for models not in the catalog.
+
 ## Monitoring
 
 The daemon can expose an OpenMetrics (Prometheus) endpoint:

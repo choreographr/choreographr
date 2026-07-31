@@ -299,22 +299,11 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
         },
         base_url: "https://opencode.ai/zen/v1",
         default_model: "deepseek-v4-flash",
-        models: &[ModelEntry {
-            model: "big-pickle",
-            context_window: 200_000,
-            reasoning_supported: false,
-            openai_reasoning_levels: &[],
-            openai_responses: false,
-        }],
-    },
-    ProviderEntry {
-        slug: "opencode-go",
-        display_name: "OpenCode Go",
-        protocol: ProviderProtocol::OpenAi {
-            max_tokens_field: MaxTokensField::MaxTokens,
-        },
-        base_url: "https://opencode.ai/zen/go/v1",
-        default_model: "deepseek-v4-pro",
+        // Model → API-format mapping follows opencode.ai/docs/zen (Zen
+        // gateway): the GPT 5.x family is served via the Responses API
+        // (@ai-sdk/openai), while deepseek-v4 and the rest use Chat
+        // Completions (@ai-sdk/openai-compatible). The daemon dispatches per
+        // model on this flag via ServiceConfig::request_format_for_model().
         models: &[
             ModelEntry {
                 model: "deepseek-v4-flash",
@@ -329,6 +318,191 @@ pub static PROVIDER_CATALOG: &[ProviderEntry] = &[
                 reasoning_supported: true,
                 openai_reasoning_levels: &["high", "max"],
                 openai_responses: false,
+            },
+            ModelEntry {
+                model: "big-pickle",
+                context_window: 200_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.6-sol",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.6-terra",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.6-luna",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.5",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.5-pro",
+                context_window: 1_050_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["medium", "high"],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.4",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.4-pro",
+                context_window: 1_050_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["low", "medium", "high"],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.4-mini",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.4-nano",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.3-codex",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.3-codex-spark",
+                context_window: 128_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.2",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.2-codex",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.1",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.1-codex",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.1-codex-max",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5.1-codex-mini",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5-codex",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+            ModelEntry {
+                model: "gpt-5-nano",
+                context_window: 400_000,
+                reasoning_supported: false,
+                openai_reasoning_levels: &[],
+                openai_responses: true,
+            },
+        ],
+    },
+    ProviderEntry {
+        slug: "opencode-go",
+        display_name: "OpenCode Go",
+        protocol: ProviderProtocol::OpenAi {
+            max_tokens_field: MaxTokensField::MaxTokens,
+        },
+        base_url: "https://opencode.ai/zen/go/v1",
+        default_model: "deepseek-v4-pro",
+        // Model → API-format mapping follows opencode.ai/docs/go (Go gateway):
+        // the deepseek-v4 family is served via Chat Completions
+        // (@ai-sdk/openai-compatible), while GPT-5.6 Luna is the one model on
+        // this gateway that uses the Responses API (@ai-sdk/openai). The
+        // daemon dispatches per model on this flag via
+        // ServiceConfig::request_format_for_model().
+        models: &[
+            ModelEntry {
+                model: "deepseek-v4-flash",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["high", "max"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "deepseek-v4-pro",
+                context_window: 1_000_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["high", "max"],
+                openai_responses: false,
+            },
+            ModelEntry {
+                model: "gpt-5.6-luna",
+                context_window: 272_000,
+                reasoning_supported: true,
+                openai_reasoning_levels: &["off", "low", "medium", "high"],
+                openai_responses: true,
             },
         ],
     },
@@ -1263,6 +1437,55 @@ mod tests {
     fn model_request_format_known_model() {
         let fmt = model_request_format("openai", "gpt-4.1");
         assert_eq!(fmt, Some(RequestFormat::ChatCompletions));
+    }
+
+    #[test]
+    fn model_request_format_opencode_go_matches_gateway_docs() {
+        // opencode.ai/docs/go: deepseek-v4 models are served via Chat
+        // Completions (@ai-sdk/openai-compatible); gpt-5.6-luna is the Go
+        // gateway's Responses API model (@ai-sdk/openai).
+        assert_eq!(
+            model_request_format("opencode-go", "deepseek-v4-flash"),
+            Some(RequestFormat::ChatCompletions)
+        );
+        assert_eq!(
+            model_request_format("opencode-go", "deepseek-v4-pro"),
+            Some(RequestFormat::ChatCompletions)
+        );
+        assert_eq!(
+            model_request_format("opencode-go", "gpt-5.6-luna"),
+            Some(RequestFormat::Responses)
+        );
+    }
+
+    #[test]
+    fn model_request_format_opencode_zen_gpt_family_uses_responses() {
+        // opencode.ai/docs/zen: the GPT 5.x family on the Zen gateway is
+        // served via the Responses API, while deepseek-v4 uses Chat
+        // Completions.
+        for model in [
+            "gpt-5",
+            "gpt-5-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.4",
+            "gpt-5.5-pro",
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+        ] {
+            assert_eq!(
+                model_request_format("opencode", model),
+                Some(RequestFormat::Responses),
+                "expected {model} to use the Responses API on the Zen gateway"
+            );
+        }
+        assert_eq!(
+            model_request_format("opencode", "deepseek-v4-flash"),
+            Some(RequestFormat::ChatCompletions)
+        );
+        assert_eq!(
+            model_request_format("opencode", "big-pickle"),
+            Some(RequestFormat::ChatCompletions)
+        );
     }
 
     #[test]
