@@ -1,6 +1,6 @@
 use super::{
-    MAX_LINE_DISPLAY_BYTES, MAX_TOOL_OUTPUT_BYTES, ToolExecError, confine_path, drain_rest_of_line,
-    open_text_reader, read_line_capped,
+    MAX_TOOL_OUTPUT_BYTES, OutputBudget, TextStream, ToolExecError, confine_path, open_text_reader,
+    render_streamed_line,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -49,91 +49,31 @@ pub(crate) fn execute_read_file_range_tool(
     // Stream through a bounded reader (see read_file.rs for the rationale):
     // we hold at most one capped line plus the output budget in memory, and
     // binary files are rejected up front by `open_text_reader`.
-    let mut reader = open_text_reader(&resolved)?;
+    let mut stream = TextStream::new(open_text_reader(&resolved)?);
 
     let start = args.start_line as u64;
     let max = args.max_lines as u64;
 
     let mut out = String::new();
-    let mut line_buf: Vec<u8> = Vec::new();
-    let mut total_lines: u64 = 0;
-    let mut total_bytes: u64 = 0;
-    let mut shown_bytes: usize = 0;
+    let mut budget = OutputBudget::new(MAX_TOOL_OUTPUT_BYTES);
     let mut lines_shown: u64 = 0;
-    let mut output_truncated = false;
 
-    loop {
-        let complete = read_line_capped(&mut reader, &mut line_buf, MAX_LINE_DISPLAY_BYTES)?;
-        if line_buf.is_empty() {
-            // EOF (empty file, or trailing newline consumed): no extra line.
-            break;
-        }
-        total_lines += 1;
-        let bytes_before_line = total_bytes;
-        let line_total: u64 = if complete {
-            line_buf.len() as u64
-        } else {
-            // Over-cap line: count its full length (draining keeps memory
-            // bounded) but display only the capped prefix below.
-            line_buf.len() as u64 + drain_rest_of_line(&mut reader)?
-        };
-        total_bytes += line_total;
-
-        let in_window = total_lines >= start && lines_shown < max;
-        if !in_window || output_truncated {
+    for line in &mut stream {
+        let line = line?;
+        let in_window = line.line_number >= start && lines_shown < max;
+        if !in_window || budget.is_truncated() {
             // Outside the requested range (or past the output budget): count
             // only. Encoding validation applies solely to lines we return.
             continue;
         }
-
-        // Binary / encoding checks — only for lines we actually return.
-        if let Some(pos) = line_buf.iter().position(|&b| b == 0) {
-            return Err(ToolExecError(format!(
-                "'{}' appears to be a binary file (NUL byte at offset {})",
-                resolved.display(),
-                bytes_before_line + pos as u64
-            )));
-        }
-        let line_str = match std::str::from_utf8(&line_buf) {
-            Ok(s) => s,
-            Err(e) if !complete && e.error_len().is_none() => {
-                // The display cap split a multi-byte char mid-sequence; the
-                // prefix before the split is valid and that is all we show.
-                std::str::from_utf8(&line_buf[..e.valid_up_to()]).unwrap_or_default()
-            }
-            Err(e) => {
-                return Err(ToolExecError(format!(
-                    "'{}' is not valid UTF-8 text (invalid byte sequence at offset {})",
-                    resolved.display(),
-                    bytes_before_line + e.valid_up_to() as u64
-                )));
-            }
-        };
-
-        // Match `str::lines()` display semantics (strip one '\n', then one
-        // '\r'), then render with the current 1-based line number.
-        let mut display = line_str;
-        if let Some(stripped) = display.strip_suffix('\n') {
-            display = stripped;
-        }
-        if let Some(stripped) = display.strip_suffix('\r') {
-            display = stripped;
-        }
-        let mut display_line = format!("{total_lines} | {display}");
-        if !complete {
-            display_line.push_str("\n...[line truncated: exceeds 64 KiB]");
-        }
-        // +1 accounts for the newline re-appended below.
-        let display_len = display_line.len() + 1;
-        if shown_bytes + display_len <= MAX_TOOL_OUTPUT_BYTES {
-            out.push_str(&display_line);
-            out.push('\n');
-            shown_bytes += display_len;
+        let display_line = render_streamed_line(&line, &resolved, true)?;
+        if budget.push_line(&mut out, &display_line) {
             lines_shown += 1;
-        } else {
-            output_truncated = true;
         }
     }
+
+    let total_lines = stream.total_lines();
+    let total_bytes = stream.total_bytes();
 
     if args.start_line as u64 > total_lines {
         return Err(ToolExecError(format!(
@@ -147,14 +87,14 @@ pub(crate) fn execute_read_file_range_tool(
     // requested end. (saturating_add guards against start_line near usize::MAX
     // in debug builds — the past-EOF check above already errors for those.)
     let requested_end = total_lines.min(start.saturating_add(max - 1));
-    let header = if output_truncated && lines_shown == 0 {
+    let header = if budget.is_truncated() && lines_shown == 0 {
         format!(
             "path: {}\nlines: none of {} (first line exceeds output budget)\n\n",
             resolved.display(),
             total_lines
         )
     } else {
-        let shown_end = if output_truncated {
+        let shown_end = if budget.is_truncated() {
             start + lines_shown - 1
         } else {
             requested_end
@@ -168,11 +108,15 @@ pub(crate) fn execute_read_file_range_tool(
         )
     };
 
-    if output_truncated {
+    if budget.is_truncated() {
+        // Report the total bytes the caller actually receives before the
+        // marker — body + prepended header + the marker's leading newline —
+        // so "showing X of Y bytes" matches the returned content exactly
+        // (the marker text itself is appended past the budget).
+        let returned_bytes = budget.shown_bytes() + header.len() + 1;
         out.push_str(&format!(
-            "\n...[truncated: showing {} of {} bytes ({} of {} lines) — \
-             use a smaller range]",
-            shown_bytes, total_bytes, lines_shown, total_lines
+            "\n...[truncated: showing {returned_bytes} of {total_bytes} bytes \
+             ({lines_shown} of {total_lines} lines) — use a smaller range]"
         ));
     }
 
@@ -182,7 +126,7 @@ pub(crate) fn execute_read_file_range_tool(
         max_lines = args.max_lines,
         total_lines,
         lines_shown,
-        truncated = output_truncated,
+        truncated = budget.is_truncated(),
         "read_file_range completed"
     );
 
@@ -297,9 +241,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_nul_past_sniff_head_in_range() {
+        // NUL beyond the 8 KiB head-sniff window, inside the requested
+        // range: caught by the per-line check on the returned line.
+        let mut content = vec![b'a'; 9 * 1024];
+        content.extend_from_slice(b"\n\x00nul\n");
+        let err = run_bytes(&content, 1, 5).unwrap_err();
+        assert!(err.to_string().contains("binary file"), "{err}");
+    }
+
+    #[test]
     fn rejects_invalid_utf8_in_range() {
         let err = run_bytes(b"ok\n\xff\xfe\n", 1, 5).unwrap_err();
         assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_past_sniff_head_in_range() {
+        // Invalid bytes beyond the 8 KiB head-sniff window, inside the
+        // requested range: caught by per-line validation.
+        let mut content = vec![b'a'; 9 * 1024];
+        content.extend_from_slice(b"\n\xff\xfe\n");
+        let err = run_bytes(&content, 2, 5).unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn ignores_invalid_utf8_outside_requested_range() {
+        // The documented contract: content outside the returned range is not
+        // validated. Line 2 is invalid but excluded, so the call succeeds.
+        let mut content = vec![b'a'; 9 * 1024];
+        content.extend_from_slice(b"\n\xff\xfe\nok\n");
+        let out = run_bytes(&content, 3, 1).unwrap();
+        assert!(out.contains("3 | ok"), "{out}");
+        assert!(out.contains("lines: 3-3 of 3"), "{out}");
     }
 
     #[test]
@@ -321,6 +296,24 @@ mod tests {
         let out = run(&content, 1, 500).unwrap();
         assert!(out.contains("...[truncated: showing"), "{out}");
         assert!(out.contains("of 300 lines)"), "{out}");
+    }
+
+    #[test]
+    fn truncation_report_counts_header_bytes() {
+        // The "showing X of Y bytes" figure must match the bytes actually
+        // returned (header + body + separator newline), not just the body.
+        let content = (0..300)
+            .map(|i| format!("{i:>3} {}", "y".repeat(496)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = run(&content, 1, 500).unwrap();
+        let marker_prefix = "...[truncated: showing ";
+        let marker_tail = out.rsplit(marker_prefix).next().expect("marker present");
+        let shown: usize = marker_tail.split(" of ").next().unwrap().parse().unwrap();
+        // Everything before the marker prefix is what the caller receives;
+        // the reported figure must equal it exactly.
+        let returned = out.len() - marker_tail.len() - marker_prefix.len();
+        assert_eq!(shown, returned, "reported bytes != returned bytes: {out}");
     }
 
     #[test]
