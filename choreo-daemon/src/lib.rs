@@ -41,9 +41,7 @@ pub(crate) use crate::tools::sha256_hex;
 pub use crate::tools::vm::{RunRiscVInput, execute_run_riscv_tool};
 
 #[cfg(test)]
-pub(crate) use crate::tools::fs::{
-    execute_edit_file_tool, execute_read_file_range_tool, execute_write_file_tool,
-};
+pub(crate) use crate::tools::fs::{execute_edit_file_tool, execute_write_file_tool};
 
 #[cfg(test)]
 mod tests;

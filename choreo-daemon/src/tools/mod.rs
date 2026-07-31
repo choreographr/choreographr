@@ -7,6 +7,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::mpsc;
@@ -127,6 +129,8 @@ mod image;
 pub(crate) mod notify;
 pub(crate) mod nu;
 pub(crate) mod random;
+pub(crate) mod read_file;
+pub(crate) mod read_file_range;
 pub(crate) mod series;
 pub(crate) mod sh;
 pub mod shell_util;
@@ -598,8 +602,8 @@ impl ToolRegistry {
             tools: HashMap::new(),
             dynamic_groups: Vec::new(),
         };
-        reg.register(fs::ReadFile);
-        reg.register(fs::ReadFileRange);
+        reg.register(read_file::ReadFile);
+        reg.register(read_file_range::ReadFileRange);
         reg.register(fs::ListFiles);
         reg.register(fs::DeleteFiles);
         reg.register(fs::LineCount);
@@ -1021,16 +1025,136 @@ pub(crate) fn sha256_hex(content: &str) -> String {
     hex::encode(digest)
 }
 
+/// Shared byte budget for tool output (128 KiB ≈ ~32K tokens for ASCII,
+/// ~43K for CJK — far below any modern context window, yet a single call
+/// can never flood the conversation). Measured in *bytes* rather than chars
+/// so the effective token cost is roughly uniform across scripts: ASCII and
+/// CJK both sit at ~3-4 bytes per token, whereas char counts vary 4x.
+pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
+
+/// Number of leading bytes inspected when deciding whether a file is binary.
+/// Mirrors ripgrep's heuristic: a NUL byte in the head marks the file as
+/// binary (text files virtually never contain NUL).
+pub(crate) const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// Per-line display cap for the file-read tools. Guards against pathological
+/// single-line files (minified bundles, base64 blobs, 1 GiB one-liners) that
+/// would otherwise force an unbounded line buffer into memory.
+pub(crate) const MAX_LINE_DISPLAY_BYTES: usize = 64 * 1024;
+
 pub(crate) fn truncate_tool_output(content: &str) -> String {
-    const MAX_TOOL_OUTPUT_CHARS: usize = 64 * 1024;
-    if content.chars().count() <= MAX_TOOL_OUTPUT_CHARS {
+    if content.len() <= MAX_TOOL_OUTPUT_BYTES {
         return content.to_string();
     }
-    let truncated = content
-        .chars()
-        .take(MAX_TOOL_OUTPUT_CHARS)
-        .collect::<String>();
-    format!("{truncated}\n...[truncated]")
+    // Cut on a char boundary so we never split a multi-byte UTF-8 char.
+    let split = content.floor_char_boundary(MAX_TOOL_OUTPUT_BYTES);
+    let mut truncated = content[..split].to_string();
+    truncated.push_str("\n...[truncated]");
+    truncated
+}
+
+/// Open `path` for streaming text reads, rejecting binary files up front.
+///
+/// The first [`BINARY_SNIFF_BYTES`] are *peeked* via `fill_buf` (not
+/// consumed), so the returned reader can continue streaming from the start
+/// of the file. A NUL byte in the head marks the file as binary. Invalid
+/// UTF-8 in the head is also rejected, unless the invalid sequence is a
+/// multi-byte char merely split at the sniff boundary (`error_len() == None`)
+/// — the per-line UTF-8 validation in the read tools handles that case.
+pub(crate) fn open_text_reader(path: &std::path::Path) -> Result<BufReader<File>, ToolExecError> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(BINARY_SNIFF_BYTES, file);
+    let head = reader.fill_buf()?;
+    if let Some(pos) = head.iter().position(|&b| b == 0) {
+        return Err(ToolExecError(format!(
+            "'{}' appears to be a binary file (NUL byte at offset {pos}); \
+             read_file/read_file_range are for UTF-8 text files",
+            path.display()
+        )));
+    }
+    if let Err(e) = std::str::from_utf8(head)
+        && e.error_len().is_some()
+    {
+        return Err(ToolExecError(format!(
+            "'{}' is not valid UTF-8 text (invalid byte sequence at offset {})",
+            path.display(),
+            e.valid_up_to()
+        )));
+    }
+    Ok(reader)
+}
+
+/// Read one line (up to and including `\n`) into `buf`, stopping early once
+/// `buf` reaches `cap` bytes.
+///
+/// Returns `Ok(true)` when the line is complete (terminated by `\n` or EOF)
+/// and `Ok(false)` when the line is longer than `cap` — in that case `buf`
+/// holds the first `cap` bytes (no trailing `\n`) and the caller should
+/// drain the remainder with [`drain_rest_of_line`] before reading on.
+/// Memory stays bounded: `buf` never grows past `cap`.
+pub(crate) fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> io::Result<bool> {
+    buf.clear();
+    loop {
+        // Scope the `fill_buf` borrow so `available` is dropped before
+        // `consume` re-borrows the reader (BufRead requires this).
+        let (consumed, done) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                // EOF: a final partial line (possibly empty) counts as complete.
+                return Ok(true);
+            }
+            let remaining = cap.saturating_sub(buf.len());
+            if remaining == 0 {
+                // Reached the display cap before finding a newline.
+                return Ok(false);
+            }
+            let take = available.len().min(remaining);
+            match available[..take].iter().position(|&b| b == b'\n') {
+                Some(idx) => {
+                    buf.extend_from_slice(&available[..=idx]);
+                    (idx + 1, true)
+                }
+                None => {
+                    buf.extend_from_slice(&available[..take]);
+                    (take, false)
+                }
+            }
+        };
+        reader.consume(consumed);
+        if done {
+            return Ok(true);
+        }
+    }
+}
+
+/// Consume the remainder of an over-cap line (up to and including `\n`),
+/// returning the number of bytes drained. Keeps line *counting* correct
+/// after [`read_line_capped`] bailed out, without ever buffering the whole
+/// line — a fixed chunk is reused, so memory stays O(1) in line size.
+pub(crate) fn drain_rest_of_line<R: BufRead>(reader: &mut R) -> io::Result<u64> {
+    let mut drained: u64 = 0;
+    loop {
+        let (consumed, done) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                // EOF mid-line: no trailing newline to find.
+                return Ok(drained);
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(idx) => (idx + 1, true),
+                None => (available.len(), false),
+            }
+        };
+        drained += consumed as u64;
+        reader.consume(consumed);
+        if done {
+            return Ok(drained);
+        }
+    }
 }
 
 #[cfg(test)]

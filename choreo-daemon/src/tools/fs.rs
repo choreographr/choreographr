@@ -10,12 +10,6 @@ use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
 use super::glob_util::GlobFilter;
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReadFileArgs {
-    /// Relative or absolute path to a text file
-    pub path: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct WriteFileArgs {
     /// Relative or absolute path to the file to write
     pub path: String,
@@ -47,16 +41,6 @@ pub struct TextEditArgs {
     pub new_text: String,
     /// When true, replace all exact matches instead of requiring exactly one match
     pub replace_all: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReadFileRangeArgs {
-    /// Relative or absolute path to a text file
-    pub path: String,
-    /// 1-based inclusive start line
-    pub start_line: usize,
-    /// Maximum number of lines to return
-    pub max_lines: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -100,79 +84,6 @@ pub(crate) fn execute_line_count_tool(
     let content = std::fs::read_to_string(&resolved)?;
     let line_count = content.lines().count();
     Ok(format!("{}: {} lines", resolved.display(), line_count))
-}
-
-pub(crate) fn execute_read_file_tool(
-    args: &ReadFileArgs,
-    working_dir: Option<&Path>,
-) -> Result<String, ToolExecError> {
-    if args.path.trim().is_empty() {
-        return Err(ToolExecError(
-            "missing required string argument: path".to_string(),
-        ));
-    }
-    let resolved = confine_path(&args.path, working_dir)?;
-    let content = std::fs::read_to_string(&resolved)?;
-    Ok(truncate_tool_output(&content))
-}
-
-pub(crate) fn execute_read_file_range_tool(
-    args: &ReadFileRangeArgs,
-    working_dir: Option<&Path>,
-) -> Result<String, ToolExecError> {
-    const MAX_READ_FILE_RANGE_LINES: usize = 200;
-
-    if args.path.trim().is_empty() {
-        return Err(ToolExecError(
-            "missing required string argument: path".to_string(),
-        ));
-    }
-
-    if args.start_line == 0 {
-        return Err(ToolExecError("start_line must be >= 1".to_string()));
-    }
-
-    if args.max_lines == 0 {
-        return Err(ToolExecError("max_lines must be >= 1".to_string()));
-    }
-
-    if args.max_lines > MAX_READ_FILE_RANGE_LINES {
-        return Err(ToolExecError(format!(
-            "max_lines must be <= {MAX_READ_FILE_RANGE_LINES}"
-        )));
-    }
-
-    let resolved = confine_path(&args.path, working_dir)?;
-    let content = std::fs::read_to_string(&resolved)?;
-
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
-
-    if args.start_line > total_lines {
-        return Err(ToolExecError(format!(
-            "start_line {} is past end of file; file has {} lines",
-            args.start_line, total_lines
-        )));
-    }
-
-    let end_line = total_lines.min(args.start_line + args.max_lines - 1);
-    let start_idx = args.start_line - 1;
-    let end_idx = end_line;
-
-    let mut output = format!(
-        "path: {}\nlines: {}-{} of {}\n\n",
-        resolved.display(),
-        args.start_line,
-        end_line,
-        total_lines
-    );
-
-    for (index, line) in lines[start_idx..end_idx].iter().enumerate() {
-        let line_number = args.start_line + index;
-        output.push_str(&format!("{line_number} | {line}\n"));
-    }
-
-    Ok(truncate_tool_output(&output))
 }
 
 pub(crate) fn execute_list_files_tool(
@@ -644,41 +555,6 @@ fn format_edit_result(action: &str, path: &str, summary: &AppliedEditSummary) ->
     out
 }
 
-pub fn describe_read_file_invocation(args: &ReadFileArgs) -> String {
-    format!("Reading file `{}`.", args.path)
-}
-
-pub(crate) struct ReadFile;
-
-define_tool!(
-    ReadFile,
-    "read_file",
-    "Read a UTF-8 text file from the local workspace.",
-    ReadFileArgs,
-    execute_read_file_tool,
-    "core",
-    describe_read_file_invocation
-);
-
-pub fn describe_read_file_range_invocation(args: &ReadFileRangeArgs) -> String {
-    format!(
-        "Reading file `{}` from line {} (max {} lines).",
-        args.path, args.start_line, args.max_lines
-    )
-}
-
-pub(crate) struct ReadFileRange;
-
-define_tool!(
-    ReadFileRange,
-    "read_file_range",
-    "Read a line range from a UTF-8 text file in the local workspace.",
-    ReadFileRangeArgs,
-    execute_read_file_range_tool,
-    "core",
-    describe_read_file_range_invocation
-);
-
 pub fn describe_list_files_invocation(args: &ListFilesArgs) -> String {
     match &args.path {
         Some(p) => format!("Listing files in `{}`.", p),
@@ -830,29 +706,6 @@ mod tests {
         .unwrap();
         assert_eq!(summary.content, "a B c");
         assert_eq!(summary.replacement_count, 1);
-    }
-
-    #[test]
-    fn describe_read_file_invocation() {
-        let args = ReadFileArgs {
-            path: "src/main.rs".into(),
-        };
-        let desc = super::describe_read_file_invocation(&args);
-        assert_eq!(desc, "Reading file `src/main.rs`.");
-    }
-
-    #[test]
-    fn describe_read_file_range_invocation() {
-        let args = ReadFileRangeArgs {
-            path: "src/lib.rs".into(),
-            start_line: 10,
-            max_lines: 50,
-        };
-        let desc = super::describe_read_file_range_invocation(&args);
-        assert_eq!(
-            desc,
-            "Reading file `src/lib.rs` from line 10 (max 50 lines)."
-        );
     }
 
     #[test]

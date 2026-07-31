@@ -941,6 +941,34 @@ A leading `~` or `~/` in any path argument is expanded to the user's home direct
 `expand_tilde()` inside `resolve_path()`, so callers can write `~/project` instead of the
 full absolute path. The `~user` form is *not* expanded and is passed through unchanged.
 
+### File-read tool limits
+
+`read_file` and `read_file_range` share a streaming, memory-bounded design. Each tool
+lives in its own module (`tools/read_file.rs`, `tools/read_file_range.rs`); the shared
+streaming and binary-sniff helpers (`open_text_reader`, `read_line_capped`,
+`drain_rest_of_line`) live in `tools/mod.rs` alongside `confine_path` and
+`truncate_tool_output`.
+
+- **Binary rejection:** both tools peek the first 8 KiB (`BINARY_SNIFF_BYTES`) and reject
+  files containing a NUL byte with a friendly `"appears to be a binary file"` error,
+  mirroring ripgrep's heuristic. Returned content is always valid UTF-8 — invalid UTF-8
+  in the head or in a returned line yields an explicit `"not valid UTF-8"` error rather
+  than a raw std I/O error. Content outside the returned range is not validated.
+- **Line cap:** `read_file_range` returns at most 500 lines per call
+  (`MAX_READ_FILE_RANGE_LINES`); larger requests fail with a validation error, while
+  requests that run past EOF clamp to the last line.
+- **Output budget:** tool output is capped at 128 KiB **bytes**
+  (`MAX_TOOL_OUTPUT_BYTES`). Bytes are used rather than chars so the effective token cost
+  is roughly uniform across scripts (ASCII and CJK are both ~3-4 bytes per token).
+  Truncation always reports totals — `showing X of Y bytes; file has N line(s)` — so the
+  agent knows what it is missing and can switch to `read_file_range`.
+- **Per-line cap:** a single line longer than 64 KiB (`MAX_LINE_DISPLAY_BYTES`) is shown
+  as a truncated prefix with a `...[line truncated]` marker; the remainder is drained
+  (counted for totals, never buffered).
+- **Memory:** both tools stream via `BufReader` + `read_line_capped`, holding at most one
+  capped line plus the output budget in memory regardless of file size (previously the
+  whole file was loaded via `read_to_string`).
+
 ### Postcard binary encoding
 
 Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protocol:

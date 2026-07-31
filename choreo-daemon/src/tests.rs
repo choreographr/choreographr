@@ -1,5 +1,5 @@
 use super::*;
-use crate::tools::fs::{EditFileArgs, ReadFileRangeArgs, TextEditArgs, WriteFileArgs};
+use crate::tools::fs::{EditFileArgs, TextEditArgs, WriteFileArgs};
 
 fn test_temp_path(prefix: &str) -> std::path::PathBuf {
     let unique = std::time::SystemTime::now()
@@ -7,92 +7,6 @@ fn test_temp_path(prefix: &str) -> std::path::PathBuf {
         .expect("time")
         .as_nanos();
     std::env::temp_dir().join(format!("{prefix}-{unique}.txt"))
-}
-
-#[test]
-fn read_file_range_tool_reads_numbered_line_chunks() {
-    let path = test_temp_path("choreo-read-range-tool");
-    std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\n").expect("seed file");
-
-    let result = execute_read_file_range_tool(
-        &ReadFileRangeArgs {
-            path: path.display().to_string(),
-            start_line: 2,
-            max_lines: 2,
-        },
-        None,
-    );
-
-    let content = result.unwrap_or_default();
-    assert!(content.contains("lines: 2-3 of 4"), "{}", content);
-    assert!(content.contains("2 | beta"), "{}", content);
-    assert!(content.contains("3 | gamma"), "{}", content);
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn read_file_range_tool_clamps_to_eof() {
-    let path = test_temp_path("choreo-read-range-eof-tool");
-    std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("seed file");
-
-    let result = execute_read_file_range_tool(
-        &ReadFileRangeArgs {
-            path: path.display().to_string(),
-            start_line: 2,
-            max_lines: 10,
-        },
-        None,
-    );
-
-    let content = result.unwrap_or_default();
-    assert!(content.contains("lines: 2-3 of 3"), "{}", content);
-    assert!(content.contains("2 | beta"), "{}", content);
-    assert!(content.contains("3 | gamma"), "{}", content);
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn read_file_range_tool_rejects_start_line_past_eof() {
-    let path = test_temp_path("choreo-read-range-past-eof-tool");
-    std::fs::write(&path, "alpha\nbeta\n").expect("seed file");
-
-    let result = execute_read_file_range_tool(
-        &ReadFileRangeArgs {
-            path: path.display().to_string(),
-            start_line: 5,
-            max_lines: 1,
-        },
-        None,
-    );
-
-    assert!(result.is_err(), "{}", result.unwrap_err());
-    let err = result.unwrap_err().to_string();
-    assert!(err.contains("past end of file"), "{}", err);
-
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn read_file_range_tool_rejects_excessive_max_lines() {
-    let path = test_temp_path("choreo-read-range-max-lines-tool");
-    std::fs::write(&path, "alpha\n").expect("seed file");
-
-    let result = execute_read_file_range_tool(
-        &ReadFileRangeArgs {
-            path: path.display().to_string(),
-            start_line: 1,
-            max_lines: 201,
-        },
-        None,
-    );
-
-    assert!(result.is_err(), "{}", result.unwrap_err());
-    let err = result.unwrap_err().to_string();
-    assert!(err.contains("max_lines must be <= 200"), "{}", err);
-
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
