@@ -1414,6 +1414,7 @@ impl App {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
     pub(crate) fn rebuild_height_prefix(&mut self) {
         let vp = self.history_viewport;
         if let Some(d) = self.active_display() {
@@ -1428,33 +1429,16 @@ impl App {
             .unwrap_or(1)
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_streaming_changed(&mut self) {
         if let Some(d) = self.active_display() {
             d.mark_streaming_changed();
         }
     }
 
-    pub(crate) fn mark_content_changed(&mut self) {
-        if let Some(d) = self.active_display() {
-            d.mark_content_changed();
-        }
-    }
-
-    pub(crate) fn resolve_streaming_turn_index(&mut self, request_id: u32) {
-        if let Some(d) = self.active_display() {
-            d.resolve_streaming_turn_index(request_id);
-        }
-    }
-
     pub(crate) fn max_scroll_offset(&self) -> usize {
         self.active_display_ref()
             .map(|d| d.max_scroll_offset(&self.history_viewport))
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn virtual_track_slots(&self) -> usize {
-        self.active_display_ref()
-            .map(|d| d.virtual_track_slots(&self.history_viewport))
             .unwrap_or(0)
     }
 
@@ -1585,6 +1569,7 @@ impl App {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
     pub(crate) fn scrollbar_notch(&self) -> usize {
         self.active_display_ref()
             .map(|d| d.scrollbar_notch(&self.history_viewport))
@@ -3420,22 +3405,24 @@ mod tests {
 
         // Capture viewport height before taking a mutable borrow.
         let viewport_height = app.history_viewport.height;
-        let mut display = app.active_display().unwrap();
-        let initial_total = display.total_history_height();
+        {
+            let display = app.active_display().unwrap();
+            let initial_total = display.total_history_height();
 
-        display.history_scroll.scroll =
-            initial_total.saturating_sub(viewport_height as usize) / 2;
-        // Drop mutable borrow so we can access app again.
-        drop(display);
+            display.history_scroll.scroll =
+                initial_total.saturating_sub(viewport_height as usize) / 2;
+        }
         assert!(app.effective_scroll() > 0, "should be scrolled up");
 
         insert_turn(&mut app, 2, "new content", "new content");
         let old_total = app.total_history_height();
-        let mut display = app.active_display().unwrap();
-        let old_scroll = display.history_scroll.scroll;
+        let old_scroll;
+        {
+            let display = app.active_display().unwrap();
+            old_scroll = display.history_scroll.scroll;
 
-        display.mark_content_changed();
-        drop(display);
+            display.mark_content_changed();
+        }
 
         app.compute_total_height_and_markers();
 
@@ -3461,17 +3448,19 @@ mod tests {
         insert_turn(&mut app, 1, "b", "b");
         app.rebuild_height_prefix();
 
-        let mut display = app.active_display().unwrap();
-        display.history_scroll.scroll = 0;
-        // Drop mutable borrow so we can access app again.
-        drop(display);
+        {
+            let display = app.active_display().unwrap();
+            display.history_scroll.scroll = 0;
+        }
         assert_eq!(app.effective_scroll(), 0, "should be at bottom");
 
         insert_turn(&mut app, 2, "more", "more");
-        let mut display = app.active_display().unwrap();
-        let old_scroll = display.history_scroll.scroll;
-        display.mark_content_changed();
-        drop(display);
+        let old_scroll;
+        {
+            let display = app.active_display().unwrap();
+            old_scroll = display.history_scroll.scroll;
+            display.mark_content_changed();
+        }
 
         app.compute_total_height_and_markers();
 
@@ -3499,9 +3488,10 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let display = app.active_display().unwrap();
-        display.view.insert_or_replace(0, turn);
-        drop(display);
+        {
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(0, turn);
+        }
         app.rebuild_height_prefix();
 
         let display = app.active_display_ref().unwrap();
@@ -3621,13 +3611,15 @@ mod tests {
         insert_turn(&mut app, 0, "a", "a");
         app.rebuild_height_prefix();
 
-        let mut display = app.active_display().unwrap();
-        display.history_scroll.scroll = 10;
-        let old_scroll = display.history_scroll.scroll;
+        let old_scroll;
+        {
+            let display = app.active_display().unwrap();
+            display.history_scroll.scroll = 10;
+            old_scroll = display.history_scroll.scroll;
 
-        display.markers_dirty = true;
-        assert!(!display.content_dirty, "content should not be dirty");
-        drop(display);
+            display.markers_dirty = true;
+            assert!(!display.content_dirty, "content should not be dirty");
+        }
         app.compute_total_height_and_markers();
 
         let display = app.active_display_ref().unwrap();
@@ -3680,18 +3672,19 @@ mod tests {
         app.last_terminal_size = Some((100, 30));
         app.terminal_resized = false;
 
-        let mut display = app.active_display().unwrap();
-        display.content_dirty = true;
-        display.markers_dirty = true;
-        display.render_cache = vec![Some(RenderedCache {
-            turn_id: 0,
-            lines: Arc::from(Vec::<Line<'static>>::new()),
-            width: 0,
-            viewport_width: 0,
-            height: 0,
-            visual_offsets: Arc::from([]),
-        })];
-        drop(display);
+        {
+            let display = app.active_display().unwrap();
+            display.content_dirty = true;
+            display.markers_dirty = true;
+            display.render_cache = vec![Some(RenderedCache {
+                turn_id: 0,
+                lines: Arc::from(Vec::<Line<'static>>::new()),
+                width: 0,
+                viewport_width: 0,
+                height: 0,
+                visual_offsets: Arc::from([]),
+            })];
+        }
 
         app.update_viewport_from_terminal_size();
 
@@ -3712,18 +3705,19 @@ mod tests {
         app.last_terminal_size = Some((80, 30));
         app.terminal_resized = false;
 
-        let mut display = app.active_display().unwrap();
-        display.content_dirty = true;
-        display.markers_dirty = true;
-        display.render_cache = vec![Some(RenderedCache {
-            turn_id: 0,
-            lines: Arc::from(Vec::<Line<'static>>::new()),
-            width: 0,
-            viewport_width: 0,
-            height: 0,
-            visual_offsets: Arc::from([]),
-        })];
-        drop(display);
+        {
+            let display = app.active_display().unwrap();
+            display.content_dirty = true;
+            display.markers_dirty = true;
+            display.render_cache = vec![Some(RenderedCache {
+                turn_id: 0,
+                lines: Arc::from(Vec::<Line<'static>>::new()),
+                width: 0,
+                viewport_width: 0,
+                height: 0,
+                visual_offsets: Arc::from([]),
+            })];
+        }
 
         app.update_viewport_from_terminal_size();
 
@@ -3749,18 +3743,20 @@ mod tests {
         assert!(old_total > 0, "should have content");
 
         let viewport_height = app.history_viewport.height;
-        let mut display = app.active_display().unwrap();
-        display.history_scroll.scroll =
-            old_total.saturating_sub(viewport_height as usize) / 2;
-        drop(display);
+        {
+            let display = app.active_display().unwrap();
+            display.history_scroll.scroll =
+                old_total.saturating_sub(viewport_height as usize) / 2;
+        }
         assert!(app.effective_scroll() > 0, "should be scrolled up");
 
-        let mut display = app.active_display().unwrap();
-        display.view.turns.remove(&1);
-        assert_eq!(display.view.turns.len(), 1);
+        {
+            let display = app.active_display().unwrap();
+            display.view.turns.remove(&1);
+            assert_eq!(display.view.turns.len(), 1);
 
-        display.mark_content_changed();
-        drop(display);
+            display.mark_content_changed();
+        }
 
         app.compute_total_height_and_markers();
 
@@ -3778,17 +3774,21 @@ mod tests {
         app.rebuild_height_prefix();
 
         let viewport_height = app.history_viewport.height;
-        let mut display = app.active_display().unwrap();
-        let old_total = display.total_history_height();
-        display.history_scroll.scroll =
-            old_total.saturating_sub(viewport_height as usize) / 2;
-        let old_scroll = display.history_scroll.scroll;
-        drop(display);
+        let old_total;
+        let old_scroll;
+        {
+            let display = app.active_display().unwrap();
+            old_total = display.total_history_height();
+            display.history_scroll.scroll =
+                old_total.saturating_sub(viewport_height as usize) / 2;
+            old_scroll = display.history_scroll.scroll;
+        }
 
         insert_turn(&mut app, 1, "c", "d");
-        let mut display = app.active_display().unwrap();
-        display.mark_content_changed();
-        drop(display);
+        {
+            let display = app.active_display().unwrap();
+            display.mark_content_changed();
+        }
 
         app.compute_total_height_and_markers();
 
@@ -3804,10 +3804,11 @@ mod tests {
     #[test]
     fn mark_streaming_changed_sets_flags() {
         let mut app = test_app();
-        let display = app.active_display_ref().unwrap();
-        assert!(!display.streaming_dirty);
-        assert!(!display.content_dirty);
-        drop(display);
+        {
+            let display = app.active_display_ref().unwrap();
+            assert!(!display.streaming_dirty);
+            assert!(!display.content_dirty);
+        }
 
         app.mark_streaming_changed();
 
@@ -3819,7 +3820,7 @@ mod tests {
     #[test]
     fn mark_content_changed_resets_streaming_turn_index() {
         let mut app = test_app();
-        let mut display = app.active_display().unwrap();
+        let display = app.active_display().unwrap();
         display.markers_dirty = false;
         display.streaming_turn_index = Some(0);
 
