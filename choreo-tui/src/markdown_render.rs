@@ -276,10 +276,15 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
 /// Each section (user, assistant, tool results) is wrapped in the margin
 /// pattern (top separator, padding, content, padding, bottom separator)
 /// with role-specific accent colors.
+///
+/// `reasoning_expanded` controls whether the turn's reasoning body is shown
+/// below its collapsible header (the caller derives this from the default
+/// plus any user override — see [`reasoning_expanded_default`]).
 pub(crate) fn render_turn_lines(
     turn: &Turn,
     content_width: u16,
     tool_content_width: u16,
+    reasoning_expanded: bool,
 ) -> Vec<Line<'static>> {
     let mut all_lines: Vec<Line<'static>> = Vec::new();
 
@@ -304,30 +309,46 @@ pub(crate) fn render_turn_lines(
 
     // ── Assistant response block (blue accent) ───────────────
     //
-    // During streaming the reasoning section is shown first.  When the
-    // response starts streaming, `assistant_reasoning` is cleared (see
-    // `stream_chunk` in history.rs) so only the response appears.
-    // After completion, if both fields exist, only the response text
-    // is shown; if no response exists, the reasoning is shown instead.
-    // No "Reasoning:" or "Response:" headings are rendered.
+    // The reasoning section is collapsible.  A header line (arrow glyph +
+    // "Reasoning") is always rendered when reasoning content exists, and the
+    // reasoning body only when `reasoning_expanded` is true.  The response
+    // text is rendered whenever present.  Reasoning is retained in the turn
+    // even after the response streams (see `stream_chunk` in history.rs), so
+    // clicking the header lets the user re-expand the thinking after the
+    // answer replaces it.  No "Response:" heading is rendered.
     let has_assistant = turn.assistant_text.is_some() || turn.assistant_reasoning.is_some();
     if has_assistant {
         let mut body: Vec<Line<'static>> = Vec::new();
 
-        // Show response text preferentially — if present, it replaces
-        // any reasoning content that was shown during streaming.
+        let has_reasoning = turn
+            .assistant_reasoning
+            .as_deref()
+            .is_some_and(|r| !r.trim().is_empty());
+
+        // Collapsible reasoning header — always shown when reasoning exists so
+        // the user can re-expand it.  ▼ = expanded (body shown below the
+        // header), ▶ = collapsed (body hidden).  The header is dimmed so it
+        // reads as a control rather than message content.
+        if has_reasoning {
+            let arrow = if reasoning_expanded { "▼" } else { "▶" };
+            body.push(Line::from(vec![
+                Span::styled(format!("{arrow} "), Style::default().fg(Color::Gray)),
+                Span::styled("Reasoning", Style::default().fg(Color::Gray)),
+            ]));
+            if reasoning_expanded && let Some(ref reasoning) = turn.assistant_reasoning {
+                body.extend(markdown_lines(reasoning.trim(), content_width));
+            }
+        }
+
+        // Response text — shown whenever present.
         if let Some(ref text) = turn.assistant_text {
             let trimmed = text.trim();
             if !trimmed.is_empty() {
-                body.extend(markdown_lines(trimmed, content_width));
-            }
-        }
-        // Only show reasoning when there is no response text.
-        if turn.assistant_text.is_none()
-            && let Some(ref reasoning) = turn.assistant_reasoning
-        {
-            let trimmed = reasoning.trim();
-            if !trimmed.is_empty() {
+                // Separate the reasoning body from the response when both
+                // are visible so they don't merge into one paragraph.
+                if reasoning_expanded && has_reasoning {
+                    body.push(Line::from(Span::styled(String::new(), Style::default())));
+                }
                 body.extend(markdown_lines(trimmed, content_width));
             }
         }
@@ -421,6 +442,24 @@ pub(crate) fn render_turn_lines(
     }
 
     all_lines
+}
+
+/// Whether a turn's reasoning section should be shown expanded by default.
+///
+/// Reasoning defaults to expanded only while no response text exists yet
+/// (e.g. while it is still streaming); once a response arrives it defaults
+/// to collapsed so the response is the primary content.  The user can
+/// override this per turn by clicking the reasoning header.
+pub(crate) fn reasoning_expanded_default(turn: &Turn) -> bool {
+    let has_reasoning = turn
+        .assistant_reasoning
+        .as_deref()
+        .is_some_and(|r| !r.trim().is_empty());
+    let has_response = turn
+        .assistant_text
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty());
+    has_reasoning && !has_response
 }
 
 // ── Margin helpers (reused from current render system) ─────────────────
@@ -1695,7 +1734,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        let lines = render_turn_lines(&turn, 80, 85, false);
         assert!(!lines.is_empty());
         let text = lines
             .iter()
@@ -1719,7 +1758,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        let lines = render_turn_lines(&turn, 80, 85, false);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1742,21 +1781,22 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        // Default state for a turn with a response: reasoning collapsed.
+        let lines = render_turn_lines(&turn, 80, 85, false);
         let text = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        // When response text is present, only the response is shown;
-        // reasoning is hidden and no headings are rendered.
+        // The collapsible header is always shown when reasoning exists.
+        assert!(text.contains("Reasoning"), "reasoning header should appear");
         assert!(
-            !text.contains("Reasoning:"),
-            "reasoning header should NOT appear"
+            text.contains("▶"),
+            "collapsed reasoning shows a right-pointing arrow"
         );
         assert!(
             !text.contains("Let me think"),
-            "reasoning body should NOT appear"
+            "collapsed reasoning body should NOT appear"
         );
         assert!(
             !text.contains("Response:"),
@@ -1769,7 +1809,7 @@ mod tests {
     }
 
     #[test]
-    fn render_turn_lines_reasoning_bold_markdown() {
+    fn render_turn_lines_reasoning_collapsed_with_response() {
         let turn = Turn {
             created_at: choreo_proto::TimestampMs::now(),
             undone: false,
@@ -1782,20 +1822,51 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        let lines = render_turn_lines(&turn, 80, 85, false);
         let text = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        // Response text is present, so only the response shows.
-        assert!(
-            !text.contains("Reasoning:"),
-            "reasoning header should NOT appear"
-        );
+        // Response present + reasoning collapsed: header shown, body hidden.
+        assert!(text.contains("▶ Reasoning"), "header should be visible");
         assert!(
             !text.contains("Use **bold"),
             "reasoning body should NOT appear"
+        );
+        assert!(text.contains("Okay."), "response text should appear");
+        assert!(
+            !text.contains("**bold**"),
+            "markdown bold syntax should not appear literally in output"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_reasoning_expanded_with_response() {
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("Okay.".into()),
+            assistant_reasoning: Some("Use **bold** for emphasis.".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        // User re-expanded the reasoning: header points down and the body
+        // appears before the response.
+        let lines = render_turn_lines(&turn, 80, 85, true);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("▼ Reasoning"), "header should point down");
+        assert!(
+            text.contains("Use bold for emphasis."),
+            "reasoning body should appear when expanded"
         );
         assert!(text.contains("Okay."), "response text should appear");
         assert!(
@@ -1818,16 +1889,16 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        // No response text: reasoning defaults to expanded.
+        let lines = render_turn_lines(&turn, 80, 85, true);
         let text = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        // No response text, so reasoning is shown. No heading rendered.
         assert!(
-            !text.contains("Reasoning:"),
-            "reasoning header should NOT appear"
+            text.contains("▼ Reasoning"),
+            "reasoning header should appear and point down"
         );
         assert!(text.contains("code"), "code content should appear");
         assert!(
@@ -1850,17 +1921,17 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        let lines = render_turn_lines(&turn, 80, 85, false);
         let text = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        // Response is present, whitespace-only reasoning is skipped.
-        // No headings rendered.
+        // Whitespace-only reasoning is treated as absent: no header, and the
+        // response renders as before.
         assert!(
-            !text.contains("Reasoning:"),
-            "reasoning header should NOT appear"
+            !text.contains("Reasoning"),
+            "whitespace-only reasoning should not produce a header"
         );
         assert!(
             !text.contains("Response:"),
@@ -1886,22 +1957,79 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        // No response text: reasoning defaults to expanded.
+        let lines = render_turn_lines(&turn, 80, 85, true);
         let text = lines
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        // No response text, so reasoning is shown. No heading rendered.
-        assert!(
-            !text.contains("Reasoning:"),
-            "reasoning header should NOT appear"
-        );
+        assert!(text.contains("▼ Reasoning"), "header should appear");
         assert!(
             text.contains("fn main() {}"),
             "code block content should appear"
         );
         assert!(text.contains("```"), "code block fences should be visible");
+    }
+
+    #[test]
+    fn reasoning_expanded_default_with_response_is_collapsed() {
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("response".into()),
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        assert!(
+            !reasoning_expanded_default(&turn),
+            "response present → reasoning collapsed by default"
+        );
+    }
+
+    #[test]
+    fn reasoning_expanded_default_without_response_is_expanded() {
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        assert!(
+            reasoning_expanded_default(&turn),
+            "no response yet → reasoning expanded by default"
+        );
+    }
+
+    #[test]
+    fn reasoning_expanded_default_without_reasoning_is_collapsed() {
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("response".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        assert!(
+            !reasoning_expanded_default(&turn),
+            "no reasoning → no expanded section"
+        );
     }
 
     #[test]
@@ -1922,7 +2050,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        let lines = render_turn_lines(&turn, 80, 85, false);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1954,7 +2082,7 @@ mod tests {
             }],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        let lines = render_turn_lines(&turn, 80, 85, false);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1988,7 +2116,7 @@ mod tests {
             }],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        let lines = render_turn_lines(&turn, 80, 85, false);
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2012,7 +2140,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        let lines = render_turn_lines(&turn, 80, 85, false);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].width(), 0);
     }
@@ -2031,7 +2159,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85);
+        let lines = render_turn_lines(&turn, 80, 85, false);
         let text = lines
             .iter()
             .map(|l| l.to_string())

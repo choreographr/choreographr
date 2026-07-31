@@ -1006,7 +1006,23 @@ fn handle_chat_event(
                 // the correct image index — no text-height recomputation
                 // or cache dependency needed.
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some((turn_idx, offset)) = find_turn_at_row(app, mouse.row)
+                    // A click on the reasoning header row toggles the
+                    // collapsible reasoning section.  Checked before image
+                    // hit-testing so the header wins when they overlap.
+                    let reasoning_toggle =
+                        find_turn_at_row(app, mouse.row).and_then(|(turn_idx, offset)| {
+                            let display = app.active_display_ref()?;
+                            let layout = display.turn_layouts.get(turn_idx)?;
+                            let (start, end) = layout.reasoning_header_range?;
+                            (offset >= start && offset < end)
+                                .then(|| display.visible_turn_ids.get(turn_idx).copied())
+                                .flatten()
+                        });
+                    if let Some(turn_id) = reasoning_toggle {
+                        if let Some(display) = app.active_display() {
+                            display.toggle_reasoning(turn_id);
+                        }
+                    } else if let Some((turn_idx, offset)) = find_turn_at_row(app, mouse.row)
                         && let Some(layout) =
                             app.active_display_ref().unwrap().turn_layouts.get(turn_idx)
                         && let Some(img_idx) = layout

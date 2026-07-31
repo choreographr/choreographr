@@ -1,4 +1,4 @@
-use crate::markdown_render::{display_width, render_turn_lines};
+use crate::markdown_render::{display_width, reasoning_expanded_default, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
     AI_PROVIDER_ITEM_LINES, AIProvidersView, App, CTRL_HELP_LINE1, CTRL_HELP_LINE2,
@@ -453,13 +453,22 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                 continue;
             }
             let count = turn.displayed_images.len();
+            // Effective reasoning visibility: user override (header click)
+            // falling back to the streaming-derived default.  Cache misses
+            // recompute with this value; toggle invalidates the slot so the
+            // cached lines can never go stale.
+            let reasoning_expanded = display
+                .reasoning_override
+                .get(&turn_id)
+                .copied()
+                .unwrap_or_else(|| reasoning_expanded_default(turn));
             let (arc, height, offsets) = cached_or_compute_lines(
                 &mut display.render_cache,
                 i,
                 turn_id,
                 content_width,
                 area.width,
-                || render_turn_lines(turn, content_width, tool_content_width),
+                || render_turn_lines(turn, content_width, tool_content_width, reasoning_expanded),
             );
             (arc, height, offsets, count)
         };

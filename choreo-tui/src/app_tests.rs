@@ -7,7 +7,9 @@ use choreo_proto::{
     ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, ReasoningCapability,
     SessionStatus, TokenUsage, Turn,
 };
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::text::Line;
 use tui_prompts::State;
 
@@ -2102,6 +2104,65 @@ fn commit_does_not_duplicate_user_text() {
 
     assert_eq!(app.user_texts().len(), 1);
     assert_eq!(app.user_texts()[0], "hello");
+}
+
+#[test]
+fn click_on_reasoning_header_toggles_collapse() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 20;
+
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: Some("Response text.".into()),
+        assistant_reasoning: Some("Hidden thinking.".into()),
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+    };
+    app.active_display()
+        .unwrap()
+        .view
+        .insert_or_replace(1, turn);
+    app.rebuild_height_prefix();
+
+    // No user text, so the reasoning header is the first line of the turn
+    // (content line 0, a single row).
+    let (start, end) = app.active_display().unwrap().turn_layouts[0]
+        .reasoning_header_range
+        .expect("reasoning header range should exist");
+    assert_eq!((start, end), (0, 1), "header occupies the first row");
+
+    // `find_turn_at_row` maps screen rows linearly only when the history
+    // fills the viewport, so size the viewport to the content and click the
+    // top row, which corresponds to content line 0.
+    let total = app.active_display().unwrap().total_history_height();
+    app.history_viewport.height = total as u16;
+    let row = 0u16;
+
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle click");
+
+    // Default was collapsed (response present) → the click expands it.
+    assert_eq!(
+        app.active_display().unwrap().reasoning_override.get(&1),
+        Some(&true),
+        "clicking the header should expand reasoning"
+    );
 }
 
 #[test]

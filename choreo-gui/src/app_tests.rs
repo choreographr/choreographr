@@ -76,7 +76,8 @@ fn app_state_stream_updates_history() {
         .expect("turn 1 should exist");
 
     assert_eq!(turn.assistant_text.as_deref(), Some("hello world"));
-    // assistant_reasoning is cleared when Answer stream starts (see stream_chunk)
+    // Reasoning content is retained alongside the response (see stream_chunk)
+    // so UIs can offer a collapsible reasoning view after the answer arrives.
 }
 
 #[test]

@@ -15,7 +15,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::markdown_render::{
-    compute_visual_offsets, lines_height, plain_text_lines, render_turn_lines,
+    MARGIN_STRUCTURAL_ROWS, compute_visual_offsets, lines_height, markdown_lines, plain_text_lines,
+    reasoning_expanded_default, render_turn_lines,
 };
 use ratatui::text::Line;
 use tui_prompts::{SelectState, State, TextState};
@@ -339,11 +340,15 @@ pub(crate) struct Marker {
     pub virtual_slot: usize,
 }
 
-/// Per-turn image content-line ranges, computed alongside `height_prefix`.
-/// Maps a content-line offset within the turn to the correct image index
-/// in the click handler — no text-height recomputation needed.
+/// Per-turn content-line ranges used for click hit-testing, computed
+/// alongside `height_prefix`.  Maps a content-line offset within the turn to
+/// the reasoning header or the correct image index — no text-height
+/// recomputation needed in the click handler.
 #[derive(Debug)]
-pub(crate) struct TurnImageLayout {
+pub(crate) struct TurnLayout {
+    /// (start, end) content-line range of the reasoning header row(s),
+    /// relative to the turn's start.  None when the turn has no reasoning.
+    pub reasoning_header_range: Option<(usize, usize)>,
     /// (start, end) content-line ranges for each displayed image,
     /// relative to the turn's start.  Empty when the turn has no images.
     pub image_ranges: Vec<(usize, usize)>,
@@ -422,7 +427,12 @@ pub(crate) struct SessionDisplayState {
     pub(crate) streaming_dirty: bool,
     pub(crate) content_dirty: bool,
     pub(crate) history_scroll: HistoryScrollState,
-    pub(crate) turn_layouts: Vec<TurnImageLayout>,
+    pub(crate) turn_layouts: Vec<TurnLayout>,
+    /// Per-turn explicit reasoning visibility (turn_id → expanded) set by
+    /// clicking the reasoning header.  Absent entries fall back to
+    /// [`reasoning_expanded_default`] (expanded while streaming, collapsed
+    /// once a response exists).
+    pub(crate) reasoning_override: HashMap<u32, bool>,
     pub(crate) render_cache: Vec<Option<RenderedCache>>,
     pub(crate) active: HashSet<u32>,
     pub(crate) live_input_estimate: u32,
@@ -454,6 +464,7 @@ impl Default for SessionDisplayState {
             content_dirty: false,
             history_scroll: HistoryScrollState::new(),
             turn_layouts: Vec::new(),
+            reasoning_override: HashMap::new(),
             render_cache: Vec::new(),
             active: HashSet::new(),
             live_input_estimate: 0,
@@ -1563,6 +1574,7 @@ impl App {
         display.height_prefix.clear();
         display.turn_heights.clear();
         display.turn_layouts.clear();
+        display.reasoning_override.clear();
         display.streaming_turn_index = None;
         display.streaming_dirty = false;
         display.markers_dirty = true;
@@ -2042,14 +2054,49 @@ impl SessionDisplayState {
             let content_width = viewport.width.saturating_sub(9);
             let tool_content_width = viewport.width.saturating_sub(4);
 
-            let (_text_lines, text_height, _visual_offsets) = cached_or_compute_lines(
+            // Effective reasoning visibility for this turn: the per-turn
+            // user override (from clicking the header), falling back to the
+            // streaming-derived default.
+            let reasoning_expanded = self
+                .reasoning_override
+                .get(&turn_id)
+                .copied()
+                .unwrap_or_else(|| reasoning_expanded_default(turn));
+
+            let (_text_lines, text_height, text_offsets) = cached_or_compute_lines(
                 &mut self.render_cache,
                 visible_idx,
                 turn_id,
                 content_width,
                 viewport.width,
-                || render_turn_lines(turn, content_width, tool_content_width),
+                || render_turn_lines(turn, content_width, tool_content_width, reasoning_expanded),
             );
+
+            // The reasoning header (when present) is the first line of the
+            // assistant block, which directly follows the user block (margin
+            // rows + user body).  Its visual-row range is derived from the
+            // cached line offsets so the click handler can hit-test it in
+            // O(1) — same approach as image ranges.
+            let has_reasoning = turn
+                .assistant_reasoning
+                .as_deref()
+                .is_some_and(|r| !r.trim().is_empty());
+            let reasoning_header_range = if has_reasoning {
+                let header_idx = turn
+                    .user_text
+                    .as_ref()
+                    .map(|t| markdown_lines(t, content_width).len() + MARGIN_STRUCTURAL_ROWS)
+                    .unwrap_or(0);
+                let start = if header_idx == 0 {
+                    0
+                } else {
+                    text_offsets[header_idx - 1]
+                };
+                let end = text_offsets[header_idx];
+                Some((start, end))
+            } else {
+                None
+            };
 
             let mut image_ranges: Vec<(usize, usize)> = Vec::new();
             let mut total_img_height: usize = 0;
@@ -2058,7 +2105,10 @@ impl SessionDisplayState {
                 image_ranges.push((start, start + fallback_img_height));
                 total_img_height += fallback_img_height;
             }
-            self.turn_layouts.push(TurnImageLayout { image_ranges });
+            self.turn_layouts.push(TurnLayout {
+                reasoning_header_range,
+                image_ranges,
+            });
             let turn_height = text_height + total_img_height;
             self.turn_heights.push(turn_height);
             if turn.user_text.is_some() {
@@ -2096,6 +2146,28 @@ impl SessionDisplayState {
         self.content_dirty = true;
         self.streaming_turn_index = None;
         self.streaming_dirty = false;
+    }
+
+    /// Toggle the reasoning section's visibility for a turn (clicking the
+    /// header).  Records the explicit user preference in `reasoning_override`
+    /// and invalidates the turn's render cache so the change takes effect on
+    /// the next frame.
+    pub(crate) fn toggle_reasoning(&mut self, turn_id: u32) {
+        let Some(turn) = self.view.turns.get(&turn_id) else {
+            return;
+        };
+        let current = self
+            .reasoning_override
+            .get(&turn_id)
+            .copied()
+            .unwrap_or_else(|| reasoning_expanded_default(turn));
+        self.reasoning_override.insert(turn_id, !current);
+        if let Some(idx) = self.visible_turn_ids.iter().position(|id| *id == turn_id)
+            && let Some(slot) = self.render_cache.get_mut(idx)
+        {
+            *slot = None;
+        }
+        self.mark_content_changed();
     }
 
     pub(crate) fn resolve_streaming_turn_index(&mut self, request_id: u32) {
@@ -2156,12 +2228,21 @@ impl SessionDisplayState {
         let content_width = viewport.width.saturating_sub(9);
         let tool_content_width = viewport.width.saturating_sub(4);
 
+        // Re-render with the effective reasoning visibility so the streaming
+        // fast path stays consistent with the collapsed/expanded state.
+        let reasoning_expanded = self
+            .reasoning_override
+            .get(&turn_id)
+            .copied()
+            .unwrap_or_else(|| reasoning_expanded_default(turn));
+
         if let Some(Some(cached)) = self.render_cache.get_mut(turn_idx)
             && cached.turn_id == turn_id
             && cached.width == content_width
             && cached.viewport_width == viewport.width
         {
-            let text_lines = render_turn_lines(turn, content_width, tool_content_width);
+            let text_lines =
+                render_turn_lines(turn, content_width, tool_content_width, reasoning_expanded);
             let text_height = lines_height(&text_lines, viewport.width).max(1);
             let visual_offsets = compute_visual_offsets(&text_lines, viewport.width);
 
@@ -2418,7 +2499,24 @@ impl TurnEventHandler for App {
         data: Cow<'_, str>,
     ) {
         let display = self.display_for(session_id);
+        // Detect the first Answer chunk for this request: the turn has no
+        // response text yet, so this chunk begins the response phase.
+        let turn_id = display.view.request_to_turn.get(&request_id).copied();
+        let first_answer = matches!(stream, OutputStream::Answer)
+            && turn_id
+                .and_then(|id| display.view.turns.get(&id))
+                .is_some_and(|t| t.assistant_text.is_none());
+
         display.view.stream_chunk(request_id, stream, &data);
+
+        // Auto-collapse reasoning when the response starts — drop any
+        // explicit expansion override so the derived default (collapsed once
+        // a response exists) takes over.  The user can re-expand it by
+        // clicking the header.
+        if first_answer && let Some(turn_id) = turn_id {
+            display.reasoning_override.remove(&turn_id);
+        }
+
         display.resolve_streaming_turn_index(request_id);
         display.mark_streaming_changed();
     }
@@ -3315,7 +3413,7 @@ mod tests {
         let text_h = {
             let display = app.active_display().unwrap();
             let turn = &display.view.turns[&2];
-            lines_height(&render_turn_lines(turn, 71, vp_width), vp_width).max(1)
+            lines_height(&render_turn_lines(turn, 71, vp_width, false), vp_width).max(1)
         };
 
         let layout = &app.active_display().unwrap().turn_layouts[0];
@@ -3328,6 +3426,234 @@ mod tests {
         let (s1, e1) = layout.image_ranges[1];
         assert_eq!(s1, text_h + fallback_h);
         assert_eq!(e1, text_h + 2 * fallback_h);
+    }
+
+    // ── TurnLayout reasoning_header_range ──
+
+    #[test]
+    fn turn_layout_reasoning_header_range_present() {
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("hello".into()),
+            assistant_text: Some("world".into()),
+            assistant_reasoning: Some("think".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(1, turn);
+        app.rebuild_height_prefix();
+
+        let layout = &app.active_display().unwrap().turn_layouts[0];
+        let Some((start, end)) = layout.reasoning_header_range else {
+            panic!("reasoning header range should be present");
+        };
+        assert!(
+            start < end,
+            "header range must be non-empty ({start}..{end})"
+        );
+        // No images on this turn, so the full turn height is its text block;
+        // the header must lie inside it.
+        let turn_h = app.active_display().unwrap().turn_heights[0];
+        assert!(end <= turn_h, "header must lie within the turn text");
+    }
+
+    #[test]
+    fn turn_layout_reasoning_header_range_none_without_reasoning() {
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("hello".into()),
+            assistant_text: Some("world".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(1, turn);
+        app.rebuild_height_prefix();
+
+        let layout = &app.active_display().unwrap().turn_layouts[0];
+        assert!(
+            layout.reasoning_header_range.is_none(),
+            "no reasoning → no header range"
+        );
+    }
+
+    // ── toggle_reasoning ──
+
+    #[test]
+    fn toggle_reasoning_flips_override_and_invalidates_cache() {
+        let mut app = test_app();
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("response".into()),
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, turn);
+        display.visible_turn_ids.push(1);
+        display.render_cache = vec![Some(RenderedCache {
+            turn_id: 1,
+            lines: Arc::from(vec![Line::from("stale")]),
+            width: 71,
+            viewport_width: 80,
+            height: 1,
+            visual_offsets: Arc::from([1]),
+        })];
+
+        // Default is collapsed (response present) → first click expands.
+        display.toggle_reasoning(1);
+        assert_eq!(
+            display.reasoning_override.get(&1),
+            Some(&true),
+            "first click should expand"
+        );
+        assert!(
+            display.render_cache[0].is_none(),
+            "toggle must invalidate the render cache"
+        );
+
+        // Second click collapses again.
+        display.toggle_reasoning(1);
+        assert_eq!(
+            display.reasoning_override.get(&1),
+            Some(&false),
+            "second click should collapse"
+        );
+    }
+
+    #[test]
+    fn toggle_reasoning_missing_turn_is_noop() {
+        let mut app = test_app();
+        let display = app.active_display().unwrap();
+        display.toggle_reasoning(999);
+        assert!(
+            display.reasoning_override.is_empty(),
+            "unknown turn should not record an override"
+        );
+    }
+
+    #[test]
+    fn toggle_reasoning_default_expanded_without_response() {
+        let mut app = test_app();
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, turn);
+        // No response yet → default expanded → first click collapses.
+        display.toggle_reasoning(1);
+        assert_eq!(
+            display.reasoning_override.get(&1),
+            Some(&false),
+            "first click on streaming reasoning should collapse"
+        );
+    }
+
+    // ── auto-collapse on first answer chunk ──
+
+    #[test]
+    fn first_answer_chunk_auto_collapses_reasoning() {
+        let mut app = test_app();
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, turn);
+        display.view.request_to_turn.insert(7, 1);
+        // The user expanded reasoning during streaming.
+        display.reasoning_override.insert(1, true);
+
+        app.handle_request_stream(0, 7, OutputStream::Answer, Cow::Borrowed("Hi"));
+
+        let display = app.active_display().unwrap();
+        assert!(
+            !display.reasoning_override.contains_key(&1),
+            "first answer chunk should auto-collapse reasoning"
+        );
+        assert_eq!(display.view.turns[&1].assistant_text.as_deref(), Some("Hi"));
+        assert!(
+            display.view.turns[&1].assistant_reasoning.is_some(),
+            "reasoning content must be retained after the response streams"
+        );
+    }
+
+    #[test]
+    fn reasoning_chunk_keeps_expansion_override() {
+        let mut app = test_app();
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let display = app.active_display().unwrap();
+        display.view.insert_or_replace(1, turn);
+        display.view.request_to_turn.insert(7, 1);
+        display.reasoning_override.insert(1, true);
+
+        app.handle_request_stream(0, 7, OutputStream::Reasoning, Cow::Borrowed(" more"));
+
+        let display = app.active_display().unwrap();
+        assert_eq!(
+            display.reasoning_override.get(&1),
+            Some(&true),
+            "reasoning chunks must not collapse the section"
+        );
+        assert_eq!(
+            display.view.turns[&1].assistant_reasoning.as_deref(),
+            Some("thinking more"),
+            "reasoning chunk should append to the reasoning text"
+        );
     }
 
     // ── apply_image_result ──
