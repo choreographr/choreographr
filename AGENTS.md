@@ -61,4 +61,4 @@ Before committing:
 2. Stage changes with `git add`
 3. Commit with `git commit`
 
-A `.githooks/pre-commit` hook auto-fixes `clippy` and `fmt` on every commit. The model should not run clippy or fmt manually during development — the hook handles them.
+The `.githooks/pre-commit` hook has been removed. Run `cargo clippy` and `cargo fmt` manually before committing.

@@ -1,4 +1,0 @@
-#!/bin/sh
-cargo clippy --fix --allow-dirty --allow-staged --workspace
-cargo fmt
-git diff --cached --name-only | xargs git add
