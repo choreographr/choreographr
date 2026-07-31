@@ -1027,6 +1027,20 @@ Implementation details:
   These no longer require `&mut SessionState` (they route mutations to the
   session main loop via `DaemonCommand`), but they still execute serially so
   same-turn ordering of session-config mutations is preserved.
+- **Worker-copy mirror (Phase 3)** — after every tool in the response has
+  executed, `run_agent_loop` mirrors successful session-config mutations onto
+  its own worker config copy so the next agent-loop iteration observes them
+  (tool definitions, system content, working-dir-relative file ops): the
+  shared `apply_load_tools`/`apply_unload_tools` for the group sets, and the
+  same `resolve_path` + `canonicalize` resolution for `set_working_dir`
+  (against the working directory in effect when the response was planned,
+  so repeated relative `set_working_dir` calls match what the main loop
+  applied verbatim). The mirror is deferred until the end of the response
+  because the model planned every tool call in the batch against the
+  pre-change state (parallel semantics) — `set_working_dir` therefore takes
+  effect on the next agent-loop turn, matching its advertised description.
+  The worker copy is discarded at request end, so it cannot drift from the
+  main loop's authoritative state across requests.
 - **Concurrent** — all remaining tools (shell, filesystem, VM, HTTP, Git,
   `spawn_subsession`, etc.) — tools whose execution is independent of session state.
   These are dispatched across multiple OS threads in parallel using `spawn_single_tool()`.

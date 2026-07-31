@@ -14,7 +14,7 @@ use tracing::info;
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct LoadToolsArgs {
     /// Tool groups to activate.
-    groups: Vec<String>,
+    pub(crate) groups: Vec<String>,
 }
 
 // ── Execute ────────────────────────────────────────────────────────────────
@@ -175,8 +175,8 @@ impl Tool for LoadTools {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::context::ToolContext;
     use crate::tools::ToolRegistry;
+    use crate::tools::context::ToolContext;
     use std::sync::Arc;
 
     /// Build a ToolContext with a mock daemon channel, plus the receiver so
@@ -210,7 +210,10 @@ mod tests {
             DaemonCommand::LoadTools { reply: tx, .. } => {
                 tx.send(reply).unwrap();
             }
-            other => panic!("expected LoadTools, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected LoadTools, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
         (handle.join().unwrap(), cmd)
     }
@@ -243,16 +246,12 @@ mod tests {
         let args = LoadToolsArgs {
             groups: vec!["shell".into(), "x".into()],
         };
-        let (result, cmd) = run_with_daemon_reply(
-            args,
-            Ok("Activated tool groups: shell and x".into()),
-        );
+        let (result, cmd) =
+            run_with_daemon_reply(args, Ok("Activated tool groups: shell and x".into()));
         assert_eq!(result.unwrap(), "Activated tool groups: shell and x");
         match cmd {
             DaemonCommand::LoadTools {
-                session_id,
-                groups,
-                ..
+                session_id, groups, ..
             } => {
                 assert_eq!(session_id, 42);
                 assert_eq!(groups, vec!["shell", "x"]);
@@ -266,10 +265,14 @@ mod tests {
         let args = LoadToolsArgs {
             groups: vec!["shell".into()],
         };
-        let (result, _cmd) =
-            run_with_daemon_reply(args, Err("session is not active".into()));
+        let (result, _cmd) = run_with_daemon_reply(args, Err("session is not active".into()));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("session is not active"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("session is not active")
+        );
     }
 
     #[test]

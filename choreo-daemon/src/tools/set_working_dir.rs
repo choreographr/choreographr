@@ -12,7 +12,7 @@ use tracing::info;
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct SetWorkingDirArgs {
     /// Absolute path or path relative to the current session working directory.
-    path: String,
+    pub(crate) path: String,
 }
 
 // ── Result ─────────────────────────────────────────────────────────────────
@@ -190,9 +190,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
-        let args = SetWorkingDirArgs {
-            path: "sub".into(),
-        };
+        let args = SetWorkingDirArgs { path: "sub".into() };
 
         let result = execute_set_working_dir(&args, Some(dir.path()), Some(&ctx));
         assert!(result.is_ok(), "expected ok: {:?}", result.err());
@@ -258,7 +256,10 @@ mod tests {
             path: "/home/user/project".into(),
         };
         let desc = describe_invocation(&args);
-        assert_eq!(desc, "Changing session working directory to '/home/user/project'.");
+        assert_eq!(
+            desc,
+            "Changing session working directory to '/home/user/project'."
+        );
     }
 
     #[test]

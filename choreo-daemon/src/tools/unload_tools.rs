@@ -14,7 +14,7 @@ use tracing::info;
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub(crate) struct UnloadToolsArgs {
     /// Tool groups to deactivate.
-    groups: Vec<String>,
+    pub(crate) groups: Vec<String>,
 }
 
 // ── Execute ────────────────────────────────────────────────────────────────
@@ -188,8 +188,8 @@ impl Tool for UnloadTools {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::context::ToolContext;
     use crate::tools::ToolRegistry;
+    use crate::tools::context::ToolContext;
     use std::sync::Arc;
 
     /// Build a ToolContext with a mock daemon channel, plus the receiver so
@@ -224,7 +224,10 @@ mod tests {
             DaemonCommand::UnloadTools { reply: tx, .. } => {
                 tx.send(reply).unwrap();
             }
-            other => panic!("expected UnloadTools, got {:?}", std::mem::discriminant(other)),
+            other => panic!(
+                "expected UnloadTools, got {:?}",
+                std::mem::discriminant(other)
+            ),
         }
         (handle.join().unwrap(), cmd)
     }
@@ -233,10 +236,9 @@ mod tests {
 
     #[test]
     fn apply_removes_groups() {
-        let mut active: HashSet<String> =
-            ["core".into(), "git".into(), "shell".into(), "x".into()]
-                .into_iter()
-                .collect();
+        let mut active: HashSet<String> = ["core".into(), "git".into(), "shell".into(), "x".into()]
+            .into_iter()
+            .collect();
         let result = apply_unload_tools(&mut active, &["x".into()]);
         assert_eq!(result, "Deactivated tool groups: x");
         assert!(!active.contains("x"));
@@ -280,9 +282,7 @@ mod tests {
         assert_eq!(result.unwrap(), "Deactivated tool groups: x");
         match cmd {
             DaemonCommand::UnloadTools {
-                session_id,
-                groups,
-                ..
+                session_id, groups, ..
             } => {
                 assert_eq!(session_id, 42);
                 assert_eq!(groups, vec!["x"]);
@@ -296,10 +296,14 @@ mod tests {
         let args = UnloadToolsArgs {
             groups: vec!["x".into()],
         };
-        let (result, _cmd) =
-            run_with_daemon_reply(args, Err("session is not active".into()));
+        let (result, _cmd) = run_with_daemon_reply(args, Err("session is not active".into()));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("session is not active"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("session is not active")
+        );
     }
 
     #[test]

@@ -8,7 +8,12 @@ use crate::providers::{
 };
 use crate::sessions::{RequestContext, SessionCommand, SessionState};
 use crate::tools::context::ToolContext;
-use crate::tools::{PreparedImage, ToolError, ToolOutput, ToolOutputFormat, ToolRegistry};
+use crate::tools::load_tools::{LoadToolsArgs, apply_load_tools};
+use crate::tools::set_working_dir::SetWorkingDirArgs;
+use crate::tools::unload_tools::{UnloadToolsArgs, apply_unload_tools};
+use crate::tools::{
+    PreparedImage, ToolError, ToolOutput, ToolOutputFormat, ToolRegistry, resolve_path,
+};
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
@@ -232,7 +237,14 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
     // Forwards streaming output chunks to subscribers as they arrive.
     // Exits when the output channel is disconnected (tool finished) or
     // a kill signal is received (we stopped waiting).
-    spawn_forwarding_thread(cmd_tx, session_id, request_id, tool_call.id.clone(), output_rx, kill_rx);
+    spawn_forwarding_thread(
+        cmd_tx,
+        session_id,
+        request_id,
+        tool_call.id.clone(),
+        output_rx,
+        kill_rx,
+    );
 
     // ── Execution thread ───────────────────────────────────────────
     let tc = tool_call.clone();
@@ -589,6 +601,101 @@ fn collect_tool_result(params: CollectToolResultParams) {
     );
 }
 
+/// Mirror a successful session-config tool's mutation onto the request
+/// worker's copy of the session configuration.
+///
+/// The authoritative mutation is applied by the session main loop (via
+/// DaemonCommand → SessionCommand routing); this worker copy must be updated
+/// as well so the NEXT agent-loop iteration observes the change when it
+/// rebuilds tool definitions, system content, and working-dir-relative file
+/// operations. Called only after every tool in the current response has
+/// executed (Phase 3 of the tool-use arm in `run_agent_loop`).
+///
+/// `base_working_dir` is the working directory in effect when the response
+/// was planned — every `set_working_dir` call in the response resolved
+/// against it, so mirroring must too (chaining relative resolutions against
+/// the mutated copy would diverge from the canonical paths the tools sent
+/// to the main loop, which applies them verbatim in call order).
+fn mirror_session_config_change(
+    session: &mut SessionState,
+    tool_call: &ChatToolCall,
+    base_working_dir: Option<&Path>,
+) {
+    match tool_call.name.as_str() {
+        "load_tools" => {
+            let Ok(args) = serde_json::from_str::<LoadToolsArgs>(&tool_call.arguments_json) else {
+                warn!(
+                    tool_call_id = %tool_call.id,
+                    "load_tools: could not parse args to mirror onto worker config",
+                );
+                return;
+            };
+            apply_load_tools(&mut session.config.active_tool_groups, &args.groups);
+            debug!(
+                tool_call_id = %tool_call.id,
+                groups = ?args.groups,
+                "mirrored load_tools onto worker session config",
+            );
+        }
+        "unload_tools" => {
+            let Ok(args) = serde_json::from_str::<UnloadToolsArgs>(&tool_call.arguments_json)
+            else {
+                warn!(
+                    tool_call_id = %tool_call.id,
+                    "unload_tools: could not parse args to mirror onto worker config",
+                );
+                return;
+            };
+            apply_unload_tools(&mut session.config.active_tool_groups, &args.groups);
+            debug!(
+                tool_call_id = %tool_call.id,
+                groups = ?args.groups,
+                "mirrored unload_tools onto worker session config",
+            );
+        }
+        "set_working_dir" => {
+            let Ok(args) = serde_json::from_str::<SetWorkingDirArgs>(&tool_call.arguments_json)
+            else {
+                warn!(
+                    tool_call_id = %tool_call.id,
+                    "set_working_dir: could not parse args to mirror onto worker config",
+                );
+                return;
+            };
+            // Reproduce the tool's resolution exactly: tilde expansion +
+            // relative-to-base resolution, then canonicalization (which also
+            // enforces the existence check). If the path vanished between the
+            // tool's execution and now (TOCTOU), skip the mirror — the
+            // authoritative copy still holds the change and will win on the
+            // next request.
+            let resolved = resolve_path(&args.path, base_working_dir);
+            let canonical = match resolved.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        tool_call_id = %tool_call.id,
+                        path = %resolved.display(),
+                        error = %e,
+                        "set_working_dir: cannot re-resolve path for worker mirror; skipping",
+                    );
+                    return;
+                }
+            };
+            session.config.working_dir = Some(canonical.clone());
+            // Invalidate the skill cache so skills are re-discovered from
+            // the new working directory on the next agent-loop turn — the
+            // main-loop handler does the same for the authoritative state.
+            session.discovered_skills = None;
+            debug!(
+                tool_call_id = %tool_call.id,
+                path = %canonical.display(),
+                "mirrored set_working_dir onto worker session config",
+            );
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn run_agent_loop(
     client: &InferenceProvider,
     session: &mut SessionState,
@@ -824,6 +931,18 @@ pub(crate) fn run_agent_loop(
                         )
                     });
 
+                // All session-config tools in this response resolve relative
+                // paths against the working directory in effect when the
+                // response was planned. Capture it once so the Phase 3 mirror
+                // reproduces exactly the canonical paths the tools sent to
+                // the main loop (which applies them verbatim, in call order).
+                let turn_base_working_dir = session.config.working_dir.clone();
+
+                // Successful session-config mutations, in call order, to be
+                // mirrored onto this worker's config copy once every tool in
+                // the response has executed (see Phase 3 below).
+                let mut pending_config_changes: Vec<ChatToolCall> = Vec::new();
+
                 // ── Phase 1: Session-config tools (serial) ────────
                 for tool_call in mutators.into_iter() {
                     if is_cancelled_once(cancel_rx) {
@@ -907,6 +1026,14 @@ pub(crate) fn run_agent_loop(
                         known_hint_paths: &mut known_hint_paths,
                         pending_hints: &mut pending_hints,
                     });
+
+                    // Only mirror mutations that were actually accepted: an
+                    // error (e.g. inactive session, daemon communication
+                    // failure) means the authoritative state was NOT changed,
+                    // so this worker must not pretend it was.
+                    if !output.is_error {
+                        pending_config_changes.push(tool_call.clone());
+                    }
                 }
 
                 // ── Phase 2: All remaining tools (concurrent) ───────
@@ -1059,6 +1186,29 @@ pub(crate) fn run_agent_loop(
                             pending_hints: &mut pending_hints,
                         });
                     }
+                }
+
+                // ── Phase 3: Mirror session-config changes onto the
+                //    worker's config copy ────────────────────────────
+                //
+                // The authoritative mutations were applied by the session
+                // main loop. The worker's throwaway copy must be updated too,
+                // or the next loop iteration would keep building tool
+                // definitions, system content, and file ops from the stale
+                // pre-change state. This runs only after every tool in the
+                // response has executed: the model planned all of them
+                // against the state at the start of the turn (they are a
+                // parallel batch), so applying the change earlier — e.g.
+                // right after Phase 1 — would silently alter the semantics
+                // of tools batched alongside the config change. The worker
+                // copy is still discarded at request end, so the two copies
+                // cannot drift across requests.
+                for tool_call in &pending_config_changes {
+                    mirror_session_config_change(
+                        session,
+                        tool_call,
+                        turn_base_working_dir.as_deref(),
+                    );
                 }
             }
             Err(choreo_proto::InferenceError::Cancelled) => {
@@ -1488,6 +1638,100 @@ mod tests {
         let (tx, rx) = mpsc::channel::<()>();
         tx.send(()).unwrap();
         assert!(is_cancelled_once(&rx));
+    }
+
+    // -- mirror_session_config_change tests ---------------------------------
+
+    fn config_change_call(name: &str, arguments_json: &str) -> ChatToolCall {
+        ChatToolCall {
+            id: "call_1".into(),
+            name: name.into(),
+            arguments_json: arguments_json.into(),
+            caller: None,
+        }
+    }
+
+    #[test]
+    fn mirror_load_tools_updates_worker_active_groups() {
+        let mut session = SessionState::empty();
+        session.config.active_tool_groups = ["core".into(), "git".into()].into_iter().collect();
+        let tool_call = config_change_call("load_tools", r#"{"groups": ["shell", "x"]}"#);
+
+        mirror_session_config_change(&mut session, &tool_call, None);
+
+        assert!(session.config.active_tool_groups.contains("shell"));
+        assert!(session.config.active_tool_groups.contains("x"));
+        assert!(session.config.active_tool_groups.contains("core"));
+    }
+
+    #[test]
+    fn mirror_unload_tools_updates_worker_active_groups() {
+        let mut session = SessionState::empty();
+        session.config.active_tool_groups = ["core".into(), "git".into(), "shell".into()]
+            .into_iter()
+            .collect();
+        let tool_call = config_change_call("unload_tools", r#"{"groups": ["shell"]}"#);
+
+        mirror_session_config_change(&mut session, &tool_call, None);
+
+        assert!(!session.config.active_tool_groups.contains("shell"));
+        assert!(session.config.active_tool_groups.contains("core"));
+    }
+
+    #[test]
+    fn mirror_set_working_dir_updates_worker_and_invalidates_skills() {
+        let mut session = SessionState::empty();
+        let base = tempfile::tempdir().unwrap();
+        let sub = base.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        // Pre-populate the skill cache so we can verify it gets invalidated.
+        session.discovered_skills = Some(Vec::new());
+        let tool_call = config_change_call("set_working_dir", r#"{"path": "sub"}"#);
+
+        mirror_session_config_change(&mut session, &tool_call, Some(base.path()));
+
+        // The mirror resolves relative to the BASE working dir (the one the
+        // tool itself resolved against), not the worker's current copy.
+        assert_eq!(
+            session.config.working_dir.as_deref(),
+            Some(sub.canonicalize().unwrap().as_path())
+        );
+        assert!(
+            session.discovered_skills.is_none(),
+            "skill cache must be invalidated by the mirror"
+        );
+    }
+
+    #[test]
+    fn mirror_set_working_dir_nonexistent_path_is_skipped() {
+        let mut session = SessionState::empty();
+        let base = tempfile::tempdir().unwrap();
+        let tool_call = config_change_call("set_working_dir", r#"{"path": "does-not-exist"}"#);
+
+        mirror_session_config_change(&mut session, &tool_call, Some(base.path()));
+
+        assert!(session.config.working_dir.is_none());
+    }
+
+    #[test]
+    fn mirror_unknown_tool_is_noop() {
+        let mut session = SessionState::empty();
+        let tool_call = config_change_call("read_file", r#"{"path": "x"}"#);
+
+        mirror_session_config_change(&mut session, &tool_call, None);
+
+        assert!(session.config.working_dir.is_none());
+        assert!(session.config.active_tool_groups.is_empty());
+    }
+
+    #[test]
+    fn mirror_unparseable_args_is_noop() {
+        let mut session = SessionState::empty();
+        let tool_call = config_change_call("load_tools", "not json");
+
+        mirror_session_config_change(&mut session, &tool_call, None);
+
+        assert!(session.config.active_tool_groups.is_empty());
     }
 
     // -- broadcast_turn_appended tests -----------------------------------
