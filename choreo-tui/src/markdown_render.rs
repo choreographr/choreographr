@@ -309,13 +309,14 @@ pub(crate) fn render_turn_lines(
 
     // ── Assistant response block (blue accent) ───────────────
     //
-    // The reasoning section is collapsible.  A header line (arrow glyph +
-    // "Reasoning") is always rendered when reasoning content exists, and the
-    // reasoning body only when `reasoning_expanded` is true.  The response
-    // text is rendered whenever present.  Reasoning is retained in the turn
-    // even after the response streams (see `stream_chunk` in history.rs), so
-    // clicking the header lets the user re-expand the thinking after the
-    // answer replaces it.  No "Response:" heading is rendered.
+    // The response text is the primary content and is rendered first.  The
+    // reasoning section sits below it and is collapsible: a header line
+    // (arrow glyph + "Reasoning") is always rendered when reasoning content
+    // exists, and the reasoning body only when `reasoning_expanded` is true.
+    // Reasoning is retained in the turn even after the response streams (see
+    // `stream_chunk` in history.rs), so clicking the header lets the user
+    // re-expand the thinking after the answer replaces it.  No "Response:"
+    // heading is rendered.
     let has_assistant = turn.assistant_text.is_some() || turn.assistant_reasoning.is_some();
     if has_assistant {
         let mut body: Vec<Line<'static>> = Vec::new();
@@ -324,12 +325,29 @@ pub(crate) fn render_turn_lines(
             .assistant_reasoning
             .as_deref()
             .is_some_and(|r| !r.trim().is_empty());
+        let response_present = turn
+            .assistant_text
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
 
-        // Collapsible reasoning header — always shown when reasoning exists so
-        // the user can re-expand it.  ▼ = expanded (body shown below the
+        // Response text — shown whenever present.
+        if let Some(ref text) = turn.assistant_text {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                body.extend(markdown_lines(trimmed, content_width));
+            }
+        }
+
+        // Collapsible reasoning header — always shown when reasoning exists
+        // so the user can re-expand it.  ▼ = expanded (body shown below the
         // header), ▶ = collapsed (body hidden).  The header is dimmed so it
         // reads as a control rather than message content.
         if has_reasoning {
+            if response_present {
+                // Separate the response from the reasoning section so they
+                // don't merge into one paragraph.
+                body.push(Line::from(Span::styled(String::new(), Style::default())));
+            }
             let arrow = if reasoning_expanded { "▼" } else { "▶" };
             body.push(Line::from(vec![
                 Span::styled(format!("{arrow} "), Style::default().fg(Color::Gray)),
@@ -337,19 +355,6 @@ pub(crate) fn render_turn_lines(
             ]));
             if reasoning_expanded && let Some(ref reasoning) = turn.assistant_reasoning {
                 body.extend(markdown_lines(reasoning.trim(), content_width));
-            }
-        }
-
-        // Response text — shown whenever present.
-        if let Some(ref text) = turn.assistant_text {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                // Separate the reasoning body from the response when both
-                // are visible so they don't merge into one paragraph.
-                if reasoning_expanded && has_reasoning {
-                    body.push(Line::from(Span::styled(String::new(), Style::default())));
-                }
-                body.extend(markdown_lines(trimmed, content_width));
             }
         }
 
@@ -460,6 +465,21 @@ pub(crate) fn reasoning_expanded_default(turn: &Turn) -> bool {
         .as_deref()
         .is_some_and(|t| !t.trim().is_empty());
     has_reasoning && !has_response
+}
+
+/// Find the semantic-line index of the collapsible reasoning header within a
+/// turn's rendered lines, if present.
+///
+/// The header is the line carrying the literal "Reasoning" label rendered in
+/// gray (see [`render_turn_lines`]).  Matching on the styled label rather
+/// than the arrow glyph keeps a body or response line that happens to start
+/// with an arrow character from being mistaken for the header.
+pub(crate) fn reasoning_header_line_index(lines: &[Line<'_>]) -> Option<usize> {
+    lines.iter().position(|line| {
+        line.spans
+            .iter()
+            .any(|span| span.style.fg == Some(Color::Gray) && span.content.as_ref() == "Reasoning")
+    })
 }
 
 // ── Margin helpers (reused from current render system) ─────────────────
@@ -1806,6 +1826,11 @@ mod tests {
             text.contains("The answer is 42."),
             "response body should appear"
         );
+        // Reasoning sits BELOW the response in the rendered output.
+        assert!(
+            text.find("The answer is 42.") < text.find("Reasoning"),
+            "response should be rendered above the reasoning header"
+        );
     }
 
     #[test]
@@ -1839,6 +1864,11 @@ mod tests {
             !text.contains("**bold**"),
             "markdown bold syntax should not appear literally in output"
         );
+        // The reasoning header appears below the response.
+        assert!(
+            text.find("Okay.") < text.find("▶ Reasoning"),
+            "response should be rendered above the collapsed reasoning header"
+        );
     }
 
     #[test]
@@ -1855,8 +1885,8 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        // User re-expanded the reasoning: header points down and the body
-        // appears before the response.
+        // User re-expanded the reasoning: the header points down and the
+        // reasoning body appears BELOW the response.
         let lines = render_turn_lines(&turn, 80, 85, true);
         let text = lines
             .iter()
@@ -1872,6 +1902,12 @@ mod tests {
         assert!(
             !text.contains("**bold**"),
             "markdown bold syntax should not appear literally in output"
+        );
+        // Response first, then the header, then the reasoning body.
+        assert!(
+            text.find("Okay.") < text.find("▼ Reasoning")
+                && text.find("▼ Reasoning") < text.find("Use bold for emphasis."),
+            "response, header, and reasoning body should appear in that order"
         );
     }
 

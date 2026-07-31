@@ -15,8 +15,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::markdown_render::{
-    MARGIN_STRUCTURAL_ROWS, compute_visual_offsets, lines_height, markdown_lines, plain_text_lines,
-    reasoning_expanded_default, render_turn_lines,
+    compute_visual_offsets, lines_height, plain_text_lines, reasoning_expanded_default,
+    reasoning_header_line_index, render_turn_lines,
 };
 use ratatui::text::Line;
 use tui_prompts::{SelectState, State, TextState};
@@ -2063,7 +2063,7 @@ impl SessionDisplayState {
                 .copied()
                 .unwrap_or_else(|| reasoning_expanded_default(turn));
 
-            let (_text_lines, text_height, text_offsets) = cached_or_compute_lines(
+            let (text_lines, text_height, text_offsets) = cached_or_compute_lines(
                 &mut self.render_cache,
                 visible_idx,
                 turn_id,
@@ -2072,31 +2072,23 @@ impl SessionDisplayState {
                 || render_turn_lines(turn, content_width, tool_content_width, reasoning_expanded),
             );
 
-            // The reasoning header (when present) is the first line of the
-            // assistant block, which directly follows the user block (margin
-            // rows + user body).  Its visual-row range is derived from the
-            // cached line offsets so the click handler can hit-test it in
-            // O(1) — same approach as image ranges.
-            let has_reasoning = turn
+            // The reasoning header's visual-row range for click hit-testing.
+            // The header line is located directly in the rendered output (it
+            // is present whenever reasoning exists) and its semantic index is
+            // converted to a visual-row range via the cached offsets — O(1)
+            // in the click handler, same approach as image ranges.
+            let reasoning_header_range = turn
                 .assistant_reasoning
                 .as_deref()
-                .is_some_and(|r| !r.trim().is_empty());
-            let reasoning_header_range = if has_reasoning {
-                let header_idx = turn
-                    .user_text
-                    .as_ref()
-                    .map(|t| markdown_lines(t, content_width).len() + MARGIN_STRUCTURAL_ROWS)
-                    .unwrap_or(0);
-                let start = if header_idx == 0 {
-                    0
-                } else {
-                    text_offsets[header_idx - 1]
-                };
-                let end = text_offsets[header_idx];
-                Some((start, end))
-            } else {
-                None
-            };
+                .is_some_and(|r| !r.trim().is_empty())
+                .then(|| {
+                    reasoning_header_line_index(&text_lines).map(|idx| {
+                        let start = if idx == 0 { 0 } else { text_offsets[idx - 1] };
+                        let end = text_offsets[idx];
+                        (start, end)
+                    })
+                })
+                .flatten();
 
             let mut image_ranges: Vec<(usize, usize)> = Vec::new();
             let mut total_img_height: usize = 0;
@@ -2200,8 +2192,14 @@ impl SessionDisplayState {
                         .scroll
                         .saturating_add(new_total - old_total);
                 } else if old_total > new_total {
-                    tracing::trace!(old_total, new_total, "content removed, scrolling to bottom");
-                    self.history_scroll.scroll = 0;
+                    // Content shrank (e.g. collapsing a reasoning section or
+                    // undoing turns).  Pull the scroll offset up by the
+                    // removed height so the same content rows stay anchored
+                    // in the viewport instead of jumping to the bottom.
+                    self.history_scroll.scroll = self
+                        .history_scroll
+                        .scroll
+                        .saturating_sub(old_total - new_total);
                 }
             }
 
@@ -2245,6 +2243,19 @@ impl SessionDisplayState {
                 render_turn_lines(turn, content_width, tool_content_width, reasoning_expanded);
             let text_height = lines_height(&text_lines, viewport.width).max(1);
             let visual_offsets = compute_visual_offsets(&text_lines, viewport.width);
+
+            // Keep the reasoning header's click-hit range in sync as the
+            // response streams — the header sits below the growing response,
+            // so its position shifts on every chunk.  Rebuilds (via
+            // `rebuild_height_prefix`) recompute it from scratch.
+            if let Some(layout) = self.turn_layouts.get_mut(turn_idx) {
+                layout.reasoning_header_range =
+                    reasoning_header_line_index(&text_lines).map(|idx| {
+                        let start = if idx == 0 { 0 } else { visual_offsets[idx - 1] };
+                        let end = visual_offsets[idx];
+                        (start, end)
+                    });
+            }
 
             cached.lines = Arc::from(text_lines);
             cached.height = text_height;
@@ -2297,8 +2308,13 @@ impl SessionDisplayState {
                     .scroll
                     .saturating_add(new_total - old_total);
             } else if old_total > new_total {
-                tracing::trace!(old_total, new_total, "content removed, scrolling to bottom");
-                self.history_scroll.scroll = 0;
+                // Mirror the anchor-preserving adjustment in
+                // `compute_total_height_and_markers`: pull the scroll offset
+                // up by the removed height rather than jumping to the bottom.
+                self.history_scroll.scroll = self
+                    .history_scroll
+                    .scroll
+                    .saturating_sub(old_total - new_total);
             }
         }
 
@@ -4174,10 +4190,10 @@ mod tests {
         );
     }
 
-    // ── compute_total_height_and_markers: scroll-to-bottom on content removal ──
+    // ── compute_total_height_and_markers: anchor preservation on content removal ──
 
     #[test]
-    fn content_removed_scrolls_to_bottom() {
+    fn content_removed_preserves_scroll_anchor() {
         let mut app = test_app();
         app.history_viewport.width = 80;
         app.history_viewport.height = 5;
@@ -4190,9 +4206,14 @@ mod tests {
         assert!(old_total > 0, "should have content");
 
         let viewport_height = app.history_viewport.height;
+        let old_scroll;
         {
             let display = app.active_display().unwrap();
-            display.history_scroll.scroll = old_total.saturating_sub(viewport_height as usize) / 2;
+            // Scroll to the top of the history so the removed turn (the
+            // last one) lies entirely below the viewport — the scenario
+            // where anchor preservation keeps the viewport still.
+            display.history_scroll.scroll = old_total.saturating_sub(viewport_height as usize);
+            old_scroll = display.history_scroll.scroll;
         }
         assert!(app.effective_scroll() > 0, "should be scrolled up");
 
@@ -4207,10 +4228,18 @@ mod tests {
         app.compute_total_height_and_markers();
 
         let display = app.active_display_ref().unwrap();
+        let new_total = display.total_history_height();
+        let new_scroll = display.history_scroll.scroll;
+        assert!(
+            new_total < old_total,
+            "removing a turn should shrink the total height"
+        );
+        // The content row at the viewport's bottom edge stays anchored
+        // instead of the viewport jumping to the bottom.
         assert_eq!(
-            display.effective_scroll(&app.history_viewport),
-            0,
-            "scroll should be at bottom after content removal"
+            new_total.saturating_sub(new_scroll),
+            old_total.saturating_sub(old_scroll),
+            "the anchored content row should not move"
         );
     }
 
@@ -4349,6 +4378,54 @@ mod tests {
         );
         assert!(!display.streaming_dirty, "streaming_dirty cleared");
         assert!(!display.content_dirty, "content_dirty cleared");
+    }
+
+    #[test]
+    fn streaming_answer_moves_reasoning_header_range() {
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 200;
+
+        // A turn with reasoning only (no response yet), actively streaming.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        {
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(1, turn);
+            display.view.request_to_turn.insert(7, 1);
+        }
+        app.rebuild_height_prefix();
+
+        // Before the answer: reasoning is the only content, so the header
+        // sits at the top of the assistant block.
+        let initial_start = app.active_display_ref().unwrap().turn_layouts[0]
+            .reasoning_header_range
+            .expect("header range should exist")
+            .0;
+
+        // First Answer chunk auto-collapses the reasoning and places the
+        // response above the header.
+        app.handle_request_stream(0, 7, OutputStream::Answer, Cow::Borrowed("Response text."));
+        app.compute_total_height_and_markers();
+
+        let (start, end) = app.active_display_ref().unwrap().turn_layouts[0]
+            .reasoning_header_range
+            .expect("header range should remain after auto-collapse");
+        assert!(
+            start > initial_start,
+            "header should move below the streaming response ({initial_start} -> {start})"
+        );
+        assert!(start < end, "header range must be non-empty");
     }
 
     #[test]

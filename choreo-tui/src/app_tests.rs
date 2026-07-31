@@ -2131,19 +2131,19 @@ fn click_on_reasoning_header_toggles_collapse() {
         .insert_or_replace(1, turn);
     app.rebuild_height_prefix();
 
-    // No user text, so the reasoning header is the first line of the turn
-    // (content line 0, a single row).
+    // No user text: assistant separator (0), padding (1), response (2),
+    // blank separator (3), then the reasoning header at rows [4,5).
     let (start, end) = app.active_display().unwrap().turn_layouts[0]
         .reasoning_header_range
         .expect("reasoning header range should exist");
-    assert_eq!((start, end), (0, 1), "header occupies the first row");
+    assert_eq!((start, end), (4, 5), "header sits below the response");
 
     // `find_turn_at_row` maps screen rows linearly only when the history
     // fills the viewport, so size the viewport to the content and click the
-    // top row, which corresponds to content line 0.
+    // header's first row, which corresponds to content line `start`.
     let total = app.active_display().unwrap().total_history_height();
     app.history_viewport.height = total as u16;
-    let row = 0u16;
+    let row = start as u16;
 
     handle_terminal_event(
         Event::Mouse(MouseEvent {
