@@ -632,6 +632,20 @@ fn is_session_config_tool(name: &str) -> bool {
     matches!(name, "load_tools" | "unload_tools" | "set_working_dir")
 }
 
+/// Status label shown while a batch of concurrent tool calls executes.
+///
+/// Every non-session-config tool call lands in the concurrent dispatch
+/// bucket, even a lone one — so the label must not claim parallelism for a
+/// single call. Show the real tool name for `len == 1` and reserve
+/// "(parallel)" for genuine multi-tool batches.
+fn concurrent_tool_status_label(tools: &[ChatToolCall]) -> String {
+    if tools.len() == 1 {
+        tools[0].name.clone()
+    } else {
+        "(parallel)".into()
+    }
+}
+
 /// Capture a successful session-config tool's mutation into a typed
 /// [`PendingConfigChange`] for later application.  Called only for tools that
 /// actually executed without error.
@@ -1098,7 +1112,7 @@ pub(crate) fn run_agent_loop(
                     if ctx
                         .cmd_tx
                         .send(SessionCommand::StatusChanged(SessionStatus::ToolCall(
-                            "(parallel)".into(),
+                            concurrent_tool_status_label(&concurrent),
                         )))
                         .is_err()
                     {
@@ -1667,6 +1681,33 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].role, "user");
         assert_eq!(result[0].content.as_deref(), Some("visible"));
+    }
+
+    // -- Concurrent tool status label tests --------------------------------
+
+    #[test]
+    fn concurrent_status_label_single_tool_uses_real_name() {
+        // A lone non-config tool call still dispatches through the concurrent
+        // bucket, so the status must show its real name, not "(parallel)".
+        let label = concurrent_tool_status_label(&[config_change_call("sh", "{}")]);
+        assert_eq!(label, "sh");
+    }
+
+    #[test]
+    fn concurrent_status_label_multi_tool_batch_is_parallel() {
+        let label = concurrent_tool_status_label(&[
+            config_change_call("sh", "{}"),
+            config_change_call("grep", "{}"),
+        ]);
+        assert_eq!(label, "(parallel)");
+    }
+
+    #[test]
+    fn concurrent_status_label_empty_batch_is_parallel() {
+        // Defensive: the caller guards with `!concurrent.is_empty()` before
+        // sending, but the label should still be well-defined if reached.
+        let label = concurrent_tool_status_label(&[]);
+        assert_eq!(label, "(parallel)");
     }
 
     // -- Cancellation helper tests -----------------------------------------
