@@ -141,11 +141,18 @@ pub enum ToolOutputFormat {
     Json,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
     pub invocation_description: String,
+    /// The tool's structured return value, captured after a successful
+    /// execution (`serde_json::to_value(ret)`). `None` for error/timeout
+    /// outputs and for returns that fail to serialize.  The request worker
+    /// reads this to mirror session-config mutations (e.g. the canonical
+    /// path from `set_working_dir`) onto its config copy without
+    /// re-executing or re-resolving the tool's logic.
+    pub result_json: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -443,6 +450,7 @@ impl<T: Tool + 'static> ToolDyn for T {
                     content: e.to_string(),
                     is_error: true,
                     invocation_description: desc,
+                    ..Default::default()
                 });
             }
         };
@@ -461,6 +469,7 @@ impl<T: Tool + 'static> ToolDyn for T {
             },
             is_error: false,
             invocation_description: desc,
+            result_json: serde_json::to_value(&ret).ok(),
         })
     }
 
@@ -512,6 +521,7 @@ impl<T: Tool + 'static> ToolDyn for T {
                     content: e.to_string(),
                     is_error: true,
                     invocation_description: desc,
+                    ..Default::default()
                 });
             }
         };
@@ -530,6 +540,7 @@ impl<T: Tool + 'static> ToolDyn for T {
             },
             is_error: false,
             invocation_description: desc,
+            result_json: serde_json::to_value(&ret).ok(),
         })
     }
 }
@@ -791,6 +802,17 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// The set of group names valid as `load_tools`/`unload_tools` arguments:
+    /// every registry group plus the always-on "core" group (which is loadable
+    /// as a no-op and protected from unload, but never appears in the schema
+    /// enum).  Used by the tools and the session handlers to reject unknown
+    /// group names before they can be persisted into a session's active set.
+    pub(crate) fn known_group_names(&self) -> HashSet<String> {
+        let mut s: HashSet<String> = self.group_names().into_iter().collect();
+        s.insert("core".into());
+        s
+    }
+
     /// Return tool definitions for groups in the active set.
     ///
     /// Uses plain `ChatToolDefinition::function()` — no `output_schema` or
@@ -832,6 +854,48 @@ impl ToolRegistry {
             })
             .collect()
     }
+}
+
+/// Validate a `load_tools`/`unload_tools` group list against the known group
+/// set.  Returns `Some(unknown)` with the offending names when any group is not
+/// in `known`, or `None` when every name is valid.  Shared by the tools (primary
+/// validation) and the session handlers (defense-in-depth) so the two can never
+/// drift.
+pub(crate) fn unknown_group_names(
+    groups: &[String],
+    known: &HashSet<String>,
+) -> Option<Vec<String>> {
+    let unknown: Vec<String> = groups
+        .iter()
+        .filter(|g| !known.contains(*g))
+        .cloned()
+        .collect();
+    if unknown.is_empty() {
+        None
+    } else {
+        Some(unknown)
+    }
+}
+
+/// Build the JSON Schema for the `groups` argument of `load_tools`/`unload_tools`
+/// from the live registry group catalog (including dynamic MCP groups).  The
+/// schema enum is advisory — the tools validate at execution time — but keeping
+/// the two schema builders in one place prevents drift.
+pub(crate) fn groups_enum_schema(names: Vec<String>, description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "groups": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": names
+                },
+                "description": description
+            }
+        },
+        "required": ["groups"]
+    })
 }
 
 /// Expand a leading tilde (`~` or `~/...`) to the user's home directory.

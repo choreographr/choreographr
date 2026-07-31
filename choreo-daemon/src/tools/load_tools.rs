@@ -1,6 +1,6 @@
 use crate::daemon::DaemonCommand;
 use crate::tools::context::ToolContext;
-use crate::tools::{AllowedCaller, Tool, ToolExecError};
+use crate::tools::{AllowedCaller, Tool, ToolExecError, groups_enum_schema, unknown_group_names};
 use choreo_keystore::ServiceCredential;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -144,21 +144,7 @@ impl Tool for LoadTools {
     fn schema(&self) -> serde_json::Value {
         // Build the schema by hand (rather than deriving it from schemars)
         // so the `groups` enum reflects the live registry group catalog.
-        let names = self.group_names();
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "groups": {
-                    "type": "array",
-                    "items": {
-                        "type": "string",
-                        "enum": names
-                    },
-                    "description": "Tool groups to activate"
-                }
-            },
-            "required": ["groups"]
-        })
+        groups_enum_schema(self.group_names(), "Tool groups to activate")
     }
 
     fn execute(
@@ -168,6 +154,18 @@ impl Tool for LoadTools {
         working_dir: Option<&Path>,
         ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
+        // Reject unknown group names against the live catalog (the schema
+        // enum is advisory — the model may pass anything).  Unknown groups
+        // would otherwise be persisted into the session's active set and
+        // reported as successfully activated.
+        if let Some(known) = self.registry.upgrade().map(|r| r.known_group_names())
+            && let Some(unknown) = unknown_group_names(&args.groups, &known)
+        {
+            return Err(ToolExecError(format!(
+                "Unknown tool group(s): {}",
+                unknown.join(", ")
+            )));
+        }
         execute_load_tools(&args, working_dir, ctx)
     }
 }
@@ -330,6 +328,44 @@ mod tests {
         let callers = tool.allowed_callers();
         assert_eq!(callers, vec![AllowedCaller::Direct]);
         assert!(!callers.contains(&AllowedCaller::Programmatic));
+    }
+
+    #[test]
+    fn execute_rejects_unknown_group() {
+        let registry = ToolRegistry::new().build();
+        let tool = LoadTools::new(Arc::downgrade(&registry));
+        let args = LoadToolsArgs {
+            groups: vec!["not-a-real-group".into()],
+        };
+
+        let result = tool.execute(args, None, None, None);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown tool group(s): not-a-real-group")
+        );
+    }
+
+    #[test]
+    fn execute_accepts_core_and_known_groups() {
+        let registry = ToolRegistry::new().build();
+        let tool = LoadTools::new(Arc::downgrade(&registry));
+        // "core" is always-on and valid input (a no-op), as are real groups
+        // like "git" — validation must not reject either.
+        let args = LoadToolsArgs {
+            groups: vec!["core".into(), "git".into()],
+        };
+        // No context: validation passes first and the execution reports the
+        // missing context, proving validation did not reject the names.
+        let result = tool.execute(args, None, None, None);
+        assert!(
+            result
+                .err()
+                .map(|e| e.to_string())
+                .is_some_and(|e| e.contains("no session context"))
+        );
     }
 
     #[test]

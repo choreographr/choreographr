@@ -9,11 +9,9 @@ use crate::providers::{
 use crate::sessions::{RequestContext, SessionCommand, SessionState};
 use crate::tools::context::ToolContext;
 use crate::tools::load_tools::{LoadToolsArgs, apply_load_tools};
-use crate::tools::set_working_dir::SetWorkingDirArgs;
+use crate::tools::set_working_dir::{SetWorkingDirArgs, resolve_working_dir_path};
 use crate::tools::unload_tools::{UnloadToolsArgs, apply_unload_tools};
-use crate::tools::{
-    PreparedImage, ToolError, ToolOutput, ToolOutputFormat, ToolRegistry, resolve_path,
-};
+use crate::tools::{PreparedImage, ToolError, ToolOutput, ToolOutputFormat, ToolRegistry};
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
@@ -281,6 +279,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                         content: format!("tool '{}' timed out", tool_call.name,),
                         is_error: true,
                         invocation_description: invocation_description.clone(),
+                        ..Default::default()
                     };
                 }
                 match result_rx.recv_timeout(remaining.min(check_interval)) {
@@ -290,6 +289,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                             content: e.to_string(),
                             is_error: true,
                             invocation_description: invocation_description.clone(),
+                            ..Default::default()
                         };
                     }
                     Err(RecvTimeoutError::Timeout) => continue,
@@ -298,6 +298,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                             content: "tool execution thread panicked".to_string(),
                             is_error: true,
                             invocation_description: invocation_description.clone(),
+                            ..Default::default()
                         };
                     }
                 }
@@ -310,6 +311,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                             content: e.to_string(),
                             is_error: true,
                             invocation_description: invocation_description.clone(),
+                            ..Default::default()
                         };
                     }
                     Err(_) => {
@@ -317,6 +319,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                             content: "tool execution thread panicked".to_string(),
                             is_error: true,
                             invocation_description: invocation_description.clone(),
+                            ..Default::default()
                         };
                     }
                 }
@@ -601,26 +604,52 @@ fn collect_tool_result(params: CollectToolResultParams) {
     );
 }
 
-/// Mirror a successful session-config tool's mutation onto the request
-/// worker's copy of the session configuration.
+/// A successful session-config tool mutation, captured in Phase 1 and
+/// applied to the worker's config copy in Phase 3.
 ///
 /// The authoritative mutation is applied by the session main loop (via
 /// DaemonCommand → SessionCommand routing); this worker copy must be updated
 /// as well so the NEXT agent-loop iteration observes the change when it
 /// rebuilds tool definitions, system content, and working-dir-relative file
-/// operations. Called only after every tool in the current response has
-/// executed (Phase 3 of the tool-use arm in `run_agent_loop`).
+/// operations.
+enum PendingConfigChange {
+    LoadTools(Vec<String>),
+    UnloadTools(Vec<String>),
+    /// The canonical path the tool resolved and the session main loop applied
+    /// verbatim, taken from the tool's EXECUTED result (so no re-resolution
+    /// and therefore no TOCTOU window).  `None` only when the executed result
+    /// was unavailable AND re-resolution failed — the worker then skips the
+    /// path update but still invalidates its skill cache so a stale cache
+    /// never survives the request boundary.
+    SetWorkingDir(Option<PathBuf>),
+}
+
+/// Whether `name` is one of the session-config tools that must run serially
+/// and whose successful mutations are mirrored onto the worker config copy.
+/// Single source of truth for the tool-name list used by the dispatch
+/// partition and the mirror capture.
+fn is_session_config_tool(name: &str) -> bool {
+    matches!(name, "load_tools" | "unload_tools" | "set_working_dir")
+}
+
+/// Capture a successful session-config tool's mutation into a typed
+/// [`PendingConfigChange`] for later application.  Called only for tools that
+/// actually executed without error.
 ///
 /// `base_working_dir` is the working directory in effect when the response
 /// was planned — every `set_working_dir` call in the response resolved
-/// against it, so mirroring must too (chaining relative resolutions against
-/// the mutated copy would diverge from the canonical paths the tools sent
-/// to the main loop, which applies them verbatim in call order).
-fn mirror_session_config_change(
-    session: &mut SessionState,
+/// against it, so the (rare) re-resolution fallback must too (chaining
+/// relative resolutions against the mutated copy would diverge from the
+/// canonical paths the tools sent to the main loop, which applies them
+/// verbatim in call order).
+fn pending_config_change(
     tool_call: &ChatToolCall,
+    output: &ToolOutput,
     base_working_dir: Option<&Path>,
-) {
+) -> Option<PendingConfigChange> {
+    if !is_session_config_tool(&tool_call.name) {
+        return None;
+    }
     match tool_call.name.as_str() {
         "load_tools" => {
             let Ok(args) = serde_json::from_str::<LoadToolsArgs>(&tool_call.arguments_json) else {
@@ -628,14 +657,9 @@ fn mirror_session_config_change(
                     tool_call_id = %tool_call.id,
                     "load_tools: could not parse args to mirror onto worker config",
                 );
-                return;
+                return None;
             };
-            apply_load_tools(&mut session.config.active_tool_groups, &args.groups);
-            debug!(
-                tool_call_id = %tool_call.id,
-                groups = ?args.groups,
-                "mirrored load_tools onto worker session config",
-            );
+            Some(PendingConfigChange::LoadTools(args.groups))
         }
         "unload_tools" => {
             let Ok(args) = serde_json::from_str::<UnloadToolsArgs>(&tool_call.arguments_json)
@@ -644,55 +668,70 @@ fn mirror_session_config_change(
                     tool_call_id = %tool_call.id,
                     "unload_tools: could not parse args to mirror onto worker config",
                 );
-                return;
+                return None;
             };
-            apply_unload_tools(&mut session.config.active_tool_groups, &args.groups);
-            debug!(
-                tool_call_id = %tool_call.id,
-                groups = ?args.groups,
-                "mirrored unload_tools onto worker session config",
-            );
+            Some(PendingConfigChange::UnloadTools(args.groups))
         }
         "set_working_dir" => {
+            // Prefer the canonical path from the tool's EXECUTED result: it
+            // matches byte-for-byte what the session main loop applied, with
+            // no re-resolution (and therefore no TOCTOU window in which the
+            // directory could vanish between the tool's resolution and this
+            // mirror).
+            if let Some(path) = output
+                .result_json
+                .as_ref()
+                .and_then(|v| v.get("path"))
+                .and_then(|v| v.as_str())
+            {
+                return Some(PendingConfigChange::SetWorkingDir(Some(PathBuf::from(
+                    path,
+                ))));
+            }
+            // Fallback (practically unreachable — result_json is populated on
+            // every successful execution): re-run the tool's own shared
+            // resolution.  If even that fails, still return a None-path change
+            // so the caller invalidates the worker's skill cache — a stale
+            // cache must never survive the request boundary.
             let Ok(args) = serde_json::from_str::<SetWorkingDirArgs>(&tool_call.arguments_json)
             else {
                 warn!(
                     tool_call_id = %tool_call.id,
                     "set_working_dir: could not parse args to mirror onto worker config",
                 );
-                return;
+                return Some(PendingConfigChange::SetWorkingDir(None));
             };
-            // Reproduce the tool's resolution exactly: tilde expansion +
-            // relative-to-base resolution, then canonicalization (which also
-            // enforces the existence check). If the path vanished between the
-            // tool's execution and now (TOCTOU), skip the mirror — the
-            // authoritative copy still holds the change and will win on the
-            // next request.
-            let resolved = resolve_path(&args.path, base_working_dir);
-            let canonical = match resolved.canonicalize() {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(
-                        tool_call_id = %tool_call.id,
-                        path = %resolved.display(),
-                        error = %e,
-                        "set_working_dir: cannot re-resolve path for worker mirror; skipping",
-                    );
-                    return;
-                }
-            };
-            session.config.working_dir = Some(canonical.clone());
-            // Invalidate the skill cache so skills are re-discovered from
-            // the new working directory on the next agent-loop turn — the
-            // main-loop handler does the same for the authoritative state.
-            session.discovered_skills = None;
-            debug!(
-                tool_call_id = %tool_call.id,
-                path = %canonical.display(),
-                "mirrored set_working_dir onto worker session config",
-            );
+            let path = resolve_working_dir_path(&args.path, base_working_dir).ok();
+            Some(PendingConfigChange::SetWorkingDir(path))
         }
-        _ => {}
+        _ => None,
+    }
+}
+
+/// Apply a captured session-config mutation to the worker's config copy.
+fn apply_pending_config_change(session: &mut SessionState, change: &PendingConfigChange) {
+    match change {
+        PendingConfigChange::LoadTools(groups) => {
+            apply_load_tools(&mut session.config.active_tool_groups, groups);
+            debug!(groups = ?groups, "mirrored load_tools onto worker session config");
+        }
+        PendingConfigChange::UnloadTools(groups) => {
+            apply_unload_tools(&mut session.config.active_tool_groups, groups);
+            debug!(groups = ?groups, "mirrored unload_tools onto worker session config");
+        }
+        PendingConfigChange::SetWorkingDir(path) => {
+            if let Some(path) = path {
+                session.config.working_dir = Some(path.clone());
+            }
+            // Always invalidate the skill cache: even when we could not
+            // determine the new path, the authoritative state changed and a
+            // stale cache would leak across the request boundary
+            // (RequestFinished merges the worker's discovered_skills over the
+            // main loop's invalidated None).  The main-loop handler does the
+            // same for the authoritative state.
+            session.discovered_skills = None;
+            debug!(path = ?path, "mirrored set_working_dir onto worker session config");
+        }
     }
 }
 
@@ -923,25 +962,23 @@ pub(crate) fn run_agent_loop(
                 // execution preserves the model's call order so e.g. a
                 // load_tools followed by a set_working_dir lands in the
                 // intended sequence.
-                let (mutators, concurrent): (Vec<_>, Vec<_>) =
-                    tool_use.tool_calls.into_iter().partition(|tc| {
-                        matches!(
-                            tc.name.as_str(),
-                            "load_tools" | "unload_tools" | "set_working_dir"
-                        )
-                    });
+                let (mutators, concurrent): (Vec<_>, Vec<_>) = tool_use
+                    .tool_calls
+                    .into_iter()
+                    .partition(|tc| is_session_config_tool(&tc.name));
 
                 // All session-config tools in this response resolve relative
                 // paths against the working directory in effect when the
-                // response was planned. Capture it once so the Phase 3 mirror
-                // reproduces exactly the canonical paths the tools sent to
-                // the main loop (which applies them verbatim, in call order).
+                // response was planned. Capture it once so the (rare) Phase 3
+                // mirror fallback reproduces exactly the canonical paths the
+                // tools sent to the main loop (which applies them verbatim, in
+                // call order).
                 let turn_base_working_dir = session.config.working_dir.clone();
 
                 // Successful session-config mutations, in call order, to be
                 // mirrored onto this worker's config copy once every tool in
                 // the response has executed (see Phase 3 below).
-                let mut pending_config_changes: Vec<ChatToolCall> = Vec::new();
+                let mut pending_config_changes: Vec<PendingConfigChange> = Vec::new();
 
                 // ── Phase 1: Session-config tools (serial) ────────
                 for tool_call in mutators.into_iter() {
@@ -1031,8 +1068,11 @@ pub(crate) fn run_agent_loop(
                     // error (e.g. inactive session, daemon communication
                     // failure) means the authoritative state was NOT changed,
                     // so this worker must not pretend it was.
-                    if !output.is_error {
-                        pending_config_changes.push(tool_call.clone());
+                    if !output.is_error
+                        && let Some(change) =
+                            pending_config_change(&tool_call, &output, turn_base_working_dir.as_deref())
+                    {
+                        pending_config_changes.push(change);
                     }
                 }
 
@@ -1142,6 +1182,7 @@ pub(crate) fn run_agent_loop(
                                 content: "tool thread panicked".to_string(),
                                 is_error: true,
                                 invocation_description,
+                                ..Default::default()
                             },
                             image: None,
                         });
@@ -1203,12 +1244,8 @@ pub(crate) fn run_agent_loop(
                 // of tools batched alongside the config change. The worker
                 // copy is still discarded at request end, so the two copies
                 // cannot drift across requests.
-                for tool_call in &pending_config_changes {
-                    mirror_session_config_change(
-                        session,
-                        tool_call,
-                        turn_base_working_dir.as_deref(),
-                    );
+                for change in &pending_config_changes {
+                    apply_pending_config_change(session, change);
                 }
             }
             Err(choreo_proto::InferenceError::Cancelled) => {
@@ -1397,6 +1434,7 @@ fn execute_tool_with_timeout(
                 content: format!("tool '{}' cancelled", tool_call.name),
                 is_error: true,
                 invocation_description: String::new(),
+                ..Default::default()
             };
         }
 
@@ -1415,6 +1453,7 @@ fn execute_tool_with_timeout(
                 ),
                 is_error: true,
                 invocation_description: String::new(),
+                ..Default::default()
             };
         }
 
@@ -1437,6 +1476,7 @@ fn execute_tool_with_timeout(
                     content: e.to_string(),
                     is_error: true,
                     invocation_description: String::new(),
+                    ..Default::default()
                 };
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1450,6 +1490,7 @@ fn execute_tool_with_timeout(
                     content: "tool execution thread panicked".to_string(),
                     is_error: true,
                     invocation_description: String::new(),
+                    ..Default::default()
                 };
             }
         }
@@ -1640,7 +1681,7 @@ mod tests {
         assert!(is_cancelled_once(&rx));
     }
 
-    // -- mirror_session_config_change tests ---------------------------------
+    // -- pending/apply config-change tests ---------------------------------
 
     fn config_change_call(name: &str, arguments_json: &str) -> ChatToolCall {
         ChatToolCall {
@@ -1651,50 +1692,67 @@ mod tests {
         }
     }
 
+    /// A successful tool output with the given structured result (or `None`
+    /// for tools whose result_json wasn't captured).
+    fn ok_output(result_json: Option<serde_json::Value>) -> ToolOutput {
+        ToolOutput {
+            content: String::new(),
+            is_error: false,
+            invocation_description: String::new(),
+            result_json,
+        }
+    }
+
     #[test]
-    fn mirror_load_tools_updates_worker_active_groups() {
+    fn pending_load_tools_captures_groups_and_applies() {
+        let tool_call = config_change_call("load_tools", r#"{"groups": ["shell", "x"]}"#);
+        let change = pending_config_change(&tool_call, &ok_output(None), None)
+            .expect("load_tools should produce a change");
+        assert!(matches!(change, PendingConfigChange::LoadTools(ref g) if g == &["shell", "x"]));
+
         let mut session = SessionState::empty();
         session.config.active_tool_groups = ["core".into(), "git".into()].into_iter().collect();
-        let tool_call = config_change_call("load_tools", r#"{"groups": ["shell", "x"]}"#);
-
-        mirror_session_config_change(&mut session, &tool_call, None);
-
+        apply_pending_config_change(&mut session, &change);
         assert!(session.config.active_tool_groups.contains("shell"));
         assert!(session.config.active_tool_groups.contains("x"));
         assert!(session.config.active_tool_groups.contains("core"));
     }
 
     #[test]
-    fn mirror_unload_tools_updates_worker_active_groups() {
-        let mut session = SessionState::empty();
-        session.config.active_tool_groups = ["core".into(), "git".into(), "shell".into()]
-            .into_iter()
-            .collect();
+    fn pending_unload_tools_captures_groups_and_applies() {
         let tool_call = config_change_call("unload_tools", r#"{"groups": ["shell"]}"#);
+        let change = pending_config_change(&tool_call, &ok_output(None), None)
+            .expect("unload_tools should produce a change");
+        assert!(matches!(change, PendingConfigChange::UnloadTools(ref g) if g == &["shell"]));
 
-        mirror_session_config_change(&mut session, &tool_call, None);
-
+        let mut session = SessionState::empty();
+        session.config.active_tool_groups = ["core".into(), "shell".into()].into_iter().collect();
+        apply_pending_config_change(&mut session, &change);
         assert!(!session.config.active_tool_groups.contains("shell"));
         assert!(session.config.active_tool_groups.contains("core"));
     }
 
     #[test]
-    fn mirror_set_working_dir_updates_worker_and_invalidates_skills() {
-        let mut session = SessionState::empty();
-        let base = tempfile::tempdir().unwrap();
-        let sub = base.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        // Pre-populate the skill cache so we can verify it gets invalidated.
-        session.discovered_skills = Some(Vec::new());
+    fn pending_set_working_dir_mirrors_executed_result() {
+        // The tool executed against a path that has since been deleted.  The
+        // mirror must use the EXECUTED result (the canonical path the tool
+        // computed and the main loop applied) — no re-resolution, so the
+        // deleted directory cannot break the mirror (no TOCTOU).
         let tool_call = config_change_call("set_working_dir", r#"{"path": "sub"}"#);
+        let output = ok_output(Some(serde_json::json!({ "path": "/real/canonical/sub" })));
+        let change = pending_config_change(&tool_call, &output, None)
+            .expect("set_working_dir should produce a change");
+        assert!(matches!(
+            change,
+            PendingConfigChange::SetWorkingDir(Some(ref p)) if p == &PathBuf::from("/real/canonical/sub")
+        ));
 
-        mirror_session_config_change(&mut session, &tool_call, Some(base.path()));
-
-        // The mirror resolves relative to the BASE working dir (the one the
-        // tool itself resolved against), not the worker's current copy.
+        let mut session = SessionState::empty();
+        session.discovered_skills = Some(Vec::new());
+        apply_pending_config_change(&mut session, &change);
         assert_eq!(
             session.config.working_dir.as_deref(),
-            Some(sub.canonicalize().unwrap().as_path())
+            Some(PathBuf::from("/real/canonical/sub").as_path())
         );
         assert!(
             session.discovered_skills.is_none(),
@@ -1703,35 +1761,81 @@ mod tests {
     }
 
     #[test]
-    fn mirror_set_working_dir_nonexistent_path_is_skipped() {
+    fn pending_set_working_dir_falls_back_to_shared_resolution() {
+        // result_json missing (shouldn't happen on success) — the mirror
+        // falls back to the SAME resolution helper the tool uses.
+        let base = tempfile::tempdir().unwrap();
+        let sub = base.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let tool_call = config_change_call("set_working_dir", r#"{"path": "sub"}"#);
+
+        let change = pending_config_change(&tool_call, &ok_output(None), Some(base.path()))
+            .expect("set_working_dir should produce a change");
+
         let mut session = SessionState::empty();
+        apply_pending_config_change(&mut session, &change);
+        assert_eq!(
+            session.config.working_dir.as_deref(),
+            Some(sub.canonicalize().unwrap().as_path())
+        );
+    }
+
+    #[test]
+    fn pending_set_working_dir_nonexistent_path_still_invalidates_skills() {
+        // The tool succeeded (result_json present) but the path is now gone.
+        // The mirror still applies the executed path verbatim — no TOCTOU.
+        let tool_call = config_change_call("set_working_dir", r#"{"path": "gone"}"#);
+        let output = ok_output(Some(serde_json::json!({ "path": "/gone/dir" })));
+        let change = pending_config_change(&tool_call, &output, None)
+            .expect("set_working_dir should produce a change");
+
+        let mut session = SessionState::empty();
+        session.discovered_skills = Some(Vec::new());
+        apply_pending_config_change(&mut session, &change);
+        assert_eq!(
+            session.config.working_dir.as_deref(),
+            Some(PathBuf::from("/gone/dir").as_path())
+        );
+        assert!(
+            session.discovered_skills.is_none(),
+            "skill cache must be invalidated even when the path is gone"
+        );
+    }
+
+    #[test]
+    fn pending_set_working_dir_unresolvable_fallback_still_invalidates_skills() {
+        // result_json missing AND the fallback resolution fails (path does
+        // not exist) — the worker skips the path update but MUST still
+        // invalidate its skill cache so stale skills never leak across the
+        // request boundary (RequestFinished merges discovered_skills over the
+        // main loop's invalidated None).
         let base = tempfile::tempdir().unwrap();
         let tool_call = config_change_call("set_working_dir", r#"{"path": "does-not-exist"}"#);
 
-        mirror_session_config_change(&mut session, &tool_call, Some(base.path()));
+        let change = pending_config_change(&tool_call, &ok_output(None), Some(base.path()))
+            .expect("set_working_dir should still produce a change");
+        assert!(matches!(change, PendingConfigChange::SetWorkingDir(None)));
 
+        let mut session = SessionState::empty();
+        session.discovered_skills = Some(Vec::new());
+        apply_pending_config_change(&mut session, &change);
         assert!(session.config.working_dir.is_none());
+        assert!(
+            session.discovered_skills.is_none(),
+            "skill cache must be invalidated even when no path could be resolved"
+        );
     }
 
     #[test]
-    fn mirror_unknown_tool_is_noop() {
-        let mut session = SessionState::empty();
+    fn pending_unknown_tool_is_noop() {
         let tool_call = config_change_call("read_file", r#"{"path": "x"}"#);
-
-        mirror_session_config_change(&mut session, &tool_call, None);
-
-        assert!(session.config.working_dir.is_none());
-        assert!(session.config.active_tool_groups.is_empty());
+        assert!(pending_config_change(&tool_call, &ok_output(None), None).is_none());
     }
 
     #[test]
-    fn mirror_unparseable_args_is_noop() {
-        let mut session = SessionState::empty();
+    fn pending_unparseable_args_is_noop() {
         let tool_call = config_change_call("load_tools", "not json");
-
-        mirror_session_config_change(&mut session, &tool_call, None);
-
-        assert!(session.config.active_tool_groups.is_empty());
+        assert!(pending_config_change(&tool_call, &ok_output(None), None).is_none());
     }
 
     // -- broadcast_turn_appended tests -----------------------------------

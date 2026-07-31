@@ -1,5 +1,6 @@
 use choreo_proto::DaemonMessage;
-use choreographr::{RequestContext, SessionCommand, session_main};
+use choreographr::{RequestContext, SessionCommand, db, session_main};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
 
@@ -112,4 +113,63 @@ fn session_cancel_nonexistent_request_does_not_panic() {
     drop(session_tx);
 
     handle.join().unwrap();
+}
+
+#[ignore]
+#[test]
+fn session_config_tools_mutate_authoritative_state_and_persist() {
+    let db = Arc::new(common::test_db());
+    let (session_tx, handle) = spawn_session(db.clone(), 1);
+
+    // set_working_dir round-trip — the synchronous reply confirms the change
+    // was applied by the session main loop's AUTHORITATIVE config, not a
+    // throwaway worker copy (the regression this guards: the old inline
+    // meta-tools mutated the request worker's snapshot, which was discarded at
+    // request end, silently reverting the change on the next turn).
+    let (wd_reply_tx, wd_reply_rx) = mpsc::channel();
+    session_tx
+        .send(SessionCommand::SetWorkingDir {
+            path: PathBuf::from("/tmp/new-wd"),
+            reply: wd_reply_tx,
+        })
+        .unwrap();
+    match wd_reply_rx.recv().unwrap() {
+        Ok(path) => assert_eq!(path, "/tmp/new-wd"),
+        Err(e) => panic!("set_working_dir rejected: {e}"),
+    }
+
+    // load_tools round-trip.
+    let (lt_reply_tx, lt_reply_rx) = mpsc::channel();
+    session_tx
+        .send(SessionCommand::LoadTools {
+            groups: vec!["x".into()],
+            reply: lt_reply_tx,
+        })
+        .unwrap();
+    match lt_reply_rx.recv().unwrap() {
+        Ok(msg) => assert!(msg.contains("x"), "unexpected summary: {msg}"),
+        Err(e) => panic!("load_tools rejected: {e}"),
+    }
+
+    // The authoritative state must reflect both changes immediately — a
+    // subsequent GetSummary sees them because the main loop holds them.
+    let (summary_tx, summary_rx) = mpsc::channel();
+    session_tx
+        .send(SessionCommand::GetSummary { reply: summary_tx })
+        .unwrap();
+    let summary = summary_rx.recv().unwrap();
+    assert_eq!(summary.working_dir.as_deref(), Some("/tmp/new-wd"));
+    assert!(summary.active_tool_groups.contains(&"x".to_string()));
+
+    // Shut down cleanly; the handlers persist via write_session_retry so the
+    // record survives a daemon restart.
+    session_tx.send(SessionCommand::Shutdown).unwrap();
+    drop(session_tx);
+    handle.join().unwrap();
+
+    // The persisted record carries the mutations — the exact thing the
+    // lost-update bug silently reverted.
+    let record = db::read_session(&db, 1).unwrap().expect("session record");
+    assert_eq!(record.working_dir.as_deref(), Some("/tmp/new-wd"));
+    assert!(record.active_tool_groups.contains(&"x".to_string()));
 }

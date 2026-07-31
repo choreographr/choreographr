@@ -69,9 +69,11 @@ pub enum SessionCommand {
     },
     /// Set the session working directory (authoritative state lives in the
     /// main loop, so this must be routed here rather than mutated on the
-    /// request worker's throwaway copy).
+    /// request worker's throwaway copy).  Replies with the applied path once
+    /// the change has been broadcast and persisted.
     SetWorkingDir {
         path: PathBuf,
+        reply: mpsc::Sender<Result<String, String>>,
     },
     /// Activate tool groups on the authoritative active-group set, then
     /// reply to the caller with a summary of what changed.
@@ -799,7 +801,9 @@ fn process_command(
         } => handle_request_finished(request_id, snapshot, state, shutdown_requested, ctx),
         SessionCommand::Broadcast(message) => handle_broadcast(message, state, ctx),
         SessionCommand::SetTitle { title } => handle_set_title(title, state, ctx),
-        SessionCommand::SetWorkingDir { path } => handle_set_working_dir(path, state, ctx),
+        SessionCommand::SetWorkingDir { path, reply } => {
+            handle_set_working_dir(path, reply, state, ctx)
+        }
         SessionCommand::LoadTools { groups, reply } => {
             handle_load_tools(groups, reply, state, ctx)
         }
@@ -1433,8 +1437,14 @@ fn handle_set_title(title: String, state: &mut SessionState, ctx: &RequestContex
 /// `SessionConfig` lives — so the change survives the request and is picked
 /// up by the next turn's snapshot.  (The pre-refactor implementation
 /// mutated the request worker's throwaway copy, which was discarded at
-/// request end, silently reverting the change.)
-fn handle_set_working_dir(path: PathBuf, state: &mut SessionState, ctx: &RequestContext) -> bool {
+/// request end, silently reverting the change.)  Replies with the canonical
+/// path that was applied so the calling tool knows the round-trip succeeded.
+fn handle_set_working_dir(
+    path: PathBuf,
+    reply: mpsc::Sender<Result<String, String>>,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
     info!(
         session_id = ctx.session_id,
         old_path = ?state.config.working_dir,
@@ -1461,6 +1471,8 @@ fn handle_set_working_dir(path: PathBuf, state: &mut SessionState, ctx: &Request
 
     persist_session_metadata(state, ctx, "SetWorkingDir");
 
+    let _ = reply.send(Ok(path.to_string_lossy().into_owned()));
+
     false
 }
 
@@ -1474,6 +1486,20 @@ fn handle_load_tools(
     ctx: &RequestContext,
 ) -> bool {
     info!(session_id = ctx.session_id, groups = ?groups, "session load_tools");
+
+    // Defense-in-depth: the tool validates group names against the live
+    // registry before sending, so unknown names normally never reach the
+    // handler.  Re-validate here so a directly-sent command can never
+    // persist a typo'd group into the authoritative active set.
+    let known = ctx.tool_registry.known_group_names();
+    if let Some(unknown) = crate::tools::unknown_group_names(&groups, &known) {
+        let _ = reply.send(Err(format!(
+            "Unknown tool group(s): {}",
+            unknown.join(", ")
+        )));
+        return false;
+    }
+
     let result =
         crate::tools::load_tools::apply_load_tools(&mut state.config.active_tool_groups, &groups);
 
@@ -1497,6 +1523,18 @@ fn handle_unload_tools(
     ctx: &RequestContext,
 ) -> bool {
     info!(session_id = ctx.session_id, groups = ?groups, "session unload_tools");
+
+    // Defense-in-depth: reject unknown group names (same rationale as
+    // handle_load_tools).  "core" is known and handled below as protected.
+    let known = ctx.tool_registry.known_group_names();
+    if let Some(unknown) = crate::tools::unknown_group_names(&groups, &known) {
+        let _ = reply.send(Err(format!(
+            "Unknown tool group(s): {}",
+            unknown.join(", ")
+        )));
+        return false;
+    }
+
     let result =
         crate::tools::unload_tools::apply_unload_tools(&mut state.config.active_tool_groups, &groups);
 
@@ -2085,6 +2123,7 @@ mod tests {
         let (mut state, ctx) = broadcast_setup();
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         state.subscribers.insert(10, tx);
+        let (reply_tx, reply_rx) = mpsc::channel();
         // Pre-populate the skill cache so we can verify it gets invalidated.
         state.discovered_skills = Some(Vec::new());
         let new_path = PathBuf::from("/tmp/new-wd");
@@ -2093,6 +2132,7 @@ mod tests {
         process_command(
             SessionCommand::SetWorkingDir {
                 path: new_path.clone(),
+                reply: reply_tx,
             },
             &mut state,
             &mut shutdown,
@@ -2115,6 +2155,12 @@ mod tests {
                 assert_eq!(path.as_deref(), Some("/tmp/new-wd"));
             }
             other => panic!("expected SessionWorkingDirSet, got {:?}", other),
+        }
+        // The handler replies synchronously with the applied path.
+        match reply_rx.recv() {
+            Ok(Ok(msg)) => assert_eq!(msg, "/tmp/new-wd"),
+            Ok(Err(e)) => panic!("expected success reply, got error: {e}"),
+            Err(e) => panic!("expected reply, got {e:?}"),
         }
     }
 
@@ -2216,6 +2262,61 @@ mod tests {
         match reply_rx.recv() {
             Ok(Ok(msg)) => assert_eq!(msg, "The 'core' group cannot be unloaded."),
             Ok(Err(e)) => panic!("expected success reply, got error: {e}"),
+            Err(e) => panic!("expected reply, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn load_tools_rejects_unknown_group() {
+        let (mut state, ctx) = broadcast_setup();
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::LoadTools {
+                groups: vec!["not-a-real-group".into()],
+                reply: reply_tx,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        // The unknown group must not be persisted into the authoritative set.
+        assert!(!state.config.active_tool_groups.contains("not-a-real-group"));
+        match reply_rx.recv() {
+            Ok(Err(msg)) => {
+                assert!(msg.contains("Unknown tool group(s): not-a-real-group"))
+            }
+            Ok(Ok(msg)) => panic!("expected error reply, got success: {msg}"),
+            Err(e) => panic!("expected reply, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn unload_tools_rejects_unknown_group() {
+        let (mut state, ctx) = broadcast_setup();
+        state.config.active_tool_groups.insert("git".into());
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::UnloadTools {
+                groups: vec!["not-a-real-group".into()],
+                reply: reply_tx,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        // No group (valid or not) was touched — the whole request is rejected.
+        assert!(state.config.active_tool_groups.contains("git"));
+        match reply_rx.recv() {
+            Ok(Err(msg)) => {
+                assert!(msg.contains("Unknown tool group(s): not-a-real-group"))
+            }
+            Ok(Ok(msg)) => panic!("expected error reply, got success: {msg}"),
             Err(e) => panic!("expected reply, got {e:?}"),
         }
     }

@@ -190,10 +190,14 @@ pub enum DaemonCommand {
         title: String,
     },
     /// Set the session working directory, forwarded to the session's main
-    /// loop for in-memory update, broadcast, and persistence.
+    /// loop for in-memory update, broadcast, and persistence.  The session
+    /// replies once the change has been applied; the daemon replies with an
+    /// error immediately if the session is inactive so the caller (a blocked
+    /// tool execution) never hangs.
     SetWorkingDir {
         session_id: u64,
         path: PathBuf,
+        reply: mpsc::Sender<Result<String, String>>,
     },
     /// Activate tool groups.  Forwarded to the session's main loop, which
     /// applies the change to the authoritative active-group set and replies
@@ -334,9 +338,11 @@ impl DaemonState {
             DaemonCommand::SetSessionTitle { session_id, title } => {
                 self.handle_set_session_title(session_id, title)
             }
-            DaemonCommand::SetWorkingDir { session_id, path } => {
-                self.handle_set_working_dir(session_id, path)
-            }
+            DaemonCommand::SetWorkingDir {
+                session_id,
+                path,
+                reply,
+            } => self.handle_set_working_dir(session_id, path, reply),
             DaemonCommand::LoadTools {
                 session_id,
                 groups,
@@ -1010,14 +1016,22 @@ impl DaemonState {
 
     /// Forward a working-directory change to the session thread for
     /// in-memory update, subscriber broadcast, and persistence.
-    fn handle_set_working_dir(&mut self, session_id: u64, path: PathBuf) {
+    fn handle_set_working_dir(
+        &mut self,
+        session_id: u64,
+        path: PathBuf,
+        reply: mpsc::Sender<Result<String, String>>,
+    ) {
         debug!(session_id, path = %path.display(), "forwarding working dir change to session");
         match self.active_sessions.get(&session_id) {
             Some(entry) => {
-                let _ = entry.cmd_tx.send(SessionCommand::SetWorkingDir { path });
+                let _ = entry.cmd_tx.send(SessionCommand::SetWorkingDir { path, reply });
             }
             None => {
                 warn!(session_id, "cannot set working dir: session is not active");
+                // Reply immediately so the caller (a blocked tool execution)
+                // doesn't hang waiting on a session that doesn't exist.
+                let _ = reply.send(Err("session is not active".into()));
             }
         }
     }
@@ -1921,12 +1935,13 @@ mod tests {
         state.handle_command(DaemonCommand::SetWorkingDir {
             session_id: 1,
             path: PathBuf::from("/tmp"),
+            reply: mpsc::channel().0,
         });
 
         // The send is synchronous (handle_command sends on cmd_tx), so
         // try_recv is deterministic — no time-based wait needed.
         match cmd_rx.try_recv() {
-            Ok(SessionCommand::SetWorkingDir { path }) => {
+            Ok(SessionCommand::SetWorkingDir { path, .. }) => {
                 assert_eq!(path, PathBuf::from("/tmp"));
             }
             Ok(_) => panic!("expected SetWorkingDir, got a different SessionCommand variant"),
@@ -1938,13 +1953,23 @@ mod tests {
     }
 
     #[test]
-    fn handle_set_working_dir_nonexistent_session_logs_warning() {
-        let (mut state, _rx) = make_daemon_state();
+    fn handle_set_working_dir_nonexistent_session_replies_error() {
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let (reply_tx, reply_rx) = mpsc::channel();
+
         state.handle_command(DaemonCommand::SetWorkingDir {
             session_id: 999,
             path: PathBuf::from("/tmp"),
+            reply: reply_tx,
         });
-        // No active session = no message to verify; just checking no panic.
+
+        // The daemon replies synchronously for inactive sessions so a
+        // blocked tool execution never hangs.
+        match reply_rx.recv() {
+            Ok(Err(msg)) => assert!(msg.contains("not active"), "unexpected msg: {msg}"),
+            Ok(Ok(_)) => panic!("expected an error reply for an inactive session"),
+            Err(e) => panic!("expected error reply, got {e:?}"),
+        }
     }
 
     #[test]

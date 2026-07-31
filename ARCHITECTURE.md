@@ -806,6 +806,12 @@ pub struct ToolOutput {
     /// Empty string when the description is unavailable (e.g. spawned
     /// thread error paths before the description could be generated).
     pub invocation_description: String,
+    /// The tool's structured return value (`serde_json::to_value(ret)`),
+    /// populated by the blanket `ToolDyn` impl after a successful execution.
+    /// `None` for error/timeout outputs.  The request worker reads this to
+    /// mirror session-config mutations (e.g. `set_working_dir`'s canonical
+    /// path) onto its config copy without re-executing the tool.
+    pub result_json: Option<serde_json::Value>,
 }
 ```
 
@@ -1008,6 +1014,15 @@ Implementation details:
   symlink escapes); `load_tools`/`unload_tools` carry a weak reference to the
   registry so their `groups` schema enum reflects the live group catalog
   (including dynamic MCP groups) at definition time
+- `set_working_dir` performs a synchronous reply round-trip like
+  `load_tools`/`unload_tools`: the daemon replies with an error immediately if
+  the session is inactive, and the session main loop replies after applying the
+  change — so a tool success means the authoritative state was actually updated
+- `load_tools`/`unload_tools` validate their group names against the live
+  registry catalog before sending (the schema enum is advisory): unknown groups
+  are rejected with a clear error instead of being silently persisted into the
+  session's active set.  The session handlers re-validate as defense-in-depth
+  (see `unknown_group_names` / `ToolRegistry::known_group_names`)
 - The three tools are restricted to `AllowedCaller::Direct` (model only) and are
   kept in the serial dispatch phase to preserve same-turn ordering of
   session-config mutations
@@ -1030,17 +1045,25 @@ Implementation details:
 - **Worker-copy mirror (Phase 3)** — after every tool in the response has
   executed, `run_agent_loop` mirrors successful session-config mutations onto
   its own worker config copy so the next agent-loop iteration observes them
-  (tool definitions, system content, working-dir-relative file ops): the
-  shared `apply_load_tools`/`apply_unload_tools` for the group sets, and the
-  same `resolve_path` + `canonicalize` resolution for `set_working_dir`
-  (against the working directory in effect when the response was planned,
-  so repeated relative `set_working_dir` calls match what the main loop
-  applied verbatim). The mirror is deferred until the end of the response
-  because the model planned every tool call in the batch against the
-  pre-change state (parallel semantics) — `set_working_dir` therefore takes
-  effect on the next agent-loop turn, matching its advertised description.
-  The worker copy is discarded at request end, so it cannot drift from the
-  main loop's authoritative state across requests.
+  (tool definitions, system content, working-dir-relative file ops).  The
+  mutations are captured in Phase 1 as a typed `PendingConfigChange`
+  (`LoadTools(Vec<String>)`, `UnloadTools(Vec<String>)`,
+  `SetWorkingDir(Option<PathBuf>)`) and applied in call order in Phase 3:
+  the shared `apply_load_tools`/`apply_unload_tools` for the group sets, and
+  for `set_working_dir` the tool's **executed result** — the canonical path is
+  carried on `ToolOutput.result_json` (populated by the blanket `ToolDyn` impl
+  from the tool's typed return), so the mirror reproduces exactly what the
+  main loop applied with no re-resolution and therefore no TOCTOU window.  A
+  rarely-reachable fallback re-runs the shared `resolve_working_dir_path`
+  helper (against the working directory in effect when the response was
+  planned); if even that fails, the worker still invalidates its `discovered_skills`
+  cache so a stale skill set can never leak across the request boundary.  The
+  mirror is deferred until the end of the response because the model planned
+  every tool call in the batch against the pre-change state (parallel
+  semantics) — `set_working_dir` therefore takes effect on the next
+  agent-loop turn, matching its advertised description.  The worker copy is
+  discarded at request end, so it cannot drift from the main loop's
+  authoritative state across requests.
 - **Concurrent** — all remaining tools (shell, filesystem, VM, HTTP, Git,
   `spawn_subsession`, etc.) — tools whose execution is independent of session state.
   These are dispatched across multiple OS threads in parallel using `spawn_single_tool()`.

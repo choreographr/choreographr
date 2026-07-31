@@ -142,6 +142,7 @@ impl ToolDyn for McpToolWrapper {
             },
             is_error,
             invocation_description: String::new(),
+            ..Default::default()
         })
     }
 
@@ -188,6 +189,7 @@ impl ToolDyn for McpToolWrapper {
             },
             is_error,
             invocation_description: String::new(),
+            ..Default::default()
         })
     }
 }
@@ -209,6 +211,7 @@ mod tests {
             content: text_parts.join("\n"),
             is_error,
             invocation_description: String::new(),
+            ..Default::default()
         }
     }
 

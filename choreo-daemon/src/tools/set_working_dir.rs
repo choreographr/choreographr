@@ -4,7 +4,8 @@ use crate::tools::{AllowedCaller, Tool, ToolExecError, resolve_path};
 use choreo_keystore::ServiceCredential;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use tracing::info;
 
 // ── Args ───────────────────────────────────────────────────────────────────
@@ -23,19 +24,21 @@ pub struct SetWorkingDirResult {
     pub path: String,
 }
 
-// ── Execute ────────────────────────────────────────────────────────────────
+// ── Resolution (shared with the worker-copy mirror) ────────────────────────
 
-fn execute_set_working_dir(
-    args: &SetWorkingDirArgs,
+/// Resolve `path` relative to `working_dir` (with tilde expansion) and
+/// canonicalize it, enforcing existence and symlink-escape checks.
+///
+/// Shared by the tool's own execution and by `requests.rs`'s worker-copy
+/// mirror fallback, so the two can never drift on resolution rules.
+pub(crate) fn resolve_working_dir_path(
+    path: &str,
     working_dir: Option<&Path>,
-    ctx: Option<&ToolContext>,
-) -> Result<SetWorkingDirResult, ToolExecError> {
-    let ctx = ctx.ok_or_else(|| ToolExecError("no session context".into()))?;
-
+) -> Result<PathBuf, ToolExecError> {
     // Resolve relative to the current session working directory (or process
     // cwd if none is set yet).  Tilde expansion (`~` → home directory) is
     // handled inside resolve_path.
-    let resolved = resolve_path(&args.path, working_dir);
+    let resolved = resolve_path(path, working_dir);
 
     // canonicalize() resolves symlinks and normalizes the path.  This serves
     // two purposes:
@@ -52,6 +55,18 @@ fn execute_set_working_dir(
             resolved.display()
         ))
     })?;
+    Ok(canonical)
+}
+
+// ── Execute ────────────────────────────────────────────────────────────────
+
+fn execute_set_working_dir(
+    args: &SetWorkingDirArgs,
+    working_dir: Option<&Path>,
+    ctx: Option<&ToolContext>,
+) -> Result<SetWorkingDirResult, ToolExecError> {
+    let ctx = ctx.ok_or_else(|| ToolExecError("no session context".into()))?;
+    let canonical = resolve_working_dir_path(&args.path, working_dir)?;
 
     info!(
         session_id = ctx.session_id,
@@ -64,12 +79,24 @@ fn execute_set_working_dir(
     // must NOT mutate its own (worker-thread) copy of session state — that
     // copy is discarded when the request finishes, so changes made there
     // would silently revert on the next turn.
+    //
+    // Synchronous round-trip (like load_tools/unload_tools): the daemon
+    // replies immediately if the session is inactive, and the session main
+    // loop replies after applying the change — so a success return means the
+    // authoritative state was actually updated, and a rejected round-trip is
+    // surfaced to the model instead of silently succeeding.
+    let (reply, rx) = mpsc::channel();
     ctx.daemon_tx
         .send(DaemonCommand::SetWorkingDir {
             session_id: ctx.session_id,
             path: canonical.clone(),
+            reply,
         })
         .map_err(|e| ToolExecError(format!("daemon communication failed: {e}")))?;
+    let outcome = rx
+        .recv()
+        .map_err(|e| ToolExecError(format!("daemon did not respond: {e}")))?;
+    outcome.map_err(ToolExecError)?;
 
     Ok(SetWorkingDirResult {
         path: canonical.to_string_lossy().into_owned(),
@@ -156,64 +183,102 @@ mod tests {
         (ctx, daemon_tx, daemon_rx)
     }
 
+    /// Run execute_set_working_dir on a thread (it blocks waiting for the
+    /// daemon's reply), intercept the DaemonCommand on the main thread, send
+    /// the reply, and join.  Deterministic — no time-based waits: the tool
+    /// blocks on the reply channel until this test sends it.  Takes owned
+    /// args because the spawned thread must own everything it touches
+    /// (`'static` bound).
+    fn run_with_daemon_reply(
+        args: SetWorkingDirArgs,
+        working_dir: Option<PathBuf>,
+        reply: Result<String, String>,
+    ) -> (Result<SetWorkingDirResult, ToolExecError>, DaemonCommand) {
+        let (ctx, _daemon_tx, daemon_rx) = test_context();
+        let wd = working_dir.clone();
+        let handle =
+            std::thread::spawn(move || execute_set_working_dir(&args, wd.as_deref(), Some(&ctx)));
+        let cmd = daemon_rx.recv().unwrap();
+        match &cmd {
+            DaemonCommand::SetWorkingDir { reply: tx, .. } => {
+                tx.send(reply).unwrap();
+            }
+            other => panic!(
+                "expected SetWorkingDir, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+        (handle.join().unwrap(), cmd)
+    }
+
     #[test]
     fn execute_set_working_dir_sends_daemon_command() {
-        let (ctx, _daemon_tx, daemon_rx) = test_context();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_string_lossy().into_owned();
         let args = SetWorkingDirArgs { path: path.clone() };
 
-        let result = execute_set_working_dir(&args, None, Some(&ctx));
+        let (result, cmd) = run_with_daemon_reply(args, None, Ok(path.clone()));
         assert!(result.is_ok(), "expected ok: {:?}", result.err());
         assert_eq!(result.unwrap().path, path);
 
         // Verify a SetWorkingDir command was sent to the daemon.
-        match daemon_rx.try_recv() {
-            Ok(DaemonCommand::SetWorkingDir {
+        match cmd {
+            DaemonCommand::SetWorkingDir {
                 session_id,
                 path: sent_path,
-            }) => {
+                ..
+            } => {
                 assert_eq!(session_id, 42);
                 assert_eq!(sent_path.to_string_lossy(), path);
             }
-            Ok(other) => panic!(
-                "expected SetWorkingDir, got something else: {:?}",
-                std::mem::discriminant(&other)
-            ),
-            Err(e) => panic!("expected SetWorkingDir, got {e:?}"),
+            _ => panic!("expected SetWorkingDir command"),
         }
     }
 
     #[test]
     fn execute_resolves_relative_path_against_working_dir() {
-        let (ctx, _daemon_tx, daemon_rx) = test_context();
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         let args = SetWorkingDirArgs { path: "sub".into() };
 
-        let result = execute_set_working_dir(&args, Some(dir.path()), Some(&ctx));
+        let (result, _cmd) = run_with_daemon_reply(args, Some(dir.path().to_path_buf()), Ok(
+            sub.to_string_lossy().into_owned(),
+        ));
         assert!(result.is_ok(), "expected ok: {:?}", result.err());
         assert_eq!(
             result.unwrap().path,
             sub.to_string_lossy(),
             "relative path should resolve against working_dir and canonicalize"
         );
-        // Drain the daemon command so the channel doesn't retain it.
-        let _ = daemon_rx.try_recv();
     }
 
     #[test]
     fn execute_expands_tilde() {
-        let (ctx, _daemon_tx, daemon_rx) = test_context();
         let home = dirs::home_dir().expect("home dir should exist in test env");
         // `~` alone maps to the home directory itself, which always exists.
         let args = SetWorkingDirArgs { path: "~".into() };
 
-        let result = execute_set_working_dir(&args, None, Some(&ctx));
+        let (result, _cmd) =
+            run_with_daemon_reply(args, None, Ok(home.to_string_lossy().into_owned()));
         assert!(result.is_ok(), "expected ok: {:?}", result.err());
         assert_eq!(result.unwrap().path, home.to_string_lossy());
-        let _ = daemon_rx.try_recv();
+    }
+
+    #[test]
+    fn execute_forwards_daemon_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let args = SetWorkingDirArgs { path };
+
+        let (result, _cmd) = run_with_daemon_reply(args, None, Err("session is not active".into()));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("session is not active")
+        );
     }
 
     #[test]
