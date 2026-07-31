@@ -954,7 +954,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 
 | Group | Tools |
 |---|---|
-| **Core** | `list_sessions`, `get_session`, `load_skill`, `set_session_title`, `read_file`, `read_file_range`, `write_file`, `edit_file`, `list_files`, `delete_files`, `line_count`, `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed), `get_current_time` (Unix millisecond timestamp) |
+| **Core** | `list_sessions`, `get_session`, `load_skill`, `set_session_title`, `set_working_dir`, `load_tools`, `unload_tools`, `read_file`, `read_file_range`, `write_file`, `edit_file`, `list_files`, `delete_files`, `line_count`, `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed), `get_current_time` (Unix millisecond timestamp) |
 | **HTTP** | `http_request` (GET/POST/HEAD with headers, body, timeout) |
 | **Image** | `display_image` (from path, URL, base64, or SVG text) |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push`, `git_show` |
@@ -991,29 +991,42 @@ mechanism, not access control. The RISC-V VM (`run_riscv`) always has access to 
 tools regardless of group state.
 
 Implementation details:
-- `ToolRegistry::available_definitions(active)` returns definitions for all registry tools
-  in the active set, plus always-available meta-tools (`load_tools`, `unload_tools`,
-  `set_working_dir`) that require mutable session state
-- `load_tools`/`unload_tools`/`set_working_dir` are intercepted in
-  `execute_tool_with_timeout()` — they are not in the registry because they modify
-  `session.config.active_tool_groups` or `session.config.working_dir`
-  (`set_working_dir` supports tilde expansion in its `path` argument, inherited from
-  `resolve_path`)
-- `list_sessions`, `get_session`, `load_skill`, and `spawn_subsession` were formerly
-  intercepted like `load_tools`/`unload_tools` but are now proper `Tool` trait implementations
-  registered in the default registry via `ToolRegistry::build()`, using `ToolContext.daemon_tx`
-  to communicate with the daemon command loop
+- `ToolRegistry::available_definitions(active)` returns definitions for all registry
+  tools in the active set; every tool — including `load_tools`, `unload_tools`, and
+  `set_working_dir` — is a proper `Tool` trait implementation registered in the
+  default registry via `ToolRegistry::build()`
+- The former meta-tools were converted from inline `&mut SessionState` handlers in
+  `execute_tool_with_timeout()` to registry tools (see `tools/set_working_dir.rs`,
+  `tools/load_tools.rs`, `tools/unload_tools.rs`).  They follow the
+  `set_session_title` pattern: validate in the tool, then route the mutation
+  through `DaemonCommand` → daemon → `SessionCommand` → the session's main loop,
+  which applies it to the authoritative `SessionConfig` (broadcast + persist).
+  This fixes a lost-update bug where the old inline handlers mutated the request
+  worker's throwaway snapshot, which was discarded at request end
+- `set_working_dir` supports tilde expansion in its `path` argument (inherited from
+  `resolve_path`) and canonicalizes the target (rejecting non-existent paths and
+  symlink escapes); `load_tools`/`unload_tools` carry a weak reference to the
+  registry so their `groups` schema enum reflects the live group catalog
+  (including dynamic MCP groups) at definition time
+- The three tools are restricted to `AllowedCaller::Direct` (model only) and are
+  kept in the serial dispatch phase to preserve same-turn ordering of
+  session-config mutations
+- `list_sessions`, `get_session`, `load_skill`, and `spawn_subsession` are also
+  proper `Tool` trait implementations registered in the default registry via
+  `ToolRegistry::build()`, using `ToolContext.daemon_tx` to communicate with the
+  daemon command loop
 - Session state stores `active_tool_groups: HashSet<String>` (default: `{core, git, shell}`)
 - `ToolGroup` struct and `GROUPS` constant live in `choreographr/src/tools/mod.rs`
-- Handler functions live in `choreographr/src/tools/groups.rs`
 - Group metadata is appended to the system prompt in `context::build_base_prompt()`
 
 ### Concurrent tool dispatch
 
 `run_agent_loop` in `requests.rs` partitions tool calls into two groups before execution:
 
-- **Mutators** — `load_tools`, `unload_tools` — tools that require `&mut SessionState`.
-  These execute serially on the agent loop's thread via `execute_tool_with_timeout()`.
+- **Serial (session-config)** — `load_tools`, `unload_tools`, `set_working_dir`.
+  These no longer require `&mut SessionState` (they route mutations to the
+  session main loop via `DaemonCommand`), but they still execute serially so
+  same-turn ordering of session-config mutations is preserved.
 - **Concurrent** — all remaining tools (shell, filesystem, VM, HTTP, Git,
   `spawn_subsession`, etc.) — tools whose execution is independent of session state.
   These are dispatched across multiple OS threads in parallel using `spawn_single_tool()`.

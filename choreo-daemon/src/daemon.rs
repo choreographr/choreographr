@@ -189,6 +189,28 @@ pub enum DaemonCommand {
         session_id: u64,
         title: String,
     },
+    /// Set the session working directory, forwarded to the session's main
+    /// loop for in-memory update, broadcast, and persistence.
+    SetWorkingDir {
+        session_id: u64,
+        path: PathBuf,
+    },
+    /// Activate tool groups.  Forwarded to the session's main loop, which
+    /// applies the change to the authoritative active-group set and replies
+    /// with a summary of what changed.
+    LoadTools {
+        session_id: u64,
+        groups: Vec<String>,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+    /// Deactivate tool groups ("core" is protected).  Forwarded to the
+    /// session's main loop, which applies the change and replies with a
+    /// summary of what changed.
+    UnloadTools {
+        session_id: u64,
+        groups: Vec<String>,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
 }
 
 impl DaemonState {
@@ -312,6 +334,19 @@ impl DaemonState {
             DaemonCommand::SetSessionTitle { session_id, title } => {
                 self.handle_set_session_title(session_id, title)
             }
+            DaemonCommand::SetWorkingDir { session_id, path } => {
+                self.handle_set_working_dir(session_id, path)
+            }
+            DaemonCommand::LoadTools {
+                session_id,
+                groups,
+                reply,
+            } => self.handle_load_tools(session_id, groups, reply),
+            DaemonCommand::UnloadTools {
+                session_id,
+                groups,
+                reply,
+            } => self.handle_unload_tools(session_id, groups, reply),
             DaemonCommand::Shutdown => {
                 warn!("unexpected Shutdown command in handle_command; handled at loop level");
             }
@@ -969,6 +1004,65 @@ impl DaemonState {
             }
             None => {
                 warn!(session_id, "cannot set title: session is not active");
+            }
+        }
+    }
+
+    /// Forward a working-directory change to the session thread for
+    /// in-memory update, subscriber broadcast, and persistence.
+    fn handle_set_working_dir(&mut self, session_id: u64, path: PathBuf) {
+        debug!(session_id, path = %path.display(), "forwarding working dir change to session");
+        match self.active_sessions.get(&session_id) {
+            Some(entry) => {
+                let _ = entry.cmd_tx.send(SessionCommand::SetWorkingDir { path });
+            }
+            None => {
+                warn!(session_id, "cannot set working dir: session is not active");
+            }
+        }
+    }
+
+    /// Forward a tool-group activation to the session thread, which applies
+    /// it to the authoritative active-group set and replies with a summary.
+    fn handle_load_tools(
+        &mut self,
+        session_id: u64,
+        groups: Vec<String>,
+        reply: mpsc::Sender<Result<String, String>>,
+    ) {
+        debug!(session_id, groups = ?groups, "forwarding load_tools to session");
+        match self.active_sessions.get(&session_id) {
+            Some(entry) => {
+                let _ = entry.cmd_tx.send(SessionCommand::LoadTools { groups, reply });
+            }
+            None => {
+                warn!(session_id, "cannot load tools: session is not active");
+                // Reply immediately so the caller (a blocked tool execution)
+                // doesn't hang waiting on a session that doesn't exist.
+                let _ = reply.send(Err("session is not active".into()));
+            }
+        }
+    }
+
+    /// Forward a tool-group deactivation to the session thread, which
+    /// applies it to the authoritative active-group set and replies with
+    /// a summary.
+    fn handle_unload_tools(
+        &mut self,
+        session_id: u64,
+        groups: Vec<String>,
+        reply: mpsc::Sender<Result<String, String>>,
+    ) {
+        debug!(session_id, groups = ?groups, "forwarding unload_tools to session");
+        match self.active_sessions.get(&session_id) {
+            Some(entry) => {
+                let _ = entry.cmd_tx.send(SessionCommand::UnloadTools { groups, reply });
+            }
+            None => {
+                warn!(session_id, "cannot unload tools: session is not active");
+                // Reply immediately so the caller (a blocked tool execution)
+                // doesn't hang waiting on a session that doesn't exist.
+                let _ = reply.send(Err("session is not active".into()));
             }
         }
     }
@@ -1796,6 +1890,143 @@ mod tests {
             title: "ghost title".into(),
         });
         // No active session = no message to verify; just checking no panic.
+    }
+
+    // ── Session-config tool forwarding tests ────────────────────────────
+
+    /// Insert a minimal active-session entry whose command channel is
+    /// returned for verification.  The session thread blocks until the
+    /// returned release sender fires, then exits.
+    fn insert_active_session(
+        state: &mut DaemonState,
+        session_id: u64,
+    ) -> (mpsc::Receiver<SessionCommand>, mpsc::Sender<()>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            // Block until told to stop — we just need the entry to exist.
+            let _ = release_rx.recv();
+        });
+        state
+            .active_sessions
+            .insert(session_id, ActiveSessionEntry { cmd_tx, handle });
+        (cmd_rx, release_tx)
+    }
+
+    #[test]
+    fn handle_set_working_dir_forwards_to_session() {
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let (cmd_rx, release_tx) = insert_active_session(&mut state, 1);
+
+        state.handle_command(DaemonCommand::SetWorkingDir {
+            session_id: 1,
+            path: PathBuf::from("/tmp"),
+        });
+
+        // The send is synchronous (handle_command sends on cmd_tx), so
+        // try_recv is deterministic — no time-based wait needed.
+        match cmd_rx.try_recv() {
+            Ok(SessionCommand::SetWorkingDir { path }) => {
+                assert_eq!(path, PathBuf::from("/tmp"));
+            }
+            Ok(_) => panic!("expected SetWorkingDir, got a different SessionCommand variant"),
+            Err(e) => panic!("expected SetWorkingDir, got error: {e}"),
+        }
+
+        // Clean up the session thread.
+        let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn handle_set_working_dir_nonexistent_session_logs_warning() {
+        let (mut state, _rx) = make_daemon_state();
+        state.handle_command(DaemonCommand::SetWorkingDir {
+            session_id: 999,
+            path: PathBuf::from("/tmp"),
+        });
+        // No active session = no message to verify; just checking no panic.
+    }
+
+    #[test]
+    fn handle_load_tools_forwards_to_session() {
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let (cmd_rx, release_tx) = insert_active_session(&mut state, 1);
+
+        state.handle_command(DaemonCommand::LoadTools {
+            session_id: 1,
+            groups: vec!["x".into()],
+            reply: mpsc::channel().0,
+        });
+
+        match cmd_rx.try_recv() {
+            Ok(SessionCommand::LoadTools { groups, .. }) => {
+                assert_eq!(groups, vec!["x"]);
+            }
+            Ok(_) => panic!("expected LoadTools, got a different SessionCommand variant"),
+            Err(e) => panic!("expected LoadTools, got error: {e}"),
+        }
+
+        let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn handle_load_tools_nonexistent_session_replies_error() {
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        state.handle_command(DaemonCommand::LoadTools {
+            session_id: 999,
+            groups: vec!["x".into()],
+            reply: reply_tx,
+        });
+
+        // The daemon replies synchronously for inactive sessions so a
+        // blocked tool execution never hangs.
+        match reply_rx.recv() {
+            Ok(Err(msg)) => assert!(msg.contains("not active"), "unexpected msg: {msg}"),
+            Ok(Ok(_)) => panic!("expected an error reply for an inactive session"),
+            Err(e) => panic!("expected error reply, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_unload_tools_forwards_to_session() {
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let (cmd_rx, release_tx) = insert_active_session(&mut state, 1);
+
+        state.handle_command(DaemonCommand::UnloadTools {
+            session_id: 1,
+            groups: vec!["x".into()],
+            reply: mpsc::channel().0,
+        });
+
+        match cmd_rx.try_recv() {
+            Ok(SessionCommand::UnloadTools { groups, .. }) => {
+                assert_eq!(groups, vec!["x"]);
+            }
+            Ok(_) => panic!("expected UnloadTools, got a different SessionCommand variant"),
+            Err(e) => panic!("expected UnloadTools, got error: {e}"),
+        }
+
+        let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn handle_unload_tools_nonexistent_session_replies_error() {
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        state.handle_command(DaemonCommand::UnloadTools {
+            session_id: 999,
+            groups: vec!["x".into()],
+            reply: reply_tx,
+        });
+
+        match reply_rx.recv() {
+            Ok(Err(msg)) => assert!(msg.contains("not active"), "unexpected msg: {msg}"),
+            Ok(Ok(_)) => panic!("expected an error reply for an inactive session"),
+            Err(e) => panic!("expected error reply, got {e:?}"),
+        }
     }
 
     // ── Activity subscriber tests ───────────────────────────────────────

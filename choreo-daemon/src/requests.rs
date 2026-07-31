@@ -1,5 +1,4 @@
 use crate::context::{self, LoadedSkill, SkillMeta};
-use crate::db::{SessionRecord, write_session_retry};
 use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
 };
@@ -7,11 +6,9 @@ use crate::providers::types::{ChatToolCall, ChatTurnResult};
 use crate::providers::{
     ChatTurnRequest, InferenceProvider, StreamEvent, ToolResultItem, model_reasoning_capability,
 };
-use crate::sessions::{RequestContext, SessionCommand, SessionMetadata, SessionState};
+use crate::sessions::{RequestContext, SessionCommand, SessionState};
 use crate::tools::context::ToolContext;
-use crate::tools::{
-    PreparedImage, ToolError, ToolOutput, ToolOutputFormat, ToolRegistry, resolve_path,
-};
+use crate::tools::{PreparedImage, ToolError, ToolOutput, ToolOutputFormat, ToolRegistry};
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
@@ -811,7 +808,14 @@ pub(crate) fn run_agent_loop(
                 prev_resp_id = tool_use.response_id;
                 tool_results.clear();
 
-                // Partition tool calls into mutators and concurrent.
+                // Partition tool calls into serial and concurrent.
+                // Session-config tools (load_tools, unload_tools,
+                // set_working_dir) run serially even though they are now
+                // registry tools: their mutations are applied by the session
+                // main loop via daemon → session command routing, and serial
+                // execution preserves the model's call order so e.g. a
+                // load_tools followed by a set_working_dir lands in the
+                // intended sequence.
                 let (mutators, concurrent): (Vec<_>, Vec<_>) =
                     tool_use.tool_calls.into_iter().partition(|tc| {
                         matches!(
@@ -820,7 +824,7 @@ pub(crate) fn run_agent_loop(
                         )
                     });
 
-                // ── Phase 1: Session-mutating tools (serial) ────────
+                // ── Phase 1: Session-config tools (serial) ────────
                 for tool_call in mutators.into_iter() {
                     if is_cancelled_once(cancel_rx) {
                         return Ok(true);
@@ -1167,166 +1171,7 @@ fn execute_tool_with_timeout(
         _ => ToolOutputFormat::Text,
     };
     // Capture start time for tool execution metrics.
-    // Meta-tools (load_tools, unload_tools) that need mutable session state
-    // return early and are not timed — only the registry-executed path below
-    // records metrics.
     let exec_start = std::time::Instant::now();
-    match tool_call.name.as_str() {
-        "load_tools" => {
-            let result = crate::tools::groups::execute_load_tools(
-                &mut session.config.active_tool_groups,
-                &tool_call.arguments_json,
-            );
-            // Broadcast updated session state so the client (e.g. TUI status
-            // bar) picks up the new active_tool_groups immediately.
-            let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                session.session_state_message(ctx.session_id),
-            ));
-            let _ = ctx
-                .daemon_tx
-                .send(crate::daemon::DaemonCommand::UpdateMetadata {
-                    session_id: ctx.session_id,
-                    metadata: SessionMetadata::from(&*session),
-                });
-            return ToolOutput {
-                content: result,
-                is_error: false,
-                invocation_description: String::new(),
-            };
-        }
-        "unload_tools" => {
-            let result = crate::tools::groups::execute_unload_tools(
-                &mut session.config.active_tool_groups,
-                &tool_call.arguments_json,
-            );
-            // Broadcast updated session state so the client picks up the
-            // new active_tool_groups immediately.
-            let _ = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                session.session_state_message(ctx.session_id),
-            ));
-            let _ = ctx
-                .daemon_tx
-                .send(crate::daemon::DaemonCommand::UpdateMetadata {
-                    session_id: ctx.session_id,
-                    metadata: SessionMetadata::from(&*session),
-                });
-            return ToolOutput {
-                content: result,
-                is_error: false,
-                invocation_description: String::new(),
-            };
-        }
-        "set_working_dir" => {
-            // Meta-tools receive raw JSON rather than typed Args because they
-            // are not registered as `Tool` impls — they run inline here with
-            // direct `&mut SessionState` access, avoiding the indirection of
-            // the ToolRegistry dispatch path.
-            let args: serde_json::Value = match serde_json::from_str(&tool_call.arguments_json) {
-                Ok(a) => a,
-                Err(e) => {
-                    return ToolOutput {
-                        content: format!("invalid arguments: {e}"),
-                        is_error: true,
-                        invocation_description: String::new(),
-                    };
-                }
-            };
-            let path_str = match args.get("path").and_then(|v| v.as_str()) {
-                Some(s) => s,
-                None => {
-                    return ToolOutput {
-                        content: "missing required argument: path".to_string(),
-                        is_error: true,
-                        invocation_description: String::new(),
-                    };
-                }
-            };
-            // Resolve relative to the current session working directory
-            // (or process cwd if none is set yet).  Tilde expansion (`~`
-            // → home directory) is handled inside resolve_path.
-            let resolved = resolve_path(path_str, working_dir);
-            // canonicalize() resolves symlinks and normalizes the path.
-            // This serves two purposes:
-            //   1. Prevents symlink-escape attacks that would let a model
-            //      redirect subsequent file ops outside the intended tree.
-            //   2. Ensures the path actually exists so subsequent tools
-            //      (find, grep, read_file) don't silently operate on
-            //      a directory that was mistyped or never created.
-            // The downside is that `set_working_dir` cannot target a path
-            // that doesn't exist yet — this is an intentional tradeoff.
-            let canonical = match resolved.canonicalize() {
-                Ok(p) => p,
-                Err(e) => {
-                    return ToolOutput {
-                        content: format!(
-                            "path '{}' does not exist or cannot be resolved: {e}",
-                            resolved.display()
-                        ),
-                        is_error: true,
-                        invocation_description: String::new(),
-                    };
-                }
-            };
-
-            info!(
-                session_id = ctx.session_id,
-                path = %canonical.display(),
-                "set_working_dir: changing session working directory",
-            );
-
-            session.config.working_dir = Some(canonical.clone());
-            // Invalidating cached skills so they are re-discovered from
-            // the new working directory on the next agent-loop turn.
-            session.discovered_skills = None;
-
-            // Notify session subscribers (e.g. TUI) so the status bar
-            // updates to reflect the new working directory immediately.
-            let path_str = canonical.to_string_lossy().into_owned();
-            debug!(
-                session_id = ctx.session_id,
-                path = %path_str,
-                "set_working_dir: broadcasting SessionWorkingDirSet",
-            );
-            if let Err(e) = ctx.cmd_tx.send(SessionCommand::Broadcast(
-                DaemonMessage::SessionWorkingDirSet {
-                    session_id: ctx.session_id,
-                    path: Some(path_str),
-                },
-            )) {
-                warn!(session_id = ctx.session_id, error = %e, "failed to broadcast SessionWorkingDirSet");
-            }
-
-            // Notify the daemon so the TUI/inspector can reflect the change
-            // immediately without waiting for the next persist cycle.
-            if let Err(e) = ctx
-                .daemon_tx
-                .send(crate::daemon::DaemonCommand::UpdateMetadata {
-                    session_id: ctx.session_id,
-                    metadata: SessionMetadata::from(&*session),
-                })
-            {
-                warn!(session_id = ctx.session_id, error = %e, "failed to notify daemon of working dir change");
-            }
-
-            // Persist the updated working_dir so it survives a daemon restart.
-            // This is the same pattern used by load_tools/unload_tools.
-            let record: SessionRecord = (&*session).into();
-            if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
-                warn!(
-                    session_id = ctx.session_id,
-                    error = %e,
-                    "set_working_dir: failed to persist session",
-                );
-            }
-
-            return ToolOutput {
-                content: format!("Working directory changed to '{}'", canonical.display()),
-                is_error: false,
-                invocation_description: String::new(),
-            };
-        }
-        _ => {}
-    }
 
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let (output_tx, output_rx) = std::sync::mpsc::channel();

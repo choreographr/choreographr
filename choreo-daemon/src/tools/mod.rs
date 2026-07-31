@@ -69,7 +69,10 @@ macro_rules! define_tool {
 
 pub(crate) mod admin;
 mod error;
+pub(crate) mod load_tools;
 pub(crate) mod set_session_title;
+pub(crate) mod set_working_dir;
+pub(crate) mod unload_tools;
 pub use error::ToolError;
 pub use error::ToolExecError;
 pub(crate) use error::{tool_err, tool_ok};
@@ -119,7 +122,6 @@ pub(crate) mod fs;
 pub(crate) mod git;
 pub(crate) mod glob_util;
 pub(crate) mod grep;
-pub(crate) mod groups;
 pub mod http;
 mod image;
 pub(crate) mod notify;
@@ -628,6 +630,7 @@ impl ToolRegistry {
         reg.register(admin::GetSession);
         reg.register(admin::LoadSkill);
         reg.register(set_session_title::SetSessionTitle);
+        reg.register(set_working_dir::SetWorkingDir);
         reg.register(subsession::SpawnSubsession);
         reg
     }
@@ -636,11 +639,15 @@ impl ToolRegistry {
     ///
     /// Uses `Arc::new_cyclic` to give the RISC-V sandbox a weak reference to
     /// the registry so guest tool calls can be dispatched without a global.
+    /// `load_tools`/`unload_tools` also receive a weak reference so their
+    /// JSON Schema enums can list the live group catalog at definition time.
     pub fn build(self) -> Arc<Self> {
         Arc::new_cyclic(|weak| {
             let mut reg = self;
             reg.register(vm::RunRiscV::new(weak.clone()));
             reg.register(series::RunSeries::new(weak.clone()));
+            reg.register(load_tools::LoadTools::new(weak.clone()));
+            reg.register(unload_tools::UnloadTools::new(weak.clone()));
             reg
         })
     }
@@ -784,8 +791,7 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Return tool definitions for groups in the active set, plus always-available
-    /// meta-tools (load_tools, unload_tools, etc.).
+    /// Return tool definitions for groups in the active set.
     ///
     /// Uses plain `ChatToolDefinition::function()` — no `output_schema` or
     /// `allowed_callers` — so the definitions are compatible with both Chat
@@ -793,18 +799,11 @@ impl ToolRegistry {
     /// call [`available_definitions_for_responses`] instead when it needs
     /// those fields.
     pub fn available_definitions(&self, active: &HashSet<String>) -> Vec<ChatToolDefinition> {
-        let mut defs: Vec<_> = self
-            .tools
+        self.tools
             .values()
             .filter(|t| active.contains(t.group()))
             .map(|t| ChatToolDefinition::function(t.name(), t.description(), t.schema()))
-            .collect();
-        // Always-available meta-tools (not in the registry because they
-        // need mutable access to session state — load_tools, unload_tools).
-        defs.push(groups::load_tools_definition(self));
-        defs.push(groups::unload_tools_definition(self));
-        defs.push(groups::set_working_dir_definition());
-        defs
+            .collect()
     }
 
     /// Like [`available_definitions`] but includes `output_schema` and
@@ -814,8 +813,7 @@ impl ToolRegistry {
         &self,
         active: &HashSet<String>,
     ) -> Vec<ChatToolDefinition> {
-        let mut defs: Vec<_> = self
-            .tools
+        self.tools
             .values()
             .filter(|t| active.contains(t.group()))
             .map(|t| {
@@ -832,11 +830,7 @@ impl ToolRegistry {
                     },
                 )
             })
-            .collect();
-        defs.push(groups::load_tools_definition(self));
-        defs.push(groups::unload_tools_definition(self));
-        defs.push(groups::set_working_dir_definition());
-        defs
+            .collect()
     }
 }
 
@@ -979,6 +973,57 @@ pub(crate) fn truncate_tool_output(content: &str) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn available_definitions_includes_session_config_tools() {
+        // Regression guard: the session-config tools (formerly inline
+        // meta-tools) must be registered as real tools so they appear in
+        // the API tool definitions for the always-on core group.
+        let registry = ToolRegistry::new().build();
+        let active: HashSet<String> = ["core".into()].into_iter().collect();
+        let defs = registry.available_definitions(&active);
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        for tool in [
+            "set_working_dir",
+            "load_tools",
+            "unload_tools",
+            "set_session_title",
+        ] {
+            assert!(
+                names.contains(&tool),
+                "missing {tool} in core definitions: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn available_definitions_responses_restricts_session_config_tools() {
+        let registry = ToolRegistry::new().build();
+        let active: HashSet<String> = ["core".into()].into_iter().collect();
+        let defs = registry.available_definitions_for_responses(&active);
+
+        // Session-config tools are Direct-only so programmatic callers
+        // cannot silently redirect the session's working directory or
+        // tool surface.
+        let set_wd = defs
+            .iter()
+            .find(|d| d.function.name == "set_working_dir")
+            .expect("set_working_dir should be defined");
+        assert_eq!(
+            set_wd.function.allowed_callers.as_deref(),
+            Some(&[AllowedCaller::Direct][..])
+        );
+
+        // Ordinary tools keep the default (model or program).
+        let read_file = defs
+            .iter()
+            .find(|d| d.function.name == "read_file")
+            .expect("read_file should be defined");
+        assert_eq!(
+            read_file.function.allowed_callers.as_deref(),
+            Some(&[AllowedCaller::Direct, AllowedCaller::Programmatic][..])
+        );
+    }
 
     #[test]
     fn confine_path_within_dir() {

@@ -67,6 +67,24 @@ pub enum SessionCommand {
     SetTitle {
         title: String,
     },
+    /// Set the session working directory (authoritative state lives in the
+    /// main loop, so this must be routed here rather than mutated on the
+    /// request worker's throwaway copy).
+    SetWorkingDir {
+        path: PathBuf,
+    },
+    /// Activate tool groups on the authoritative active-group set, then
+    /// reply to the caller with a summary of what changed.
+    LoadTools {
+        groups: Vec<String>,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+    /// Deactivate tool groups on the authoritative active-group set, then
+    /// reply to the caller with a summary of what changed.
+    UnloadTools {
+        groups: Vec<String>,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
     SetAccount {
         name: String,
     },
@@ -781,6 +799,13 @@ fn process_command(
         } => handle_request_finished(request_id, snapshot, state, shutdown_requested, ctx),
         SessionCommand::Broadcast(message) => handle_broadcast(message, state, ctx),
         SessionCommand::SetTitle { title } => handle_set_title(title, state, ctx),
+        SessionCommand::SetWorkingDir { path } => handle_set_working_dir(path, state, ctx),
+        SessionCommand::LoadTools { groups, reply } => {
+            handle_load_tools(groups, reply, state, ctx)
+        }
+        SessionCommand::UnloadTools { groups, reply } => {
+            handle_unload_tools(groups, reply, state, ctx)
+        }
         SessionCommand::SetAccount { name } => handle_set_account(name, state, ctx),
         SessionCommand::SetReasoningEffort { effort } => {
             handle_set_reasoning_effort(effort, state, ctx)
@@ -1400,6 +1425,91 @@ fn handle_set_title(title: String, state: &mut SessionState, ctx: &RequestContex
     false
 }
 
+/// Set the session working directory, broadcasting the change to
+/// subscribers and notifying the daemon so session listings reflect it
+/// immediately.
+///
+/// This runs in the session's main loop, where the authoritative
+/// `SessionConfig` lives — so the change survives the request and is picked
+/// up by the next turn's snapshot.  (The pre-refactor implementation
+/// mutated the request worker's throwaway copy, which was discarded at
+/// request end, silently reverting the change.)
+fn handle_set_working_dir(path: PathBuf, state: &mut SessionState, ctx: &RequestContext) -> bool {
+    info!(
+        session_id = ctx.session_id,
+        old_path = ?state.config.working_dir,
+        new_path = %path.display(),
+        "session working directory changed",
+    );
+    state.config.working_dir = Some(path.clone());
+    // Skills are discovered relative to the working directory — invalidate
+    // the cache so they are re-discovered from the new location on the next
+    // agent-loop turn.  (The system-prompt context cache is fingerprint-keyed
+    // and self-invalidates when the working directory changes.)
+    state.discovered_skills = None;
+
+    // Broadcast to session subscribers (e.g. TUI) so they reflect the new
+    // path immediately, without waiting for the next persist cycle.
+    broadcast(
+        &mut state.subscribers,
+        &ctx.daemon_tx,
+        DaemonMessage::SessionWorkingDirSet {
+            session_id: ctx.session_id,
+            path: Some(path.to_string_lossy().into_owned()),
+        },
+    );
+
+    persist_session_metadata(state, ctx, "SetWorkingDir");
+
+    false
+}
+
+/// Activate tool groups on the authoritative session state, broadcast the
+/// updated group set, persist, and reply to the calling tool with a summary
+/// of what changed.
+fn handle_load_tools(
+    groups: Vec<String>,
+    reply: mpsc::Sender<Result<String, String>>,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    info!(session_id = ctx.session_id, groups = ?groups, "session load_tools");
+    let result =
+        crate::tools::load_tools::apply_load_tools(&mut state.config.active_tool_groups, &groups);
+
+    // Broadcast updated session state so the client (e.g. TUI status bar)
+    // picks up the new active_tool_groups immediately.
+    let session_state = state.session_state_message(ctx.session_id);
+    broadcast(&mut state.subscribers, &ctx.daemon_tx, session_state);
+    persist_session_metadata(state, ctx, "LoadTools");
+    let _ = reply.send(Ok(result));
+
+    false
+}
+
+/// Deactivate tool groups on the authoritative session state, broadcast the
+/// updated group set, persist, and reply to the calling tool with a summary
+/// of what changed.
+fn handle_unload_tools(
+    groups: Vec<String>,
+    reply: mpsc::Sender<Result<String, String>>,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    info!(session_id = ctx.session_id, groups = ?groups, "session unload_tools");
+    let result =
+        crate::tools::unload_tools::apply_unload_tools(&mut state.config.active_tool_groups, &groups);
+
+    // Broadcast updated session state so the client picks up the new
+    // active_tool_groups immediately.
+    let session_state = state.session_state_message(ctx.session_id);
+    broadcast(&mut state.subscribers, &ctx.daemon_tx, session_state);
+    persist_session_metadata(state, ctx, "UnloadTools");
+    let _ = reply.send(Ok(result));
+
+    false
+}
+
 /// Set the account for this session and try to resolve its provider.
 fn handle_set_account(name: String, state: &mut SessionState, ctx: &RequestContext) -> bool {
     info!("session {}: SetAccount account={}", ctx.session_id, name);
@@ -1844,6 +1954,51 @@ mod tests {
         assert_eq!(record.turn_count, 1);
     }
 
+    #[test]
+    fn apply_worker_snapshot_preserves_main_loop_config_mutations() {
+        let mut state = test_state();
+        // Simulate a mid-request SessionCommand mutation applied on the main
+        // loop (e.g. SetWorkingDir / LoadTools from the new tools): the
+        // authoritative config changes while the worker is running.
+        state.config.working_dir = Some(PathBuf::from("/main-loop-wd"));
+        state.config.active_tool_groups.insert("x".into());
+        state.config.title = Some("main-loop title".into());
+
+        // The worker snapshot was taken BEFORE those mutations, so it
+        // carries stale values for every config field.
+        let mut snapshot = state.config.clone();
+        snapshot.working_dir = Some(PathBuf::from("/stale-wd"));
+        snapshot.active_tool_groups = ["core".into()].into_iter().collect();
+        snapshot.title = Some("stale title".into());
+        snapshot.accumulated_usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+        };
+        snapshot.context_window = Some(8192);
+        snapshot.last_prompt_tokens = Some(10);
+
+        state.config.apply_worker_snapshot(&snapshot);
+
+        // Worker-owned fields (usage, context window) ARE applied.
+        assert_eq!(state.config.accumulated_usage.total_tokens, 15);
+        assert_eq!(state.config.context_window, Some(8192));
+        assert_eq!(state.config.last_prompt_tokens, Some(10));
+
+        // Config fields mutated on the main loop are NOT clobbered — this
+        // is the regression guard for the set_working_dir / load_tools /
+        // unload_tools lost-update bug.
+        assert_eq!(
+            state.config.working_dir,
+            Some(PathBuf::from("/main-loop-wd"))
+        );
+        assert!(
+            state.config.active_tool_groups.contains("x"),
+            "active_tool_groups must not be clobbered by the worker snapshot"
+        );
+        assert_eq!(state.config.title.as_deref(), Some("main-loop title"));
+    }
+
     // -- SessionCommand::Broadcast tests -----------------------------------
 
     #[test]
@@ -1921,6 +2076,148 @@ mod tests {
             &ctx,
         );
         assert!(!shutdown);
+    }
+
+    // -- Session-config tool command tests --------------------------------
+
+    #[test]
+    fn set_working_dir_updates_config_and_broadcasts() {
+        let (mut state, ctx) = broadcast_setup();
+        let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
+        state.subscribers.insert(10, tx);
+        // Pre-populate the skill cache so we can verify it gets invalidated.
+        state.discovered_skills = Some(Vec::new());
+        let new_path = PathBuf::from("/tmp/new-wd");
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::SetWorkingDir {
+                path: new_path.clone(),
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        assert_eq!(state.config.working_dir, Some(new_path));
+        assert!(
+            state.discovered_skills.is_none(),
+            "skill cache must be invalidated on working-dir change"
+        );
+        assert!(!shutdown);
+        // Subscribers should receive the SessionWorkingDirSet broadcast.
+        match rx.recv().unwrap() {
+            DaemonMessage::SessionWorkingDirSet {
+                session_id,
+                path,
+            } => {
+                assert_eq!(session_id, ctx.session_id);
+                assert_eq!(path.as_deref(), Some("/tmp/new-wd"));
+            }
+            other => panic!("expected SessionWorkingDirSet, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_tools_updates_active_groups_and_replies() {
+        let (mut state, ctx) = broadcast_setup();
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::LoadTools {
+                groups: vec!["x".into()],
+                reply: reply_tx,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        assert!(state.config.active_tool_groups.contains("x"));
+        assert!(!shutdown);
+        // The reply is sent synchronously by the handler — deterministic.
+        match reply_rx.recv() {
+            Ok(Ok(msg)) => assert_eq!(msg, "Activated tool groups: x"),
+            Ok(Err(e)) => panic!("expected success reply, got error: {e}"),
+            Err(e) => panic!("expected reply, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn load_tools_skips_already_active_in_reply() {
+        let (mut state, ctx) = broadcast_setup();
+        state.config.active_tool_groups.insert("shell".into());
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::LoadTools {
+                groups: vec!["shell".into()],
+                reply: reply_tx,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        match reply_rx.recv() {
+            Ok(Ok(msg)) => {
+                assert_eq!(msg, "All specified groups were already active.")
+            }
+            Ok(Err(e)) => panic!("expected success reply, got error: {e}"),
+            Err(e) => panic!("expected reply, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn unload_tools_updates_active_groups_and_replies() {
+        let (mut state, ctx) = broadcast_setup();
+        state.config.active_tool_groups.insert("x".into());
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::UnloadTools {
+                groups: vec!["x".into()],
+                reply: reply_tx,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        assert!(!state.config.active_tool_groups.contains("x"));
+        assert!(!shutdown);
+        match reply_rx.recv() {
+            Ok(Ok(msg)) => assert_eq!(msg, "Deactivated tool groups: x"),
+            Ok(Err(e)) => panic!("expected success reply, got error: {e}"),
+            Err(e) => panic!("expected reply, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn unload_tools_protects_core() {
+        let (mut state, ctx) = broadcast_setup();
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        let mut shutdown = false;
+        process_command(
+            SessionCommand::UnloadTools {
+                groups: vec!["core".into()],
+                reply: reply_tx,
+            },
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+
+        assert!(state.config.active_tool_groups.contains("core"));
+        match reply_rx.recv() {
+            Ok(Ok(msg)) => assert_eq!(msg, "The 'core' group cannot be unloaded."),
+            Ok(Err(e)) => panic!("expected success reply, got error: {e}"),
+            Err(e) => panic!("expected reply, got {e:?}"),
+        }
     }
 
     // -- Cancel / Shutdown tests -------------------------------------------
