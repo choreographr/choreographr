@@ -63,8 +63,16 @@ pub(crate) fn render_fullscreen_only(frame: &mut Frame<'_>, app: &mut App) -> bo
     let Some((session_id, turn_id, img_idx)) = app.fullscreen_image_target else {
         return false;
     };
-    if !app.rendered_images.get(&session_id).is_some_and(|m| m.contains_key(&turn_id))
-        && !app.display_for(session_id).view.turns.get(&turn_id).is_some_and(|t| !t.displayed_images.is_empty())
+    if !app
+        .rendered_images
+        .get(&session_id)
+        .is_some_and(|m| m.contains_key(&turn_id))
+        && !app
+            .display_for(session_id)
+            .view
+            .turns
+            .get(&turn_id)
+            .is_some_and(|t| !t.displayed_images.is_empty())
     {
         app.fullscreen_image_target = None;
         return false;
@@ -81,7 +89,13 @@ fn render_fullscreen_placeholder(frame: &mut Frame<'_>) {
     frame.render_widget(block, area);
 }
 
-fn render_fullscreen_image(frame: &mut Frame<'_>, session_id: u64, turn_id: u32, img_idx: usize, app: &mut App) {
+fn render_fullscreen_image(
+    frame: &mut Frame<'_>,
+    session_id: u64,
+    turn_id: u32,
+    img_idx: usize,
+    app: &mut App,
+) {
     let area = frame.area();
     let full = Size::new(area.width, area.height);
 
@@ -187,7 +201,8 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         let position = app
             .max_scroll_offset()
             .saturating_sub(app.effective_scroll());
-        let marker_slots: Vec<usize> = app.active_display_ref()
+        let marker_slots: Vec<usize> = app
+            .active_display_ref()
             .map(|d| d.markers.iter().map(|m| m.virtual_slot).collect())
             .unwrap_or_default();
         frame.render_stateful_widget(
@@ -299,17 +314,29 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
         // across the session — go first (left side) so the bar's leading edge
         // stays fixed.  Runtime metrics (tokens, context fill) follow on the
         // right where their per-turn updates don't shift the identity fields.
-        let wd = app.active_display_ref().and_then(|d| d.working_dir.as_deref()).unwrap_or("-");
+        let wd = app
+            .active_display_ref()
+            .and_then(|d| d.working_dir.as_deref())
+            .unwrap_or("-");
         let provider = app.attached_provider_slug.as_deref().unwrap_or("-");
-        let model = app.active_display_ref().and_then(|d| d.selected_model.as_deref()).unwrap_or("-");
-        let reasoning = app.active_display_ref().and_then(|d| d.reasoning_effort.as_deref()).unwrap_or("-");
+        let model = app
+            .active_display_ref()
+            .and_then(|d| d.selected_model.as_deref())
+            .unwrap_or("-");
+        let reasoning = app
+            .active_display_ref()
+            .and_then(|d| d.reasoning_effort.as_deref())
+            .unwrap_or("-");
 
         // Runtime metrics: tokens flow and context-window fill.
         let tokens = match &app.display_token_usage() {
             Some(usage) => format!("↑{} ↓{}", usage.input_tokens, usage.output_tokens),
             None => String::new(),
         };
-        let context = match (app.active_display_ref().and_then(|d| d.context_window), app.active_display_ref().and_then(|d| d.last_prompt_tokens)) {
+        let context = match (
+            app.active_display_ref().and_then(|d| d.context_window),
+            app.active_display_ref().and_then(|d| d.last_prompt_tokens),
+        ) {
             (Some(limit), Some(current)) => {
                 let ratio = if limit > 0 {
                     current as f64 / limit as f64
@@ -453,7 +480,15 @@ fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
                     width: area.width,
                     height: visible_height as u16,
                 };
-                render_turn_image(frame, img_rect, session_id, turn_id, img_idx, app, fully_visible);
+                render_turn_image(
+                    frame,
+                    img_rect,
+                    session_id,
+                    turn_id,
+                    img_idx,
+                    app,
+                    fully_visible,
+                );
             }
         }
 

@@ -44,8 +44,20 @@ pub trait TurnEventHandler {
     fn handle_turn_finalized(&mut self, session_id: u64, turn_id: u32, turn: Turn);
     fn handle_turns_undone(&mut self, session_id: u64, turn_ids: &[u32]);
     fn handle_turns_redone(&mut self, session_id: u64, turns: BTreeMap<u32, Turn>);
-    fn handle_request_stream(&mut self, session_id: u64, request_id: u32, stream: OutputStream, data: Cow<'_, str>);
-    fn handle_started(&mut self, session_id: u64, request_id: u32, turn_id: u32, estimated_prompt_tokens: u32);
+    fn handle_request_stream(
+        &mut self,
+        session_id: u64,
+        request_id: u32,
+        stream: OutputStream,
+        data: Cow<'_, str>,
+    );
+    fn handle_started(
+        &mut self,
+        session_id: u64,
+        request_id: u32,
+        turn_id: u32,
+        estimated_prompt_tokens: u32,
+    );
     fn handle_done(
         &mut self,
         session_id: u64,
@@ -55,11 +67,20 @@ pub trait TurnEventHandler {
     );
     fn handle_failed(&mut self, session_id: u64, request_id: u32, error: String);
     fn handle_tool_call_event(&mut self, session_id: u64, request_id: u32, event: ToolCallEvent);
-    fn handle_tool_result_chunk(&mut self, session_id: u64, request_id: u32, call_id: String, data: Vec<u8>);
+    fn handle_tool_result_chunk(
+        &mut self,
+        session_id: u64,
+        request_id: u32,
+        call_id: String,
+        data: Vec<u8>,
+    );
     fn handle_session_state(&mut self, state: SessionStateData);
     fn handle_status_text(&mut self, text: String);
     fn handle_error(&mut self, error: String);
     fn handle_session_attached(&mut self, session_id: u64);
+    // The parameter list mirrors the SessionCreated message fields 1:1; a
+    // struct would just re-wrap fields the dispatcher already destructures.
+    #[allow(clippy::too_many_arguments)]
     fn handle_session_created(
         &mut self,
         session_id: u64,
@@ -150,10 +171,9 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             session_id,
             turn_ids,
         } => handler.handle_turns_undone(*session_id, turn_ids),
-        DaemonMessage::TurnsRedone {
-            session_id,
-            turns,
-        } => handler.handle_turns_redone(*session_id, turns.clone()),
+        DaemonMessage::TurnsRedone { session_id, turns } => {
+            handler.handle_turns_redone(*session_id, turns.clone())
+        }
         DaemonMessage::Started {
             session_id,
             request_id,
@@ -219,7 +239,12 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             request_id,
             call_id,
             data,
-        } => handler.handle_tool_result_chunk(*session_id, *request_id, call_id.clone(), data.clone()),
+        } => handler.handle_tool_result_chunk(
+            *session_id,
+            *request_id,
+            call_id.clone(),
+            data.clone(),
+        ),
         DaemonMessage::Done {
             session_id,
             request_id,
@@ -269,11 +294,7 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
         DaemonMessage::ModelsFailed { error } => {
             handler.handle_error(format!("[daemon] models failed: {error}"));
         }
-        DaemonMessage::ModelSelected {
-            model,
-            reasoning_capability: _,
-            ..
-        } => {
+        DaemonMessage::ModelSelected { model, .. } => {
             handler.handle_status_text(format!("[daemon] selected model: {model}"));
         }
         DaemonMessage::ModelSelectionFailed { model, error, .. } => {

@@ -1462,7 +1462,12 @@ impl App {
     }
 
     pub(crate) fn sync_turn_images(&mut self, session_id: u64, turn_id: u32, turn: &Turn) {
-        let images = self.rendered_images.entry(session_id).or_default().entry(turn_id).or_default();
+        let images = self
+            .rendered_images
+            .entry(session_id)
+            .or_default()
+            .entry(turn_id)
+            .or_default();
         for (idx, record) in turn.displayed_images.iter().enumerate() {
             images.entry(idx).or_insert_with(|| {
                 RenderedImage::new_placeholder(
@@ -1495,6 +1500,10 @@ impl App {
         }
     }
 
+    // All eight parameters are already owned by the caller (an image-ready
+    // event handler); grouping them would only add a wrapper struct without
+    // reducing the information flow.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn submit_image_job(
         &mut self,
         session_id: u64,
@@ -1521,7 +1530,8 @@ impl App {
             cell_size.height,
         );
 
-        self.pending_job_idx.insert(id, (session_id, turn_id, img_idx));
+        self.pending_job_idx
+            .insert(id, (session_id, turn_id, img_idx));
 
         if let Some(session_images) = self.rendered_images.get_mut(&session_id)
             && let Some(images) = session_images.get_mut(&turn_id)
@@ -1754,13 +1764,31 @@ impl App {
         self.active_session_id = Some(session_id);
         self.attached_session_id = Some(session_id);
         // Copy session summary fields before borrowing display.
-        let (token_usage, context_window, last_prompt_tokens, account_name, selected_model, reasoning_effort, working_dir, status) = self
+        let (
+            token_usage,
+            context_window,
+            last_prompt_tokens,
+            account_name,
+            selected_model,
+            reasoning_effort,
+            working_dir,
+            status,
+        ) = self
             .session_mgr
             .sessions
             .iter()
             .find(|s| s.session_id == session_id)
             .map(|s| {
-                (s.token_usage, s.context_window, s.last_prompt_tokens, s.account_name.clone(), s.selected_model.clone(), s.reasoning_effort.clone(), s.working_dir.clone(), Some(s.status.clone()))
+                (
+                    s.token_usage,
+                    s.context_window,
+                    s.last_prompt_tokens,
+                    s.account_name.clone(),
+                    s.selected_model.clone(),
+                    s.reasoning_effort.clone(),
+                    s.working_dir.clone(),
+                    Some(s.status.clone()),
+                )
             })
             .unwrap_or((None, None, None, None, None, None, None, None));
         {
@@ -1812,10 +1840,10 @@ impl App {
             d.selected_model = Some(model.to_owned());
             d.reasoning_capability = reasoning_capability;
         }
-        if self.attached_session_id.is_some() {
-            if let Some(s) = self.attached_session_mut() {
-                s.selected_model = Some(model.to_owned());
-            }
+        if self.attached_session_id.is_some()
+            && let Some(s) = self.attached_session_mut()
+        {
+            s.selected_model = Some(model.to_owned());
         }
     }
 
@@ -1823,10 +1851,10 @@ impl App {
         if let Some(d) = self.active_display() {
             d.reasoning_effort = Some(effort.clone());
         }
-        if self.attached_session_id.is_some() {
-            if let Some(s) = self.attached_session_mut() {
-                s.reasoning_effort = Some(effort);
-            }
+        if self.attached_session_id.is_some()
+            && let Some(s) = self.attached_session_mut()
+        {
+            s.reasoning_effort = Some(effort);
         }
     }
 
@@ -1931,11 +1959,8 @@ impl App {
                     // Inherit account_name from the first available account,
                     // so the auto-created default session doesn't lose the
                     // account selection that was already configured.
-                    let default_account = self
-                        .ai_providers
-                        .accounts
-                        .first()
-                        .map(|a| a.name.clone());
+                    let default_account =
+                        self.ai_providers.accounts.first().map(|a| a.name.clone());
                     client_tx
                         .send(ClientMessage::CreateSession {
                             title: Some("default".to_string()),
@@ -1978,7 +2003,9 @@ impl App {
         Some(TokenUsage {
             input_tokens: usage.input_tokens + display.live_input_estimate,
             output_tokens: usage.output_tokens + display.live_output_tokens,
-            total_tokens: usage.total_tokens + display.live_input_estimate + display.live_output_tokens,
+            total_tokens: usage.total_tokens
+                + display.live_input_estimate
+                + display.live_output_tokens,
         })
     }
 }
@@ -2003,12 +2030,7 @@ impl SessionDisplayState {
         let turn_count = self.view.turns.len();
         tracing::trace!(turn_count, "rebuild_height_prefix");
 
-        let visible_count = self
-            .view
-            .turns
-            .iter()
-            .filter(|(_, t)| !t.undone)
-            .count();
+        let visible_count = self.view.turns.iter().filter(|(_, t)| !t.undone).count();
         self.render_cache.resize(visible_count, None);
 
         let mut user_text_start_lines: Vec<usize> = Vec::with_capacity(turn_count);
@@ -2287,7 +2309,12 @@ impl SessionDisplayState {
         self.history_scroll.scroll_compensation = 0;
     }
 
-    pub(crate) fn scroll_to_track_row(&mut self, mouse_row: u16, track_height: u16, viewport: &HistoryViewport) {
+    pub(crate) fn scroll_to_track_row(
+        &mut self,
+        mouse_row: u16,
+        track_height: u16,
+        viewport: &HistoryViewport,
+    ) {
         let track_height = track_height as usize;
         if track_height > 1 {
             let row = (mouse_row as usize).min(track_height.saturating_sub(1));
@@ -2298,7 +2325,11 @@ impl SessionDisplayState {
         }
     }
 
-    pub(crate) fn scroll_to_content_line(&mut self, content_line: usize, viewport: &HistoryViewport) {
+    pub(crate) fn scroll_to_content_line(
+        &mut self,
+        content_line: usize,
+        viewport: &HistoryViewport,
+    ) {
         let total = self.total_history_height();
         let vh = viewport.height as usize;
         let target = total.saturating_sub(content_line + vh);
@@ -2318,7 +2349,10 @@ impl SessionDisplayState {
 
 /// Invalidate the render cache entry for `turn_id`.
 fn invalidate_turn_cache(display: &mut SessionDisplayState, turn_id: u32) {
-    if let Some(idx) = display.visible_turn_ids.iter().position(|id| *id == turn_id)
+    if let Some(idx) = display
+        .visible_turn_ids
+        .iter()
+        .position(|id| *id == turn_id)
         && let Some(slot) = display.render_cache.get_mut(idx)
     {
         *slot = None;
@@ -2358,7 +2392,11 @@ impl TurnEventHandler for App {
         display.mark_content_changed();
     }
 
-    fn handle_turns_redone(&mut self, session_id: u64, turns: std::collections::BTreeMap<u32, Turn>) {
+    fn handle_turns_redone(
+        &mut self,
+        session_id: u64,
+        turns: std::collections::BTreeMap<u32, Turn>,
+    ) {
         tracing::trace!(?turns, "handle_turns_redone");
         // Sync images first, then get display to avoid borrow conflict.
         for (tid, turn) in &turns {
@@ -2372,21 +2410,36 @@ impl TurnEventHandler for App {
         display.mark_content_changed();
     }
 
-    fn handle_request_stream(&mut self, session_id: u64, request_id: u32, stream: OutputStream, data: Cow<'_, str>) {
+    fn handle_request_stream(
+        &mut self,
+        session_id: u64,
+        request_id: u32,
+        stream: OutputStream,
+        data: Cow<'_, str>,
+    ) {
         let display = self.display_for(session_id);
         display.view.stream_chunk(request_id, stream, &data);
         display.resolve_streaming_turn_index(request_id);
         display.mark_streaming_changed();
     }
 
-    fn handle_started(&mut self, session_id: u64, request_id: u32, turn_id: u32, estimated_prompt_tokens: u32) {
+    fn handle_started(
+        &mut self,
+        session_id: u64,
+        request_id: u32,
+        turn_id: u32,
+        estimated_prompt_tokens: u32,
+    ) {
         tracing::trace!(%request_id, %turn_id, %estimated_prompt_tokens, "handle_started");
         let display = self.display_for(session_id);
         display.view.request_to_turn.insert(request_id, turn_id);
         display.active.insert(request_id);
         display.live_input_estimate = estimated_prompt_tokens;
         display.live_output_tokens = 0;
-        display.streaming_turn_index = display.visible_turn_ids.iter().position(|id| *id == turn_id);
+        display.streaming_turn_index = display
+            .visible_turn_ids
+            .iter()
+            .position(|id| *id == turn_id);
     }
 
     fn handle_done(
@@ -2433,7 +2486,9 @@ impl TurnEventHandler for App {
                 tool_name,
                 arguments_json,
             } => {
-                display.view.tool_call_started(request_id, call_id, tool_name, arguments_json);
+                display
+                    .view
+                    .tool_call_started(request_id, call_id, tool_name, arguments_json);
                 display.resolve_streaming_turn_index(request_id);
                 display.mark_streaming_changed();
             }
@@ -2442,7 +2497,13 @@ impl TurnEventHandler for App {
         }
     }
 
-    fn handle_tool_result_chunk(&mut self, session_id: u64, request_id: u32, call_id: String, data: Vec<u8>) {
+    fn handle_tool_result_chunk(
+        &mut self,
+        session_id: u64,
+        request_id: u32,
+        call_id: String,
+        data: Vec<u8>,
+    ) {
         let text = String::from_utf8_lossy(&data).into_owned();
         let display = self.display_for(session_id);
         display.view.tool_result_chunk(request_id, &call_id, &text);
@@ -2593,7 +2654,9 @@ pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<(usize, usi
         return None;
     }
 
-    let i = display.height_prefix.partition_point(|&p| p <= content_line);
+    let i = display
+        .height_prefix
+        .partition_point(|&p| p <= content_line);
     if i < display.height_prefix.len() {
         let turn_start = i
             .checked_sub(1)
@@ -3161,7 +3224,10 @@ mod tests {
         assert_eq!(images[&1].data.as_ref(), b"more-svg");
         // Second call is idempotent — preserves existing entries
         app.sync_turn_images(0, 42, &turn);
-        assert_eq!(app.rendered_images.get(&0).unwrap().get(&42).unwrap().len(), 2);
+        assert_eq!(
+            app.rendered_images.get(&0).unwrap().get(&42).unwrap().len(),
+            2
+        );
     }
 
     // ── TurnImageLayout image_ranges ──
@@ -3183,11 +3249,18 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        app.active_display().unwrap().view.insert_or_replace(1, turn);
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(1, turn);
         app.rebuild_height_prefix();
 
         assert_eq!(app.active_display().unwrap().turn_layouts.len(), 1);
-        assert!(app.active_display().unwrap().turn_layouts[0].image_ranges.is_empty());
+        assert!(
+            app.active_display().unwrap().turn_layouts[0]
+                .image_ranges
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3226,7 +3299,10 @@ mod tests {
             ],
         };
         let turn_clone = turn.clone();
-        app.active_display().unwrap().view.insert_or_replace(2, turn);
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(2, turn);
         app.sync_turn_images(0, 2, &turn_clone);
         app.rebuild_height_prefix();
 
@@ -3287,7 +3363,10 @@ mod tests {
             }],
         };
         let turn_clone = turn.clone();
-        app.active_display().unwrap().view.insert_or_replace(4, turn);
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(4, turn);
         app.sync_turn_images(0, 4, &turn_clone);
 
         let img_id = next_job_id();
@@ -3310,7 +3389,14 @@ mod tests {
         };
         app.apply_image_result(result);
 
-        let img = app.rendered_images.get(&0).unwrap().get(&4).unwrap().get(&0).unwrap();
+        let img = app
+            .rendered_images
+            .get(&0)
+            .unwrap()
+            .get(&4)
+            .unwrap()
+            .get(&0)
+            .unwrap();
         assert!(img.failed_sizes.contains(&inline_size));
         assert!(img.pending_job.is_none());
     }
@@ -3346,7 +3432,10 @@ mod tests {
             }],
         };
         let turn_clone = turn.clone();
-        app.active_display().unwrap().view.insert_or_replace(5, turn);
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(5, turn);
         app.sync_turn_images(0, 5, &turn_clone);
 
         let img_id = next_job_id();
@@ -3370,7 +3459,14 @@ mod tests {
         };
         app.apply_image_result(result);
 
-        let img = app.rendered_images.get(&0).unwrap().get(&5).unwrap().get(&0).unwrap();
+        let img = app
+            .rendered_images
+            .get(&0)
+            .unwrap()
+            .get(&5)
+            .unwrap()
+            .get(&0)
+            .unwrap();
         assert!(img.failed_sizes.contains(&non_inline_size));
     }
 
@@ -3429,13 +3525,19 @@ mod tests {
         let display = app.active_display_ref().unwrap();
         let new_total = display.total_history_height();
         let delta = new_total.saturating_sub(old_total);
-        assert!(delta > 0, "total height should increase after adding content");
+        assert!(
+            delta > 0,
+            "total height should increase after adding content"
+        );
         assert_eq!(
             display.history_scroll.scroll,
             old_scroll + delta,
             "scroll should be adjusted by the content delta"
         );
-        assert!(!display.content_dirty, "content_dirty should be cleared after computation");
+        assert!(
+            !display.content_dirty,
+            "content_dirty should be cleared after computation"
+        );
     }
 
     #[test]
@@ -3465,7 +3567,10 @@ mod tests {
         app.compute_total_height_and_markers();
 
         let display = app.active_display_ref().unwrap();
-        assert_eq!(display.history_scroll.scroll, old_scroll, "scroll should stay at 0 when user is at bottom");
+        assert_eq!(
+            display.history_scroll.scroll, old_scroll,
+            "scroll should stay at 0 when user is at bottom"
+        );
     }
 
     // ── marker computation ──
@@ -3495,7 +3600,10 @@ mod tests {
         app.rebuild_height_prefix();
 
         let display = app.active_display_ref().unwrap();
-        assert!(display.markers.is_empty(), "no markers should be created when no turn has user_text");
+        assert!(
+            display.markers.is_empty(),
+            "no markers should be created when no turn has user_text"
+        );
     }
 
     #[test]
@@ -3526,7 +3634,11 @@ mod tests {
         app.rebuild_height_prefix();
 
         let display = app.active_display_ref().unwrap();
-        assert_eq!(display.markers.len(), 2, "expected 2 markers for 2 user-text turns");
+        assert_eq!(
+            display.markers.len(),
+            2,
+            "expected 2 markers for 2 user-text turns"
+        );
         assert!(
             display.markers[0].content_line < display.markers[1].content_line,
             "first user-text turn should appear before the second"
@@ -3623,7 +3735,10 @@ mod tests {
         app.compute_total_height_and_markers();
 
         let display = app.active_display_ref().unwrap();
-        assert_eq!(display.history_scroll.scroll, old_scroll, "scroll should not change when content_dirty is false");
+        assert_eq!(
+            display.history_scroll.scroll, old_scroll,
+            "scroll should not change when content_dirty is false"
+        );
     }
 
     // ── update_viewport_from_terminal_size ──
@@ -3647,18 +3762,12 @@ mod tests {
         app.update_viewport_from_terminal_size();
         let height_with_help = app.history_viewport.height;
 
-        assert_eq!(
-            height_without_help - height_with_help,
-            2,
-        );
+        assert_eq!(height_without_help - height_with_help, 2,);
 
         let total = app.total_history_height();
         let max_scroll = app.max_scroll_offset();
         if total > height_with_help as usize {
-            assert_eq!(
-                max_scroll + height_with_help as usize,
-                total,
-            );
+            assert_eq!(max_scroll + height_with_help as usize, total,);
         }
     }
 
@@ -3689,9 +3798,15 @@ mod tests {
         app.update_viewport_from_terminal_size();
 
         let display = app.active_display_ref().unwrap();
-        assert!(!display.content_dirty, "content_dirty should be cleared on width change");
+        assert!(
+            !display.content_dirty,
+            "content_dirty should be cleared on width change"
+        );
         assert!(display.markers_dirty, "markers_dirty should remain true");
-        assert!(display.render_cache.iter().all(|c| c.is_none()), "render_cache should be cleared");
+        assert!(
+            display.render_cache.iter().all(|c| c.is_none()),
+            "render_cache should be cleared"
+        );
         assert_eq!(app.history_viewport.width, 99);
     }
 
@@ -3722,9 +3837,15 @@ mod tests {
         app.update_viewport_from_terminal_size();
 
         let display = app.active_display_ref().unwrap();
-        assert!(display.content_dirty, "content_dirty should NOT be cleared on height-only change");
+        assert!(
+            display.content_dirty,
+            "content_dirty should NOT be cleared on height-only change"
+        );
         assert!(display.markers_dirty, "markers_dirty should remain true");
-        assert!(display.render_cache.iter().all(|c| c.is_none()), "render_cache should be cleared");
+        assert!(
+            display.render_cache.iter().all(|c| c.is_none()),
+            "render_cache should be cleared"
+        );
     }
 
     // ── compute_total_height_and_markers: scroll-to-bottom on content removal ──
@@ -3745,8 +3866,7 @@ mod tests {
         let viewport_height = app.history_viewport.height;
         {
             let display = app.active_display().unwrap();
-            display.history_scroll.scroll =
-                old_total.saturating_sub(viewport_height as usize) / 2;
+            display.history_scroll.scroll = old_total.saturating_sub(viewport_height as usize) / 2;
         }
         assert!(app.effective_scroll() > 0, "should be scrolled up");
 
@@ -3761,7 +3881,11 @@ mod tests {
         app.compute_total_height_and_markers();
 
         let display = app.active_display_ref().unwrap();
-        assert_eq!(display.effective_scroll(&app.history_viewport), 0, "scroll should be at bottom after content removal");
+        assert_eq!(
+            display.effective_scroll(&app.history_viewport),
+            0,
+            "scroll should be at bottom after content removal"
+        );
     }
 
     #[test]
@@ -3779,8 +3903,7 @@ mod tests {
         {
             let display = app.active_display().unwrap();
             old_total = display.total_history_height();
-            display.history_scroll.scroll =
-                old_total.saturating_sub(viewport_height as usize) / 2;
+            display.history_scroll.scroll = old_total.saturating_sub(viewport_height as usize) / 2;
             old_scroll = display.history_scroll.scroll;
         }
 
@@ -3796,7 +3919,11 @@ mod tests {
         let new_total = display.total_history_height();
         let delta = new_total.saturating_sub(old_total);
         assert!(delta > 0, "total height should increase");
-        assert_eq!(display.history_scroll.scroll, old_scroll + delta, "scroll should be shifted down by the content delta");
+        assert_eq!(
+            display.history_scroll.scroll,
+            old_scroll + delta,
+            "scroll should be shifted down by the content delta"
+        );
     }
 
     // ── streaming (incremental update) ──
@@ -3828,7 +3955,10 @@ mod tests {
 
         assert!(display.markers_dirty, "markers_dirty should be set");
         assert!(display.content_dirty, "content_dirty should be set");
-        assert!(display.streaming_turn_index.is_none(), "streaming_turn_index should be cleared");
+        assert!(
+            display.streaming_turn_index.is_none(),
+            "streaming_turn_index should be cleared"
+        );
     }
 
     #[test]

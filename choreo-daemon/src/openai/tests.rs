@@ -2,7 +2,6 @@ use super::*;
 use std::sync::mpsc;
 use std::time::Duration;
 
-
 #[test]
 fn build_sse_event_joins_multiple_data_lines() {
     let mut lines = vec![

@@ -3098,7 +3098,10 @@ fn ctrl_r_cycles_through_valid_slugs() {
         &tx,
     )
     .expect("handle ctrl+r 2");
-    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("medium"));
+    assert_eq!(
+        app.display_for(0).reasoning_effort.as_deref(),
+        Some("medium")
+    );
     let msg = rx.recv().expect("SetReasoningEffort 2");
     assert_eq!(
         msg,

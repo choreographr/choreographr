@@ -4,15 +4,14 @@ use tracing::{debug, info, trace, warn};
 use super::retry;
 use super::{
     ChatRequestMessage, ChatToolDefinition, ResponsesStreamEvent, SseReader, endpoint_url,
-    messages_to_responses_input, parse_responses_stream_event,
-    validate_tool_call_arguments,
+    messages_to_responses_input, parse_responses_stream_event, validate_tool_call_arguments,
 };
 use crate::providers::StreamEvent;
+use crate::providers::ToolResultItem;
 use crate::providers::shared::MAX_TOOL_CALLS;
 use crate::providers::types::{
     CallerInfo, ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult,
 };
-use crate::providers::ToolResultItem;
 use choreo_proto::TokenUsage;
 use std::collections::HashMap;
 use std::io;
@@ -502,10 +501,10 @@ pub(crate) fn responses_request_with_tools(
         match item {
             ResponseOutputItem::Message { content, .. } => {
                 for part in content {
-                    if part.kind == "output_text" {
-                        if let Some(t) = &part.text {
-                            full_text.push_str(t);
-                        }
+                    if part.kind == "output_text"
+                        && let Some(t) = &part.text
+                    {
+                        full_text.push_str(t);
                     }
                 }
             }
@@ -1105,7 +1104,8 @@ mod tests {
 
     #[test]
     fn response_output_item_deserializes_function_call() {
-        let json_str = r#"{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}"#;
+        let json_str =
+            r#"{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}"#;
         let item: ResponseOutputItem = serde_json::from_str(json_str).unwrap();
         match item {
             ResponseOutputItem::FunctionCall {
@@ -1138,8 +1138,7 @@ mod tests {
 
     #[test]
     fn response_output_item_deserializes_program() {
-        let json_str =
-            r#"{"type":"program","call_id":"prog_1","code":"console.log('hello')","fingerprint":"fp_1"}"#;
+        let json_str = r#"{"type":"program","call_id":"prog_1","code":"console.log('hello')","fingerprint":"fp_1"}"#;
         let item: ResponseOutputItem = serde_json::from_str(json_str).unwrap();
         match item {
             ResponseOutputItem::Program {
@@ -1234,19 +1233,12 @@ mod tests {
     #[test]
     fn extract_reasoning_text_objects_with_text_field() {
         let input = vec![json!({"text": "thinking..."})];
-        assert_eq!(
-            extract_reasoning_text(&input),
-            Some("thinking...".into())
-        );
+        assert_eq!(extract_reasoning_text(&input), Some("thinking...".into()));
     }
 
     #[test]
     fn extract_reasoning_text_mixed() {
-        let input = vec![
-            json!("first"),
-            json!({"text": "second"}),
-            json!("third"),
-        ];
+        let input = vec![json!("first"), json!({"text": "second"}), json!("third")];
         assert_eq!(
             extract_reasoning_text(&input),
             Some("first second third".into())
@@ -1310,11 +1302,13 @@ mod tests {
             base_url: "https://api.openai.com/v1".into(),
             ..Default::default()
         };
-        let (_url, body) =
-            build_simple_responses_body(&config, "gpt-4", "hello", false).unwrap();
+        let (_url, body) = build_simple_responses_body(&config, "gpt-4", "hello", false).unwrap();
         // store: false is skipped via skip_serializing_if — the field
         // is absent rather than explicit false.
-        assert!(body.get("store").is_none(), "store should be absent when false");
+        assert!(
+            body.get("store").is_none(),
+            "store should be absent when false"
+        );
         assert_eq!(body["model"], "gpt-4");
         assert_eq!(body["input"], "hello");
         assert!(body.get("tools").is_none());
@@ -1327,8 +1321,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".into(),
             ..Default::default()
         };
-        let (_url, body) =
-            build_simple_responses_body(&config, "gpt-4", "hello", true).unwrap();
+        let (_url, body) = build_simple_responses_body(&config, "gpt-4", "hello", true).unwrap();
         assert_eq!(body["stream"], true);
     }
 

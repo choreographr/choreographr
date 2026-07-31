@@ -242,9 +242,11 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let args = SetWorkingDirArgs { path: "sub".into() };
 
-        let (result, _cmd) = run_with_daemon_reply(args, Some(dir.path().to_path_buf()), Ok(
-            sub.to_string_lossy().into_owned(),
-        ));
+        let (result, _cmd) = run_with_daemon_reply(
+            args,
+            Some(dir.path().to_path_buf()),
+            Ok(sub.to_string_lossy().into_owned()),
+        );
         assert!(result.is_ok(), "expected ok: {:?}", result.err());
         assert_eq!(
             result.unwrap().path,

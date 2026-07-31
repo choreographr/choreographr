@@ -283,12 +283,14 @@ impl DaemonState {
             DaemonCommand::UnregisterActivitySubscriber { client_id } => {
                 self.handle_unregister_activity_subscriber(client_id)
             }
-            DaemonCommand::TrackSessionSubscription { client_id, session_id } => {
-                self.handle_track_session_subscription(client_id, session_id)
-            }
-            DaemonCommand::UntrackSessionSubscription { client_id, session_id } => {
-                self.handle_untrack_session_subscription(client_id, session_id)
-            }
+            DaemonCommand::TrackSessionSubscription {
+                client_id,
+                session_id,
+            } => self.handle_track_session_subscription(client_id, session_id),
+            DaemonCommand::UntrackSessionSubscription {
+                client_id,
+                session_id,
+            } => self.handle_untrack_session_subscription(client_id, session_id),
             DaemonCommand::ClientDisconnected { client_id } => {
                 self.handle_client_disconnected(client_id)
             }
@@ -914,20 +916,18 @@ impl DaemonState {
             origin_session_id,
             self.activity_subscribers.len(),
         );
-        self.activity_subscribers
-            .retain(|client_id, tx| {
-                // Skip if this client is also a direct subscriber of the
-                // session that originated this message — they'll receive it
-                // through the per-session broadcast path.
-                if let Some(ref sid) = origin_session_id {
-                    if let Some(sessions) = self.client_subscribed_sessions.get(client_id) {
-                        if sessions.contains(sid) {
-                            return true;
-                        }
-                    }
-                }
-                tx.try_send(msg.clone()).is_ok()
-            });
+        self.activity_subscribers.retain(|client_id, tx| {
+            // Skip if this client is also a direct subscriber of the
+            // session that originated this message — they'll receive it
+            // through the per-session broadcast path.
+            if let Some(ref sid) = origin_session_id
+                && let Some(sessions) = self.client_subscribed_sessions.get(client_id)
+                && sessions.contains(sid)
+            {
+                return true;
+            }
+            tx.try_send(msg.clone()).is_ok()
+        });
     }
 
     /// Handle a cancel request from a client.  Sends `SessionCommand::Cancel`
@@ -1025,7 +1025,9 @@ impl DaemonState {
         debug!(session_id, path = %path.display(), "forwarding working dir change to session");
         match self.active_sessions.get(&session_id) {
             Some(entry) => {
-                let _ = entry.cmd_tx.send(SessionCommand::SetWorkingDir { path, reply });
+                let _ = entry
+                    .cmd_tx
+                    .send(SessionCommand::SetWorkingDir { path, reply });
             }
             None => {
                 warn!(session_id, "cannot set working dir: session is not active");
@@ -1047,7 +1049,9 @@ impl DaemonState {
         debug!(session_id, groups = ?groups, "forwarding load_tools to session");
         match self.active_sessions.get(&session_id) {
             Some(entry) => {
-                let _ = entry.cmd_tx.send(SessionCommand::LoadTools { groups, reply });
+                let _ = entry
+                    .cmd_tx
+                    .send(SessionCommand::LoadTools { groups, reply });
             }
             None => {
                 warn!(session_id, "cannot load tools: session is not active");
@@ -1070,7 +1074,9 @@ impl DaemonState {
         debug!(session_id, groups = ?groups, "forwarding unload_tools to session");
         match self.active_sessions.get(&session_id) {
             Some(entry) => {
-                let _ = entry.cmd_tx.send(SessionCommand::UnloadTools { groups, reply });
+                let _ = entry
+                    .cmd_tx
+                    .send(SessionCommand::UnloadTools { groups, reply });
             }
             None => {
                 warn!(session_id, "cannot unload tools: session is not active");
@@ -2610,22 +2616,16 @@ mod tests {
     #[test]
     fn session_id_returns_none_for_non_session_variants() {
         let cases: Vec<DaemonMessage> = vec![
-            DaemonMessage::Sessions {
-                sessions: vec![],
-            },
+            DaemonMessage::Sessions { sessions: vec![] },
             DaemonMessage::Pong,
             DaemonMessage::Models {
                 models: vec![],
                 selected_model: None,
             },
-            DaemonMessage::ModelsFailed {
-                error: "e".into(),
-            },
+            DaemonMessage::ModelsFailed { error: "e".into() },
             DaemonMessage::Unlocked,
             DaemonMessage::Locked,
-            DaemonMessage::LockedError {
-                error: "e".into(),
-            },
+            DaemonMessage::LockedError { error: "e".into() },
             DaemonMessage::CredentialAdded {
                 service: "s".into(),
             },
@@ -2637,12 +2637,8 @@ mod tests {
                 service: "s".into(),
                 key: None,
             },
-            DaemonMessage::AccountAdded {
-                name: "a".into(),
-            },
-            DaemonMessage::Accounts {
-                accounts: vec![],
-            },
+            DaemonMessage::AccountAdded { name: "a".into() },
+            DaemonMessage::Accounts { accounts: vec![] },
             DaemonMessage::ShuttingDown,
         ];
 

@@ -209,14 +209,8 @@ impl OpenAiClient {
         info!("listing models from {}", self.config.base_url);
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
         let retry = retry::retry_config_from_config(&self.config);
-        let response = retry::retry_send_get(
-            &self.http,
-            &url,
-            &self.api_key,
-            &retry,
-            &mut None,
-            None,
-        )?;
+        let response =
+            retry::retry_send_get(&self.http, &url, &self.api_key, &retry, &mut None, None)?;
         let payload: ModelListResponse = response
             .into_body()
             .read_json()
@@ -228,18 +222,31 @@ impl OpenAiClient {
 
     pub fn completion(&self, model: &str, prompt: &str) -> Result<String, OpenAiError> {
         match self.config.request_format_for_model(model) {
-            RequestFormat::Responses => {
-                responses::responses_request(&self.http, &self.config, &self.api_key, model, prompt, None)
-            }
-            RequestFormat::ChatCompletions => {
-                chat_completions::chat_completions_request(
-                    &self.http, &self.config, &self.api_key, model, prompt, None,
-                )
-            }
+            RequestFormat::Responses => responses::responses_request(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                model,
+                prompt,
+                None,
+            ),
+            RequestFormat::ChatCompletions => chat_completions::chat_completions_request(
+                &self.http,
+                &self.config,
+                &self.api_key,
+                model,
+                prompt,
+                None,
+            ),
         }
     }
 
-    pub fn completion_stream<F>(&self, model: &str, prompt: &str, mut on_event: F) -> Result<(), OpenAiError>
+    pub fn completion_stream<F>(
+        &self,
+        model: &str,
+        prompt: &str,
+        mut on_event: F,
+    ) -> Result<(), OpenAiError>
     where
         F: FnMut(StreamEvent) -> io::Result<()>,
     {
@@ -253,11 +260,23 @@ impl OpenAiClient {
 
         match self.config.request_format_for_model(model) {
             RequestFormat::Responses => responses::responses_request_streaming(
-                &self.http, &self.config, &self.api_key, model, prompt, None, &mut on_event,
+                &self.http,
+                &self.config,
+                &self.api_key,
+                model,
+                prompt,
+                None,
+                &mut on_event,
             ),
             RequestFormat::ChatCompletions => chat_completions::chat_completions_request_streaming(
-                &self.http, &self.config, &self.api_key, model, prompt,
-                None, None, &mut on_event,
+                &self.http,
+                &self.config,
+                &self.api_key,
+                model,
+                prompt,
+                None,
+                None,
+                &mut on_event,
             ),
         }
     }
@@ -270,19 +289,32 @@ impl OpenAiClient {
         tracing::debug!(effort = %params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
         match self.config.request_format_for_model(params.model) {
             RequestFormat::Responses => responses::responses_request_with_tools(
-                &self.http, &self.config, &self.api_key,
-                params.model, params.messages, params.tools,
+                &self.http,
+                &self.config,
+                &self.api_key,
+                params.model,
+                params.messages,
+                params.tools,
                 reasoning_effort,
-                params.previous_response_id, params.tool_results,
-                params.on_retry, params.cancel_rx,
+                params.previous_response_id,
+                params.tool_results,
+                params.on_retry,
+                params.cancel_rx,
                 params.programmatic_tool_calling,
             ),
-            RequestFormat::ChatCompletions => chat_completions::chat_completions_request_with_tools(
-                &self.http, &self.config, &self.api_key,
-                params.model, params.messages, params.tools,
-                reasoning_effort,
-                params.on_retry, params.cancel_rx,
-            ),
+            RequestFormat::ChatCompletions => {
+                chat_completions::chat_completions_request_with_tools(
+                    &self.http,
+                    &self.config,
+                    &self.api_key,
+                    params.model,
+                    params.messages,
+                    params.tools,
+                    reasoning_effort,
+                    params.on_retry,
+                    params.cancel_rx,
+                )
+            }
         }
     }
 
@@ -309,20 +341,31 @@ impl OpenAiClient {
 
         match self.config.request_format_for_model(params.model) {
             RequestFormat::Responses => responses::responses_request_streaming_with_tools(
-                &self.http, &self.config, &self.api_key,
-                params.model, params.messages, params.tools,
+                &self.http,
+                &self.config,
+                &self.api_key,
+                params.model,
+                params.messages,
+                params.tools,
                 reasoning_effort,
-                params.previous_response_id, params.tool_results,
-                params.on_retry, params.cancel_rx,
+                params.previous_response_id,
+                params.tool_results,
+                params.on_retry,
+                params.cancel_rx,
                 params.programmatic_tool_calling,
                 &mut on_event,
             ),
             RequestFormat::ChatCompletions => {
                 chat_completions::chat_completions_request_streaming_with_tools(
-                    &self.http, &self.config, &self.api_key,
-                    params.model, params.messages, params.tools,
+                    &self.http,
+                    &self.config,
+                    &self.api_key,
+                    params.model,
+                    params.messages,
+                    params.tools,
                     reasoning_effort,
-                    params.on_retry, params.cancel_rx,
+                    params.on_retry,
+                    params.cancel_rx,
                     &mut on_event,
                 )
             }

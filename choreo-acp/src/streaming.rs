@@ -106,7 +106,6 @@ pub fn translate_message(
         DaemonMessage::ToolCallFinished {
             request_id: _,
             call_id,
-            tool_name: _,
             ..
         } => Some(vec![SessionUpdateParams {
             session_id: session_acp_id.to_string(),
@@ -144,7 +143,6 @@ pub fn translate_message(
         DaemonMessage::Done {
             request_id: _,
             token_usage,
-            last_prompt_tokens: _,
             ..
         } => {
             let mut updates = Vec::with_capacity(2);
@@ -174,11 +172,7 @@ pub fn translate_message(
         // ------------------------------------------------------------------
         // Failed → signal refusal / error.
         // ------------------------------------------------------------------
-        DaemonMessage::Failed {
-            request_id: _,
-            error: _,
-            ..
-        } => Some(vec![SessionUpdateParams {
+        DaemonMessage::Failed { .. } => Some(vec![SessionUpdateParams {
             session_id: session_acp_id.to_string(),
             variant: SessionUpdateVariant::StatusUpdate {
                 status: "refusal".into(),

@@ -62,12 +62,24 @@ impl TurnEventHandler for AppState {
         }
     }
 
-    fn handle_request_stream(&mut self, _session_id: u64, request_id: u32, stream: OutputStream, data: Cow<'_, str>) {
+    fn handle_request_stream(
+        &mut self,
+        _session_id: u64,
+        request_id: u32,
+        stream: OutputStream,
+        data: Cow<'_, str>,
+    ) {
         trace!(%request_id, ?stream, len = %data.len(), "handle_request_stream");
         self.session_view.stream_chunk(request_id, stream, &data);
     }
 
-    fn handle_started(&mut self, _session_id: u64, request_id: u32, turn_id: u32, _estimated_prompt_tokens: u32) {
+    fn handle_started(
+        &mut self,
+        _session_id: u64,
+        request_id: u32,
+        turn_id: u32,
+        _estimated_prompt_tokens: u32,
+    ) {
         debug!(%request_id, %turn_id, "stream started");
         self.session_view
             .request_to_turn
@@ -106,7 +118,13 @@ impl TurnEventHandler for AppState {
         }
     }
 
-    fn handle_tool_result_chunk(&mut self, _session_id: u64, request_id: u32, call_id: String, data: Vec<u8>) {
+    fn handle_tool_result_chunk(
+        &mut self,
+        _session_id: u64,
+        request_id: u32,
+        call_id: String,
+        data: Vec<u8>,
+    ) {
         trace!(%request_id, %call_id, len = %data.len(), "handle_tool_result_chunk");
         match String::from_utf8(data) {
             Ok(text) => {

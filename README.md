@@ -53,14 +53,6 @@ the model calls the `load_skill` tool, the full instruction body is injected int
 conversation (progressive disclosure), giving the model specialized knowledge on demand
 without bloating every request.
 
-## Setup
-
-Register the pre-commit hook (auto-fixes clippy and fmt on every commit):
-
-```bash
-git config core.hooksPath .githooks
-```
-
 ## Build
 
 ```bash

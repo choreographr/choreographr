@@ -1069,8 +1069,11 @@ pub(crate) fn run_agent_loop(
                     // failure) means the authoritative state was NOT changed,
                     // so this worker must not pretend it was.
                     if !output.is_error
-                        && let Some(change) =
-                            pending_config_change(&tool_call, &output, turn_base_working_dir.as_deref())
+                        && let Some(change) = pending_config_change(
+                            &tool_call,
+                            &output,
+                            turn_base_working_dir.as_deref(),
+                        )
                     {
                         pending_config_changes.push(change);
                     }

@@ -205,12 +205,10 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 let (reply, rx) = mpsc::channel();
                 let _ = tx.send(SessionCommand::GetReasoningEffort { reply });
                 if let Ok(effort) = rx.recv() {
-                    let _ = ctx
-                        .writer_tx
-                        .send(DaemonMessage::ReasoningEffortSet {
-                            session_id: 0,
-                            effort,
-                        });
+                    let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSet {
+                        session_id: 0,
+                        effort,
+                    });
                 }
             } else {
                 let _ = ctx.writer_tx.send(DaemonMessage::ReasoningEffortSet {
@@ -320,15 +318,19 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             handle_client_set_session_account(name, ctx);
         }
         ClientMessage::SubscribeAllActivity => {
-            let _ = ctx.daemon_tx.send(DaemonCommand::RegisterActivitySubscriber {
-                client_id: ctx.client_id,
-                writer: ctx.writer_tx.clone(),
-            });
+            let _ = ctx
+                .daemon_tx
+                .send(DaemonCommand::RegisterActivitySubscriber {
+                    client_id: ctx.client_id,
+                    writer: ctx.writer_tx.clone(),
+                });
         }
         ClientMessage::UnsubscribeAllActivity => {
-            let _ = ctx.daemon_tx.send(DaemonCommand::UnregisterActivitySubscriber {
-                client_id: ctx.client_id,
-            });
+            let _ = ctx
+                .daemon_tx
+                .send(DaemonCommand::UnregisterActivitySubscriber {
+                    client_id: ctx.client_id,
+                });
         }
         _ => {
             warn!(

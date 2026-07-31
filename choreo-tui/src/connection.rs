@@ -453,7 +453,11 @@ fn run_ui_loop(
         // Clear the terminal-native progress bar when leaving Chat.
         // Updates are driven directly by the event handlers (Done,
         // SessionState) rather than through progress_dirty.
-        if app.active_display_ref().map(|d| d.progress_dirty).unwrap_or(false) {
+        if app
+            .active_display_ref()
+            .map(|d| d.progress_dirty)
+            .unwrap_or(false)
+        {
             if let Some(d) = app.active_display() {
                 d.progress_dirty = false;
             }
@@ -767,16 +771,23 @@ fn handle_chat_event(
                                     parent_session_id,
                                     // Inherit fields from the currently attached session
                                     // when not explicitly provided by the user.
-                                    working_dir: working_dir
-                                        .or_else(|| app.active_display_ref().and_then(|d| d.working_dir.clone())),
+                                    working_dir: working_dir.or_else(|| {
+                                        app.active_display_ref().and_then(|d| d.working_dir.clone())
+                                    }),
                                     max_turns,
                                     context_config,
-                                    account_name: account_name
-                                        .or_else(|| app.active_display_ref().and_then(|d| d.account_name.clone())),
-                                    selected_model: selected_model
-                                        .or_else(|| app.active_display_ref().and_then(|d| d.selected_model.clone())),
-                                    reasoning_effort: reasoning_effort
-                                        .or_else(|| app.active_display_ref().and_then(|d| d.reasoning_effort.clone())),
+                                    account_name: account_name.or_else(|| {
+                                        app.active_display_ref()
+                                            .and_then(|d| d.account_name.clone())
+                                    }),
+                                    selected_model: selected_model.or_else(|| {
+                                        app.active_display_ref()
+                                            .and_then(|d| d.selected_model.clone())
+                                    }),
+                                    reasoning_effort: reasoning_effort.or_else(|| {
+                                        app.active_display_ref()
+                                            .and_then(|d| d.reasoning_effort.clone())
+                                    }),
                                 },
                                 other => other,
                             };
@@ -996,16 +1007,21 @@ fn handle_chat_event(
                 // or cache dependency needed.
                 MouseEventKind::Down(MouseButton::Left) => {
                     if let Some((turn_idx, offset)) = find_turn_at_row(app, mouse.row)
-                        && let Some(layout) = app.active_display_ref().unwrap().turn_layouts.get(turn_idx)
+                        && let Some(layout) =
+                            app.active_display_ref().unwrap().turn_layouts.get(turn_idx)
                         && let Some(img_idx) = layout
                             .image_ranges
                             .iter()
                             .position(|&(start, end)| offset >= start && offset < end)
-                        && let Some(turn_id) = app.active_display_ref().unwrap().visible_turn_ids.get(turn_idx).copied()
+                        && let Some(turn_id) = app
+                            .active_display_ref()
+                            .unwrap()
+                            .visible_turn_ids
+                            .get(turn_idx)
+                            .copied()
+                        && let Some(session_id) = app.active_session_id
                     {
-                        if let Some(session_id) = app.active_session_id {
-                            app.fullscreen_image_target = Some((session_id, turn_id, img_idx));
-                        }
+                        app.fullscreen_image_target = Some((session_id, turn_id, img_idx));
                     }
                 }
                 _ => {}
@@ -1029,12 +1045,12 @@ fn handle_chat_ctrl_key(
 ) -> Result<(), ClientError> {
     match key.code {
         KeyCode::Char('r') => {
-            let (capability, current_effort) = app.active_display_ref()
+            let (capability, current_effort) = app
+                .active_display_ref()
                 .map(|d| (d.reasoning_capability.clone(), d.reasoning_effort.clone()))
                 .unwrap_or_default();
             match capability.as_ref().and_then(|c| {
-                let current = current_effort
-                    .unwrap_or_else(|| "off".to_string());
+                let current = current_effort.unwrap_or_else(|| "off".to_string());
                 c.cycle_from(&current).map(|next| (current, next))
             }) {
                 Some((current, next)) => {
@@ -1183,9 +1199,15 @@ fn handle_session_list_key(
                     working_dir: app.active_display_ref().and_then(|d| d.working_dir.clone()),
                     max_turns: None,
                     context_config: None,
-                    account_name: app.active_display_ref().and_then(|d| d.account_name.clone()),
-                    selected_model: app.active_display_ref().and_then(|d| d.selected_model.clone()),
-                    reasoning_effort: app.active_display_ref().and_then(|d| d.reasoning_effort.clone()),
+                    account_name: app
+                        .active_display_ref()
+                        .and_then(|d| d.account_name.clone()),
+                    selected_model: app
+                        .active_display_ref()
+                        .and_then(|d| d.selected_model.clone()),
+                    reasoning_effort: app
+                        .active_display_ref()
+                        .and_then(|d| d.reasoning_effort.clone()),
                 })
                 .map_err(broken_pipe)?;
         }
@@ -1580,7 +1602,9 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::SessionDeleteFailed { session_id, error } => {
             app.handle_session_delete_failed(*session_id, error);
         }
-        DaemonMessage::SessionFailed { operation, error, .. } => {
+        DaemonMessage::SessionFailed {
+            operation, error, ..
+        } => {
             app.error = Some(format!("[daemon] {operation} failed: {error}"));
             // If we're on the Session Manager page, also show the error
             // right on that page so the user has immediate feedback.
@@ -1717,10 +1741,10 @@ pub(crate) fn handle_daemon_message(
             session_id,
             context_window,
         } => {
-            if app.attached_session_id == Some(*session_id) {
-                if let Some(display) = app.active_display() {
-                    display.context_window = Some(*context_window);
-                }
+            if app.attached_session_id == Some(*session_id)
+                && let Some(display) = app.active_display()
+            {
+                display.context_window = Some(*context_window);
             }
         }
         DaemonMessage::SessionWorkingDirSet { session_id, path } => {
@@ -1807,8 +1831,11 @@ mod tests {
     fn find_marker_by_row(app: &App, mouse_row: u16) -> Option<&Marker> {
         let top_slot = 2 * mouse_row as usize;
         let bot_slot = top_slot + 1;
-        app.active_display_ref()
-            .and_then(|d| d.markers.iter().find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot))
+        app.active_display_ref().and_then(|d| {
+            d.markers
+                .iter()
+                .find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot)
+        })
     }
 
     #[test]
@@ -1822,7 +1849,11 @@ mod tests {
         insert_turn(&mut app, 1, "user b", "assistant b");
         app.rebuild_height_prefix();
 
-        assert_eq!(app.active_display_ref().unwrap().markers.len(), 2, "should have 2 markers");
+        assert_eq!(
+            app.active_display_ref().unwrap().markers.len(),
+            2,
+            "should have 2 markers"
+        );
 
         // Each marker's virtual_slot must be findable by the click handler's
         // row-to-slot mapping (slot = 2*row or slot = 2*row+1).
@@ -1862,7 +1893,13 @@ mod tests {
 
         // Collect content_lines first to avoid borrow conflict with
         // scroll_to_content_line which takes &mut self.
-        let content_lines: Vec<usize> = app.active_display_ref().unwrap().markers.iter().map(|m| m.content_line).collect();
+        let content_lines: Vec<usize> = app
+            .active_display_ref()
+            .unwrap()
+            .markers
+            .iter()
+            .map(|m| m.content_line)
+            .collect();
 
         // Clicking on each marker should scroll so that the marker's
         // content_line is at the top of the viewport.
@@ -1903,7 +1940,13 @@ mod tests {
         );
 
         // Collect content_lines first to avoid borrow conflict.
-        let content_lines: Vec<usize> = app.active_display_ref().unwrap().markers.iter().map(|m| m.content_line).collect();
+        let content_lines: Vec<usize> = app
+            .active_display_ref()
+            .unwrap()
+            .markers
+            .iter()
+            .map(|m| m.content_line)
+            .collect();
 
         // Each marker should scroll to the correct content_line.
         for &cl in &content_lines {
@@ -1966,7 +2009,10 @@ mod tests {
         };
         app.display_for(0).view.insert_or_replace(0, turn);
         app.rebuild_height_prefix();
-        assert!(app.display_for(0).markers.is_empty(), "should have no markers");
+        assert!(
+            app.display_for(0).markers.is_empty(),
+            "should have no markers"
+        );
 
         // No marker should be found at any row.
         for row in 0..10 {

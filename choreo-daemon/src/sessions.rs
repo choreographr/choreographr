@@ -804,9 +804,7 @@ fn process_command(
         SessionCommand::SetWorkingDir { path, reply } => {
             handle_set_working_dir(path, reply, state, ctx)
         }
-        SessionCommand::LoadTools { groups, reply } => {
-            handle_load_tools(groups, reply, state, ctx)
-        }
+        SessionCommand::LoadTools { groups, reply } => handle_load_tools(groups, reply, state, ctx),
         SessionCommand::UnloadTools { groups, reply } => {
             handle_unload_tools(groups, reply, state, ctx)
         }
@@ -842,7 +840,13 @@ fn handle_run_input(
         "session received input",
     );
     if text.is_empty() {
-        return fail_request(&mut state.subscribers, &ctx.daemon_tx, ctx.session_id, request_id, "empty input");
+        return fail_request(
+            &mut state.subscribers,
+            &ctx.daemon_tx,
+            ctx.session_id,
+            request_id,
+            "empty input",
+        );
     }
     let provider = if let Some(p) = state.provider.as_ref() {
         p.clone()
@@ -894,7 +898,13 @@ fn handle_run_input(
     let model = match &state.config.selected_model {
         Some(m) => m.clone(),
         None => {
-            return fail_request(&mut state.subscribers, &ctx.daemon_tx, ctx.session_id, request_id, "no model selected");
+            return fail_request(
+                &mut state.subscribers,
+                &ctx.daemon_tx,
+                ctx.session_id,
+                request_id,
+                "no model selected",
+            );
         }
     };
     if *shutdown_requested {
@@ -1266,10 +1276,12 @@ fn handle_detach(
 
     // Notify the daemon so it can stop filtering duplicates through
     // the activity subscriber path for this client/session pair.
-    let _ = ctx.daemon_tx.send(DaemonCommand::UntrackSessionSubscription {
-        client_id,
-        session_id: ctx.session_id,
-    });
+    let _ = ctx
+        .daemon_tx
+        .send(DaemonCommand::UntrackSessionSubscription {
+            client_id,
+            session_id: ctx.session_id,
+        });
     state.active_requests.is_empty() && (state.subscribers.is_empty() || *shutdown_requested)
 }
 
@@ -1535,8 +1547,10 @@ fn handle_unload_tools(
         return false;
     }
 
-    let result =
-        crate::tools::unload_tools::apply_unload_tools(&mut state.config.active_tool_groups, &groups);
+    let result = crate::tools::unload_tools::apply_unload_tools(
+        &mut state.config.active_tool_groups,
+        &groups,
+    );
 
     // Broadcast updated session state so the client picks up the new
     // active_tool_groups immediately.
@@ -1753,7 +1767,11 @@ fn handle_redo(state: &mut SessionState, ctx: &RequestContext) -> bool {
 }
 
 /// Signal shutdown: cancel all active requests and check if the loop should exit.
-fn handle_shutdown(state: &mut SessionState, shutdown_requested: &mut bool, ctx: &RequestContext) -> bool {
+fn handle_shutdown(
+    state: &mut SessionState,
+    shutdown_requested: &mut bool,
+    ctx: &RequestContext,
+) -> bool {
     *shutdown_requested = true;
     for (&request_id, active) in &state.active_requests {
         let _ = active.cancel_tx.send(());
@@ -2147,10 +2165,7 @@ mod tests {
         assert!(!shutdown);
         // Subscribers should receive the SessionWorkingDirSet broadcast.
         match rx.recv().unwrap() {
-            DaemonMessage::SessionWorkingDirSet {
-                session_id,
-                path,
-            } => {
+            DaemonMessage::SessionWorkingDirSet { session_id, path } => {
                 assert_eq!(session_id, ctx.session_id);
                 assert_eq!(path.as_deref(), Some("/tmp/new-wd"));
             }

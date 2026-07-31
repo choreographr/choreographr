@@ -207,7 +207,11 @@ fn bridge_turn_images() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::TurnAppended { session_id: 0, turn_id: 1, turn },
+        &DaemonMessage::TurnAppended {
+            session_id: 0,
+            turn_id: 1,
+            turn,
+        },
     )
     .unwrap();
     use std::io::Write;
@@ -312,7 +316,10 @@ fn bridge_cancelled_clears_buffer() {
 
     write_message(
         &mut daemon_writer,
-        &DaemonMessage::Cancelled { session_id: 0, request_id: 42 },
+        &DaemonMessage::Cancelled {
+            session_id: 0,
+            request_id: 42,
+        },
     )
     .unwrap();
     use std::io::Write;

@@ -3,8 +3,7 @@ use tracing::debug;
 
 use super::retry;
 use super::{
-    ChatRequestMessage, ChatToolDefinition, SseReader,
-    endpoint_url, validate_tool_call_arguments,
+    ChatRequestMessage, ChatToolDefinition, SseReader, endpoint_url, validate_tool_call_arguments,
 };
 use crate::providers::StreamEvent;
 use crate::providers::shared::MAX_TOOL_CALLS;
@@ -247,7 +246,12 @@ pub(crate) fn chat_completions_request_with_tools(
         // All calls had invalid arguments. Return the text if the model
         // produced any, so the session continues gracefully and the LLM
         // can retry with valid arguments on the next turn.
-        let content = choice.message.content.unwrap_or_default().trim().to_string();
+        let content = choice
+            .message
+            .content
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         return Ok(ChatTurnResult::FinalText(FinalTextResult {
             content,
             reasoning,
@@ -565,7 +569,11 @@ where
             // session can continue gracefully.
             return Ok(ChatTurnResult::FinalText(FinalTextResult {
                 content: full_content,
-                reasoning: if full_reasoning.is_empty() { None } else { Some(full_reasoning) },
+                reasoning: if full_reasoning.is_empty() {
+                    None
+                } else {
+                    Some(full_reasoning)
+                },
                 usage: last_usage,
                 response_id: None,
             }));
@@ -995,6 +1003,4 @@ mod tests {
         assert_eq!(delta.content.as_deref(), Some("answer"));
         assert_eq!(delta.reasoning_text.as_deref(), Some("think"));
     }
-
-
 }

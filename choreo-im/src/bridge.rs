@@ -180,7 +180,9 @@ fn daemon_to_bridge_events(
             }
             None
         }
-        DaemonMessage::Failed { request_id, error, .. } => {
+        DaemonMessage::Failed {
+            request_id, error, ..
+        } => {
             buffers.remove(&request_id);
             Some(BridgeEvent::Error(error))
         }
@@ -398,7 +400,10 @@ mod tests {
         );
 
         let events = daemon_to_bridge_events(
-            DaemonMessage::Cancelled { session_id: 0, request_id: 2 },
+            DaemonMessage::Cancelled {
+                session_id: 0,
+                request_id: 2,
+            },
             &mut buffers,
             &mut tool_buffers,
         );
