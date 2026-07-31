@@ -105,7 +105,7 @@ fn spawn_http_tool_server() -> (String, std::thread::JoinHandle<()>) {
                 }
 
                 if first_line.starts_with("GET /long ") {
-                    let body = "x".repeat((16 * 1024) + 128);
+                    let body = "x".repeat(200 * 1024);
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                         body.len(),

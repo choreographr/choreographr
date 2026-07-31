@@ -126,7 +126,7 @@ fn no_working_dir_skips_confinement() {
 fn output_truncation() {
     let result = execute_sh_tool(
         &ShArgs {
-            command: "head -c 100000 /dev/zero | tr '\\0' 'x'".into(),
+            command: "head -c 200000 /dev/zero | tr '\\0' 'x'".into(),
             shell: SHELL,
             workdir: None,
             timeout: None,

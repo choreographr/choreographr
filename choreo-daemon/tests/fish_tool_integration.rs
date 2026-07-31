@@ -117,7 +117,7 @@ fn no_working_dir_skips_confinement() {
 fn output_truncation() {
     let result = execute_fish_tool(
         &FishArgs {
-            command: "head -c 100000 /dev/zero | tr '\\0' 'x'".into(),
+            command: "head -c 200000 /dev/zero | tr '\\0' 'x'".into(),
             workdir: None,
             timeout: None,
         },

@@ -127,7 +127,7 @@ fn output_truncation() {
             command: "sh".into(),
             args: vec![
                 "-c".into(),
-                "head -c 100000 /dev/zero | tr '\\0' 'x'".into(),
+                "head -c 200000 /dev/zero | tr '\\0' 'x'".into(),
             ],
             workdir: None,
             timeout: None,

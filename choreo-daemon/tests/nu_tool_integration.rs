@@ -117,7 +117,7 @@ fn no_working_dir_skips_confinement() {
 fn output_truncation() {
     let result = execute_nu_tool(
         &NuArgs {
-            command: "1..99999 | each { 'x' } | str join".into(),
+            command: "1..200000 | each { 'x' } | str join".into(),
             workdir: None,
             timeout: None,
         },

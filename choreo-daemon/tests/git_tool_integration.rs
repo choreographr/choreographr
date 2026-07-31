@@ -69,7 +69,11 @@ fn status_initial_repo() {
         None,
     )
     .unwrap_or_default();
-    assert!(worktree.contains("mode: working tree"), "{}", worktree);
+    assert!(worktree.contains("head: main"), "{}", worktree);
+    assert!(worktree.contains("staged:"), "{}", worktree);
+    assert!(worktree.contains("unstaged:"), "{}", worktree);
+    assert!(worktree.contains("untracked:"), "{}", worktree);
+    assert!(worktree.contains("(none)"), "{}", worktree);
 }
 
 #[test]
