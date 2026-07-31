@@ -15,8 +15,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::markdown_render::{
-    compute_visual_offsets, lines_height, plain_text_lines, reasoning_expanded_default,
-    reasoning_header_line_index, render_turn_lines,
+    RenderedTurnLines, compute_visual_offsets, lines_height, plain_text_lines,
+    reasoning_expanded_default, render_turn_lines,
 };
 use ratatui::text::Line;
 use tui_prompts::{SelectState, State, TextState};
@@ -349,6 +349,12 @@ pub(crate) struct TurnLayout {
     /// (start, end) content-line range of the reasoning header row(s),
     /// relative to the turn's start.  None when the turn has no reasoning.
     pub reasoning_header_range: Option<(usize, usize)>,
+    /// Whether this turn's reasoning section is expanded by default, derived
+    /// from turn content at layout time (an explicit header-click override in
+    /// `reasoning_override` takes precedence at render time).  Stored here so
+    /// the per-frame render path can compute the effective state in O(1)
+    /// without re-scanning turn strings.
+    pub reasoning_default_expanded: bool,
     /// (start, end) content-line ranges for each displayed image,
     /// relative to the turn's start.  Empty when the turn has no images.
     pub image_ranges: Vec<(usize, usize)>,
@@ -359,6 +365,15 @@ pub(crate) struct RenderedCache {
     /// Turn ID this cache entry belongs to, used to detect stale entries
     /// after turns are removed/reordered.
     pub turn_id: u32,
+    /// Reasoning visibility the cached lines were rendered with.  Part of
+    /// the cache key: if the effective state changes without a cache
+    /// invalidation, the stale entry is treated as a miss instead of being
+    /// served.
+    pub reasoning_expanded: bool,
+    /// Semantic-line index of the reasoning header within `lines` (see
+    /// [`RenderedTurnLines`]), so click hit-testing never re-scans the
+    /// rendered output.
+    pub reasoning_header_idx: Option<usize>,
     pub lines: Arc<[Line<'static>]>,
     pub width: u16,
     /// Full viewport width when this cache entry was computed.
@@ -374,9 +389,16 @@ pub(crate) struct RenderedCache {
     pub visual_offsets: Arc<[usize]>,
 }
 
+/// Cached render output for a turn: the lines plus the precomputed height,
+/// cumulative visual offsets, and reasoning-header semantic index.  Returned
+/// from [`cached_or_compute_lines`] so callers can render and hit-test without
+/// re-walking the lines.
+pub(crate) type RenderedTurnCache = (Arc<[Line<'static>]>, usize, Arc<[usize]>, Option<usize>);
+
 /// Check `render_cache[index]` for a valid entry matching `turn_id`, `width`,
-/// and `viewport_width`.  On hit, return the cached `(lines, height, visual_offsets)`.
-/// On miss, call `compute`, store the result in `render_cache[index]`, and return it.
+/// `viewport_width`, and `reasoning_expanded`.  On hit, return the cached
+/// [`RenderedTurnCache`].  On miss, call `compute`, store the result in
+/// `render_cache[index]`, and return it.
 ///
 /// When `index` is out of bounds (in-band or because the cache is shorter than
 /// expected), the result is still returned but not cached.
@@ -386,26 +408,32 @@ pub(crate) fn cached_or_compute_lines(
     turn_id: u32,
     width: u16,
     viewport_width: u16,
-    compute: impl FnOnce() -> Vec<Line<'static>>,
-) -> (Arc<[Line<'static>]>, usize, Arc<[usize]>) {
+    reasoning_expanded: bool,
+    compute: impl FnOnce() -> RenderedTurnLines,
+) -> RenderedTurnCache {
     if let Some(Some(cached)) = cache.get(index)
         && cached.turn_id == turn_id
         && cached.width == width
         && cached.viewport_width == viewport_width
+        && cached.reasoning_expanded == reasoning_expanded
     {
         return (
             Arc::clone(&cached.lines),
             cached.height,
             Arc::clone(&cached.visual_offsets),
+            cached.reasoning_header_idx,
         );
     }
 
-    let lines = Arc::from(compute());
+    let rendered = compute();
+    let lines = Arc::from(rendered.lines);
     let height = lines_height(&lines, viewport_width).max(1);
     let visual_offsets = compute_visual_offsets(&lines, viewport_width);
     if let Some(slot) = cache.get_mut(index) {
         *slot = Some(RenderedCache {
             turn_id,
+            reasoning_expanded,
+            reasoning_header_idx: rendered.reasoning_header_idx,
             height,
             lines: Arc::clone(&lines),
             width,
@@ -413,7 +441,7 @@ pub(crate) fn cached_or_compute_lines(
             visual_offsets: Arc::clone(&visual_offsets),
         });
     }
-    (lines, height, visual_offsets)
+    (lines, height, visual_offsets, rendered.reasoning_header_idx)
 }
 
 pub(crate) struct SessionDisplayState {
@@ -2056,39 +2084,41 @@ impl SessionDisplayState {
 
             // Effective reasoning visibility for this turn: the per-turn
             // user override (from clicking the header), falling back to the
-            // streaming-derived default.
-            let reasoning_expanded = self
-                .reasoning_override
-                .get(&turn_id)
-                .copied()
-                .unwrap_or_else(|| reasoning_expanded_default(turn));
+            // streaming-derived default.  The derived default is also stored
+            // in the turn layout so the per-frame render path can reuse it
+            // in O(1) without re-scanning turn strings.
+            let reasoning_default_expanded = reasoning_expanded_default(turn);
+            let reasoning_expanded =
+                self.effective_reasoning_expanded(turn_id, reasoning_default_expanded);
 
-            let (text_lines, text_height, text_offsets) = cached_or_compute_lines(
-                &mut self.render_cache,
-                visible_idx,
-                turn_id,
-                content_width,
-                viewport.width,
-                || render_turn_lines(turn, content_width, tool_content_width, reasoning_expanded),
-            );
+            let (_text_lines, text_height, text_offsets, reasoning_header_idx) =
+                cached_or_compute_lines(
+                    &mut self.render_cache,
+                    visible_idx,
+                    turn_id,
+                    content_width,
+                    viewport.width,
+                    reasoning_expanded,
+                    || {
+                        render_turn_lines(
+                            turn,
+                            content_width,
+                            tool_content_width,
+                            reasoning_expanded,
+                        )
+                    },
+                );
 
             // The reasoning header's visual-row range for click hit-testing.
-            // The header line is located directly in the rendered output (it
-            // is present whenever reasoning exists) and its semantic index is
-            // converted to a visual-row range via the cached offsets — O(1)
-            // in the click handler, same approach as image ranges.
-            let reasoning_header_range = turn
-                .assistant_reasoning
-                .as_deref()
-                .is_some_and(|r| !r.trim().is_empty())
-                .then(|| {
-                    reasoning_header_line_index(&text_lines).map(|idx| {
-                        let start = if idx == 0 { 0 } else { text_offsets[idx - 1] };
-                        let end = text_offsets[idx];
-                        (start, end)
-                    })
-                })
-                .flatten();
+            // The renderer reports the header's semantic-line index directly
+            // (no output scanning); the cached offsets convert it to a
+            // visual-row range — O(1) in the click handler, same approach
+            // as image ranges.
+            let reasoning_header_range = reasoning_header_idx.map(|idx| {
+                let start = if idx == 0 { 0 } else { text_offsets[idx - 1] };
+                let end = text_offsets[idx];
+                (start, end)
+            });
 
             let mut image_ranges: Vec<(usize, usize)> = Vec::new();
             let mut total_img_height: usize = 0;
@@ -2099,6 +2129,7 @@ impl SessionDisplayState {
             }
             self.turn_layouts.push(TurnLayout {
                 reasoning_header_range,
+                reasoning_default_expanded,
                 image_ranges,
             });
             let turn_height = text_height + total_img_height;
@@ -2140,6 +2171,18 @@ impl SessionDisplayState {
         self.streaming_dirty = false;
     }
 
+    /// Effective reasoning visibility for a turn: an explicit override from
+    /// clicking the header wins; otherwise the caller-provided derived
+    /// default is used.  Callers compute the default either from the turn
+    /// content (`reasoning_expanded_default`) or from the precomputed
+    /// `TurnLayout` when one is available (per-frame render path).
+    pub(crate) fn effective_reasoning_expanded(&self, turn_id: u32, default: bool) -> bool {
+        self.reasoning_override
+            .get(&turn_id)
+            .copied()
+            .unwrap_or(default)
+    }
+
     /// Toggle the reasoning section's visibility for a turn (clicking the
     /// header).  Records the explicit user preference in `reasoning_override`
     /// and invalidates the turn's render cache so the change takes effect on
@@ -2148,11 +2191,7 @@ impl SessionDisplayState {
         let Some(turn) = self.view.turns.get(&turn_id) else {
             return;
         };
-        let current = self
-            .reasoning_override
-            .get(&turn_id)
-            .copied()
-            .unwrap_or_else(|| reasoning_expanded_default(turn));
+        let current = self.effective_reasoning_expanded(turn_id, reasoning_expanded_default(turn));
         self.reasoning_override.insert(turn_id, !current);
         if let Some(idx) = self.visible_turn_ids.iter().position(|id| *id == turn_id)
             && let Some(slot) = self.render_cache.get_mut(idx)
@@ -2227,36 +2266,41 @@ impl SessionDisplayState {
         let tool_content_width = viewport.width.saturating_sub(4);
 
         // Re-render with the effective reasoning visibility so the streaming
-        // fast path stays consistent with the collapsed/expanded state.
-        let reasoning_expanded = self
-            .reasoning_override
-            .get(&turn_id)
-            .copied()
-            .unwrap_or_else(|| reasoning_expanded_default(turn));
+        // fast path stays consistent with the collapsed/expanded state.  The
+        // derived default is stored back into the turn layout, keeping the
+        // per-frame render path O(1).
+        let reasoning_default_expanded = reasoning_expanded_default(turn);
+        let reasoning_expanded =
+            self.effective_reasoning_expanded(turn_id, reasoning_default_expanded);
 
         if let Some(Some(cached)) = self.render_cache.get_mut(turn_idx)
             && cached.turn_id == turn_id
             && cached.width == content_width
             && cached.viewport_width == viewport.width
         {
-            let text_lines =
+            let rendered =
                 render_turn_lines(turn, content_width, tool_content_width, reasoning_expanded);
+            let text_lines = rendered.lines;
             let text_height = lines_height(&text_lines, viewport.width).max(1);
             let visual_offsets = compute_visual_offsets(&text_lines, viewport.width);
 
-            // Keep the reasoning header's click-hit range in sync as the
-            // response streams — the header sits below the growing response,
-            // so its position shifts on every chunk.  Rebuilds (via
-            // `rebuild_height_prefix`) recompute it from scratch.
+            // Keep the reasoning header's click-hit range and the precomputed
+            // default in sync as the response streams — the header sits below
+            // the growing response, so its position shifts on every chunk.
+            // Rebuilds (via `rebuild_height_prefix`) recompute from scratch.
             if let Some(layout) = self.turn_layouts.get_mut(turn_idx) {
-                layout.reasoning_header_range =
-                    reasoning_header_line_index(&text_lines).map(|idx| {
-                        let start = if idx == 0 { 0 } else { visual_offsets[idx - 1] };
-                        let end = visual_offsets[idx];
-                        (start, end)
-                    });
+                layout.reasoning_header_range = rendered.reasoning_header_idx.map(|idx| {
+                    let start = if idx == 0 { 0 } else { visual_offsets[idx - 1] };
+                    let end = visual_offsets[idx];
+                    (start, end)
+                });
+                layout.reasoning_default_expanded = reasoning_default_expanded;
             }
 
+            // The cache entry now reflects the current reasoning state; the
+            // next frame's lookup will treat this as a valid hit.
+            cached.reasoning_expanded = reasoning_expanded;
+            cached.reasoning_header_idx = rendered.reasoning_header_idx;
             cached.lines = Arc::from(text_lines);
             cached.height = text_height;
             cached.visual_offsets = visual_offsets;
@@ -2482,6 +2526,10 @@ impl TurnEventHandler for App {
         let display = self.display_for(session_id);
         for tid in turn_ids {
             invalidate_turn_cache(display, *tid);
+            // Drop the user's reasoning-expansion preference for undone turns
+            // so the map can't accumulate stale entries; a redo restores the
+            // turn fresh with the derived default.
+            display.reasoning_override.remove(tid);
             if let Some(turn) = display.view.turns.get_mut(tid) {
                 turn.undone = true;
             }
@@ -3429,7 +3477,11 @@ mod tests {
         let text_h = {
             let display = app.active_display().unwrap();
             let turn = &display.view.turns[&2];
-            lines_height(&render_turn_lines(turn, 71, vp_width, false), vp_width).max(1)
+            lines_height(
+                &render_turn_lines(turn, 71, vp_width, false).lines,
+                vp_width,
+            )
+            .max(1)
         };
 
         let layout = &app.active_display().unwrap().turn_layouts[0];
@@ -3484,6 +3536,61 @@ mod tests {
     }
 
     #[test]
+    fn turn_layout_reasoning_default_expanded_reflects_turn_content() {
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+
+        // Response present → default collapsed.
+        let responded = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("world".into()),
+            assistant_reasoning: Some("think".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(1, responded);
+
+        // Streaming (no response yet) → default expanded.
+        let streaming = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(2, streaming);
+
+        app.rebuild_height_prefix();
+
+        let display = app.active_display().unwrap();
+        assert!(
+            !display.turn_layouts[0].reasoning_default_expanded,
+            "response present → collapsed default"
+        );
+        assert!(
+            display.turn_layouts[1].reasoning_default_expanded,
+            "no response yet → expanded default"
+        );
+    }
+
+    #[test]
     fn turn_layout_reasoning_header_range_none_without_reasoning() {
         let mut app = test_app();
         app.history_viewport.width = 80;
@@ -3535,6 +3642,8 @@ mod tests {
         display.visible_turn_ids.push(1);
         display.render_cache = vec![Some(RenderedCache {
             turn_id: 1,
+            reasoning_expanded: false, // response present → collapsed default
+            reasoning_header_idx: None,
             lines: Arc::from(vec![Line::from("stale")]),
             width: 71,
             viewport_width: 80,
@@ -3597,6 +3706,65 @@ mod tests {
             display.reasoning_override.get(&1),
             Some(&false),
             "first click on streaming reasoning should collapse"
+        );
+    }
+
+    // ── effective_reasoning_expanded ──
+
+    #[test]
+    fn effective_reasoning_expanded_prefers_override() {
+        let mut app = test_app();
+        let display = app.active_display().unwrap();
+        // No override → the derived default wins.
+        assert!(!display.effective_reasoning_expanded(1, false));
+        assert!(display.effective_reasoning_expanded(1, true));
+        // An explicit override wins over the derived default.
+        display.reasoning_override.insert(1, true);
+        assert!(
+            display.effective_reasoning_expanded(1, false),
+            "override should beat a collapsed default"
+        );
+        display.reasoning_override.insert(1, false);
+        assert!(
+            !display.effective_reasoning_expanded(1, true),
+            "override should beat an expanded default"
+        );
+    }
+
+    // ── reasoning_override pruning on undo ──
+
+    #[test]
+    fn turns_undone_prunes_reasoning_override() {
+        let mut app = test_app();
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("response".into()),
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        {
+            let display = app.active_display().unwrap();
+            display.view.insert_or_replace(1, turn);
+            // Simulate the user having expanded the reasoning section.
+            display.reasoning_override.insert(1, true);
+        }
+
+        app.handle_turns_undone(0, &[1]);
+
+        let display = app.active_display_ref().unwrap();
+        assert!(
+            !display.reasoning_override.contains_key(&1),
+            "undo should prune the reasoning override"
+        );
+        assert!(
+            display.view.turns[&1].undone,
+            "the turn should be marked undone"
         );
     }
 
@@ -4129,6 +4297,8 @@ mod tests {
             display.markers_dirty = true;
             display.render_cache = vec![Some(RenderedCache {
                 turn_id: 0,
+                reasoning_expanded: false,
+                reasoning_header_idx: None,
                 lines: Arc::from(Vec::<Line<'static>>::new()),
                 width: 0,
                 viewport_width: 0,
@@ -4168,6 +4338,8 @@ mod tests {
             display.markers_dirty = true;
             display.render_cache = vec![Some(RenderedCache {
                 turn_id: 0,
+                reasoning_expanded: false,
+                reasoning_header_idx: None,
                 lines: Arc::from(Vec::<Line<'static>>::new()),
                 width: 0,
                 viewport_width: 0,

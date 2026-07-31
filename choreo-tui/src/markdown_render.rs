@@ -272,6 +272,18 @@ pub(crate) fn lines_height(lines: &[Line<'_>], width: u16) -> usize {
         .sum::<usize>()
 }
 
+/// A turn rendered into styled lines, plus the metadata the TUI needs to
+/// hit-test the collapsible reasoning header without re-scanning the output.
+pub(crate) struct RenderedTurnLines {
+    pub lines: Vec<Line<'static>>,
+    /// Semantic-line index of the reasoning header line within `lines`,
+    /// present iff the turn has non-whitespace reasoning content.  The
+    /// index is stable across collapse/expand (the header is always the
+    /// first reasoning line; expansion only appends body lines *after* it),
+    /// so it can be cached alongside the rendered lines.
+    pub reasoning_header_idx: Option<usize>,
+}
+
 /// Render a complete Turn as styled lines suitable for the chat history.
 /// Each section (user, assistant, tool results) is wrapped in the margin
 /// pattern (top separator, padding, content, padding, bottom separator)
@@ -285,7 +297,7 @@ pub(crate) fn render_turn_lines(
     content_width: u16,
     tool_content_width: u16,
     reasoning_expanded: bool,
-) -> Vec<Line<'static>> {
+) -> RenderedTurnLines {
     let mut all_lines: Vec<Line<'static>> = Vec::new();
 
     // ── Error block ──────────────────────────────────────────
@@ -296,7 +308,10 @@ pub(crate) fn render_turn_lines(
             Style::default().fg(Color::Red),
         ))];
         all_lines.extend(lines);
-        return all_lines;
+        return RenderedTurnLines {
+            lines: all_lines,
+            reasoning_header_idx: None,
+        };
     }
 
     // ── User text block (green accent) ───────────────────────
@@ -318,6 +333,10 @@ pub(crate) fn render_turn_lines(
     // re-expand the thinking after the answer replaces it.  No "Response:"
     // heading is rendered.
     let has_assistant = turn.assistant_text.is_some() || turn.assistant_reasoning.is_some();
+    // Semantic-line index of the reasoning header within the final output.
+    // The header is always the first reasoning line, so the index is
+    // independent of the collapsed/expanded state.
+    let mut reasoning_header_idx: Option<usize> = None;
     if has_assistant {
         let mut body: Vec<Line<'static>> = Vec::new();
 
@@ -349,6 +368,11 @@ pub(crate) fn render_turn_lines(
                 body.push(Line::from(Span::styled(String::new(), Style::default())));
             }
             let arrow = if reasoning_expanded { "▼" } else { "▶" };
+            // Record the header's position *within the body* before pushing
+            // it; the final semantic index is resolved after margin wrapping
+            // (add_margin_lines prepends a separator + padding row to the
+            // body — half of MARGIN_STRUCTURAL_ROWS).
+            let header_idx_in_body = body.len();
             body.push(Line::from(vec![
                 Span::styled(format!("{arrow} "), Style::default().fg(Color::Gray)),
                 Span::styled("Reasoning", Style::default().fg(Color::Gray)),
@@ -356,6 +380,8 @@ pub(crate) fn render_turn_lines(
             if reasoning_expanded && let Some(ref reasoning) = turn.assistant_reasoning {
                 body.extend(markdown_lines(reasoning.trim(), content_width));
             }
+            reasoning_header_idx =
+                Some(all_lines.len() + MARGIN_STRUCTURAL_ROWS / 2 + header_idx_in_body);
         }
 
         // If we have content, wrap with margin lines (no timestamp).
@@ -446,7 +472,10 @@ pub(crate) fn render_turn_lines(
         all_lines.push(Line::from(Span::styled(String::new(), Style::default())));
     }
 
-    all_lines
+    RenderedTurnLines {
+        lines: all_lines,
+        reasoning_header_idx,
+    }
 }
 
 /// Whether a turn's reasoning section should be shown expanded by default.
@@ -465,21 +494,6 @@ pub(crate) fn reasoning_expanded_default(turn: &Turn) -> bool {
         .as_deref()
         .is_some_and(|t| !t.trim().is_empty());
     has_reasoning && !has_response
-}
-
-/// Find the semantic-line index of the collapsible reasoning header within a
-/// turn's rendered lines, if present.
-///
-/// The header is the line carrying the literal "Reasoning" label rendered in
-/// gray (see [`render_turn_lines`]).  Matching on the styled label rather
-/// than the arrow glyph keeps a body or response line that happens to start
-/// with an arrow character from being mistaken for the header.
-pub(crate) fn reasoning_header_line_index(lines: &[Line<'_>]) -> Option<usize> {
-    lines.iter().position(|line| {
-        line.spans
-            .iter()
-            .any(|span| span.style.fg == Some(Color::Gray) && span.content.as_ref() == "Reasoning")
-    })
 }
 
 // ── Margin helpers (reused from current render system) ─────────────────
@@ -1754,7 +1768,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false);
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
         assert!(!lines.is_empty());
         let text = lines
             .iter()
@@ -1778,7 +1792,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false);
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1802,7 +1816,7 @@ mod tests {
             displayed_images: vec![],
         };
         // Default state for a turn with a response: reasoning collapsed.
-        let lines = render_turn_lines(&turn, 80, 85, false);
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1847,7 +1861,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false);
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1887,7 +1901,7 @@ mod tests {
         };
         // User re-expanded the reasoning: the header points down and the
         // reasoning body appears BELOW the response.
-        let lines = render_turn_lines(&turn, 80, 85, true);
+        let lines = render_turn_lines(&turn, 80, 85, true).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1926,7 +1940,7 @@ mod tests {
             displayed_images: vec![],
         };
         // No response text: reasoning defaults to expanded.
-        let lines = render_turn_lines(&turn, 80, 85, true);
+        let lines = render_turn_lines(&turn, 80, 85, true).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1940,6 +1954,113 @@ mod tests {
         assert!(
             !text.contains("`code`"),
             "markdown inline code backticks should not appear literally"
+        );
+    }
+
+    // ── reasoning_header_idx ──
+
+    #[test]
+    fn render_turn_lines_reasoning_header_idx_points_at_header_line() {
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("hello".into()),
+            assistant_text: Some("response".into()),
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        // Turn with a response: reasoning collapsed by default.
+        let rendered = render_turn_lines(&turn, 80, 85, false);
+        let idx = rendered
+            .reasoning_header_idx
+            .expect("turn with reasoning must report a header index");
+        assert!(
+            idx < rendered.lines.len(),
+            "header index must be within the rendered lines"
+        );
+        let header_line = rendered.lines[idx].to_string();
+        assert!(
+            header_line.contains("▶ Reasoning"),
+            "line at the reported index should be the collapsed header: {header_line:?}"
+        );
+        // The header must sit below the response text.
+        let response_idx = rendered
+            .lines
+            .iter()
+            .position(|l| l.to_string().contains("response"))
+            .expect("response text should be rendered");
+        assert!(
+            response_idx < idx,
+            "response line ({response_idx}) should precede the header ({idx})"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_reasoning_header_idx_stable_across_expand_collapse() {
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("response".into()),
+            assistant_reasoning: Some("thinking".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let collapsed = render_turn_lines(&turn, 80, 85, false);
+        let expanded = render_turn_lines(&turn, 80, 85, true);
+        assert_eq!(
+            collapsed.reasoning_header_idx, expanded.reasoning_header_idx,
+            "the header index must not depend on the collapsed/expanded state"
+        );
+        assert!(collapsed.reasoning_header_idx.is_some());
+    }
+
+    #[test]
+    fn render_turn_lines_reasoning_header_idx_none_without_reasoning() {
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("response".into()),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let rendered = render_turn_lines(&turn, 80, 85, false);
+        assert!(
+            rendered.reasoning_header_idx.is_none(),
+            "no reasoning → no header index"
+        );
+    }
+
+    #[test]
+    fn render_turn_lines_reasoning_header_idx_none_for_whitespace_only_reasoning() {
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("response".into()),
+            assistant_reasoning: Some("   \n ".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let rendered = render_turn_lines(&turn, 80, 85, false);
+        assert!(
+            rendered.reasoning_header_idx.is_none(),
+            "whitespace-only reasoning is treated as absent"
         );
     }
 
@@ -1957,7 +2078,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false);
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -1994,7 +2115,7 @@ mod tests {
             displayed_images: vec![],
         };
         // No response text: reasoning defaults to expanded.
-        let lines = render_turn_lines(&turn, 80, 85, true);
+        let lines = render_turn_lines(&turn, 80, 85, true).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2086,7 +2207,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false);
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2118,7 +2239,7 @@ mod tests {
             }],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false);
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2152,7 +2273,7 @@ mod tests {
             }],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false);
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
@@ -2176,7 +2297,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false);
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].width(), 0);
     }
@@ -2195,7 +2316,7 @@ mod tests {
             tool_results: vec![],
             displayed_images: vec![],
         };
-        let lines = render_turn_lines(&turn, 80, 85, false);
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
         let text = lines
             .iter()
             .map(|l| l.to_string())
