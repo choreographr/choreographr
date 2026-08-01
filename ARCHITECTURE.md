@@ -408,7 +408,7 @@ Currently supports 70+ providers. Adding a new OpenAI-compatible provider requir
 
 | Protocol | Providers |
 |---|---|
-| OpenAI-compatible | OpenAI, DeepSeek, Mistral, xAI, Groq, Together AI, OpenRouter, Hugging Face, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, DashScope, Moonshot AI, Perplexity, Z.ai, Qwen Token Plan, Venice AI, Novita AI, LM Studio, Ollama (local/cloud), OpenCode Zen/Go, DeepInfra, Upstage, Nous, Arcee, GMI, StepFun, Zhipu, iFlytek, Inception, Meta, NEAR AI, OrcaRouter, Routstr, Sakana, SaladCloud, Scaleway, OVHcloud, Tensorix, FuturMix, EmpirioLabs, Friendli, aimlapi, GitLawb OpenGateway, KiloCode, Atomic Chat, OpenCode Codex, and custom OpenAI-compatible |
+| OpenAI-compatible | OpenAI, DeepSeek, Mistral, xAI, Groq, Together AI, OpenRouter, Hugging Face, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, Alibaba (Qwen), Moonshot AI, Perplexity, Z.ai, Qwen Token Plan, Venice AI, Novita AI, LM Studio, Ollama (local/cloud), OpenCode Zen/Go, DeepInfra, Upstage, Nous, Arcee, GMI, StepFun, Zhipu, iFlytek, Inception, Meta, NEAR AI, OrcaRouter, Routstr, Sakana, SaladCloud, Scaleway, OVHcloud, Tensorix, FuturMix, EmpirioLabs, Friendli, aimlapi, GitLawb OpenGateway, KiloCode, Atomic Chat, OpenCode Codex, and custom OpenAI-compatible |
 | Anthropic Messages | Anthropic Claude, MiniMax, Vercel AI Gateway, Kimi Code, Fireworks (Anthropic mode), OpenCode Go (Anthropic-compatible), custom Anthropic-compatible |
 | Google Generative AI | Google Gemini |
 

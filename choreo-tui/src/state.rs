@@ -104,10 +104,6 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
         display_name: "Custom OpenAI-Compatible",
     },
     ProviderInfo {
-        slug: "dashscope",
-        display_name: "DashScope (Alibaba)",
-    },
-    ProviderInfo {
         slug: "deepinfra",
         display_name: "DeepInfra",
     },
@@ -202,10 +198,6 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
     ProviderInfo {
         slug: "mistral",
         display_name: "Mistral",
-    },
-    ProviderInfo {
-        slug: "moonshot",
-        display_name: "Moonshot AI (Kimi)",
     },
     ProviderInfo {
         slug: "moonshotai",
@@ -330,10 +322,6 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
     ProviderInfo {
         slug: "xai",
         display_name: "xAI",
-    },
-    ProviderInfo {
-        slug: "xiaomi-mimo",
-        display_name: "Xiaomi MiMo",
     },
     ProviderInfo {
         slug: "xiaomi",
@@ -3366,10 +3354,9 @@ mod tests {
             "google",
             "mistral",
             "deepseek",
-            "dashscope",
             "perplexity",
-            "xiaomi-mimo",
-            "moonshot",
+            "xiaomi",
+            "moonshotai",
             "openai-codex",
             "kimi-code",
             "github-copilot",
