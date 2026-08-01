@@ -1,5 +1,5 @@
 use super::{ensure_parent_directories, validate_nonempty_path, write_text_file};
-use crate::tools::{ToolExecError, confine_path};
+use crate::tools::{ToolExecError, resolve_path};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{io, path::Path};
@@ -21,7 +21,7 @@ pub(crate) fn execute_write_file_tool(
     working_dir: Option<&Path>,
 ) -> Result<String, ToolExecError> {
     let path = validate_nonempty_path(&args.path)?;
-    let resolved = confine_path(&path, working_dir)?;
+    let resolved = resolve_path(&path, working_dir);
     ensure_parent_directories(&resolved, args.create_parents.unwrap_or(true))?;
 
     match write_text_file(&resolved, &args.content, args.overwrite.unwrap_or(true)) {

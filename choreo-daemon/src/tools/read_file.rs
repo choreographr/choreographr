@@ -1,6 +1,6 @@
 use super::{
-    MAX_TOOL_OUTPUT_BYTES, OutputBudget, TextStream, ToolExecError, confine_path, open_text_reader,
-    render_streamed_line,
+    MAX_TOOL_OUTPUT_BYTES, OutputBudget, TextStream, ToolExecError, open_text_reader,
+    render_streamed_line, resolve_path,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -22,7 +22,7 @@ pub(crate) fn execute_read_file_tool(
             "missing required string argument: path".to_string(),
         ));
     }
-    let resolved = confine_path(&args.path, working_dir)?;
+    let resolved = resolve_path(&args.path, working_dir);
 
     // Stream through a bounded reader (see `TextStream`): memory usage is
     // capped at one line plus the output budget, no matter how large the

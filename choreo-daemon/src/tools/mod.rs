@@ -959,67 +959,6 @@ pub(crate) fn resolve_path(
     }
 }
 
-/// Resolve a path relative to `working_dir` and verify it stays within
-/// the session's working directory boundary.
-///
-/// When `working_dir` is `None`, confinement is skipped and the path is
-/// returned as resolved by [`resolve_path`] (relative to the daemon's
-/// process working directory).
-pub(crate) fn confine_path(
-    path: &str,
-    working_dir: Option<&std::path::Path>,
-) -> Result<std::path::PathBuf, ToolExecError> {
-    let resolved = resolve_path(path, working_dir);
-    if let Some(wd) = working_dir {
-        let wd_canonical = wd.canonicalize().map_err(|e| {
-            ToolExecError(format!(
-                "cannot resolve session working directory '{}': {e}",
-                wd.display()
-            ))
-        })?;
-        // For paths that may not exist yet (e.g. a file about to be
-        // created by write_file), walk up to the nearest existing
-        // ancestor and canonicalize that for the confinement check.
-        let anchor = resolve_existing_ancestor(&resolved).map_err(|_| {
-            ToolExecError(format!(
-                "path '{}' has no existing ancestor within the filesystem",
-                resolved.display()
-            ))
-        })?;
-        let anchor_canonical = anchor.canonicalize().map_err(|e| {
-            ToolExecError(format!(
-                "cannot resolve path component '{}': {e}",
-                anchor.display()
-            ))
-        })?;
-        if !anchor_canonical.starts_with(&wd_canonical) {
-            return Err(ToolExecError(format!(
-                "path '{}' is outside the session working directory '{}'",
-                resolved.display(),
-                wd.display(),
-            )));
-        }
-    }
-    Ok(resolved)
-}
-
-/// Walk up from `path` until a component exists on disk, allowing
-/// confinement checks for paths that have not been created yet.
-fn resolve_existing_ancestor(path: &std::path::Path) -> std::io::Result<&std::path::Path> {
-    let mut p = path;
-    loop {
-        if p.exists() {
-            return Ok(p);
-        }
-        p = p.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no existing ancestor found for '{}'", path.display()),
-            )
-        })?;
-    }
-}
-
 pub(crate) fn sha256_hex(content: &str) -> String {
     let digest = Sha256::digest(content.as_bytes());
     hex::encode(digest)
@@ -1426,86 +1365,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn confine_path_within_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = confine_path("subdir", Some(dir.path()));
-        let expected = dir.path().join("subdir");
-        assert_eq!(result.unwrap(), expected);
-    }
-
-    #[test]
-    fn confine_path_nonexistent_file_within_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = confine_path("nonexistent/file.txt", Some(dir.path()));
-        let expected = dir.path().join("nonexistent/file.txt");
-        assert_eq!(result.unwrap(), expected);
-    }
-
-    #[test]
-    fn confine_path_outside_dir_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = confine_path("..", Some(dir.path()));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(err, ToolExecError(_)));
-    }
-
-    #[test]
-    fn confine_path_absolute_outside_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = confine_path("/etc/passwd", Some(dir.path()));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn confine_path_no_working_dir_returns_path() {
-        let result = confine_path("relative/path", None);
-        assert_eq!(result.unwrap(), Path::new("relative/path").to_path_buf());
-    }
-
-    #[test]
-    fn confine_path_absolute_no_working_dir() {
-        let result = confine_path("/tmp", None);
-        assert_eq!(result.unwrap(), Path::new("/tmp").to_path_buf());
-    }
-
-    #[test]
-    fn resolve_existing_ancestor_finds_root() {
-        let path = Path::new("/nonexistent_dir_12345/file.txt");
-        let ancestor = resolve_existing_ancestor(path).unwrap();
-        assert_eq!(ancestor, Path::new("/"));
-    }
-
-    #[test]
-    fn resolve_existing_ancestor_finds_existing_parent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("new_file.txt");
-        let ancestor = resolve_existing_ancestor(&path).unwrap();
-        assert_eq!(ancestor, dir.path());
-    }
-
-    #[test]
-    fn confine_path_deep_path_inside_dir_allowed() {
-        let dir = tempfile::tempdir().unwrap();
-        // only the workspace dir exists, not a/b/c
-        let result = confine_path("a/b/c/d/file.txt", Some(dir.path()));
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), dir.path().join("a/b/c/d/file.txt"));
-    }
-
-    #[test]
-    fn confine_path_symlink_escape_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
-        // Create a symlink inside the workspace that points outside
-        let link = dir.path().join("escape");
-        std::os::unix::fs::symlink(target.path(), &link).unwrap();
-        // Accessing a file through the symlink should be rejected
-        let result = confine_path("escape/outside.txt", Some(dir.path()));
-        assert!(result.is_err());
-    }
-
     // ── expand_tilde tests ────────────────────────────────────────────
 
     #[test]
@@ -1550,15 +1409,6 @@ mod tests {
     fn expand_tilde_mid_path_left_alone() {
         // Tilde not at the start is not expanded.
         assert_eq!(expand_tilde("/path/~foo"), "/path/~foo");
-    }
-
-    #[test]
-    fn resolve_existing_ancestor_errors_on_empty() {
-        // An obviously non-existent deeply nested path should walk up to root,
-        // which always exists on Unix, so it should succeed.
-        let path = Path::new("/tmp/__choreographr_test_nonexistent_dir_abcdefg/h/i/j/k/file.txt");
-        let ancestor = resolve_existing_ancestor(path).unwrap();
-        assert!(ancestor.exists());
     }
 
     // ── Tool trait default method tests ──────────────────────────────

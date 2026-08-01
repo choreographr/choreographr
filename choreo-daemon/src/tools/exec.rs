@@ -2,8 +2,7 @@ use super::{
     Tool, ToolExecError,
     context::ToolContext,
     shell_util::{
-        format_shell_output, resolve_and_confine, run_shell_streaming, setup_child,
-        spawn_with_watchdog,
+        format_shell_output, resolve_workdir, run_shell_streaming, setup_child, spawn_with_watchdog,
     },
 };
 use choreo_keystore::ServiceCredential;
@@ -86,7 +85,7 @@ impl Tool for Exec {
         let program = &args.command;
         let prog_args = &args.args;
         let timeout_ms = args.timeout.unwrap_or(30000);
-        let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
+        let resolved = resolve_workdir(args.workdir.as_deref(), working_dir);
 
         let mut cmd = std::process::Command::new(program);
         cmd.args(prog_args)
@@ -115,7 +114,7 @@ pub fn execute_exec_tool(
     let prog_args = &args.args;
     let timeout_ms = args.timeout.unwrap_or(30000);
 
-    let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
+    let resolved = resolve_workdir(args.workdir.as_deref(), working_dir);
 
     let mut cmd = std::process::Command::new(program);
     cmd.args(prog_args)

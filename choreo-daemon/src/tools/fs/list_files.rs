@@ -1,4 +1,4 @@
-use crate::tools::{ToolExecError, confine_path, truncate_tool_output};
+use crate::tools::{ToolExecError, resolve_path, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -14,7 +14,7 @@ pub(crate) fn execute_list_files_tool(
     working_dir: Option<&Path>,
 ) -> Result<String, ToolExecError> {
     let path = args.path.as_deref().unwrap_or(".");
-    let resolved = confine_path(path, working_dir)?;
+    let resolved = resolve_path(path, working_dir);
     let entries = std::fs::read_dir(&resolved)?;
     let mut names = Vec::new();
     for entry in entries {

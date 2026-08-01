@@ -16,12 +16,13 @@ pub(crate) fn binary_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve the working directory and enforce that it stays within the session working directory.
-pub(crate) fn resolve_and_confine(
-    workdir: Option<&str>,
-    working_dir: Option<&Path>,
-) -> Result<PathBuf, ToolExecError> {
-    super::confine_path(workdir.unwrap_or("."), working_dir)
+/// Resolve the working directory the child process should start in.
+///
+/// In-process path confinement was removed in favour of OS-level sandboxing
+/// (Landlock on Linux, Seatbelt on macOS), so this only resolves the directory
+/// — it no longer verifies that it stays inside the session working directory.
+pub(crate) fn resolve_workdir(workdir: Option<&str>, working_dir: Option<&Path>) -> PathBuf {
+    super::resolve_path(workdir.unwrap_or("."), working_dir)
 }
 
 /// Strip environment variables that could be used for code injection.

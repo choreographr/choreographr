@@ -950,7 +950,7 @@ full absolute path. The `~user` form is *not* expanded and is passed through unc
 lives in its own module (`tools/read_file.rs`, `tools/read_file_range.rs`); the shared
 streaming and binary-sniff helpers (`open_text_reader`, `TextStream`, `render_streamed_line`,
 `OutputBudget`, `read_line_capped`, `drain_rest_of_line`) live in `tools/mod.rs` alongside
-`confine_path` and `truncate_tool_output`. `TextStream` yields one capped line at a time
+`truncate_tool_output`. `TextStream` yields one capped line at a time
 with byte accounting; `render_streamed_line` validates and renders a single line (NUL /
 UTF-8 checks, CRLF normalization, truncation marker); `OutputBudget` enforces the shared
 byte cap across appended lines.
@@ -1722,7 +1722,7 @@ registered tools.
 
 `exec` spawns a program directly without shell interpretation. The command is split into argv (program + args array) and passed to `execvp` — no pipes, redirects, glob expansion, or environment variable interpolation.
 
-Sandboxing is identical to the shell tools: timeout, rlimits, env sanitization, path confinement, output truncation, and non-interactive stdin.
+Sandboxing is identical to the shell tools: timeout, rlimits, env sanitization, output truncation, and non-interactive stdin.
 
 Use `exec` when the command is a single program with explicit arguments. Prefer it over `sh` when you don't need shell features — it avoids shell-injection surface.
 
@@ -1738,11 +1738,15 @@ Sandboxing (shared across all shell/exec tools via `shell_util.rs`):
 
 3. **Environment sanitization** — dangerous env vars (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `LD_DEBUG`, `PYTHONPATH`, `PERL5LIB`, `RUBYLIB`, `DYLD_INSERT_LIBRARIES`) are stripped in the child before exec.
 
-4. **Path confinement** — the resolved working directory is canonicalized and must be at or below the session working directory. Absolute paths or `..` traversals that escape the project directory are rejected.
+4. **Output limits** — stdout/stderr are combined and truncated to 16 KB via `truncate_tool_output`, preventing context overflow.
 
-5. **Output limits** — stdout/stderr are combined and truncated to 16 KB via `truncate_tool_output`, preventing context overflow.
+5. **Non-interactive** — stdin is not connected. Commands that attempt to read from stdin will hang until the timeout.
 
-6. **Non-interactive** — stdin is not connected. Commands that attempt to read from stdin will hang until the timeout.
+In-process path confinement (`confine_path`) was removed in favour of OS-level sandboxing:
+the session working directory is the boundary enforced by [Landlock](https://landlock.io/)
+on Linux and [Seatbelt](https://theapplewiki.com/wiki/Dev:Seatbelt) on macOS (see README).
+Tools still resolve relative paths against the working directory, but the boundary check
+itself is the kernel's responsibility.
 
 ### `nushell` — nushell command execution with sandboxing
 

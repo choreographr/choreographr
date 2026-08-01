@@ -341,7 +341,11 @@ pub fn subdirectory_hints(
     known_paths: &[PathBuf],
 ) -> Option<(String, Vec<PathBuf>)> {
     let target_path = extract_tool_path(tool_name, arguments_json)?;
-    let resolved = crate::tools::confine_path(&target_path, working_dir).ok()?;
+    // Resolve the tool's target path against the session working directory.
+    // No in-process confinement check here — the OS-level sandbox (Landlock /
+    // Seatbelt) is the boundary; resolution simply determines where the hint
+    // walk should start.
+    let resolved = crate::tools::resolve_path(&target_path, working_dir);
     let parent = resolved.parent()?;
     let working_dir_canonical = working_dir
         .map(|p| p.to_path_buf())

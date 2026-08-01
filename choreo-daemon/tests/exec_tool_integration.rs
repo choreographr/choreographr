@@ -70,57 +70,6 @@ fn timeout_kills_command() {
 
 #[test]
 #[ignore]
-fn path_confinement_allows_subdirectory() {
-    let result = execute_exec_tool(
-        &ExecArgs {
-            command: "echo".into(),
-            args: vec!["ok".into()],
-            workdir: None,
-            timeout: None,
-        },
-        Some(Path::new("/tmp")),
-    );
-    assert!(result.is_ok(), "expected success: {:?}", result);
-}
-
-#[test]
-#[ignore]
-fn no_working_dir_skips_confinement() {
-    let result = execute_exec_tool(
-        &ExecArgs {
-            command: "echo".into(),
-            args: vec!["ok".into()],
-            workdir: None,
-            timeout: None,
-        },
-        None,
-    );
-    assert!(result.is_ok(), "expected success: {:?}", result);
-}
-
-#[test]
-#[ignore]
-fn path_confinement_rejects_escape() {
-    let result = execute_exec_tool(
-        &ExecArgs {
-            command: "echo escape".into(),
-            args: vec![],
-            workdir: Some("/etc".into()),
-            timeout: None,
-        },
-        Some(Path::new("/tmp")),
-    );
-    assert!(result.is_err(), "expected error: {:?}", result);
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("outside the session working directory"),
-        "{}",
-        err
-    );
-}
-
-#[test]
-#[ignore]
 fn output_truncation() {
     let result = execute_exec_tool(
         &ExecArgs {

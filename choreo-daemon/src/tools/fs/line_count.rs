@@ -1,4 +1,4 @@
-use crate::tools::{ToolExecError, confine_path};
+use crate::tools::{ToolExecError, resolve_path};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -18,7 +18,7 @@ pub(crate) fn execute_line_count_tool(
             "missing required string argument: path".to_string(),
         ));
     }
-    let resolved = confine_path(&args.path, working_dir)?;
+    let resolved = resolve_path(&args.path, working_dir);
     let content = std::fs::read_to_string(&resolved)?;
     let line_count = content.lines().count();
     Ok(format!("{}: {} lines", resolved.display(), line_count))

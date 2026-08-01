@@ -2,8 +2,7 @@ use super::{
     Tool, ToolExecError,
     context::ToolContext,
     shell_util::{
-        format_shell_output, resolve_and_confine, run_shell_streaming, setup_child,
-        spawn_with_watchdog,
+        format_shell_output, resolve_workdir, run_shell_streaming, setup_child, spawn_with_watchdog,
     },
 };
 use choreo_keystore::ServiceCredential;
@@ -76,7 +75,7 @@ impl Tool for NuShell {
     ) -> Result<Self::Return, Self::Error> {
         let command = &args.command;
         let timeout_ms = args.timeout.unwrap_or(30000);
-        let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
+        let resolved = resolve_workdir(args.workdir.as_deref(), working_dir);
 
         let mut cmd = std::process::Command::new("nu");
         cmd.args(["-c", command])
@@ -96,7 +95,7 @@ pub fn execute_nu_tool(args: &NuArgs, working_dir: Option<&Path>) -> Result<Stri
     let command = &args.command;
     let timeout_ms = args.timeout.unwrap_or(30000);
 
-    let resolved = resolve_and_confine(args.workdir.as_deref(), working_dir)?;
+    let resolved = resolve_workdir(args.workdir.as_deref(), working_dir);
 
     let mut cmd = std::process::Command::new("nu");
     cmd.args(["-c", command])

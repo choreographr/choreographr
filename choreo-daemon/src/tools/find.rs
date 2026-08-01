@@ -155,7 +155,7 @@ pub fn execute_find_tool(
     working_dir: Option<&Path>,
 ) -> Result<String, ToolExecError> {
     let path = args.path.as_deref().unwrap_or(".");
-    let resolved = super::confine_path(path, working_dir)?;
+    let resolved = super::resolve_path(path, working_dir);
     run_find_walk(
         &resolved,
         &args.pattern,
@@ -225,7 +225,7 @@ impl Tool for Find {
         _ctx: Option<&ToolContext>,
     ) -> Result<Self::Return, Self::Error> {
         let path = args.path.as_deref().unwrap_or(".");
-        let resolved = super::confine_path(path, working_dir)?;
+        let resolved = super::resolve_path(path, working_dir);
         run_find_walk(
             &resolved,
             &args.pattern,

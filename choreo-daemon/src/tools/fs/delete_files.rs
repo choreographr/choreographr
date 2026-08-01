@@ -1,5 +1,5 @@
 use crate::tools::glob_util::GlobFilter;
-use crate::tools::{ToolExecError, confine_path, truncate_tool_output};
+use crate::tools::{ToolExecError, resolve_path, truncate_tool_output};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -53,17 +53,17 @@ pub(crate) fn execute_delete_files_tool(
                     ToolExecError(format!("invalid glob pattern '{trimmed}': {e}"))
                 })?);
         } else {
-            // Literal paths are confined immediately, rejecting directory
-            // traversal attempts before any I/O occurs.
-            targets.push(confine_path(trimmed, working_dir)?);
+            // Literal paths are resolved against the session working directory.
+            // Boundary enforcement is the OS-level sandbox's job (Landlock on
+            // Linux, Seatbelt on macOS) — no in-process confinement here.
+            targets.push(resolve_path(trimmed, working_dir));
         }
     }
 
     // Expand glob patterns via a single directory walk anchored at the working dir.
     if !glob_patterns.is_empty() {
-        // Use confine_path for the walk root (rather than resolve_path) so the
-        // anchor itself is validated — defense-in-depth against misconfiguration.
-        let wd = confine_path(".", working_dir)?;
+        // Resolve the walk root against the session working directory.
+        let wd = resolve_path(".", working_dir);
 
         // WalkFlags::RECOMMENDED skips hidden files and respects .gitignore rules,
         // matching the behavior of find and grep tools. This prevents accidental
@@ -90,20 +90,11 @@ pub(crate) fn execute_delete_files_tool(
                 ToolExecError(format!("walk error: {e}"))
             })?;
 
-        // Confine each glob-expanded path — defense-in-depth. Although the walk
-        // is rooted in the working dir, a symlink-to-parent or bind-mount could
-        // cause the walker to visit paths outside it. We filter them here so a
-        // malicious or accidental symlink cannot escalate a glob beyond the
-        // session boundary.
-        for path in matched {
-            match confine_path(&path.to_string_lossy(), working_dir) {
-                Ok(confined) => targets.push(confined),
-                Err(e) => warn!(
-                    "skipping glob match '{}' — outside working directory: {e}",
-                    path.display()
-                ),
-            }
-        }
+        // Push each glob-expanded path directly.  Previously these were
+        // re-checked against the working directory boundary; with the move to
+        // OS-level sandboxing the walk result is taken as-is (the kernel
+        // enforces the boundary at access time).
+        targets.extend(matched);
     }
 
     // Deduplicate — a path matched by multiple patterns should appear once.
@@ -332,16 +323,21 @@ mod tests {
     }
 
     #[test]
-    fn delete_files_outside_working_dir_rejected() {
-        let dir = tempfile::TempDir::new().unwrap();
+    fn delete_files_relative_path_resolves_against_working_dir() {
+        // In-process path confinement was removed (the OS-level sandbox is now
+        // the boundary), so `..` paths resolve relative to the working dir and
+        // are no longer rejected here.
+        let base = tempfile::TempDir::new().unwrap();
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(base.path().join("outside.txt"), "").unwrap();
         let args = DeleteFilesArgs {
             targets: vec!["../outside.txt".into()],
             recursive: None,
         };
-        let result = super::execute_delete_files_tool(&args, Some(dir.path()));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.0.contains("outside the session working directory"));
+        let result = super::execute_delete_files_tool(&args, Some(&workspace)).unwrap();
+        assert!(result.contains("Deleted 1 item(s)"), "{}", result);
+        assert!(!base.path().join("outside.txt").exists());
     }
 
     #[test]

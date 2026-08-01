@@ -1,5 +1,5 @@
 use super::{validate_nonempty_path, write_text_file};
-use crate::tools::{ToolExecError, confine_path, sha256_hex};
+use crate::tools::{ToolExecError, resolve_path, sha256_hex};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -38,7 +38,7 @@ pub(crate) fn execute_edit_file_tool(
         ));
     }
 
-    let resolved = confine_path(&path, working_dir)?;
+    let resolved = resolve_path(&path, working_dir);
     let original_content = std::fs::read_to_string(&resolved)?;
 
     if let Some(expected_sha256) = args.expected_sha256.as_deref() {
