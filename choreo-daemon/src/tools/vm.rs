@@ -885,7 +885,9 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
             "--target",
             target,
             "-C",
-            "opt-level=z",
+            "opt-level=2",
+            "-C",
+            "target-feature=+b",
             "--edition",
             "2024",
             "--color",
@@ -967,6 +969,18 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
 /// means the tool follows automatically if the dependency is ever upgraded.
 const DEFAULT_VM_MEMORY: usize = ckb_vm::RISCV_MAX_MEMORY;
 
+/// Default cycle budget for the VM.
+///
+/// 10M gives ~10x headroom over the previous 1M default, which was too
+/// small in practice: real guest workloads (git-pull reports, large tool
+/// outputs) routinely needed 700K-1.7M cycles, and line-heavy responses
+/// pushed past 5M.  A spinning `loop {}` still trips the cap in roughly a
+/// second of wall clock (the interpreter is the bottleneck), so 10M keeps
+/// runaway guests bounded while leaving room for legitimate I/O-heavy
+/// programs.  Kept as a constant so the machine constructor, the
+/// invocation description, and the schema text all agree on the default.
+const DEFAULT_MAX_CYCLES: u64 = 10_000_000;
+
 /// Compute heap bounds for a guest VM with the given `memory_size`.
 ///
 /// The heap sits between a fixed 256 KB offset and a 64 KB guard below
@@ -1026,8 +1040,9 @@ fn run_riscv_impl(
     let compile_source: Option<&str> = formatted_source.as_deref().or(input.source.as_deref());
 
     let target = "riscv64imac-unknown-none-elf";
-    let compile_cmd =
-        format!("rustc +stable --target {target} -C opt-level=z --edition 2024 --color always");
+    let compile_cmd = format!(
+        "rustc +stable --target {target} -C opt-level=2 -C target-feature=+b --edition 2024 --color always"
+    );
 
     let elf = match (
         compile_source,
@@ -1093,7 +1108,7 @@ fn run_riscv_impl(
     let core = DefaultCoreMachine::<u64, FlatMemory<u64>>::new_with_memory(
         ISA_IMC | ISA_A | ISA_B | ISA_MOP,
         VERSION2,
-        input.max_cycles.unwrap_or(1_000_000),
+        input.max_cycles.unwrap_or(DEFAULT_MAX_CYCLES),
         memory_size,
     );
 
@@ -1133,7 +1148,7 @@ fn run_riscv_impl(
 
     info!(
         memory_size,
-        max_cycles = input.max_cycles.unwrap_or(1_000_000),
+        max_cycles = input.max_cycles.unwrap_or(DEFAULT_MAX_CYCLES),
         "starting VM"
     );
 
@@ -1228,7 +1243,7 @@ impl Tool for RunRiscV {
                 parts.push(String::from("\nAllocator: included."));
                 parts.push(format!(
                     "\nMax cycles: {}.",
-                    args.max_cycles.unwrap_or(1_000_000)
+                    args.max_cycles.unwrap_or(DEFAULT_MAX_CYCLES)
                 ));
                 parts.push(format!(
                     "\nMemory: {} bytes.",
@@ -1274,7 +1289,7 @@ impl Tool for RunRiscV {
 
                 "max_cycles": {
                     "type": "integer",
-                    "description": "Maximum CPU cycles before VM termination (default: 1_000_000)"
+                    "description": &format!("Maximum CPU cycles before VM termination (default: {})", DEFAULT_MAX_CYCLES)
                 },
                 "memory_size": {
                     "type": "integer",
@@ -1653,6 +1668,35 @@ mod tests {
         // and the schema/description text can be updated in the same change.
         assert_eq!(ckb_vm::RISCV_MAX_MEMORY, 4 * 1024 * 1024);
         assert_eq!(DEFAULT_VM_MEMORY, ckb_vm::RISCV_MAX_MEMORY);
+    }
+
+    #[test]
+    fn vm_default_max_cycles_is_pinned() {
+        // Pin the default cycle budget so a deliberate change is a visible
+        // one-line edit plus this test update, and the schema/description
+        // drift test below cannot silently pass against an unintended value.
+        assert_eq!(DEFAULT_MAX_CYCLES, 10_000_000);
+    }
+
+    #[test]
+    fn vm_schema_and_invocation_document_default_max_cycles() {
+        // The machine constructor, describe_invocation, and the JSON schema
+        // must all agree on the default max_cycles — this is what the model
+        // sees when deciding whether to pass max_cycles explicitly.
+        let tool = RunRiscV::new(Weak::new());
+        let schema = tool.schema();
+        let desc = schema["properties"]["max_cycles"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        let expected = format!("default: {DEFAULT_MAX_CYCLES}");
+        assert!(desc.contains(&expected), "schema max_cycles: {desc}");
+
+        let inv = tool.describe_invocation(&RunRiscVInput {
+            source: Some("fn main() {}".to_string()),
+            ..Default::default()
+        });
+        let expected_inv = format!("Max cycles: {DEFAULT_MAX_CYCLES}.");
+        assert!(inv.contains(&expected_inv), "invocation: {inv}");
     }
 
     #[test]

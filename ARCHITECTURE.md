@@ -1691,8 +1691,11 @@ to the guest syscall handler.
     `#![no_std]` boilerplate (panic handler, entry point, `Choreographr` module with
      `tool_call`, `write`, `exit` syscall wrappers, dynamically-sized linked-list allocator)
     and compiled via a single
-    `rustc +stable --target riscv64imac-unknown-none-elf` invocation in a temp
-   directory.
+    `rustc +stable --target riscv64imac-unknown-none-elf -C opt-level=2 -C target-feature=+b` invocation in a temp
+   directory.  `opt-level=2` measurably reduces interpreter cycles
+    versus the previous `-C opt-level=z` (≈8% in benchmarks), and `+b` lets LLVM emit
+    RISC-V Bitmanip instructions (`cpop`, `clz`, `ctz`, `rev8`, …) that ckb-vm's `ISA_B`
+    fully implements — harmless when unused, faster for bit-manip-heavy guests.
 3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory
    (the default and the maximum — ckb-vm 0.24.14 hard-codes `RISCV_MAX_MEMORY = 4 << 20`
    in `ckb-vm-definitions`. `FlatMemory::new_with_memory` asserts on it and every memory
@@ -1702,7 +1705,11 @@ to the guest syscall handler.
    instead of a panic inside the dependency. Raising the cap to 16MB requires a newer
    ckb-vm release — upstream `develop` has removed the cap, but nothing newer than
    0.24.14 is published; the `DEFAULT_VM_MEMORY` constant and schema text are derived
-   from the upstream constant so they follow automatically on upgrade).
+   from the upstream constant so they follow automatically on upgrade).  The default
+    cycle budget is 10M (`DEFAULT_MAX_CYCLES`, configurable via `max_cycles`) — a ~10x
+    bump over the original 1M, which real I/O-heavy guests (large tool outputs, line-heavy
+    reports) routinely exhausted; a spinning `loop {}` still trips the cap in roughly a
+    second of wall clock.
 4. Registers a `ChoreographrSyscall` handler that intercepts three guest syscalls:
    - **Syscall #0 (TOOL_CALL)** — reads a postcard-encoded frame `[tool_name: String][args: bytes]`
      from guest memory, dispatches it via the `ToolRegistry::execute_dyn()`, and writes the

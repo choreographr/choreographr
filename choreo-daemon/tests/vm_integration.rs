@@ -174,6 +174,48 @@ fn memory_size_at_cap_passes_validation() {
 
 #[test]
 #[ignore]
+fn bitmanip_source_program() {
+    // The daemon compiles `source` guests with -C opt-level=2 -C target-feature=+b.
+    // The arg is runtime data (defeating const folding), so LLVM must emit real
+    // bitmanip instructions — `count_ones` -> cpop, `leading_zeros` -> clz,
+    // `trailing_zeros` -> ctz, `swap_bytes` -> rev8 (verified via objdump: all
+    // four appear only in the +b build). Correct results prove ckb-vm decodes
+    // and executes the B-extension instructions.
+    let result = execute_run_riscv_tool(
+        &RunRiscVInput {
+            source: Some(
+                "fn main() {
+                    let raw = choreo::args();
+                    let s = String::from_utf8_lossy(&raw[0]).to_string();
+                    let n: u64 = s.parse().unwrap_or(0);
+                    // 0x0F0F_0F0F_0000_0000 — runtime value, not const-foldable.
+                    let a = n << 32;
+                    let out = format!(
+                        \"cpop={} clz={} ctz={} rev8={:016x}\",
+                        a.count_ones(),
+                        a.leading_zeros(),
+                        a.trailing_zeros(),
+                        a.swap_bytes(),
+                    );
+                    choreo::write(out.as_bytes());
+                }"
+                .to_string(),
+            ),
+            args: Some(vec!["252645135".to_string()]), // 0x0F0F_0F0F
+            ..Default::default()
+        },
+        Some(Path::new("/tmp")),
+    );
+    let content = result.unwrap_or_default();
+    assert!(
+        content.contains("cpop=16 clz=4 ctz=32 rev8=000000000f0f0f0f"),
+        "{}",
+        content
+    );
+}
+
+#[test]
+#[ignore]
 fn invalid_base64_program() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
