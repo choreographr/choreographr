@@ -4,30 +4,30 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="Apache 2.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2024_edition-orange" alt="Rust 2024"></a>
   <img src="https://img.shields.io/badge/providers-30+-brightgreen" alt="30+ providers">
-  <img src="https://img.shields.io/badge/wire_protocols-4-lightgrey" alt="4 wire protocols">
+  <img src="https://img.shields.io/badge/wire_protocols-3-lightgrey" alt="3 wire protocols">
 </p>
 
 ## What is Choreographr?
 
-Choreographr is a local-first AI agent daemon written entirely in Rust — a server-side engine that runs agent sessions, with 30+ LLM providers across four wire protocols, real tools, encrypted credentials, and a sandboxed RISC-V VM, fronted by clients that can connect and disconnect at any time.
+Choreographr is a local-first AI agent daemon written entirely in Rust — a server-side engine that runs agent sessions, with 30+ LLM providers across three wire protocols, real tools, encrypted credentials, and a sandboxed RISC-V VM, fronted by clients that can connect and disconnect at any time.
 
 ### General Purpose
 
-Choreographr is a general purpose agent. It can be used for software development, a personal / business agent, or as a reseach tool. It can run on your desktop or in the cloud.
+Choreographr is a general purpose agent. It can be used for software development, a personal / business agent, or as a research tool. It can run on your desktop or in the cloud.
 
 ### Client / Server Architecture
 
 Choreographr was designed from the beginning to have a separation of concerns between the server software that actually runs the sessions and the clients that can connect and disconnect any time.
 
-The client can either run on the same computer as the server agent (via local socket), or the server can be anywhere else on your local network or the Internet. When not connecting locally the client connects to the server via [Noise-IK](https://en.wikipedia.org/wiki/Noise_Protocol_Framework) encrypted TCP connection.
+The client can either run on the same computer as the server agent (via local socket), or the server can be anywhere else on your local network or the Internet. When not connecting locally the client connects to the server via [Noise-IK](https://en.wikipedia.org/wiki/Noise_Protocol_Framework) encrypted TCP connection. Because the server can live anywhere and is reachable over encrypted TCP, it can also be accessed from mobile devices — for example, chatting with your agent on the go via the `choreo-im` Telegram bridge.
 
 Client/server communication is currently encoded via [Postcard](https://postcard.jamesmunns.com/), but this will probably be changed in future to a self-describing binary format with broader language support.
 
 Currently the primary client is **`choreo-tui`** - a fullscreen terminal UI.
 
-Other client being developed: 
+Other clients being developed: 
 
-- **`choreo-gui`** — GUI built with [Dioxus](https://dioxuslabs.com/) - just a placeholder for now, it will support Linux, MacOS, Windows, Android and iOS.
+- **`choreo-gui`** — GUI built with [Dioxus](https://dioxuslabs.com/) - just a placeholder for now, it will support Linux, macOS, Windows, Android and iOS.
 - **`choreo-im`** — instant-messaging bridge (Telegram, more platforms coming) - chat with your agent on the go!
 - **`choreo-acp`** — ACP bridge so ACP-compatible editors (Claude Code, Cline, …) can drive Choreographr sessions over JSON-RPC.
 - **`choreo-daemon`** — Choreographr servers will be able to connect to other servers to deploy work elsewhere.
@@ -36,7 +36,7 @@ Other client being developed:
 
 The LLM can invoke the RISC-V VM (powered by [CKB VM](https://github.com/nervosnetwork/ckb-vm)) by either providing a Rust snippet, or pre-compiled bytecode. Other languages will be supported in future.
 
-The VM has full access to the agent's tool calls. The LLM can quickly write a Rust script for a complex task and hand it off the the VM for high-performance execution.
+The VM has full access to the agent's tool calls. The LLM can quickly write a Rust script for a complex task and hand it off to the VM for high-performance execution.
 
 
 ### Multiple live sessions
@@ -55,24 +55,30 @@ In Choreographr, the LLM or VM can start new sessions that will report back once
 
 ### Session database
 
-Each session has a persistent key/value store. The LLM / VM can store data and retreive it at a later time.
+Each session has a persistent key/value store. The LLM / VM can store data and retrieve it at a later time.
 
 ### High performance Multithreaded Architecture
 
-Currently the codebase doesn't use any async code - this red. It uses real kernel threads with event loops and message passing. Mutable state is not shared between threads (except for the message passing). Everything is event driven without polling.
+Currently the codebase doesn't use any async code - this reduces the complexity of the codebase significantly. It uses real kernel threads with event loops and message passing. Mutable state is not shared between threads (except for the message passing). Everything is event driven without polling.
 
 Extensions may require tokio to use certain crates.
 
 choreo-tui is entirely event driven, and runs in immediate mode. The terminal is updated immediately upon receiving a keystroke or networking event. There is no maximum framerate. Additionally, it has O(1) scrolling and O(1) streaming. It is ultra-smooth!
 
-### Encryped Keystore
+### Encrypted Keystore
 
+Credentials are encrypted per-credential with ECDH (X25519) + HKDF +
+AES-256-GCM before being stored in the `redb` database, so only the holder
+of the daemon's private key can decrypt them. Identity keys live in
+`~/.config/choreographr/` — `identity.pk` (private), `public.pk` (public),
+and optionally `identity.pk.enc` (passphrase-encrypted). The daemon starts
+locked and only decrypts credentials into memory after `/unlock`.
 
 ### Maximum model compatibility
 
 Currently Choreographr supports the following model APIs:
 
-- **Open AI**
+- **OpenAI**
     1. Chat Completions - used by almost all model providers
     2. Responses - including [programmatic tool calling](https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling) (gpt-5.6+ models)
 - **Anthropic**
@@ -93,23 +99,23 @@ Other major APIs will be supported in future:
 
 ### Extensions
 
-Extensions communicate with the choreograhr server via a local socket. They will be able to hook into the operation of the server, for example to expose new tool calls. Similar to MCP (also supported). There will be a blockchain extensions that enable reading and writing to EVM / Solana / Polkadot blockchains.
+Extensions communicate with the choreographr server via a local socket. They will be able to hook into the operation of the server, for example to expose new tool calls. Similar to MCP (also supported). There will be blockchain extensions that enable reading and writing to EVM / Solana / Polkadot blockchains.
 
 
-## Stored VM programs
+### Stored VM programs
 
-Once the tool call ABI has stablized, it will be possible for compiled Rust programs to be stored and executed when necessary.
+Once the tool call ABI has stabilized, it will be possible for compiled Rust programs to be stored and executed when necessary.
 
-## Cron
+### Cron
 
-Programs will be able to run automatially at designated times.
+Programs will be able to run automatically at designated times.
 
 
 ### Sandboxing
 
 With the agent able to run anything via the shell, there needs to be a robust sandboxing solution.
 
-On Linux, [Landlock](https://landlock.io/) will be used. On MacOS, [Seatbelt](https://theapplewiki.com/wiki/Dev:Seatbelt).
+On Linux, [Landlock](https://landlock.io/) will be used. On macOS, [Seatbelt](https://theapplewiki.com/wiki/Dev:Seatbelt).
 Windows does not have a good solution for this yet.
 
 
@@ -119,7 +125,7 @@ Currently, as with most AI agents, if the LLM wants to see a file it issues the 
 
 ### Git Worktree Support
 
-To get the most out of subsessions, they need to run in parallel on the same codebase. The problem is that they will interfere with each other's work. The solution is for each subsession to work on its own branch in its own directory. This is where [Git Worktrees](https://git-scm.com/docs/git-worktree) come in. Once a subsession has finished commiting in its own branch, the parent session can merge it into its own branch. Any merge conflicts can be resolved by the LLM.
+To get the most out of subsessions, they need to run in parallel on the same codebase. The problem is that they will interfere with each other's work. The solution is for each subsession to work on its own branch in its own directory. This is where [Git Worktrees](https://git-scm.com/docs/git-worktree) come in. Once a subsession has finished committing in its own branch, the parent session can merge it into its own branch. Any merge conflicts can be resolved by the LLM.
 
 The problem with worktrees is that programming languages such as Rust can have many gigabytes of build artifacts. If each worktree has to regenerate these it consumes CPU bandwidth, I/O bandwidth, storage space and is generally very slow. Copying the artifacts from the parent's tree reduces the CPU bandwidth, but is still a big problem.
 
@@ -136,18 +142,18 @@ Choreographr will have an option to automate this process, so it can be left alo
 | Feature | Choreo | zero | goose | pi | opencode | hermes | turnstone | openclaw | buzz | OpenMinis | langgraph | tau | mercury | openwork | t3code | herdr |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Daemon + multi-client | ✅ | — | server | — | — | — | server | ✅ | ✅ | — | — | — | — | ✅ | ✅ | — |
-| Providers | ~30/4 proto | 36 | 35+ | 38/9 proto | 15 | 29+ | 5 | 40+ | agnostic | 8 | agnostic | 9 | 11 | agnostic | 5 | n/a |
+| Providers | ~30/3 proto | 36 | 35+ | 38/9 proto | 15 | 29+ | 5 | 40+ | agnostic | 8 | agnostic | 9 | 11 | agnostic | 5 | n/a |
 | OAuth | — | ✅ | — | ✅ | ✅ | ✅ 6× | ✅ MCP | ✅ | — | ✅ | — | ✅ | ✅ | ✅ | — | — |
 | Credential rotation/fallback | retry only | — | — | — | — | ✅ pool | ✅ | ✅ failover | — | ✅ fallback | — | — | ✅ | — | — | — |
-| Tool permission gating | **—** | ✅ | ✅ | ✅ | ✅ | env-only | ✅ judge | ✅ | — | ✅ | — | — | — | — | — | — |
-| Compaction | **—** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | — | — | — | — | — |
+| Tool permission gating | — | ✅ | ✅ | ✅ | ✅ | env-only | ✅ judge | ✅ | — | ✅ | — | — | — | — | — | — |
+| Compaction | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | — | — | — | — | — |
 | Sandbox | RISC-V VM | seccomp eng. | — | — | — | Docker/SSH | OpenShell | Docker/SSH | — | iSH/PRoot | — | — | — | worker | — | — |
 | Subagents | subsessions | specialists | — | — | — | delegation | workstreams | swarm | agent pool | — | subgraphs | — | — | — | multi-agent | — |
 | Skills (SKILL.md) | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | ✅ | — | — |
 | MCP client | ✅ | ✅ | ✅ | — | ✅ | — | ✅ (OAuth) | ✅ | ✅ | ✅ | — | — | — | ✅ meta | — | — |
 | ACP | bridge | — | server | — | — | — | — | bridge | harness | — | — | — | — | — | — | — |
 | IM surfaces | Telegram | — | — | — | — | 20+ | 2 | 25+ | chat natively | — | — | — | — | — | — | — |
-| Web search | **—** | ✅ | — | — | ✅ | ✅ | ✅ | ✅ | — | — | — | — | — | — | — | — |
+| Web search | — | ✅ | — | — | ✅ | ✅ | ✅ | ✅ | — | — | — | — | — | — | — | — |
 | Hooks/lifecycle | — | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ | — | — | — | — | — | — | — |
 | Plugins | — | ✅ | — | ✅ | ✅ | ✅ | — | ✅ | — | — | — | — | — | ✅ | — | — |
 | Encrypted creds | ✅ unique | ✅ | ✅ keyring | — | — | — | ✅ Fernet | ✅ | NIP auth | ✅ keychain | — | 0600 | — | ✅ | ✅ | — |
@@ -162,30 +168,31 @@ Choreographr will have an option to automate this process, so it can be left alo
 Requires a [Rust toolchain](https://rustup.rs/).
 
 ```bash
-cargo build
+cargo build --release
 ```
 
 Start the daemon:
 
 ```bash
-cargo run -p choreo-daemon          # default log level: info
-cargo run -p choreo-daemon -- -v    # debug
-cargo run -p choreo-daemon -- -vv   # trace
-cargo run -p choreo-daemon -- -q    # warnings only
+cargo run --release -p choreo-daemon         # default log level: info
+cargo run --release -p choreo-daemon -- -v   # debug
+cargo run --release -p choreo-daemon -- -vv  # trace
+cargo run --release -p choreo-daemon -- -q   # warnings only
 ```
 
 `RUST_LOG` takes precedence over the CLI flags:
 
 ```bash
-RUST_LOG=debug cargo run -p choreo-daemon
+RUST_LOG=debug cargo run --release -p choreo-daemon
 ```
 
 Then a client:
 
 ```bash
-cargo run -p choreo-tui     # terminal UI
-cargo run -p choreo-gui     # desktop app
-cargo run -p choreo-im      # IM bridge
+cargo run --release -p choreo-tui     # terminal UI
+cargo run --release -p choreo-gui     # desktop app
+cargo run --release -p choreo-im      # IM bridge
+cargo run --release -p choreo-acp     # ACP bridge for editors
 ```
 
 ### First conversation
@@ -203,18 +210,26 @@ cargo run -p choreo-im      # IM bridge
 ├──────────────┤                     │              │◄──────────────►│  Anthropic Messages│
 │  choreo-gui  │◄───────────────────►│ choreographr │                ├────────────────────┤
 │  (desktop)   │   Noise-IK TCP      │  (daemon)    │◄──────────────►│  Google Gemini     │
-├──────────────┤                     │              │                ├────────────────────┤
-│  choreo-im   │◄───────────────────►│              │◄──────────────►│  Mistral           │
-│  (IM bridge) │                     │              │                └────────────────────┘
+├──────────────┤                     │              │                └────────────────────┘
+│  choreo-im   │◄───────────────────►│              │
+│  (IM bridge) │                     │              │
 ├──────────────┤                     │              │
 │ choreo-acp   │◄───────────────────►│              │   MCP subprocess servers
 │  (ACP bridge)│                     └──────────────┘   RISC-V VM sandbox
 └──────────────┘                                        redb database
 ```
 
+Mistral and the other OpenAI-compatible providers (Ollama, Groq, DeepSeek,
+OpenRouter, …) speak the OpenAI wire protocol; Anthropic Messages and Google
+Gemini each have their own format.
+
 ## Crates
 
 A Rust workspace of eleven crates (resolver = "3"):
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the daemon's
+internals — threading model, provider architecture, tool system, and session
+data model.
 
 | Crate | Description |
 |---|---|
@@ -292,6 +307,10 @@ and stored in the `redb` database. Identity keys reside in
 The socket path defaults to `/tmp/Choreographr.sock` (override with
 `CHOREOGRAPHR_SOCKET_PATH`). The database path defaults to
 `~/.local/share/choreographr/state.redb` (override with `CHOREOGRAPHR_DB_PATH`).
+
+`CHOREOGRAPHR_MAX_TURNS` overrides the `max_turns` setting from `config.toml`
+(resolution chain: per-session `max_turns` → `CHOREOGRAPHR_MAX_TURNS` →
+`config.toml` → default 25; `0` = unlimited).
 
 ### Accounts
 
@@ -372,6 +391,7 @@ In `choreo-tui`:
 
 - `/ping` — health check
 - `/models` — list and select models
+- `/model` — alias for `/models`
 - `/session` — show current session info
 - `/session list` — list all sessions
 - `/session new [title]` — create a new session
@@ -420,7 +440,7 @@ stored credential blobs into memory.
 The daemon can expose an OpenMetrics (Prometheus) endpoint:
 
 ```bash
-cargo run -p choreo-daemon -- --metrics-addr 127.0.0.1:9464
+cargo run --release -p choreo-daemon -- --metrics-addr 127.0.0.1:9464
 ```
 
 When `--metrics-addr` is provided, a dedicated HTTP thread serves `GET /metrics`
@@ -437,6 +457,13 @@ cargo test -- --ignored     # integration tests
 cargo clippy --workspace    # lints
 cargo fmt --all             # formatting
 ```
+
+## Troubleshooting
+
+- `choreo-tui` writes its diagnostics to `/tmp/choreo-tui.log` — check there
+  for client-side issues.
+- The daemon logs to stderr; use `-v`/`-vv` for more detail, or set
+  `RUST_LOG`.
 
 ## License
 
