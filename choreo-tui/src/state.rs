@@ -27,9 +27,9 @@ pub(crate) const MAX_INPUT_CONTENT_LINES: u16 = 10;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
 pub(crate) const CTRL_HELP_LINE1: &str =
-    "ctrl+h help  ctrl+q quit  ctrl+a accounts  ctrl+s sessions  ctrl+r reasoning";
+    "ctrl+h help  ctrl+q quit  ctrl+a accounts  ctrl+s sessions  ctrl+m models";
 pub(crate) const CTRL_HELP_LINE2: &str =
-    "esc stop  alt+enter continue  ctrl+up undo  ctrl+down redo";
+    "esc stop  alt+enter continue  ctrl+up undo  ctrl+down redo  ctrl+r reasoning";
 
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
 
@@ -512,6 +512,193 @@ impl Default for SessionDisplayState {
     }
 }
 
+/// State for the model-selector popup (Chat page, Ctrl+M).
+///
+/// The selector lists the models available on the attached session's account
+/// (fetched from the daemon via `ClientMessage::ListModels`) and lets the user
+/// pick one with the keyboard.  The filter is a plain case-insensitive
+/// substring match over model IDs — no fuzzy matching.  The currently active
+/// model is highlighted with a `●` marker so the user can see where they are
+/// before committing.
+pub(crate) struct ModelSelectorState {
+    /// Whether the popup is currently visible.
+    pub(crate) open: bool,
+    /// True between `open()` and the arrival of the `Models`/`ModelsFailed`
+    /// reply; the popup shows a "loading" row instead of the list.
+    pub(crate) loading: bool,
+    /// All models for the attached session's account, in daemon order.
+    pub(crate) all_models: Vec<String>,
+    /// The currently active model (marked with `●`), if known.
+    pub(crate) selected: Option<String>,
+    /// Filter text; reuses `InputBuffer` so editing is grapheme-aware and
+    /// consistent with the main command input.
+    pub(crate) filter: InputBuffer,
+    /// Index into the *filtered* list of the highlighted row.
+    pub(crate) focused: usize,
+    /// First row of the visible window into the filtered list.
+    pub(crate) scroll: usize,
+    /// Popup-scoped error text (e.g. the daemon failed to list models).
+    pub(crate) error: Option<String>,
+}
+
+impl ModelSelectorState {
+    pub(crate) fn new() -> Self {
+        Self {
+            open: false,
+            loading: false,
+            all_models: Vec::new(),
+            selected: None,
+            filter: InputBuffer::new(),
+            focused: 0,
+            scroll: 0,
+            error: None,
+        }
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Open the selector and request a fresh model list.
+    ///
+    /// The caller is responsible for sending `ClientMessage::ListModels`;
+    /// `loading` stays true until `apply_models` or `apply_error` arrives.
+    /// The previous filter/focus is discarded so each opening starts clean.
+    pub(crate) fn open(&mut self) {
+        self.open = true;
+        self.loading = true;
+        self.error = None;
+        self.filter.clear();
+        self.focused = 0;
+        self.scroll = 0;
+    }
+
+    /// Dismiss the popup.  Keeps `all_models` so a re-open shows results
+    /// immediately while the fresh `ListModels` reply is in flight.
+    pub(crate) fn close(&mut self) {
+        self.open = false;
+        self.loading = false;
+        self.error = None;
+    }
+
+    /// Populate the model list from a `Models` reply and preselect the
+    /// current model.  `selected` falls back to `None` when the daemon does
+    /// not report one; the caller may pass the display's cached value.
+    pub(crate) fn apply_models(&mut self, models: Vec<String>, selected: Option<String>) {
+        self.all_models = models;
+        self.selected = selected;
+        self.loading = false;
+        self.error = None;
+        // Preselect the active model when it survives the current filter;
+        // otherwise the highlight stays at the top of the list.
+        if let Some(sel) = &self.selected
+            && let Some(idx) = self.filtered().iter().position(|m| m == sel)
+        {
+            self.focused = idx;
+            self.scroll = idx;
+        }
+        self.clamp_focus();
+    }
+
+    /// Record a `ModelsFailed` reply so the popup can show the error inline.
+    pub(crate) fn apply_error(&mut self, error: impl Into<String>) {
+        self.loading = false;
+        self.error = Some(error.into());
+    }
+
+    /// Models matching the current filter (case-insensitive substring).
+    /// Borrows from `all_models`; an empty query returns every model.
+    pub(crate) fn filtered(&self) -> Vec<&str> {
+        let needle = self.filter.text.to_lowercase();
+        if needle.is_empty() {
+            return self.all_models.iter().map(String::as_str).collect();
+        }
+        self.all_models
+            .iter()
+            .filter(|m| m.to_lowercase().contains(&needle))
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Clamp `focused` and `scroll` against the filtered list length.
+    /// Called after every filter mutation so the highlight never points
+    /// past the end of a narrowed list.
+    fn clamp_focus(&mut self) {
+        let len = self.filtered().len();
+        if len == 0 {
+            self.focused = 0;
+            self.scroll = 0;
+            return;
+        }
+        if self.focused >= len {
+            self.focused = len - 1;
+        }
+        self.scroll = self.scroll.min(len - 1);
+    }
+
+    pub(crate) fn move_up(&mut self) {
+        if self.focused > 0 {
+            self.focused -= 1;
+        }
+    }
+
+    pub(crate) fn move_down(&mut self) {
+        let len = self.filtered().len();
+        if len > 0 && self.focused + 1 < len {
+            self.focused += 1;
+        }
+    }
+
+    /// Route a key to the filter input and re-clamp focus against the
+    /// narrowed/expanded filtered list.  Returns whether the key was
+    /// consumed (Enter/Esc are handled by the modal event handler instead).
+    pub(crate) fn filter_key(&mut self, key: KeyEvent) -> bool {
+        let consumed = self.filter.handle_key(key);
+        if consumed {
+            self.clamp_focus();
+        }
+        consumed
+    }
+
+    /// Adjust `scroll` so the focused row is visible within a window of
+    /// `height` rows, and return the `(start, count)` slice to render.
+    /// This is the single place window arithmetic lives; the renderer just
+    /// draws `filtered()[start..start + count]`.
+    pub(crate) fn window(&mut self, height: usize) -> (usize, usize) {
+        let len = self.filtered().len();
+        if len == 0 || height == 0 {
+            return (0, 0);
+        }
+        if self.focused >= len {
+            self.focused = len - 1;
+        }
+        let max_scroll = len.saturating_sub(height);
+        self.scroll = self.scroll.min(max_scroll);
+        if self.focused < self.scroll {
+            // Focus drifted above the window (e.g. after a filter that
+            // shrunk the list) — pull the window up.
+            self.scroll = self.focused;
+        } else if self.focused >= self.scroll + height {
+            // Focus is below the fold — push the window down.
+            self.scroll = self.focused + 1 - height;
+        }
+        (self.scroll, height.min(len - self.scroll))
+    }
+
+    /// The highlighted model ID, if the filtered list is non-empty.
+    pub(crate) fn highlighted(&self) -> Option<String> {
+        self.filtered().get(self.focused).map(|s| s.to_string())
+    }
+
+    /// Return the highlighted model and close the selector.  The caller
+    /// sends `SetModel` with the returned value.
+    pub(crate) fn submit(&mut self) -> Option<String> {
+        let model = self.highlighted();
+        self.close();
+        model
+    }
+}
+
 pub(crate) struct App {
     pub(crate) input: InputBuffer,
     pub(crate) next_request_id: u32,
@@ -528,6 +715,7 @@ pub(crate) struct App {
     pub(crate) show_ctrl_help: bool,
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
+    pub(crate) model_selector: ModelSelectorState,
     pub(crate) scroll_accumulator: isize,
     pub(crate) scrollbar_dragging: bool,
     pub(crate) last_terminal_size: Option<(u16, u16)>,
@@ -1332,6 +1520,7 @@ impl App {
             show_ctrl_help: true,
             session_mgr: SessionManagerState::new(),
             ai_providers: AIProvidersState::new(),
+            model_selector: ModelSelectorState::new(),
             scroll_accumulator: 0,
             scrollbar_dragging: false,
             history_index: None,
@@ -5043,5 +5232,194 @@ mod tests {
         assert!(display.error.is_some());
         assert!(display.markers_dirty, "markers_dirty should be set");
         assert!(display.content_dirty, "content_dirty should be set");
+    }
+
+    // ── ModelSelectorState ──
+
+    fn selector_with_models(models: &[&str]) -> ModelSelectorState {
+        let mut sel = ModelSelectorState::new();
+        sel.open();
+        sel.apply_models(models.iter().map(|s| s.to_string()).collect(), None);
+        sel
+    }
+
+    #[test]
+    fn model_selector_open_resets_state_and_marks_loading() {
+        let mut sel = ModelSelectorState::new();
+        sel.all_models = vec!["a".into()];
+        sel.selected = Some("a".into());
+        sel.filter.text = "stale".to_string();
+        sel.filter.cursor = 5;
+        sel.focused = 3;
+        sel.scroll = 2;
+        sel.error = Some("old error".into());
+
+        sel.open();
+
+        assert!(sel.is_open());
+        assert!(sel.loading);
+        assert!(sel.filter.text.is_empty());
+        assert_eq!(sel.focused, 0);
+        assert_eq!(sel.scroll, 0);
+        assert!(sel.error.is_none());
+    }
+
+    #[test]
+    fn model_selector_close_keeps_model_list() {
+        let mut sel = selector_with_models(&["a", "b"]);
+        sel.close();
+
+        assert!(!sel.is_open());
+        assert_eq!(sel.all_models.len(), 2, "cached list survives close");
+    }
+
+    #[test]
+    fn model_selector_apply_models_preselects_current() {
+        let mut sel = ModelSelectorState::new();
+        sel.open();
+        sel.apply_models(
+            vec![
+                "gpt-4o".into(),
+                "gpt-4o-mini".into(),
+                "gpt-3.5-turbo".into(),
+            ],
+            Some("gpt-4o-mini".into()),
+        );
+
+        assert!(!sel.loading);
+        assert_eq!(sel.focused, 1, "highlight lands on the active model");
+        assert_eq!(sel.highlighted().as_deref(), Some("gpt-4o-mini"));
+    }
+
+    #[test]
+    fn model_selector_apply_models_falls_back_to_top_when_selected_missing() {
+        let mut sel = ModelSelectorState::new();
+        sel.open();
+        sel.apply_models(vec!["a".into(), "b".into()], Some("missing".into()));
+
+        assert_eq!(sel.focused, 0);
+        assert_eq!(sel.highlighted().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn model_selector_filter_matches_case_insensitive_substring() {
+        let mut sel = selector_with_models(&["gpt-4o", "GPT-4O-MINI", "claude-3"]);
+        sel.filter.text = "gpt".to_string();
+        sel.filter.cursor = 3;
+
+        let filtered = sel.filtered();
+        assert_eq!(filtered, vec!["gpt-4o", "GPT-4O-MINI"]);
+    }
+
+    #[test]
+    fn model_selector_empty_filter_returns_all() {
+        let sel = selector_with_models(&["a", "b", "c"]);
+        assert_eq!(sel.filtered(), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn model_selector_no_match_returns_empty() {
+        let mut sel = selector_with_models(&["a", "b"]);
+        sel.filter.text = "zzz".to_string();
+        sel.filter.cursor = 3;
+        assert!(sel.filtered().is_empty());
+    }
+
+    #[test]
+    fn model_selector_focus_clamps_when_filter_narrows_list() {
+        let mut sel = selector_with_models(&["a", "b", "c"]);
+        sel.focused = 2;
+        // Narrow to a single row: the highlight must not point past the end.
+        sel.filter.text = "a".to_string();
+        sel.filter.cursor = 1;
+        sel.clamp_focus();
+        assert_eq!(sel.focused, 0);
+    }
+
+    #[test]
+    fn model_selector_move_up_down_clamped() {
+        let mut sel = selector_with_models(&["a", "b", "c"]);
+        sel.move_down();
+        assert_eq!(sel.focused, 1);
+        sel.move_down();
+        sel.move_down();
+        assert_eq!(sel.focused, 2, "move_down clamps at the last row");
+        sel.move_up();
+        assert_eq!(sel.focused, 1);
+        sel.move_up();
+        sel.move_up();
+        assert_eq!(sel.focused, 0, "move_up clamps at the first row");
+    }
+
+    #[test]
+    fn model_selector_window_keeps_focus_visible() {
+        let mut sel = selector_with_models(&["a", "b", "c", "d", "e"]);
+        sel.focused = 4;
+        let (start, count) = sel.window(3);
+        assert_eq!((start, count), (2, 3), "window slides down to reveal focus");
+        assert!(sel.focused >= start && sel.focused < start + count);
+    }
+
+    #[test]
+    fn model_selector_window_pulls_up_when_focus_above() {
+        let mut sel = selector_with_models(&["a", "b", "c", "d", "e"]);
+        sel.scroll = 4;
+        sel.focused = 1;
+        let (start, _) = sel.window(3);
+        assert_eq!(start, 1, "window pulls up so focus is visible");
+    }
+
+    #[test]
+    fn model_selector_window_empty_list_returns_zero() {
+        let mut sel = selector_with_models(&[]);
+        assert_eq!(sel.window(5), (0, 0));
+        assert!(sel.highlighted().is_none());
+    }
+
+    #[test]
+    fn model_selector_submit_returns_highlighted_and_closes() {
+        let mut sel = selector_with_models(&["a", "b"]);
+        sel.move_down();
+        let model = sel.submit();
+        assert_eq!(model.as_deref(), Some("b"));
+        assert!(!sel.is_open(), "submit closes the selector");
+    }
+
+    #[test]
+    fn model_selector_submit_empty_returns_none() {
+        let mut sel = selector_with_models(&[]);
+        assert!(sel.submit().is_none());
+        assert!(!sel.is_open());
+    }
+
+    #[test]
+    fn model_selector_filter_key_consumes_chars_and_backspace() {
+        let mut sel = selector_with_models(&["gpt-4o", "claude-3"]);
+        let consumed = sel.filter_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(consumed);
+        assert_eq!(sel.filter.text, "g");
+        assert_eq!(sel.filtered(), vec!["gpt-4o"]);
+
+        let consumed = sel.filter_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(consumed);
+        assert!(sel.filter.text.is_empty());
+        assert_eq!(sel.filtered().len(), 2);
+    }
+
+    #[test]
+    fn model_selector_filter_key_ignores_enter() {
+        let mut sel = selector_with_models(&["a"]);
+        let consumed = sel.filter_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!consumed, "Enter is handled by the modal event handler");
+        assert!(sel.is_open());
+    }
+
+    #[test]
+    fn model_selector_apply_error_records_and_clears_loading() {
+        let mut sel = ModelSelectorState::new();
+        sel.open();
+        sel.apply_error("no credential".to_string());
+        assert!(!sel.loading);
+        assert_eq!(sel.error.as_deref(), Some("no credential"));
     }
 }

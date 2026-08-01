@@ -553,6 +553,12 @@ pub(crate) fn handle_terminal_event(
     if app.fullscreen_image_target.is_some() {
         return handle_fullscreen_event(event, app, client_tx);
     }
+    // The model selector overlay (Chat page) also takes priority over page
+    // content, mirroring the fullscreen guard above.  Ctrl+Q is handled
+    // before this point so the user can always quit while it is open.
+    if app.model_selector.is_open() {
+        return handle_model_selector_event(event, app, client_tx);
+    }
     match app.page {
         Page::SessionManager => handle_session_manager_event(event, app, client_tx),
         Page::AIProviders => handle_ai_providers_event(event, app, client_tx),
@@ -569,6 +575,13 @@ pub(crate) fn handle_terminal_event(
 fn handle_paste_event(data: &str, app: &mut App) -> Result<(), ClientError> {
     match app.page {
         Page::Chat => {
+            // While the model selector is open, pasted text goes into its
+            // filter box rather than the main command input.
+            if app.model_selector.is_open() {
+                tracing::debug!("[choreo-tui] pasting into model selector filter");
+                app.model_selector.filter.insert_str_at_cursor(data);
+                return Ok(());
+            }
             tracing::debug!("[choreo-tui] pasting into chat input buffer");
             app.input.insert_str_at_cursor(data);
             app.ensure_input_cursor_visible();
@@ -640,6 +653,53 @@ fn handle_fullscreen_event(
     }
     if key.code == KeyCode::Esc {
         app.fullscreen_image_target = None;
+    }
+    Ok(())
+}
+
+/// Handle events while the model selector overlay is open (Chat page).
+///
+/// Up/Down move the highlight, Enter selects the highlighted model and
+/// closes (sending `SetModel`), Esc dismisses without changing anything,
+/// and every other key feeds the filter box.  Non-key events are ignored;
+/// quit is handled via Ctrl+Q at the terminal-event level.
+fn handle_model_selector_event(
+    event: Event,
+    app: &mut App,
+    client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Event::Key(key) = event else {
+        return Ok(());
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+    // Esc dismisses the overlay without changing the model.
+    if key.code == KeyCode::Esc {
+        tracing::debug!("[choreo-tui] model selector dismissed");
+        app.model_selector.close();
+        return Ok(());
+    }
+    // Enter selects the highlighted model (if any) and closes.  An empty
+    // filtered list (e.g. a filter with no matches) simply closes.
+    if key.code == KeyCode::Enter {
+        if let Some(model) = app.model_selector.submit() {
+            tracing::info!(%model, "model selector: selecting model");
+            client_tx
+                .send(ClientMessage::SetModel { model })
+                .map_err(broken_pipe)?;
+        }
+        return Ok(());
+    }
+    match key.code {
+        KeyCode::Up => app.model_selector.move_up(),
+        KeyCode::Down => app.model_selector.move_down(),
+        // Everything else goes to the filter input (characters, backspace,
+        // word deletes, cursor movement).  `filter_key` returns false for
+        // Enter/Esc, which are handled above.
+        _ => {
+            app.model_selector.filter_key(key);
+        }
     }
     Ok(())
 }
@@ -1112,6 +1172,13 @@ fn handle_chat_ctrl_key(
             app.set_page(Page::AIProviders);
             client_tx
                 .send(ClientMessage::ListAccounts)
+                .map_err(broken_pipe)?;
+        }
+        KeyCode::Char('m') => {
+            tracing::debug!("Ctrl+M opening model selector");
+            app.model_selector.open();
+            client_tx
+                .send(ClientMessage::ListModels)
                 .map_err(broken_pipe)?;
         }
         // Ctrl+C is a deliberate no-op on the chat page (no copy/sigint
@@ -1801,6 +1868,37 @@ pub(crate) fn handle_daemon_message(
             display.live_output_tokens = *output_tokens;
         }
 
+        DaemonMessage::Models {
+            models,
+            selected_model,
+        } => {
+            if app.model_selector.is_open() {
+                // While the selector is open, the reply populates the popup
+                // and must NOT fall through to the generic dispatch, which
+                // would print the whole list into the chat history.  Prefer
+                // the daemon's reported selection, falling back to the
+                // display's cached model when it is absent.
+                let selected = selected_model.clone().or_else(|| {
+                    app.active_display_ref()
+                        .and_then(|d| d.selected_model.clone())
+                });
+                tracing::debug!(
+                    count = models.len(),
+                    ?selected,
+                    "model selector: received model list"
+                );
+                app.model_selector.apply_models(models.clone(), selected);
+                return Ok(());
+            }
+            // Selector closed: fall through to dispatch_daemon_message so
+            // `/model` keeps printing the list into the chat history.
+        }
+        DaemonMessage::ModelsFailed { error } if app.model_selector.is_open() => {
+            tracing::warn!(%error, "model selector: failed to list models");
+            app.model_selector.apply_error(error.clone());
+            return Ok(());
+        }
+        // Selector closed: fall through to the generic error handling.
         _ => {}
     }
 

@@ -10,9 +10,9 @@ use choreo_tui::RenderedImage;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Padding, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
 use ratatui_image::StatefulImage;
 use std::sync::Arc;
@@ -55,6 +55,11 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         Page::Chat => render_chat(frame, app),
         Page::SessionManager => render_session_manager(frame, app),
         Page::AIProviders => render_ai_providers(frame, app),
+    }
+
+    // The model selector overlay draws on top of the Chat page content.
+    if app.model_selector.is_open() {
+        render_model_selector(frame, app);
     }
 }
 
@@ -1198,6 +1203,153 @@ pub(crate) fn format_status(status: &SessionStatus) -> String {
 
 pub(crate) fn status_color(status: &SessionStatus) -> Color {
     status_display(status).1
+}
+
+/// Centered popup listing the models available on the attached session's
+/// account.  Drawn last so it covers the Chat page content.  The filter box
+/// reuses `InputBuffer` editing semantics; key handling lives in
+/// `handle_model_selector_event` (connection.rs).
+fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    // Target ~60% of the terminal width and ~2/3 of the height, floored at a
+    // sane minimum and capped so the popup never touches the screen edges.
+    // The `.min(area…)` guards keep the arithmetic panic-free on tiny
+    // terminals (clamp panics if its bounds are inverted).
+    let width = ((area.width as u32 * 3 / 5) as u16)
+        .clamp(24, 100)
+        .min(area.width.saturating_sub(4))
+        .max(1);
+    let height = ((area.height as u32 * 2 / 3) as u16)
+        .clamp(8, 40)
+        .min(area.height.saturating_sub(2))
+        .max(1);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    // Erase the region beneath so the popup reads as a solid overlay rather
+    // than text drawn on top of the chat history.
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Select Model ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // ── Filter row ──────────────────────────────────────────────
+    let filter_row = chunks[0];
+    let filter_prefix = "> ";
+    let filter_display = format!("{filter_prefix}{}", app.model_selector.filter.text);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            filter_display,
+            Style::default().fg(Color::White),
+        ))),
+        filter_row,
+    );
+    // Park the terminal cursor right after the filter text so typing feels
+    // like the main input box.  `cursor` is a byte offset (InputBuffer's
+    // convention); clamp the column so a long filter never pushes the
+    // cursor off-screen.
+    let before_cursor = app
+        .model_selector
+        .filter
+        .text
+        .get(..app.model_selector.filter.cursor)
+        .unwrap_or(&app.model_selector.filter.text);
+    let cursor_col =
+        filter_row.x + filter_prefix.len() as u16 + display_width(before_cursor) as u16;
+    let cursor_col = cursor_col.min(filter_row.x + filter_row.width.saturating_sub(1));
+    frame.set_cursor_position((cursor_col, filter_row.y));
+
+    // ── Body: error / loading / empty / list ───────────────────
+    let body = chunks[1];
+    if let Some(ref err) = app.model_selector.error {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" Error: {err}"),
+                Style::default().fg(Color::Red),
+            ))),
+            body,
+        );
+        return;
+    }
+    if app.model_selector.loading {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " Loading models…",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            body,
+        );
+        return;
+    }
+
+    // Adjust the scroll window so the focused row is visible, then build the
+    // visible rows.  `window` borrows mutably; the filtered view is fetched
+    // afterwards so the borrows do not overlap.
+    let list_height = body.height as usize;
+    let (scroll, count) = app.model_selector.window(list_height);
+    let filtered = app.model_selector.filtered();
+    let selected = app.model_selector.selected.clone();
+    let focused = app.model_selector.focused;
+
+    if filtered.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " No models match the filter.",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            body,
+        );
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::with_capacity(count);
+    for (i, model) in filtered.iter().enumerate().skip(scroll).take(count) {
+        let is_current = selected.as_deref() == Some(model);
+        let is_focused = i == focused;
+        // `●` marks the active model (mirrors opencode's modal); `>` marks
+        // the highlight the user is about to select.
+        let prefix = if is_focused { "> " } else { "  " };
+        let marker = if is_current { "●" } else { " " };
+        let style = if is_focused {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if is_current {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{marker} {model}"),
+            style,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+
+    // ── Footer hint ─────────────────────────────────────────────
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " esc close · enter select",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[2],
+    );
 }
 
 #[cfg(test)]
