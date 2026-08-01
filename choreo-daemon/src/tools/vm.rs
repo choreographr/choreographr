@@ -699,6 +699,7 @@ fn format_rust_source(source: &str) -> String {
 pub struct RunRiscVInput {
     pub source: Option<String>,
     pub program: Option<String>,
+    pub program_path: Option<String>,
     pub args: Option<Vec<String>>,
     pub max_cycles: Option<u64>,
     pub memory_size: Option<usize>,
@@ -960,6 +961,31 @@ fn compute_heap_bounds(memory_size: usize) -> (u64, u64) {
     (heap_base as u64, heap_size as u64)
 }
 
+/// Read a pre-compiled RISC-V ELF from disk for the `program_path` input.
+///
+/// The VM's flat memory is capped at 4MB, so an ELF larger than that can
+/// never load — reject it up front with a clear message rather than reading
+/// a pathological file into RAM and failing later with a confusing loader
+/// error. Returns a domain error string on failure.
+fn read_program_file(path: &str) -> Result<Vec<u8>, String> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("cannot read program file '{path}': {e}"))?;
+    if meta.len() > 4 * 1024 * 1024 {
+        return Err(format!(
+            "program file '{path}' is {} bytes; max supported is 4MB",
+            meta.len()
+        ));
+    }
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("cannot read program file '{path}': {e}"))?;
+    info!(
+        path,
+        size = bytes.len(),
+        "loaded pre-compiled program from disk"
+    );
+    Ok(bytes)
+}
+
 fn run_riscv_impl(
     input: &RunRiscVInput,
     x_credentials: Option<&ServiceCredential>,
@@ -981,8 +1007,12 @@ fn run_riscv_impl(
     let compile_cmd =
         format!("rustc +stable --target {target} -C opt-level=z --edition 2024 --color always");
 
-    let elf = match (compile_source, input.program.as_deref()) {
-        (Some(source), None) => {
+    let elf = match (
+        compile_source,
+        input.program.as_deref(),
+        input.program_path.as_deref(),
+    ) {
+        (Some(source), None, None) => {
             // Show the compile command in the streaming output so the user
             // knows what's being run.
             if let Some(ref tx) = write_tx {
@@ -996,17 +1026,21 @@ fn run_riscv_impl(
                 }
             }
         }
-        (None, Some(program_b64)) => match BASE64.decode(program_b64) {
+        (None, Some(program_b64), None) => match BASE64.decode(program_b64) {
             Ok(elf) => elf,
             Err(e) => {
                 return tool_err(format!("base64 decode error: {e}"));
             }
         },
-        (None, None) => {
-            return tool_err("either 'source' or 'program' is required");
+        (None, None, Some(path)) => match read_program_file(path) {
+            Ok(elf) => elf,
+            Err(e) => return tool_err(e),
+        },
+        (None, None, None) => {
+            return tool_err("either 'source', 'program', or 'program_path' is required");
         }
-        (Some(_), Some(_)) => {
-            return tool_err("provide only one of 'source' or 'program'");
+        _ => {
+            return tool_err("provide only one of 'source', 'program', or 'program_path'");
         }
     };
 
@@ -1147,7 +1181,7 @@ impl Tool for RunRiscV {
     }
 
     fn description(&self) -> &'static str {
-        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `choreo` module. Use per-tool convenience wrappers: choreo::read_file(path), choreo::write_file(path, content, overwrite), choreo::db_get(key), choreo::db_set(key, value), choreo::db_delete(key), choreo::sh(command, shell, workdir, timeout_ms), choreo::exec(command, args, workdir, timeout_ms), choreo::grep(pattern, regex, include, path, max_results), choreo::find(pattern, glob, path, max_results), choreo::http_request(method, url, headers, body, timeout_secs). CRITICAL: For grep, set regex:true when using regex patterns — the default is literal matching. The wrappers handle postcard encoding automatically. Use choreo::write(b\"...\") for VM output and choreo::exit(code) to finish. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported."
+        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `choreo` module. For externally-compiled ELFs, use 'program' (base64) or 'program_path' (path to an ELF file on disk) — the binary must be compiled with the choreographr syscall ABI. Use per-tool convenience wrappers: choreo::read_file(path), choreo::write_file(path, content, overwrite), choreo::db_get(key), choreo::db_set(key, value), choreo::db_delete(key), choreo::sh(command, shell, workdir, timeout_ms), choreo::exec(command, args, workdir, timeout_ms), choreo::grep(pattern, regex, include, path, max_results), choreo::find(pattern, glob, path, max_results), choreo::http_request(method, url, headers, body, timeout_secs). CRITICAL: For grep, set regex:true when using regex patterns — the default is literal matching. The wrappers handle postcard encoding automatically. Use choreo::write(b\"...\") for VM output and choreo::exit(code) to finish. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported."
     }
 
     fn supports_streaming_output() -> bool {
@@ -1155,8 +1189,8 @@ impl Tool for RunRiscV {
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
-        match (&args.source, &args.program) {
-            (Some(source), None) => {
+        match (&args.source, &args.program, &args.program_path) {
+            (Some(source), None, None) => {
                 let display = format_rust_source(source);
                 let mut parts = vec![format!(
                     "Compiling and running Rust code:\n```rust\n{display}\n```"
@@ -1177,9 +1211,13 @@ impl Tool for RunRiscV {
                 ));
                 parts.concat()
             }
-            (None, Some(_)) => "Running a pre-compiled RISC-V ELF binary.".to_string(),
-            (Some(_), Some(_)) => "Provide only one of 'source' or 'program'.".to_string(),
-            (None, None) => "No source or program provided for run_riscv.".to_string(),
+            (None, Some(_), None) => {
+                "Running a pre-compiled RISC-V ELF binary (base64).".to_string()
+            }
+            (None, None, Some(path)) => {
+                format!("Running a pre-compiled RISC-V ELF from file: {path}.")
+            }
+            _ => "Provide only one of 'source', 'program', or 'program_path'.".to_string(),
         }
     }
 
@@ -1198,6 +1236,10 @@ impl Tool for RunRiscV {
                 "program": {
                     "type": "string",
                     "description": "Base64-encoded RISC-V ELF binary. Only use if you compiled externally WITH the choreographr syscall ABI (syscall 0=postcard-encoded tool dispatch, 1=write, 93=exit). Programs using Linux syscall number 64 (write) will fail. When in doubt, use 'source' instead."
+                },
+                "program_path": {
+                    "type": "string",
+                    "description": "Path to a pre-compiled RISC-V ELF binary on disk (absolute path recommended). Alternative to 'program' for workflows that compile externally with rustc, avoiding base64 encoding. Same ABI requirements as 'program' (choreographr syscall ABI: 0=postcard tool dispatch, 1=write, 93=exit). Max file size 4MB."
                 },
                 "args": {
                     "type": "array",
@@ -1428,6 +1470,63 @@ mod tests {
         );
         assert!(result.is_error, "expected error: {}", result.content);
         assert!(result.content.contains("only one of"), "{}", result.content);
+    }
+
+    #[test]
+    fn run_riscv_rejects_source_and_program_path() {
+        let result = run_riscv_impl(
+            &RunRiscVInput {
+                source: Some("fn main() {}".to_string()),
+                program_path: Some("/tmp/some.elf".to_string()),
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+            dummy_registry(),
+            None,
+        );
+        assert!(result.is_error, "expected error: {}", result.content);
+        assert!(result.content.contains("only one of"), "{}", result.content);
+    }
+
+    #[test]
+    fn run_riscv_rejects_program_and_program_path() {
+        let result = run_riscv_impl(
+            &RunRiscVInput {
+                program: Some("AAAA".to_string()),
+                program_path: Some("/tmp/some.elf".to_string()),
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+            dummy_registry(),
+            None,
+        );
+        assert!(result.is_error, "expected error: {}", result.content);
+        assert!(result.content.contains("only one of"), "{}", result.content);
+    }
+
+    #[test]
+    fn run_riscv_rejects_missing_program_file() {
+        let result = run_riscv_impl(
+            &RunRiscVInput {
+                program_path: Some("/nonexistent/definitely-not-here-choreo-9f3c2.elf".to_string()),
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+            dummy_registry(),
+            None,
+        );
+        assert!(result.is_error, "expected error: {}", result.content);
+        assert!(
+            result.content.contains("cannot read program file"),
+            "{}",
+            result.content
+        );
     }
 
     #[test]

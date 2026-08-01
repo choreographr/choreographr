@@ -165,6 +165,99 @@ fn invalid_base64_program() {
 
 #[test]
 #[ignore]
+fn program_path_missing_file() {
+    let result = execute_run_riscv_tool(
+        &RunRiscVInput {
+            program_path: Some("/nonexistent/definitely-not-here-choreo-9f3c2.elf".to_string()),
+            ..Default::default()
+        },
+        None,
+    );
+    assert!(result.is_err(), "expected error: {:?}", result);
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("cannot read program file"), "{}", err);
+}
+
+#[test]
+#[ignore]
+fn program_path_runs_precompiled_elf() {
+    // Compile a minimal no_std ELF externally (as a user would with rustc),
+    // then verify the VM runs it straight from disk via `program_path`.
+    let dir = std::env::temp_dir().join(format!(
+        "choreo-vm-path-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let src_path = dir.join("guest.rs");
+    let elf_path = dir.join("guest.elf");
+
+    // Guest: write "hello from file" via choreographr WRITE syscall (1),
+    // then exit with code 42 via Linux exit syscall (93, handled natively by
+    // CKB-VM's DefaultMachine). No allocator needed — no heap usage.
+    let src = r#"
+#![no_std]
+#![no_main]
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { loop {} }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn _start() -> ! {
+    let msg = b"hello from file";
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a0") msg.as_ptr(),
+            in("a1") msg.len(),
+            in("a7") 1u64,
+            options(nostack)
+        );
+        core::arch::asm!(
+            "ecall",
+            in("a0") 42u64,
+            in("a7") 93u64,
+            options(noreturn)
+        );
+    }
+}
+"#;
+    std::fs::write(&src_path, src).expect("write guest source");
+
+    let status = std::process::Command::new("rustc")
+        .arg("+stable")
+        .args(["--target", "riscv64imac-unknown-none-elf"])
+        .args(["-C", "opt-level=z", "--edition", "2024"])
+        .arg("-o")
+        .arg(&elf_path)
+        .arg(&src_path)
+        .status()
+        .expect("spawn rustc");
+    assert!(status.success(), "external rustc compile failed");
+
+    let result = execute_run_riscv_tool(
+        &RunRiscVInput {
+            program_path: Some(elf_path.to_string_lossy().to_string()),
+            ..Default::default()
+        },
+        Some(Path::new("/tmp")),
+    );
+    let content = result.unwrap_or_default();
+    assert!(content.contains("hello from file"), "{}", content);
+    assert!(
+        content.contains("exited with code 42"),
+        "expected exit banner: {}",
+        content
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore]
 fn write_with_vec() {
     let result = execute_run_riscv_tool(
         &RunRiscVInput {

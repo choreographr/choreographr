@@ -1683,7 +1683,9 @@ to the guest syscall handler.
 
 **Execution flow:**
 
-1. Accepts either Rust `source` or pre-compiled base64 `program`.
+1. Accepts Rust `source`, pre-compiled base64 `program`, or `program_path` pointing at a
+   pre-compiled ELF file on disk (read with a 4MB size cap, since the VM's flat memory
+   cannot exceed 4MB).
 2. If `source` is provided, it is first formatted via `rustfmt` (silently skipped
    if `rustfmt` is unavailable).  The formatted source is then prepended with a
     `#![no_std]` boilerplate (panic handler, entry point, `Choreographr` module with
