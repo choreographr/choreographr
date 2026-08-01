@@ -2,13 +2,17 @@ use std::path::Path;
 use zlob::{ZlobFlags, ZlobPattern};
 
 /// A compiled glob pattern with a flag indicating whether to match against
-/// the file's basename (filename only) or the full path.
+/// the file's basename (filename only) or the full path passed in.
 ///
 /// Following gitignore convention:
 /// - Patterns **without** a `/` are matched against the file's basename,
 ///   so `*.log` matches `.log` files at any directory depth.
 /// - Patterns **with** a `/` are matched against the full path starting
-///   from the working directory.
+///   from the caller-provided root.
+///
+/// The caller decides what "the full path" is: `grep` passes paths relative
+/// to the search root (so `src/*.rs` matches regardless of where the root
+/// lives), while `delete_files` passes the walker's absolute paths.
 pub(crate) struct GlobFilter {
     pattern: ZlobPattern,
     match_basename: bool,
@@ -35,7 +39,10 @@ impl GlobFilter {
     /// Returns `true` if the file at `path` matches this glob filter.
     ///
     /// When `match_basename` is `true`, only the file's name (last component)
-    /// is tested against the pattern. Otherwise the full path is used.
+    /// is tested against the pattern. Otherwise the full passed-in path is
+    /// used — pass a path relative to the search root for root-relative
+    /// semantics (see `grep`), or an absolute path when that is the intended
+    /// anchor (see `delete_files`).
     pub(crate) fn matches(&self, path: &Path) -> bool {
         let name = if self.match_basename {
             // file_name() returns None only for the root path "/",

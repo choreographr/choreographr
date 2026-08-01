@@ -958,8 +958,11 @@ lives in its own module (`tools/read_file.rs`, `tools/read_file_range.rs`); the 
 streaming and binary-sniff helpers (`open_text_reader`, `TextStream`, `render_streamed_line`,
 `OutputBudget`, `read_line_capped`, `drain_rest_of_line`) live in `tools/mod.rs` alongside
 `truncate_tool_output` and the shared output-formatting helpers (`sanitize_name`,
-`human_size`, `symlink_target_label`, `truncation_marker`) used by the line-oriented
-tools (`list_files`, `find`, `grep`). `TextStream` yields one capped line at a time
+`human_size`, `symlink_target_label`, `truncation_marker`, `finish_tool_output`)
+used by the line-oriented
+tools (`list_files`, `find`, `grep`). `finish_tool_output` caps a body at the shared
+byte budget and appends the truncation marker *past* the cap so the count signal
+survives even a byte-capped result. `TextStream` yields one capped line at a time
 with byte accounting; `render_streamed_line` validates and renders a single line (NUL /
 UTF-8 checks, CRLF normalization, truncation marker); `OutputBudget` enforces the shared
 byte cap across appended lines.
@@ -1015,7 +1018,7 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
 > **`git_diff` output:** Always returns a line-by-line unified diff wrapped in a ````diff` fenced code block. The old `full` parameter (which previously toggled between summary-only and full diff modes) has been removed — the tool now always produces full diffs. The diff output for each file change is enclosed in ````diff` ... ```` fences for clear markdown formatting.
 | **EVM** | `evm_chain`, `evm_balance`, `evm_token_balance`, `evm_block`, `evm_transaction`, `evm_call`, `evm_gas`, `evm_logs`, `evm_nonce`, `evm_resolve` |
 | **File search** | `grep` (file content search), `find` (file name search) |
-> **`find` output:** One match per line. Files render with a human-readable size (`blob.bin  4 KiB`), directories with a trailing `/`, symlinks as `name -> target`. Glob patterns containing `/` (e.g. `src/*.rs`) are matched natively by the walker against root-relative paths and prune traversal outside the pattern's literal prefix; bare patterns match file names (basename). When `max_results` cuts the walk short, a `...[truncated at N results]` line is appended so the caller can tell "exactly N results" from "N of many more" — `grep` appends `...[truncated at N matches]` the same way. Both tools escape control characters in file names so output stays one line per result.
+> **`find` output:** One match per line. Files render with a human-readable size (`blob.bin  4 KiB`), directories with a trailing `/`, symlinks as `name -> target`. Glob patterns containing `/` (e.g. `src/*.rs`) are matched natively by the walker against root-relative paths and prune traversal outside the pattern's literal prefix; bare patterns match file names (basename). A leading `./` is stripped and absolute patterns are converted to root-relative (erroring when outside the search root). `grep`'s `include` glob follows the same split — patterns with `/` match root-relative paths in directory mode (the file name for a directly-named file), bare patterns match basenames. When `max_results` cuts the walk short, a `...[truncated at N results]` line is appended — note this signals *at least* N matches (the cap is hit before the walk proves nothing more exists); `grep` appends `...[truncated at N matches]` the same way. Both tools escape control characters in file names and symlink targets so output stays one line per result.
 | **RISC-V VM** | `run_riscv` (compile & run Rust code in a sandboxed RISC-V VM with access to all registered tools) |
 | **Shell** | `exec` (direct program execution), `sh` (bash/dash/zsh — detected at startup), `nushell` (if `nu` is installed), `fish` (if `fish` is installed) |
 | **X/Twitter** | `x_post`, `x_search_recent`, `x_user_lookup` |

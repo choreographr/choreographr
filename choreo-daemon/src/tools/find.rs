@@ -1,10 +1,11 @@
 use super::{
-    Tool, ToolExecError, context::ToolContext, human_size, sanitize_name, symlink_target_label,
-    truncate_tool_output, truncation_marker,
+    Tool, ToolExecError, context::ToolContext, finish_tool_output, human_size, sanitize_name,
+    symlink_target_label, truncation_marker,
 };
 use choreo_keystore::ServiceCredential;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::mpsc;
 use tracing::debug;
@@ -54,6 +55,37 @@ fn use_glob_pattern(pattern: &str, glob: bool) -> bool {
     glob || zlob::has_wildcards(pattern, ZlobFlags::RECOMMENDED)
 }
 
+/// Normalize a find pattern for matching against root-relative paths:
+///
+/// - A leading `./` is a path prefix, not part of any file name — strip it
+///   (repeatedly) so `./src/*.rs` behaves like `src/*.rs` instead of silently
+///   matching nothing.
+/// - An absolute pattern must live under the search root to be expressible as
+///   a root-relative pattern (zlob's walker `include()` matches against
+///   root-relative paths). If it does, convert it to the equivalent relative
+///   pattern; otherwise error rather than silently returning nothing.
+fn normalize_find_pattern<'a>(
+    pattern: &'a str,
+    resolved: &Path,
+) -> Result<Cow<'a, str>, ToolExecError> {
+    let mut p = pattern;
+    while let Some(rest) = p.strip_prefix("./") {
+        p = rest;
+    }
+    if Path::new(p).is_absolute() {
+        match Path::new(p).strip_prefix(resolved) {
+            Ok(rel) => return Ok(Cow::Owned(rel.to_string_lossy().into_owned())),
+            Err(_) => {
+                return Err(ToolExecError(format!(
+                    "pattern `{pattern}` is outside the search root `{}`",
+                    resolved.display()
+                )));
+            }
+        }
+    }
+    Ok(Cow::Borrowed(p))
+}
+
 /// Run the find walk with the given parameters, optionally streaming each
 /// match to `output_tx` as it is found (for incremental client display).
 fn run_find_walk(
@@ -64,7 +96,12 @@ fn run_find_walk(
     output_tx: Option<&mpsc::Sender<Vec<u8>>>,
 ) -> Result<String, ToolExecError> {
     let use_glob = use_glob_pattern(pattern, glob);
-    debug!(pattern, resolved = %resolved.display(), use_glob, max_results, "find: starting search");
+    // Normalize before deciding the matching mode: `./src/*.rs` must become
+    // `src/*.rs` (a leading `./` is a path prefix) and an absolute pattern
+    // under the root must become root-relative, or the include() matcher
+    // (which compares root-relative paths) would silently match nothing.
+    let pattern = normalize_find_pattern(pattern, resolved)?;
+    debug!(pattern = %pattern, resolved = %resolved.display(), use_glob, max_results, "find: starting search");
 
     // Glob patterns containing a path separator are handed to the walker via
     // `include()`: zlob matches them against the entry's root-relative path
@@ -75,7 +112,7 @@ fn run_find_walk(
     let native_include = use_glob && pattern.contains('/');
     let glob_matcher: Option<ZlobPattern> = if use_glob && !native_include {
         Some(
-            ZlobPattern::compile(pattern, ZlobFlags::RECOMMENDED)
+            ZlobPattern::compile(&pattern, ZlobFlags::RECOMMENDED)
                 .map_err(|e| ToolExecError(format!("invalid glob pattern: {e}")))?,
         )
     } else {
@@ -102,7 +139,7 @@ fn run_find_walk(
         // not the glob, controls hidden-file visibility. Same choice as
         // GlobFilter in glob_util.rs.
         builder
-            .include(pattern)
+            .include(&pattern)
             .map_err(|e| ToolExecError(format!("invalid glob pattern: {e}")))?
             .include_flags(ZlobFlags::RECOMMENDED | ZlobFlags::PERIOD);
     }
@@ -114,26 +151,31 @@ fn run_find_walk(
     builder
         .metadata(WalkMetadata::SIZE)
         .run_serial(|entry| {
-            // Get the file or directory name for matching against the pattern.
-            // Use to_string_lossy so non-UTF-8 filenames are handled via
-            // replacement characters rather than silently skipped.
-            let name = entry
-                .path()
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default();
-
             // Check whether the entry's name matches the search pattern. With
             // native include() the walker has already filtered by relative path,
-            // so no further matching is needed here.
+            // so no further matching is needed here — and we skip the basename
+            // extraction entirely (it would be dead work for every entry).
             let matched = if native_include {
                 true
             } else if let Some(ref matcher) = glob_matcher {
-                // Glob mode (bare pattern): delegate to zlob's compiled matcher.
+                // Glob mode (bare pattern): delegate to zlob's compiled matcher
+                // on the entry's basename. Use to_string_lossy so non-UTF-8
+                // filenames are handled via replacement characters rather than
+                // silently skipped.
+                let name = entry
+                    .path()
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
                 matcher.matches_default(&name)
             } else {
                 // Substring mode: case-insensitive contains check using the
                 // pre-lowercased pattern.
+                let name = entry
+                    .path()
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
                 name.to_lowercase().contains(&pattern_lower)
             };
 
@@ -200,11 +242,10 @@ fn run_find_walk(
         return Ok(String::new());
     }
 
-    let mut out = results.join("\n");
-    if let Some(marker) = marker {
-        out.push_str(&format!("\n{marker}"));
-    }
-    Ok(truncate_tool_output(&out))
+    // Cap the body at the shared byte budget, appending the truncation marker
+    // *after* the cap so the "N of many more" signal always survives even when
+    // the result body alone exceeds the budget.
+    Ok(finish_tool_output(&results.join("\n"), marker))
 }
 
 pub fn execute_find_tool(
@@ -236,7 +277,7 @@ impl Tool for Find {
     }
 
     fn description(&self) -> &'static str {
-        "Find files and directories by name. Glob auto-detected when pattern contains wildcards — set glob:true to force glob mode or glob:false to force substring matching. Patterns containing '/' match relative paths (e.g. 'src/*.rs') and prune traversal; bare patterns match file names. Use path to scope the search directory and max_results to cap matches (a '...[truncated at N results]' line is appended when the cap is hit). Respects .gitignore and hidden files. Results show file sizes, a trailing '/' on directories, and symlink targets."
+        "Find files and directories by name. Glob auto-detected when pattern contains wildcards — set glob:true to force glob mode or glob:false to force substring matching. Patterns containing '/' match relative paths (e.g. 'src/*.rs') and prune traversal; bare patterns match file names. A leading './' is stripped and absolute patterns are matched relative to the search root (erroring when outside it). Use path to scope the search directory and max_results to cap matches (a '...[truncated at N results]' line is appended when the cap is hit — it means *at least* N exist). Respects .gitignore and hidden files. Results show file sizes, a trailing '/' on directories, and symlink targets (control characters escaped)."
     }
 
     fn supports_streaming_output() -> bool {
@@ -510,6 +551,38 @@ mod tests {
         assert!(
             result.contains("src/"),
             "expected 'src/' with trailing slash:\n{result}"
+        );
+    }
+
+    #[test]
+    fn normalize_strips_leading_dot_slash() {
+        // `./` is a path prefix, not part of any file name — it must not
+        // silently kill the match.
+        let p = Path::new("/proj");
+        assert_eq!(normalize_find_pattern("./src/*.rs", p).unwrap(), "src/*.rs");
+        assert_eq!(normalize_find_pattern("././a", p).unwrap(), "a");
+        assert_eq!(normalize_find_pattern("plain.rs", p).unwrap(), "plain.rs");
+        // A bare `./` degenerates to the empty pattern (matches everything,
+        // same as a bare empty pattern).
+        assert_eq!(normalize_find_pattern("./", p).unwrap(), "");
+    }
+
+    #[test]
+    fn normalize_absolute_pattern_under_root_becomes_relative() {
+        let root = Path::new("/proj");
+        let abs = "/proj/src/*.rs";
+        assert_eq!(normalize_find_pattern(abs, root).unwrap(), "src/*.rs");
+        // The search root itself degenerates to the empty pattern.
+        assert_eq!(normalize_find_pattern("/proj", root).unwrap(), "");
+    }
+
+    #[test]
+    fn normalize_absolute_pattern_outside_root_errors() {
+        let root = Path::new("/proj");
+        let err = normalize_find_pattern("/elsewhere/x.rs", root).unwrap_err();
+        assert!(
+            err.0.contains("outside the search root"),
+            "unexpected error: {err}"
         );
     }
 }

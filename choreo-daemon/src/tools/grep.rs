@@ -1,7 +1,6 @@
 use super::glob_util::GlobFilter;
 use super::{
-    Tool, ToolExecError, context::ToolContext, sanitize_name, truncate_tool_output,
-    truncation_marker,
+    Tool, ToolExecError, context::ToolContext, finish_tool_output, sanitize_name, truncation_marker,
 };
 use choreo_keystore::ServiceCredential;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -130,14 +129,24 @@ fn run_grep_walk(
     // walk loop skips it silently. This also avoids .gitignore filtering
     // for explicitly-requested files.
     if resolved.is_file() {
-        // Apply the include glob filter if one was configured — matching
-        // by basename, consistent with the file-glob code path.
+        // The directly-named file has no directory context, so the include
+        // glob is matched against the file name — the same path string the
+        // output displays. Bare globs (`*.rs`) match by basename as before;
+        // a path-anchored glob (`src/*.rs`) requires the pattern to match
+        // the bare file name, consistent with the root-relative contract.
+        let raw_name = resolved
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
         if let Some(ref filter) = include_filter
-            && !filter.matches(resolved)
+            && !filter.matches(Path::new(raw_name.as_ref()))
         {
             // File doesn't match the glob — return empty.
             return Ok(String::new());
         }
+        // Sanitize so a pathological file name (e.g. one containing a
+        // newline) cannot corrupt the line-oriented `path:line:content` output.
+        let file_name = sanitize_name(&raw_name);
 
         // Search the file. `GrepSink` handles both streaming (when
         // `output_tx` is set) and collecting modes transparently.
@@ -150,17 +159,6 @@ fn run_grep_walk(
             );
         }
 
-        // Format the (single-file) results.
-        // Use the file name as the display prefix since there's no
-        // directory structure to derive a relative path from. Sanitize so a
-        // pathological file name (e.g. one containing a newline) cannot
-        // corrupt the line-oriented `path:line:content` output.
-        let file_name = sanitize_name(
-            &resolved
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default(),
-        );
         let has_results = !sink.results.is_empty();
         let hint = regex_mode_hint(pattern, regex, has_results);
         if !has_results {
@@ -171,13 +169,12 @@ fn run_grep_walk(
             .iter()
             .map(|(_, line_num, content)| format!("{file_name}:{line_num}:{content}"))
             .collect();
-        let body = join_grep_lines(lines, sink.done, max_results);
-        let output = if let Some(h) = hint {
-            format!("{h}\n{body}")
-        } else {
-            body
-        };
-        return Ok(truncate_tool_output(&output));
+        return Ok(assemble_grep_output(
+            hint,
+            lines.join("\n"),
+            sink.done,
+            max_results,
+        ));
     }
 
     // Walk the directory tree with gitignore-aware traversal.
@@ -191,9 +188,14 @@ fn run_grep_walk(
                 return WalkState::Continue;
             }
 
-            // Apply the include glob filter if one was configured.
+            // Apply the include glob filter if one was configured. The glob
+            // is matched against the entry's **root-relative** path (gitignore
+            // convention, matching find's native include), so `src/*.rs`
+            // matches `src/main.rs` regardless of where the search root
+            // happens to live. Matching the absolute path instead would
+            // silently return nothing for every anchored include.
             if let Some(ref filter) = include_filter
-                && !filter.matches(entry.path())
+                && !filter.matches(entry.relative_path())
             {
                 return WalkState::Continue;
             }
@@ -249,13 +251,12 @@ fn run_grep_walk(
         })
         .collect();
 
-    let body = join_grep_lines(lines, sink.done, max_results);
-    let output = if let Some(h) = hint {
-        format!("{h}\n{body}")
-    } else {
-        body
-    };
-    Ok(truncate_tool_output(&output))
+    Ok(assemble_grep_output(
+        hint,
+        lines.join("\n"),
+        sink.done,
+        max_results,
+    ))
 }
 
 pub fn execute_grep_tool(
@@ -288,7 +289,7 @@ impl Tool for Grep {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents for a pattern. Pattern is treated as a literal substring by default — set regex:true to use regular expressions (be sure to set regex:true if your pattern contains regex metacharacters like |, (, ), ^, $, +, etc. — without it they are matched literally). Use include to filter files by glob (e.g. \"*.rs\"), path to scope the search (a file or directory), and max_results to cap matches. Results in file:line:content format. Respects .gitignore, hidden, and binary files."
+        "Search file contents for a pattern. Pattern is treated as a literal substring by default — set regex:true to use regular expressions (be sure to set regex:true if your pattern contains regex metacharacters like |, (, ), ^, $, +, etc. — without it they are matched literally). Use include to filter files by glob (e.g. \"*.rs\"); globs with '/' match root-relative paths (e.g. 'src/*.rs') and bare globs match file names. path scopes the search (a file or directory), and max_results caps matches (a '...[truncated at N matches]' line is appended when the cap is hit — it means *at least* N exist). Results in file:line:content format. Respects .gitignore, hidden, and binary files."
     }
 
     fn supports_streaming_output() -> bool {
@@ -348,15 +349,22 @@ impl Tool for Grep {
     }
 }
 
-/// Join grep match lines, appending the explicit truncation marker when the
-/// walk stopped at the max_results cap so the caller can tell "exactly N
-/// matches" from "N of many more". Shared by the single-file and directory
-/// paths.
-fn join_grep_lines(lines: Vec<String>, truncated: bool, max_results: usize) -> String {
-    let body = lines.join("\n");
-    match truncation_marker(truncated, max_results, "matches") {
-        Some(marker) => format!("{body}\n{marker}"),
-        None => body,
+/// Assemble the final grep output: an optional regex-mode hint line, then the
+/// match lines capped at the shared byte budget with the truncation marker
+/// appended **past** the cap so the "N of many more" count signal always
+/// survives even when the body alone exceeds the budget. Shared by the
+/// single-file and directory paths.
+fn assemble_grep_output(
+    hint: Option<String>,
+    body: String,
+    truncated: bool,
+    max_results: usize,
+) -> String {
+    let marker = truncation_marker(truncated, max_results, "matches");
+    let capped = finish_tool_output(&body, marker);
+    match hint {
+        Some(h) => format!("{h}\n{capped}"),
+        None => capped,
     }
 }
 
@@ -724,15 +732,16 @@ mod tests {
     }
 
     #[test]
-    fn test_path_pattern_include_matches_full_path() {
+    fn test_path_anchored_include_matches_relative_paths() {
         let dir = TempDir::new().expect("temp dir");
-        // Create a file at root level
+        // Create a file at root level (should NOT match `*/data.txt` — it is
+        // not inside a subdirectory relative to the search root).
         {
             let mut f =
                 std::fs::File::create(dir.path().join("data.txt")).expect("create data.txt");
             writeln!(f, "hello").expect("write");
         }
-        // Create a file in subdir matching the path pattern
+        // Create a file in subdir (SHOULD match `*/data.txt`).
         {
             let sub = dir.path().join("sub");
             std::fs::create_dir(&sub).expect("create subdir");
@@ -741,9 +750,9 @@ mod tests {
         }
 
         let tool = Grep;
-        // Pattern has a `/` so it's matched against the full path.
-        // Since zlob's `*` matches `/`, `*/data.txt` matches any
-        // file at any depth whose basename is `data.txt`.
+        // Pattern has a `/` so it's matched against the root-relative path.
+        // `*/data.txt` requires the file to sit exactly one directory below
+        // the search root — a root-level `data.txt` has no leading directory.
         let args = GrepArgs {
             pattern: "hello".to_string(),
             regex: false,
@@ -752,10 +761,74 @@ mod tests {
             max_results: None,
         };
         let result = tool.execute(args, None, None, None).unwrap();
-        // `*/data.txt` against absolute paths: zlob's `*` matches `/`,
-        // so `*` consumes the prefix, then `/data.txt` matches literally.
-        // Both `/tmp/xxx/data.txt` and `/tmp/xxx/sub/data.txt` should match.
-        assert_eq!(result.lines().count(), 2, "expected 2 matches:\n{result}");
+        assert_eq!(result.lines().count(), 1, "expected 1 match:\n{result}");
+        assert!(
+            result.contains("sub/data.txt:1:hello"),
+            "expected sub/data.txt:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_src_anchored_include_matches_relative_to_root() {
+        // The regression this guards: `src/*.rs` used to be matched against
+        // the absolute path and silently returned nothing. It must match
+        // `src/main.rs` relative to the search root wherever that root lives.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::create_dir(dir.path().join("src")).expect("create src");
+        {
+            let mut f =
+                std::fs::File::create(dir.path().join("src/main.rs")).expect("create main.rs");
+            writeln!(f, "hello").expect("write");
+        }
+
+        let tool = Grep;
+        let args = GrepArgs {
+            pattern: "hello".to_string(),
+            regex: false,
+            include: Some("src/*.rs".to_string()),
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            result.contains("src/main.rs:1:hello"),
+            "expected src/main.rs match:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_single_file_include_matches_basename() {
+        let dir = setup_test_dir();
+        let tool = Grep;
+        // A directly-named file has no directory context: the include glob is
+        // matched against the file name. A bare glob matches the basename.
+        let file_path = dir.path().join("test1.rs");
+        let args = GrepArgs {
+            pattern: "hello".to_string(),
+            regex: false,
+            include: Some("*.rs".to_string()),
+            path: Some(file_path.to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            result.contains("test1.rs:1:fn hello()"),
+            "expected match in test1.rs:\n{result}"
+        );
+
+        // A non-matching glob filters the file out entirely.
+        let args = GrepArgs {
+            pattern: "hello".to_string(),
+            regex: false,
+            include: Some("*.py".to_string()),
+            path: Some(file_path.to_str().unwrap().to_string()),
+            max_results: None,
+        };
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            result.is_empty(),
+            "expected no match for *.py on test1.rs:\n{result}"
+        );
     }
 
     #[test]

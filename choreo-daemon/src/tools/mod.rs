@@ -1031,6 +1031,11 @@ pub(crate) fn human_size(bytes: u64) -> String {
 /// when the target resolves to a directory so dir-links are visually
 /// distinct from file-links. Degrades to `<unreadable target>` instead of
 /// failing the whole listing or tool call.
+///
+/// The returned label is sanitized: a target containing a control character
+/// (a newline is legal in POSIX file names) would otherwise split the
+/// line-oriented output, defeating the one-line-per-entry invariant that
+/// `sanitize_name` enforces for the entry names themselves.
 pub(crate) fn symlink_target_label(path: &Path) -> String {
     let target = match std::fs::read_link(path) {
         Ok(target) => target.to_string_lossy().into_owned(),
@@ -1045,15 +1050,33 @@ pub(crate) fn symlink_target_label(path: &Path) -> String {
     };
     // std::fs::metadata follows the link; on failure (e.g. dangling link) we
     // keep the bare target rather than failing the whole listing.
-    match std::fs::metadata(path) {
+    let label = match std::fs::metadata(path) {
         Ok(meta) if meta.is_dir() => format!("{target}/"),
         _ => target,
+    };
+    sanitize_name(&label)
+}
+
+/// Cap `body` at the shared byte budget, then append `marker` (if any)
+/// **after** the cap so the truncation signal always survives the byte cut.
+/// The marker is short and critical ("N of many more"), so it is appended
+/// past the budget — the same convention the file-read tools use for their
+/// truncation markers (see ARCHITECTURE.md).
+pub(crate) fn finish_tool_output(body: &str, marker: Option<String>) -> String {
+    let mut out = truncate_tool_output(body);
+    if let Some(marker) = marker {
+        out.push_str(&format!("\n{marker}"));
     }
+    out
 }
 
 /// Marker appended when a search tool (`find`/`grep`) stops at its
 /// `max_results` cap, so the LLM can tell "exactly N results" from
 /// "N of many more". `None` when the walk completed naturally.
+///
+/// Note the marker means **at least** N matches exist: it fires as soon as
+/// the cap is hit, so a tree with exactly N matching entries also reports it
+/// (proving "more exist" would require walking one extra entry).
 pub(crate) fn truncation_marker(truncated: bool, cap: usize, noun: &str) -> Option<String> {
     truncated.then(|| format!("...[truncated at {cap} {noun}]"))
 }
@@ -2220,6 +2243,41 @@ mod tests {
         assert_eq!(sanitize_name("plain.txt"), "plain.txt");
         assert_eq!(sanitize_name("a\nb"), "a\\nb");
         assert_eq!(sanitize_name("a\tb"), "a\\tb");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_target_label_sanitizes_control_chars() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        // A symlink whose *target* name contains a literal newline (legal on
+        // POSIX) must render escaped so line-oriented output stays intact.
+        let target_name = "evil\ntarget.txt";
+        std::fs::write(dir.path().join(target_name), "hi").expect("write target");
+        symlink(target_name, dir.path().join("link")).expect("symlink");
+        let label = symlink_target_label(&dir.path().join("link"));
+        assert_eq!(label, "evil\\ntarget.txt");
+    }
+
+    #[test]
+    fn finish_tool_output_keeps_marker_past_byte_cap() {
+        // A body larger than the shared byte budget: the byte-cap truncation
+        // marker appears, and the caller's marker must survive appended after
+        // it — the count signal is the whole point of the marker.
+        let big = "x".repeat(super::MAX_TOOL_OUTPUT_BYTES + 100);
+        let out = finish_tool_output(&big, Some("...[truncated at 5 results]".to_string()));
+        assert!(out.contains("...[truncated]"), "expected byte-cap marker");
+        assert!(
+            out.ends_with("...[truncated at 5 results]"),
+            "marker must survive the cap: …{}",
+            &out[out.len().saturating_sub(60)..]
+        );
+    }
+
+    #[test]
+    fn finish_tool_output_without_marker_is_plain_cap() {
+        let body = "a\nb";
+        assert_eq!(finish_tool_output(body, None), body);
     }
 
     #[test]

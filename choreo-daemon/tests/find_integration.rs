@@ -268,3 +268,99 @@ fn find_bare_glob_matches_basename_at_any_depth() {
     assert!(content.contains("src/main.rs"), "{content}");
     assert!(content.contains("top.rs"), "{content}");
 }
+
+#[test]
+#[ignore]
+fn find_leading_dot_slash_pattern_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+
+    // A leading `./` is a path prefix, not part of any file name — it must
+    // not silently produce zero results.
+    let result = execute_find_tool(
+        &FindArgs {
+            pattern: "./src/*.rs".to_string(),
+            glob: false,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        },
+        None,
+    );
+    let content = result.unwrap_or_default();
+    assert!(content.contains("src/main.rs"), "{content}");
+}
+
+#[test]
+#[ignore]
+fn find_absolute_pattern_relative_to_root() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+
+    // An absolute pattern under the search root is converted to the
+    // equivalent root-relative pattern instead of silently matching nothing.
+    let abs_pattern = format!("{}/src/*.rs", dir.path().display());
+    let result = execute_find_tool(
+        &FindArgs {
+            pattern: abs_pattern,
+            glob: false,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        },
+        None,
+    );
+    let content = result.unwrap_or_default();
+    assert!(content.contains("src/main.rs"), "{content}");
+}
+
+#[test]
+#[ignore]
+fn find_absolute_pattern_outside_root_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    std::fs::write(other.path().join("x.rs"), "").unwrap();
+
+    // An absolute pattern outside the search root cannot be expressed
+    // relative to it — error rather than silently returning nothing.
+    let abs_pattern = format!("{}/x.rs", other.path().display());
+    let result = execute_find_tool(
+        &FindArgs {
+            pattern: abs_pattern,
+            glob: false,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        },
+        None,
+    );
+    assert!(result.is_err(), "expected an error, got {result:?}");
+    assert!(result.unwrap_err().0.contains("outside the search root"));
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn find_sanitizes_control_chars_in_symlink_target() {
+    let dir = tempfile::tempdir().unwrap();
+    // A symlink whose *target* name contains a literal newline — the target
+    // must be escaped so the result stays on exactly one line.
+    let target_name = "evil\ntarget.txt";
+    std::fs::write(dir.path().join(target_name), "hi\n").unwrap();
+    std::os::unix::fs::symlink(target_name, dir.path().join("link.txt")).unwrap();
+
+    let result = execute_find_tool(
+        &FindArgs {
+            pattern: "link".to_string(),
+            glob: false,
+            path: Some(dir.path().to_str().unwrap().to_string()),
+            max_results: None,
+        },
+        None,
+    );
+    let content = result.unwrap_or_default();
+    assert!(
+        content.contains("link.txt -> evil\\ntarget.txt"),
+        "{content:?}"
+    );
+    assert_eq!(content.lines().count(), 1, "{content:?}");
+}
