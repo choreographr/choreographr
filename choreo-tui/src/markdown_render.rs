@@ -580,8 +580,22 @@ fn add_margin_lines(
 
 pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     let document = MarkdownDocument::parse(markdown);
+    // Normalize heading levels so the document's first heading always renders
+    // as level 1.  LLM output sometimes starts a document at `##` (or deeper)
+    // instead of `#`; since the decorative prefixes below are anchored to
+    // level 1, we shift every heading down by (first_level - 1) so a
+    // `## First / ### Sub` document renders as level 1 + level 2.
+    let heading_shift = first_heading_level(&document.blocks)
+        .map(|level| (level.saturating_sub(1)) as usize)
+        .unwrap_or(0);
     let mut lines = Vec::new();
-    render_markdown_blocks(&document.blocks, &mut lines, 0, width as usize);
+    render_markdown_blocks(
+        &document.blocks,
+        &mut lines,
+        0,
+        width as usize,
+        heading_shift,
+    );
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
     }
@@ -604,17 +618,64 @@ fn ensure_blank_line(lines: &mut Vec<Line<'static>>) {
     }
 }
 
+/// Find the level of the first heading in the block tree, walking nested
+/// blockquotes and list items in document order.  Returns `None` when the
+/// document contains no headings at all.
+fn first_heading_level(blocks: &[MarkdownBlock]) -> Option<u8> {
+    for block in blocks {
+        match block {
+            MarkdownBlock::Heading { level, .. } => return Some(*level),
+            MarkdownBlock::BlockQuote(inner) => {
+                if let Some(level) = first_heading_level(inner) {
+                    return Some(level);
+                }
+            }
+            MarkdownBlock::List { items, .. } => {
+                for item in items {
+                    if let Some(level) = first_heading_level(item) {
+                        return Some(level);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Build the decorative prefix for a heading line from its *normalized*
+/// level: level 1 has no prefix (the `# ` marker is dropped entirely), level 2
+/// gets a single powerline wedge (U+E0B4), and deeper levels get one solid
+/// block per extra level stacked before the wedge (`██ ` + title for level 4).
+/// Returns `None` for level 1 so the heading text renders flush left.
+fn heading_prefix(level: usize) -> Option<String> {
+    match level {
+        0 | 1 => None,
+        2 => Some("\u{e0b4} ".to_string()),
+        _ => Some(format!("{}\u{e0b4} ", "█".repeat(level - 2))),
+    }
+}
+
 fn render_markdown_blocks(
     blocks: &[MarkdownBlock],
     lines: &mut Vec<Line<'static>>,
     indent: usize,
     width: usize,
+    heading_shift: usize,
 ) {
     for (index, block) in blocks.iter().enumerate() {
         if index > 0 {
             ensure_blank_line(lines);
         }
-        render_markdown_block(block, lines, indent, width);
+        // Headings get a *second* blank line for extra visual separation —
+        // except when the heading is the first block (index 0) of the
+        // document (or of a nested quote/list context), which must not be
+        // preceded by blank lines.  `ensure_blank_line` above supplies the
+        // first blank; this push adds the second.
+        if index > 0 && matches!(block, MarkdownBlock::Heading { .. }) {
+            lines.push(Line::from(Span::styled(String::new(), Style::default())));
+        }
+        render_markdown_block(block, lines, indent, width, heading_shift);
     }
 }
 
@@ -623,6 +684,7 @@ fn render_markdown_block(
     lines: &mut Vec<Line<'static>>,
     indent: usize,
     width: usize,
+    heading_shift: usize,
 ) {
     match block {
         MarkdownBlock::Paragraph(content) => lines.extend(inlines_to_lines(
@@ -633,11 +695,10 @@ fn render_markdown_block(
             Modifier::empty(),
         )),
         MarkdownBlock::Heading { level, content } => {
-            // Two blank lines before every heading for visual separation.
-            // render_markdown_blocks already supplies one via ensure_blank_line;
-            // the unconditional push here adds the second.
-            lines.push(Line::from(Span::styled(String::new(), Style::default())));
-            let prefix = Some(format!("{} ", "#".repeat(*level as usize)));
+            // Normalize the raw markdown level by the document-wide shift so
+            // the first heading always renders as level 1 (see markdown_lines).
+            let normalized = (*level as usize).saturating_sub(heading_shift).max(1);
+            let prefix = heading_prefix(normalized);
             // Headings are rendered bold + underlined for visual distinction.
             lines.extend(inlines_to_lines(
                 content,
@@ -695,7 +756,13 @@ fn render_markdown_block(
             let mut quoted = Vec::new();
             // Content is rendered at (width - indent - 2) so that when "> " and the
             // outer indent are prepended on each line the total stays within `width`.
-            render_markdown_blocks(blocks, &mut quoted, 0, width.saturating_sub(indent + 2));
+            render_markdown_blocks(
+                blocks,
+                &mut quoted,
+                0,
+                width.saturating_sub(indent + 2),
+                heading_shift,
+            );
             for line in quoted {
                 let mut spans = line.spans.clone();
                 spans.insert(0, Span::styled("> ".to_string(), Style::default()));
@@ -724,6 +791,7 @@ fn render_markdown_block(
                     &mut rendered,
                     0,
                     width.saturating_sub(indent + marker_width),
+                    heading_shift,
                 );
                 // Track whether the item spans more than one visual line.
                 // Multi-line items get a blank line after them; single-line
@@ -2915,18 +2983,90 @@ mod tests {
     }
 
     #[test]
-    fn first_heading_no_extra_blank_on_top() {
-        // A heading at the very start of the document should not have two
-        // blank lines above it (there's no content before it).
+    fn first_heading_no_blank_lines_on_top() {
+        // A heading at the very start of the document must not be preceded by
+        // blank lines — the "two blank lines" rule only applies to headings
+        // that follow other content.
         let result = markdown_lines("# first heading", 80);
-        let heading_idx = result.iter().position(|l| l.to_string().contains("first"));
-        assert!(heading_idx.is_some(), "heading should appear");
-        // The heading should be the first non-empty line, or at line 0.
-        // There shouldn't be two blank lines before it.
-        let idx = heading_idx.unwrap();
+        let heading_idx = result
+            .iter()
+            .position(|l| l.to_string().contains("first"))
+            .expect("heading should appear");
+        assert_eq!(
+            heading_idx, 0,
+            "first heading should be the very first rendered line, got {heading_idx} lines before it: \
+             {result:?}"
+        );
+    }
+
+    #[test]
+    fn first_heading_has_no_hash_prefix() {
+        // A level-1 heading drops the `# ` marker entirely — the title
+        // renders flush left.
+        let result = markdown_lines("# Title", 80);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].to_string(), "Title");
+        assert!(!result[0].to_string().contains('#'));
+    }
+
+    #[test]
+    fn heading_prefix_by_level() {
+        // Level 1 has no prefix; level 2 gets a single wedge; deeper levels
+        // stack one solid block per extra level before the wedge.
+        assert_eq!(heading_prefix(1), None);
+        assert_eq!(heading_prefix(2), Some("\u{e0b4} ".to_string()));
+        assert_eq!(heading_prefix(3), Some("█\u{e0b4} ".to_string()));
+        assert_eq!(heading_prefix(4), Some("██\u{e0b4} ".to_string()));
+        assert_eq!(heading_prefix(6), Some("████\u{e0b4} ".to_string()));
+    }
+
+    #[test]
+    fn level_two_heading_renders_wedge_prefix() {
+        let result = markdown_lines("# Title\n\n## Section", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(whole.contains("\u{e0b4} Section"), "got: {whole:?}");
         assert!(
-            idx < 2,
-            "first heading should not have two blank lines above, got {idx} lines before it"
+            !whole.contains("## Section"),
+            "raw markdown markers must not appear, got: {whole:?}"
+        );
+    }
+
+    #[test]
+    fn level_three_heading_renders_block_before_wedge() {
+        let result = markdown_lines("# Title\n\n## Section\n\n### Sub", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(whole.contains("█\u{e0b4} Sub"), "got: {whole:?}");
+    }
+
+    #[test]
+    fn first_heading_normalized_from_double_hash() {
+        // A document whose first heading is `##` is normalized so the first
+        // heading renders as level 1 (no prefix) and every later heading
+        // shifts down by the same amount.
+        let result = markdown_lines("## First\n\n### Sub", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(whole.contains("First"), "first heading text should render");
+        assert!(
+            whole.contains("\u{e0b4} Sub"),
+            "the `###` heading should normalize to level 2 and get the wedge, got: {whole:?}"
+        );
+        assert!(
+            !whole.contains("## First") && !whole.contains("### Sub"),
+            "raw hash markers must not appear, got: {whole:?}"
+        );
+    }
+
+    #[test]
+    fn first_heading_normalization_shifts_only_heading_levels() {
+        // Paragraph text is untouched; only heading levels shift.  With the
+        // first heading at `##` (shift 1), a `#####` heading normalizes to
+        // level 4 → two solid blocks before the wedge.
+        let result = markdown_lines("## First\n\nplain paragraph\n\n##### Deep", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(whole.contains("plain paragraph"), "paragraph should render");
+        assert!(
+            whole.contains("██\u{e0b4} Deep"),
+            "`#####` normalizes to level 4 → two blocks + wedge, got: {whole:?}"
         );
     }
 
