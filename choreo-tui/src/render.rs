@@ -898,12 +898,6 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
             )),
             Line::from(format!("Turn Count:    {}", detail.turn_count)),
             Line::from(format!(
-                "Max Turns:     {}",
-                detail
-                    .max_turns
-                    .map_or("unlimited".to_string(), |mt| mt.to_string())
-            )),
-            Line::from(format!(
                 "Account:       {}",
                 detail.account_name.as_deref().unwrap_or("-")
             )),

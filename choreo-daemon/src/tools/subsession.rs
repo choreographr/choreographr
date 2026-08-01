@@ -15,8 +15,6 @@ pub struct SpawnSubsessionArgs {
     pub prompt: String,
     /// Optional title for the sub-session
     pub title: Option<String>,
-    /// Optional maximum tool-calling iterations for this sub-session
-    pub max_turns: Option<u32>,
     /// Optional tool categories to activate. Inherits from parent session if not set.
     pub categories: Option<Vec<String>>,
 }
@@ -44,9 +42,6 @@ impl Tool for SpawnSubsession {
         let mut parts = vec![format!("Spawning subsession: {}.", args.prompt)];
         if let Some(ref title) = args.title {
             parts.push(format!(" Title: {}.", title));
-        }
-        if let Some(turns) = args.max_turns {
-            parts.push(format!(" Max turns: {}.", turns));
         }
         if let Some(ref cats) = args.categories {
             parts.push(format!(" Categories: {}.", cats.join(", ")));
@@ -95,7 +90,6 @@ impl Tool for SpawnSubsession {
                 title: args.title,
                 parent_session_id: Some(ctx.session_id),
                 working_dir: child_working_dir.clone(),
-                max_turns: args.max_turns,
                 reasoning_effort: ctx.reasoning_effort.clone(),
                 selected_model: ctx.selected_model.clone(),
                 context_config: None,
@@ -230,7 +224,6 @@ mod tests {
         let args: SpawnSubsessionArgs = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(args.prompt, "do something");
         assert!(args.title.is_none());
-        assert!(args.max_turns.is_none());
         assert!(args.categories.is_none());
     }
 
@@ -239,14 +232,12 @@ mod tests {
         let json = r#"{
             "prompt": "work",
             "title": "my sub",
-            "max_turns": 10,
             "categories": ["core", "shell"]
         }"#;
         let args: SpawnSubsessionArgs =
             serde_json::from_str(json).expect("should deserialize full payload");
         assert_eq!(args.prompt, "work");
         assert_eq!(args.title.as_deref(), Some("my sub"));
-        assert_eq!(args.max_turns, Some(10));
         assert_eq!(args.categories, Some(vec!["core".into(), "shell".into()]));
     }
 
@@ -263,7 +254,6 @@ mod tests {
         let args = SpawnSubsessionArgs {
             prompt: "Write a test".into(),
             title: None,
-            max_turns: None,
             categories: None,
         };
         let desc = tool.describe_invocation(&args);
@@ -276,13 +266,11 @@ mod tests {
         let args = SpawnSubsessionArgs {
             prompt: "Refactor code".into(),
             title: Some("Refactor".into()),
-            max_turns: Some(10),
             categories: Some(vec!["core".into(), "git".into()]),
         };
         let desc = tool.describe_invocation(&args);
         assert!(desc.contains("Spawning subsession: Refactor code."));
         assert!(desc.contains("Title: Refactor."));
-        assert!(desc.contains("Max turns: 10."));
         assert!(desc.contains("Categories: core, git."));
     }
 }

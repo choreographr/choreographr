@@ -271,7 +271,6 @@ fn continue_new_session_after_models(
         title: None,
         parent_session_id: None,
         working_dir: None,
-        max_turns: None,
         context_config: None,
         account_name,
         selected_model: None,

@@ -160,18 +160,11 @@ impl TurnEventHandler for AppState {
         session_id: u64,
         title: Option<String>,
         working_dir: Option<String>,
-        max_turns: Option<u32>,
         _account_name: Option<String>,
         _selected_model: Option<String>,
         _reasoning_effort: Option<String>,
     ) {
-        debug!(
-            session_id,
-            ?title,
-            ?working_dir,
-            ?max_turns,
-            "handle_session_created"
-        );
+        debug!(session_id, ?title, ?working_dir, "handle_session_created");
         self.attached_session_id = Some(session_id);
     }
 

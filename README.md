@@ -250,13 +250,13 @@ data model.
 **Agent loop (harness).** The daemon drives a server-side loop that repeatedly
 sends conversation history and available tools to the LLM, executes any tool
 calls the model requests, appends the results, and loops until the model
-produces a final answer or the per-session iteration cap is reached (0 =
-unlimited). Each session keeps a responsive control thread and runs request work
+produces a final answer, is cancelled, or hits an error (subject to the
+daemon-wide iteration cap; 0 = unlimited). Each session keeps a responsive control thread and runs request work
 in a separate worker thread. The client only sees `ToolCallStarted` /
 `ToolCallFinished` lifecycle events, keeping it simple.
 
 **Session / subsession.** A *session* is a persisted conversation with its own
-message history, model, working directory, and tool-iteration cap. Sessions form
+message history, model, and working directory. Sessions form
 a parent-child tree, support multiple concurrent client attachments, and survive
 daemon restarts via an embedded `redb` database. A *subsession* is a child
 session spawned by the `spawn_subsession` tool — it inherits the parent's
@@ -286,7 +286,7 @@ The daemon reads config from `~/.config/choreographr/config.toml` (all fields
 optional):
 
 ```toml
-max_turns = 25      # 0 = unlimited (loop runs until final answer or error)
+max_turns = 0      # daemon-wide tool-loop budget; 0 = unlimited (default)
 
 [context]
 context_file_names = ["AGENTS.md", "CLAUDE.md"]
@@ -309,8 +309,10 @@ The socket path defaults to `/tmp/Choreographr.sock` (override with
 `~/.local/share/choreographr/state.redb` (override with `CHOREOGRAPHR_DB_PATH`).
 
 `CHOREOGRAPHR_MAX_TURNS` overrides the `max_turns` setting from `config.toml`
-(resolution chain: per-session `max_turns` → `CHOREOGRAPHR_MAX_TURNS` →
-`config.toml` → default 25; `0` = unlimited).
+(resolution chain: `CHOREOGRAPHR_MAX_TURNS` → `config.toml` → default 0; `0` =
+unlimited — the agent loop runs until the model produces a final answer, is
+cancelled, or hits an error). This is a daemon-wide cap; individual sessions no
+longer carry their own `max_turns`.
 
 ### Accounts
 

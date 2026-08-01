@@ -114,7 +114,9 @@ pub struct RequestContext {
     pub tool_registry: Arc<ToolRegistry>,
     /// Channel to the daemon command loop.
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
-    /// Default max agent loop turns when the session doesn't specify one.
+    /// Daemon-wide cap on agent tool-loop iterations per request.  This is
+    /// the sole source of the loop limit now that per-session `max_turns` has
+    /// been removed (0 = unlimited).
     pub max_turns_default: u32,
 }
 
@@ -133,7 +135,6 @@ pub struct SessionMetadata {
     pub created_at: i64,
     pub last_modified: i64,
     pub turn_count: u32,
-    pub max_turns: Option<u32>,
     pub status: SessionStatus,
     pub active_tool_groups: Vec<String>,
     pub account_name: Option<String>,
@@ -153,7 +154,6 @@ impl From<SessionRecord> for SessionMetadata {
             reasoning_effort: record.reasoning_effort,
             parent_session_id: record.parent_session_id,
             working_dir: record.working_dir.map(PathBuf::from),
-            max_turns: record.max_turns,
             created_at: record.created_at,
             last_modified: record.last_modified,
             status: SessionStatus::Sleeping,
@@ -179,7 +179,6 @@ impl From<SessionMetadata> for SessionRecord {
             reasoning_effort: meta.reasoning_effort,
             parent_session_id: meta.parent_session_id,
             working_dir: meta.working_dir,
-            max_turns: meta.max_turns,
             turn_count: meta.turn_count,
             created_at: meta.created_at,
             last_modified: meta.last_modified,
@@ -216,7 +215,6 @@ impl SessionMetadata {
             created_at: self.created_at,
             last_modified: self.last_modified,
             turn_count: self.turn_count,
-            max_turns: self.max_turns,
             status: self.status.clone(),
             active_tool_groups: self.active_tool_groups.clone(),
             account_name: self.account_name.clone(),
@@ -237,7 +235,6 @@ pub struct SessionConfig {
     pub reasoning_effort: Option<String>,
     pub parent_session_id: Option<u64>,
     pub working_dir: Option<PathBuf>,
-    pub max_turns: Option<u32>,
     pub created_at: i64,
     pub last_modified: i64,
     pub status: SessionStatus,
@@ -257,7 +254,6 @@ impl Default for SessionConfig {
             reasoning_effort: None,
             parent_session_id: None,
             working_dir: None,
-            max_turns: None,
             created_at: 0,
             last_modified: 0,
             status: SessionStatus::Inactive,
@@ -303,7 +299,6 @@ impl From<&SessionConfig> for SessionMetadata {
             created_at: config.created_at,
             last_modified: config.last_modified,
             turn_count: 0,
-            max_turns: config.max_turns,
             status: config.status.clone(),
             active_tool_groups: config.active_tool_groups.iter().cloned().collect(),
             account_name: config.account_name.clone(),
@@ -440,7 +435,6 @@ impl SessionState {
                 .working_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
-            max_turns: self.config.max_turns,
             turns: self.turns.clone(),
             active_tool_groups: self.config.active_tool_groups.iter().cloned().collect(),
             token_usage: Some(self.config.accumulated_usage),
@@ -693,7 +687,6 @@ pub fn session_main(
         working_dir: init_record
             .as_ref()
             .and_then(|r| r.working_dir.as_ref().map(PathBuf::from)),
-        max_turns: init_record.as_ref().and_then(|r| r.max_turns),
         created_at: init_record
             .as_ref()
             .map(|r| r.created_at)
@@ -1323,7 +1316,6 @@ fn handle_get_summary(
         created_at: state.config.created_at,
         last_modified: state.config.last_modified,
         turn_count: state.turns.len() as u32,
-        max_turns: state.config.max_turns,
         status: state.config.status.clone(),
         active_tool_groups: state.config.active_tool_groups.iter().cloned().collect(),
         account_name: state.config.account_name.clone(),
@@ -1978,7 +1970,6 @@ mod tests {
                 reasoning_effort: None,
                 parent_session_id: None,
                 working_dir: Some(std::path::PathBuf::from("/tmp")),
-                max_turns: Some(10),
                 created_at: 1000,
                 last_modified: 1000,
                 status: SessionStatus::Inactive,

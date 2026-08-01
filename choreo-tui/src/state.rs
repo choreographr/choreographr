@@ -316,7 +316,6 @@ pub(crate) struct SessionDetailData {
     pub(crate) created_at: i64,
     pub(crate) last_modified: i64,
     pub(crate) turn_count: u32,
-    pub(crate) max_turns: Option<u32>,
     pub(crate) status: SessionStatus,
     pub(crate) active_tool_groups: Vec<String>,
     pub(crate) account_name: Option<String>,
@@ -904,7 +903,6 @@ impl SessionManagerState {
             let created_at = s.created_at;
             let last_modified = s.last_modified;
             let turn_count = s.turn_count;
-            let max_turns = s.max_turns;
             SessionDetailData {
                 session_id,
                 title,
@@ -915,7 +913,6 @@ impl SessionManagerState {
                 created_at,
                 last_modified,
                 turn_count,
-                max_turns,
                 status: s.status.clone(),
                 active_tool_groups: s.active_tool_groups.clone(),
                 account_name: s.account_name.clone(),
@@ -2251,7 +2248,6 @@ impl App {
                             title: Some("default".to_string()),
                             parent_session_id: None,
                             working_dir: None,
-                            max_turns: None,
                             context_config: None,
                             account_name: default_account,
                             selected_model: None,
@@ -3084,7 +3080,6 @@ impl TurnEventHandler for App {
         _session_id: u64,
         _title: Option<String>,
         _working_dir: Option<String>,
-        _max_turns: Option<u32>,
         _account_name: Option<String>,
         _selected_model: Option<String>,
         _reasoning_effort: Option<String>,
@@ -3176,7 +3171,6 @@ mod tests {
             created_at: 1000,
             last_modified: 1000,
             turn_count: 0,
-            max_turns: None,
             status: SessionStatus::Inactive,
             active_tool_groups: vec!["core".into()],
             account_name: None,
@@ -3197,7 +3191,6 @@ mod tests {
             created_at: 0,
             last_modified: 0,
             turn_count: 0,
-            max_turns: None,
             status: SessionStatus::Inactive,
             active_tool_groups: vec![],
             account_name: None,

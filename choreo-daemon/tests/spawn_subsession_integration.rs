@@ -30,7 +30,6 @@ fn spawn_subsession_happy_path() {
                 title,
                 parent_session_id,
                 working_dir,
-                max_turns,
                 reasoning_effort,
                 selected_model,
                 context_config: _,
@@ -42,7 +41,6 @@ fn spawn_subsession_happy_path() {
                 assert_eq!(title.as_deref(), Some("test-sub"));
                 assert_eq!(parent_session_id, Some(1));
                 assert_eq!(working_dir, None);
-                assert_eq!(max_turns, Some(5));
                 assert_eq!(reasoning_effort, None);
                 assert_eq!(selected_model, None);
                 assert_eq!(account_name, None);
@@ -98,7 +96,6 @@ fn spawn_subsession_happy_path() {
         SpawnSubsessionArgs {
             prompt: "work on this task".into(),
             title: Some("test-sub".into()),
-            max_turns: Some(5),
             categories: None,
         },
         None, // x_credentials
@@ -156,7 +153,6 @@ fn spawn_subsession_daemon_rejects_creation() {
         SpawnSubsessionArgs {
             prompt: "irrelevant".into(),
             title: None,
-            max_turns: None,
             categories: None,
         },
         None,
@@ -203,7 +199,6 @@ fn spawn_subsession_daemon_disconnected() {
         SpawnSubsessionArgs {
             prompt: "should not matter".into(),
             title: None,
-            max_turns: None,
             categories: None,
         },
         None,
@@ -232,7 +227,6 @@ fn spawn_subsession_no_context() {
         SpawnSubsessionArgs {
             prompt: "irrelevant".into(),
             title: None,
-            max_turns: None,
             categories: None,
         },
         None,
@@ -311,7 +305,6 @@ fn spawn_subsession_inherits_categories() {
         SpawnSubsessionArgs {
             prompt: "work".into(),
             title: None,
-            max_turns: None,
             categories: None, // inherit from ctx
         },
         None,
@@ -380,7 +373,6 @@ fn spawn_subsession_overrides_categories() {
         SpawnSubsessionArgs {
             prompt: "work".into(),
             title: None,
-            max_turns: None,
             categories: Some(vec!["db".into()]),
         },
         None,
@@ -449,7 +441,6 @@ fn spawn_subsession_inherits_selected_model() {
         SpawnSubsessionArgs {
             prompt: "work".into(),
             title: None,
-            max_turns: None,
             categories: None,
         },
         None,

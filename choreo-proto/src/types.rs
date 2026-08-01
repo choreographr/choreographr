@@ -246,7 +246,6 @@ pub struct SessionSummary {
     /// changes, and used to order the sessions list (newest first).
     pub last_modified: i64,
     pub turn_count: u32,
-    pub max_turns: Option<u32>,
     pub status: SessionStatus,
     pub active_tool_groups: Vec<String>,
     /// The AI provider account name associated with this session, if any.
@@ -270,7 +269,6 @@ pub enum ClientMessage {
         title: Option<String>,
         parent_session_id: Option<u64>,
         working_dir: Option<String>,
-        max_turns: Option<u32>,
         context_config: Option<ContextConfig>,
         account_name: Option<String>,
         selected_model: Option<String>,
@@ -370,7 +368,6 @@ pub enum DaemonMessage {
         title: Option<String>,
         parent_session_id: Option<u64>,
         working_dir: Option<String>,
-        max_turns: Option<u32>,
         account_name: Option<String>,
         selected_model: Option<String>,
         reasoning_effort: Option<String>,
@@ -387,7 +384,6 @@ pub enum DaemonMessage {
         selected_model: Option<String>,
         parent_session_id: Option<u64>,
         working_dir: Option<String>,
-        max_turns: Option<u32>,
         turns: BTreeMap<u32, Turn>,
         active_tool_groups: Vec<String>,
         /// Accumulated token usage for this session, if available.

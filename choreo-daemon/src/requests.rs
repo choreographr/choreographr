@@ -758,7 +758,7 @@ pub(crate) fn run_agent_loop(
     ctx: &RequestContext,
     user_text: Option<String>,
 ) -> io::Result<bool> {
-    let max_turns = session.config.max_turns.unwrap_or(ctx.max_turns_default);
+    let max_turns = ctx.max_turns_default;
     // `max_turns == 0` means *unlimited* — the loop runs until the model
     // produces a final answer, is cancelled, or hits an error.
     let limited = max_turns > 0;

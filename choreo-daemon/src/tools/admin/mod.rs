@@ -41,7 +41,6 @@ pub(crate) mod tests {
                             created_at: 1000,
                             last_modified: 1000,
                             turn_count: 5,
-                            max_turns: None,
                             status: SessionStatus::Inactive,
                             active_tool_groups: vec!["core".into()],
                             account_name: None,

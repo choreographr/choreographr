@@ -188,7 +188,6 @@ fn handle_session_message(
                         title: Some("default".to_string()),
                         parent_session_id: None,
                         working_dir: None,
-                        max_turns: None,
                         context_config: None,
                         account_name: None,
                         selected_model: None,

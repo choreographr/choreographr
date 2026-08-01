@@ -438,7 +438,7 @@ main()
 RunInput received
   └► extract/validate session, check active requests
      └► if chat_completions + tools:
-        └► tool-call loop (max configurable iterations, default 25; 0 = unlimited):
+        └► tool-call loop (daemon-wide configurable cap, default 0 = unlimited):
            0.5. build system content (skills + context with fingerprint cache + loaded skills + subdirectory hints)
            1. send messages + tools → model
            2. receive response
@@ -1149,7 +1149,7 @@ It runs in the concurrent dispatch path alongside other tools. When invoked:
 1. A child session is created via `DaemonCommand::CreateSession` with the parent as
    `parent_session_id` and inheriting the parent's working directory and tool groups.
 2. The prompt argument is pushed as a `SystemText` message into the child session.
-3. The child session runs its own `run_agent_loop()` (model → tools → model, up to 8 iterations).
+3. The child session runs its own `run_agent_loop()` (model → tools → model), subject to the daemon-wide `max_turns` cap.
 4. The child's assistant text output is collected and returned to the parent as the tool result.
 5. The child session persists in the database and is listable/attachable like any other session.
 
@@ -1205,7 +1205,6 @@ across snapshot/restore, metadata conversion, and record persistence:
 - `reasoning_effort: Option<String>` — per-session reasoning effort slug (e.g. `"off"`, `"low"`, `"medium"`, `"high"`)
 - `parent_session_id: Option<u64>` — parent session for sub-sessions
 - `working_dir: Option<PathBuf>` — working directory for filesystem tools
-- `max_turns: Option<u32>` — per-session tool loop iteration cap (inherits from parent). `0` = unlimited (loop runs until final answer, cancellation, or error).
 - `created_at: i64` — Unix timestamp of creation
 - `status: SessionStatus` — current status (Inactive, Inference, Retrying, Sleeping, …)
 - `active_tool_groups: HashSet<String>` — tool groups active for this session
@@ -1230,9 +1229,9 @@ across snapshot/restore, metadata conversion, and record persistence:
 ### Hierarchy and working directory inheritance
 
 Sessions form a tree: a session can have a `parent_session_id` pointing to another
-session. When creating a child session, if no explicit `working_dir` or `max_turns` is
-provided, it inherits the parent's value. This allows sub-sessions (subagents) to operate
-in the same directory as their parent with a default iteration cap.
+session. When creating a child session, if no explicit `working_dir` is
+provided, it inherits the parent's value. This allows sub-sessions (subagents)
+to operate in the same directory as their parent.
 
 ### Persistence lifecycle
 
@@ -1289,7 +1288,7 @@ uses `turn_id` to maintain a globally ordered history.
 **Service config:** `~/.config/choreographr/config.toml`
 
 ```toml
-max_turns = 25      # 0 = unlimited (loop runs until final answer or error)
+max_turns = 0      # daemon-wide tool-loop budget; 0 = unlimited (default)
 
 [context]
 context_file_names = ["AGENTS.md", "CLAUDE.md"]
@@ -1305,11 +1304,10 @@ context_file_max_bytes = 32768
 **Socket path:** `/tmp/Choreographr.sock` (override via `CHOREOGRAPHR_SOCKET_PATH` env var)
 
 **Tool loop limit:** `CHOREOGRAPHR_MAX_TURNS` env var overrides `config.toml` `max_turns`. Resolution
-chain: per-session `max_turns` → `CHOREOGRAPHR_MAX_TURNS` env var → `config.toml` → default 25.
-A value of `0` means *unlimited* — the agent loop runs indefinitely until the model
-produces a final answer, is cancelled, or hits an error.
-The `spawn_subsession` tool accepts an optional `max_turns` parameter; if not set, the
-child inherits the parent's value.
+chain: `CHOREOGRAPHR_MAX_TURNS` env var → `config.toml` → default 0 (unlimited).
+A value of `0` means *unlimited* — the agent loop runs until the model
+produces a final answer, is cancelled, or hits an error. This is a daemon-wide
+cap; individual sessions no longer carry their own `max_turns`.
 
 **Logging:** `choreographr` uses `tracing` with `tracing-subscriber`. Default level is `info`.
 CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level.
@@ -1505,7 +1503,7 @@ user switches to it (`reset_for_session_switch` preserves live estimates).
    loop and report results back to the parent.
 
 6. **Tool-call loop in the daemon** — the daemon drives multi-turn tool interactions (up to a
-   configurable `max_turns` per session, default 25 (0 = unlimited) rather than pushing that complexity to
+   configurable daemon-wide `max_turns` cap, default 0 (unlimited) rather than pushing that complexity to
    the client or model. The client just sees `ToolCallStarted`/`ToolCallFinished` events.
 
 7. **Session subscription model** — multiple clients can subscribe to the same session. Events

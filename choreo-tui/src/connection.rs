@@ -903,7 +903,6 @@ fn handle_chat_event(
                                     title,
                                     parent_session_id,
                                     working_dir,
-                                    max_turns,
                                     context_config,
                                     account_name,
                                     selected_model,
@@ -916,7 +915,6 @@ fn handle_chat_event(
                                     working_dir: working_dir.or_else(|| {
                                         app.active_display_ref().and_then(|d| d.working_dir.clone())
                                     }),
-                                    max_turns,
                                     context_config,
                                     account_name: account_name.or_else(|| {
                                         app.active_display_ref()
@@ -1366,7 +1364,6 @@ fn handle_session_list_key(
                     parent_session_id: None,
                     // Inherit fields from the currently attached session.
                     working_dir: app.active_display_ref().and_then(|d| d.working_dir.clone()),
-                    max_turns: None,
                     context_config: None,
                     account_name: app
                         .active_display_ref()

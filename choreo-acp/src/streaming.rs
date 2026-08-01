@@ -469,7 +469,6 @@ mod tests {
                 title: None,
                 parent_session_id: None,
                 working_dir: None,
-                max_turns: None,
                 account_name: None,
                 selected_model: None,
                 reasoning_effort: None,

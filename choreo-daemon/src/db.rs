@@ -40,7 +40,6 @@ pub struct SessionRecord {
     pub selected_model: Option<String>,
     pub parent_session_id: Option<u64>,
     pub working_dir: Option<String>,
-    pub max_turns: Option<u32>,
     pub turn_count: u32,
     /// Creation time, Unix-epoch-milliseconds.
     pub created_at: i64,
@@ -763,7 +762,6 @@ mod tests {
             reasoning_effort: None,
             parent_session_id: None,
             working_dir: Some("/tmp".into()),
-            max_turns: None,
             turn_count: 1,
             created_at: 1234567890000,
             last_modified: 1234567890000,

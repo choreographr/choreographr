@@ -227,7 +227,7 @@ fn token_usage_serde_round_trip() {
 
 #[test]
 fn token_usage_in_session_summary_backward_compat() {
-    let json = r#"{"session_id":1,"title":null,"selected_model":null,"reasoning_effort":null,"parent_session_id":null,"working_dir":null,"created_at":0,"last_modified":0,"turn_count":0,"max_turns":null,"status":"Inactive","active_tool_groups":[],"account_name":null}"#;
+    let json = r#"{"session_id":1,"title":null,"selected_model":null,"reasoning_effort":null,"parent_session_id":null,"working_dir":null,"created_at":0,"last_modified":0,"turn_count":0,"status":"Inactive","active_tool_groups":[],"account_name":null}"#;
     let summary: SessionSummary = serde_json::from_str(json).unwrap();
     assert_eq!(summary.session_id, 1);
     assert_eq!(summary.token_usage, None);
@@ -313,7 +313,6 @@ fn session_summary_none_optionals_round_trip() {
         created_at: 0,
         last_modified: 0,
         turn_count: 0,
-        max_turns: None,
         status: SessionStatus::Inactive,
         active_tool_groups: vec![],
         account_name: None,
@@ -343,7 +342,6 @@ fn session_summary_some_token_usage_round_trip() {
         created_at: 0,
         last_modified: 0,
         turn_count: 0,
-        max_turns: None,
         status: SessionStatus::Inactive,
         active_tool_groups: vec![],
         account_name: None,
@@ -364,7 +362,6 @@ fn session_state_none_optionals_round_trip() {
         selected_model: None,
         parent_session_id: None,
         working_dir: None,
-        max_turns: None,
         turns: BTreeMap::new(),
         active_tool_groups: vec![],
         token_usage: None,
@@ -391,7 +388,6 @@ fn sessions_with_none_optionals_round_trip() {
         created_at: 0,
         last_modified: 0,
         turn_count: 0,
-        max_turns: None,
         status: SessionStatus::Inactive,
         active_tool_groups: vec![],
         account_name: None,
