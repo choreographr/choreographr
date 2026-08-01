@@ -2,6 +2,7 @@ pub(crate) use crate::openai::AllowedCaller;
 use crate::openai::ChatToolDefinition;
 use crate::providers::types::ChatToolCall;
 use choreo_keystore::ServiceCredential;
+use humfmt::{BytesOptions, bytes_with};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::mpsc;
@@ -990,6 +992,70 @@ pub(crate) fn truncate_tool_output(content: &str) -> String {
     let mut truncated = content[..split].to_string();
     truncated.push_str("\n...[truncated]");
     truncated
+}
+
+/// Escape control characters in a name so a pathological name (e.g. one
+/// containing a newline) cannot corrupt the line-oriented tool output — every
+/// entry must stay on exactly one line for the LLM to parse the listing.
+///
+/// Shared by the line-oriented tools (`list_files`, `find`, `grep`) so a
+/// hostile filename can't break any of them.
+pub(crate) fn sanitize_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_control() {
+            // escape_default renders e.g. `\n` for a literal newline — the
+            // two-character sequence keeps the output one line per entry.
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Formatting for byte sizes: binary (IEC) units with a separating space
+/// (`"1.5 KiB"`). humfmt trims trailing fractional zeros by default, so
+/// `1.0 KiB` renders as `1 KiB` and columns stay compact — exact `u128`
+/// integer arithmetic throughout.
+const BYTE_OPTIONS: BytesOptions = BytesOptions::new().binary().space(true);
+
+/// Human-readable byte size: `"512 B"`, `"1.5 KiB"`, `"100 MiB"`. Delegates
+/// to humfmt's byte formatter (binary units, separating space, trimmed
+/// fractional zeros) so the exact integer math lives in a maintained crate.
+pub(crate) fn human_size(bytes: u64) -> String {
+    bytes_with(bytes, BYTE_OPTIONS).to_string()
+}
+
+/// Render a symlink's target for `name -> target` display, appending `/`
+/// when the target resolves to a directory so dir-links are visually
+/// distinct from file-links. Degrades to `<unreadable target>` instead of
+/// failing the whole listing or tool call.
+pub(crate) fn symlink_target_label(path: &Path) -> String {
+    let target = match std::fs::read_link(path) {
+        Ok(target) => target.to_string_lossy().into_owned(),
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "failed to resolve symlink target"
+            );
+            return "<unreadable target>".to_string();
+        }
+    };
+    // std::fs::metadata follows the link; on failure (e.g. dangling link) we
+    // keep the bare target rather than failing the whole listing.
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => format!("{target}/"),
+        _ => target,
+    }
+}
+
+/// Marker appended when a search tool (`find`/`grep`) stops at its
+/// `max_results` cap, so the LLM can tell "exactly N results" from
+/// "N of many more". `None` when the walk completed naturally.
+pub(crate) fn truncation_marker(truncated: bool, cap: usize, noun: &str) -> Option<String> {
+    truncated.then(|| format!("...[truncated at {cap} {noun}]"))
 }
 
 /// Open `path` for streaming text reads, rejecting binary files up front.
@@ -2136,5 +2202,36 @@ mod tests {
         let out = render_streamed_line(&line, path, false).unwrap();
         assert!(out.contains("...[line truncated: exceeds 64 KiB]"), "{out}");
         std::str::from_utf8(out.as_bytes()).expect("output must be valid UTF-8");
+    }
+
+    #[test]
+    fn human_size_formats() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(1024), "1 KiB");
+        assert_eq!(human_size(1500), "1.5 KiB");
+        assert_eq!(human_size(1024 * 1024), "1 MiB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5 MiB");
+        assert_eq!(human_size(100 * 1024 * 1024), "100 MiB");
+    }
+
+    #[test]
+    fn sanitize_name_escapes_control_chars() {
+        assert_eq!(sanitize_name("plain.txt"), "plain.txt");
+        assert_eq!(sanitize_name("a\nb"), "a\\nb");
+        assert_eq!(sanitize_name("a\tb"), "a\\tb");
+    }
+
+    #[test]
+    fn truncation_marker_only_when_capped() {
+        assert_eq!(truncation_marker(false, 50, "results"), None);
+        assert_eq!(
+            truncation_marker(true, 50, "results").as_deref(),
+            Some("...[truncated at 50 results]")
+        );
+        assert_eq!(
+            truncation_marker(true, 200, "matches").as_deref(),
+            Some("...[truncated at 200 matches]")
+        );
     }
 }

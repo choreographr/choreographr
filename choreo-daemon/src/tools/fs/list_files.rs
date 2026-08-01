@@ -1,16 +1,12 @@
-use crate::tools::{ToolExecError, resolve_path, truncate_tool_output};
-use humfmt::{BytesOptions, bytes_with};
+use crate::tools::{
+    ToolExecError, human_size, resolve_path, sanitize_name, symlink_target_label,
+    truncate_tool_output,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 use tracing::warn;
-
-/// Formatting for the size column: binary (IEC) units with a separating
-/// space (`"1.5 KiB"`). humfmt trims trailing fractional zeros by default,
-/// so `1.0 KiB` renders as `1 KiB` and columns stay compact — no hand-rolled
-/// f64 unit math, and exact `u128` integer arithmetic throughout.
-const BYTE_OPTIONS: BytesOptions = BytesOptions::new().binary().space(true);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesArgs {
@@ -47,30 +43,6 @@ struct EntryRecord {
     name: String,
     kind: EntryKind,
     detail: EntryDetail,
-}
-
-/// Escape control characters in a file name so a pathological name (e.g. one
-/// containing a newline) cannot corrupt the line-oriented tool output — every
-/// entry must stay on exactly one line for the LLM to parse the listing.
-fn sanitize_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if c.is_control() {
-            // escape_default renders e.g. `\n` for a literal newline — the
-            // two-character sequence keeps the output one line per entry.
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Human-readable byte size: `"512 B"`, `"1.5 KiB"`, `"100 MiB"`. Delegates
-/// to humfmt's byte formatter (binary units, separating space, trimmed
-/// fractional zeros) so the exact integer math lives in a maintained crate.
-fn human_size(bytes: u64) -> String {
-    bytes_with(bytes, BYTE_OPTIONS).to_string()
 }
 
 /// Count the entries in a subdirectory so the listing can show `(N entries)`
@@ -111,28 +83,12 @@ fn subdir_summary(path: &Path) -> String {
 
 /// Render a symlink as `name -> target`, appending `/` to the target when it
 /// resolves to a directory so dir-links are visually distinct from file-links.
+/// Target rendering is shared: `crate::tools::symlink_target_label`.
 fn describe_symlink(raw_name: &str, path: &Path) -> EntryRecord {
-    let target = match fs::read_link(path) {
-        Ok(target) => target.to_string_lossy().into_owned(),
-        Err(err) => {
-            warn!(
-                error = %err,
-                path = %path.display(),
-                "list_files: failed to resolve symlink target"
-            );
-            "<unreadable target>".to_string()
-        }
-    };
-    // fs::metadata follows the link; on failure (e.g. dangling link) we keep
-    // the bare target rather than failing the whole listing.
-    let target = match fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => format!("{target}/"),
-        _ => target,
-    };
     EntryRecord {
         name: sanitize_name(raw_name),
         kind: EntryKind::Link,
-        detail: EntryDetail::Note(format!("-> {target}")),
+        detail: EntryDetail::Note(format!("-> {}", symlink_target_label(path))),
     }
 }
 
@@ -304,24 +260,6 @@ mod tests {
         let args = ListFilesArgs { path: None };
         let desc = super::describe_list_files_invocation(&args);
         assert_eq!(desc, "Listing files in the working directory.");
-    }
-
-    #[test]
-    fn human_size_formats() {
-        assert_eq!(human_size(0), "0 B");
-        assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(1024), "1 KiB");
-        assert_eq!(human_size(1500), "1.5 KiB");
-        assert_eq!(human_size(1024 * 1024), "1 MiB");
-        assert_eq!(human_size(5 * 1024 * 1024), "5 MiB");
-        assert_eq!(human_size(100 * 1024 * 1024), "100 MiB");
-    }
-
-    #[test]
-    fn sanitize_name_escapes_control_chars() {
-        assert_eq!(sanitize_name("plain.txt"), "plain.txt");
-        assert_eq!(sanitize_name("a\nb"), "a\\nb");
-        assert_eq!(sanitize_name("a\tb"), "a\\tb");
     }
 
     #[test]

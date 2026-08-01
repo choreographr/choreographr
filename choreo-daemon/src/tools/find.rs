@@ -1,11 +1,14 @@
-use super::{Tool, ToolExecError, context::ToolContext, truncate_tool_output};
+use super::{
+    Tool, ToolExecError, context::ToolContext, human_size, sanitize_name, symlink_target_label,
+    truncate_tool_output, truncation_marker,
+};
 use choreo_keystore::ServiceCredential;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
 use std::sync::mpsc;
 use tracing::debug;
-use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
+use zlob::walk::{WalkBuilder, WalkEntryKind, WalkFlags, WalkMetadata, WalkState};
 use zlob::{ZlobFlags, ZlobPattern};
 
 /// Default result limit when the caller doesn't specify one.
@@ -63,8 +66,14 @@ fn run_find_walk(
     let use_glob = use_glob_pattern(pattern, glob);
     debug!(pattern, resolved = %resolved.display(), use_glob, max_results, "find: starting search");
 
-    // Substring mode skips the matcher entirely — just does contains().
-    let glob_matcher: Option<ZlobPattern> = if use_glob {
+    // Glob patterns containing a path separator are handed to the walker via
+    // `include()`: zlob matches them against the entry's root-relative path
+    // AND prunes directories outside the pattern's literal prefix, so
+    // `src/**/*.rs` only ever descends into `src/`. Bare patterns (no `/`)
+    // keep basename matching, preserving the "find by file name" contract —
+    // the same split GlobFilter applies to grep's include argument.
+    let native_include = use_glob && pattern.contains('/');
+    let glob_matcher: Option<ZlobPattern> = if use_glob && !native_include {
         Some(
             ZlobPattern::compile(pattern, ZlobFlags::RECOMMENDED)
                 .map_err(|e| ToolExecError(format!("invalid glob pattern: {e}")))?,
@@ -81,12 +90,29 @@ fn run_find_walk(
     // request an unbounded or absurdly large result set.
     let max_results = max_results.clamp(1, MAX_RESULTS_CAP) as usize;
     let mut results: Vec<String> = Vec::new();
+    // Set when the walk stops early at the max_results cap; drives the
+    // `...[truncated at N results]` marker so the caller knows more exist.
+    let mut truncated = false;
+
+    let mut builder = WalkBuilder::new(resolved)
+        .map_err(|e| ToolExecError(format!("failed to create walker: {e}")))?;
+    builder.options(WalkFlags::RECOMMENDED);
+    if native_include {
+        // PERIOD so the glob matches whatever the walker yields — the walker,
+        // not the glob, controls hidden-file visibility. Same choice as
+        // GlobFilter in glob_util.rs.
+        builder
+            .include(pattern)
+            .map_err(|e| ToolExecError(format!("invalid glob pattern: {e}")))?
+            .include_flags(ZlobFlags::RECOMMENDED | ZlobFlags::PERIOD);
+    }
 
     // Walk the directory tree with gitignore-aware traversal.
     // WalkFlags::RECOMMENDED skips hidden files and respects .gitignore rules.
-    WalkBuilder::new(resolved)
-        .map_err(|e| ToolExecError(format!("failed to create walker: {e}")))?
-        .options(WalkFlags::RECOMMENDED)
+    // WalkMetadata::SIZE makes the walker fill in file sizes during its
+    // existing lstat pass — no extra syscalls from Rust.
+    builder
+        .metadata(WalkMetadata::SIZE)
         .run_serial(|entry| {
             // Get the file or directory name for matching against the pattern.
             // Use to_string_lossy so non-UTF-8 filenames are handled via
@@ -97,9 +123,13 @@ fn run_find_walk(
                 .map(|n| n.to_string_lossy())
                 .unwrap_or_default();
 
-            // Check whether the entry's name matches the search pattern.
-            let matched = if let Some(ref matcher) = glob_matcher {
-                // Glob mode: delegate to zlob's compiled matcher.
+            // Check whether the entry's name matches the search pattern. With
+            // native include() the walker has already filtered by relative path,
+            // so no further matching is needed here.
+            let matched = if native_include {
+                true
+            } else if let Some(ref matcher) = glob_matcher {
+                // Glob mode (bare pattern): delegate to zlob's compiled matcher.
                 matcher.matches_default(&name)
             } else {
                 // Substring mode: case-insensitive contains check using the
@@ -111,25 +141,40 @@ fn run_find_walk(
                 return WalkState::Continue;
             }
 
-            // Compute the relative path from the search root via zlob's
-            // built-in relative_path() method — avoids a strip_prefix roundtrip.
-            let mut rel = entry.relative_path().to_string_lossy().to_string();
-            // Append a trailing slash for directories — a visual cue that the
-            // entry is a directory, matching common ls/find conventions.
-            if entry.is_dir() {
-                rel.push('/');
-            }
+            // Relative path from the search root via zlob's built-in
+            // relative_path() method — avoids a strip_prefix roundtrip.
+            // Sanitize so a pathological name (e.g. one containing a newline)
+            // cannot corrupt the line-oriented output.
+            let rel = sanitize_name(&entry.relative_path().to_string_lossy());
+            // Entry kind comes from the walker's lstat at no extra cost; file
+            // sizes are present because SIZE metadata was requested.
+            let line = match entry.kind() {
+                // Append a trailing slash for directories — a visual cue that
+                // the entry is a directory, matching common ls/find conventions.
+                WalkEntryKind::Dir => format!("{rel}/"),
+                WalkEntryKind::File => match entry.size() {
+                    Some(size) => format!("{rel}  {}", human_size(size)),
+                    None => rel,
+                },
+                // Symlinks (not followed under RECOMMENDED flags) render their
+                // target so dir-links are visually distinct from file-links.
+                WalkEntryKind::Symlink => {
+                    format!("{rel} -> {}", symlink_target_label(entry.path()))
+                }
+                WalkEntryKind::Unknown => rel,
+            };
 
             // Stream the result if a sender is configured so the client can
             // display matches incrementally rather than waiting for the
             // entire walk to complete.
             if let Some(tx) = output_tx {
-                let _ = tx.send(format!("{rel}\n").into_bytes());
+                let _ = tx.send(format!("{line}\n").into_bytes());
             }
-            results.push(rel);
+            results.push(line);
 
             // Stop early once we've accumulated enough results.
             if results.len() >= max_results {
+                truncated = true;
                 WalkState::Quit
             } else {
                 WalkState::Continue
@@ -143,11 +188,23 @@ fn run_find_walk(
             ToolExecError(format!("walk error: {e}"))
         })?;
 
+    // When the cap cut the walk short, append an explicit marker (and stream
+    // it as a final chunk) so the caller can tell "exactly N results" from
+    // "N of many more".
+    let marker = truncation_marker(truncated, max_results, "results");
+    if let (Some(marker), Some(tx)) = (&marker, output_tx) {
+        let _ = tx.send(format!("{marker}\n").into_bytes());
+    }
+
     if results.is_empty() {
         return Ok(String::new());
     }
 
-    Ok(truncate_tool_output(&results.join("\n")))
+    let mut out = results.join("\n");
+    if let Some(marker) = marker {
+        out.push_str(&format!("\n{marker}"));
+    }
+    Ok(truncate_tool_output(&out))
 }
 
 pub fn execute_find_tool(
@@ -179,7 +236,7 @@ impl Tool for Find {
     }
 
     fn description(&self) -> &'static str {
-        "Find files and directories by name. Glob auto-detected when pattern contains wildcards — set glob:true to force glob mode or glob:false to force substring matching. Use path to scope the search directory and max_results to cap matches. Respects .gitignore and hidden files."
+        "Find files and directories by name. Glob auto-detected when pattern contains wildcards — set glob:true to force glob mode or glob:false to force substring matching. Patterns containing '/' match relative paths (e.g. 'src/*.rs') and prune traversal; bare patterns match file names. Use path to scope the search directory and max_results to cap matches (a '...[truncated at N results]' line is appended when the cap is hit). Respects .gitignore and hidden files. Results show file sizes, a trailing '/' on directories, and symlink targets."
     }
 
     fn supports_streaming_output() -> bool {
@@ -409,12 +466,16 @@ mod tests {
         };
         let result = tool.execute(args, None, None, None).unwrap();
 
-        // With max_results=1 we should get exactly one line of output.
-        // Note: ".rs" has no wildcards, so it stays in substring mode.
+        // With max_results=1 we get one match line plus the explicit
+        // truncation marker so the caller knows more results exist.
         assert_eq!(
             result.lines().count(),
-            1,
-            "expected exactly 1 result:\n{result}"
+            2,
+            "expected 1 result + truncation marker:\n{result}"
+        );
+        assert!(
+            result.contains("...[truncated at 1 results]"),
+            "expected truncation marker:\n{result}"
         );
     }
 

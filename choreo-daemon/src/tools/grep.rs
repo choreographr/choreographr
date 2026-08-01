@@ -1,5 +1,8 @@
 use super::glob_util::GlobFilter;
-use super::{Tool, ToolExecError, context::ToolContext, truncate_tool_output};
+use super::{
+    Tool, ToolExecError, context::ToolContext, sanitize_name, truncate_tool_output,
+    truncation_marker,
+};
 use choreo_keystore::ServiceCredential;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
@@ -149,11 +152,15 @@ fn run_grep_walk(
 
         // Format the (single-file) results.
         // Use the file name as the display prefix since there's no
-        // directory structure to derive a relative path from.
-        let file_name = resolved
-            .file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default();
+        // directory structure to derive a relative path from. Sanitize so a
+        // pathological file name (e.g. one containing a newline) cannot
+        // corrupt the line-oriented `path:line:content` output.
+        let file_name = sanitize_name(
+            &resolved
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default(),
+        );
         let has_results = !sink.results.is_empty();
         let hint = regex_mode_hint(pattern, regex, has_results);
         if !has_results {
@@ -162,12 +169,13 @@ fn run_grep_walk(
         let lines: Vec<String> = sink
             .results
             .iter()
-            .map(|(_, line_num, content)| format!("{}:{}:{}", file_name, line_num, content))
+            .map(|(_, line_num, content)| format!("{file_name}:{line_num}:{content}"))
             .collect();
+        let body = join_grep_lines(lines, sink.done, max_results);
         let output = if let Some(h) = hint {
-            format!("{}\n{}", h, lines.join("\n"))
+            format!("{h}\n{body}")
         } else {
-            lines.join("\n")
+            body
         };
         return Ok(truncate_tool_output(&output));
     }
@@ -230,14 +238,22 @@ fn run_grep_walk(
         .iter()
         .map(|(path, line_num, content)| {
             let rel = path.strip_prefix(resolved).unwrap_or(path);
-            format!("{}:{}:{}", rel.display(), line_num, content)
+            // Sanitize the path so a pathological file name (e.g. one
+            // containing a newline) cannot corrupt the line-oriented output.
+            format!(
+                "{}:{}:{}",
+                sanitize_name(&rel.to_string_lossy()),
+                line_num,
+                content
+            )
         })
         .collect();
 
+    let body = join_grep_lines(lines, sink.done, max_results);
     let output = if let Some(h) = hint {
-        format!("{}\n{}", h, lines.join("\n"))
+        format!("{h}\n{body}")
     } else {
-        lines.join("\n")
+        body
     };
     Ok(truncate_tool_output(&output))
 }
@@ -332,6 +348,18 @@ impl Tool for Grep {
     }
 }
 
+/// Join grep match lines, appending the explicit truncation marker when the
+/// walk stopped at the max_results cap so the caller can tell "exactly N
+/// matches" from "N of many more". Shared by the single-file and directory
+/// paths.
+fn join_grep_lines(lines: Vec<String>, truncated: bool, max_results: usize) -> String {
+    let body = lines.join("\n");
+    match truncation_marker(truncated, max_results, "matches") {
+        Some(marker) => format!("{body}\n{marker}"),
+        None => body,
+    }
+}
+
 /// Custom Sink that collects matching lines up to a configured limit.
 ///
 /// This avoids buffering the entire result set in memory and lets us
@@ -385,15 +413,28 @@ impl Sink for GrepSink {
                 .as_ref()
                 .and_then(|root| path.strip_prefix(root).ok())
                 .unwrap_or(&path);
-            let line = format!("{}:{}:{}\n", rel.display(), line_number, content);
+            let line = format!(
+                "{}:{}:{}\n",
+                sanitize_name(&rel.to_string_lossy()),
+                line_number,
+                content
+            );
             let _ = tx.send(line.into_bytes());
         }
 
         self.results.push((path, line_number, content));
 
-        // If we've collected enough results, signal termination globally.
+        // If we've collected enough results, signal termination globally
+        // and stream the truncation marker as the final chunk so the
+        // client's incremental display ends with the same signal as the
+        // fully-assembled output.
         if self.results.len() >= self.max_results {
             self.done = true;
+            if let Some(ref tx) = self.output_tx
+                && let Some(marker) = truncation_marker(true, self.max_results, "matches")
+            {
+                let _ = tx.send(format!("{marker}\n").into_bytes());
+            }
             return Ok(false);
         }
 
@@ -545,11 +586,16 @@ mod tests {
         };
         let result = tool.execute(args, None, None, None).unwrap();
 
-        // With max_results=1 we should get exactly one line of output
+        // With max_results=1 we get one match line plus the explicit
+        // truncation marker so the caller knows more matches exist.
         assert_eq!(
             result.lines().count(),
-            1,
-            "expected exactly 1 result:\n{result}"
+            2,
+            "expected 1 match + truncation marker:\n{result}"
+        );
+        assert!(
+            result.contains("...[truncated at 1 matches]"),
+            "expected truncation marker:\n{result}"
         );
     }
 
