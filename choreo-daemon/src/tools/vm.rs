@@ -947,6 +947,26 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
     Ok(elf)
 }
 
+/// Default VM memory size in bytes — currently 4MB, the hard cap of ckb-vm.
+///
+/// This is intentionally tied to `ckb_vm::RISCV_MAX_MEMORY` rather than a
+/// literal: ckb-vm 0.24.14 (the latest release on crates.io) defines
+/// `RISCV_MAX_MEMORY = 4 << 20` in the `ckb-vm-definitions` crate and
+/// enforces it in two places that we cannot work around:
+///
+/// 1. `FlatMemory::new_with_memory` **asserts** `memory_size <= RISCV_MAX_MEMORY`
+///    (ckb-vm/src/memory/flat.rs) — a larger size would panic, not error.
+/// 2. Every load/store goes through `get_page_indices`, which rejects
+///    `addr_end > RISCV_MAX_MEMORY` (ckb-vm/src/memory/mod.rs) — even a
+///    hand-built machine could not address memory beyond 4MB.
+///
+/// So 4MB is the largest VM this dependency can construct; raising it to
+/// 16MB requires a ckb-vm release with the cap removed (upstream `develop`
+/// has refactored this, but nothing newer than 0.24.14 is published).
+/// Keeping the default and the validation bound on the upstream constant
+/// means the tool follows automatically if the dependency is ever upgraded.
+const DEFAULT_VM_MEMORY: usize = ckb_vm::RISCV_MAX_MEMORY;
+
 /// Compute heap bounds for a guest VM with the given `memory_size`.
 ///
 /// The heap sits between a fixed 256 KB offset and a 64 KB guard below
@@ -963,17 +983,19 @@ fn compute_heap_bounds(memory_size: usize) -> (u64, u64) {
 
 /// Read a pre-compiled RISC-V ELF from disk for the `program_path` input.
 ///
-/// The VM's flat memory is capped at 4MB, so an ELF larger than that can
-/// never load — reject it up front with a clear message rather than reading
-/// a pathological file into RAM and failing later with a confusing loader
-/// error. Returns a domain error string on failure.
+/// The VM's flat memory is capped at `ckb_vm::RISCV_MAX_MEMORY` (4MB in
+/// ckb-vm 0.24.14), so an ELF larger than that can never load — reject it
+/// up front with a clear message rather than reading a pathological file
+/// into RAM and failing later with a confusing loader error. Returns a
+/// domain error string on failure.
 fn read_program_file(path: &str) -> Result<Vec<u8>, String> {
     let meta =
         std::fs::metadata(path).map_err(|e| format!("cannot read program file '{path}': {e}"))?;
-    if meta.len() > 4 * 1024 * 1024 {
+    if meta.len() > ckb_vm::RISCV_MAX_MEMORY as u64 {
         return Err(format!(
-            "program file '{path}' is {} bytes; max supported is 4MB",
-            meta.len()
+            "program file '{path}' is {} bytes; max supported is {} bytes (ckb-vm RISCV_MAX_MEMORY)",
+            meta.len(),
+            ckb_vm::RISCV_MAX_MEMORY
         ));
     }
     let bytes =
@@ -1044,15 +1066,18 @@ fn run_riscv_impl(
         }
     };
 
-    let memory_size = input.memory_size.unwrap_or(4 * 1024 * 1024);
+    let memory_size = input.memory_size.unwrap_or(DEFAULT_VM_MEMORY);
     if !memory_size.is_multiple_of(4096) {
         return tool_err("memory_size must be a multiple of 4096");
     }
     if memory_size < 512 * 1024 {
         return tool_err("memory_size must be at least 512KB");
     }
-    if memory_size > 4 * 1024 * 1024 {
-        return tool_err("memory_size cannot exceed 4MB");
+    // ckb-vm's FlatMemory asserts memory_size <= RISCV_MAX_MEMORY (4MB in
+    // 0.24.14) — going over would panic inside the dependency instead of
+    // returning a clean error, so we validate against the same bound here.
+    if memory_size > ckb_vm::RISCV_MAX_MEMORY {
+        return tool_err("memory_size cannot exceed 4MB (ckb-vm RISCV_MAX_MEMORY)");
     }
 
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
@@ -1207,7 +1232,7 @@ impl Tool for RunRiscV {
                 ));
                 parts.push(format!(
                     "\nMemory: {} bytes.",
-                    args.memory_size.unwrap_or(4 * 1024 * 1024)
+                    args.memory_size.unwrap_or(DEFAULT_VM_MEMORY)
                 ));
                 parts.concat()
             }
@@ -1239,7 +1264,7 @@ impl Tool for RunRiscV {
                 },
                 "program_path": {
                     "type": "string",
-                    "description": "Path to a pre-compiled RISC-V ELF binary on disk (absolute path recommended). Alternative to 'program' for workflows that compile externally with rustc, avoiding base64 encoding. Same ABI requirements as 'program' (choreographr syscall ABI: 0=postcard tool dispatch, 1=write, 93=exit). Max file size 4MB."
+                    "description": &format!("Path to a pre-compiled RISC-V ELF binary on disk (absolute path recommended). Alternative to 'program' for workflows that compile externally with rustc, avoiding base64 encoding. Same ABI requirements as 'program' (choreographr syscall ABI: 0=postcard tool dispatch, 1=write, 93=exit). Max file size {} bytes ({}MB — ckb-vm's RISCV_MAX_MEMORY).", ckb_vm::RISCV_MAX_MEMORY, ckb_vm::RISCV_MAX_MEMORY / (1024 * 1024))
                 },
                 "args": {
                     "type": "array",
@@ -1253,7 +1278,7 @@ impl Tool for RunRiscV {
                 },
                 "memory_size": {
                     "type": "integer",
-                    "description": "VM memory size in bytes (default: 4_194_304, must be a multiple of 4096, max 4MB)"
+                    "description": &format!("VM memory size in bytes (default: {}, must be a multiple of 4096, max {} bytes = {}MB — ckb-vm's RISCV_MAX_MEMORY)", DEFAULT_VM_MEMORY, ckb_vm::RISCV_MAX_MEMORY, ckb_vm::RISCV_MAX_MEMORY / (1024 * 1024))
                 }
             }
         })
@@ -1596,10 +1621,13 @@ mod tests {
 
     #[test]
     fn run_riscv_rejects_memory_over_4mb() {
+        // One page over ckb-vm's hard cap (RISCV_MAX_MEMORY = 4MB in 0.24.14).
+        // This must fail cleanly in OUR validation — FlatMemory::new_with_memory
+        // would otherwise panic on the same input, taking down the tool thread.
         let result = run_riscv_impl(
             &RunRiscVInput {
                 program: Some("AAAA".to_string()),
-                memory_size: Some(4198400),
+                memory_size: Some(ckb_vm::RISCV_MAX_MEMORY + 4096),
                 ..Default::default()
             },
             None,
@@ -1614,6 +1642,17 @@ mod tests {
             "{}",
             result.content
         );
+    }
+
+    #[test]
+    fn vm_default_memory_tracks_ckb_vm_cap() {
+        // The 4MB cap is not our choice: ckb-vm 0.24.14 hard-codes
+        // RISCV_MAX_MEMORY = 4 << 20 and FlatMemory::new_with_memory asserts
+        // on it. Pin the current upstream value so that if ckb-vm ever raises
+        // the limit (upstream develop has removed the cap), this test fails
+        // and the schema/description text can be updated in the same change.
+        assert_eq!(ckb_vm::RISCV_MAX_MEMORY, 4 * 1024 * 1024);
+        assert_eq!(DEFAULT_VM_MEMORY, ckb_vm::RISCV_MAX_MEMORY);
     }
 
     #[test]
@@ -2590,6 +2629,22 @@ mod tests {
         //   heap_size  = 0x2F0000 - 0x040000 = 0x2B0000 (~2.75 MB)
         assert_eq!(base, 262_144);
         assert_eq!(size, 0x2B0000);
+    }
+
+    #[test]
+    fn compute_heap_bounds_16mb_layout() {
+        // Documents how the heap scales for a 16MB VM — the size the tool
+        // would offer once ckb-vm drops its 4MB RISCV_MAX_MEMORY cap:
+        //   stack_base = 16MB - 16MB/4 = 12MB
+        //   heap_end   = 12MB - 64KB = 12,517,376
+        //   heap_size  = heap_end - 256KB = 12,255,232 (~11.7MB)
+        let (base, size) = compute_heap_bounds(16 * 1024 * 1024);
+        assert_eq!(base, 262_144);
+        assert_eq!(
+            size,
+            16 * 1024 * 1024 - 4 * 1024 * 1024 - 64 * 1024 - 256 * 1024
+        );
+        assert_eq!(size, 12_255_232);
     }
 
     #[test]

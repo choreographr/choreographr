@@ -1684,8 +1684,8 @@ to the guest syscall handler.
 **Execution flow:**
 
 1. Accepts Rust `source`, pre-compiled base64 `program`, or `program_path` pointing at a
-   pre-compiled ELF file on disk (read with a 4MB size cap, since the VM's flat memory
-   cannot exceed 4MB).
+   pre-compiled ELF file on disk (read with a 4MB size cap — the same
+   `ckb_vm::RISCV_MAX_MEMORY` bound as the VM's flat memory, see step 3).
 2. If `source` is provided, it is first formatted via `rustfmt` (silently skipped
    if `rustfmt` is unavailable).  The formatted source is then prepended with a
     `#![no_std]` boilerplate (panic handler, entry point, `Choreographr` module with
@@ -1693,7 +1693,16 @@ to the guest syscall handler.
     and compiled via a single
     `rustc +stable --target riscv64imac-unknown-none-elf` invocation in a temp
    directory.
-3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory.
+3. Creates a `DefaultCoreMachine<u64, FlatMemory<u64>>` with 4 MB of flat memory
+   (the default and the maximum — ckb-vm 0.24.14 hard-codes `RISCV_MAX_MEMORY = 4 << 20`
+   in `ckb-vm-definitions`. `FlatMemory::new_with_memory` asserts on it and every memory
+   access goes through `get_page_indices`, which rejects addresses beyond it, so 4MB is
+   the largest VM this dependency can construct. The tool validates `memory_size` against
+   `ckb_vm::RISCV_MAX_MEMORY` up front so an oversized request fails with a clean error
+   instead of a panic inside the dependency. Raising the cap to 16MB requires a newer
+   ckb-vm release — upstream `develop` has removed the cap, but nothing newer than
+   0.24.14 is published; the `DEFAULT_VM_MEMORY` constant and schema text are derived
+   from the upstream constant so they follow automatically on upgrade).
 4. Registers a `ChoreographrSyscall` handler that intercepts three guest syscalls:
    - **Syscall #0 (TOOL_CALL)** — reads a postcard-encoded frame `[tool_name: String][args: bytes]`
      from guest memory, dispatches it via the `ToolRegistry::execute_dyn()`, and writes the
@@ -1728,7 +1737,7 @@ returning `Vec<Vec<u8>>`:
 pub fn args() -> Vec<Vec<u8>>;
 ```
 
-**Safety:** The guest runs in an isolated VM with 4 MB of flat memory. All tool access goes
+**Safety:** The guest runs in an isolated VM with 4 MB of flat memory (ckb-vm's maximum). All tool access goes
 through the same `ToolRegistry` as the host agent, respecting the same `x_credentials` and `working_dir`.
 The guest cannot access host memory, syscalls, or files outside the VM without going through
 registered tools.

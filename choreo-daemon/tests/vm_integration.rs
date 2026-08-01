@@ -135,10 +135,13 @@ fn memory_size_not_aligned() {
 #[test]
 #[ignore]
 fn memory_size_exceeds_max() {
+    // One page over ckb-vm's hard cap (RISCV_MAX_MEMORY = 4MB in 0.24.14).
+    // The tool must reject this with a clean validation error — a larger
+    // size would panic inside FlatMemory::new_with_memory instead.
     let result = execute_run_riscv_tool(
         &RunRiscVInput {
             program: Some("AAAA".to_string()),
-            memory_size: Some(4198400),
+            memory_size: Some(4 * 1024 * 1024 + 4096),
             ..Default::default()
         },
         None,
@@ -146,6 +149,27 @@ fn memory_size_exceeds_max() {
     assert!(result.is_err(), "expected error: {:?}", result);
     let err = result.unwrap_err().to_string();
     assert!(err.contains("cannot exceed 4MB"), "{}", err);
+}
+
+#[test]
+#[ignore]
+fn memory_size_at_cap_passes_validation() {
+    // memory_size == ckb-vm's RISCV_MAX_MEMORY (4MB) is the largest valid
+    // size; validation must accept it and only fail later at ELF load time
+    // ("AAAA" is not a real ELF).
+    let result = execute_run_riscv_tool(
+        &RunRiscVInput {
+            program: Some("AAAA".to_string()),
+            memory_size: Some(4 * 1024 * 1024),
+            ..Default::default()
+        },
+        None,
+    );
+    assert!(result.is_err(), "expected error: {:?}", result);
+    let err = result.unwrap_err().to_string();
+    assert!(!err.contains("cannot exceed 4MB"), "{}", err);
+    assert!(!err.contains("multiple of 4096"), "{}", err);
+    assert!(err.contains("failed to load program"), "{}", err);
 }
 
 #[test]
