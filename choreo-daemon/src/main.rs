@@ -41,18 +41,32 @@ const DEFAULT_MAX_TURNS: u32 = 0;
 /// Resolution chain: `CHOREOGRAPHR_MAX_TURNS` env var → `config.toml` → default 0 (unlimited).
 /// A value of `0` means *unlimited* — the agent loop will run until the
 /// model produces a final answer, is cancelled, or hits an error.
-fn resolve_max_turns() -> u32 {
-    if let Ok(val) = std::env::var("CHOREOGRAPHR_MAX_TURNS")
-        && let Ok(n) = val.parse::<u32>()
-    {
-        return n;
+///
+/// A `CHOREOGRAPHR_MAX_TURNS` that is set but not a valid `u32` is a
+/// configuration error: failing startup beats silently running unbounded.
+fn resolve_max_turns() -> anyhow::Result<u32> {
+    match std::env::var("CHOREOGRAPHR_MAX_TURNS") {
+        Ok(val) => return parse_max_turns_env(&val),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "failed to read CHOREOGRAPHR_MAX_TURNS: {e}"
+            ));
+        }
     }
     if let Ok(config) = load_daemon_config()
         && let Some(n) = config.max_turns
     {
-        return n;
+        return Ok(n);
     }
-    DEFAULT_MAX_TURNS
+    Ok(DEFAULT_MAX_TURNS)
+}
+
+/// Parse the `CHOREOGRAPHR_MAX_TURNS` value. Kept as a pure function so the
+/// parsing behavior is unit-testable without touching process-global env.
+fn parse_max_turns_env(val: &str) -> anyhow::Result<u32> {
+    val.parse::<u32>()
+        .map_err(|e| anyhow::anyhow!("CHOREOGRAPHR_MAX_TURNS={val:?} is not a valid u32: {e}"))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -83,7 +97,7 @@ fn main() -> anyhow::Result<()> {
 
     info!(effective_level = ?log_level.unwrap_or("from RUST_LOG"), "logging initialized");
 
-    let max_turns = resolve_max_turns();
+    let max_turns = resolve_max_turns().context("failed to resolve tool-loop iteration limit")?;
     info!(max_turns, "tool loop iteration limit");
     info!("choreographr starting (locked)");
 
@@ -129,11 +143,8 @@ fn main() -> anyhow::Result<()> {
 
     let state = DaemonState {
         daemon_tx,
-        // Compute the next session ID from actual session records so we
-        // never collide with an existing session.  The DB's stored counter
-        // is only updated at startup and goes stale once the in-memory
-        // counter diverges — if the daemon crashes the counter resets and
-        // IDs get reused, overwriting old sessions.
+        // Derive the next session ID from the highest existing record so a
+        // fresh daemon never collides with a persisted session.
         next_session_id: session_metadata
             .keys()
             .max()
@@ -177,4 +188,34 @@ fn main() -> anyhow::Result<()> {
         acl,
     )
     .context("failed to run server")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_max_turns_env_accepts_zero() {
+        assert_eq!(parse_max_turns_env("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_max_turns_env_accepts_positive() {
+        assert_eq!(parse_max_turns_env("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_max_turns_env_rejects_non_numeric() {
+        assert!(parse_max_turns_env("abc").is_err());
+    }
+
+    #[test]
+    fn parse_max_turns_env_rejects_negative() {
+        assert!(parse_max_turns_env("-5").is_err());
+    }
+
+    #[test]
+    fn parse_max_turns_env_rejects_empty() {
+        assert!(parse_max_turns_env("").is_err());
+    }
 }

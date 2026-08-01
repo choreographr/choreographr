@@ -368,7 +368,7 @@ impl DaemonState {
         let db = Arc::clone(&self.db);
         let tool_registry = Arc::clone(&self.tool_registry);
         let daemon_tx = self.daemon_tx.clone();
-        let max_turns_default = self.max_turns;
+        let max_turns = self.max_turns;
 
         // Resolve provider from the session's account name
         let account_name = metadata.account_name.clone();
@@ -392,7 +392,7 @@ impl DaemonState {
                     db,
                     tool_registry,
                     daemon_tx,
-                    max_turns_default,
+                    max_turns,
                 },
             );
         });

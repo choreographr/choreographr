@@ -226,15 +226,23 @@ fn token_usage_serde_round_trip() {
 }
 
 #[test]
-fn token_usage_in_session_summary_backward_compat() {
-    let json = r#"{"session_id":1,"title":null,"selected_model":null,"reasoning_effort":null,"parent_session_id":null,"working_dir":null,"created_at":0,"last_modified":0,"turn_count":0,"status":"Inactive","active_tool_groups":[],"account_name":null}"#;
+fn session_summary_tolerates_missing_and_unknown_fields() {
+    // `token_usage` and the other trailing optional fields use
+    // `#[serde(default)]`, so a payload that omits them must still parse — that
+    // is the contract that lets the protocol grow additively. `max_turns` was
+    // removed from SessionSummary; serde ignores unknown fields by default, so a
+    // payload that still carries it must parse too. This fixture pins both
+    // behaviors.
+    let json = r#"{"session_id":1,"title":null,"selected_model":null,"reasoning_effort":null,"parent_session_id":null,"working_dir":null,"created_at":0,"last_modified":0,"turn_count":0,"max_turns":null,"status":"Inactive","active_tool_groups":[],"account_name":null}"#;
     let summary: SessionSummary = serde_json::from_str(json).unwrap();
     assert_eq!(summary.session_id, 1);
     assert_eq!(summary.token_usage, None);
 }
 
 #[test]
-fn token_usage_in_daemon_message_done_backward_compat() {
+fn done_tolerates_missing_optional_fields() {
+    // `token_usage` on Done is optional (`#[serde(default)]`): a payload that
+    // omits it must parse and default to None.
     let json = r#"{"Done":{"session_id":1,"request_id":42}}"#;
     let msg: DaemonMessage = serde_json::from_str(json).unwrap();
     match msg {

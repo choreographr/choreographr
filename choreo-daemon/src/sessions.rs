@@ -114,10 +114,8 @@ pub struct RequestContext {
     pub tool_registry: Arc<ToolRegistry>,
     /// Channel to the daemon command loop.
     pub daemon_tx: mpsc::Sender<DaemonCommand>,
-    /// Daemon-wide cap on agent tool-loop iterations per request.  This is
-    /// the sole source of the loop limit now that per-session `max_turns` has
-    /// been removed (0 = unlimited).
-    pub max_turns_default: u32,
+    /// Daemon-wide cap on agent tool-loop iterations per request (0 = unlimited).
+    pub max_turns: u32,
 }
 
 pub struct ChildResult {
@@ -2004,7 +2002,7 @@ mod tests {
             db,
             tool_registry,
             daemon_tx,
-            max_turns_default: 0,
+            max_turns: 0,
         };
         (test_state(), ctx)
     }

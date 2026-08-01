@@ -758,7 +758,7 @@ pub(crate) fn run_agent_loop(
     ctx: &RequestContext,
     user_text: Option<String>,
 ) -> io::Result<bool> {
-    let max_turns = ctx.max_turns_default;
+    let max_turns = ctx.max_turns;
     // `max_turns == 0` means *unlimited* — the loop runs until the model
     // produces a final answer, is cancelled, or hits an error.
     let limited = max_turns > 0;
@@ -2174,7 +2174,7 @@ mod tests {
             db: Arc::new(db),
             tool_registry: registry,
             daemon_tx,
-            max_turns_default: 0,
+            max_turns: 0,
         };
         let result = execute_tool_with_timeout(
             &tool_call,

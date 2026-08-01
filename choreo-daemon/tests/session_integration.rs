@@ -30,7 +30,7 @@ fn spawn_session(
                 db,
                 tool_registry,
                 daemon_tx,
-                max_turns_default: 0,
+                max_turns: 0,
             },
         );
     });
