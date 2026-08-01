@@ -27,6 +27,7 @@ pub use crate::sessions::{
 pub use crate::tools::exec::{ExecArgs, execute_exec_tool};
 pub use crate::tools::find::{FindArgs, execute_find_tool};
 pub use crate::tools::fish::{FishArgs, execute_fish_tool};
+pub use crate::tools::fs::{ListFilesArgs, execute_list_files_tool};
 pub use crate::tools::git::{
     GitAddArgs, GitCommitArgs, GitDiffArgs, GitLogArgs, GitPushArgs, GitRepoArgs, GitShowArgs,
     execute_git_add_tool, execute_git_commit_tool, execute_git_diff_tool, execute_git_log_tool,

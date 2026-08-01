@@ -1,9 +1,16 @@
 use crate::tools::{ToolExecError, resolve_path, truncate_tool_output};
+use humfmt::{BytesOptions, bytes_with};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 use tracing::warn;
+
+/// Formatting for the size column: binary (IEC) units with a separating
+/// space (`"1.5 KiB"`). humfmt trims trailing fractional zeros by default,
+/// so `1.0 KiB` renders as `1 KiB` and columns stay compact — no hand-rolled
+/// f64 unit math, and exact `u128` integer arithmetic throughout.
+const BYTE_OPTIONS: BytesOptions = BytesOptions::new().binary().space(true);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesArgs {
@@ -21,18 +28,25 @@ enum EntryKind {
     Other,
 }
 
+/// The trailing column of a row: a human-readable size (files and "other"
+/// entries) or a text annotation (dirs, symlink targets, unreadable entries).
+///
+/// A sum type instead of two `Option`s so the "exactly one of size-or-note"
+/// invariant is enforced by the compiler rather than by hoping every
+/// construction site picks a valid combination.
+#[derive(Debug)]
+enum EntryDetail {
+    Size(u64),
+    Note(String),
+}
+
 /// One rendered row of the listing.
 #[derive(Debug)]
 struct EntryRecord {
     /// Sanitized display name (control chars escaped; trailing `/` for dirs).
     name: String,
     kind: EntryKind,
-    /// File size in bytes (files and "other" entries only; `None` for dirs,
-    /// links, and unreadable entries).
-    size: Option<u64>,
-    /// Annotation column: `"-> target"`, `"(24 entries)"`, `"(empty)"`,
-    /// `"(unreadable)"`.
-    annotation: Option<String>,
+    detail: EntryDetail,
 }
 
 /// Escape control characters in a file name so a pathological name (e.g. one
@@ -52,24 +66,11 @@ fn sanitize_name(name: &str) -> String {
     out
 }
 
-/// Human-readable byte size: `"512 B"`, `"2.6 KiB"`, `"1.4 MiB"`. Values
-/// ≥ 100 in a unit drop the decimal so columns stay compact (`"100 MiB"`).
+/// Human-readable byte size: `"512 B"`, `"1.5 KiB"`, `"100 MiB"`. Delegates
+/// to humfmt's byte formatter (binary units, separating space, trimmed
+/// fractional zeros) so the exact integer math lives in a maintained crate.
 fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if value >= 100.0 {
-        format!("{value:.0} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    bytes_with(bytes, BYTE_OPTIONS).to_string()
 }
 
 /// Count the entries in a subdirectory so the listing can show `(N entries)`
@@ -131,8 +132,7 @@ fn describe_symlink(raw_name: &str, path: &Path) -> EntryRecord {
     EntryRecord {
         name: sanitize_name(raw_name),
         kind: EntryKind::Link,
-        size: None,
-        annotation: Some(format!("-> {target}")),
+        detail: EntryDetail::Note(format!("-> {target}")),
     }
 }
 
@@ -155,14 +155,12 @@ fn describe_entry(entry: &fs::DirEntry) -> EntryRecord {
         Ok(meta) if meta.is_dir() => EntryRecord {
             name: format!("{}/", sanitize_name(&raw_name)),
             kind: EntryKind::Dir,
-            size: None,
-            annotation: Some(subdir_summary(&entry.path())),
+            detail: EntryDetail::Note(subdir_summary(&entry.path())),
         },
         Ok(meta) if meta.is_file() => EntryRecord {
             name: sanitize_name(&raw_name),
             kind: EntryKind::File,
-            size: Some(meta.len()),
-            annotation: None,
+            detail: EntryDetail::Size(meta.len()),
         },
         // Sockets, fifos, devices, and stat failures: show what we can. A
         // per-entry failure degrades to an `(unreadable)` annotation rather
@@ -171,8 +169,7 @@ fn describe_entry(entry: &fs::DirEntry) -> EntryRecord {
         Ok(meta) => EntryRecord {
             name: sanitize_name(&raw_name),
             kind: EntryKind::Other,
-            size: Some(meta.len()),
-            annotation: None,
+            detail: EntryDetail::Size(meta.len()),
         },
         Err(err) => {
             warn!(
@@ -183,25 +180,24 @@ fn describe_entry(entry: &fs::DirEntry) -> EntryRecord {
             EntryRecord {
                 name: sanitize_name(&raw_name),
                 kind: EntryKind::Other,
-                size: None,
-                annotation: Some("(unreadable)".to_string()),
+                detail: EntryDetail::Note("(unreadable)".to_string()),
             }
         }
     }
 }
 
 /// `"1 file"` / `"2 files"` — singular for exactly one, plural otherwise.
-/// Keeps the summary line readable ("3 entries (2 files, 1 dir)") without
-/// hard-coding per-category grammar at each call site.
-fn count_label(count: usize, singular: &str) -> String {
+/// Takes the full plural form explicitly so irregular nouns
+/// ("entry" -> "entries") render correctly without string heuristics.
+fn count_label(count: usize, singular: &str, plural: &str) -> String {
     if count == 1 {
         format!("1 {singular}")
     } else {
-        format!("{count} {singular}s")
+        format!("{count} {plural}")
     }
 }
 
-pub(crate) fn execute_list_files_tool(
+pub fn execute_list_files_tool(
     args: &ListFilesArgs,
     working_dir: Option<&Path>,
 ) -> Result<String, ToolExecError> {
@@ -229,19 +225,23 @@ pub(crate) fn execute_list_files_tool(
         .filter(|r| r.kind == EntryKind::Other)
         .count();
 
-    let mut out = format!("{}: {} entries", resolved.display(), records.len());
+    let mut out = format!(
+        "{}: {}",
+        resolved.display(),
+        count_label(records.len(), "entry", "entries")
+    );
     let mut parts = Vec::new();
     if files > 0 {
-        parts.push(count_label(files, "file"));
+        parts.push(count_label(files, "file", "files"));
     }
     if dirs > 0 {
-        parts.push(count_label(dirs, "dir"));
+        parts.push(count_label(dirs, "dir", "dirs"));
     }
     if links > 0 {
-        parts.push(count_label(links, "link"));
+        parts.push(count_label(links, "link", "links"));
     }
     if others > 0 {
-        parts.push(count_label(others, "other"));
+        parts.push(count_label(others, "other", "others"));
     }
     if !parts.is_empty() {
         out.push_str(&format!(" ({})", parts.join(", ")));
@@ -257,13 +257,11 @@ pub(crate) fn execute_list_files_tool(
         .unwrap_or(0);
     for record in &records {
         let name_col = format!("{:<width$}", record.name);
-        match (record.size.map(human_size), &record.annotation) {
-            (Some(size), Some(annotation)) => {
-                out.push_str(&format!("{name_col} {size:<10} {annotation}\n"));
+        match &record.detail {
+            EntryDetail::Size(bytes) => {
+                out.push_str(&format!("{name_col} {}\n", human_size(*bytes)));
             }
-            (Some(size), None) => out.push_str(&format!("{name_col} {size}\n")),
-            (None, Some(annotation)) => out.push_str(&format!("{name_col} {annotation}\n")),
-            (None, None) => out.push_str(&format!("{}\n", name_col.trim_end())),
+            EntryDetail::Note(note) => out.push_str(&format!("{name_col} {note}\n")),
         }
     }
     Ok(truncate_tool_output(&out))
@@ -291,7 +289,6 @@ define_tool!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[test]
     fn describe_list_files_invocation_with_path() {
@@ -313,10 +310,10 @@ mod tests {
     fn human_size_formats() {
         assert_eq!(human_size(0), "0 B");
         assert_eq!(human_size(512), "512 B");
-        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(1024), "1 KiB");
         assert_eq!(human_size(1500), "1.5 KiB");
-        assert_eq!(human_size(1024 * 1024), "1.0 MiB");
-        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MiB");
+        assert_eq!(human_size(1024 * 1024), "1 MiB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5 MiB");
         assert_eq!(human_size(100 * 1024 * 1024), "100 MiB");
     }
 
@@ -329,78 +326,11 @@ mod tests {
 
     #[test]
     fn count_label_singular_and_plural() {
-        assert_eq!(count_label(1, "file"), "1 file");
-        assert_eq!(count_label(2, "file"), "2 files");
-        assert_eq!(count_label(1, "dir"), "1 dir");
-        assert_eq!(count_label(3, "link"), "3 links");
-    }
-
-    #[test]
-    fn lists_files_with_rich_metadata() {
-        let dir = TempDir::new().unwrap();
-        // A small text file with a known size.
-        fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
-        // A 4 KiB file.
-        fs::write(dir.path().join("blob.bin"), vec![0u8; 4096]).unwrap();
-        // Subdirectory with a couple of entries.
-        fs::create_dir(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-        fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-
-        let args = ListFilesArgs {
-            path: Some(dir.path().to_str().unwrap().into()),
-        };
-        let out = execute_list_files_tool(&args, None).unwrap();
-
-        assert!(out.contains("3 entries (2 files, 1 dir)"), "{out}");
-        assert!(out.contains("main.rs"), "{out}");
-        assert!(out.contains("4.0 KiB"), "{out}");
-        assert!(out.contains("src/"), "{out}");
-        assert!(out.contains("(2 entries)"), "{out}");
-        // Pure metadata: sizes only, never content-derived annotations.
-        assert!(!out.contains("lines"), "{out}");
-        assert!(!out.contains("binary"), "{out}");
-    }
-
-    #[test]
-    fn empty_directory_reports_zero_entries() {
-        let dir = TempDir::new().unwrap();
-        let args = ListFilesArgs {
-            path: Some(dir.path().to_str().unwrap().into()),
-        };
-        let out = execute_list_files_tool(&args, None).unwrap();
-        assert!(out.contains("0 entries"), "{out}");
-        assert_eq!(out.lines().count(), 1, "only the summary line: {out}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn symlink_shows_target() {
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("real.txt"), "hi\n").unwrap();
-        std::os::unix::fs::symlink("real.txt", dir.path().join("link.txt")).unwrap();
-
-        let args = ListFilesArgs {
-            path: Some(dir.path().to_str().unwrap().into()),
-        };
-        let out = execute_list_files_tool(&args, None).unwrap();
-
-        assert!(out.contains("2 entries (1 file, 1 link)"), "{out}");
-        assert!(out.contains("link.txt -> real.txt"), "{out}");
-    }
-
-    #[test]
-    fn default_path_lists_working_directory() {
-        // Execute with a temp working dir so the result is deterministic.
-        let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("a.txt"), "x\n").unwrap();
-        let args = ListFilesArgs { path: None };
-        let out = execute_list_files_tool(&args, Some(dir.path())).unwrap();
-        assert!(out.contains("1 entries (1 file)"), "{out}");
-        assert!(out.contains("a.txt"), "{out}");
-        assert!(
-            out.starts_with(&format!("{}:", dir.path().display())),
-            "{out}"
-        );
+        assert_eq!(count_label(1, "file", "files"), "1 file");
+        assert_eq!(count_label(2, "file", "files"), "2 files");
+        assert_eq!(count_label(1, "dir", "dirs"), "1 dir");
+        assert_eq!(count_label(3, "link", "links"), "3 links");
+        assert_eq!(count_label(1, "entry", "entries"), "1 entry");
+        assert_eq!(count_label(4, "entry", "entries"), "4 entries");
     }
 }

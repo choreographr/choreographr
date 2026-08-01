@@ -8,6 +8,10 @@ pub(crate) use delete_files::DeleteFiles;
 pub(crate) use edit_file::EditFile;
 pub(crate) use line_count::LineCount;
 pub(crate) use list_files::ListFiles;
+// Public so crate-level integration tests (tests/list_files_integration.rs)
+// can drive the tool through the same API the registry uses, mirroring
+// how find.rs exposes FindArgs/execute_find_tool.
+pub use list_files::{ListFilesArgs, execute_list_files_tool};
 pub(crate) use write_file::WriteFile;
 
 #[cfg(test)]
