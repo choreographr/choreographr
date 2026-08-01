@@ -2228,6 +2228,129 @@ fn click_on_reasoning_header_toggles_collapse_when_content_fits_viewport() {
 }
 
 #[test]
+fn click_on_reasoning_header_toggles_collapse_when_scrolled() {
+    // Regression: on sessions with a scrollbar, once the user scrolls away
+    // from the bottom the click mapping must account for the scroll offset
+    // (content line `c` sits at screen row `vh - total + scroll + c`).  A
+    // naive "content starts at row 0" mapping broke header clicks here.
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+
+    // Several full turns so the history overflows the viewport.
+    for i in 0..5 {
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some(format!("user {i}")),
+            assistant_text: Some(format!("assistant response {i}")),
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(i as u32, turn);
+    }
+    // The reasoning-bearing turn to click on.
+    let target = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: Some("Response text.".into()),
+        assistant_reasoning: Some("Hidden thinking.".into()),
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+    };
+    app.active_display()
+        .unwrap()
+        .view
+        .insert_or_replace(99, target);
+    app.rebuild_height_prefix();
+
+    let total = app.active_display().unwrap().total_history_height();
+    let vh = app.history_viewport.height as usize;
+    assert!(total > vh, "test requires a session with a scrollbar");
+
+    // Find the target turn's reasoning header range, then scroll so the
+    // header is visible near the bottom of the viewport.
+    let target_idx = {
+        let display = app.active_display().unwrap();
+        display
+            .visible_turn_ids
+            .iter()
+            .position(|&id| id == 99)
+            .expect("target turn should be visible")
+    };
+    let header_start = {
+        let display = app.active_display().unwrap();
+        let (start, _end) = display.turn_layouts[target_idx]
+            .reasoning_header_range
+            .expect("reasoning header range should exist");
+        start
+    };
+    // Absolute content line of the header (turn start + in-turn offset).
+    let header_content_line = display_content_line(&app, target_idx) + header_start;
+
+    // Scroll so the header lands at row `vh - 2` (near the bottom, on
+    // screen).  Content line `c` sits at screen row `c - (total - scroll -
+    // vh)`, so solve for scroll and clamp into [0, max_scroll].
+    let max_scroll = total - vh;
+    let target_row = (vh - 2) as isize;
+    let scroll = (target_row + total as isize - vh as isize - header_content_line as isize)
+        .clamp(0, max_scroll as isize) as usize;
+    app.scroll_to(scroll);
+
+    // Sanity: the header must be visible at the expected row, mapped to its
+    // in-turn offset.
+    let header_row =
+        (vh as isize - total as isize + scroll as isize + header_content_line as isize) as u16;
+    let (_idx, offset) = find_turn_at_row(&app, header_row).expect("row must map");
+    assert_eq!(
+        offset, header_start,
+        "header content line must be at the expected row"
+    );
+
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: header_row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle click");
+
+    assert_eq!(
+        app.active_display().unwrap().reasoning_override.get(&99),
+        Some(&true),
+        "clicking the header on a scrolled session should expand reasoning"
+    );
+}
+
+/// Content line where the turn at `turn_idx` starts (0 for the first turn).
+fn display_content_line(app: &App, turn_idx: usize) -> usize {
+    app.active_display_ref()
+        .and_then(|d| {
+            turn_idx
+                .checked_sub(1)
+                .and_then(|prev| d.height_prefix.get(prev))
+        })
+        .copied()
+        .unwrap_or(0)
+}
+
+#[test]
 fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();

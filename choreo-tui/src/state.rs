@@ -2816,22 +2816,26 @@ pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<(usize, usi
     let effective_scroll = display.effective_scroll(&app.history_viewport);
     let total_height = display.total_history_height();
 
-    // Map the screen row to a content line.  `render_history` draws the
-    // history bottom-up (newest rows at the bottom of the viewport), so when
-    // the history is shorter than the viewport — the "no scrollbar" case —
-    // the content sits in the bottom `total_height` rows and there is a blank
-    // band of `scrolled - total_height` rows at the top.  Using plain
-    // subtraction (not `saturating_sub`) here is essential: clamping the
-    // offset to zero would collapse the blank band away and map every click
-    // to the wrong content line, breaking reasoning-header/image hit-testing
-    // on short sessions.
+    // Map the screen row to a content line, mirroring `render_history`'s
+    // bottom-up draw order: the viewport shows the bottom `vh` rows of the
+    // unscrolled content window, i.e. content lines `[total - scroll - vh,
+    // total - scroll)`, so screen row `r` maps to content line
+    // `r + total - scroll - vh`.  The same formula covers both layouts:
+    //  - Tall history (scrollbar present): `scroll + vh <= total`, so the
+    //    result is always `>= 0` and every viewport row shows content.
+    //  - Short history (no scrollbar, `scroll == 0`): `total < vh` leaves a
+    //    blank band of `vh - total` rows at the top — rows whose computed
+    //    content line is negative.  Those rows must map to no turn rather
+    //    than being clamped into the content (which is what both a naive
+    //    `saturating_sub` and the pre-fix code did, breaking header/image
+    //    click hit-testing on short sessions).
     let scrolled = effective_scroll.saturating_add(vh as usize);
-    let first_content_row = scrolled.saturating_sub(total_height);
-    if (screen_row as usize) < first_content_row {
+    let content_line = (screen_row as usize).saturating_add(total_height);
+    if content_line < scrolled {
         // Click landed in the blank band above the content.
         return None;
     }
-    let content_line = screen_row as usize - first_content_row;
+    let content_line = content_line - scrolled;
 
     if content_line >= total_height {
         return None;
@@ -3044,6 +3048,74 @@ mod tests {
 
         // Rows above the content are blank and must not map to a turn.
         assert!(find_turn_at_row(&app, first_row.saturating_sub(1)).is_none());
+    }
+
+    #[test]
+    fn find_turn_at_row_scrolled_history_maps_rows_correctly() {
+        // Tall session with a scrollbar: scroll away from the bottom and
+        // verify the mapping agrees with `render_history`'s bottom-up draw
+        // order (content line `c` sits at screen row `vh - total + scroll + c`).
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        for i in 0..8 {
+            let turn = Turn {
+                created_at: choreo_proto::TimestampMs::now(),
+                undone: false,
+                error: None,
+                user_text: Some(format!("user {i}")),
+                assistant_text: Some(format!("assistant {i}")),
+                assistant_reasoning: None,
+                tool_calls: vec![],
+                token_usage: None,
+                tool_results: vec![],
+                displayed_images: vec![],
+            };
+            app.active_display()
+                .unwrap()
+                .view
+                .insert_or_replace(i, turn);
+        }
+        app.rebuild_height_prefix();
+
+        let total = app.active_display().unwrap().total_history_height();
+        let vh = app.history_viewport.height as usize;
+        assert!(
+            total > vh,
+            "test requires content taller than the viewport (scrollbar present)"
+        );
+
+        // Scroll partway up: max_scroll = total - vh.
+        let scroll = (total - vh) / 2;
+        app.scroll_to(scroll);
+        assert_eq!(app.effective_scroll(), scroll);
+
+        // The topmost visible content line is `total - scroll - vh`; the
+        // bottom row of the viewport shows content line `total - scroll - 1`.
+        let top_line = total - scroll - vh;
+        let (idx, offset) = find_turn_at_row(&app, 0).expect("top row must map to a turn");
+        assert_eq!(offset, top_line - turn_start(&app, idx));
+
+        let bottom_row = (vh - 1) as u16;
+        let (idx_b, offset_b) = find_turn_at_row(&app, bottom_row).expect("bottom row must map");
+        assert_eq!(
+            offset_b,
+            total - scroll - 1 - turn_start(&app, idx_b),
+            "bottom row must map to the last visible content line"
+        );
+    }
+
+    /// Content line where the turn at `turn_idx` starts (height_prefix
+    /// prefix-sum entry, 0 for the first turn).
+    fn turn_start(app: &App, turn_idx: usize) -> usize {
+        app.active_display_ref()
+            .and_then(|d| {
+                turn_idx
+                    .checked_sub(1)
+                    .and_then(|prev| d.height_prefix.get(prev))
+            })
+            .copied()
+            .unwrap_or(0)
     }
 
     #[test]
