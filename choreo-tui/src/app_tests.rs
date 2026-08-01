@@ -2859,6 +2859,7 @@ fn daemon_message_session_state_ignores_wrong_session() {
 fn daemon_message_done_with_token_usage_updates_progress() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(0);
 
     handle_daemon_message(
         DaemonMessage::Done {
@@ -2907,6 +2908,231 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
     // Must remain at defaults — no data written, no dirty flag set.
     assert!(app.display_for(0).token_usage.is_none());
     assert!(!app.display_for(0).progress_dirty);
+}
+
+// ── multi-session streaming: switching keeps accumulated content ──
+
+/// A turn whose assistant text was streamed in via OutputChunk.
+fn streamed_turn(user_text: &str, assistant_text: &str) -> Turn {
+    Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some(user_text.to_string()),
+        assistant_text: Some(assistant_text.to_string()),
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+    }
+}
+
+/// The empty placeholder the daemon's attach snapshot carries for an
+/// in-flight turn (what `start_turn` inserts on the main session thread
+/// before the worker owns the live content).
+fn placeholder_turn(user_text: &str) -> Turn {
+    Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some(user_text.to_string()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+    }
+}
+
+#[test]
+fn reset_for_session_switch_preserves_accumulated_streaming_state() {
+    let mut app = test_app();
+    // While viewing session 0, session 7's content accumulated via the
+    // all-activity subscription: a streamed turn, its request→turn routing
+    // entry, the active-request set, a live token estimate, and a reasoning
+    // preference.
+    {
+        let display = app.display_for(7);
+        display
+            .view
+            .insert_or_replace(5, streamed_turn("user q", "partial answer"));
+        display.view.request_to_turn.insert(99, 5);
+        display.active.insert(99);
+        display.live_output_tokens = 42;
+        display.reasoning_override.insert(5, true);
+    }
+
+    app.reset_for_session_switch(7);
+
+    let display = app.display_for(7);
+    // Live state survives the switch…
+    assert_eq!(
+        display.view.turns.len(),
+        1,
+        "accumulated turns must survive the switch"
+    );
+    assert_eq!(
+        display
+            .view
+            .turns
+            .get(&5)
+            .unwrap()
+            .assistant_text
+            .as_deref(),
+        Some("partial answer"),
+        "streamed content must survive the switch"
+    );
+    assert_eq!(
+        display.view.request_to_turn.get(&99),
+        Some(&5),
+        "request→turn routing must survive the switch"
+    );
+    assert!(
+        display.active.contains(&99),
+        "active request set must survive"
+    );
+    assert_eq!(display.live_output_tokens, 42);
+    assert_eq!(display.reasoning_override.get(&5), Some(&true));
+    // …while transient render state is reset and queued for a full rebuild.
+    assert!(display.markers_dirty);
+    assert!(display.visible_turn_ids.is_empty());
+    assert!(display.height_prefix.is_empty());
+    assert!(display.progress_dirty);
+}
+
+#[test]
+fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() {
+    let mut app = test_app();
+    app.attached_session_id = Some(7);
+    let (tx, _rx) = std::sync::mpsc::channel();
+
+    // Accumulated via the all-activity subscription: turn 5 is live-streaming.
+    {
+        let display = app.display_for(7);
+        display
+            .view
+            .insert_or_replace(5, streamed_turn("user q", "streamed answer so far"));
+        display.view.request_to_turn.insert(99, 5);
+        display.active.insert(99);
+    }
+
+    // Daemon attach snapshot: turn 3 is finished, turn 5 is the in-flight
+    // placeholder (assistant_text is None).
+    let mut snapshot_turns = std::collections::BTreeMap::new();
+    snapshot_turns.insert(3, streamed_turn("old q", "finished answer"));
+    snapshot_turns.insert(5, placeholder_turn("user q"));
+
+    handle_daemon_message(
+        DaemonMessage::SessionState {
+            session_id: 7,
+            title: None,
+            selected_model: None,
+            parent_session_id: None,
+            working_dir: None,
+            max_turns: None,
+            turns: snapshot_turns,
+            active_tool_groups: vec![],
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+            reasoning_effort: None,
+            reasoning_capability: None,
+            status: SessionStatus::Inactive,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    let display = app.display_for(7);
+    // The in-flight turn keeps its live content — the placeholder must not win.
+    assert_eq!(
+        display
+            .view
+            .turns
+            .get(&5)
+            .unwrap()
+            .assistant_text
+            .as_deref(),
+        Some("streamed answer so far"),
+        "accumulated live content must survive the attach snapshot merge"
+    );
+    // Finished turns come from the snapshot.
+    assert_eq!(
+        display
+            .view
+            .turns
+            .get(&3)
+            .unwrap()
+            .assistant_text
+            .as_deref(),
+        Some("finished answer")
+    );
+    // Request routing and the active set survive the merge.
+    assert_eq!(display.view.request_to_turn.get(&99), Some(&5));
+    assert!(display.active.contains(&99));
+}
+
+#[test]
+fn done_for_background_session_does_not_pollute_attached_display() {
+    let mut app = test_app();
+    app.attached_session_id = Some(0);
+    let (tx, _rx) = std::sync::mpsc::channel();
+    // The attached session already has its own token usage.
+    app.display_for(0).token_usage = Some(TokenUsage {
+        input_tokens: 1,
+        output_tokens: 2,
+        total_tokens: 3,
+    });
+    // Session 7 (background, streamed via SubscribeAllActivity) has an
+    // in-flight request that is about to finish.
+    {
+        let display = app.display_for(7);
+        display.view.request_to_turn.insert(50, 5);
+        display.active.insert(50);
+    }
+
+    handle_daemon_message(
+        DaemonMessage::Done {
+            session_id: 7,
+            request_id: 50,
+            token_usage: Some(TokenUsage {
+                input_tokens: 99,
+                output_tokens: 99,
+                total_tokens: 99,
+            }),
+            last_prompt_tokens: Some(99),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    // The attached display is untouched — no progress-bar clobber from a
+    // background session finishing.
+    assert_eq!(
+        app.display_for(0).token_usage,
+        Some(TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+        })
+    );
+    assert!(!app.display_for(0).progress_dirty);
+    // The background session's own display got the token usage and its
+    // request was cleaned up via the generic handle_done dispatch.
+    assert_eq!(
+        app.display_for(7).token_usage,
+        Some(TokenUsage {
+            input_tokens: 99,
+            output_tokens: 99,
+            total_tokens: 99,
+        })
+    );
+    assert!(!app.display_for(7).active.contains(&50));
+    assert!(!app.display_for(7).view.request_to_turn.contains_key(&50));
 }
 
 #[test]

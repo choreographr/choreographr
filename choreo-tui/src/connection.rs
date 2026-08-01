@@ -1699,40 +1699,49 @@ pub(crate) fn handle_daemon_message(
             // Fall through to dispatch_daemon_message for message processing.
         }
         DaemonMessage::Done {
+            session_id,
             token_usage,
             last_prompt_tokens,
             ..
         } => {
-            // Capture per-request token usage at turn end.
-            // Only set progress_dirty when we actually write data —
-            // a Done message without token info doesn't change state.
-            let has_data = token_usage.is_some() || last_prompt_tokens.is_some();
+            // Progress-bar updates only apply to the currently-attached
+            // session.  A Done for a background session (received via
+            // SubscribeAllActivity) must not clobber the attached session's
+            // token display — the generic dispatch below routes the
+            // per-session bookkeeping (request cleanup, token_usage) to the
+            // correct session display via handle_done.
+            if app.attached_session_id == Some(*session_id) {
+                // Capture per-request token usage at turn end.
+                // Only set progress_dirty when we actually write data —
+                // a Done message without token info doesn't change state.
+                let has_data = token_usage.is_some() || last_prompt_tokens.is_some();
 
-            if let Some(usage) = token_usage {
-                let display = app.display_for(app.attached_session_id.unwrap_or(0));
-                display.token_usage = Some(*usage);
-                // Many providers only supply token_usage without the
-                // separate last_prompt_tokens field.  Fall back to
-                // input_tokens so the progress bar always updates.
-                if last_prompt_tokens.is_none() {
-                    display.last_prompt_tokens = Some(usage.input_tokens);
+                if let Some(usage) = token_usage {
+                    let display = app.display_for(*session_id);
+                    display.token_usage = Some(*usage);
+                    // Many providers only supply token_usage without the
+                    // separate last_prompt_tokens field.  Fall back to
+                    // input_tokens so the progress bar always updates.
+                    if last_prompt_tokens.is_none() {
+                        display.last_prompt_tokens = Some(usage.input_tokens);
+                    }
                 }
-            }
-            if let Some(tokens) = last_prompt_tokens {
-                let display = app.display_for(app.attached_session_id.unwrap_or(0));
-                display.last_prompt_tokens = Some(*tokens);
-            }
+                if let Some(tokens) = last_prompt_tokens {
+                    let display = app.display_for(*session_id);
+                    display.last_prompt_tokens = Some(*tokens);
+                }
 
-            if has_data {
-                let display = app.display_for(app.attached_session_id.unwrap_or(0));
-                display.progress_dirty = true;
-                // Push the update directly instead of waiting for the
-                // render loop — bypasses any timing issues with the
-                // progress_dirty flag getting consumed before render.
-                if let (Some(cw), Some(tokens)) =
-                    (display.context_window, display.last_prompt_tokens)
-                {
-                    terminal_progress::update_terminal_progress(Some(tokens), Some(cw));
+                if has_data {
+                    let display = app.display_for(*session_id);
+                    display.progress_dirty = true;
+                    // Push the update directly instead of waiting for the
+                    // render loop — bypasses any timing issues with the
+                    // progress_dirty flag getting consumed before render.
+                    if let (Some(cw), Some(tokens)) =
+                        (display.context_window, display.last_prompt_tokens)
+                    {
+                        terminal_progress::update_terminal_progress(Some(tokens), Some(cw));
+                    }
                 }
             }
             // Fall through to dispatch_daemon_message.

@@ -1421,16 +1421,36 @@ Model calls display_image tool
 
 ### Session switch flow (updated)
 
+Because the TUI subscribes to *all* session activity (`SubscribeAllActivity`,
+sent once at startup), every session's streaming events (`Started`,
+`OutputChunk`, `TurnAppended`, `ToolCallStarted`, `ToolResultChunk`, `Done`,
+…) are routed into per-session `SessionDisplayState` entries in
+`session_displays` keyed by `session_id` — even for sessions the user is not
+currently viewing.  Switching sessions therefore does **not** discard that
+accumulated state:
+
 ```
 User presses Enter on a session in the session manager
-  → history cleared (client.history, render_cache, scroll, in_progress)
+  → reset_for_session_switch(session_id)
+      • preserves live state: view.turns, view.request_to_turn, active
+        request set, live token estimates, reasoning overrides
+      • resets only transient render state (scroll, markers, height caches)
+        which is rebuilt on the next layout pass (markers_dirty)
   → AttachSession sent to daemon
-  → daemon responds with SessionState { messages: Vec<SessionMessage>, … }
-    where messages may include SessionMessageKind::DisplayedImage for persisted images
-  → for each message:
-    DisplayedImage → RenderedImage::new_placeholder(metadata, Arc::from(data)) → HistoryItem::Image
-    other         → classify_session_message → HistoryItem::{SessionMessage,Text,Diff}
+  → daemon responds with SessionState { turns, … }
+  → handle_session_state MERGES the snapshot with the accumulated turns:
+      • finished turns come from the snapshot (daemon-canonical)
+      • the in-flight turn keeps the accumulated version — the snapshot only
+        holds the empty placeholder from start_turn, while the accumulated
+        turn has the live streamed content (see turn_has_live_content)
+  → rendered_images re-synced from the merged turn set
 ```
+
+This makes switching into a streaming session seamless: the user "jumps in"
+to the live content accumulated so far instead of seeing a blank turn until
+the next chunk arrives.  (Cold-starting clients that were never subscribed
+to the session still miss pre-attach content — the worker owns the live turn
+and only syncs back on `RequestFinished`.)
 
 
 ---

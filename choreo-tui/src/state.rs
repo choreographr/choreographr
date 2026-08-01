@@ -1599,18 +1599,26 @@ impl App {
 
     pub(crate) fn reset_for_session_switch(&mut self, session_id: u64) {
         self.active_session_id = Some(session_id);
-        self.rendered_images.remove(&session_id);
         let display = self.display_for(session_id);
-        display.view = SessionView::new();
+        // Keep the session's live state: `view.turns` and `view.request_to_turn`
+        // (accumulated via the all-activity subscription while the user was
+        // viewing another session), the active-request set, live token
+        // estimates, and per-turn reasoning preferences.  Destroying these on
+        // switch was the root cause of "switching to a streaming session shows
+        // nothing until the next turn": the accumulated content AND the
+        // request→turn routing map were wiped exactly when they were needed,
+        // and the attach snapshot only holds the empty in-flight placeholder.
+        //
+        // Only transient *render* state is reset here — it is rebuilt on the
+        // next layout pass because `markers_dirty` forces a full rebuild from
+        // the preserved `view.turns`.
         display.render_cache.clear();
         display.visible_turn_ids.clear();
         display.history_scroll = HistoryScrollState::new();
-        display.active.clear();
         display.markers.clear();
         display.height_prefix.clear();
         display.turn_heights.clear();
         display.turn_layouts.clear();
-        display.reasoning_override.clear();
         display.streaming_turn_index = None;
         display.streaming_dirty = false;
         display.markers_dirty = true;
@@ -2508,6 +2516,35 @@ fn invalidate_turn_cache(display: &mut SessionDisplayState, turn_id: u32) {
     }
 }
 
+/// Decide whether the locally-accumulated version of a turn should win over
+/// the daemon snapshot's version when merging an attach snapshot.
+///
+/// The snapshot is authoritative for finished turns, but for the in-flight
+/// turn it contains only the empty placeholder inserted by `start_turn` — the
+/// accumulated version (fed by `OutputChunk`, `ToolCallStarted` and
+/// `ToolResultChunk` via the all-activity subscription) holds the real
+/// streaming content.  Keep the accumulated turn whenever it carries content
+/// the snapshot version lacks; otherwise prefer the snapshot, which is the
+/// daemon's canonical state.
+fn turn_has_live_content(accumulated: &Turn, snapshot: &Turn) -> bool {
+    (accumulated
+        .assistant_text
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+        && snapshot.assistant_text.as_deref().is_none_or(str::is_empty))
+        || (accumulated
+            .assistant_reasoning
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+            && snapshot
+                .assistant_reasoning
+                .as_deref()
+                .is_none_or(str::is_empty))
+        || (!accumulated.tool_calls.is_empty() && snapshot.tool_calls.is_empty())
+        || (!accumulated.tool_results.is_empty() && snapshot.tool_results.is_empty())
+        || (!accumulated.displayed_images.is_empty() && snapshot.displayed_images.is_empty())
+}
+
 // ── TurnEventHandler implementation ──────────────────────────────────
 
 impl TurnEventHandler for App {
@@ -2704,13 +2741,43 @@ impl TurnEventHandler for App {
             reasoning_capability,
             ..
         } = state;
+
+        // Merge the daemon snapshot with turns already accumulated locally
+        // via the all-activity subscription (while the user was viewing
+        // another session).  The snapshot is authoritative for finished
+        // turns, but for an in-flight turn it only holds the empty
+        // placeholder inserted by `start_turn` — the worker owns the live
+        // content and only syncs back on RequestFinished.  The accumulated
+        // turn carries the real streamed content, so it must win; otherwise
+        // switching into a streaming session would blank the turn until the
+        // next chunk arrived.
+        let accumulated = {
+            let display = self.display_for(session_id);
+            std::mem::take(&mut display.view.turns)
+        };
+        let mut merged = turns;
+        for (turn_id, acc_turn) in &accumulated {
+            match merged.get_mut(turn_id) {
+                Some(snap_turn) if turn_has_live_content(acc_turn, snap_turn) => {
+                    *snap_turn = acc_turn.clone();
+                }
+                // Turn only known to the client (e.g. a turn created just
+                // before this snapshot) — keep the accumulated version.
+                None => {
+                    merged.insert(*turn_id, acc_turn.clone());
+                }
+                // Snapshot is at least as complete — keep it.
+                Some(_) => {}
+            }
+        }
+
         // Sync images before getting display to avoid borrow conflict.
         self.rendered_images.remove(&session_id);
-        for (tid, turn) in &turns {
+        for (tid, turn) in &merged {
             self.sync_turn_images(session_id, *tid, turn);
         }
         let display = self.display_for(session_id);
-        display.view.turns = turns;
+        display.view.turns = merged;
         display.selected_model = selected_model;
         if let Some(usage) = token_usage {
             display.token_usage = Some(usage);
@@ -4643,6 +4710,67 @@ mod tests {
             display.streaming_turn_index.is_none(),
             "streaming_turn_index should be cleared"
         );
+    }
+
+    // ── turn_has_live_content (attach snapshot merge) ──
+
+    fn empty_placeholder() -> Turn {
+        Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("q".into()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        }
+    }
+
+    fn with_text(turn: &Turn, text: &str) -> Turn {
+        let mut t = turn.clone();
+        t.assistant_text = Some(text.into());
+        t
+    }
+
+    #[test]
+    fn accumulated_live_content_beats_snapshot_placeholder() {
+        let placeholder = empty_placeholder();
+        let live = with_text(&placeholder, "streamed so far");
+        // The accumulated turn has content the snapshot placeholder lacks.
+        assert!(turn_has_live_content(&live, &placeholder));
+        // But the placeholder never "wins" over a live turn.
+        assert!(!turn_has_live_content(&placeholder, &live));
+    }
+
+    #[test]
+    fn snapshot_with_content_wins_over_accumulated() {
+        let placeholder = empty_placeholder();
+        let snapshot_final = with_text(&placeholder, "final answer from daemon");
+        let accumulated = with_text(&placeholder, "earlier accumulated");
+        // Both have content — the snapshot (daemon-canonical) wins.
+        assert!(!turn_has_live_content(&accumulated, &snapshot_final));
+        // Identical content: snapshot wins too (no clause triggers).
+        let same = with_text(&placeholder, "same");
+        assert!(!turn_has_live_content(&same, &same));
+    }
+
+    #[test]
+    fn reasoning_and_tool_content_also_count_as_live() {
+        let placeholder = empty_placeholder();
+        let mut reasoning = placeholder.clone();
+        reasoning.assistant_reasoning = Some("thinking…".into());
+        assert!(turn_has_live_content(&reasoning, &placeholder));
+
+        let mut tool = placeholder.clone();
+        tool.tool_calls.push(choreo_proto::AssistantToolCallRecord {
+            call_id: "call_1".into(),
+            name: "read_file".into(),
+            arguments_json: "{}".into(),
+        });
+        assert!(turn_has_live_content(&tool, &placeholder));
     }
 
     #[test]
