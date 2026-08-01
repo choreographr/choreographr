@@ -115,7 +115,8 @@ Programs will be able to run automatically at designated times.
 
 With the agent able to run anything via the shell, there needs to be a robust sandboxing solution.
 
-Path confinement was previously enforced in-process (`confine_path`); that code has been removed in favour of OS-level sandboxing: on Linux, [Landlock](https://landlock.io/); on macOS, [Seatbelt](https://theapplewiki.com/wiki/Dev:Seatbelt). Windows does not have a good solution for this yet.
+On Linux, [Landlock](https://landlock.io/) will be used. On macOS, [Seatbelt](https://theapplewiki.com/wiki/Dev:Seatbelt).
+Windows does not have a good solution for this yet.
 
 
 ### Advanced Context Management
