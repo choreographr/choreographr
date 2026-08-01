@@ -2166,6 +2166,68 @@ fn click_on_reasoning_header_toggles_collapse() {
 }
 
 #[test]
+fn click_on_reasoning_header_toggles_collapse_when_content_fits_viewport() {
+    // Regression: on sessions whose history is shorter than the viewport (no
+    // scrollbar), the content is anchored to the bottom of the viewport.
+    // Clicking the reasoning header must resolve to the right content line
+    // despite the blank band above it.
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 20;
+
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: Some("Response text.".into()),
+        assistant_reasoning: Some("Hidden thinking.".into()),
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+    };
+    app.active_display()
+        .unwrap()
+        .view
+        .insert_or_replace(1, turn);
+    app.rebuild_height_prefix();
+
+    let (start, total) = {
+        let display = app.active_display().unwrap();
+        let (start, _end) = display.turn_layouts[0]
+            .reasoning_header_range
+            .expect("reasoning header range should exist");
+        (start, display.total_history_height())
+    };
+    assert!(
+        total < app.history_viewport.height as usize,
+        "test requires a session too short to need the scrollbar"
+    );
+
+    // The header renders at the bottom-anchored position.
+    let row = (app.history_viewport.height as usize - total + start) as u16;
+    handle_terminal_event(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        &mut app,
+        &tx,
+    )
+    .expect("handle click");
+
+    assert_eq!(
+        app.active_display().unwrap().reasoning_override.get(&1),
+        Some(&true),
+        "clicking the header on a short session should expand reasoning"
+    );
+}
+
+#[test]
 fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
     let (tx, _rx) = std::sync::mpsc::channel();
     let mut app = test_app();

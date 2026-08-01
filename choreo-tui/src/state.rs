@@ -1453,6 +1453,14 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// Whether the vertical scrollbar is currently rendered.  Must stay in
+    /// lockstep with the click handling so a hidden scrollbar never swallows
+    /// clicks in its (still-reserved) column on sessions whose history fits
+    /// the viewport.
+    pub(crate) fn scrollbar_visible(&self) -> bool {
+        self.total_history_height() > self.history_viewport.height as usize
+    }
+
     #[cfg(test)]
     pub(crate) fn rebuild_height_prefix(&mut self) {
         let vp = self.history_viewport;
@@ -2808,9 +2816,22 @@ pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<(usize, usi
     let effective_scroll = display.effective_scroll(&app.history_viewport);
     let total_height = display.total_history_height();
 
-    let content_line = total_height
-        .saturating_sub(effective_scroll + vh as usize)
-        .saturating_add(screen_row as usize);
+    // Map the screen row to a content line.  `render_history` draws the
+    // history bottom-up (newest rows at the bottom of the viewport), so when
+    // the history is shorter than the viewport — the "no scrollbar" case —
+    // the content sits in the bottom `total_height` rows and there is a blank
+    // band of `scrolled - total_height` rows at the top.  Using plain
+    // subtraction (not `saturating_sub`) here is essential: clamping the
+    // offset to zero would collapse the blank band away and map every click
+    // to the wrong content line, breaking reasoning-header/image hit-testing
+    // on short sessions.
+    let scrolled = effective_scroll.saturating_add(vh as usize);
+    let first_content_row = scrolled.saturating_sub(total_height);
+    if (screen_row as usize) < first_content_row {
+        // Click landed in the blank band above the content.
+        return None;
+    }
+    let content_line = screen_row as usize - first_content_row;
 
     if content_line >= total_height {
         return None;
@@ -3013,9 +3034,73 @@ mod tests {
         display.view.insert_or_replace(1, turn);
         app.rebuild_height_prefix();
 
-        let (turn_idx, offset) = find_turn_at_row(&app, 0).unwrap();
+        // The history is shorter than the viewport, so content is anchored to
+        // the bottom: content line 0 sits at screen row `vh - total`.
+        let total = app.active_display().unwrap().total_history_height();
+        let first_row = (app.history_viewport.height as usize - total) as u16;
+        let (turn_idx, offset) = find_turn_at_row(&app, first_row).unwrap();
         assert_eq!(turn_idx, 0);
         assert_eq!(offset, 0);
+
+        // Rows above the content are blank and must not map to a turn.
+        assert!(find_turn_at_row(&app, first_row.saturating_sub(1)).is_none());
+    }
+
+    #[test]
+    fn find_turn_at_row_short_history_anchors_content_at_bottom() {
+        // Regression: when the history is shorter than the viewport (no
+        // scrollbar shown), the renderer anchors the content at the bottom of
+        // the viewport, but the click mapping assumed content always starts at
+        // screen row 0.  The reasoning header (and image clicks) therefore
+        // couldn't be hit on short sessions.
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: Some("Response text.".into()),
+            assistant_reasoning: Some("Hidden thinking.".into()),
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        app.active_display()
+            .unwrap()
+            .view
+            .insert_or_replace(1, turn);
+        app.rebuild_height_prefix();
+
+        let (start, total) = {
+            let display = app.active_display().unwrap();
+            let (start, _end) = display.turn_layouts[0]
+                .reasoning_header_range
+                .expect("reasoning header range should exist");
+            (start, display.total_history_height())
+        };
+        assert!(
+            total < app.history_viewport.height as usize,
+            "test requires a session too short to need the scrollbar"
+        );
+
+        // The header is drawn at screen row `vh - total + start` (bottom
+        // anchored); clicking that row must resolve to the header's content
+        // line `start`.
+        let screen_row = (app.history_viewport.height as usize - total + start) as u16;
+        let (turn_idx, offset) =
+            find_turn_at_row(&app, screen_row).expect("row must map to a turn");
+        assert_eq!(turn_idx, 0);
+        assert_eq!(offset, start);
+
+        // The blank band above the content must not map to any turn.
+        let blank_row = (app.history_viewport.height as usize - total - 1) as u16;
+        assert!(
+            find_turn_at_row(&app, blank_row).is_none(),
+            "empty rows above the content must not hit a turn"
+        );
     }
 
     // ── scrollbar_notch ──

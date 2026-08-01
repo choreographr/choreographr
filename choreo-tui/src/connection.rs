@@ -919,14 +919,18 @@ fn handle_chat_event(
         // Left-click (and drag) in the scrollbar column.
         // This must be checked BEFORE the drag handler so that a new click
         // on the scrollbar always reaches this handler, even when the drag
-        // flag is still set from a previous click.
+        // flag is still set from a previous click.  Only treated as a
+        // scrollbar when one is actually rendered: on sessions whose history
+        // fits the viewport the column is blank, and a click there must not
+        // arm the drag state (which would swallow the next history click).
         Event::Mouse(mouse)
-            if mouse_in_scrollbar_column(
-                mouse.column,
-                mouse.row,
-                app.history_viewport.width,
-                app.history_viewport.height,
-            ) =>
+            if app.scrollbar_visible()
+                && mouse_in_scrollbar_column(
+                    mouse.column,
+                    mouse.row,
+                    app.history_viewport.width,
+                    app.history_viewport.height,
+                ) =>
         {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -2001,6 +2005,69 @@ mod tests {
                 "virtual_slot should be proportional to content_line using final total as denominator"
             );
         }
+    }
+
+    // ── Scrollbar-column click gating ──
+
+    fn click_scrollbar_column(app: &mut App, row: u16) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        handle_terminal_event(
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: app.history_viewport.width,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+            app,
+            &tx,
+        )
+        .expect("handle click");
+    }
+
+    #[test]
+    fn scrollbar_column_click_ignored_when_no_scrollbar_rendered() {
+        // Short session: the history fits the viewport, so no scrollbar is
+        // drawn.  Clicking the reserved rightmost column must not arm the
+        // drag state (which would otherwise swallow the next history click,
+        // e.g. on the reasoning header).
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 20;
+        insert_turn(&mut app, 0, "short", "short");
+        app.rebuild_height_prefix();
+        assert!(
+            !app.scrollbar_visible(),
+            "content must fit the viewport for this test"
+        );
+
+        click_scrollbar_column(&mut app, 0);
+        assert!(
+            !app.scrollbar_dragging,
+            "a hidden scrollbar must not arm the drag state"
+        );
+    }
+
+    #[test]
+    fn scrollbar_column_click_arms_drag_when_scrollbar_rendered() {
+        // Tall session: the history overflows the viewport, so the scrollbar
+        // is drawn and clicking its column must arm the drag as before.
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        for i in 0..20 {
+            insert_turn(&mut app, i, "user text", "assistant response");
+        }
+        app.rebuild_height_prefix();
+        assert!(
+            app.scrollbar_visible(),
+            "content must overflow the viewport for this test"
+        );
+
+        click_scrollbar_column(&mut app, 0);
+        assert!(
+            app.scrollbar_dragging,
+            "a visible scrollbar should arm the drag state"
+        );
     }
 
     #[test]

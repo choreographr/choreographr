@@ -197,7 +197,7 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     // ── Scrollbar ────────────────────────────────────────────
     let viewport_height = app.history_viewport.height as usize;
     let total_height = app.total_history_height();
-    if total_height > viewport_height {
+    if app.scrollbar_visible() {
         let position = app
             .max_scroll_offset()
             .saturating_sub(app.effective_scroll());
@@ -1423,8 +1423,8 @@ mod tests {
         assert_eq!(cached.height, 1);
         assert_eq!(cached.lines.len(), 1);
         assert_eq!(&*cached.visual_offsets, &[1]);
-        assert_eq!(
-            cached.reasoning_expanded, false,
+        assert!(
+            !cached.reasoning_expanded,
             "cache should record the reasoning state it was rendered with"
         );
     }
@@ -1659,8 +1659,8 @@ mod tests {
         );
         assert_eq!(lines[0], Line::from("fresh"));
         let cached = cache[0].as_ref().unwrap();
-        assert_eq!(
-            cached.reasoning_expanded, true,
+        assert!(
+            cached.reasoning_expanded,
             "cache entry should record the new reasoning state"
         );
     }
