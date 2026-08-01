@@ -1368,6 +1368,20 @@ fn starts_with_closing_punct(text: &str) -> bool {
     })
 }
 
+/// Returns `true` if `text` ends with opening punctuation that the following
+/// inline content should directly attach to without a space (e.g. "(" in
+/// "(**hi**)" renders as "(hi)", not "( hi)"). This is the mirror image of
+/// `starts_with_closing_punct`: that helper keeps trailing punctuation glued
+/// to the *preceding* word, this one keeps leading punctuation glued to the
+/// *following* inline (bold, emphasis, code, links, …). Only checked when the
+/// text itself does not end with whitespace, so explicit source spaces like
+/// "( **hi** )" are still preserved.
+fn ends_with_opening_punct(text: &str) -> bool {
+    text.chars()
+        .next_back()
+        .is_some_and(|c| matches!(c, '(' | '[' | '{' | '\u{2018}' | '\u{201c}'))
+}
+
 fn render_text_inline(text: &str, ctx: &mut RenderCtx) {
     // If the original text does NOT start with whitespace (e.g. "**bold**!"
     // where "!" directly follows the bold), check whether it starts with
@@ -1416,6 +1430,12 @@ fn render_text_inline(text: &str, ctx: &mut RenderCtx) {
 
     if ends_with_space && !words.is_empty() {
         *ctx.needs_separator = true;
+    } else if ends_with_opening_punct(text) {
+        // Text ends with an opening bracket/quote and no whitespace, so the
+        // next inline (e.g. "**hi**" inside "(**hi**)") must attach directly
+        // without a space. Without this the renderer treats "(" as a word and
+        // inserts a spurious space after it.
+        *ctx.needs_separator = false;
     }
 }
 
@@ -2854,6 +2874,36 @@ mod tests {
         assert!(!starts_with_closing_punct("\u{201c}")); // left double quote
     }
 
+    // ── ends_with_opening_punct ──────────────────────────────────────────
+
+    #[test]
+    fn ends_with_opening_punct_brackets() {
+        assert!(ends_with_opening_punct("("));
+        assert!(ends_with_opening_punct("(("));
+        assert!(ends_with_opening_punct("word ("));
+        assert!(ends_with_opening_punct("["));
+        assert!(ends_with_opening_punct("{"));
+    }
+
+    #[test]
+    fn ends_with_opening_punct_unicode_quotes() {
+        assert!(ends_with_opening_punct("\u{2018}")); // left single quote
+        assert!(ends_with_opening_punct("\u{201c}")); // left double quote
+        assert!(ends_with_opening_punct("said \u{201c}"));
+    }
+
+    #[test]
+    fn ends_with_opening_punct_non_opening_chars() {
+        assert!(!ends_with_opening_punct(""));
+        assert!(!ends_with_opening_punct("hello"));
+        assert!(!ends_with_opening_punct(")"));
+        // A trailing space means the source had a gap; the next inline must
+        // stay separated, so this must NOT count as ending with a bracket.
+        assert!(!ends_with_opening_punct("( "));
+        assert!(!ends_with_opening_punct("\u{201d}")); // right double quote
+        assert!(!ends_with_opening_punct("\u{2019}")); // right single quote
+    }
+
     // ── punctuation attachment (closing punct after styled text) ──────────
 
     #[test]
@@ -2926,6 +2976,109 @@ mod tests {
         assert!(
             whole.contains("word ("),
             "expected space before opening paren"
+        );
+    }
+
+    // ── opening punct attachment (styled text after opening bracket) ──────
+
+    #[test]
+    fn bold_after_opening_paren_no_extra_space() {
+        // "(**hi**)" should render as "(hi)", not "( hi)"
+        let result = markdown_lines("(**hi**)", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("(hi)"),
+            "expected '(hi)' without space, got: {whole:?}"
+        );
+        assert!(
+            !whole.contains("( hi"),
+            "should not have space after opening bracket"
+        );
+        assert!(
+            !whole.contains("**hi**"),
+            "markdown syntax should not appear"
+        );
+    }
+
+    #[test]
+    fn styled_text_after_opening_paren_in_sentence() {
+        let result = markdown_lines("a (**hi**) b", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("a (hi) b"),
+            "expected 'a (hi) b', got: {whole:?}"
+        );
+    }
+
+    #[test]
+    fn emphasis_after_opening_paren_no_extra_space() {
+        let result = markdown_lines("(*hi*)", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("(hi)"),
+            "expected '(hi)' without space, got: {whole:?}"
+        );
+    }
+
+    #[test]
+    fn code_after_opening_paren_no_extra_space() {
+        let result = markdown_lines("(`hi`)", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("(hi)"),
+            "expected '(hi)' without space, got: {whole:?}"
+        );
+    }
+
+    #[test]
+    fn bold_after_opening_quote_no_extra_space() {
+        // Smart punctuation turns "**hi**" into “**hi**”, which splits into
+        // Text(“), Strong(hi), Text(”). The opening quote must not get a space.
+        let result = markdown_lines("\"**hi**\"", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("\u{201c}hi\u{201d}"),
+            "expected curly-quoted 'hi' without space, got: {whole:?}"
+        );
+        assert!(
+            !whole.contains("\u{201c} hi"),
+            "should not have space after opening quote"
+        );
+    }
+
+    #[test]
+    fn multiple_styled_parentheses_no_extra_space() {
+        let result = markdown_lines("(**hi**) and (**there**)", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("(hi) and (there)"),
+            "expected '(hi) and (there)', got: {whole:?}"
+        );
+    }
+
+    #[test]
+    fn spaced_brackets_keep_spaces() {
+        // A literal space between bracket and styled text must be preserved.
+        let result = markdown_lines("( **hi** )", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("( hi )"),
+            "expected '( hi )' with spaces preserved, got: {whole:?}"
+        );
+    }
+
+    #[test]
+    fn styled_paren_after_word_keeps_space_before_bracket() {
+        // The space before the bracket is kept; only the space after it is removed.
+        let result = markdown_lines("word (**hi**)", 80);
+        let whole: String = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            whole.contains("word (hi)"),
+            "expected 'word (hi)', got: {whole:?}"
+        );
+        assert!(
+            !whole.contains("word(hi)"),
+            "space before opening bracket should remain"
         );
     }
 
