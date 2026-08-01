@@ -34,6 +34,24 @@ use tui_prompts::State;
 
 const UI_EVENT_CHANNEL_SIZE: usize = 4096;
 
+/// Keyboard enhancements requested from the terminal via the kitty keyboard
+/// protocol (`CSI > flags u`), pushed at startup and re-pushed after resume.
+///
+/// `DISAMBIGUATE_ESCAPE_CODES` makes `Ctrl+letter` (e.g. Ctrl+M) arrive as an
+/// unambiguous CSI-u sequence (`CSI 109;5 u`) instead of the legacy control
+/// byte (0x0D — identical to Enter).  `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
+/// additionally reports *every* key, including plain text keys, as CSI-u,
+/// which guarantees Ctrl+M stays distinguishable on terminals that implement
+/// the protocol.
+///
+/// Terminals that do not implement the kitty protocol simply ignore the push
+/// and keep legacy encodings (there Ctrl+M arrives as Enter); supporting
+/// those terminals is out of scope for now.
+const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags = KeyboardEnhancementFlags::from_bits_retain(
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits()
+        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES.bits(),
+);
+
 /// Commands sent from the terminal-event thread to the main loop for
 /// coordinating terminal state around suspend/resume cycles.
 #[derive(Debug)]
@@ -148,7 +166,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
         EnableBracketedPaste,
         crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableMouseCapture,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        PushKeyboardEnhancementFlags(KITTY_KEYBOARD_FLAGS),
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -487,7 +505,7 @@ fn handle_resume_command(
                 EnableBracketedPaste,
                 crossterm::terminal::EnterAlternateScreen,
                 crossterm::event::EnableMouseCapture,
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+                PushKeyboardEnhancementFlags(KITTY_KEYBOARD_FLAGS),
             )?;
             terminal.clear()?;
             Ok(true)
@@ -510,11 +528,75 @@ fn handle_resume_command(
     }
 }
 
+/// With the kitty protocol's `REPORT_ALL_KEYS_AS_ESCAPE_CODES` enhancement, a
+/// terminal reports text keys as *unshifted* codepoints with an explicit
+/// SHIFT modifier (e.g. `CSI 97;2 u` for Shift+A) instead of sending the
+/// shifted glyph (`'A'`) as plain text.  Reconstruct the legacy view of the
+/// event — apply the US-layout shift mapping and clear the SHIFT bit — so
+/// every downstream handler (chat input, filter boxes, other pages) sees
+/// exactly the `Char` it would have received from a legacy terminal.
+///
+/// When Ctrl is held the modifier is dropped without remapping: legacy
+/// terminals masked Ctrl+letter to a control byte and lost the shift
+/// distinction anyway (Ctrl+Shift+M was byte 0x0D, same as Ctrl+M).
+/// Non-Char keys (e.g. Shift+Enter, Shift+Tab) pass through untouched.
+fn normalize_kitty_shift(event: Event) -> Event {
+    let Event::Key(mut key) = event else {
+        return event;
+    };
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return Event::Key(key);
+    }
+    let KeyCode::Char(c) = key.code else {
+        return Event::Key(key);
+    };
+    key.modifiers.remove(KeyModifiers::SHIFT);
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        key.code = KeyCode::Char(shift_char(c));
+    }
+    Event::Key(key)
+}
+
+/// US-layout shift mapping for ASCII keys — the layout terminals assume when
+/// producing legacy shifted text.  Non-ASCII characters pass through
+/// unchanged (the terminal's layout-specific shift result cannot be
+/// reconstructed from the unshifted codepoint alone).
+fn shift_char(c: char) -> char {
+    match c {
+        'a'..='z' => (c as u8 - b'a' + b'A') as char,
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '`' => '~',
+        other => other,
+    }
+}
+
 pub(crate) fn handle_terminal_event(
     event: Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // Normalise kitty-protocol SHIFT reporting before anything else so the
+    // paste guard and all page handlers see legacy-equivalent events.
+    let event = normalize_kitty_shift(event);
     // Handle bracketed-paste events before anything else.  Pasted text
     // (including embedded newlines) arrives as a single Paste(String)
     // event rather than individual key events, so it must be inserted
@@ -1939,6 +2021,114 @@ mod tests {
     #[test]
     fn invalid_signal_number_returns_none() {
         assert!(signal_to_resume_command(9999).is_none());
+    }
+
+    // ── Kitty keyboard protocol ──
+
+    #[test]
+    fn kitty_flags_include_report_all_keys() {
+        // Ctrl+M must arrive as a distinct CSI-u key event; REPORT_ALL_KEYS is
+        // what guarantees text keys are reported as key events on terminals
+        // that implement the kitty protocol.
+        assert!(
+            KITTY_KEYBOARD_FLAGS
+                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+        );
+        assert!(KITTY_KEYBOARD_FLAGS.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+    }
+
+    #[test]
+    fn shift_char_maps_us_layout() {
+        assert_eq!(shift_char('a'), 'A');
+        assert_eq!(shift_char('z'), 'Z');
+        assert_eq!(shift_char('1'), '!');
+        assert_eq!(shift_char('0'), ')');
+        assert_eq!(shift_char('-'), '_');
+        assert_eq!(shift_char('='), '+');
+        assert_eq!(shift_char('['), '{');
+        assert_eq!(shift_char(']'), '}');
+        assert_eq!(shift_char('\\'), '|');
+        assert_eq!(shift_char(';'), ':');
+        assert_eq!(shift_char('\''), '"');
+        assert_eq!(shift_char(','), '<');
+        assert_eq!(shift_char('.'), '>');
+        assert_eq!(shift_char('/'), '?');
+        assert_eq!(shift_char('`'), '~');
+        // Non-ASCII and already-shifted chars pass through unchanged.
+        assert_eq!(shift_char('é'), 'é');
+        assert_eq!(shift_char('A'), 'A');
+    }
+
+    #[test]
+    fn normalize_kitty_shift_applies_mapping_and_clears_shift() {
+        // Shift+A arrives as Char('a') + SHIFT (kitty CSI 97;2 u); the
+        // normaliser must produce the legacy-equivalent Char('A') with no
+        // modifiers.
+        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(
+            out,
+            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE))
+        );
+
+        // Shift+1 → '!'.
+        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
+            KeyCode::Char('1'),
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(
+            out,
+            Event::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+        );
+    }
+
+    #[test]
+    fn normalize_kitty_shift_drops_shift_when_ctrl_held() {
+        // Ctrl+Shift+M arrives as Char('m') + CONTROL + SHIFT (CSI 109;6 u).
+        // Legacy Ctrl+Shift+M was byte 0x0D — identical to Ctrl+M — so the
+        // normaliser drops SHIFT without remapping the char.
+        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )));
+        assert_eq!(
+            out,
+            Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL))
+        );
+    }
+
+    #[test]
+    fn normalize_kitty_shift_keeps_alt() {
+        // Alt+Shift+A arrives as Char('a') + ALT + SHIFT; legacy sent ESC 'A'
+        // (Char('A') + ALT).  The mapping must keep the ALT modifier.
+        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        )));
+        assert_eq!(
+            out,
+            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::ALT))
+        );
+    }
+
+    #[test]
+    fn normalize_kitty_shift_leaves_other_events_untouched() {
+        // Non-Char keys (Shift+Enter keeps its modifier — it inserts a
+        // newline in the chat input), unmodified keys, and non-key events
+        // must pass through unchanged.
+        let shift_enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(normalize_kitty_shift(shift_enter.clone()), shift_enter);
+
+        let plain = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(normalize_kitty_shift(plain.clone()), plain);
+
+        let ctrl_q = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert_eq!(normalize_kitty_shift(ctrl_q.clone()), ctrl_q);
+
+        let paste = Event::Paste("Hi".to_string());
+        assert_eq!(normalize_kitty_shift(paste.clone()), paste);
     }
 
     // ── Marker click logic ──

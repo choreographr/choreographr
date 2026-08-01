@@ -409,7 +409,7 @@ In `choreo-tui`:
 - `/reasoning` — show current reasoning effort slug
 - `/reasoning <slug>` — set reasoning effort (e.g. `off`, `low`, `medium`, `high`, `on`, `xhigh`, `max`; available values depend on the model)
 - `Ctrl+R` — cycle reasoning effort through available slugs for the attached session's model
-- `Ctrl+M` — open the model selector: list models available on the attached session's account, type to filter, Enter to select, Esc to dismiss
+- `Ctrl+M` — open the model selector: list models available on the attached session's account, type to filter, Enter to select, Esc to dismiss (requires a terminal that implements the kitty keyboard protocol — e.g. kitty, foot, wezterm, ghostty, alacritty; on other terminals Ctrl+M arrives as Enter)
 - `/continue` — continue a stopped/idle session by sending a "Please continue." prompt
 - `/stop` — cancel whatever request is currently active on the attached session (same as `/cancel 0`)
 - `/undo` — undo the most recent user turn and its entire assistant response subtree

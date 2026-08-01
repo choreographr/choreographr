@@ -660,29 +660,34 @@ impl ModelSelectorState {
         consumed
     }
 
-    /// Adjust `scroll` so the focused row is visible within a window of
-    /// `height` rows, and return the `(start, count)` slice to render.
+    /// Compute the `(start, count)` slice of the filtered list to render for
+    /// a window of `height` rows, keeping the focused row visible.
+    ///
     /// This is the single place window arithmetic lives; the renderer just
-    /// draws `filtered()[start..start + count]`.
-    pub(crate) fn window(&mut self, height: usize) -> (usize, usize) {
+    /// draws `filtered()[start..start + count]`.  It is deliberately **pure**
+    /// (takes `&self`): render must never mutate scroll/focus state — that
+    /// happens in the event loop before `terminal.draw()` (see the module
+    /// docs in render.rs).  `scroll` is used only as a hint and is corrected
+    /// locally, so repeated calls return identical results.
+    pub(crate) fn window(&self, height: usize) -> (usize, usize) {
         let len = self.filtered().len();
         if len == 0 || height == 0 {
             return (0, 0);
         }
-        if self.focused >= len {
-            self.focused = len - 1;
-        }
+        // Clamp on local copies; `clamp_focus()` keeps the stored fields in
+        // range, and render must not write them back.
+        let focused = self.focused.min(len - 1);
         let max_scroll = len.saturating_sub(height);
-        self.scroll = self.scroll.min(max_scroll);
-        if self.focused < self.scroll {
+        let mut scroll = self.scroll.min(max_scroll);
+        if focused < scroll {
             // Focus drifted above the window (e.g. after a filter that
             // shrunk the list) — pull the window up.
-            self.scroll = self.focused;
-        } else if self.focused >= self.scroll + height {
+            scroll = focused;
+        } else if focused >= scroll + height {
             // Focus is below the fold — push the window down.
-            self.scroll = self.focused + 1 - height;
+            scroll = focused + 1 - height;
         }
-        (self.scroll, height.min(len - self.scroll))
+        (scroll, height.min(len - scroll))
     }
 
     /// The highlighted model ID, if the filtered list is non-empty.
@@ -5371,9 +5376,28 @@ mod tests {
 
     #[test]
     fn model_selector_window_empty_list_returns_zero() {
-        let mut sel = selector_with_models(&[]);
+        let sel = selector_with_models(&[]);
         assert_eq!(sel.window(5), (0, 0));
         assert!(sel.highlighted().is_none());
+    }
+
+    #[test]
+    fn model_selector_window_is_pure_and_idempotent() {
+        // The renderer calls `window` during terminal.draw(), which must
+        // never mutate scroll/focus state.  Verify repeated calls return
+        // identical results and leave the fields untouched.
+        let mut sel = selector_with_models(&["a", "b", "c", "d", "e"]);
+        sel.scroll = 3;
+        sel.focused = 4;
+        let before_scroll = sel.scroll;
+        let before_focused = sel.focused;
+
+        let first = sel.window(3);
+        let second = sel.window(3);
+
+        assert_eq!(first, second, "window must be deterministic");
+        assert_eq!(sel.scroll, before_scroll, "window must not mutate scroll");
+        assert_eq!(sel.focused, before_focused, "window must not mutate focus");
     }
 
     #[test]
