@@ -1,0 +1,24 @@
+slug = "minimax"
+display_name = "MiniMax"
+protocol = "anthropic"
+base_url = "https://api.minimax.io/anthropic"
+default_model = "MiniMax-M3"
+
+[[models]]
+model = "MiniMax-M2.7"
+context_window = 204800
+reasoning_supported = true
+reasoning_levels = ["off", "minimal", "low", "medium", "high"]
+responses = false
+[[models]]
+model = "MiniMax-M2.7-highspeed"
+context_window = 204800
+reasoning_supported = true
+reasoning_levels = ["off", "minimal", "low", "medium", "high"]
+responses = false
+[[models]]
+model = "MiniMax-M3"
+context_window = 1000000
+reasoning_supported = true
+reasoning_levels = ["off", "minimal", "low", "medium", "high"]
+responses = false

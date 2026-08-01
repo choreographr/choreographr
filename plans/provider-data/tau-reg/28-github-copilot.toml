@@ -1,0 +1,137 @@
+name = "github-copilot"
+display_name = "GitHub Copilot"
+kind = "openai-compatible"
+base_url = "https://api.individual.githubcopilot.com"
+api_key_env = "COPILOT_GITHUB_TOKEN"
+default_model = "gpt-5.4"
+api = "openai-responses"
+thinking_levels = ["off", "minimal", "low", "medium", "high", "xhigh"]
+
+model = "claude-fable-5"
+context_window = 0
+reasoning = false
+api = "openai-completions"
+[[models]]
+model = "claude-haiku-4.5"
+context_window = 0
+reasoning = false
+api = "anthropic-messages"
+[[models]]
+model = "claude-opus-4.5"
+context_window = 0
+reasoning = false
+api = "anthropic-messages"
+[[models]]
+model = "claude-opus-4.6"
+context_window = 0
+reasoning = false
+api = "anthropic-messages"
+[[models]]
+model = "claude-opus-4.7"
+context_window = 0
+reasoning = false
+api = "anthropic-messages"
+[[models]]
+model = "claude-opus-4.8"
+context_window = 0
+reasoning = false
+api = "anthropic-messages"
+[[models]]
+model = "claude-sonnet-4"
+context_window = 0
+reasoning = false
+api = "anthropic-messages"
+[[models]]
+model = "claude-sonnet-4.5"
+context_window = 0
+reasoning = false
+api = "anthropic-messages"
+[[models]]
+model = "claude-sonnet-4.6"
+context_window = 0
+reasoning = false
+api = "anthropic-messages"
+[[models]]
+model = "claude-sonnet-5"
+context_window = 0
+reasoning = false
+api = "anthropic-messages"
+[[models]]
+model = "gemini-2.5-pro"
+context_window = 0
+reasoning = false
+api = "openai-completions"
+[[models]]
+model = "gemini-3-flash-preview"
+context_window = 0
+reasoning = false
+api = "openai-completions"
+[[models]]
+model = "gemini-3.1-pro-preview"
+context_window = 0
+reasoning = false
+api = "openai-completions"
+[[models]]
+model = "gemini-3.5-flash"
+context_window = 0
+reasoning = false
+api = "openai-completions"
+[[models]]
+model = "gpt-4.1"
+context_window = 0
+reasoning = false
+api = "openai-completions"
+[[models]]
+model = "gpt-5-mini"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.2"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.2-codex"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.3-codex"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.4"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.4-mini"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.4-nano"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.5"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.6-luna"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.6-sol"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.6-terra"
+context_window = 0
+reasoning = false
+[[models]]
+model = "kimi-k2.7-code"
+context_window = 0
+reasoning = false
+api = "openai-completions"
+[[models]]
+model = "mai-code-1-flash-picker"
+context_window = 0
+reasoning = false
+[[models]]

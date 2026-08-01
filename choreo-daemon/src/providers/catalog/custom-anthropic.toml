@@ -1,0 +1,6 @@
+slug = "custom-anthropic"
+display_name = "Custom Anthropic-Compatible"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+default_model = "custom-model"
+

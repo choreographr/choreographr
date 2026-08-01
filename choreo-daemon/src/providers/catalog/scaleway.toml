@@ -1,0 +1,91 @@
+slug = "scaleway"
+display_name = "Scaleway"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "https://api.scaleway.ai/v1"
+default_model = "qwen/qwen3.5-397b-a17b"
+
+[[models]]
+model = "qwen/qwen3.5-397b-a17b"
+context_window = 256000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen/qwen3.6-35b-a3b"
+context_window = 256000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen/qwen3-235b-a22b-instruct-2507"
+context_window = 256000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen/qwen3-coder-30b-a3b-instruct"
+context_window = 128000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "meta/llama-3.3-70b-instruct"
+context_window = 128000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "mistralai/mistral-medium-2505"
+context_window = 256000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "mistralai/devstral-2-123b-instruct-2512"
+context_window = 200000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "mistralai/mistral-small-3.2-24b-instruct-2506"
+context_window = 128000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "mistralai/voxtral-small-24b-2507"
+context_window = 32000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "mistralai/pixtral-12b-2409"
+context_window = 128000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "google/gemma-4-26b-a4b-it"
+context_window = 256000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "google/gemma-3-27b-it"
+context_window = 40000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "hcompany/holo2-30b-a3b"
+context_window = 22000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "openai/gpt-oss-120b"
+context_window = 128000
+reasoning_supported = false
+reasoning_levels = []
+responses = false

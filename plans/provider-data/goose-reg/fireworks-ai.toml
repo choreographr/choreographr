@@ -1,0 +1,46 @@
+name = "fireworks-ai"
+display_name = "Fireworks AI"
+kind = "openai"
+base_url = "https://api.fireworks.ai/inference/v1/chat/completions"
+api_key_env = "FIREWORKS_API_KEY"
+
+[[models]]
+model = "accounts/fireworks/models/kimi-k2p7-code"
+context_window = 262000
+[[models]]
+[[models]]
+model = "accounts/fireworks/models/kimi-k2p6"
+context_window = 262000
+[[models]]
+[[models]]
+model = "accounts/fireworks/models/glm-5p2"
+context_window = 1048576
+[[models]]
+[[models]]
+model = "accounts/fireworks/models/deepseek-v4-pro"
+context_window = 1000000
+[[models]]
+[[models]]
+model = "accounts/fireworks/models/deepseek-v4-flash"
+context_window = 1000000
+[[models]]
+[[models]]
+model = "accounts/fireworks/models/minimax-m3"
+context_window = 512000
+[[models]]
+[[models]]
+model = "accounts/fireworks/models/qwen3p7-plus"
+context_window = 262144
+[[models]]
+[[models]]
+model = "accounts/fireworks/models/glm-5p1"
+context_window = 202800
+[[models]]
+[[models]]
+model = "accounts/fireworks/models/gpt-oss-120b"
+context_window = 131072
+[[models]]
+[[models]]
+model = "accounts/fireworks/models/gpt-oss-20b"
+context_window = 131072
+[[models]]

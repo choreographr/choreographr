@@ -1,0 +1,10 @@
+name = "nvidia"
+display_name = "NVIDIA"
+kind = "openai"
+base_url = "https://integrate.api.nvidia.com/v1"
+api_key_env = "NVIDIA_API_KEY"
+
+[[models]]
+model = "z-ai/glm-4.7"
+context_window = 131072
+[[models]]

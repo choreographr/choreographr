@@ -285,7 +285,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
 | `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. |
-| `providers/` | `ProviderClient` trait + `ProviderCatalog` system. `InferenceProvider` struct wraps `Arc<dyn ProviderClient>`. Static `PROVIDER_CATALOG` maps ~30 slugs to protocol type, default base URL, and default model. Dispatches to the correct client based on protocol. |
+| `providers/` | `ProviderClient` trait + `ProviderCatalog` system. `InferenceProvider` struct wraps `Arc<dyn ProviderClient>`. Provider data lives in TOML (`providers/catalog/<slug>.toml`, one file per provider) and is loaded lazily into a `static LazyLock<Vec<ProviderEntry>>` (`PROVIDER_CATALOG`) — 70+ providers across 3 wire protocols, each with a curated model list, context windows, and reasoning levels. Dispatches to the correct client based on protocol. |
 | `providers/shared.rs` | Shared provider infrastructure: `ProviderError` (unified error type used by all providers), `build_agent()` (ureq Agent construction with timeouts), `error_type_label()`, `provider_error_to_inference()`, `timed_result()` (metrics instrumentation wrapper), `emit_non_streaming_events()` (converts a non-streaming `ChatTurnResult` into `StreamEvent` callbacks so non-streaming configurations reuse the same event-driven path). Eliminates duplicated error types, `From<ProviderHttpError>` impls, and error conversion functions across provider implementations. |
 | `anthropic/` | Anthropic Messages API client (`AnthropicClient`). Implements `ProviderClient`. |
 | `google/` | Google Gemini API client (`GoogleClient`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
@@ -354,13 +354,12 @@ pub struct InferenceProvider {
 ```
 Created via `from_account_config()` which looks up the provider slug in the catalog and dispatches to the appropriate client constructor by protocol type.
 
-**3. Provider Catalog (`providers/catalog.rs`):**
+**3. Provider Catalog (`providers/catalog/`):**
 ```rust
 pub enum ProviderProtocol {
-    OpenAiCompatible,
+    OpenAi { max_tokens_field: MaxTokensField },
     AnthropicMessages,
     GoogleGenerativeAi,
-    Mistral,
 }
 ```
 
@@ -376,36 +375,42 @@ Each variant carries its data inline so the streaming callback is self-describin
 equivalent sequence of `StreamEvent`s, allowing non-streaming configurations to reuse the
 same event-driven path as streaming ones without duplication across providers.
 
-**3. Provider Catalog (`providers/catalog.rs`):**
+**3. Provider Catalog (`providers/catalog/`):**
 ```rust
 pub enum ProviderProtocol {
-    OpenAiCompatible,
+    OpenAi { max_tokens_field: MaxTokensField },
     AnthropicMessages,
     GoogleGenerativeAi,
-    Mistral,
 }
 ```
 
-A static `PROVIDER_CATALOG: &[ProviderEntry]` maps each provider slug to:
+(Note: Mistral speaks the OpenAI wire format — `POST /v1/chat/completions` —
+so it is catalogued under `OpenAi`, not a protocol of its own.)
+
+Provider data is stored as TOML — one `catalog/<slug>.toml` file per provider —
+and parsed lazily into a `static PROVIDER_CATALOG: LazyLock<Vec<ProviderEntry>>`
+(`catalog/mod.rs` + `catalog/loader.rs`). Keeping the data in TOML means adding
+or refreshing a provider is a data-file edit (machine-generatable), and the
+`&'static`-reference API is preserved because static storage is never mutated.
+
+A `ProviderEntry` (loaded from its TOML file) maps each provider slug to:
 - `display_name` — human-readable name for UIs
 - `protocol` — which wire protocol to use
-- `default_base_url` — well-known API endpoint
+- `base_url` — well-known API endpoint
 - `default_model` — sensible default model name
-- `reasoning` — `ReasoningSupport` variant declaring which reasoning parameter protocol the provider speaks
-- `model_context_windows` — static list of `(model_slug, window)` pairs for known models
+- `models` — curated `ModelEntry` list with `context_window`, `reasoning_supported`, explicit `openai_reasoning_levels`, and whether the model uses the Responses API (`openai_responses`)
 
-`ReasoningSupport` enum: `None`, `ReasoningEffort` (OpenAI-style), `AnthropicThinking` (thinking budget block), `GoogleThinkingConfig` (thinkingConfig field). Model-level reasoning is declared via a `ModelReasoningEntry { model, levels }` list on each `ProviderEntry.model_reasoning_levels` field, and resolved at runtime by `model_reasoning_capability()` which returns a `ReasoningCapability` with the model's available effort slugs. Providers without explicit entries fall back to heuristics inside `resolve_reasoning_effort()`.
+Model-level reasoning is resolved at runtime by `model_reasoning_capability()`, which returns a `ReasoningCapability` with the model's available effort slugs. Providers without explicit entries fall back to protocol defaults (`off/low/medium/high` for OpenAI & Anthropic, `off/on` for Google).
 
-Currently supports ~30 providers. Adding a new OpenAI-compatible provider requires only a catalog entry — zero client code.
+Currently supports 70+ providers. Adding a new OpenAI-compatible provider requires only a catalog TOML file (and a line in `loader.rs`'s `include_str!` list) — zero client code.
 
 **Supported providers by protocol:**
 
 | Protocol | Providers |
 |---|---|
-| OpenAI-compatible | OpenAI, DeepSeek, xAI/Grok, Groq, Together AI, Ollama (local/cloud), OpenRouter, HuggingFace, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, DashScope, Moonshot AI, Perplexity, Z.ai, Venice AI, Novita AI, LM Studio, OpenCode Zen, OpenCode Go, Atomic Chat, and custom OpenAI-compatible |
-| Anthropic Messages | Anthropic Claude, MiniMax, custom Anthropic-compatible |
+| OpenAI-compatible | OpenAI, DeepSeek, Mistral, xAI, Groq, Together AI, OpenRouter, Hugging Face, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, Xiaomi MiMo, DashScope, Moonshot AI, Perplexity, Z.ai, Qwen Token Plan, Venice AI, Novita AI, LM Studio, Ollama (local/cloud), OpenCode Zen/Go, DeepInfra, Upstage, Nous, Arcee, GMI, StepFun, Zhipu, iFlytek, Inception, Meta, NEAR AI, OrcaRouter, Routstr, Sakana, SaladCloud, Scaleway, OVHcloud, Tensorix, FuturMix, EmpirioLabs, Friendli, aimlapi, GitLawb OpenGateway, KiloCode, Atomic Chat, OpenCode Codex, and custom OpenAI-compatible |
+| Anthropic Messages | Anthropic Claude, MiniMax, Vercel AI Gateway, Kimi Code, Fireworks (Anthropic mode), OpenCode Go (Anthropic-compatible), custom Anthropic-compatible |
 | Google Generative AI | Google Gemini |
-| Mistral | Mistral |
 
 > **Note:** Amazon Bedrock support is deferred pending multi-field credential support (needs AWS access key + secret key + region).
 

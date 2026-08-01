@@ -1,0 +1,51 @@
+name = "groq"
+display_name = "Groq"
+kind = "openai-compatible"
+base_url = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+default_model = "openai/gpt-oss-120b"
+api = "openai-completions"
+thinking_levels = ["off", "minimal", "low", "medium", "high"]
+
+model = "groq/compound"
+context_window = 131072
+reasoning = true
+unsupported_thinking_levels = ["minimal", "low", "medium", "high"]
+[[models]]
+model = "groq/compound-mini"
+context_window = 131072
+reasoning = true
+unsupported_thinking_levels = ["minimal", "low", "medium", "high"]
+[[models]]
+model = "llama-3.1-8b-instant"
+context_window = 131072
+reasoning = false
+[[models]]
+model = "llama-3.3-70b-versatile"
+context_window = 131072
+reasoning = false
+[[models]]
+model = "meta-llama/llama-4-scout-17b-16e-instruct"
+context_window = 131072
+reasoning = false
+[[models]]
+model = "openai/gpt-oss-120b"
+context_window = 131072
+reasoning = true
+unsupported_thinking_levels = ["minimal"]
+[[models]]
+model = "openai/gpt-oss-20b"
+context_window = 131072
+reasoning = true
+unsupported_thinking_levels = ["minimal"]
+[[models]]
+model = "openai/gpt-oss-safeguard-20b"
+context_window = 131072
+reasoning = true
+unsupported_thinking_levels = ["minimal"]
+[[models]]
+model = "qwen/qwen3-32b"
+context_window = 131072
+reasoning = true
+unsupported_thinking_levels = ["minimal", "low", "medium"]
+[[models]]

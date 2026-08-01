@@ -1,0 +1,7 @@
+slug = "atomic-chat"
+display_name = "Atomic Chat"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "https://api.atomic.chat/v1"
+default_model = "gpt-4.1"
+

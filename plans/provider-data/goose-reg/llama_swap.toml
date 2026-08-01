@@ -1,0 +1,6 @@
+name = "llama_swap"
+display_name = "Llama Swap"
+kind = "openai"
+base_url = "${LLAMA_SWAP_HOST}/v1/chat/completions"
+api_key_env = "LLAMA_SWAP_API_KEY"
+

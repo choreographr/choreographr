@@ -1,0 +1,37 @@
+slug = "tensorix"
+display_name = "Tensorix"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "https://api.tensorix.ai/v1"
+default_model = "z-ai/glm-5"
+
+[[models]]
+model = "z-ai/glm-5"
+context_window = 203000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "deepseek/deepseek-chat-v3.1"
+context_window = 164000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "deepseek/deepseek-r1-0528"
+context_window = 164000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "minimax/minimax-m2.5"
+context_window = 197000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "moonshotai/kimi-k2.5"
+context_window = 262000
+reasoning_supported = false
+reasoning_levels = []
+responses = false

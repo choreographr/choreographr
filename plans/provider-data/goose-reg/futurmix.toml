@@ -1,0 +1,26 @@
+name = "futurmix"
+display_name = "FuturMix"
+kind = "openai"
+base_url = "https://futurmix.ai/v1/chat/completions"
+api_key_env = "FUTURMIX_API_KEY"
+
+[[models]]
+model = "claude-sonnet-4-20250514"
+context_window = 200000
+[[models]]
+[[models]]
+model = "gpt-4o"
+context_window = 128000
+[[models]]
+[[models]]
+model = "gemini-2.5-pro"
+context_window = 1048576
+[[models]]
+[[models]]
+model = "deepseek-chat"
+context_window = 131072
+[[models]]
+[[models]]
+model = "claude-haiku-4-20250514"
+context_window = 200000
+[[models]]

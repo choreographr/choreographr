@@ -1,0 +1,6 @@
+name = "atomic_chat"
+display_name = "Atomic Chat"
+kind = "openai"
+base_url = "${ATOMIC_CHAT_HOST}/v1/chat/completions"
+api_key_env = ""
+

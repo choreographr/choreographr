@@ -1,0 +1,7 @@
+slug = "bankr"
+display_name = "Bankr"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "https://api.bankr.bot/v1"
+default_model = "bankr-large"
+

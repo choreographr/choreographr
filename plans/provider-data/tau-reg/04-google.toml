@@ -1,0 +1,70 @@
+name = "google"
+display_name = "Google Gemini"
+kind = "google-generative-ai"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+default_model = "gemini-flash-latest"
+api = "google-generative-ai"
+thinking_levels = ["off", "minimal", "low", "medium", "high"]
+
+model = "gemini-2.5-flash"
+context_window = 1048576
+reasoning = true
+[[models]]
+model = "gemini-2.5-flash-lite"
+context_window = 1048576
+reasoning = true
+[[models]]
+model = "gemini-2.5-pro"
+context_window = 1048576
+reasoning = true
+unsupported_thinking_levels = ["off"]
+[[models]]
+model = "gemini-3-flash-preview"
+context_window = 1048576
+reasoning = true
+unsupported_thinking_levels = ["off"]
+[[models]]
+model = "gemini-3.1-flash-lite"
+context_window = 1048576
+reasoning = true
+unsupported_thinking_levels = ["off"]
+[[models]]
+model = "gemini-3.1-flash-lite-preview"
+context_window = 1048576
+reasoning = true
+unsupported_thinking_levels = ["off"]
+[[models]]
+model = "gemini-3.1-pro-preview"
+context_window = 1048576
+reasoning = true
+unsupported_thinking_levels = ["off", "minimal", "medium"]
+[[models]]
+model = "gemini-3.1-pro-preview-customtools"
+context_window = 1048576
+reasoning = true
+unsupported_thinking_levels = ["off", "minimal", "medium"]
+[[models]]
+model = "gemini-3.5-flash"
+context_window = 1048576
+reasoning = true
+unsupported_thinking_levels = ["off"]
+[[models]]
+model = "gemini-flash-latest"
+context_window = 1048576
+reasoning = true
+[[models]]
+model = "gemini-flash-lite-latest"
+context_window = 1048576
+reasoning = true
+[[models]]
+model = "gemma-4-26b-a4b-it"
+context_window = 262144
+reasoning = true
+unsupported_thinking_levels = ["off", "low", "medium"]
+[[models]]
+model = "gemma-4-31b-it"
+context_window = 262144
+reasoning = true
+unsupported_thinking_levels = ["off", "low", "medium"]
+[[models]]

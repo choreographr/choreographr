@@ -1,0 +1,29 @@
+name = "xiaomi-token-plan-cn"
+display_name = "Xiaomi MiMo Token Plan (China)"
+kind = "openai-compatible"
+base_url = "https://token-plan-cn.xiaomimimo.com/v1"
+api_key_env = "XIAOMI_TOKEN_PLAN_CN_API_KEY"
+default_model = "mimo-v2.5-pro"
+api = "openai-completions"
+thinking_levels = ["off", "minimal", "low", "medium", "high"]
+
+model = "mimo-v2-flash"
+context_window = 262144
+reasoning = true
+[[models]]
+model = "mimo-v2-omni"
+context_window = 262144
+reasoning = true
+[[models]]
+model = "mimo-v2-pro"
+context_window = 1048576
+reasoning = true
+[[models]]
+model = "mimo-v2.5"
+context_window = 1048576
+reasoning = true
+[[models]]
+model = "mimo-v2.5-pro"
+context_window = 1048576
+reasoning = true
+[[models]]

@@ -1,0 +1,67 @@
+slug = "alibaba"
+display_name = "Alibaba (Qwen)"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+default_model = "qwen3.6-plus"
+
+[[models]]
+model = "qwen3.7-max"
+context_window = 262144
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen3.7-max-preview"
+context_window = 262144
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen3.6-max-preview"
+context_window = 262144
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen3.6-plus"
+context_window = 1000000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen3-max"
+context_window = 262144
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen-plus"
+context_window = 1000000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen-turbo"
+context_window = 1000000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen-flash"
+context_window = 1000000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen3-coder-plus"
+context_window = 1048576
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "qwen3-coder-flash"
+context_window = 1000000
+reasoning_supported = false
+reasoning_levels = []
+responses = false

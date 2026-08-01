@@ -1,0 +1,7 @@
+slug = "ollama-cloud"
+display_name = "Ollama Cloud"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "https://ollama.com/v1"
+default_model = "qwen3-coder:480b"
+

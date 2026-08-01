@@ -1,0 +1,10 @@
+name = "inception"
+display_name = "Inception"
+kind = "openai"
+base_url = "https://api.inceptionlabs.ai"
+api_key_env = "INCEPTION_API_KEY"
+
+[[models]]
+model = "mercury-coder"
+context_window = 128000
+[[models]]

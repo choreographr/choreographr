@@ -1,0 +1,7 @@
+slug = "arcee"
+display_name = "Arcee AI"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "https://api.arcee.ai/api/v1"
+default_model = "trinity-large"
+

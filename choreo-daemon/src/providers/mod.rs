@@ -58,7 +58,7 @@ impl InferenceProvider {
                 let mut svc_config = crate::openai::ServiceConfig {
                     base_url: entry.base_url.to_string(),
                     chat_completions_max_tokens_field: max_tokens_field,
-                    provider_slug: entry.slug,
+                    provider_slug: entry.slug.as_str(),
                     ..Default::default()
                 };
                 config.apply_overrides(&mut svc_config);
@@ -68,7 +68,7 @@ impl InferenceProvider {
                     .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
-                    slug: entry.slug,
+                    slug: entry.slug.as_str(),
                 })
             }
             ProviderProtocol::AnthropicMessages => {
@@ -84,7 +84,7 @@ impl InferenceProvider {
                     .map_err(|e| format!("failed to create Anthropic client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
-                    slug: entry.slug,
+                    slug: entry.slug.as_str(),
                 })
             }
             ProviderProtocol::GoogleGenerativeAi => {
@@ -100,7 +100,7 @@ impl InferenceProvider {
                     .map_err(|e| format!("failed to create Google client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
-                    slug: entry.slug,
+                    slug: entry.slug.as_str(),
                 })
             }
         }
@@ -277,8 +277,8 @@ mod tests {
         let client = AnthropicClient::new(config, "test-key".into()).unwrap();
         let provider = InferenceProvider::from_anthropic(client);
         assert_eq!(
-            provider.resolve_context_window("claude-sonnet-4"),
-            Some(200_000)
+            provider.resolve_context_window("claude-sonnet-4-6"),
+            Some(1_000_000)
         );
         // Unknown model — neither client nor catalog knows it
         assert_eq!(provider.resolve_context_window("completely-unknown"), None);

@@ -1,0 +1,30 @@
+name = "nearai"
+display_name = "NEAR AI Cloud"
+kind = "openai"
+base_url = "https://cloud-api.near.ai/v1"
+api_key_env = "NEARAI_API_KEY"
+
+[[models]]
+model = "zai-org/GLM-5.2"
+context_window = 1000000
+[[models]]
+[[models]]
+model = "zai-org/GLM-5.1-FP8"
+context_window = 202752
+[[models]]
+[[models]]
+model = "Qwen/Qwen3.6-35B-A3B-FP8"
+context_window = 262144
+[[models]]
+[[models]]
+model = "Qwen/Qwen3.5-122B-A10B"
+context_window = 131072
+[[models]]
+[[models]]
+model = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+context_window = 256000
+[[models]]
+[[models]]
+model = "google/gemma-4-31B-it"
+context_window = 262144
+[[models]]

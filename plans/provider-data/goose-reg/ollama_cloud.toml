@@ -1,0 +1,6 @@
+name = "ollama_cloud"
+display_name = "Ollama Cloud"
+kind = "openai"
+base_url = "https://ollama.com/v1/chat/completions"
+api_key_env = "OLLAMA_CLOUD_API_KEY"
+

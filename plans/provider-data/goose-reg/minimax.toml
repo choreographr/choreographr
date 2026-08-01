@@ -1,0 +1,26 @@
+name = "minimax"
+display_name = "MiniMax"
+kind = "anthropic"
+base_url = "https://api.minimax.io/anthropic"
+api_key_env = "MINIMAX_API_KEY"
+
+[[models]]
+model = "MiniMax-M3"
+context_window = 1000000
+[[models]]
+[[models]]
+model = "MiniMax-M2.7"
+context_window = 200000
+[[models]]
+[[models]]
+model = "MiniMax-M2.7-highspeed"
+context_window = 200000
+[[models]]
+[[models]]
+model = "MiniMax-M2.5"
+context_window = 204800
+[[models]]
+[[models]]
+model = "MiniMax-M2.5-highspeed"
+context_window = 204800
+[[models]]

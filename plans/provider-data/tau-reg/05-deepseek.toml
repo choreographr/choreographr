@@ -1,0 +1,19 @@
+name = "deepseek"
+display_name = "DeepSeek"
+kind = "openai-compatible"
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+default_model = "deepseek-v4-pro"
+api = "openai-completions"
+thinking_levels = ["off", "high", "xhigh"]
+
+model = "deepseek-v4-flash"
+context_window = 1000000
+reasoning = true
+unsupported_thinking_levels = ["minimal", "low", "medium"]
+[[models]]
+model = "deepseek-v4-pro"
+context_window = 1000000
+reasoning = true
+unsupported_thinking_levels = ["minimal", "low", "medium"]
+[[models]]

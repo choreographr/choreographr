@@ -1,0 +1,10 @@
+name = "meta"
+display_name = "Meta"
+kind = "openai"
+base_url = "https://api.meta.ai/v1"
+api_key_env = "META_MODEL_API_KEY"
+
+[[models]]
+model = "muse-spark-1.1"
+context_window = 1000000
+[[models]]

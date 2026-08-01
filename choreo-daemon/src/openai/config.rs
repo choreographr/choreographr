@@ -264,19 +264,20 @@ mod tests {
         // Models not in the catalog fall back to default_request_format.
         // When the default is Responses, gpt-5.6 models auto-enable.
         assert!(config.programmatic_tool_calling_for_model("gpt-5.6-chat"));
-        // Known models with openai_responses: false use ChatCompletions
-        // instead, so auto-enable does not fire.
-        assert!(!config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
+        // gpt-5.6-sol is Responses in the catalog (OpenAI's default API),
+        // so auto-enable fires even without the account-level override.
+        assert!(config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
     }
 
     #[test]
-    fn programmatic_tool_calling_not_auto_enabled_for_gpt_5_6_chat_completions() {
+    fn programmatic_tool_calling_not_auto_enabled_with_chat_completions_default() {
         let config = ServiceConfig {
             default_request_format: RequestFormat::ChatCompletions,
             ..Default::default()
         };
-        // No auto-enable when using Chat Completions format.
-        assert!(!config.programmatic_tool_calling_for_model("gpt-5.6-sol"));
+        // An unknown gpt-5.6 model falls back to the ChatCompletions default,
+        // so auto-enable (Responses-only) does not fire.
+        assert!(!config.programmatic_tool_calling_for_model("gpt-5.6-future-unknown"));
     }
 
     #[test]
@@ -299,7 +300,7 @@ mod tests {
         };
         assert_eq!(
             config.request_format_for_model("gpt-4.1"),
-            RequestFormat::ChatCompletions
+            RequestFormat::Responses
         );
         // Unknown model falls back to default_request_format.
         assert_eq!(

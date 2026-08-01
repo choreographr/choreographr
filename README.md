@@ -342,13 +342,17 @@ streaming = false
 retry_max_attempts = 3
 ```
 
-Supported providers: all entries in the provider catalog — Anthropic, Cerebras,
-Custom Anthropic-Compatible, Custom OpenAI-Compatible, DashScope (Alibaba),
-DeepSeek, Fireworks AI, GitHub Models, Google Gemini, Groq, Hugging Face,
-LM Studio, MiniMax, Mistral, Moonshot AI (Kimi), Novita AI, NVIDIA NIM,
-Ollama Cloud, Ollama (Local), OpenAI, OpenAI Compatible, OpenCode Go,
-OpenCode Zen, OpenRouter, Perplexity, Together AI, Venice AI, xAI Grok,
-Xiaomi MiMo, Z.ai (GLM). See `choreographr/src/providers/catalog.rs` for the
+Supported providers: all entries in the provider catalog — 70+ across three
+wire protocols (OpenAI-compatible, Anthropic Messages, Google Generative AI).
+Each provider has its own data file under
+`choreo-daemon/src/providers/catalog/<slug>.toml` (one file per provider,
+TOML data, not code) with a curated model list, context windows, reasoning
+levels, and the API format each model uses. Highlights: OpenAI, Anthropic,
+Google Gemini, Mistral, DeepSeek, xAI Grok, Groq, Together AI, OpenRouter,
+Hugging Face, GitHub Models, NVIDIA NIM, Cerebras, Fireworks AI, DashScope,
+Moonshot AI (Kimi), Perplexity, Z.ai, Xiaomi MiMo, Qwen Token Plan, Vercel AI
+Gateway, OpenCode Zen/Go, GitHub Copilot, Kimi Code, Ollama (local/cloud), LM
+Studio, and many regional/niche gateways. See the `catalog/` directory for the
 full list. Each provider ships sensible defaults (base URL, default model) —
 override any field per-account:
 

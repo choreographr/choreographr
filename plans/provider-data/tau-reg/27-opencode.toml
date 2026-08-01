@@ -1,0 +1,124 @@
+name = "opencode"
+display_name = "OpenCode Zen"
+kind = "openai-compatible"
+base_url = "https://opencode.ai/zen/v1"
+api_key_env = "OPENCODE_API_KEY"
+default_model = "kimi-k2.7-code"
+api = "openai-completions"
+thinking_levels = ["off", "minimal", "low", "medium", "high", "xhigh"]
+
+model = "big-pickle"
+context_window = 0
+reasoning = false
+[[models]]
+model = "deepseek-v4-flash"
+context_window = 0
+reasoning = false
+[[models]]
+model = "deepseek-v4-flash-free"
+context_window = 0
+reasoning = false
+[[models]]
+model = "deepseek-v4-pro"
+context_window = 0
+reasoning = false
+[[models]]
+model = "glm-5"
+context_window = 0
+reasoning = false
+[[models]]
+model = "glm-5.1"
+context_window = 0
+reasoning = false
+[[models]]
+model = "glm-5.2"
+context_window = 0
+reasoning = false
+[[models]]
+model = "gpt-5.4"
+context_window = 0
+reasoning = false
+api = "openai-responses"
+[[models]]
+model = "gpt-5.4-mini"
+context_window = 0
+reasoning = false
+api = "openai-responses"
+[[models]]
+model = "gpt-5.5"
+context_window = 0
+reasoning = false
+api = "openai-responses"
+[[models]]
+model = "gpt-5.5-pro"
+context_window = 0
+reasoning = false
+api = "openai-responses"
+[[models]]
+model = "gpt-5.6-luna"
+context_window = 0
+reasoning = false
+api = "openai-responses"
+[[models]]
+model = "gpt-5.6-sol"
+context_window = 0
+reasoning = false
+api = "openai-responses"
+[[models]]
+model = "gpt-5.6-terra"
+context_window = 0
+reasoning = false
+api = "openai-responses"
+[[models]]
+model = "grok-4.5"
+context_window = 0
+reasoning = false
+[[models]]
+model = "grok-build-0.1"
+context_window = 0
+reasoning = false
+[[models]]
+model = "kimi-k2.5"
+context_window = 0
+reasoning = false
+[[models]]
+model = "kimi-k2.6"
+context_window = 0
+reasoning = false
+[[models]]
+model = "kimi-k2.7-code"
+context_window = 0
+reasoning = false
+[[models]]
+model = "mimo-v2.5-free"
+context_window = 0
+reasoning = false
+[[models]]
+model = "minimax-m2.5"
+context_window = 0
+reasoning = false
+[[models]]
+model = "minimax-m2.7"
+context_window = 0
+reasoning = false
+[[models]]
+model = "minimax-m3"
+context_window = 0
+reasoning = false
+[[models]]
+model = "nemotron-3-ultra-free"
+context_window = 0
+reasoning = false
+[[models]]
+model = "north-mini-code-free"
+context_window = 0
+reasoning = false
+[[models]]
+model = "qwen3.5-plus"
+context_window = 0
+reasoning = false
+[[models]]
+model = "qwen3.6-plus"
+context_window = 0
+reasoning = false
+[[models]]

@@ -1,0 +1,30 @@
+name = "routstr"
+display_name = "Routstr"
+kind = "openai"
+base_url = "${ROUTSTR_HOST}/v1"
+api_key_env = "ROUTSTR_API_KEY"
+
+[[models]]
+model = "claude-opus-4.7"
+context_window = 1000000
+[[models]]
+[[models]]
+model = "gemini-3.1-pro-preview"
+context_window = 1048576
+[[models]]
+[[models]]
+model = "gemini-3-flash-preview"
+context_window = 1048576
+[[models]]
+[[models]]
+model = "deepseek-v4-pro"
+context_window = 1048576
+[[models]]
+[[models]]
+model = "glm-5.1"
+context_window = 202752
+[[models]]
+[[models]]
+model = "minimax-m2.7"
+context_window = 196608
+[[models]]

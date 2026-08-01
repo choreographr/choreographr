@@ -2551,6 +2551,17 @@ fn ai_providers_new_form_enter_on_apikey_submits() {
         &tx,
     )
     .expect("enter to provider");
+    // Select OpenAI in the (alphabetically-sorted) provider picker.
+    // The select's options are only populated at render time, so in this
+    // headless test set the focused index directly: "openai" is the 46th
+    // entry (0-based index 45) of PROVIDER_OPTIONS.
+    let openai_idx = PROVIDER_OPTIONS
+        .iter()
+        .position(|p| p.slug == "openai")
+        .expect("openai in provider options");
+    app.ai_providers
+        .new_provider_state
+        .set_focused_index(openai_idx);
     // Advance to API key
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),

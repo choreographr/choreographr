@@ -1,0 +1,18 @@
+name = "iflytek"
+display_name = "iFlytek Spark"
+kind = "openai"
+base_url = "https://spark-api-open.xf-yun.com/v1"
+api_key_env = "SPARK_API_PASSWORD"
+
+[[models]]
+model = "4.0Ultra"
+context_window = 8192
+[[models]]
+[[models]]
+model = "generalv3.5"
+context_window = 8192
+[[models]]
+[[models]]
+model = "max-32k"
+context_window = 32768
+[[models]]

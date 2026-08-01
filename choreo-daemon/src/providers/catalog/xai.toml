@@ -1,0 +1,49 @@
+slug = "xai"
+display_name = "xAI"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "https://api.x.ai/v1"
+default_model = "grok-4.20-0309-reasoning"
+
+[[models]]
+model = "grok-3"
+context_window = 131072
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "grok-3-fast"
+context_window = 131072
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "grok-4.20-0309-non-reasoning"
+context_window = 2000000
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "grok-4.20-0309-reasoning"
+context_window = 2000000
+reasoning_supported = true
+reasoning_levels = ["off", "minimal", "low", "medium", "high"]
+responses = false
+[[models]]
+model = "grok-4.3"
+context_window = 1000000
+reasoning_supported = true
+reasoning_levels = ["off", "minimal", "low", "medium", "high"]
+responses = false
+[[models]]
+model = "grok-build-0.1"
+context_window = 256000
+reasoning_supported = true
+reasoning_levels = ["off", "minimal", "low", "medium", "high"]
+responses = false
+[[models]]
+model = "grok-code-fast-1"
+context_window = 32768
+reasoning_supported = false
+reasoning_levels = []
+responses = false

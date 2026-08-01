@@ -1,0 +1,18 @@
+name = "venice"
+display_name = "Venice.ai"
+kind = "openai"
+base_url = "https://api.venice.ai/api/v1/chat/completions"
+api_key_env = "VENICE_API_KEY"
+
+[[models]]
+model = "llama-3.3-70b"
+context_window = 131072
+[[models]]
+[[models]]
+model = "llama-3.2-3b"
+context_window = 131072
+[[models]]
+[[models]]
+model = "mistral-31-24b"
+context_window = 131072
+[[models]]

@@ -1,0 +1,10 @@
+name = "tanzu_ai"
+display_name = "VMware Tanzu Platform"
+kind = "openai"
+base_url = "${TANZU_AI_ENDPOINT}/openai/v1/chat/completions"
+api_key_env = "TANZU_AI_API_KEY"
+
+[[models]]
+model = "openai/gpt-oss-120b"
+context_window = 131072
+[[models]]

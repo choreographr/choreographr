@@ -60,20 +60,44 @@ pub(crate) struct ProviderInfo {
 
 pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
     ProviderInfo {
-        slug: "openai",
-        display_name: "OpenAI",
+        slug: "aimlapi",
+        display_name: "aimlapi.com",
+    },
+    ProviderInfo {
+        slug: "alibaba",
+        display_name: "Alibaba (Qwen)",
+    },
+    ProviderInfo {
+        slug: "ant-ling",
+        display_name: "Ant Ling",
     },
     ProviderInfo {
         slug: "anthropic",
         display_name: "Anthropic",
     },
     ProviderInfo {
-        slug: "google",
-        display_name: "Google Gemini",
+        slug: "arcee",
+        display_name: "Arcee AI",
+    },
+    ProviderInfo {
+        slug: "atlascloud",
+        display_name: "Atlas Cloud",
+    },
+    ProviderInfo {
+        slug: "atomic-chat",
+        display_name: "Atomic Chat",
+    },
+    ProviderInfo {
+        slug: "bankr",
+        display_name: "Bankr",
     },
     ProviderInfo {
         slug: "cerebras",
         display_name: "Cerebras",
+    },
+    ProviderInfo {
+        slug: "custom-anthropic",
+        display_name: "Custom Anthropic-Compatible",
     },
     ProviderInfo {
         slug: "custom-openai",
@@ -84,16 +108,48 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
         display_name: "DashScope (Alibaba)",
     },
     ProviderInfo {
+        slug: "deepinfra",
+        display_name: "DeepInfra",
+    },
+    ProviderInfo {
         slug: "deepseek",
         display_name: "DeepSeek",
     },
     ProviderInfo {
+        slug: "empiriolabs",
+        display_name: "EmpirioLabs AI",
+    },
+    ProviderInfo {
         slug: "fireworks",
-        display_name: "Fireworks AI",
+        display_name: "Fireworks",
+    },
+    ProviderInfo {
+        slug: "friendli",
+        display_name: "Friendli AI",
+    },
+    ProviderInfo {
+        slug: "futurmix",
+        display_name: "FuturMix",
     },
     ProviderInfo {
         slug: "github",
         display_name: "GitHub Models",
+    },
+    ProviderInfo {
+        slug: "github-copilot",
+        display_name: "GitHub Copilot",
+    },
+    ProviderInfo {
+        slug: "gitlawb-opengateway",
+        display_name: "GitLawb OpenGateway",
+    },
+    ProviderInfo {
+        slug: "gmi",
+        display_name: "GMI Cloud",
+    },
+    ProviderInfo {
+        slug: "google",
+        display_name: "Google Gemini",
     },
     ProviderInfo {
         slug: "groq",
@@ -104,12 +160,68 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
         display_name: "Hugging Face",
     },
     ProviderInfo {
+        slug: "iflytek",
+        display_name: "iFlytek Spark",
+    },
+    ProviderInfo {
+        slug: "iflytek-astron",
+        display_name: "iFlytek Astron MaaS",
+    },
+    ProviderInfo {
+        slug: "inception",
+        display_name: "Inception",
+    },
+    ProviderInfo {
+        slug: "kilocode",
+        display_name: "KiloCode",
+    },
+    ProviderInfo {
+        slug: "kimi-code",
+        display_name: "Kimi Code subscription",
+    },
+    ProviderInfo {
         slug: "lmstudio",
         display_name: "LM Studio",
     },
     ProviderInfo {
+        slug: "longcat",
+        display_name: "LongCat",
+    },
+    ProviderInfo {
+        slug: "meta",
+        display_name: "Meta",
+    },
+    ProviderInfo {
+        slug: "minimax",
+        display_name: "MiniMax",
+    },
+    ProviderInfo {
+        slug: "minimax-cn",
+        display_name: "MiniMax (China)",
+    },
+    ProviderInfo {
+        slug: "mistral",
+        display_name: "Mistral",
+    },
+    ProviderInfo {
         slug: "moonshot",
         display_name: "Moonshot AI (Kimi)",
+    },
+    ProviderInfo {
+        slug: "moonshotai",
+        display_name: "Moonshot AI (Kimi)",
+    },
+    ProviderInfo {
+        slug: "moonshotai-cn",
+        display_name: "Moonshot AI (China)",
+    },
+    ProviderInfo {
+        slug: "nearai",
+        display_name: "NEAR AI Cloud",
+    },
+    ProviderInfo {
+        slug: "nous",
+        display_name: "Nous Research",
     },
     ProviderInfo {
         slug: "novita",
@@ -128,6 +240,18 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
         display_name: "Ollama Cloud",
     },
     ProviderInfo {
+        slug: "openai",
+        display_name: "OpenAI",
+    },
+    ProviderInfo {
+        slug: "openai-codex",
+        display_name: "OpenAI Codex subscription",
+    },
+    ProviderInfo {
+        slug: "openai_compatible",
+        display_name: "OpenAI Compatible",
+    },
+    ProviderInfo {
         slug: "opencode",
         display_name: "OpenCode Zen",
     },
@@ -136,44 +260,112 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
         display_name: "OpenCode Go",
     },
     ProviderInfo {
-        slug: "openai_compatible",
-        display_name: "OpenAI Compatible",
+        slug: "opencode-go-anthropic-compatible",
+        display_name: "OpenCode Go Anthropic-compatible",
     },
     ProviderInfo {
         slug: "openrouter",
         display_name: "OpenRouter",
     },
     ProviderInfo {
+        slug: "orcarouter",
+        display_name: "OrcaRouter",
+    },
+    ProviderInfo {
+        slug: "ovhcloud",
+        display_name: "OVHcloud",
+    },
+    ProviderInfo {
         slug: "perplexity",
         display_name: "Perplexity",
+    },
+    ProviderInfo {
+        slug: "qwen-token-plan",
+        display_name: "Qwen Token Plan",
+    },
+    ProviderInfo {
+        slug: "qwen-token-plan-cn",
+        display_name: "Qwen Token Plan CN",
+    },
+    ProviderInfo {
+        slug: "routstr",
+        display_name: "Routstr",
+    },
+    ProviderInfo {
+        slug: "sakana",
+        display_name: "Sakana AI",
+    },
+    ProviderInfo {
+        slug: "saladcloud",
+        display_name: "SaladCloud AI Gateway",
+    },
+    ProviderInfo {
+        slug: "scaleway",
+        display_name: "Scaleway",
+    },
+    ProviderInfo {
+        slug: "stepfun",
+        display_name: "StepFun",
+    },
+    ProviderInfo {
+        slug: "tensorix",
+        display_name: "Tensorix",
     },
     ProviderInfo {
         slug: "together",
         display_name: "Together AI",
     },
     ProviderInfo {
+        slug: "upstage",
+        display_name: "Upstage Solar",
+    },
+    ProviderInfo {
         slug: "venice",
         display_name: "Venice AI",
+    },
+    ProviderInfo {
+        slug: "vercel-ai-gateway",
+        display_name: "Vercel AI Gateway",
+    },
+    ProviderInfo {
+        slug: "xai",
+        display_name: "xAI",
     },
     ProviderInfo {
         slug: "xiaomi-mimo",
         display_name: "Xiaomi MiMo",
     },
     ProviderInfo {
-        slug: "xai",
-        display_name: "xAI Grok",
+        slug: "xiaomi",
+        display_name: "Xiaomi MiMo",
+    },
+    ProviderInfo {
+        slug: "xiaomi-token-plan-ams",
+        display_name: "Xiaomi MiMo Token Plan (Amsterdam)",
+    },
+    ProviderInfo {
+        slug: "xiaomi-token-plan-cn",
+        display_name: "Xiaomi MiMo Token Plan (China)",
+    },
+    ProviderInfo {
+        slug: "xiaomi-token-plan-sgp",
+        display_name: "Xiaomi MiMo Token Plan (Singapore)",
     },
     ProviderInfo {
         slug: "zai",
-        display_name: "Z.ai (GLM)",
+        display_name: "ZAI",
     },
     ProviderInfo {
-        slug: "minimax",
-        display_name: "MiniMax",
+        slug: "zai-cn",
+        display_name: "Z.AI CN",
     },
     ProviderInfo {
-        slug: "custom-anthropic",
-        display_name: "Custom Anthropic-Compatible",
+        slug: "zai-coding-cn",
+        display_name: "Z.AI Coding CN",
+    },
+    ProviderInfo {
+        slug: "zhipu",
+        display_name: "Zhipu AI",
     },
 ];
 
@@ -3159,6 +3351,45 @@ pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<(usize, usi
 mod tests {
     use super::*;
     use crate::test_util::test_app;
+
+    #[test]
+    fn provider_options_cover_catalog_slugs() {
+        // The TUI's new-account provider picker must expose every provider the
+        // daemon catalog ships. Keep this list in sync with the catalog TOML
+        // files (choreo-daemon/src/providers/catalog/*.toml) — a new provider
+        // needs both a TOML file and an entry here.
+        let slugs: std::collections::HashSet<&str> =
+            PROVIDER_OPTIONS.iter().map(|p| p.slug).collect();
+        for expected in [
+            "openai",
+            "anthropic",
+            "google",
+            "mistral",
+            "deepseek",
+            "dashscope",
+            "perplexity",
+            "xiaomi-mimo",
+            "moonshot",
+            "openai-codex",
+            "kimi-code",
+            "github-copilot",
+            "vercel-ai-gateway",
+            "minimax-cn",
+            "zai-cn",
+            "ollama",
+            "openai_compatible",
+            "custom-anthropic",
+        ] {
+            assert!(
+                slugs.contains(expected),
+                "PROVIDER_OPTIONS missing provider slug {expected:?}"
+            );
+        }
+        assert!(
+            PROVIDER_OPTIONS.len() >= 70,
+            "provider options unexpectedly small"
+        );
+    }
 
     fn make_session(id: u64, title: &str) -> SessionSummary {
         SessionSummary {

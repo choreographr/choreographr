@@ -1,0 +1,73 @@
+slug = "iflytek-astron"
+display_name = "iFlytek Astron MaaS"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "https://maas-token-api.cn-huabei-1.xf-yun.com/v2"
+default_model = "xopglm51"
+
+[[models]]
+model = "xsparkx2"
+context_window = 131072
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "xsparkx2flash"
+context_window = 131072
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "xopglm51"
+context_window = 204800
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "xopglm5"
+context_window = 204800
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "xopdeepseekv4pro"
+context_window = 131072
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "xopdeepseekv4flash"
+context_window = 131072
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "xopdeepseekv32"
+context_window = 131072
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "xopkimik26"
+context_window = 262144
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "xminimaxm25"
+context_window = 131072
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "xopqwen35397b"
+context_window = 262144
+reasoning_supported = false
+reasoning_levels = []
+responses = false
+[[models]]
+model = "astron-code-latest"
+context_window = 131072
+reasoning_supported = false
+reasoning_levels = []
+responses = false

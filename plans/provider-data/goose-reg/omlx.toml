@@ -1,0 +1,6 @@
+name = "omlx"
+display_name = "oMLX"
+kind = "openai"
+base_url = "${OMLX_HOST}/v1/chat/completions"
+api_key_env = "OMLX_API_KEY"
+
