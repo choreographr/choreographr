@@ -1783,10 +1783,22 @@ pub(crate) fn handle_daemon_message(
             app.handle_session_title_set(*session_id, title);
         }
         // TokenUsageUpdate is dispatched through the generic handler below.
-        DaemonMessage::LiveOutputTokenCount { output_tokens, .. } => {
-            if let Some(display) = app.active_display() {
-                display.live_output_tokens = *output_tokens;
-            }
+        DaemonMessage::LiveOutputTokenCount {
+            session_id,
+            output_tokens,
+            ..
+        } => {
+            // Route the live count to the session the message belongs to,
+            // not the one the user happens to be viewing.  The TUI subscribes
+            // to all session activity (SubscribeAllActivity), so these arrive
+            // for every streaming session — writing to the active display
+            // would let a background session's token count bleed into the
+            // status bar of the session being viewed.  Each session keeps its
+            // own live count; reset_for_session_switch preserves it, so the
+            // count stays correct both while streaming in the background and
+            // after the user switches to that session.
+            let display = app.display_for(*session_id);
+            display.live_output_tokens = *output_tokens;
         }
 
         _ => {}

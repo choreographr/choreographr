@@ -2725,8 +2725,19 @@ impl TurnEventHandler for App {
             ?state.status,
             "handle_session_state"
         );
-        let session_id = self.attached_session_id.unwrap_or(0);
-        self.active_session_id = Some(session_id);
+        let session_id = state.session_id;
+        // SessionState snapshots are per-session: the daemon sends one for
+        // the attached session on attach, but also broadcasts them for
+        // background sessions (e.g. load_tools/unload_tools on that session
+        // reach activity subscribers like the TUI).  Route the snapshot to
+        // the session it belongs to, and only let the *attached* session's
+        // snapshot drive the view switch and the status-bar fields below —
+        // otherwise a background session's token usage / status / turns
+        // would clobber the display the user is currently looking at.
+        let is_attached = self.attached_session_id == Some(session_id);
+        if is_attached {
+            self.active_session_id = Some(session_id);
+        }
 
         let SessionStateData {
             turns,
@@ -2796,8 +2807,14 @@ impl TurnEventHandler for App {
         }
         display.mark_content_changed();
         let _ = display;
-        self.attached_status = Some(status);
-        self.attached_tool_groups = active_tool_groups;
+        // Only the attached session's snapshot may update the status bar's
+        // per-attachment state — a background session's snapshot must not
+        // overwrite the status/tool-group display while the user is viewing
+        // the attached session.
+        if is_attached {
+            self.attached_status = Some(status);
+            self.attached_tool_groups = active_tool_groups;
+        }
     }
 
     fn handle_token_usage_update(

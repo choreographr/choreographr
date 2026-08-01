@@ -1452,6 +1452,16 @@ the next chunk arrives.  (Cold-starting clients that were never subscribed
 to the session still miss pre-attach content — the worker owns the live turn
 and only syncs back on `RequestFinished`.)
 
+Token bookkeeping follows the same per-session rule.  `LiveOutputTokenCount`
+(during streaming) and `SessionState` snapshots (attach / `load_tools` /
+`unload_tools` broadcasts) are routed to the display of the session they
+belong to, never to the one the user happens to be viewing.  The status
+bar's `↑/↓` token readout and context-fill come from the active session's
+`SessionDisplayState` (`display_token_usage`), so a background session
+streaming via the all-activity subscription cannot bleed its counts into
+the session on screen — and its counts are already correct by the time the
+user switches to it (`reset_for_session_switch` preserves live estimates).
+
 
 ---
 

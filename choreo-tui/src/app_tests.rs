@@ -2780,6 +2780,9 @@ fn daemon_message_session_state_updates_progress_for_attached_session() {
 fn daemon_message_session_state_sets_tool_groups() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
+    // Tool groups only reach the status bar when the snapshot belongs to the
+    // attached session.
+    app.attached_session_id = Some(7);
 
     handle_daemon_message(
         DaemonMessage::SessionState {
@@ -2838,21 +2841,30 @@ fn daemon_message_session_state_ignores_wrong_session() {
     )
     .expect("handle_daemon_message should succeed");
 
-    // TurnEventHandler::handle_session_state sets these fields unconditionally
-    // (it does not check session_id), while progress_dirty is only set by the
-    // manual guard in connection.rs which skips non-attached sessions.
+    // A SessionState snapshot for a background session is routed to that
+    // session's own display — it must not clobber the attached session's
+    // token usage, status, or tool-group state (which the status bar reads).
     assert_eq!(
         app.display_for(7).token_usage,
+        None,
+        "attached display must not pick up the background session's usage"
+    );
+    assert_eq!(app.display_for(7).context_window, None);
+    assert_eq!(app.attached_status, None);
+    // The background session's own display received the snapshot.
+    assert_eq!(
+        app.display_for(99).token_usage,
         Some(TokenUsage {
             input_tokens: 99,
             output_tokens: 99,
             total_tokens: 99,
         })
     );
-    assert_eq!(app.display_for(7).context_window, Some(1024));
-    assert_eq!(app.attached_status, Some(SessionStatus::Inactive));
-    assert!(app.attached_tool_groups.is_empty());
+    assert_eq!(app.display_for(99).context_window, Some(1024));
+    // The progress_dirty guard in connection.rs still skips non-attached
+    // sessions.
     assert!(!app.display_for(7).progress_dirty);
+    assert!(!app.display_for(99).progress_dirty);
 }
 
 #[test]
@@ -2908,6 +2920,84 @@ fn daemon_message_done_without_token_usage_does_not_change_progress() {
     // Must remain at defaults — no data written, no dirty flag set.
     assert!(app.display_for(0).token_usage.is_none());
     assert!(!app.display_for(0).progress_dirty);
+}
+
+#[test]
+fn live_output_token_count_from_background_session_does_not_pollute_status_bar() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    // The user is viewing session 0, which already has settled token usage.
+    app.attached_session_id = Some(0);
+    app.display_for(0).token_usage = Some(TokenUsage {
+        input_tokens: 1,
+        output_tokens: 2,
+        total_tokens: 3,
+    });
+
+    // Session 7 (background, streamed via SubscribeAllActivity) reports its
+    // live output-token count while the user keeps looking at session 0.
+    handle_daemon_message(
+        DaemonMessage::LiveOutputTokenCount {
+            session_id: 7,
+            request_id: 50,
+            output_tokens: 99,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    // The live count goes to session 7's own display…
+    assert_eq!(app.display_for(7).live_output_tokens, 99);
+    // …and never lands in the display the user is viewing, so the status
+    // bar's token readout (token_usage + live counts) stays session-0-only.
+    assert_eq!(app.display_for(0).live_output_tokens, 0);
+    assert_eq!(
+        app.display_token_usage(),
+        Some(TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+        })
+    );
+}
+
+#[test]
+fn live_output_token_count_updates_own_session_after_switch() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    // The user switches to session 7 mid-stream; reset_for_session_switch
+    // preserved its accumulated live token estimate.
+    app.attached_session_id = Some(7);
+    app.active_session_id = Some(7);
+    app.display_for(7).token_usage = Some(TokenUsage {
+        input_tokens: 10,
+        output_tokens: 5,
+        total_tokens: 15,
+    });
+
+    handle_daemon_message(
+        DaemonMessage::LiveOutputTokenCount {
+            session_id: 7,
+            request_id: 50,
+            output_tokens: 42,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle_daemon_message should succeed");
+
+    // The count lands in the session the message belongs to, which is now
+    // also the one being viewed — the status bar reflects it.
+    assert_eq!(app.display_for(7).live_output_tokens, 42);
+    assert_eq!(
+        app.display_token_usage(),
+        Some(TokenUsage {
+            input_tokens: 10,
+            output_tokens: 47,
+            total_tokens: 57,
+        })
+    );
 }
 
 // ── multi-session streaming: switching keeps accumulated content ──
