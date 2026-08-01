@@ -1610,7 +1610,8 @@ fn make_session(id: u64, title: &str, model: &str, count: u32) -> choreo_proto::
         reasoning_effort: None,
         parent_session_id: None,
         working_dir: None,
-        created_at: 1705314000,
+        created_at: 1705314000000,
+        last_modified: 1705314000000,
         turn_count: count,
         max_turns: None,
         status: choreo_proto::SessionStatus::Inactive,
@@ -3231,20 +3232,20 @@ fn handle_session_status_changed_updates_attached_status() {
     assert!(app.attached_status.is_none());
 
     // With no attached session, status should not be cached.
-    app.handle_session_status_changed(42, &SessionStatus::Inference);
+    app.handle_session_status_changed(42, &SessionStatus::Inference, 1705314000000);
     assert!(app.attached_status.is_none());
 
     // Once attached, a status change for that session should be cached.
     app.attached_session_id = Some(42);
-    app.handle_session_status_changed(42, &SessionStatus::Inference);
+    app.handle_session_status_changed(42, &SessionStatus::Inference, 1705314000000);
     assert_eq!(app.attached_status, Some(SessionStatus::Inference));
 
     // A status change for a different session should not overwrite.
-    app.handle_session_status_changed(99, &SessionStatus::Sleeping);
+    app.handle_session_status_changed(99, &SessionStatus::Sleeping, 1705314000000);
     assert_eq!(app.attached_status, Some(SessionStatus::Inference));
 
     // A subsequent change for the attached session should update.
-    app.handle_session_status_changed(42, &SessionStatus::ToolCall("test".into()));
+    app.handle_session_status_changed(42, &SessionStatus::ToolCall("test".into()), 1705314000000);
     assert_eq!(
         app.attached_status,
         Some(SessionStatus::ToolCall("test".into()))

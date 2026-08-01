@@ -239,7 +239,12 @@ pub struct SessionSummary {
     pub reasoning_effort: Option<String>,
     pub parent_session_id: Option<u64>,
     pub working_dir: Option<String>,
+    /// Session creation time, Unix-epoch-milliseconds.
     pub created_at: i64,
+    /// Most recent modification time, Unix-epoch-milliseconds.  Bumped by the
+    /// daemon whenever the session's status, title, model, or turn count
+    /// changes, and used to order the sessions list (newest first).
+    pub last_modified: i64,
     pub turn_count: u32,
     pub max_turns: Option<u32>,
     pub status: SessionStatus,
@@ -416,6 +421,10 @@ pub enum DaemonMessage {
     SessionStatusChanged {
         session_id: u64,
         status: SessionStatus,
+        /// Unix-epoch-milliseconds timestamp of this status change, so the
+        /// TUI can re-sort the sessions list (most recently modified first)
+        /// without waiting for a fresh ListSessions round-trip.
+        last_modified: i64,
     },
     SessionFailed {
         session_id: u64,

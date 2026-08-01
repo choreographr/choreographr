@@ -314,6 +314,7 @@ pub(crate) struct SessionDetailData {
     pub(crate) parent_session_id: Option<u64>,
     pub(crate) working_dir: String,
     pub(crate) created_at: i64,
+    pub(crate) last_modified: i64,
     pub(crate) turn_count: u32,
     pub(crate) max_turns: Option<u32>,
     pub(crate) status: SessionStatus,
@@ -827,6 +828,7 @@ impl SessionManagerState {
             .and_then(|i| self.sessions.get(i))
             .map(|s| s.session_id);
         self.sessions = sessions;
+        self.sort_by_last_modified();
         self.selection = if self.sessions.is_empty() {
             None
         } else {
@@ -836,6 +838,29 @@ impl SessionManagerState {
             Some(idx)
         };
         self.scroll = 0;
+    }
+
+    /// Order sessions newest-first by `last_modified`.  Uses a STABLE sort:
+    /// equal timestamps keep whatever order the daemon sent (which is already
+    /// id-desc tiebroken in `handle_list_sessions`), so the TUI doesn't need
+    /// to re-implement that tiebreak here.
+    fn sort_by_last_modified(&mut self) {
+        // `sort_by_key` is stable (see the doc comment above); Reverse gives
+        // newest-first without a custom comparator.
+        self.sessions
+            .sort_by_key(|s| std::cmp::Reverse(s.last_modified));
+    }
+
+    /// Re-order after a live status change and keep the cursor on the same
+    /// session, which may have moved to a new index.
+    fn resort_after_status_change(&mut self) {
+        let selected_id = self
+            .selection
+            .and_then(|i| self.sessions.get(i))
+            .map(|s| s.session_id);
+        self.sort_by_last_modified();
+        self.selection =
+            selected_id.and_then(|id| self.sessions.iter().position(|s| s.session_id == id));
     }
 
     pub(crate) fn select_up(&mut self) {
@@ -877,6 +902,7 @@ impl SessionManagerState {
             let parent_session_id = s.parent_session_id;
             let working_dir = s.working_dir.clone().unwrap_or_else(|| "-".to_string());
             let created_at = s.created_at;
+            let last_modified = s.last_modified;
             let turn_count = s.turn_count;
             let max_turns = s.max_turns;
             SessionDetailData {
@@ -887,6 +913,7 @@ impl SessionManagerState {
                 parent_session_id,
                 working_dir,
                 created_at,
+                last_modified,
                 turn_count,
                 max_turns,
                 status: s.status.clone(),
@@ -2149,6 +2176,7 @@ impl App {
         &mut self,
         session_id: u64,
         status: &SessionStatus,
+        last_modified: i64,
     ) {
         if let Some(session) = self
             .session_mgr
@@ -2157,7 +2185,14 @@ impl App {
             .find(|s| s.session_id == session_id)
         {
             session.status = status.clone();
+            // last_modified is monotonic; guard against duplicate or
+            // out-of-order deliveries (per-session + summary paths).
+            session.last_modified = session.last_modified.max(last_modified);
         }
+        // A status change bumps last_modified on the daemon, so the list may
+        // reorder while the user is looking at it — re-sort but keep the
+        // cursor on the same session.
+        self.session_mgr.resort_after_status_change();
         if let Some(ref mut detail) = self.session_mgr.detail_data
             && detail.session_id == session_id
         {
@@ -3056,23 +3091,13 @@ impl TurnEventHandler for App {
     ) {
     }
 
-    fn handle_session_status_changed(&mut self, session_id: u64, status: SessionStatus) {
-        if let Some(session) = self
-            .session_mgr
-            .sessions
-            .iter_mut()
-            .find(|s| s.session_id == session_id)
-        {
-            session.status = status.clone();
-        }
-        if let Some(ref mut detail) = self.session_mgr.detail_data
-            && detail.session_id == session_id
-        {
-            detail.status = status.clone();
-        }
-        if self.attached_session_id == Some(session_id) {
-            self.attached_status = Some(status);
-        }
+    fn handle_session_status_changed(
+        &mut self,
+        session_id: u64,
+        status: SessionStatus,
+        last_modified: i64,
+    ) {
+        self.handle_session_status_changed(session_id, &status, last_modified);
     }
 }
 
@@ -3149,6 +3174,7 @@ mod tests {
             parent_session_id: None,
             working_dir: None,
             created_at: 1000,
+            last_modified: 1000,
             turn_count: 0,
             max_turns: None,
             status: SessionStatus::Inactive,
@@ -3169,6 +3195,7 @@ mod tests {
             parent_session_id: None,
             working_dir: String::new(),
             created_at: 0,
+            last_modified: 0,
             turn_count: 0,
             max_turns: None,
             status: SessionStatus::Inactive,
@@ -3178,6 +3205,72 @@ mod tests {
             context_window: None,
             last_prompt_tokens: None,
         }
+    }
+
+    // ── last_modified ordering ──
+
+    #[test]
+    fn set_sessions_orders_by_last_modified_desc() {
+        let mut mgr = SessionManagerState::new();
+        let mut old = make_session(1, "old");
+        old.last_modified = 1000;
+        let mut newest = make_session(2, "newest");
+        newest.last_modified = 9000;
+        let mut middle = make_session(3, "middle");
+        middle.last_modified = 5000;
+        // Deliberately unsorted input: the list must come back newest-first.
+        mgr.set_sessions(vec![old, middle, newest]);
+        let titles: Vec<&str> = mgr
+            .sessions
+            .iter()
+            .map(|s| s.title.as_deref().unwrap())
+            .collect();
+        assert_eq!(titles, vec!["newest", "middle", "old"]);
+    }
+
+    #[test]
+    fn set_sessions_stable_for_equal_timestamps() {
+        // Equal last_modified values must keep the incoming order (the daemon
+        // already applies its id-desc tiebreak before sending).
+        let mut mgr = SessionManagerState::new();
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        let ids: Vec<u64> = mgr.sessions.iter().map(|s| s.session_id).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn status_change_reorders_list_and_preserves_selection() {
+        let mut app = test_app();
+        app.session_mgr
+            .set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        // Both sessions share a timestamp, so the stable sort keeps input
+        // order; move the cursor onto session 2 (index 1).
+        app.session_mgr.select_down();
+        assert_eq!(app.session_mgr.selection, Some(1));
+
+        // Session 2 becomes active: the daemon bumps last_modified, and the
+        // TUI re-sorts so it jumps to the top while the cursor follows it.
+        app.handle_session_status_changed(2, &SessionStatus::Inference, 9999);
+        assert_eq!(
+            app.session_mgr.sessions[0].session_id, 2,
+            "active session re-sorted to top"
+        );
+        assert_eq!(app.session_mgr.sessions[0].status, SessionStatus::Inference);
+        assert_eq!(
+            app.session_mgr.selection,
+            Some(0),
+            "cursor follows the session"
+        );
+    }
+
+    #[test]
+    fn status_change_timestamp_is_monotonic() {
+        // Duplicate/out-of-order deliveries must never regress last_modified.
+        let mut app = test_app();
+        app.session_mgr.set_sessions(vec![make_session(1, "a")]);
+        app.handle_session_status_changed(1, &SessionStatus::Inference, 9000);
+        app.handle_session_status_changed(1, &SessionStatus::Inference, 5000);
+        assert_eq!(app.session_mgr.sessions[0].last_modified, 9000);
     }
 
     // ── remove_session ──

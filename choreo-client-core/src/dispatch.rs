@@ -91,7 +91,12 @@ pub trait TurnEventHandler {
         selected_model: Option<String>,
         reasoning_effort: Option<String>,
     );
-    fn handle_session_status_changed(&mut self, session_id: u64, status: SessionStatus);
+    fn handle_session_status_changed(
+        &mut self,
+        session_id: u64,
+        status: SessionStatus,
+        last_modified: i64,
+    );
     fn handle_token_usage_update(
         &mut self,
         session_id: u64,
@@ -260,9 +265,11 @@ pub fn dispatch_daemon_message(msg: &DaemonMessage, handler: &mut impl TurnEvent
             session_id,
             request_id,
         } => handler.handle_failed(*session_id, *request_id, "cancelled".to_string()),
-        DaemonMessage::SessionStatusChanged { session_id, status } => {
-            handler.handle_session_status_changed(*session_id, status.clone());
-        }
+        DaemonMessage::SessionStatusChanged {
+            session_id,
+            status,
+            last_modified,
+        } => handler.handle_session_status_changed(*session_id, status.clone(), *last_modified),
         DaemonMessage::SessionFailed { error, .. } => {
             handler.handle_error(error.clone());
         }

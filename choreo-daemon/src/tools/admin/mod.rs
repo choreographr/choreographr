@@ -39,6 +39,7 @@ pub(crate) mod tests {
                             parent_session_id: None,
                             working_dir: Some("/tmp".into()),
                             created_at: 1000,
+                            last_modified: 1000,
                             turn_count: 5,
                             max_turns: None,
                             status: SessionStatus::Inactive,

@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, trace, warn};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -132,6 +131,7 @@ pub struct SessionMetadata {
     pub parent_session_id: Option<u64>,
     pub working_dir: Option<String>,
     pub created_at: i64,
+    pub last_modified: i64,
     pub turn_count: u32,
     pub max_turns: Option<u32>,
     pub status: SessionStatus,
@@ -155,6 +155,7 @@ impl From<SessionRecord> for SessionMetadata {
             working_dir: record.working_dir.map(PathBuf::from),
             max_turns: record.max_turns,
             created_at: record.created_at,
+            last_modified: record.last_modified,
             status: SessionStatus::Sleeping,
             active_tool_groups: record.active_tool_groups.into_iter().collect(),
             context_config: record.context_config,
@@ -181,6 +182,7 @@ impl From<SessionMetadata> for SessionRecord {
             max_turns: meta.max_turns,
             turn_count: meta.turn_count,
             created_at: meta.created_at,
+            last_modified: meta.last_modified,
             active_tool_groups: meta.active_tool_groups,
             context_config: ContextConfig::default(),
             account_name: meta.account_name,
@@ -212,6 +214,7 @@ impl SessionMetadata {
             parent_session_id: self.parent_session_id,
             working_dir: self.working_dir.clone(),
             created_at: self.created_at,
+            last_modified: self.last_modified,
             turn_count: self.turn_count,
             max_turns: self.max_turns,
             status: self.status.clone(),
@@ -236,6 +239,7 @@ pub struct SessionConfig {
     pub working_dir: Option<PathBuf>,
     pub max_turns: Option<u32>,
     pub created_at: i64,
+    pub last_modified: i64,
     pub status: SessionStatus,
     pub active_tool_groups: HashSet<String>,
     pub context_config: ContextConfig,
@@ -255,6 +259,7 @@ impl Default for SessionConfig {
             working_dir: None,
             max_turns: None,
             created_at: 0,
+            last_modified: 0,
             status: SessionStatus::Inactive,
             active_tool_groups: HashSet::new(),
             context_config: ContextConfig::default(),
@@ -296,6 +301,7 @@ impl From<&SessionConfig> for SessionMetadata {
             parent_session_id: config.parent_session_id,
             working_dir: config.working_dir.as_ref().map(|p| p.display().to_string()),
             created_at: config.created_at,
+            last_modified: config.last_modified,
             turn_count: 0,
             max_turns: config.max_turns,
             status: config.status.clone(),
@@ -654,12 +660,17 @@ fn fail_request(
 /// to the database.  Shared boilerplate used by session mutation handlers
 /// (SetTitle, SetAccount, SetModel, etc.) so that changes are reflected
 /// in session listings immediately and survive daemon restarts.
-fn persist_session_metadata(state: &SessionState, ctx: &RequestContext, label: &str) {
+fn persist_session_metadata(state: &mut SessionState, ctx: &RequestContext, label: &str) {
+    // Any metadata mutation is a modification: bump the timestamp so the
+    // sessions list reorders (newest first) the moment the daemon index and
+    // the persisted record are updated.
+    let now = TimestampMs::now().as_millis();
+    state.config.last_modified = state.config.last_modified.max(now);
     let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
         session_id: ctx.session_id,
-        metadata: SessionMetadata::from(state),
+        metadata: SessionMetadata::from(&*state),
     });
-    let record = SessionRecord::from(state);
+    let record = SessionRecord::from(&*state);
     if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
         warn!(error = %e, "failed to persist session record after {label}");
     }
@@ -686,12 +697,11 @@ pub fn session_main(
         created_at: init_record
             .as_ref()
             .map(|r| r.created_at)
-            .unwrap_or_else(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64
-            }),
+            .unwrap_or_else(|| TimestampMs::now().as_millis()),
+        last_modified: init_record
+            .as_ref()
+            .map(|r| r.last_modified)
+            .unwrap_or_else(|| TimestampMs::now().as_millis()),
         status: SessionStatus::Inactive,
         active_tool_groups: init_record
             .as_ref()
@@ -1190,18 +1200,26 @@ fn validate_model_via_daemon(model: &str, ctx: &RequestContext) -> Result<(), St
 }
 
 /// Update the session status and broadcast to subscribers and daemon.
+///
+/// Bumps `last_modified` on the session's config so the status transition
+/// counts as a modification; the daemon mirrors this onto its metadata index
+/// in `handle_broadcast_session_status` (which is also what fixes stale
+/// statuses in listings — see daemon.rs).
 fn handle_status_changed(
     new_status: SessionStatus,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
+    let last_modified = TimestampMs::now().as_millis();
     state.config.status = new_status.clone();
+    state.config.last_modified = state.config.last_modified.max(last_modified);
     broadcast(
         &mut state.subscribers,
         &ctx.daemon_tx,
         DaemonMessage::SessionStatusChanged {
             session_id: ctx.session_id,
             status: new_status.clone(),
+            last_modified,
         },
     );
     let _ = ctx.daemon_tx.send(DaemonCommand::BroadcastSessionStatus {
@@ -1303,6 +1321,7 @@ fn handle_get_summary(
             .as_ref()
             .map(|p| p.display().to_string()),
         created_at: state.config.created_at,
+        last_modified: state.config.last_modified,
         turn_count: state.turns.len() as u32,
         max_turns: state.config.max_turns,
         status: state.config.status.clone(),
@@ -1328,6 +1347,10 @@ fn handle_request_finished(
     // SessionCommand calls (SetTitle, SetAccount, SetReasoningEffort) are
     // preserved without needing an explicit save/restore list.
     state.config.apply_worker_snapshot(&snapshot.config);
+
+    // A completed turn is a modification: bump the timestamp BEFORE persisting
+    // the record and refreshing the daemon index so both reflect the change.
+    state.config.last_modified = TimestampMs::now().as_millis();
 
     // Persist the updated session config (accumulated usage, context_window, etc.)
     // so resolved values survive daemon restarts.
@@ -1365,7 +1388,9 @@ fn handle_request_finished(
     }
 
     state.active_requests.remove(&request_id);
+    let last_modified = TimestampMs::now().as_millis();
     state.config.status = SessionStatus::Inactive;
+    state.config.last_modified = state.config.last_modified.max(last_modified);
     let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
         session_id: ctx.session_id,
         metadata: SessionMetadata::from(&*state),
@@ -1376,6 +1401,7 @@ fn handle_request_finished(
         DaemonMessage::SessionStatusChanged {
             session_id: ctx.session_id,
             status: SessionStatus::Inactive,
+            last_modified,
         },
     );
     let _ = ctx.daemon_tx.send(DaemonCommand::BroadcastSessionStatus {
@@ -1954,6 +1980,7 @@ mod tests {
                 working_dir: Some(std::path::PathBuf::from("/tmp")),
                 max_turns: Some(10),
                 created_at: 1000,
+                last_modified: 1000,
                 status: SessionStatus::Inactive,
                 active_tool_groups: ["core".into(), "shell".into()].into(),
                 context_config: ContextConfig::default(),

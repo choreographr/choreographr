@@ -1,3 +1,4 @@
+use crate::diff_render::truncate_str;
 use crate::markdown_render::{display_width, reasoning_expanded_default, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
@@ -12,7 +13,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, Wrap},
 };
 use ratatui_image::StatefulImage;
 use std::sync::Arc;
@@ -737,53 +738,100 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         let msg = Paragraph::new("No sessions. Press 'n' to create one.");
         frame.render_widget(msg, list_chunks[0]);
     } else {
-        let mut lines: Vec<Line> = Vec::new();
-        for i in scroll..total_items {
-            if lines.len() >= max_rows {
-                break;
-            }
+        // ── Column layout ────────────────────────────────────────────────
+        // The title column is LAST so it absorbs the remaining width via
+        // Constraint::Fill(1) — long titles truncate (with an ellipsis)
+        // instead of squeezing the fixed columns.  session_id is deliberately
+        // not shown; it adds no signal on this page.
+        let marker_w = 2u16; // ">" selection + "*" attached markers
+        let status_w = 14u16;
+        let model_w = 16u16;
+        let turns_w = 5u16;
+        let modified_w = 11u16;
+        let fixed_w = marker_w + status_w + model_w + turns_w + modified_w;
+        // The Table adds `column_spacing(1)` between the 6 columns (5 gaps),
+        // so the title column gets the remaining width minus those gaps.
+        let title_w = list_chunks[0].width.saturating_sub(fixed_w + 5).max(1) as usize;
+
+        let header = Row::new(vec![
+            Cell::from(""),
+            Cell::from("Status"),
+            Cell::from("Model"),
+            Cell::from("Turns"),
+            Cell::from("Modified"),
+            Cell::from("Title"),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+
+        // Only render the visible slice; the scrollbar below reflects the
+        // full list length.
+        let end = (scroll + max_rows).min(total_items);
+        let mut rows = Vec::with_capacity(end.saturating_sub(scroll));
+        for i in scroll..end {
             let session = &app.session_mgr.sessions[i];
             let is_selected = Some(i) == app.session_mgr.selection;
             let is_attached = Some(session.session_id) == app.attached_session_id;
-
-            let sel = if is_selected { ">" } else { " " };
-            let att = if is_attached { "*" } else { " " };
-            let title = session.title.as_deref().unwrap_or("untitled");
-            let model = session.selected_model.as_deref().unwrap_or("-");
-            let model_display =
-                if let Some(effort) = session.reasoning_effort.as_deref().filter(|e| *e != "off") {
-                    format!("({model}, {effort})")
-                } else {
-                    format!("({model})")
-                };
-            let status_str = match &session.status {
-                SessionStatus::Sleeping => "sleep",
-                SessionStatus::Inactive => "idle",
-                SessionStatus::Inference => "infer",
-                SessionStatus::ToolCall(name) => name,
-                SessionStatus::Retrying { .. } => "retry",
-                _ => "unknown",
-            };
-            let status_style = status_color(&session.status);
-            let row = format!(
-                "{sel}{att} {:>4}  \"{title}\"  {model_display}  — {} turns  [",
-                session.session_id, session.turn_count,
-            );
-
-            let style = if is_selected {
+            let row_style = if is_selected {
                 Style::default().bg(Color::Blue).fg(Color::White)
             } else {
                 Style::default()
             };
-            let status_label = format!("{}]", status_str);
-            lines.push(Line::from(vec![
-                ratatui::text::Span::styled(row, style),
-                ratatui::text::Span::styled(status_label, Style::default().fg(status_style)),
+
+            let sel = if is_selected { ">" } else { " " };
+            let att = if is_attached { "*" } else { " " };
+            let (status_text, status_color) = status_display(&session.status);
+            let model = session.selected_model.as_deref().unwrap_or("-");
+            let model_display =
+                if let Some(effort) = session.reasoning_effort.as_deref().filter(|e| *e != "off") {
+                    format!("{model} ({effort})")
+                } else {
+                    model.to_string()
+                };
+            let modified = format_timestamp(session.last_modified);
+            let title = session.title.as_deref().unwrap_or("untitled");
+
+            rows.push(Row::new(vec![
+                Cell::from(Span::styled(format!("{sel}{att}"), row_style)),
+                // Keep the status colour even on the highlighted row so
+                // active/inferring sessions stay recognisable at a glance.
+                Cell::from(Span::styled(
+                    truncate_str(&status_text, status_w as usize),
+                    row_style.fg(status_color),
+                )),
+                Cell::from(Span::styled(
+                    truncate_str(&model_display, model_w as usize),
+                    row_style,
+                )),
+                Cell::from(Span::styled(
+                    format!("{:>width$}", session.turn_count, width = turns_w as usize),
+                    row_style,
+                )),
+                Cell::from(Span::styled(
+                    truncate_str(&modified, modified_w as usize),
+                    row_style,
+                )),
+                Cell::from(Span::styled(truncate_str(title, title_w), row_style)),
             ]));
         }
 
-        let paragraph = Paragraph::new(lines);
-        frame.render_widget(paragraph, list_chunks[0]);
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(marker_w),
+                Constraint::Length(status_w),
+                Constraint::Length(model_w),
+                Constraint::Length(turns_w),
+                Constraint::Length(modified_w),
+                Constraint::Fill(1),
+            ],
+        )
+        .header(header)
+        .column_spacing(1);
+        frame.render_widget(table, list_chunks[0]);
     }
 
     if total_items > max_rows {
@@ -844,6 +892,10 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
                 "Created:       {}",
                 format_timestamp(detail.created_at)
             )),
+            Line::from(format!(
+                "Last Modified: {}",
+                format_timestamp(detail.last_modified)
+            )),
             Line::from(format!("Turn Count:    {}", detail.turn_count)),
             Line::from(format!(
                 "Max Turns:     {}",
@@ -896,14 +948,19 @@ fn render_session_detail_view(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(status, chunks[1]);
 }
 
-pub(crate) fn format_timestamp(ts_secs: i64) -> String {
-    if ts_secs <= 0 {
+/// Format a Unix-epoch-milliseconds timestamp as simplified absolute time.
+///
+/// - today → "14:32" (time only)
+/// - this calendar year → "Mar 5"
+/// - older → "Mar 5 2024"
+pub(crate) fn format_timestamp(ts_ms: i64) -> String {
+    if ts_ms <= 0 {
         return "-".to_string();
     }
 
-    use chrono::{Local, TimeZone};
+    use chrono::{Datelike, Local, TimeZone};
 
-    let dt = match Local.timestamp_opt(ts_secs, 0) {
+    let dt = match Local.timestamp_millis_opt(ts_ms) {
         chrono::LocalResult::Single(dt) => dt,
         _ => return "-".to_string(),
     };
@@ -911,8 +968,10 @@ pub(crate) fn format_timestamp(ts_secs: i64) -> String {
     let now = Local::now();
     if dt.date_naive() == now.date_naive() {
         dt.format("%H:%M").to_string()
+    } else if dt.year() == now.year() {
+        dt.format("%b %d").to_string()
     } else {
-        dt.format("%Y-%m-%d %H:%M").to_string()
+        dt.format("%b %d %Y").to_string()
     }
 }
 
@@ -1199,10 +1258,6 @@ pub(crate) fn status_display(status: &SessionStatus) -> (String, Color) {
 
 pub(crate) fn format_status(status: &SessionStatus) -> String {
     status_display(status).0
-}
-
-pub(crate) fn status_color(status: &SessionStatus) -> Color {
-    status_display(status).1
 }
 
 /// Centered popup listing the models available on the attached session's

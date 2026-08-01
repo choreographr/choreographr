@@ -175,8 +175,18 @@ impl TurnEventHandler for AppState {
         self.attached_session_id = Some(session_id);
     }
 
-    fn handle_session_status_changed(&mut self, session_id: u64, status: SessionStatus) {
-        debug!(session_id, ?status, "handle_session_status_changed");
+    fn handle_session_status_changed(
+        &mut self,
+        session_id: u64,
+        status: SessionStatus,
+        last_modified: i64,
+    ) {
+        debug!(
+            session_id,
+            ?status,
+            last_modified,
+            "handle_session_status_changed"
+        );
     }
 
     fn handle_token_usage_update(

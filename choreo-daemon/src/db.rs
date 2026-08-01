@@ -42,7 +42,12 @@ pub struct SessionRecord {
     pub working_dir: Option<String>,
     pub max_turns: Option<u32>,
     pub turn_count: u32,
+    /// Creation time, Unix-epoch-milliseconds.
     pub created_at: i64,
+    /// Most recent modification time, Unix-epoch-milliseconds (status changes,
+    /// turn completion, title/model edits).  Persisted so the sessions list
+    /// keeps its "newest first" ordering across daemon restarts.
+    pub last_modified: i64,
     pub active_tool_groups: Vec<String>,
     #[serde(default)]
     pub context_config: ContextConfig,
@@ -760,7 +765,8 @@ mod tests {
             working_dir: Some("/tmp".into()),
             max_turns: None,
             turn_count: 1,
-            created_at: 1234567890,
+            created_at: 1234567890000,
+            last_modified: 1234567890000,
             active_tool_groups: vec!["core".into(), "git".into()],
             context_config: ContextConfig::default(),
             account_name: None,

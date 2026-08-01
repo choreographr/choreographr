@@ -508,7 +508,7 @@ pub fn try_render_diff_content(diff_text: &str, width: u16) -> Option<Vec<Line<'
 
 /// Truncate a string to at most `max_width` display columns, appending `…`
 /// if truncated.  Uses `unicode-width` for proper CJK/emoji column widths.
-fn truncate_str(s: &str, max_width: usize) -> String {
+pub(crate) fn truncate_str(s: &str, max_width: usize) -> String {
     if s.width() <= max_width {
         return s.to_string();
     }

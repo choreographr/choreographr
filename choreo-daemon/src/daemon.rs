@@ -7,7 +7,8 @@ use crate::sessions::{
 };
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
-    AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary, TokenUsage,
+    AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary, TimestampMs,
+    TokenUsage,
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -478,6 +479,9 @@ impl DaemonState {
         let selected_model_clone = selected_model.clone();
         let reasoning_effort_clone = reasoning_effort.clone();
 
+        // A freshly created session's modification time is its creation time,
+        // so a new session sorts to the top of the list immediately.
+        let created_at = TimestampMs::now().as_millis();
         let record = SessionRecord {
             title: title.clone(),
             selected_model,
@@ -486,10 +490,8 @@ impl DaemonState {
             working_dir: cwd_str.clone(),
             max_turns,
             turn_count: 0,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
+            created_at,
+            last_modified: created_at,
             active_tool_groups: active_cats.clone(),
             context_config: context_config.clone().unwrap_or_default(),
             account_name: account_name.clone(),
@@ -506,6 +508,7 @@ impl DaemonState {
             parent_session_id,
             working_dir: cwd_str.clone(),
             created_at: record.created_at,
+            last_modified: record.last_modified,
             turn_count: 0,
             max_turns,
             status: SessionStatus::Inactive,
@@ -538,6 +541,9 @@ impl DaemonState {
         let status_msg = DaemonMessage::SessionStatusChanged {
             session_id: sid,
             status: SessionStatus::Inactive,
+            // Copy the creation timestamp before `record` is moved into
+            // spawn_session above.
+            last_modified: created_at,
         };
         self.broadcast(created_msg);
         self.broadcast(status_msg);
@@ -579,7 +585,8 @@ impl DaemonState {
         }
     }
 
-    /// Return a list of all active session summaries.
+    /// Return a list of all active session summaries, most recently
+    /// modified first.
     fn handle_list_sessions(&mut self, reply: std::sync::mpsc::Sender<Vec<SessionSummary>>) {
         let mut summaries: Vec<SessionSummary> = self
             .session_metadata
@@ -587,7 +594,13 @@ impl DaemonState {
             .map(|(id, meta)| meta.to_summary(*id))
             .collect();
 
-        summaries.sort_by_key(|s| s.session_id);
+        // Newest first; the session_id tiebreak keeps equal timestamps
+        // deterministic (no ordering jitter between refreshes).
+        summaries.sort_by(|a, b| {
+            b.last_modified
+                .cmp(&a.last_modified)
+                .then_with(|| b.session_id.cmp(&a.session_id))
+        });
         let _ = reply.send(summaries);
     }
 
@@ -605,11 +618,16 @@ impl DaemonState {
     }
 
     /// Update the in-memory metadata for a session.
-    fn handle_update_metadata(&mut self, session_id: u64, metadata: SessionMetadata) {
+    fn handle_update_metadata(&mut self, session_id: u64, mut metadata: SessionMetadata) {
         debug!(
             "UpdateMetadata: id={}, model={:?}",
             session_id, metadata.selected_model
         );
+        // last_modified is monotonic: never let a stale (older) update regress
+        // the timestamp the session thread or a status broadcast just set.
+        if let Some(existing) = self.session_metadata.get(&session_id) {
+            metadata.last_modified = metadata.last_modified.max(existing.last_modified);
+        }
         self.session_metadata.insert(session_id, metadata);
     }
 
@@ -633,10 +651,12 @@ impl DaemonState {
 
         if let Some(meta) = self.session_metadata.get_mut(&session_id) {
             meta.status = SessionStatus::Sleeping;
+            meta.last_modified = meta.last_modified.max(TimestampMs::now().as_millis());
         }
         let msg = DaemonMessage::SessionStatusChanged {
             session_id,
             status: SessionStatus::Sleeping,
+            last_modified: TimestampMs::now().as_millis(),
         };
         self.broadcast(msg);
     }
@@ -827,9 +847,26 @@ impl DaemonState {
         self.summary_subscribers.remove(&client_id);
     }
 
-    /// Broadcast a session status change to all summary subscribers.
+    /// Broadcast a session status change to all summary subscribers and keep
+    /// the metadata index in sync.
+    ///
+    /// This is the choke point that fixes stale statuses on the sessions page:
+    /// the session thread broadcasts status changes (see `handle_status_changed`
+    /// in sessions.rs) but never updates the daemon's `session_metadata` index,
+    /// so a subsequent ListSessions would serve an outdated status.  Updating
+    /// the index here — and bumping `last_modified` so the list reorders —
+    /// covers every status-transition path.
     fn handle_broadcast_session_status(&mut self, session_id: u64, status: SessionStatus) {
-        let msg = DaemonMessage::SessionStatusChanged { session_id, status };
+        let last_modified = TimestampMs::now().as_millis();
+        if let Some(meta) = self.session_metadata.get_mut(&session_id) {
+            meta.status = status.clone();
+            meta.last_modified = meta.last_modified.max(last_modified);
+        }
+        let msg = DaemonMessage::SessionStatusChanged {
+            session_id,
+            status,
+            last_modified,
+        };
         self.broadcast(msg);
     }
 
@@ -1495,6 +1532,7 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 created_at: 1000,
+                last_modified: 1000,
                 turn_count: 3,
                 max_turns: None,
                 status: SessionStatus::Inactive,
@@ -1511,6 +1549,74 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, 1);
         assert_eq!(sessions[0].title.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn handle_list_sessions_orders_by_last_modified_desc() {
+        let (mut state, _rx) = make_daemon_state();
+        // Insert three sessions with distinct modification times, deliberately
+        // out of order in the map.
+        for (id, created, modified) in [(1, 1000, 1000), (2, 2000, 9000), (3, 3000, 5000)] {
+            state.session_metadata.insert(
+                id,
+                SessionMetadata {
+                    title: Some(format!("s{id}")),
+                    selected_model: None,
+                    reasoning_effort: None,
+                    parent_session_id: None,
+                    working_dir: None,
+                    created_at: created,
+                    last_modified: modified,
+                    turn_count: 0,
+                    max_turns: None,
+                    status: SessionStatus::Inactive,
+                    active_tool_groups: vec![],
+                    account_name: None,
+                    accumulated_usage: TokenUsage::default(),
+                    context_window: None,
+                    last_prompt_tokens: None,
+                },
+            );
+        }
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::ListSessions { reply });
+        let sessions: Vec<SessionSummary> = rx.recv().unwrap();
+        let ids: Vec<u64> = sessions.iter().map(|s| s.session_id).collect();
+        // Most recently modified first: 2 (9000), 3 (5000), 1 (1000).
+        assert_eq!(ids, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn handle_list_sessions_tiebreaks_by_session_id_desc() {
+        let (mut state, _rx) = make_daemon_state();
+        // Equal modification times must order deterministically by id desc.
+        for id in [1u64, 2, 3] {
+            state.session_metadata.insert(
+                id,
+                SessionMetadata {
+                    title: None,
+                    selected_model: None,
+                    reasoning_effort: None,
+                    parent_session_id: None,
+                    working_dir: None,
+                    created_at: id as i64 * 1000,
+                    last_modified: 5000,
+                    turn_count: 0,
+                    max_turns: None,
+                    status: SessionStatus::Inactive,
+                    active_tool_groups: vec![],
+                    account_name: None,
+                    accumulated_usage: TokenUsage::default(),
+                    context_window: None,
+                    last_prompt_tokens: None,
+                },
+            );
+        }
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::ListSessions { reply });
+        let sessions: Vec<SessionSummary> = rx.recv().unwrap();
+        let ids: Vec<u64> = sessions.iter().map(|s| s.session_id).collect();
+        assert_eq!(ids, vec![3, 2, 1]);
     }
 
     #[test]
@@ -1537,6 +1643,7 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 created_at: 1000,
+                last_modified: 1000,
                 turn_count: 0,
                 max_turns: None,
                 status: SessionStatus::Inactive,
@@ -1554,6 +1661,7 @@ mod tests {
             parent_session_id: None,
             working_dir: None,
             created_at: 2000,
+            last_modified: 2000,
             turn_count: 5,
             max_turns: None,
             status: SessionStatus::Inference,
@@ -1610,6 +1718,27 @@ mod tests {
     #[test]
     fn handle_broadcast_session_status() {
         let (mut state, _rx) = make_daemon_state();
+        // Seed the metadata index so the broadcast has something to update.
+        state.session_metadata.insert(
+            42,
+            SessionMetadata {
+                title: None,
+                selected_model: None,
+                reasoning_effort: None,
+                parent_session_id: None,
+                working_dir: None,
+                created_at: 1000,
+                last_modified: 1000,
+                turn_count: 0,
+                max_turns: None,
+                status: SessionStatus::Inactive,
+                active_tool_groups: vec![],
+                account_name: None,
+                accumulated_usage: TokenUsage::default(),
+                context_window: None,
+                last_prompt_tokens: None,
+            },
+        );
         let (tx, rx) = mpsc::sync_channel(SUBSCRIBER_CHANNEL_CAPACITY);
         state.handle_command(DaemonCommand::RegisterSummarySubscriber {
             client_id: 1,
@@ -1624,9 +1753,18 @@ mod tests {
             msg,
             DaemonMessage::SessionStatusChanged {
                 session_id: 42,
-                status: SessionStatus::Inference
+                status: SessionStatus::Inference,
+                ..
             }
         ));
+        // The metadata index must stay in sync so a later ListSessions serves
+        // the fresh status (this is the stale-status bug fix).
+        let meta = state.session_metadata.get(&42).expect("index updated");
+        assert_eq!(meta.status, SessionStatus::Inference);
+        assert!(
+            meta.last_modified > 0,
+            "last_modified bumped on status change"
+        );
     }
 
     #[test]
@@ -1725,6 +1863,7 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 created_at: 1000,
+                last_modified: 1000,
                 turn_count: 0,
                 max_turns: None,
                 status: SessionStatus::Sleeping,
@@ -1763,6 +1902,7 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 created_at: 1000,
+                last_modified: 1000,
                 turn_count: 0,
                 max_turns: None,
                 status: SessionStatus::Inactive,
@@ -1808,6 +1948,7 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 created_at: 1000,
+                last_modified: 1000,
                 turn_count: 0,
                 max_turns: None,
                 status: SessionStatus::Inactive,
@@ -1859,6 +2000,7 @@ mod tests {
                 parent_session_id: None,
                 working_dir: None,
                 created_at: 1000,
+                last_modified: 1000,
                 turn_count: 0,
                 max_turns: None,
                 status: SessionStatus::Inactive,
@@ -2419,6 +2561,7 @@ mod tests {
         let msg = DaemonMessage::SessionStatusChanged {
             session_id: 1,
             status: SessionStatus::Inactive,
+            last_modified: 0,
         };
         state.handle_command(DaemonCommand::BroadcastActivity(msg));
 
@@ -2500,6 +2643,7 @@ mod tests {
             DaemonMessage::SessionStatusChanged {
                 session_id: 42,
                 status: SessionStatus::Inactive,
+                last_modified: 0,
             },
             DaemonMessage::SessionFailed {
                 session_id: 42,

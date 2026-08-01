@@ -1756,8 +1756,16 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::SessionAttached { session_id } => {
             app.handle_session_attached(*session_id);
         }
-        DaemonMessage::SessionStatusChanged { session_id, status } => {
-            app.handle_session_status_changed(*session_id, status);
+        DaemonMessage::SessionStatusChanged {
+            session_id,
+            status,
+            last_modified,
+        } => {
+            app.handle_session_status_changed(*session_id, status, *last_modified);
+            // Return early: the generic dispatch would call the same handler
+            // again via the TurnEventHandler trait, and the sessions-page
+            // re-sort must only run once.
+            return Ok(());
         }
         DaemonMessage::Sessions { sessions } => {
             // The Sessions handler manages the full lifecycle and should not

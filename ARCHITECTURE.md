@@ -94,6 +94,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 | `ReasoningCapability` | Struct with `available_effort_levels: Vec<String>` — the reasoning effort slugs a model supports (e.g. `"off"`, `"low"`, `"medium"`, `"high"`, `"max"`). Empty means reasoning is not supported. Cycle helper validates/rotates through slugs. |
 | `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessageKind::AssistantText` and `SessionMessageKind::AssistantToolUse` for per-turn accounting, in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals, and in `DaemonMessage::Done` for per-request usage. |
 | `last_prompt_tokens` | `Option<u32>` field on session metadata and protocol messages tracking the `input_tokens` from the most recent API response — the actual context size being sent to the model, used for context-window progress displays. |
+| `last_modified` | `i64` Unix-epoch-**milliseconds** on `SessionSummary` / `DaemonMessage::SessionStatusChanged` (proto) and `SessionMetadata` / `SessionConfig` / `SessionRecord` (daemon). Bumped on status transitions, turn completion, and title/model edits; the sessions list is ordered by it (newest first) and it survives restarts via `SessionRecord`. All session-level timestamps (`created_at`, `last_modified`) are milliseconds to match `Turn.created_at` (`TimestampMs`). |
 | `SessionStatus` | Enum representing the current session state: `Inactive`, `Inference`, `ToolCall(String)`, `Retrying {…}`, `Sleeping`. Included in `SessionSummary` and `DaemonMessage::SessionState` for live status display in client toolbars. |
 | `ToolResultRecord` | Persisted tool result with fields `call_id`, `name`, `content`, `is_error`, and `invocation_description` — a human-readable sentence from `Tool::describe_invocation` describing what the tool did. Used for UI display only; excluded from LLM message construction. |
 
@@ -490,7 +491,13 @@ LLM provider (API response)
         │  SessionState, DaemonMessage::SessionState, DaemonMessage::Done,
         │  SessionSummary)
         └─ status flows through DaemonMessage::SessionState.status and
-           DaemonMessage::SessionStatusChanged for live toolbar display
+           DaemonMessage::SessionStatusChanged for live toolbar display.
+           Every status transition ALSO bumps last_modified and refreshes the
+           daemon's session_metadata index in handle_broadcast_session_status
+           (daemon.rs) so a later ListSessions never serves a stale status;
+           the index is the source of truth for the sessions list.
+        └─ the sessions list (ListSessions) is sorted newest-first by
+           last_modified (id-desc tiebreak) — see handle_list_sessions.
         │
         ▼
      Clients (choreo-tui, choreo-gui, choreo-im)
