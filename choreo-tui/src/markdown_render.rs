@@ -774,14 +774,21 @@ fn render_markdown_block(
             start,
             items,
         } => {
+            // Render every item into its own buffer first so the whole list's
+            // spacing can be decided as a unit: if the *majority* of items wrap
+            // to more than one visual line, every item pair gets a blank line
+            // (paragraph-style); otherwise the list renders tight with no gaps
+            // between items.  A uniform rhythm per list reads better than the
+            // old per-item spacing (where one long item created a single
+            // lopsided gap in an otherwise tight list).
+            let mut rendered_items: Vec<(String, Vec<Line<'static>>)> =
+                Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
                 let marker = if *ordered {
                     format!("{}. ", start + index)
                 } else {
                     "• ".to_string()
                 };
-                let marker_width = display_width(&marker);
-                let continuation_indent = indent + marker_width;
                 let mut rendered = Vec::new();
                 // Content is rendered at (width - indent - marker_width) so that
                 // when the marker and outer indent are prepended the total fits
@@ -790,13 +797,24 @@ fn render_markdown_block(
                     item,
                     &mut rendered,
                     0,
-                    width.saturating_sub(indent + marker_width),
+                    width.saturating_sub(indent + display_width(&marker)),
                     heading_shift,
                 );
-                // Track whether the item spans more than one visual line.
-                // Multi-line items get a blank line after them; single-line
-                // items are compact (no gap) for a tight list feel.
-                let item_multi_line = rendered.len() > 1;
+                rendered_items.push((marker, rendered));
+            }
+
+            // Strict majority: more than half of the items must be multi-line
+            // for the list to be spaced out.  A tie (e.g. 2 items, 1 wrapping)
+            // stays tight because 1 * 2 == 2 is not > 2.
+            let multi_line_count = rendered_items
+                .iter()
+                .filter(|(_, rendered)| rendered.len() > 1)
+                .count();
+            let spaced = multi_line_count * 2 > items.len();
+
+            for (index, (marker, rendered)) in rendered_items.into_iter().enumerate() {
+                let marker_width = display_width(&marker);
+                let continuation_indent = indent + marker_width;
                 let mut rendered_iter = rendered.into_iter();
                 if let Some(first) = rendered_iter.next() {
                     let mut spans = vec![Span::styled(
@@ -817,12 +835,11 @@ fn render_markdown_block(
                     lines.push(Line::from(spans));
                 }
 
-                // Blank line after multi-line items only, so simple
-                // single-line items stay compact (no gaps).  Uses
-                // ensure_blank_line so consecutive blanks collapse into
-                // one (e.g. when a multi-line item ends with a nested
-                // list that already produced a blank line).
-                if index + 1 < items.len() && item_multi_line {
+                // Blank line between items only when the list is spaced out as
+                // a whole (majority of items wrap).  Uses ensure_blank_line so
+                // consecutive blanks collapse into one (e.g. when a spaced
+                // item ends with a nested list that already produced a blank).
+                if index + 1 < items.len() && spaced {
                     ensure_blank_line(lines);
                 }
             }
@@ -3286,55 +3303,141 @@ mod tests {
     }
 
     #[test]
-    fn multi_line_list_item_has_blank_after() {
-        // A multi-line (wrapping) item should get a blank line after it.
+    fn list_stays_tight_when_minority_wraps() {
+        // A single wrapping item in a two-item list is not a majority, so the
+        // list stays tight: no blank line between the items.
         let long = "a".repeat(60);
         let md = format!("- {long}\n- short");
         let result = markdown_lines(&md, 40);
-        // The long item wraps to multiple visual lines → blank line before "• short".
+        // The long item wraps to multiple visual lines, but it is only 1 of 2
+        // items (1 * 2 is not > 2), so no blank line before "• short".
         let short_idx = result.iter().position(|l| l.to_string().contains("short"));
         assert!(short_idx.is_some(), "second item should appear");
         let idx = short_idx.unwrap();
         assert!(
-            idx >= 1 && result[idx - 1].width() == 0,
-            "expected a blank line before multi-line item's successor, got lines[{}]='{}'",
+            idx >= 1 && result[idx - 1].width() > 0,
+            "expected no blank line before '• short' (minority wraps), got lines[{}]='{}'",
             idx - 1,
             result[idx - 1]
         );
     }
 
     #[test]
-    fn nested_list_outer_gets_blank_inner_compact() {
-        // Outer item spans multiple lines (nested list) so it gets a blank line
-        // after it.  Inner items are single-line so they stay compact (no gaps).
-        let md = "- outer\n  - inner\n  - inner2\n- next";
+    fn list_spaces_all_items_when_majority_wraps() {
+        // Two of three items wrap at this width — a majority — so every item
+        // pair is separated by a blank line, including before the short one.
+        let long = "a".repeat(60);
+        let md = format!("- {long}\n- short\n- {long}");
+        let result = markdown_lines(&md, 40);
+        let whole: String = result
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Blank line before the short middle item.
+        let short_idx = result.iter().position(|l| l.to_string().contains("short"));
+        assert!(short_idx.is_some(), "short item should appear");
+        let idx = short_idx.unwrap();
+        assert!(
+            idx >= 1 && result[idx - 1].width() == 0,
+            "expected blank line before '• short' (majority wraps), got lines[{}]='{}'",
+            idx - 1,
+            result[idx - 1]
+        );
+        // No consecutive blank lines anywhere.
+        let has_double_blank = result
+            .windows(2)
+            .any(|w| w[0].width() == 0 && w[1].width() == 0);
+        assert!(
+            !has_double_blank,
+            "should not have two consecutive blank lines\n{whole}"
+        );
+    }
+
+    #[test]
+    fn ordered_list_spaces_all_items_when_majority_wraps() {
+        let long = "b".repeat(60);
+        let md = format!("1. {long}\n2. short\n3. {long}");
+        let result = markdown_lines(&md, 40);
+        let idx = result.iter().position(|l| l.to_string().contains("short"));
+        assert!(idx.is_some(), "short ordered item should appear");
+        let idx = idx.unwrap();
+        assert!(
+            idx >= 1 && result[idx - 1].width() == 0,
+            "expected blank line before '2. short' (majority wraps), got lines[{}]='{}'",
+            idx - 1,
+            result[idx - 1]
+        );
+    }
+
+    #[test]
+    fn even_split_stays_tight() {
+        // Four items, exactly two wrap: half is not a majority (> half), so
+        // the list stays tight.
+        let long = "c".repeat(60);
+        let md = format!("- {long}\n- {long}\n- short1\n- short2");
+        let result = markdown_lines(&md, 40);
+        let blank_lines: Vec<bool> = result
+            .windows(2)
+            .map(|w| w[0].width() == 0 && w[1].width() > 0)
+            .collect();
+        assert_eq!(
+            blank_lines.iter().filter(|&&b| b).count(),
+            0,
+            "an even 2:2 wrap split is not a majority, so no blank lines between items"
+        );
+    }
+
+    #[test]
+    fn list_has_blank_line_before_and_after() {
+        // Regardless of tight/spaced, the list is separated from surrounding
+        // paragraphs by a blank line on each side.
+        let md = "before\n- one\n- two\n- three\n\nafter";
+        let result = markdown_lines(md, 80);
+        let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        let one = text.iter().position(|l| l.contains("• one")).unwrap();
+        let after = text.iter().position(|l| l.contains("after")).unwrap();
+        // One blank line before the list, directly after the preceding paragraph.
+        assert_eq!(text[one - 1], "", "blank line before the list");
+        assert_eq!(text[one - 2], "before", "preceding paragraph");
+        // One blank line after the list, directly before the following paragraph.
+        assert_eq!(text[after - 1], "", "blank line after the list");
+        assert_eq!(text[after - 2], "• three", "last list item");
+    }
+
+    #[test]
+    fn nested_list_makes_own_spacing_decision() {
+        // The outer list has 3 items, two of which contain a nested list
+        // (multi-line) — a majority — so outer items are spaced apart.
+        // The inner lists are all single-line items, so they stay compact.
+        let md = "- outer a\n  - inner\n  - inner2\n- outer b\n  - inner\n  - inner2\n- outer c";
         let result = markdown_lines(md, 80);
         let whole: String = result
             .iter()
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(whole.contains("• outer"), "first outer item");
-        assert!(whole.contains("• inner"), "first inner item");
-        assert!(whole.contains("• next"), "second outer item");
-        // Inner items should be compact (no blank between "• inner" and "• inner2").
-        let inner_idx = result.iter().position(|l| l.to_string().contains("inner2"));
-        assert!(inner_idx.is_some(), "inner2 should appear");
-        let i = inner_idx.unwrap();
-        // The line before inner2 should be "  • inner", not a blank line.
+        assert!(whole.contains("• outer a"), "first outer item");
+        assert!(whole.contains("• outer c"), "third outer item");
+        // Inner items compact: no blank between "• inner" and "• inner2".
+        let inner2_idx = result.iter().position(|l| l.to_string().contains("inner2"));
+        assert!(inner2_idx.is_some(), "inner2 should appear");
+        let i = inner2_idx.unwrap();
         assert!(
             i >= 1 && result[i - 1].width() > 0,
             "inner items should be compact (no blank before inner2)"
         );
-        // But there should be one blank line before "• next" (outer is multi-line).
-        let next_idx = result.iter().position(|l| l.to_string().contains("next"));
-        assert!(next_idx.is_some(), "next should appear");
-        let n = next_idx.unwrap();
+        // Outer items spaced: blank line before "• outer b".
+        let outer_b_idx = result
+            .iter()
+            .position(|l| l.to_string().contains("outer b"));
+        assert!(outer_b_idx.is_some(), "outer b should appear");
+        let b = outer_b_idx.unwrap();
         assert!(
-            n >= 1 && result[n - 1].width() == 0,
-            "expected blank line before '• next', got lines[{}]='{}'",
-            n - 1,
-            result[n - 1]
+            b >= 1 && result[b - 1].width() == 0,
+            "expected blank line before '• outer b', got lines[{}]='{}'",
+            b - 1,
+            result[b - 1]
         );
         // No consecutive blank lines anywhere.
         let has_double_blank = result
