@@ -911,11 +911,6 @@ impl DaemonState {
     /// the per-session subscriber path, avoiding duplicate delivery.
     fn handle_broadcast_activity(&mut self, msg: DaemonMessage) {
         let origin_session_id = msg.session_id();
-        debug!(
-            "BroadcastActivity: session_id={:?}, subscriber_count={}",
-            origin_session_id,
-            self.activity_subscribers.len(),
-        );
         self.activity_subscribers.retain(|client_id, tx| {
             // Skip if this client is also a direct subscriber of the
             // session that originated this message — they'll receive it
