@@ -412,7 +412,16 @@ Currently supports 70+ providers. Adding a new OpenAI-compatible provider requir
 | Anthropic Messages | Anthropic Claude, MiniMax, Vercel AI Gateway, Kimi Code, Fireworks (Anthropic mode), OpenCode Go (Anthropic-compatible), custom Anthropic-compatible |
 | Google Generative AI | Google Gemini |
 
-> **Note:** Amazon Bedrock support is deferred pending multi-field credential support (needs AWS access key + secret key + region).
+> **Note — providers present in agent catalogs but deferred from the daemon catalog**
+> (present in ~/agents; not yet given a `<slug>.toml` here):
+>
+> | Provider(s) | Reason deferred |
+> |---|---|
+> | `amazon-bedrock`, `google-vertex`, `azure-foundry`, `azure-openai-responses` | Multi-field credentials (AWS keys/region, GCP service account, Azure resource + key). The daemon's single-API-key credential model cannot represent them yet. |
+> | `chatgpt` (Codex), `openai-codex` OAuth, `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The slugs above that do have an API-key path (`openai-codex`, `kimi-code`, `github-copilot`) are catalogued; the pure-OAuth ones are not. |
+> | `cursor` | t3code subprocess driver (spawns the Cursor CLI), not a direct HTTP provider. |
+>
+> Adding them requires daemon-side OAuth support and/or multi-field credentials, both out of scope for the current TOML catalog.
 
 **Per-client architecture (OS threads):**
 

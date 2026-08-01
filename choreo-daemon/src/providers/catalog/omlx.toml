@@ -1,0 +1,6 @@
+slug = "omlx"
+display_name = "oMLX"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "http://localhost:8000/v1"
+default_model = "local-model"

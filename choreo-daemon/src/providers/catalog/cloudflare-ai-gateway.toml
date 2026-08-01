@@ -1,0 +1,6 @@
+slug = "cloudflare-ai-gateway"
+display_name = "Cloudflare AI Gateway"
+protocol = "openai"
+max_tokens_field = "max_completion_tokens"
+base_url = "https://gateway.ai.cloudflare.com/v1"
+default_model = "openai/gpt-4.1"

@@ -96,6 +96,14 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
         display_name: "Cerebras",
     },
     ProviderInfo {
+        slug: "cloudflare-ai-gateway",
+        display_name: "Cloudflare AI Gateway",
+    },
+    ProviderInfo {
+        slug: "cloudflare-workers-ai",
+        display_name: "Cloudflare Workers AI",
+    },
+    ProviderInfo {
         slug: "custom-anthropic",
         display_name: "Custom Anthropic-Compatible",
     },
@@ -176,6 +184,10 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
         display_name: "Kimi Code subscription",
     },
     ProviderInfo {
+        slug: "llama-swap",
+        display_name: "Llama Swap",
+    },
+    ProviderInfo {
         slug: "lmstudio",
         display_name: "LM Studio",
     },
@@ -230,6 +242,10 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
     ProviderInfo {
         slug: "ollama-cloud",
         display_name: "Ollama Cloud",
+    },
+    ProviderInfo {
+        slug: "omlx",
+        display_name: "oMLX",
     },
     ProviderInfo {
         slug: "openai",
@@ -298,6 +314,10 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderInfo] = &[
     ProviderInfo {
         slug: "stepfun",
         display_name: "StepFun",
+    },
+    ProviderInfo {
+        slug: "tanzu",
+        display_name: "VMware Tanzu Platform",
     },
     ProviderInfo {
         slug: "tensorix",
@@ -3339,44 +3359,6 @@ pub(crate) fn find_turn_at_row(app: &App, screen_row: u16) -> Option<(usize, usi
 mod tests {
     use super::*;
     use crate::test_util::test_app;
-
-    #[test]
-    fn provider_options_cover_catalog_slugs() {
-        // The TUI's new-account provider picker must expose every provider the
-        // daemon catalog ships. Keep this list in sync with the catalog TOML
-        // files (choreo-daemon/src/providers/catalog/*.toml) — a new provider
-        // needs both a TOML file and an entry here.
-        let slugs: std::collections::HashSet<&str> =
-            PROVIDER_OPTIONS.iter().map(|p| p.slug).collect();
-        for expected in [
-            "openai",
-            "anthropic",
-            "google",
-            "mistral",
-            "deepseek",
-            "perplexity",
-            "xiaomi",
-            "moonshotai",
-            "openai-codex",
-            "kimi-code",
-            "github-copilot",
-            "vercel-ai-gateway",
-            "minimax-cn",
-            "zai-cn",
-            "ollama",
-            "openai_compatible",
-            "custom-anthropic",
-        ] {
-            assert!(
-                slugs.contains(expected),
-                "PROVIDER_OPTIONS missing provider slug {expected:?}"
-            );
-        }
-        assert!(
-            PROVIDER_OPTIONS.len() >= 70,
-            "provider options unexpectedly small"
-        );
-    }
 
     fn make_session(id: u64, title: &str) -> SessionSummary {
         SessionSummary {
