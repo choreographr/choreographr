@@ -556,7 +556,10 @@ fn add_margin_lines(
 
     // Bottom separator: right-aligned timestamp (user messages only).
     if let Some(ms) = timestamp_ms {
-        let ts_text = format_timestamp(ms / 1000);
+        // format_timestamp expects milliseconds — pass the value through
+        // unchanged.  (Dividing by 1000 here rendered every user message
+        // as a 1970 date after format_timestamp switched to millis.)
+        let ts_text = format_timestamp(ms);
         let ts_len = ts_text.len();
         let left_fill = total_width.saturating_sub(ts_len + 4);
         result.push(Line::from(vec![
@@ -2324,6 +2327,50 @@ mod tests {
             .join("\n");
         assert!(text.contains("Hello"), "user block should appear");
         assert!(text.contains("Hi there!"), "assistant block should appear");
+    }
+
+    #[test]
+    fn user_text_timestamp_rendered_in_milliseconds() {
+        // Regression: the user-text timestamp was divided by 1000 before
+        // being passed to format_timestamp (which takes milliseconds),
+        // so every user message rendered as a 1970 date (e.g. "Jan 21 1970").
+        let ts_ms = 1_705_314_000_000i64; // a plausible modern timestamp
+        let (lines, _rows) = add_margin_lines(Vec::new(), 80, Color::Green, Some(ts_ms));
+        let bottom = lines.last().expect("bottom separator line");
+        let rendered = bottom.to_string();
+        let expected = format_timestamp(ts_ms);
+        assert!(
+            rendered.contains(&expected),
+            "bottom separator should render {expected:?}, got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("1970"),
+            "epoch-looking dates indicate the millis→seconds unit bug, got {rendered:?}"
+        );
+        // And the real render path (a user turn) must carry the same
+        // timestamp into the bottom separator.
+        let turn = Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some("hello world".into()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+        };
+        let lines = render_turn_lines(&turn, 80, 85, false).lines;
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !text.contains("1970"),
+            "rendered turn must not contain an epoch date:\n{text}"
+        );
     }
 
     // ── ansi_lines ──────────────────────────────────────────────────────
