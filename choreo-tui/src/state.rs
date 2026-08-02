@@ -26,6 +26,21 @@ pub(crate) const MIN_INPUT_CONTENT_LINES: u16 = 1;
 pub(crate) const MAX_INPUT_CONTENT_LINES: u16 = 10;
 pub(crate) const PAGE_SCROLL_LINES: usize = 3;
 
+/// Horizontal padding (columns) on each side of the command input box.
+///
+/// The box draws only top/bottom borders, so the content area loses `INPUT_PAD`
+/// columns on each side and nothing more.  Every code path that wraps input
+/// text (height estimation, cursor movement, rendering) must use
+/// [`input_inner_width`] so they all agree on where word-wrap happens;
+/// otherwise a wrapped line can be computed in one path but not another.
+pub(crate) const INPUT_PAD: u16 = 2;
+
+/// Inner content width (columns) of the command input box for a given terminal
+/// width: terminal width minus the horizontal padding on both sides.
+pub(crate) fn input_inner_width(term_width: u16) -> usize {
+    term_width.saturating_sub(INPUT_PAD * 2) as usize
+}
+
 pub(crate) const CTRL_HELP_LINE1: &str =
     "ctrl+h help  ctrl+q quit  ctrl+a accounts  ctrl+s sessions  ctrl+m models";
 pub(crate) const CTRL_HELP_LINE2: &str =
@@ -1792,7 +1807,11 @@ impl App {
     /// Number of visual content lines the input box currently occupies,
     /// computed from the text and terminal width.
     pub(crate) fn input_bar_content_lines(&mut self, term_width: u16) -> u16 {
-        let inner = term_width.saturating_sub(2) as usize;
+        // Must use the same inner width as the renderer (term_width minus the
+        // INPUT_PAD padding on each side), or the box height can disagree with
+        // the number of wrapped lines actually drawn — e.g. a wrap that the
+        // renderer sees at the true inner width would not yet grow the box.
+        let inner = input_inner_width(term_width);
         if inner < 1 {
             return 1;
         }
@@ -2184,7 +2203,9 @@ impl App {
 
     pub(crate) fn ensure_input_cursor_visible(&mut self) {
         if let Some((term_w, _)) = self.last_terminal_size {
-            let inner = term_w.saturating_sub(2) as usize;
+            // inner width must match the renderer's drawing width so the
+            // scroll window matches what is actually displayed.
+            let inner = input_inner_width(term_w);
             let visible_height = self.input_bar_content_lines(term_w) as usize;
             self.input.ensure_cursor_visible(inner, visible_height);
         }

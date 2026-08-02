@@ -1049,7 +1049,7 @@ fn navigate_history_up_adjusts_scroll_offset_for_long_entry() {
     app.navigate_history_up();
     // After loading a long history entry and setting cursor to end,
     // scroll_offset should be adjusted so the cursor is visible.
-    let inner = 78; // 80 - 2 borders
+    let inner = input_inner_width(80);
     let visual_lines = compute_visual_lines(&app.input.text, inner);
     let (cursor_row, _) = find_cursor_pos(&app.input.text, app.input.cursor, &visual_lines);
     let visible_height = app.input_bar_content_lines(80) as usize;
@@ -1098,7 +1098,7 @@ fn navigate_history_down_adjusts_scroll_offset_for_long_draft() {
 
     app.navigate_history_down();
     // After restoring the long draft, scroll_offset should ensure cursor is visible.
-    let inner = 78;
+    let inner = input_inner_width(80);
     let visual_lines = compute_visual_lines(&app.input.text, inner);
     let (cursor_row, _) = find_cursor_pos(&app.input.text, app.input.cursor, &visual_lines);
     let visible_height = app.input_bar_content_lines(80) as usize;
@@ -3297,6 +3297,40 @@ fn handle_turn_appended_with_displayed_image_populates_rendered_images() {
 }
 
 // ── InputBuffer scroll_offset ──────────────────────────────────
+
+#[test]
+fn input_bar_height_uses_renderer_inner_width() {
+    // Regression test for the prompt-entry wrap bug: the height estimation
+    // used `term_width - 2` while the renderer wraps text at `term_width - 4`
+    // (INPUT_PAD padding on each side, no side borders).  A word that wrapped
+    // at the drawing width therefore did not grow the input box — the wrapped
+    // text vanished off line 1 and the second line only appeared after two
+    // more characters had pushed the text past the wider height-calc width.
+    let mut app = test_app();
+    app.last_terminal_size = Some((80, 24));
+
+    // At an 80-wide terminal the renderer draws the input at 76 columns.
+    assert_eq!(input_inner_width(80), 76);
+
+    // A word that exactly fills 76 columns, then a space and another word:
+    // this wraps onto a second line at width 76 but still fits on a single
+    // line at width 78 (the old height-calc width).
+    let text = "a".repeat(76) + " b";
+    assert_eq!(compute_visual_lines(&text, 76).len(), 2);
+    assert_eq!(compute_visual_lines(&text, 78).len(), 1);
+
+    // The box height must reflect the renderer's 2 wrapped lines immediately.
+    // (Bump generation — every real text mutation goes through methods that do.)
+    app.input.text = text;
+    app.input.generation += 1;
+    assert_eq!(app.input_bar_content_lines(80), 2);
+    assert_eq!(app.input_bar_height(80), 4);
+
+    // Short text that fits comfortably still yields a single content line.
+    app.input.text = "hello world".to_string();
+    app.input.generation += 1;
+    assert_eq!(app.input_bar_content_lines(80), 1);
+}
 
 #[test]
 fn ensure_cursor_visible_short_text_keeps_offset_at_zero() {

@@ -2,9 +2,9 @@ use crate::diff_render::truncate_str;
 use crate::markdown_render::{display_width, reasoning_expanded_default, render_turn_lines};
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::state::{
-    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, CTRL_HELP_LINE1, CTRL_HELP_LINE2,
+    AI_PROVIDER_ITEM_LINES, AIProvidersView, App, CTRL_HELP_LINE1, CTRL_HELP_LINE2, INPUT_PAD,
     PROVIDER_OPTIONS, Page, STATUS_BAR_HEIGHT, SessionManagerView, cached_or_compute_lines,
-    cached_visual_lines,
+    cached_visual_lines, input_inner_width,
 };
 use choreo_proto::SessionStatus;
 use choreo_tui::RenderedImage;
@@ -23,9 +23,6 @@ use tui_prompts::{
 };
 
 pub(crate) const BG_SHADE: Color = Color::Rgb(53, 53, 53);
-
-/// Horizontal padding (columns) on each side of the command input box.
-const INPUT_PAD: u16 = 2;
 
 pub(crate) fn mouse_in_history_box(column: u16, row: u16, vp_width: u16, vp_height: u16) -> bool {
     column < vp_width && row < vp_height
@@ -259,8 +256,11 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     // ── Command input box ──────────────────────────────────────
-    // Account for INPUT_PAD padding on both sides (left + right = 2 * INPUT_PAD).
-    let inner_width = chunks[3].width.saturating_sub(INPUT_PAD * 2) as usize;
+    // Inner width = box width minus INPUT_PAD padding on both sides.
+    // The box draws no left/right borders, so padding is the only loss.
+    // This must match input_inner_width() used by the height estimation
+    // (input_bar_content_lines) or wrapped lines won't grow the box.
+    let inner_width = input_inner_width(chunks[3].width);
     let visible_height = (chunks[3].height.saturating_sub(2)) as usize;
 
     // Compute cursor position first (populates the lines cache) so we

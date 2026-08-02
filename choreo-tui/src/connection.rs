@@ -2,7 +2,7 @@ use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column, render};
 use crate::state::PROVIDER_OPTIONS;
 use crate::state::{
     AIProvidersView, App, InputBuffer, PAGE_SCROLL_LINES, Page, SessionManagerView, UiEvent,
-    find_turn_at_row,
+    find_turn_at_row, input_inner_width,
 };
 use choreo_client_core::{
     ClientError, ConnectionMode, broken_pipe, build_add_credential_message,
@@ -838,7 +838,7 @@ fn handle_chat_event(
                 KeyCode::Up => {
                     let inner = app
                         .last_terminal_size
-                        .map(|(w, _)| w.saturating_sub(2) as usize)
+                        .map(|(w, _)| input_inner_width(w))
                         .unwrap_or(78);
                     if app.input.is_on_first_visual_line(inner) {
                         app.navigate_history_up();
@@ -850,7 +850,7 @@ fn handle_chat_event(
                 KeyCode::Down => {
                     let inner = app
                         .last_terminal_size
-                        .map(|(w, _)| w.saturating_sub(2) as usize)
+                        .map(|(w, _)| input_inner_width(w))
                         .unwrap_or(78);
                     if app.input.is_on_last_visual_line(inner) {
                         app.navigate_history_down();
