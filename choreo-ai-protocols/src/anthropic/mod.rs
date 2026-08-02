@@ -52,7 +52,11 @@ impl Default for AnthropicConfig {
 }
 
 impl AnthropicConfig {
-    /// Apply account-level overrides onto this config.
+    /// Apply provider-agnostic overrides onto this config.
+    ///
+    /// The daemon converts its `AccountConfig` into a [`ProviderOverrides`]
+    /// carrier before calling this, so this crate never depends on daemon
+    /// types. `None` fields leave the provider default in place.
     pub fn apply_overrides(&mut self, overrides: &ProviderOverrides) {
         if let Some(base_url) = &overrides.base_url {
             self.base_url = base_url.clone();

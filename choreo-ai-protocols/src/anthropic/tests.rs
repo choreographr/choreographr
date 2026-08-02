@@ -191,18 +191,18 @@ fn known_models_are_sorted() {
 #[test]
 fn error_type_label_maps_correctly() {
     assert_eq!(
-        crate::shared::error_type_label(&AnthropicError::Unauthorized {
+        crate::shared::error_type_label(AnthropicError::Unauthorized {
             status: 401,
             detail: "bad key".into()
         }),
         "unauthorized"
     );
     assert_eq!(
-        crate::shared::error_type_label(&AnthropicError::Cancelled),
+        crate::shared::error_type_label(AnthropicError::Cancelled),
         "cancelled"
     );
     assert_eq!(
-        crate::shared::error_type_label(&AnthropicError::Io(std::io::Error::other("oops"))),
+        crate::shared::error_type_label(AnthropicError::Io(std::io::Error::other("oops"))),
         "other"
     );
 }

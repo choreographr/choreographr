@@ -215,6 +215,14 @@ mod tests {
     }
 
     #[test]
+    fn from_google_constructs_provider() {
+        let config = GoogleConfig::default();
+        let client = GoogleClient::new(config, "test-key".into()).unwrap();
+        let _provider = InferenceProvider::from_google(client);
+        // Construction succeeds — no panic.
+    }
+
+    #[test]
     fn from_account_config_unknown_provider_errors() {
         let cfg = AccountConfig::simple("unknown", "nonexistent");
         let err = InferenceProvider::from_account_config(&cfg, Some("key".into())).unwrap_err();

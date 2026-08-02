@@ -37,6 +37,13 @@ pub(super) fn list_models_request(
         max_backoff_ms: config.retry_max_backoff_ms,
     };
 
+    // `api_key` borrows from the client's `Zeroizing<String>` (see
+    // `AnthropicClient::api_key`), so the key already lives in wipe-on-drop
+    // storage and `.trim()` makes no extra heap copy here — unlike OpenAI's
+    // `Bearer …` prefix string, which is a derived value and IS wrapped in
+    // `Zeroizing` (see `openai/retry.rs`). The only transient copy is inside
+    // ureq's request object, which dies with the request. The same applies at
+    // the other `x-api-key` header sites in this file.
     let response = retry::retry_loop(
         || {
             agent

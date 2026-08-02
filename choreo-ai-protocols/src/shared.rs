@@ -81,21 +81,13 @@ impl From<ProviderError> for io::Error {
 
 /// Map a ProviderError variant to a stable label string.
 ///
-/// Only used by tests in this crate — the daemon records metrics against the
-/// shared `InferenceError` it receives across the trait boundary (see the
-/// daemon's `inference_error_label`).
+/// Test-only helper. Delegates to [`InferenceError::metric_label`] so the
+/// mapping cannot drift from the canonical variant list that owns it in
+/// `choreo-proto` — `ProviderError` and `InferenceError` are a 1:1
+/// conversion, so converting first then labeling is always correct.
 #[cfg(test)]
-pub(crate) fn error_type_label(e: &ProviderError) -> &'static str {
-    match e {
-        ProviderError::Unauthorized { .. } => "unauthorized",
-        ProviderError::RateLimited { .. } => "rate_limited",
-        ProviderError::ServerError { .. } => "server_error",
-        ProviderError::ClientError { .. } => "client_error",
-        ProviderError::EmptyResponse => "empty_response",
-        ProviderError::Cancelled => "cancelled",
-        ProviderError::TruncatedToolCall { .. } => "truncated_tool_call",
-        ProviderError::Io(_) => "other",
-    }
+pub(crate) fn error_type_label(e: ProviderError) -> &'static str {
+    provider_error_to_inference(e).metric_label()
 }
 
 /// Convert a ProviderError into the shared InferenceError type used

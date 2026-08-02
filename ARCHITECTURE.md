@@ -383,6 +383,8 @@ pub struct InferenceProvider {
 ```
 Created via `from_account_config()` which looks up the provider slug in the catalog and dispatches to the appropriate client constructor by protocol type. All wire-protocol knowledge lives in `choreo-ai-protocols`; the daemon's `InferenceProvider` is the only daemon type that dispatches by protocol. It also records API metrics (`record_api_call` / `record_api_error`) around every turn — timing moved here from the provider crates so `choreo-ai-protocols` stays free of daemon concerns.
 
+The metrics `endpoint` label is the **catalog slug** (e.g. `"opencode"` rather than the protocol name `"openai"`) — more precise than the protocol, but part of the public metrics contract: renaming it changes the Prometheus series for that provider. Error labels come from `InferenceError::metric_label()` in `choreo-proto`, the single canonical mapping shared by all providers.
+
 **3. Provider Catalog (`choreo-ai-protocols/src/catalog/`):**
 ```rust
 pub enum ProviderProtocol {
