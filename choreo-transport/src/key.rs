@@ -110,13 +110,76 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
     if let Some(parent) = sec_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&sec_path, secret)?;
-    std::fs::write(&pub_path, public)?;
-    info!(
-        "generated and wrote new Noise IK transport keypair to {}",
-        sec_path.display()
-    );
-    Ok((TransportSecretKey(secret), public))
+
+    // Advisory exclusive lock (std::fs::File::lock, stable since 1.89) so
+    // concurrently-starting processes serialize keypair generation; on Unix
+    // new secret files are created owner-only (0o600).
+    let mut sec_file = open_locked_for_write(&sec_path)?;
+
+    // Re-check under the lock: a concurrent process may have written a valid
+    // pair while we waited.
+    let write_result = (|| -> Result<(TransportSecretKey, [u8; 32]), TransportError> {
+        if sec_path.exists()
+            && pub_path.exists()
+            && let Ok(secret) = std::fs::read(&sec_path)
+            && let Ok(public) = std::fs::read(&pub_path)
+            && secret.len() == 32
+            && public.len() == 32
+        {
+            let mut sk = [0u8; 32];
+            let mut pk = [0u8; 32];
+            sk.copy_from_slice(&secret);
+            pk.copy_from_slice(&public);
+            debug!("loaded existing transport keypair (written concurrently)");
+            return Ok((TransportSecretKey(sk), pk));
+        }
+        use std::io::{Seek, SeekFrom, Write};
+        sec_file.set_len(0)?;
+        sec_file.seek(SeekFrom::Start(0))?;
+        sec_file.write_all(&secret)?;
+        sec_file.sync_all()?;
+        std::fs::write(&pub_path, public)?;
+        info!(
+            "generated and wrote new Noise IK transport keypair to {}",
+            sec_path.display()
+        );
+        Ok((TransportSecretKey(secret), public))
+    })();
+
+    let unlock_result = sec_file.unlock();
+    let pair = write_result?;
+    unlock_result?;
+    Ok(pair)
+}
+
+/// Open `path` for writing (creating it if needed) and take an advisory
+/// exclusive lock. On Unix, new files get owner-only 0o600 permissions
+/// because they contain a secret key.
+fn open_locked_for_write(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
+        file.lock()?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        file.lock()?;
+        Ok(file)
+    }
 }
 
 #[cfg(test)]
@@ -155,5 +218,42 @@ mod tests {
                 .join("transport.pub")
                 .exists()
         );
+    }
+
+    #[test]
+    fn ensure_transport_keypair_is_race_safe() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let prev = std::env::var("XDG_CONFIG_HOME").ok();
+        // SAFETY: the env var is process-wide and restored after both threads
+        // finish, so both threads resolve the same temp config dir while the
+        // two racing calls are in flight.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path());
+        }
+
+        // Both threads race to generate/write the keypair against the same
+        // paths; the advisory file lock must serialize them so they converge
+        // on one pair instead of interleaving torn writes.
+        let handle_a = std::thread::spawn(ensure_transport_keypair);
+        let handle_b = std::thread::spawn(ensure_transport_keypair);
+        let result_a = handle_a.join();
+        let result_b = handle_b.join();
+
+        match prev {
+            Some(val) => unsafe { std::env::set_var("XDG_CONFIG_HOME", val) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+
+        let (sk_a, pk_a) = result_a
+            .expect("thread A panicked")
+            .expect("thread A ensure_transport_keypair failed");
+        let (sk_b, pk_b) = result_b
+            .expect("thread B panicked")
+            .expect("thread B ensure_transport_keypair failed");
+
+        // Both threads must have converged on the same keypair: no torn
+        // write, and the secret/public halves must not be mismatched.
+        assert_eq!(sk_a.as_bytes(), sk_b.as_bytes());
+        assert_eq!(pk_a, pk_b);
     }
 }
