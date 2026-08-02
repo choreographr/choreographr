@@ -8,11 +8,11 @@ use tracing::{debug, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition};
-use crate::providers::ChatTurnRequest;
-use crate::providers::StreamEvent;
-use crate::providers::types::{
-    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult,
+use crate::overrides::ProviderOverrides;
+use crate::types::{
+    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
+use crate::{ChatTurnRequest, ContextWindowConfig};
 use choreo_proto::TokenUsage;
 
 /// Default base URL for the Gemini API.
@@ -22,7 +22,7 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta
 #[derive(Debug, Clone)]
 pub struct GoogleConfig {
     pub base_url: String,
-    pub context_window_config: crate::providers::ContextWindowConfig,
+    pub context_window_config: ContextWindowConfig,
     pub streaming: bool,
     pub retry_max_attempts: u32,
     pub retry_initial_backoff_ms: u64,
@@ -35,7 +35,7 @@ impl Default for GoogleConfig {
     fn default() -> Self {
         Self {
             base_url: DEFAULT_BASE_URL.to_string(),
-            context_window_config: crate::providers::ContextWindowConfig::default(),
+            context_window_config: ContextWindowConfig::default(),
             streaming: true,
             retry_max_attempts: 5,
             retry_initial_backoff_ms: 1000,
@@ -48,35 +48,37 @@ impl Default for GoogleConfig {
 
 impl GoogleConfig {
     /// Apply account-level overrides onto this config.
-    pub fn apply_overrides(&mut self, cfg: &crate::accounts::AccountConfig) {
-        if let Some(base_url) = &cfg.base_url {
+    pub fn apply_overrides(&mut self, overrides: &ProviderOverrides) {
+        if let Some(base_url) = &overrides.base_url {
             self.base_url = base_url.clone();
         }
-        if let Some(streaming) = cfg.streaming {
+        if let Some(streaming) = overrides.streaming {
             self.streaming = streaming;
         }
-        if let Some(retry) = cfg.retry_max_attempts {
+        if let Some(retry) = overrides.retry_max_attempts {
             self.retry_max_attempts = retry;
         }
-        if let Some(connect) = cfg.connect_timeout_secs {
+        if let Some(connect) = overrides.connect_timeout_secs {
             self.connect_timeout_secs = connect;
         }
-        if let Some(request) = cfg.request_timeout_secs {
+        if let Some(request) = overrides.request_timeout_secs {
             self.request_timeout_secs = request;
         }
-        if let Some(ms) = cfg.retry_initial_backoff_ms {
+        if let Some(ms) = overrides.retry_initial_backoff_ms {
             self.retry_initial_backoff_ms = ms;
         }
-        if let Some(ms) = cfg.retry_max_backoff_ms {
+        if let Some(ms) = overrides.retry_max_backoff_ms {
             self.retry_max_backoff_ms = ms;
         }
-        self.context_window_config
-            .apply_overrides(cfg.context_window, cfg.model_context_windows.as_ref());
+        self.context_window_config.apply_overrides(
+            overrides.context_window,
+            overrides.model_context_windows.as_ref(),
+        );
     }
 }
 
 /// Errors from the Google Gemini API.
-pub use crate::providers::shared::ProviderError as GoogleError;
+pub use crate::shared::ProviderError as GoogleError;
 
 /// The Google Gemini API client.
 #[derive(Clone, Debug)]
@@ -88,10 +90,8 @@ pub struct GoogleClient {
 
 impl GoogleClient {
     pub fn new(config: GoogleConfig, api_key: String) -> io::Result<Self> {
-        let http = crate::providers::shared::build_agent(
-            config.connect_timeout_secs,
-            config.request_timeout_secs,
-        );
+        let http =
+            crate::shared::build_agent(config.connect_timeout_secs, config.request_timeout_secs);
         Ok(Self {
             config,
             api_key,
@@ -110,7 +110,7 @@ impl GoogleClient {
     /// List available models from the API, falling back to the curated static list
     /// if the endpoint is unreachable or the API key lacks permission.
     pub fn validate_and_list_models(&self) -> Result<Vec<String>, GoogleError> {
-        crate::providers::list_models_with_fallback(
+        crate::shared::list_models_with_fallback(
             || requests::list_models_request(&self.http, &self.config, &self.api_key),
             KNOWN_GEMINI_MODELS,
             "Google",
@@ -148,8 +148,7 @@ impl GoogleClient {
         debug!(effort = %params.thinking_effort, "google chat_completion_turn_streaming");
         if !self.config.streaming {
             let result = self.chat_completion_turn(params)?;
-            let result =
-                crate::providers::shared::emit_non_streaming_events(result, &mut on_event)?;
+            let result = crate::shared::emit_non_streaming_events(result, &mut on_event)?;
             return Ok(result);
         }
 
@@ -170,7 +169,7 @@ impl GoogleClient {
 
 // ── ProviderClient trait impl ───────────────────────────────────────────
 
-use crate::providers::ProviderClient;
+use crate::ProviderClient;
 use choreo_proto::InferenceError;
 
 impl ProviderClient for GoogleClient {
@@ -182,10 +181,8 @@ impl ProviderClient for GoogleClient {
         &self,
         params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        let api_start = std::time::Instant::now();
-        let model = params.model;
-        let result = self.chat_completion_turn(params);
-        crate::providers::shared::timed_result(api_start, model, "google", result)
+        self.chat_completion_turn(params)
+            .map_err(crate::shared::provider_error_to_inference)
     }
 
     fn chat_completion_turn_streaming(
@@ -193,15 +190,13 @@ impl ProviderClient for GoogleClient {
         params: ChatTurnRequest<'_>,
         on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        let api_start = std::time::Instant::now();
-        let model = params.model;
-        let result = self.chat_completion_turn_streaming(params, on_event);
-        crate::providers::shared::timed_result(api_start, model, "google", result)
+        self.chat_completion_turn_streaming(params, on_event)
+            .map_err(crate::shared::provider_error_to_inference)
     }
 
     fn list_models(&self) -> Result<Vec<String>, InferenceError> {
         let result = self.validate_and_list_models();
-        result.map_err(crate::providers::shared::provider_error_to_inference)
+        result.map_err(crate::shared::provider_error_to_inference)
     }
 
     fn context_window_for_model(&self, model: &str) -> Option<u32> {

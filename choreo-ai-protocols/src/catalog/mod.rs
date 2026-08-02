@@ -13,7 +13,7 @@ use tracing::debug;
 use choreo_proto::ReasoningCapability;
 
 use crate::openai::RequestFormat;
-use crate::providers::shared::MaxTokensField;
+use crate::shared::MaxTokensField;
 
 mod loader;
 

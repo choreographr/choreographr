@@ -3,9 +3,8 @@ use std::io;
 use std::sync::mpsc;
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition};
-use crate::providers::StreamEvent;
-use crate::providers::types::{CallerInfo, ChatTurnResult};
 use crate::retry::RetryCallback;
+use crate::types::{CallerInfo, ChatTurnResult, StreamEvent};
 use choreo_proto::InferenceError;
 
 /// A single tool result to feed back into a Responses API turn.

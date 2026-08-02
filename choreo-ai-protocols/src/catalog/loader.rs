@@ -12,7 +12,7 @@
 
 use serde::Deserialize;
 
-use crate::providers::shared::MaxTokensField;
+use crate::shared::MaxTokensField;
 
 use super::{ModelEntry, ProviderEntry, ProviderProtocol};
 

@@ -74,7 +74,7 @@ fn mcp_server_everything_tools_are_discovered_and_callable() {
     );
 
     // ── 6. Call the echo tool through the registry ──
-    let tool_call = choreographr::providers::ChatToolCall {
+    let tool_call = choreo_ai_protocols::ChatToolCall {
         id: "call_1".to_string(),
         name: echo_name.to_string(),
         arguments_json: r#"{"message": "hello from choreo"}"#.to_string(),

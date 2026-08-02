@@ -1,5 +1,5 @@
 use super::{Tool, ToolExecError, ToolOutputFormat, ToolRegistry, context::ToolContext};
-use crate::providers::types::ChatToolCall;
+use choreo_ai_protocols::ChatToolCall;
 use choreo_keystore::ServiceCredential;
 use schemars::JsonSchema;
 use serde::Deserialize;

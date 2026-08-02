@@ -3,8 +3,7 @@ use std::io;
 use choreo_proto::InferenceError;
 use serde::{Deserialize, Serialize};
 
-use crate::providers::StreamEvent;
-use crate::providers::types::ChatTurnResult;
+use crate::types::{ChatTurnResult, StreamEvent};
 
 /// Maximum number of tool calls we accept in a single streaming response.
 /// Prevents OOM from a provider sending a maliciously large index.
@@ -80,7 +79,12 @@ impl From<ProviderError> for io::Error {
     }
 }
 
-/// Map a ProviderError variant to a stable label string for metrics.
+/// Map a ProviderError variant to a stable label string.
+///
+/// Only used by tests in this crate — the daemon records metrics against the
+/// shared `InferenceError` it receives across the trait boundary (see the
+/// daemon's `inference_error_label`).
+#[cfg(test)]
 pub(crate) fn error_type_label(e: &ProviderError) -> &'static str {
     match e {
         ProviderError::Unauthorized { .. } => "unauthorized",
@@ -141,24 +145,30 @@ pub(crate) fn build_agent(connect_timeout_secs: u64, read_timeout_secs: u64) -> 
     )
 }
 
-/// Wrap the result of a provider API call with timing instrumentation and error
-/// conversion.  Every provider uses this from its ProviderClient trait impl so
-/// that metrics are recorded uniformly.
-pub(crate) fn timed_result<T>(
-    start: std::time::Instant,
-    model: &str,
-    label: &str,
-    result: Result<T, ProviderError>,
-) -> Result<T, InferenceError> {
-    let elapsed = start.elapsed().as_secs_f64();
-    match &result {
-        Ok(_) => crate::metrics::record_api_call(model, label, elapsed),
+/// Try to list models via the API; fall back to the static known list on any
+/// error.  Used by provider implementations to gracefully degrade when the
+/// models endpoint is unreachable or the API key lacks permission.
+pub(crate) fn list_models_with_fallback<F, E>(
+    fetch: F,
+    static_list: &[&str],
+    provider_name: &str,
+) -> Result<Vec<String>, E>
+where
+    F: FnOnce() -> Result<Vec<String>, E>,
+    E: std::fmt::Display,
+{
+    match fetch() {
+        Ok(models) => {
+            tracing::info!("{provider_name} models returned: {}", models.len());
+            Ok(models)
+        }
         Err(e) => {
-            crate::metrics::record_api_call(model, label, elapsed);
-            crate::metrics::record_api_error(model, error_type_label(e));
+            tracing::warn!(
+                "failed to list models from {provider_name} API, using static list: {e}"
+            );
+            Ok(static_list.iter().map(|s| s.to_string()).collect())
         }
     }
-    result.map_err(provider_error_to_inference)
 }
 
 /// When a provider is configured for non-streaming mode, emit the result
@@ -204,7 +214,7 @@ pub(crate) fn emit_non_streaming_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::types::{ChatAssistantToolUse, ChatToolCall, FinalTextResult};
+    use crate::types::{ChatAssistantToolUse, ChatToolCall, FinalTextResult};
 
     /// Collect emitted events from a call to [`emit_non_streaming_events`].
     fn collect_events(result: ChatTurnResult) -> Vec<StreamEvent> {

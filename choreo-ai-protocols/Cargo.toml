@@ -1,0 +1,19 @@
+[package]
+name = "choreo-ai-protocols"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Provider protocols for Choreographr — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the ProviderClient trait, and the provider catalog"
+
+[lib]
+name = "choreo_ai_protocols"
+
+[dependencies]
+choreo-proto.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml = "1.1"
+tracing.workspace = true
+ureq.workspace = true

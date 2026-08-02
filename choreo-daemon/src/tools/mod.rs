@@ -1,6 +1,6 @@
-pub(crate) use crate::openai::AllowedCaller;
-use crate::openai::ChatToolDefinition;
-use crate::providers::types::ChatToolCall;
+use choreo_ai_protocols::ChatToolCall;
+pub(crate) use choreo_ai_protocols::openai::AllowedCaller;
+use choreo_ai_protocols::openai::ChatToolDefinition;
 use choreo_keystore::ServiceCredential;
 use humfmt::{BytesOptions, bytes_with};
 use schemars::JsonSchema;

@@ -1,17 +1,18 @@
 use crate::context::{self, LoadedSkill, SkillMeta};
-use crate::openai::{
-    AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
-};
-use crate::providers::types::{ChatToolCall, ChatTurnResult};
-use crate::providers::{
-    ChatTurnRequest, InferenceProvider, StreamEvent, ToolResultItem, model_reasoning_capability,
-};
+use crate::providers::InferenceProvider;
 use crate::sessions::{RequestContext, SessionCommand, SessionState};
 use crate::tools::context::ToolContext;
 use crate::tools::load_tools::{LoadToolsArgs, apply_load_tools};
 use crate::tools::set_working_dir::{SetWorkingDirArgs, resolve_working_dir_path};
 use crate::tools::unload_tools::{UnloadToolsArgs, apply_unload_tools};
 use crate::tools::{PreparedImage, ToolError, ToolOutput, ToolOutputFormat, ToolRegistry};
+use choreo_ai_protocols::openai::{
+    AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
+};
+use choreo_ai_protocols::{
+    ChatToolCall, ChatTurnRequest, ChatTurnResult, StreamEvent, ToolResultItem,
+    model_reasoning_capability,
+};
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
@@ -848,7 +849,7 @@ pub(crate) fn run_agent_loop(
                 estimated_prompt_tokens,
             }));
 
-        let mut retry_cb: Option<crate::openai::RetryCallback> = Some(Box::new({
+        let mut retry_cb: Option<choreo_ai_protocols::openai::RetryCallback> = Some(Box::new({
             let cmd_tx = ctx.cmd_tx.clone();
             move |attempt, max_attempts, delay| {
                 let _ = cmd_tx.send(SessionCommand::StatusChanged(SessionStatus::Retrying {
@@ -1359,7 +1360,7 @@ fn finish_tool_call(
 
 #[expect(clippy::too_many_arguments)]
 fn execute_tool_with_timeout(
-    tool_call: &crate::providers::types::ChatToolCall,
+    tool_call: &ChatToolCall,
     x_credentials: Option<&ServiceCredential>,
     working_dir: Option<&Path>,
     timeout_dur: Duration,
@@ -1592,11 +1593,11 @@ pub const REQUEST_IMAGE_HEIGHT: u32 = 640;
 mod tests {
     use super::*;
     use crate::daemon::DaemonCommand;
-    use crate::openai::AssistantToolCall;
     use crate::providers::InferenceProvider;
     use crate::providers::test_util::make_test_provider;
     use crate::tools::context::ToolContext;
     use crate::tools::{Tool, ToolExecError, ToolRegistry};
+    use choreo_ai_protocols::openai::AssistantToolCall;
     use std::sync::mpsc;
 
     fn make_session_with_turns() -> SessionState {
@@ -1941,8 +1942,9 @@ mod tests {
 
     #[test]
     fn resolve_reasoning_effort_openai_supported_model_preserves() {
-        let config = crate::openai::ServiceConfig::default();
-        let client = crate::openai::OpenAiClient::new(config, "test-key".into()).unwrap();
+        let config = choreo_ai_protocols::openai::ServiceConfig::default();
+        let client =
+            choreo_ai_protocols::openai::OpenAiClient::new(config, "test-key".into()).unwrap();
         let provider = InferenceProvider::from_openai(client);
 
         let result = resolve_reasoning_effort(&provider, "o3-mini", 1, 0, "high");
@@ -1951,8 +1953,9 @@ mod tests {
 
     #[test]
     fn resolve_reasoning_effort_openai_unsupported_model_disables() {
-        let config = crate::openai::ServiceConfig::default();
-        let client = crate::openai::OpenAiClient::new(config, "test-key".into()).unwrap();
+        let config = choreo_ai_protocols::openai::ServiceConfig::default();
+        let client =
+            choreo_ai_protocols::openai::OpenAiClient::new(config, "test-key".into()).unwrap();
         let provider = InferenceProvider::from_openai(client);
 
         let result = resolve_reasoning_effort(&provider, "gpt-4.1", 1, 0, "medium");
@@ -2161,7 +2164,7 @@ mod tests {
         registry.register(tool);
         let registry = registry.build();
 
-        let tool_call = crate::providers::types::ChatToolCall {
+        let tool_call = ChatToolCall {
             id: "call_test".into(),
             name: tool_name.into(),
             arguments_json: tool_args.into(),

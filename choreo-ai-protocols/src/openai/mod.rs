@@ -5,18 +5,12 @@ mod retry;
 mod sse;
 #[cfg(test)]
 mod tests;
-pub use crate::providers::shared::MaxTokensField;
-use crate::providers::{ChatTurnResult, StreamEvent};
+pub use crate::shared::MaxTokensField;
+use crate::types::{ChatTurnResult, StreamEvent};
 use tracing::warn;
 
 pub(crate) use config::endpoint_url;
-// Re-export deprecated load_service_config for backward compatibility
-// with any existing callers (e.g., external code) that may still use it.
-#[expect(deprecated)]
-pub use config::{
-    DaemonConfig, ServiceConfig, completion, config_path, load_daemon_config, load_service_config,
-    validate_and_list_models,
-};
+pub use config::{ServiceConfig, completion, validate_and_list_models};
 pub(crate) use sse::SseReader;
 #[cfg(test)]
 pub(crate) use sse::build_sse_event;
@@ -36,7 +30,7 @@ use std::io;
 
 /// Re-export the shared provider error type so all OpenAI code continues to
 /// use `super::OpenAiError` without structural changes.
-pub use crate::providers::shared::ProviderError as OpenAiError;
+pub use crate::shared::ProviderError as OpenAiError;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -180,10 +174,8 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn new(config: ServiceConfig, api_key: String) -> io::Result<Self> {
-        let http = crate::providers::shared::build_agent(
-            config.connect_timeout_secs,
-            config.request_timeout_secs,
-        );
+        let http =
+            crate::shared::build_agent(config.connect_timeout_secs, config.request_timeout_secs);
         Ok(Self {
             config,
             api_key,
@@ -283,7 +275,7 @@ impl OpenAiClient {
 
     pub fn chat_completion_turn(
         &self,
-        params: crate::providers::ChatTurnRequest<'_>,
+        params: crate::ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, OpenAiError> {
         let reasoning_effort = reasoning_effort_api_value(&params.thinking_effort);
         tracing::debug!(effort = %params.thinking_effort, ?reasoning_effort, "chat_completion_turn");
@@ -320,7 +312,7 @@ impl OpenAiClient {
 
     pub fn chat_completion_turn_streaming<F>(
         &self,
-        params: crate::providers::ChatTurnRequest<'_>,
+        params: crate::ChatTurnRequest<'_>,
         mut on_event: F,
     ) -> Result<ChatTurnResult, OpenAiError>
     where
@@ -334,8 +326,7 @@ impl OpenAiClient {
         );
         if !self.config.streaming {
             let result = self.chat_completion_turn(params)?;
-            let result =
-                crate::providers::shared::emit_non_streaming_events(result, &mut on_event)?;
+            let result = crate::shared::emit_non_streaming_events(result, &mut on_event)?;
             return Ok(result);
         }
 
@@ -440,7 +431,7 @@ pub(crate) fn messages_to_responses_input(
 /// execution to fail with a JSON parse error and trigger an error-recovery
 /// loop that inflates the context and eventually hits the provider's 400/500.
 pub(crate) fn validate_tool_call_arguments(
-    tool_calls: &mut Vec<crate::providers::types::ChatToolCall>,
+    tool_calls: &mut Vec<crate::types::ChatToolCall>,
 ) -> Vec<choreo_proto::DiscardedToolCall> {
     let all = std::mem::take(tool_calls);
     let (valid, discarded): (Vec<_>, Vec<_>) = all
@@ -465,7 +456,7 @@ pub(crate) fn validate_tool_call_arguments(
 
 // ── ProviderClient trait impl ───────────────────────────────────────────
 
-use crate::providers::{ChatTurnRequest, ProviderClient};
+use crate::{ChatTurnRequest, ProviderClient};
 use choreo_proto::InferenceError;
 
 impl ProviderClient for OpenAiClient {
@@ -477,10 +468,8 @@ impl ProviderClient for OpenAiClient {
         &self,
         params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        let api_start = std::time::Instant::now();
-        let model = params.model;
-        let result = self.chat_completion_turn(params);
-        crate::providers::shared::timed_result(api_start, model, "openai", result)
+        self.chat_completion_turn(params)
+            .map_err(crate::shared::provider_error_to_inference)
     }
 
     fn chat_completion_turn_streaming(
@@ -488,15 +477,13 @@ impl ProviderClient for OpenAiClient {
         params: ChatTurnRequest<'_>,
         on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        let api_start = std::time::Instant::now();
-        let model = params.model;
-        let result = self.chat_completion_turn_streaming(params, on_event);
-        crate::providers::shared::timed_result(api_start, model, "openai", result)
+        self.chat_completion_turn_streaming(params, on_event)
+            .map_err(crate::shared::provider_error_to_inference)
     }
 
     fn list_models(&self) -> Result<Vec<String>, InferenceError> {
         let result = self.validate_and_list_models();
-        result.map_err(crate::providers::shared::provider_error_to_inference)
+        result.map_err(crate::shared::provider_error_to_inference)
     }
 
     fn supports_programmatic_tool_calling(&self, model: &str) -> bool {

@@ -1,7 +1,7 @@
-use crate::openai::AllowedCaller;
 use crate::tools::context::ToolContext;
 use crate::tools::{PreparedImage, ToolDyn, ToolError, ToolOutput, ToolOutputFormat, encode_outer};
 use anyhow::{Context, Result};
+use choreo_ai_protocols::openai::AllowedCaller;
 use choreo_keystore::ServiceCredential;
 use choreo_mcp::{CallToolResult, McpClient, McpContent};
 use serde_json::Value;

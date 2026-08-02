@@ -1,9 +1,10 @@
 use crate::context::{LoadedSkill, SkillMeta};
 use crate::daemon::DaemonCommand;
 use crate::db::{self, SessionRecord, write_session_retry, write_turn_retry};
-use crate::providers::{InferenceProvider, model_reasoning_capability};
+use crate::providers::InferenceProvider;
 use crate::requests::run_agent_loop;
 use crate::tools::ToolRegistry;
+use choreo_ai_protocols::model_reasoning_capability;
 use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, SessionStatus,
     SessionSummary, TimestampMs, TokenUsage, ToolResultRecord, Turn,

@@ -27,7 +27,7 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 
 ## Workspace topology
 
-Eleven crates in a single Cargo workspace (resolver = "3"):
+Twelve crates in a single Cargo workspace (resolver = "3"):
 
 ```
 Choreographr (workspace)
@@ -38,6 +38,9 @@ Choreographr (workspace)
 ├── choreo-markdown        Markdown parser and HTML renderer (pulldown-cmark + ammonia)
 ├── choreo-mcp             MCP (Model Context Protocol) client — spawns subprocess servers,
 │                       discovers tools, and dispatches tool calls over JSON-RPC stdio
+├── choreo-ai-protocols    Provider protocols — OpenAI-compatible, Anthropic Messages, and
+│                       Google Gemini clients, the ProviderClient trait, and the provider
+│                       catalog (bundled TOML data)
 ├── choreographr          Unix socket server — the core engine
 ├── choreo-acp             ACP bridge — translates the Agent Communication Protocol
 │                       (JSON-RPC over stdin/stdout) into choreo-proto messages over the
@@ -51,28 +54,30 @@ Choreographr (workspace)
 ### Dependency graph
 
 ```
-                    ┌─────────────────┐
-                    │    choreo-proto    │ (no workspace deps)
-                    └────────┬────────┘
+                    ┌──────────────────┐
+                    │   choreo-proto   │ (no workspace deps)
+                    └────────┬─────────┘
                              │
-                    ┌────────▼────────┐
-                    │  choreo-keystore   │ (no workspace deps)
-                    └────────┬────────┘
+                    ┌────────▼──────────┐
+                    │ choreo-keystore   │ (no workspace deps)
+                    └────────┬──────────┘
                              │
-              ┌──────────────┼──────────────────────┐
-              │              │                      │
-      ┌────────▼────────┐   │       ┌───────────────▼──────────┐
-      │ choreo-client-core │   │       │        choreographr        │
-      └────┬───────┬────┘   │       └───────────────┬──────────┘
-           │       │        │                       │
-           │  ┌────▼────────▼────┐                  │
-           │  │  choreo-transport   │◄─────────────────│───────────┐
-           │  └────────┬────────┘                  │           │
-           │           │                   ┌───────▼──────┐ ┌──▼────────┐
-      ┌────▼───┐ ┌────▼────┐ ┌────▼───┐   │   choreo-mcp    │ │  choreo-acp  │
-      │choreo-tui  │ │choreo-gui   │ │choreo-im  │   │ (MCP client)│ │(ACP bridge)│
-      └────────┘ └─────────┘ └────────┘   └──────────────┘ └───────────┘
+              ┌──────────────┼──────────────────────────────┐
+              │              │                              │
+      ┌───────▼────────┐    │                ┌──────────────▼──────────────┐
+      │ choreo-client-core │    │                │         choreographr        │
+      └───────┬───┬────┘    │                └───────┬──────────────┬───────┘
+              │   │         │                        │              │
+              │  ┌▼─────────▼────────┐  ┌────────────▼─────────┐  ┌──▼────────┐
+              │  │ choreo-transport    │◄─│ choreo-ai-protocols  │  │ choreo-acp │
+              │  └─────────┬──────────┘  └────────────┬─────────┘  └───────────┘
+              │            │                          │
+         ┌────▼───┐  ┌─────▼─────┐  ┌──────▼────┐  ┌───▼─────────────┐
+         │choreo-tui  │  │ choreo-gui  │  │ choreo-im  │  │  choreo-mcp    │
+         └────────┘  └───────────┘  └──────────┘  └─────────────────┘
 ```
+
+(`choreo-markdown` is consumed by `choreo-client-core` and `choreo-tui`; it is omitted from the graph for brevity.)
 
 ---
 
@@ -218,6 +223,36 @@ Used by `choreographr` to spawn external MCP servers and register their tools.
 | `error.rs` | `McpError` enum — `SpawnFailed`, `InitializeFailed`, `JsonRpcError`, `ProtocolError`, `Timeout`, `Io`, `ServerShutdown`, `ToolNotFound`, `InvalidParams` |
 
 
+### `choreo-ai-protocols` — Provider protocols
+
+The wire-protocol layer for LLM providers.  Owns the three client
+implementations (`openai`, `anthropic`, `google`), the `ProviderClient` trait
+and shared turn/error/message types they all use, the retry machinery, and
+the static provider catalog.  It is free of daemon concerns — no metrics, no
+account configuration, no sessions — so it can be consumed independently of
+`choreo-daemon` (the daemon supplies those concerns at the boundary, e.g. via
+[`ProviderOverrides`] and by timing calls itself).
+
+| Module | Purpose |
+|---|---|
+| `openai/` | OpenAI-compatible client (`OpenAiClient`) covering both Chat Completions and Responses APIs (incl. programmatic tool calling), plus the canonical `ChatRequestMessage` / `ChatToolDefinition` types that the other clients translate into their own wire formats, `ServiceConfig`, SSE reader, and per-protocol retry helpers. |
+| `anthropic/` | Anthropic Messages API client (`AnthropicClient`, `AnthropicConfig`). Implements `ProviderClient`. |
+| `google/` | Google Gemini API client (`GoogleClient`, `GoogleConfig`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
+| `traits.rs` | `ProviderClient` trait, `ChatTurnRequest`, `ToolResultItem` |
+| `types.rs` | `ChatTurnResult`, `ChatToolCall`, `ChatAssistantToolUse`, `FinalTextResult`, `CallerInfo`, `StreamEvent` |
+| `shared.rs` | `ProviderError` (unified error type re-exported as `OpenAiError`/`AnthropicError`/`GoogleError`), `MaxTokensField`, `MAX_TOOL_CALLS`, `build_agent()`, `provider_error_to_inference()`, `emit_non_streaming_events()`, `list_models_with_fallback()` |
+| `context_window.rs` | `ContextWindowConfig` — per-model/global context window resolution shared by all configs |
+| `overrides.rs` | `ProviderOverrides` — protocol-agnostic account overrides carrier (the daemon converts its `AccountConfig` into this) |
+| `retry.rs` | Shared HTTP retry logic. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. |
+| `catalog/` | `ProviderProtocol` enum + `ProviderEntry`/`ModelEntry`, `PROVIDER_CATALOG` (bundled TOML, one `catalog/<slug>.toml` per provider), and lookups (`lookup_provider`, `lookup_context_window`, `model_reasoning_capability`, `model_request_format`, `all_slugs`, `all_display_names`) |
+
+**Root re-exports** give consumers a stable front door: the client types
+(`OpenAiClient`, `AnthropicClient`, `GoogleClient`, …), the trait and shared
+types (`ProviderClient`, `ChatTurnRequest`, `ChatTurnResult`, `StreamEvent`,
+`ProviderError`, `ContextWindowConfig`, `ProviderOverrides`, …), and the
+catalog (`ProviderProtocol`, `PROVIDER_CATALOG`, `lookup_*`, …).
+
+
 ### `choreo-acp` — ACP bridge (Agent Communication Protocol)
 
 Entry point: `src/main.rs` → initializes logging, connects to the daemon's Unix socket,
@@ -284,18 +319,12 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `server/lifecycle.rs` | Accept loop (non-blocking `UnixListener` + 50ms poll), signal handling (`signal_hook::flag`), shutdown orchestration. |
 | `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
-| `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. |
-| `providers/` | `ProviderClient` trait + `ProviderCatalog` system. `InferenceProvider` struct wraps `Arc<dyn ProviderClient>`. Provider data lives in TOML (`providers/catalog/<slug>.toml`, one file per provider) and is loaded lazily into a `static LazyLock<Vec<ProviderEntry>>` (`PROVIDER_CATALOG`) — 70+ providers across 3 wire protocols, each with a curated model list, context windows, and reasoning levels. Dispatches to the correct client based on protocol. |
-| `providers/shared.rs` | Shared provider infrastructure: `ProviderError` (unified error type used by all providers), `build_agent()` (ureq Agent construction with timeouts), `error_type_label()`, `provider_error_to_inference()`, `timed_result()` (metrics instrumentation wrapper), `emit_non_streaming_events()` (converts a non-streaming `ChatTurnResult` into `StreamEvent` callbacks so non-streaming configurations reuse the same event-driven path). Eliminates duplicated error types, `From<ProviderHttpError>` impls, and error conversion functions across provider implementations. |
-| `anthropic/` | Anthropic Messages API client (`AnthropicClient`). Implements `ProviderClient`. |
-| `google/` | Google Gemini API client (`GoogleClient`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
-
-| `retry/` | Shared HTTP retry logic extracted from the OpenAI module. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. All provider modules use this via the shared `ProviderError` type conversion. |
+| `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` and converts the shared fields into `ProviderOverrides` for the other protocols. |
+| `config.rs` | Daemon-level configuration: `DaemonConfig` (`max_turns`, `[context]`), `config_path()`, `load_daemon_config()`, and the deprecated `load_service_config()`. (Previously lived in `openai/config.rs`; it is daemon config, not provider config.) |
+| `providers/mod.rs` | `InferenceProvider` — protocol-erased facade wrapping `Arc<dyn ProviderClient>` plus the catalog slug. `from_account_config()` dispatches by `ProviderProtocol` and constructs the right client from `choreo-ai-protocols`. Records API metrics (`record_api_call`/`record_api_error`) around each turn — timing lives here, not in the provider crate. |
 | `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional working directory. |
-| `chat_completions.rs` / `responses.rs` | Chat Completions and Responses API wire types, request functions, SSE streaming, tool call accumulation. |
 | `context.rs` | Context file discovery, skills, fingerprint-based refresh. |
 | `metrics.rs` | Prometheus/OpenMetrics gauges, counters, histograms; HTTP server for `/metrics` endpoint. |
-| `openai/` | HTTP integration with OpenAI-compatible APIs, SSE streaming, service config loading, programmatic tool calling (Responses API). |
 | `tools/` | `Tool` trait (with `output_schema` for programmatic tool calling, `allowed_callers` for caller-level gating), `ToolRegistry` (with injectable `FffStateCache` replacing a global `OnceLock`), and 30+ registered tools (including `list_sessions`, `get_session`, `load_skill` via `admin/`). |
 | `tools/context.rs` | `ToolContext` — session-scoped context (session ID, `Arc<Database>`, `mpsc::Sender<DaemonCommand>`, active tool groups, reasoning effort, selected model, working directory) passed to tools that need DB or daemon access or parent config for sub-sessions. |
 | `tools/db/` | Session-scoped KV database tools (`db_set`, `db_get`, `db_delete`, `db_delete_range`, `db_get_range`, `db_list`, `db_count`), one file per tool (`set.rs`, `get.rs`, `delete.rs`, `delete_range.rs`, `get_range.rs`, `list.rs`, `count.rs`) with shared `DbError`/`DbValue` in `db/mod.rs`. |
@@ -308,9 +337,9 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 
 ### Provider Architecture
 
-The provider system has three layers:
+The provider system has three layers, now split across two crates:
 
-**1. `ProviderClient` trait (`providers/traits.rs`):**
+**1. `ProviderClient` trait (`choreo-ai-protocols/src/traits.rs`):**
 ```rust
 /// Holds the common parameters for a chat completion turn.
 pub struct ChatTurnRequest<'a> {
@@ -346,15 +375,15 @@ Each client implementation maps the `&str` effort slug to its wire format:
 - **Google**: `thinkingConfig` with `includeThoughts: true` (slug ≠ `"off"` enables thinking)
 - **Mistral**: `reasoning_effort` field (`"off"` omits the field, otherwise slug → `"low"`/`"medium"`/`"high"`)
 
-**2. `InferenceProvider` struct (`providers/mod.rs`):**
+**2. `InferenceProvider` struct (`choreo-daemon/src/providers/mod.rs`):**
 ```rust
 pub struct InferenceProvider {
     client: Arc<dyn ProviderClient>,
 }
 ```
-Created via `from_account_config()` which looks up the provider slug in the catalog and dispatches to the appropriate client constructor by protocol type.
+Created via `from_account_config()` which looks up the provider slug in the catalog and dispatches to the appropriate client constructor by protocol type. All wire-protocol knowledge lives in `choreo-ai-protocols`; the daemon's `InferenceProvider` is the only daemon type that dispatches by protocol. It also records API metrics (`record_api_call` / `record_api_error`) around every turn — timing moved here from the provider crates so `choreo-ai-protocols` stays free of daemon concerns.
 
-**3. Provider Catalog (`providers/catalog/`):**
+**3. Provider Catalog (`choreo-ai-protocols/src/catalog/`):**
 ```rust
 pub enum ProviderProtocol {
     OpenAi { max_tokens_field: MaxTokensField },
@@ -363,7 +392,7 @@ pub enum ProviderProtocol {
 }
 ```
 
-**`StreamEvent`** (`providers/mod.rs`) replaces the old `(CompletionChunkKind, String)` callback tuple:
+**`StreamEvent`** (`choreo-ai-protocols/src/types.rs`) replaces the old `(CompletionChunkKind, String)` callback tuple:
 ```rust
 pub enum StreamEvent {
     Answer(String),
@@ -375,7 +404,7 @@ Each variant carries its data inline so the streaming callback is self-describin
 equivalent sequence of `StreamEvent`s, allowing non-streaming configurations to reuse the
 same event-driven path as streaming ones without duplication across providers.
 
-**3. Provider Catalog (`providers/catalog/`):**
+**3. Provider Catalog (`choreo-ai-protocols/src/catalog/`):**
 ```rust
 pub enum ProviderProtocol {
     OpenAi { max_tokens_field: MaxTokensField },
@@ -1560,7 +1589,9 @@ user switches to it (`reset_for_session_switch` preserves live estimates).
     (`chat_completion_turn`, `chat_completion_turn_streaming`, `list_models`) and is constructed
     from an `AccountConfig` + credential. Accounts are defined in `accounts.toml` with a
     `provider` field (`"openai"`, `"opencode"`, `"anthropic"`, etc.). The TUI new-account form
-    offers all registered provider options via a shared `PROVIDER_OPTIONS` array.
+    offers all registered provider options via a shared `PROVIDER_OPTIONS` array. The client
+    implementations, trait, shared types, and catalog live in the `choreo-ai-protocols` crate;
+    the daemon's `InferenceProvider` is the thin dispatch/metrics facade.
 
 12. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
     where third-party libraries (alloy) require it. A global `OnceLock<tokio::runtime::Runtime>`
@@ -1813,8 +1844,7 @@ itself is the kernel's responsibility.
 | Daemon | Request lifecycle, session CRUD, cancellation, tool calls, model listing | `choreographr/src/tests.rs`, `choreographr/tests/integration.rs` |
 | MCP (choreo-mcp) | Server spawn, tool discovery, echo tool call/response | `choreo-mcp/tests/mcp_integration.rs` |
 | MCP (daemon) | McpManager + ToolRegistry integration, dynamic group registration, tool execution | `choreographr/tests/mcp_integration.rs` |
-| Daemon OpenAI | SSE parsing, HTTP request construction, config loading | `choreographr/src/openai/tests.rs`, `choreographr/src/openai/chat_completions.rs`, `choreographr/src/openai/config.rs` |
-| Daemon Anthropic | Content block deserialisation, response→turn result conversion, message payload building, config overrides | `choreographr/src/anthropic/tests.rs` |
+| Providers (`choreo-ai-protocols`) | SSE parsing, HTTP request construction, chat completions + responses serialization, content-block deserialisation, config overrides, catalog lookups | `choreo-ai-protocols/src/openai/tests.rs`, `choreo-ai-protocols/src/openai/chat_completions.rs`, `choreo-ai-protocols/src/openai/config.rs`, `choreo-ai-protocols/src/anthropic/tests.rs`, `choreo-ai-protocols/src/google/tests.rs`, `choreo-ai-protocols/src/catalog/mod.rs` |
 | choreo-tui | SVG rasterization, Unicode width, app state | `choreo-tui/src/app_tests.rs`, `choreo-tui/src/lib_tests.rs` |
 | choreo-gui | App state, render helpers | `choreo-gui/src/app_tests.rs` |
 

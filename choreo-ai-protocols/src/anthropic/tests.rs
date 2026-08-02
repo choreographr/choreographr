@@ -191,20 +191,18 @@ fn known_models_are_sorted() {
 #[test]
 fn error_type_label_maps_correctly() {
     assert_eq!(
-        crate::providers::shared::error_type_label(&AnthropicError::Unauthorized {
+        crate::shared::error_type_label(&AnthropicError::Unauthorized {
             status: 401,
             detail: "bad key".into()
         }),
         "unauthorized"
     );
     assert_eq!(
-        crate::providers::shared::error_type_label(&AnthropicError::Cancelled),
+        crate::shared::error_type_label(&AnthropicError::Cancelled),
         "cancelled"
     );
     assert_eq!(
-        crate::providers::shared::error_type_label(&AnthropicError::Io(std::io::Error::other(
-            "oops"
-        ))),
+        crate::shared::error_type_label(&AnthropicError::Io(std::io::Error::other("oops"))),
         "other"
     );
 }
@@ -220,7 +218,7 @@ fn anthropic_config_defaults_are_sensible() {
 
 #[test]
 fn config_apply_overrides() {
-    let account = crate::accounts::AccountConfig {
+    let overrides = ProviderOverrides {
         base_url: Some("https://custom.anthropic.com".into()),
         streaming: Some(false),
         retry_max_attempts: Some(3),
@@ -228,10 +226,10 @@ fn config_apply_overrides() {
         request_timeout_secs: Some(60),
         retry_initial_backoff_ms: Some(2000),
         retry_max_backoff_ms: Some(40000),
-        ..crate::accounts::AccountConfig::simple("test", "anthropic")
+        ..ProviderOverrides::default()
     };
     let mut cfg = AnthropicConfig::default();
-    cfg.apply_overrides(&account);
+    cfg.apply_overrides(&overrides);
     assert_eq!(cfg.base_url, "https://custom.anthropic.com");
     assert!(!cfg.streaming);
     assert_eq!(cfg.retry_max_attempts, 3);

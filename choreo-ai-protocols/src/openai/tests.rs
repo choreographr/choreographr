@@ -99,50 +99,6 @@ fn parse_retry_after_non_integer() {
     assert_eq!(parse_retry_after_secs(Some("abc")), None);
 }
 
-#[test]
-fn daemon_config_deserializes_max_turns() {
-    let raw = "max_turns = 42\n";
-    let config: DaemonConfig = toml::from_str(raw).unwrap();
-    assert_eq!(config.max_turns, Some(42));
-}
-
-#[test]
-fn daemon_config_deserializes_context() {
-    let raw = r#"
-[context]
-context_file_names = ["AGENTS.md"]
-context_file_max_bytes = 16384
-disable_claude_code_prompt = true
-"#;
-    let config: DaemonConfig = toml::from_str(raw).unwrap();
-    assert_eq!(config.context.context_file_names, vec!["AGENTS.md"]);
-    assert_eq!(config.context.context_file_max_bytes, 16384);
-    assert!(config.context.disable_claude_code_prompt);
-}
-
-#[test]
-fn daemon_config_ignores_unknown_fields() {
-    let raw = r#"
-max_turns = 10
-base_url = "https://example.com"
-streaming = false
-"#;
-    let config: DaemonConfig = toml::from_str(raw).unwrap();
-    assert_eq!(config.max_turns, Some(10));
-}
-
-#[test]
-fn daemon_config_defaults_when_empty() {
-    let config: DaemonConfig = toml::from_str("").unwrap();
-    assert_eq!(config.max_turns, None);
-}
-
-#[test]
-fn daemon_config_errors_on_invalid_toml() {
-    let result: Result<DaemonConfig, _> = toml::from_str("[[[");
-    assert!(result.is_err());
-}
-
 // ── Responses API SSE stream event parsing tests ────────────────────
 
 #[test]

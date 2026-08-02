@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "choreo-acp",
+    "choreo-ai-protocols",
     "choreo-client-core",
     "choreo-daemon",
     "choreo-keystore",
@@ -26,6 +27,7 @@ thiserror = "2"
 futures-channel = "0.3"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
+choreo-ai-protocols = { path = "choreo-ai-protocols" }
 choreo-client-core = { path = "choreo-client-core" }
 choreo-keystore = { path = "choreo-keystore" }
 choreo-proto = { path = "choreo-proto" }

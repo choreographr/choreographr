@@ -1,26 +1,17 @@
 use super::{MaxTokensField, OpenAiClient, RequestFormat};
 use choreo_proto::ContextConfig;
-use serde::Deserialize;
-use std::{collections::HashMap, fs, io, path::PathBuf};
+use std::{collections::HashMap, io};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL_LIST_PATH: &str = "/models";
 const DEFAULT_RESPONSES_PATH: &str = "/responses";
 const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
-/// Daemon-level configuration from config.toml.
+/// Per-client configuration for an OpenAI-compatible service.
 ///
-/// Only truly global settings belong here.  All provider-level
-/// configuration (endpoints, timeouts, retry, etc.) belongs in
-/// accounts.toml.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct DaemonConfig {
-    #[serde(default)]
-    pub max_turns: Option<u32>,
-    #[serde(default)]
-    pub context: ContextConfig,
-}
-
+/// Provider-level settings (endpoints, timeouts, retry, token limits,
+/// request format) live here; daemon-level settings live in
+/// `choreo-daemon`'s `config::DaemonConfig`.
 #[derive(Debug, Clone)]
 pub struct ServiceConfig {
     pub base_url: String,
@@ -31,7 +22,7 @@ pub struct ServiceConfig {
     pub provider_slug: &'static str,
     pub chat_completions_max_tokens: Option<u32>,
     pub model_max_tokens: HashMap<String, u32>,
-    pub context_window_config: crate::providers::ContextWindowConfig,
+    pub context_window_config: crate::ContextWindowConfig,
     pub responses_max_output_tokens: Option<u32>,
     pub model_responses_max_output_tokens: HashMap<String, u32>,
     pub chat_completions_max_tokens_field: MaxTokensField,
@@ -59,7 +50,7 @@ impl Default for ServiceConfig {
             provider_slug: "openai",
             chat_completions_max_tokens: None,
             model_max_tokens: HashMap::new(),
-            context_window_config: crate::providers::ContextWindowConfig::default(),
+            context_window_config: crate::ContextWindowConfig::default(),
             responses_max_output_tokens: None,
             model_responses_max_output_tokens: HashMap::new(),
             chat_completions_max_tokens_field: MaxTokensField::MaxCompletionTokens,
@@ -78,62 +69,6 @@ impl Default for ServiceConfig {
     }
 }
 
-pub fn config_path() -> io::Result<PathBuf> {
-    let config_dir = dirs::config_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "could not determine standard config directory",
-        )
-    })?;
-    Ok(config_dir.join("choreographr").join("config.toml"))
-}
-
-/// Load daemon-level configuration from config.toml.
-///
-/// Emits `tracing::warn!` for any provider-level fields that are still
-/// present in config.toml (they should be in accounts.toml instead).
-pub fn load_daemon_config() -> io::Result<DaemonConfig> {
-    let path = config_path()?;
-    if !path.exists() {
-        return Ok(DaemonConfig::default());
-    }
-    let raw = fs::read_to_string(&path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("failed to read config at {}: {error}", path.display()),
-        )
-    })?;
-    // Parse only the daemon-level fields (unknown fields are silently
-    // ignored thanks to #[serde(default)]).
-    let config: DaemonConfig = toml::from_str(&raw).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("failed to parse config at {}: {error}", path.display()),
-        )
-    })?;
-    Ok(config)
-}
-
-/// Deprecated.  Use [`load_daemon_config`] instead.
-///
-/// Provider-level fields in config.toml are no longer read.  This function
-/// returns default provider settings; configure those in accounts.toml.
-#[deprecated(
-    since = "0.1.0",
-    note = "provider-level config has moved to accounts.toml; use load_daemon_config() for daemon settings"
-)]
-pub fn load_service_config() -> io::Result<ServiceConfig> {
-    tracing::warn!(
-        "load_service_config() is deprecated.  Provider-level config is no longer read from \
-         config.toml; configure providers in accounts.toml instead."
-    );
-    // Also surface deprecation warnings for any stale fields.
-    if let Err(e) = load_daemon_config() {
-        tracing::warn!("error reading config.toml while checking for deprecated fields: {e}");
-    }
-    Ok(ServiceConfig::default())
-}
-
 pub(crate) fn endpoint_url(base_url: &str, path: &str) -> io::Result<String> {
     if !path.starts_with('/') {
         return Err(io::Error::new(
@@ -148,7 +83,7 @@ impl ServiceConfig {
     /// Resolve the request format for a model: catalog lookup first,
     /// falling back to the configured default for unknown models.
     pub fn request_format_for_model(&self, model: &str) -> RequestFormat {
-        crate::providers::model_request_format(self.provider_slug, model)
+        crate::catalog::model_request_format(self.provider_slug, model)
             .unwrap_or(self.default_request_format)
     }
 

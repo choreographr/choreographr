@@ -49,6 +49,7 @@ choreo-keystore.workspace = true
 choreo-mcp.workspace = true
 choreo-proto.workspace = true
 choreo-transport.workspace = true
+choreo-ai-protocols.workspace = true
 signal-hook.workspace = true
 toml = "1.1"
 tracing.workspace = true

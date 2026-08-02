@@ -219,7 +219,7 @@ fn google_config_defaults() {
 
 #[test]
 fn google_config_apply_overrides() {
-    let account = crate::accounts::AccountConfig {
+    let overrides = ProviderOverrides {
         base_url: Some("https://custom.googleapis.com".into()),
         streaming: Some(false),
         retry_max_attempts: Some(3),
@@ -227,10 +227,10 @@ fn google_config_apply_overrides() {
         request_timeout_secs: Some(60),
         retry_initial_backoff_ms: Some(2000),
         retry_max_backoff_ms: Some(40000),
-        ..crate::accounts::AccountConfig::simple("test", "google")
+        ..ProviderOverrides::default()
     };
     let mut cfg = GoogleConfig::default();
-    cfg.apply_overrides(&account);
+    cfg.apply_overrides(&overrides);
     assert_eq!(cfg.base_url, "https://custom.googleapis.com");
     assert!(!cfg.streaming);
     assert_eq!(cfg.retry_max_attempts, 3);
@@ -374,36 +374,36 @@ fn model_url_with_trailing_slash() {
 #[test]
 fn error_type_label_maps_correctly() {
     assert_eq!(
-        crate::providers::shared::error_type_label(&GoogleError::Unauthorized {
+        crate::shared::error_type_label(&GoogleError::Unauthorized {
             status: 401,
             detail: "bad key".into(),
         }),
         "unauthorized"
     );
     assert_eq!(
-        crate::providers::shared::error_type_label(&GoogleError::RateLimited {
+        crate::shared::error_type_label(&GoogleError::RateLimited {
             retry_after_secs: None,
             detail: "too many".into(),
         }),
         "rate_limited"
     );
     assert_eq!(
-        crate::providers::shared::error_type_label(&GoogleError::ServerError {
+        crate::shared::error_type_label(&GoogleError::ServerError {
             status: 500,
             detail: "oops".into(),
         }),
         "server_error"
     );
     assert_eq!(
-        crate::providers::shared::error_type_label(&GoogleError::Cancelled),
+        crate::shared::error_type_label(&GoogleError::Cancelled),
         "cancelled"
     );
     assert_eq!(
-        crate::providers::shared::error_type_label(&GoogleError::Io(std::io::Error::other("oops"))),
+        crate::shared::error_type_label(&GoogleError::Io(std::io::Error::other("oops"))),
         "other"
     );
     assert_eq!(
-        crate::providers::shared::error_type_label(&GoogleError::EmptyResponse),
+        crate::shared::error_type_label(&GoogleError::EmptyResponse),
         "empty_response"
     );
 }
@@ -516,22 +516,6 @@ fn status_to_google_error_rate_limited() {
         }
         other => panic!("expected RateLimited, got {other:?}"),
     }
-}
-
-#[test]
-fn from_account_config_routes_google() {
-    let cfg = crate::accounts::AccountConfig::simple("gemini", "google");
-    let result = crate::providers::InferenceProvider::from_account_config(&cfg, Some("key".into()));
-    assert!(result.is_ok(), "{:?}", result.err());
-}
-
-#[test]
-fn from_account_config_google_missing_key_errors() {
-    let cfg = crate::accounts::AccountConfig::simple("gemini", "google");
-    let result = crate::providers::InferenceProvider::from_account_config(&cfg, None);
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(err.contains("no API key"), "{err}");
 }
 
 // ── ResponsePart deserialization tests ────────────────────────────────

@@ -1,7 +1,7 @@
-use choreographr::openai::{
+use choreo_ai_protocols::openai::{
     ChatRequestMessage, OpenAiClient, OpenAiError, RetryCallback, ServiceConfig,
 };
-use choreographr::providers::{ChatTurnRequest, ChatTurnResult, StreamEvent};
+use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult, StreamEvent};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -77,7 +77,7 @@ fn retry_succeeds_with_callback() {
         retry_max_backoff_ms: 100,
         // Use chat-completions (not streaming) so `completion` is
         // synchronous and we get a clean text result.
-        default_request_format: choreographr::openai::RequestFormat::ChatCompletions,
+        default_request_format: choreo_ai_protocols::openai::RequestFormat::ChatCompletions,
         streaming: false,
         ..ServiceConfig::default()
     };
@@ -140,7 +140,7 @@ fn retry_cancelled_during_backoff() {
         retry_max_attempts: 3,
         retry_initial_backoff_ms: 5000,
         retry_max_backoff_ms: 30000,
-        default_request_format: choreographr::openai::RequestFormat::ChatCompletions,
+        default_request_format: choreo_ai_protocols::openai::RequestFormat::ChatCompletions,
         streaming: false,
         ..ServiceConfig::default()
     };
@@ -225,7 +225,7 @@ fn spawn_sse_server() -> (u16, mpsc::Sender<()>, thread::JoinHandle<()>) {
 fn sse_test_config(port: u16) -> ServiceConfig {
     ServiceConfig {
         base_url: format!("http://127.0.0.1:{port}"),
-        default_request_format: choreographr::openai::RequestFormat::ChatCompletions,
+        default_request_format: choreo_ai_protocols::openai::RequestFormat::ChatCompletions,
         streaming: true,
         retry_max_attempts: 1,
         ..ServiceConfig::default()

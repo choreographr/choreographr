@@ -1,10 +1,11 @@
 use crate::accounts::{AccountConfig, AccountManager, accounts_config_path};
 use crate::db::{self, SessionRecord};
 use crate::mcp::McpManager;
-use crate::providers::{InferenceProvider, lookup_context_window};
+use crate::providers::InferenceProvider;
 use crate::sessions::{
     ActiveSessionEntry, CANCEL_ALL, RequestContext, SessionCommand, SessionMetadata, session_main,
 };
+use choreo_ai_protocols::lookup_context_window;
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
     AccountInfo, ContextConfig, DaemonMessage, SessionStatus, SessionSummary, TimestampMs,

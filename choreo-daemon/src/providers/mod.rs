@@ -1,24 +1,23 @@
 use std::io;
 use std::sync::Arc;
 
-use crate::anthropic::AnthropicClient;
-use crate::openai::OpenAiClient;
+use choreo_ai_protocols::openai::{OpenAiClient, ServiceConfig};
+use choreo_ai_protocols::{
+    AnthropicClient, AnthropicConfig, ChatTurnRequest, ChatTurnResult, GoogleClient, GoogleConfig,
+    ProviderClient, ProviderProtocol, StreamEvent, lookup_provider,
+};
 use choreo_proto::InferenceError;
 
-mod catalog;
-pub(crate) mod context_window;
-pub(crate) mod shared;
-mod traits;
-pub(crate) mod types;
-
-pub use catalog::{
-    ModelEntry, PROVIDER_CATALOG, ProviderEntry, ProviderProtocol, all_display_names, all_slugs,
-    lookup_context_window, lookup_provider, model_reasoning_capability, model_request_format,
-};
-pub use context_window::ContextWindowConfig;
-pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
-pub use types::{CallerInfo, ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult};
-
+/// A concrete, protocol-erased provider facade.
+///
+/// Wraps any one [`ProviderClient`] behind a `dyn` pointer so the rest of
+/// the daemon never sees which wire protocol is in use.  Also remembers the
+/// catalog slug (e.g. `"opencode"` even when the client is an
+/// `OpenAiClient`, which always reports `"openai"`), which is what catalog
+/// lookups for reasoning/context windows need.
+///
+/// This is the only daemon type that knows about provider *protocols*; all
+/// wire-format knowledge lives in `choreo-ai-protocols`.
 #[derive(Clone, Debug)]
 pub struct InferenceProvider {
     client: Arc<dyn ProviderClient>,
@@ -55,7 +54,7 @@ impl InferenceProvider {
 
         match entry.protocol {
             ProviderProtocol::OpenAi { max_tokens_field } => {
-                let mut svc_config = crate::openai::ServiceConfig {
+                let mut svc_config = ServiceConfig {
                     base_url: entry.base_url.to_string(),
                     chat_completions_max_tokens_field: max_tokens_field,
                     provider_slug: entry.slug.as_str(),
@@ -74,12 +73,13 @@ impl InferenceProvider {
             ProviderProtocol::AnthropicMessages => {
                 let key = api_key
                     .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
-                let mut anthro_cfg = crate::anthropic::AnthropicConfig::default();
+                let mut anthro_cfg = AnthropicConfig::default();
                 // If the account doesn't specify a base_url, use the catalog default.
                 if config.base_url.is_none() {
                     anthro_cfg.base_url = entry.base_url.to_string();
                 }
-                anthro_cfg.apply_overrides(config);
+                let overrides = config.provider_overrides();
+                anthro_cfg.apply_overrides(&overrides);
                 let client = AnthropicClient::new(anthro_cfg, key)
                     .map_err(|e| format!("failed to create Anthropic client: {e}"))?;
                 Ok(Self {
@@ -90,13 +90,14 @@ impl InferenceProvider {
             ProviderProtocol::GoogleGenerativeAi => {
                 let key = api_key
                     .ok_or_else(|| format!("no API key for '{}' provider", config.provider))?;
-                let mut google_cfg = crate::google::GoogleConfig::default();
+                let mut google_cfg = GoogleConfig::default();
                 // If the account doesn't specify a base_url, use the catalog default.
                 if config.base_url.is_none() {
                     google_cfg.base_url = entry.base_url.to_string();
                 }
-                google_cfg.apply_overrides(config);
-                let client = crate::google::GoogleClient::new(google_cfg, key)
+                let overrides = config.provider_overrides();
+                google_cfg.apply_overrides(&overrides);
+                let client = GoogleClient::new(google_cfg, key)
                     .map_err(|e| format!("failed to create Google client: {e}"))?;
                 Ok(Self {
                     client: Arc::new(client),
@@ -110,7 +111,11 @@ impl InferenceProvider {
         &self,
         params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        self.client.chat_completion_turn(params)
+        let start = std::time::Instant::now();
+        let model = params.model.to_string();
+        let result = self.client.chat_completion_turn(params);
+        self.record_api_metrics(&model, start, &result);
+        result
     }
 
     pub fn chat_completion_turn_streaming(
@@ -118,7 +123,28 @@ impl InferenceProvider {
         params: ChatTurnRequest<'_>,
         on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
-        self.client.chat_completion_turn_streaming(params, on_event)
+        let start = std::time::Instant::now();
+        let model = params.model.to_string();
+        let result = self.client.chat_completion_turn_streaming(params, on_event);
+        self.record_api_metrics(&model, start, &result);
+        result
+    }
+
+    /// Record API-call metrics around a provider result.  Timing lives here
+    /// (not inside `choreo-ai-protocols`) so the provider crates stay free of
+    /// daemon concerns.  The metric label is the catalog slug — more precise
+    /// than the protocol name (e.g. "opencode" rather than "openai").
+    fn record_api_metrics<T>(
+        &self,
+        model: &str,
+        start: std::time::Instant,
+        result: &Result<T, InferenceError>,
+    ) {
+        let elapsed = start.elapsed().as_secs_f64();
+        crate::metrics::record_api_call(model, self.slug, elapsed);
+        if let Err(e) = result {
+            crate::metrics::record_api_error(model, inference_error_label(e));
+        }
     }
 
     /// Return the provider slug (e.g. "openai", "anthropic").
@@ -131,7 +157,7 @@ impl InferenceProvider {
     pub fn resolve_context_window(&self, model: &str) -> Option<u32> {
         self.client
             .context_window_for_model(model)
-            .or_else(|| catalog::lookup_context_window(self.slug, model))
+            .or_else(|| choreo_ai_protocols::lookup_context_window(self.slug, model))
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, InferenceError> {
@@ -143,41 +169,20 @@ impl InferenceProvider {
     }
 }
 
-/// A single event emitted during a streaming LLM response.
+/// Map an [`InferenceError`] variant to a stable label string for metrics.
 ///
-/// Replaces the old `(CompletionChunkKind, String)` tuple with a self-describing
-/// enum so each variant carries its data inline.  The consumer receives these
-/// through the `on_event` callback of [`chat_completion_turn_streaming`] and can
-/// use them for real-time UI updates.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StreamEvent {
-    Answer(String),
-    Reasoning(String),
-}
-
-/// Try to list models via the API; fall back to the static known list on any
-/// error.  Used by provider implementations to gracefully degrade when the
-/// models endpoint is unreachable or the API key lacks permission.
-pub(crate) fn list_models_with_fallback<F, E>(
-    fetch: F,
-    static_list: &[&str],
-    provider_name: &str,
-) -> Result<Vec<String>, E>
-where
-    F: FnOnce() -> Result<Vec<String>, E>,
-    E: std::fmt::Display,
-{
-    match fetch() {
-        Ok(models) => {
-            tracing::info!("{provider_name} models returned: {}", models.len());
-            Ok(models)
-        }
-        Err(e) => {
-            tracing::warn!(
-                "failed to list models from {provider_name} API, using static list: {e}"
-            );
-            Ok(static_list.iter().map(|s| s.to_string()).collect())
-        }
+/// Mirrors the label set the provider crates used to emit internally; the
+/// mapping moved here when metrics recording moved to the daemon boundary.
+fn inference_error_label(e: &InferenceError) -> &'static str {
+    match e {
+        InferenceError::Unauthorized { .. } => "unauthorized",
+        InferenceError::RateLimited { .. } => "rate_limited",
+        InferenceError::ServerError { .. } => "server_error",
+        InferenceError::ClientError { .. } => "client_error",
+        InferenceError::EmptyResponse => "empty_response",
+        InferenceError::Cancelled => "cancelled",
+        InferenceError::TruncatedToolCall { .. } => "truncated_tool_call",
+        InferenceError::Io(_) => "other",
     }
 }
 
@@ -185,9 +190,7 @@ where
 mod tests {
     use super::*;
     use crate::accounts::AccountConfig;
-    use crate::anthropic::AnthropicConfig;
-
-    use crate::openai::ServiceConfig;
+    use choreo_ai_protocols::openai::ServiceConfig;
 
     #[test]
     fn from_openai_constructs_provider() {
@@ -241,6 +244,20 @@ mod tests {
     }
 
     #[test]
+    fn from_account_config_google_succeeds() {
+        let cfg = AccountConfig::simple("gemini", "google");
+        let result = InferenceProvider::from_account_config(&cfg, Some("key".into()));
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn from_account_config_google_missing_key_errors() {
+        let cfg = AccountConfig::simple("gemini", "google");
+        let err = InferenceProvider::from_account_config(&cfg, None).unwrap_err();
+        assert!(err.contains("no API key"), "{err}");
+    }
+
+    #[test]
     fn anthropic_provider_list_models_returns_known() {
         let config = AnthropicConfig::default();
         let client = AnthropicClient::new(config, "test-key".into()).unwrap();
@@ -252,7 +269,7 @@ mod tests {
 
     #[test]
     fn resolve_context_window_uses_client_then_catalog() {
-        let mut cfg = crate::openai::ServiceConfig::default();
+        let mut cfg = ServiceConfig::default();
         cfg.context_window_config.per_model = [("gpt-4.1-nano".into(), 1_048_576)].into();
         cfg.context_window_config.context_window = Some(128_000);
         let client = OpenAiClient::new(cfg, "test-key".into()).unwrap();

@@ -764,6 +764,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "choreo-ai-protocols"
+version = "0.1.0"
+dependencies = [
+ "choreo-proto",
+ "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
 name = "choreo-client-core"
 version = "0.1.0"
 dependencies = [
@@ -782,6 +796,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
+ "choreo-ai-protocols",
  "choreo-keystore",
  "choreo-mcp",
  "choreo-proto",

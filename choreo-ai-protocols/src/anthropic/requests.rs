@@ -7,12 +7,11 @@ use serde::Deserialize;
 use tracing::{debug, trace};
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition};
-use crate::providers::StreamEvent;
-use crate::providers::shared::MAX_TOOL_CALLS;
-use crate::providers::types::{
-    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult,
-};
 use crate::retry;
+use crate::shared::MAX_TOOL_CALLS;
+use crate::types::{
+    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
+};
 
 use super::{
     AnthropicConfig, AnthropicError, MessagesRequest, MessagesResponse, ModelListResponse,

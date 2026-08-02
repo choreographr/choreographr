@@ -5,10 +5,9 @@ use super::retry;
 use super::{
     ChatRequestMessage, ChatToolDefinition, SseReader, endpoint_url, validate_tool_call_arguments,
 };
-use crate::providers::StreamEvent;
-use crate::providers::shared::MAX_TOOL_CALLS;
-use crate::providers::types::{
-    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult,
+use crate::shared::MAX_TOOL_CALLS;
+use crate::types::{
+    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
 use choreo_proto::TokenUsage;
 use std::collections::HashMap;

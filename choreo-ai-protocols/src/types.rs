@@ -5,8 +5,8 @@ use choreo_proto::TokenUsage;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CallerInfo {
     #[serde(rename = "type")]
-    pub(crate) kind: String,
-    pub(crate) caller_id: String,
+    pub kind: String,
+    pub caller_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,4 +38,17 @@ pub struct FinalTextResult {
 pub enum ChatTurnResult {
     FinalText(FinalTextResult),
     ToolUse(ChatAssistantToolUse),
+}
+
+/// A single event emitted during a streaming LLM response.
+///
+/// Replaces the old `(CompletionChunkKind, String)` tuple with a
+/// self-describing enum so each variant carries its data inline.  The
+/// consumer receives these through the `on_event` callback of
+/// [`chat_completion_turn_streaming`](crate::ProviderClient::chat_completion_turn_streaming)
+/// and can use them for real-time UI updates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEvent {
+    Answer(String),
+    Reasoning(String),
 }

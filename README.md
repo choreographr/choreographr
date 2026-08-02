@@ -228,7 +228,7 @@ Gemini each have their own format.
 
 ## Crates
 
-A Rust workspace of eleven crates (resolver = "3"):
+A Rust workspace of twelve crates (resolver = "3"):
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a deep dive into the daemon's
 internals — threading model, provider architecture, tool system, and session
@@ -237,6 +237,7 @@ data model.
 | Crate | Description |
 |---|---|
 | `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
+| `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (70+ providers) |
 | `choreo-proto` | Framed binary protocol (postcard + length prefix) shared between clients and daemon |
 | `choreo-keystore` | X25519 keypair + ECDH/AES-256-GCM crypto library for encrypted credentials |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
@@ -348,7 +349,7 @@ retry_max_attempts = 3
 Supported providers: all entries in the provider catalog — 70+ across three
 wire protocols (OpenAI-compatible, Anthropic Messages, Google Generative AI).
 Each provider has its own data file under
-`choreo-daemon/src/providers/catalog/<slug>.toml` (one file per provider,
+`choreo-ai-protocols/src/catalog/<slug>.toml` (one file per provider,
 TOML data, not code) with a curated model list, context windows, reasoning
 levels, and the API format each model uses. Highlights: OpenAI, Anthropic,
 Google Gemini, Mistral, DeepSeek, xAI Grok, Groq, Together AI, OpenRouter,

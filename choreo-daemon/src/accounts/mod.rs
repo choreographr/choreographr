@@ -5,7 +5,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::openai::{MaxTokensField, RequestFormat};
+use choreo_ai_protocols::openai::{MaxTokensField, RequestFormat};
 
 /// Configuration for a single inference account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,7 +94,7 @@ impl AccountConfig {
     }
 
     /// Apply this account's config overrides to a ServiceConfig.
-    pub fn apply_overrides(&self, config: &mut crate::openai::ServiceConfig) {
+    pub fn apply_overrides(&self, config: &mut choreo_ai_protocols::openai::ServiceConfig) {
         if let Some(base_url) = &self.base_url {
             config.base_url = base_url.clone();
         }
@@ -155,6 +155,24 @@ impl AccountConfig {
         config
             .context_window_config
             .apply_overrides(self.context_window, self.model_context_windows.as_ref());
+    }
+
+    /// Convert the shared override fields into the protocol-agnostic carrier
+    /// used by the provider crates (`choreo-ai-protocols`).  OpenAI-specific
+    /// fields are not represented — they are applied directly via
+    /// [`apply_overrides`](Self::apply_overrides).
+    pub fn provider_overrides(&self) -> choreo_ai_protocols::ProviderOverrides {
+        choreo_ai_protocols::ProviderOverrides {
+            base_url: self.base_url.clone(),
+            streaming: self.streaming,
+            retry_max_attempts: self.retry_max_attempts,
+            connect_timeout_secs: self.connect_timeout_secs,
+            request_timeout_secs: self.request_timeout_secs,
+            retry_initial_backoff_ms: self.retry_initial_backoff_ms,
+            retry_max_backoff_ms: self.retry_max_backoff_ms,
+            context_window: self.context_window,
+            model_context_windows: self.model_context_windows.clone(),
+        }
     }
 
     pub fn to_info(&self, has_credential: bool) -> AccountInfo {
@@ -479,7 +497,7 @@ model = "claude-4"
 
     #[test]
     fn apply_overrides() {
-        let mut svc_config = crate::openai::ServiceConfig::default();
+        let mut svc_config = choreo_ai_protocols::openai::ServiceConfig::default();
         let cfg = AccountConfig {
             base_url: Some("https://custom.api.com/v1".to_string()),
             streaming: Some(false),
@@ -489,9 +507,11 @@ model = "claude-4"
             model_list_path: Some("/v2/models".to_string()),
             responses_path: Some("/v2/responses".to_string()),
             chat_completions_path: Some("/v2/chat".to_string()),
-            default_request_format: Some(crate::openai::RequestFormat::Responses),
+            default_request_format: Some(choreo_ai_protocols::openai::RequestFormat::Responses),
             chat_completions_max_tokens: Some(2048),
-            chat_completions_max_tokens_field: Some(crate::openai::MaxTokensField::MaxTokens),
+            chat_completions_max_tokens_field: Some(
+                choreo_ai_protocols::openai::MaxTokensField::MaxTokens,
+            ),
             responses_max_output_tokens: Some(4096),
             model_responses_max_output_tokens: Some(std::collections::HashMap::from([(
                 "gpt-4".to_string(),
@@ -512,12 +532,12 @@ model = "claude-4"
         assert_eq!(svc_config.chat_completions_path, "/v2/chat");
         assert_eq!(
             svc_config.default_request_format,
-            crate::openai::RequestFormat::Responses
+            choreo_ai_protocols::openai::RequestFormat::Responses
         );
         assert_eq!(svc_config.chat_completions_max_tokens, Some(2048));
         assert_eq!(
             svc_config.chat_completions_max_tokens_field,
-            crate::openai::MaxTokensField::MaxTokens
+            choreo_ai_protocols::openai::MaxTokensField::MaxTokens
         );
         assert_eq!(svc_config.retry_initial_backoff_ms, 500);
         assert_eq!(svc_config.retry_max_backoff_ms, 60000);

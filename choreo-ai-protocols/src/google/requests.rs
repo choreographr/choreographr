@@ -6,17 +6,15 @@ use choreo_proto::TokenUsage;
 use tracing::{debug, trace};
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition};
-use crate::providers::StreamEvent;
-use crate::providers::types::ChatTurnResult;
 use crate::retry;
+use crate::shared::MAX_TOOL_CALLS;
+use crate::types::{ChatTurnResult, StreamEvent};
 
 use super::{
     GenerateContentRequest, GenerateContentResponse, GoogleConfig, GoogleError, ModelListResponse,
     build_message_payloads, build_tool_payloads, model_url, response_to_turn_result,
     thinking_config_payload,
 };
-
-use crate::providers::shared::MAX_TOOL_CALLS;
 
 /// Endpoint action for non-streaming content generation.
 const GENERATE_CONTENT: &str = "generateContent";
