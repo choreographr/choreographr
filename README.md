@@ -38,6 +38,8 @@ The LLM can invoke the RISC-V VM (powered by [CKB VM](https://github.com/nervosn
 
 The VM has full access to the agent's tool calls. The LLM can quickly write a Rust script for a complex task and hand it off to the VM for high-performance execution.
 
+The sandbox VM is single-hart with the RISC-V A (atomic) extension disabled, so guest code must not use `core::sync::atomic` read-modify-write operations (they fail at compile time).
+
 
 ### Multiple live sessions
 

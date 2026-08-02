@@ -175,7 +175,8 @@ fn memory_size_at_cap_passes_validation() {
 #[test]
 #[ignore]
 fn bitmanip_source_program() {
-    // The daemon compiles `source` guests with -C opt-level=2 -C target-feature=+b.
+    // The daemon compiles `source` guests with -C opt-level=2 -C target-feature=+b,-a
+    // (the `-a` disables the A/atomic extension; see atomic_guest_rejected_at_compile_time).
     // The arg is runtime data (defeating const folding), so LLVM must emit real
     // bitmanip instructions — `count_ones` -> cpop, `leading_zeros` -> clz,
     // `trailing_zeros` -> ctz, `swap_bytes` -> rev8 (verified via objdump: all
@@ -211,6 +212,39 @@ fn bitmanip_source_program() {
         content.contains("cpop=16 clz=4 ctz=32 rev8=000000000f0f0f0f"),
         "{}",
         content
+    );
+}
+
+#[test]
+#[ignore]
+fn atomic_guest_rejected_at_compile_time() {
+    // The daemon compiles `source` guests with -C opt-level=2 -C target-feature=+b,-a:
+    // the RISC-V A (atomic) extension is disabled because the VM is single-hart
+    // (one instruction stream), so atomics have no real concurrency semantics.
+    // A guest using an RMW atomic lowers to `amoadd.w`, which LLVM cannot select
+    // without the A extension — the compile fails in the LLVM backend before the
+    // VM ever runs. The choreo::write below is intentionally unreachable.
+    let result = execute_run_riscv_tool(
+        &RunRiscVInput {
+            source: Some(
+                "use core::sync::atomic::{AtomicU32, Ordering};
+                 fn main() {
+                     let a = AtomicU32::new(0);
+                     a.fetch_add(1, Ordering::Relaxed);
+                     choreo::write(b\"unreachable\");
+                 }"
+                .to_string(),
+            ),
+            ..Default::default()
+        },
+        Some(Path::new("/tmp")),
+    );
+    assert!(result.is_err(), "expected compile error: {:?}", result);
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("compilation error") || err.contains("LLVM"),
+        "expected LLVM backend compile failure: {}",
+        err
     );
 }
 

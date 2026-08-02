@@ -7,8 +7,8 @@ use ckb_vm::Bytes;
 use ckb_vm::machine::VERSION2;
 use ckb_vm::{
     CoreMachine, DefaultCoreMachine, DefaultMachineBuilder, DefaultMachineRunner, Error as VmError,
-    FlatMemory, ISA_A, ISA_B, ISA_IMC, ISA_MOP, SupportMachine, Syscalls, TraceMachine,
-    memory::Memory, registers,
+    FlatMemory, ISA_B, ISA_IMC, ISA_MOP, SupportMachine, Syscalls, TraceMachine, memory::Memory,
+    registers,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -887,7 +887,7 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
             "-C",
             "opt-level=2",
             "-C",
-            "target-feature=+b",
+            "target-feature=+b,-a",
             "--edition",
             "2024",
             "--color",
@@ -1041,7 +1041,7 @@ fn run_riscv_impl(
 
     let target = "riscv64imac-unknown-none-elf";
     let compile_cmd = format!(
-        "rustc +stable --target {target} -C opt-level=2 -C target-feature=+b --edition 2024 --color always"
+        "rustc +stable --target {target} -C opt-level=2 -C target-feature=+b,-a --edition 2024 --color always"
     );
 
     let elf = match (
@@ -1105,8 +1105,15 @@ fn run_riscv_impl(
         ctx,
     };
 
+    // Single-hart VM: there is only one instruction stream, so the RISC-V A
+    // (atomic) extension has no real concurrency semantics to offer. Guests
+    // are compiled with `-C target-feature=+b,-a`, so any `core::sync::atomic`
+    // read-modify-write op (e.g. `AtomicU32::fetch_add`) is rejected by LLVM
+    // at compile time. Leaving A out of the ISA mask keeps the runtime decode
+    // surface in sync with what the compiler can emit and shrinks the
+    // untrusted instruction surface.
     let core = DefaultCoreMachine::<u64, FlatMemory<u64>>::new_with_memory(
-        ISA_IMC | ISA_A | ISA_B | ISA_MOP,
+        ISA_IMC | ISA_B | ISA_MOP,
         VERSION2,
         input.max_cycles.unwrap_or(DEFAULT_MAX_CYCLES),
         memory_size,
@@ -1221,7 +1228,7 @@ impl Tool for RunRiscV {
     }
 
     fn description(&self) -> &'static str {
-        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `choreo` module. For externally-compiled ELFs, use 'program' (base64) or 'program_path' (path to an ELF file on disk) — the binary must be compiled with the choreographr syscall ABI. Use per-tool convenience wrappers: choreo::read_file(path), choreo::write_file(path, content, overwrite), choreo::db_get(key), choreo::db_set(key, value), choreo::db_delete(key), choreo::sh(command, shell, workdir, timeout_ms), choreo::exec(command, args, workdir, timeout_ms), choreo::grep(pattern, regex, include, path, max_results), choreo::find(pattern, glob, path, max_results), choreo::http_request(method, url, headers, body, timeout_secs). CRITICAL: For grep, set regex:true when using regex patterns — the default is literal matching. The wrappers handle postcard encoding automatically. Use choreo::write(b\"...\") for VM output and choreo::exit(code) to finish. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported."
+        "Compile and run Rust code in a RISC-V sandboxed VM. PREFER the 'source' parameter over 'program'. With 'source', only provide a `fn main()` body — the tool auto-generates #![no_std], #![no_main], #[panic_handler], _start, and the `choreo` module. For externally-compiled ELFs, use 'program' (base64) or 'program_path' (path to an ELF file on disk) — the binary must be compiled with the choreographr syscall ABI. Use per-tool convenience wrappers: choreo::read_file(path), choreo::write_file(path, content, overwrite), choreo::db_get(key), choreo::db_set(key, value), choreo::db_delete(key), choreo::sh(command, shell, workdir, timeout_ms), choreo::exec(command, args, workdir, timeout_ms), choreo::grep(pattern, regex, include, path, max_results), choreo::find(pattern, glob, path, max_results), choreo::http_request(method, url, headers, body, timeout_secs). CRITICAL: For grep, set regex:true when using regex patterns — the default is literal matching. The wrappers handle postcard encoding automatically. Use choreo::write(b\"...\") for VM output and choreo::exit(code) to finish. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. The guest is a single-hart RISC-V VM with the A (atomic) extension disabled, so guests must not use `core::sync::atomic` read-modify-write operations (they fail at compile time)."
     }
 
     fn supports_streaming_output() -> bool {
@@ -1271,7 +1278,7 @@ impl Tool for RunRiscV {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `choreo` module — these are auto-generated. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. Use the provided wrappers (they handle postcard encoding automatically — no need to call choreo::tool_call or choreo::call directly):\n- choreo::write(b\"...\"), choreo::exit(code)\n- choreo::read_file(path: &str) -> String\n- choreo::write_file(path: &str, content: &str, overwrite: bool)\n- choreo::db_get(key: &str) -> Vec<u8>, choreo::db_set(key: &str, value: &[u8]), choreo::db_delete(key: &str) -> bool\n- choreo::sh(command: &str, shell: Shell, workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::exec(command: &str, args: &[&str], workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::grep(pattern: &str, regex: bool, include: Option<&str>, path: Option<&str>, max_results: Option<u32>) -> String — CRITICAL: set regex: true when pattern is a regular expression (default is literal substring match). include is a file glob filter (e.g. Some(\"*.rs\")). path scopes the search directory.\n- choreo::find(pattern: &str, glob: bool, path: Option<&str>, max_results: Option<u32>) -> String — glob: true = glob mode; false = auto-detect.\n- choreo::http_request(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&str>, timeout_secs: Option<u64>) -> String\nExample: `fn main() { let content = choreo::read_file(\"Cargo.toml\"); choreo::write(content.as_bytes()); }`. Alloc types are pre-imported: Vec, String, Box, format!, .to_string()."
+                    "description": "Rust source code for `fn main()`. CRITICAL: Do NOT include #![no_std], #![no_main], #[panic_handler], _start, or the `choreo` module — these are auto-generated. Do NOT use raw ecall with Linux syscall number 64 (write) — it is not supported. Use the provided wrappers (they handle postcard encoding automatically — no need to call choreo::tool_call or choreo::call directly):\n- choreo::write(b\"...\"), choreo::exit(code)\n- choreo::read_file(path: &str) -> String\n- choreo::write_file(path: &str, content: &str, overwrite: bool)\n- choreo::db_get(key: &str) -> Vec<u8>, choreo::db_set(key: &str, value: &[u8]), choreo::db_delete(key: &str) -> bool\n- choreo::sh(command: &str, shell: Shell, workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::exec(command: &str, args: &[&str], workdir: Option<&str>, timeout_ms: Option<u64>) -> String\n- choreo::grep(pattern: &str, regex: bool, include: Option<&str>, path: Option<&str>, max_results: Option<u32>) -> String — CRITICAL: set regex: true when pattern is a regular expression (default is literal substring match). include is a file glob filter (e.g. Some(\"*.rs\")). path scopes the search directory.\n- choreo::find(pattern: &str, glob: bool, path: Option<&str>, max_results: Option<u32>) -> String — glob: true = glob mode; false = auto-detect.\n- choreo::http_request(method: &str, url: &str, headers: &[(&str, &str)], body: Option<&str>, timeout_secs: Option<u64>) -> String\nExample: `fn main() { let content = choreo::read_file(\"Cargo.toml\"); choreo::write(content.as_bytes()); }`. Alloc types are pre-imported: Vec, String, Box, format!, .to_string(). The guest is a single-hart RISC-V VM with the A (atomic) extension disabled — do not use `core::sync::atomic` read-modify-write operations (they fail at compile time)."
                 },
                 "program": {
                     "type": "string",
