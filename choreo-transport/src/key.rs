@@ -185,8 +185,14 @@ fn open_locked_for_write(path: &std::path::Path) -> std::io::Result<std::fs::Fil
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
+    // These two tests mutate the process-global XDG_CONFIG_HOME env var.
+    // Running them in parallel would clobber each other's temp config dir
+    // mid-flight (one test's restore racing the other's setup), so they are
+    // serialized with `#[serial]` to keep them deterministic.
     #[test]
+    #[serial]
     fn ensure_transport_keypair_generates_and_loads() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let prev = std::env::var("XDG_CONFIG_HOME").ok();
@@ -221,6 +227,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn ensure_transport_keypair_is_race_safe() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let prev = std::env::var("XDG_CONFIG_HOME").ok();

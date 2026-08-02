@@ -40,11 +40,12 @@ dirs = "6"
 redb = "4"
 image = "0.25"
 rand = "0.10"
-resvg = "0.47"
+resvg = "0.48"
 serde_json = "1"
 schemars = { version = "1.2.1", features = ["derive"] }
 yaml_serde = "0.10"
 signal-hook = "0.4"
+serial_test = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 lru = "0.18"
