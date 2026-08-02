@@ -72,7 +72,7 @@ fn endpoint_url(base_url: &str, path: &str) -> io::Result<String> {
 }
 
 /// Send a POST /v1/messages request with retry.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn messages_request(
     agent: &ureq::Agent,
     config: &AnthropicConfig,
@@ -141,7 +141,7 @@ pub(super) fn messages_request(
 }
 
 /// Streaming POST /v1/messages request via SSE with retry.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn messages_request_streaming<F>(
     agent: &ureq::Agent,
     config: &AnthropicConfig,
@@ -429,7 +429,7 @@ enum StreamContentBlock {
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
     #[serde(rename = "redacted_thinking")]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     RedactedThinking { data: String },
 }
 
@@ -442,7 +442,7 @@ struct ContentBlockDelta {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
-#[allow(clippy::enum_variant_names)]
+#[expect(clippy::enum_variant_names)]
 enum StreamDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },

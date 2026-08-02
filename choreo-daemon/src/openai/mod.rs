@@ -12,7 +12,7 @@ use tracing::warn;
 pub(crate) use config::endpoint_url;
 // Re-export deprecated load_service_config for backward compatibility
 // with any existing callers (e.g., external code) that may still use it.
-#[allow(deprecated)]
+#[expect(deprecated)]
 pub use config::{
     DaemonConfig, ServiceConfig, completion, config_path, load_daemon_config, load_service_config,
     validate_and_list_models,

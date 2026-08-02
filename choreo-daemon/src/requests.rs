@@ -1357,7 +1357,7 @@ fn finish_tool_call(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn execute_tool_with_timeout(
     tool_call: &crate::providers::types::ChatToolCall,
     x_credentials: Option<&ServiceCredential>,

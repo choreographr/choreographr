@@ -1803,7 +1803,7 @@ fn handle_shutdown(
     state.active_requests.is_empty()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn run_request_worker(
     request_id: u32,
     client: InferenceProvider,

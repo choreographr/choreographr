@@ -320,7 +320,7 @@ pub(super) struct UsageMetadata {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct Candidate {
     content: Option<ContentBlock>,
     #[serde(default)]
@@ -330,7 +330,7 @@ struct Candidate {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct ContentBlock {
     parts: Vec<ResponsePart>,
     #[serde(default)]
@@ -370,7 +370,7 @@ pub(crate) struct GeminiErrorBody {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) struct GeminiErrorDetail {
     #[serde(default)]
     pub(crate) code: i64,

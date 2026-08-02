@@ -496,7 +496,7 @@ fn switch_attached_session(
     *ctx.attached_session_id = Some(new_session_id);
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 /// Handle a CreateSession client message. Returns false if the daemon
 /// disconnected, signaling client_thread to return.
 fn handle_client_create_session(

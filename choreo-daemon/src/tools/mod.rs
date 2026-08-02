@@ -381,7 +381,7 @@ pub trait ToolDyn: Send + Sync {
         image_tx: Option<mpsc::Sender<PreparedImage>>,
     ) -> Result<ToolOutput, ToolError>;
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     /// Streaming JSON path.
     fn execute_streaming_json(
         &self,
@@ -700,7 +700,7 @@ impl ToolRegistry {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     /// Streaming JSON path.
     pub fn execute_streaming_json(
         &self,

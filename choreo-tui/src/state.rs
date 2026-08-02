@@ -1968,7 +1968,7 @@ impl App {
     // All eight parameters are already owned by the caller (an image-ready
     // event handler); grouping them would only add a wrapper struct without
     // reducing the information flow.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn submit_image_job(
         &mut self,
         session_id: u64,

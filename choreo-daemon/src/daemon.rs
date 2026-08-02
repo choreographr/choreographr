@@ -431,7 +431,7 @@ impl DaemonState {
             .retain(|_id, tx| tx.send(msg.clone()).is_ok());
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     /// Create a new session. Sessions are lightweight containers that can be
     /// created regardless of lock state.
     fn handle_create_session(
@@ -1203,7 +1203,7 @@ impl DaemonState {
     }
 
     /// Add a new inference account.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn handle_add_account(
         &mut self,
         name: String,

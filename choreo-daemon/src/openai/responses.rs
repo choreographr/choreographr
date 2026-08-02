@@ -83,7 +83,7 @@ pub(crate) struct ResponsesResponse {
 /// Items in a Responses API response output array.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) enum ResponseOutputItem {
     Message {
         #[serde(default)]
@@ -231,7 +231,7 @@ fn extract_reasoning_text(summary: &[serde_json::Value]) -> Option<String> {
 /// Shared helper: build the URL and serialised request body for a
 /// Responses API request with tools (and optionally tool results from a
 /// previous turn).
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn build_responses_request_body(
     config: &super::ServiceConfig,
     model: &str,
@@ -430,7 +430,7 @@ where
 
 /// Non-streaming Responses API turn with tool definitions, reasoning effort,
 /// and optional tool results from a previous turn.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn responses_request_with_tools(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
@@ -656,7 +656,7 @@ impl AccCall {
 /// `on_chunk` for each content / reasoning delta so the caller can forward
 /// it to subscribers immediately.  Tool call deltas are accumulated across
 /// chunks and returned as `ChatTurnResult::ToolUse` when the stream ends.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn responses_request_streaming_with_tools<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,

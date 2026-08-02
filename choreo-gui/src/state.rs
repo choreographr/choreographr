@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use tracing::{debug, trace, warn};
 
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub(crate) enum UiEvent {
     Daemon(choreo_proto::DaemonMessage),

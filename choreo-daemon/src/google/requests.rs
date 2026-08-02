@@ -71,7 +71,7 @@ pub(super) fn list_models_request(
 }
 
 /// Send a POST /v1beta/models/{model}:generateContent request with retry.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn generate_content_request(
     agent: &ureq::Agent,
     config: &GoogleConfig,
@@ -142,7 +142,7 @@ pub(super) fn generate_content_request(
 }
 
 /// Streaming POST /v1beta/models/{model}:streamGenerateContent?alt=sse via SSE with retry.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(super) fn generate_content_request_streaming<F>(
     agent: &ureq::Agent,
     config: &GoogleConfig,

@@ -308,7 +308,7 @@ pub(super) struct ThinkingPayload {
 
 /// Response body from POST /v1/messages.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[expect(dead_code)]
 struct MessagesResponse {
     id: String,
     r#type: String,
@@ -337,7 +337,7 @@ enum ContentBlock {
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
     #[serde(rename = "redacted_thinking")]
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     RedactedThinking { data: String },
 }
 

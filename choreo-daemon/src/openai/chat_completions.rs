@@ -164,7 +164,7 @@ pub(crate) fn chat_completions_request(
 
 // ── Non-streaming chat completions with tools ────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn chat_completions_request_with_tools(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
@@ -280,7 +280,7 @@ pub(crate) fn chat_completions_request_with_tools(
 
 // ── Simple streaming chat completions ────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn chat_completions_request_streaming<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
@@ -406,7 +406,7 @@ pub(crate) fn accumulate_tool_calls_from_deltas(
 /// `on_chunk` for each content / reasoning delta so the caller can forward
 /// it to subscribers immediately.  Tool call deltas are accumulated across
 /// chunks and returned as `ChatTurnResult::ToolUse` when the stream ends.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) fn chat_completions_request_streaming_with_tools<F>(
     agent: &ureq::Agent,
     config: &super::ServiceConfig,
