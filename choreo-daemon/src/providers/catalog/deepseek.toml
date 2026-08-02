@@ -9,11 +9,11 @@ default_model = "deepseek-v4-pro"
 model = "deepseek-v4-flash"
 context_window = 1000000
 reasoning_supported = true
-reasoning_levels = ["off", "high", "xhigh"]
+reasoning_levels = ["off", "low", "high", "xhigh", "max"]
 responses = false
 [[models]]
 model = "deepseek-v4-pro"
 context_window = 1000000
 reasoning_supported = true
-reasoning_levels = ["off", "high", "xhigh"]
+reasoning_levels = ["off", "low", "high", "xhigh", "max"]
 responses = false

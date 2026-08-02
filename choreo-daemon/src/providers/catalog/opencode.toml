@@ -13,8 +13,8 @@ responses = false
 [[models]]
 model = "deepseek-v4-flash"
 context_window = 1000000
-reasoning_supported = false
-reasoning_levels = []
+reasoning_supported = true
+reasoning_levels = ["off", "high", "max"]
 responses = false
 [[models]]
 model = "deepseek-v4-flash-free"
@@ -25,8 +25,8 @@ responses = false
 [[models]]
 model = "deepseek-v4-pro"
 context_window = 1000000
-reasoning_supported = false
-reasoning_levels = []
+reasoning_supported = true
+reasoning_levels = ["off", "high", "max"]
 responses = false
 [[models]]
 model = "glm-5"

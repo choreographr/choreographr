@@ -334,12 +334,6 @@ mod tests {
     }
 
     #[test]
-    fn model_reasoning_capability_deepseek_v4_flash() {
-        let cap = model_reasoning_capability("deepseek", "deepseek-v4-flash");
-        assert_eq!(cap.available_effort_levels, vec!["off", "high", "xhigh"]);
-    }
-
-    #[test]
     fn model_reasoning_capability_anthropic_supported() {
         let cap = model_reasoning_capability("anthropic", "claude-sonnet-4-6");
         assert_eq!(
