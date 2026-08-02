@@ -599,7 +599,7 @@ pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
     }
-    while matches!(lines.last(), Some(line) if line.width() == 0) {
+    while matches!(lines.last(), Some(line) if line_is_blank(line)) {
         lines.pop();
     }
     if lines.is_empty() {
@@ -608,12 +608,20 @@ pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+/// True when a rendered line is visually blank: every span is empty or
+/// whitespace-only.  Indented blanks count as blank even though they have
+/// nonzero width — e.g. a nested list's after-margin rendered as a
+/// continuation line inside an outer item.
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
 /// Push a blank (zero-width) line onto `lines` unless the last line is
-/// already blank.  This gives us CSS-like margin collapsing: multiple
-/// adjacent blocks that each want vertical space produce at most one
-/// blank line between them.
+/// already blank (zero-width or whitespace-only).  This gives us CSS-like
+/// margin collapsing: multiple adjacent blocks that each want vertical
+/// space produce at most one blank line between them.
 fn ensure_blank_line(lines: &mut Vec<Line<'static>>) {
-    if lines.last().is_none_or(|l| l.width() > 0) {
+    if lines.last().is_none_or(|l| !line_is_blank(l)) {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
     }
 }
@@ -3290,6 +3298,20 @@ mod tests {
         assert_eq!(lines.len(), 2);
     }
 
+    #[test]
+    fn ensure_blank_line_collapses_whitespace_only() {
+        // A line of indent-only spaces is visually blank even though it has
+        // nonzero width — e.g. a nested list's after-margin rendered as a
+        // continuation line inside an outer item.  The margin must collapse
+        // into it rather than stacking a second blank row.
+        let mut lines = vec![
+            Line::from("hello"),
+            Line::from(Span::styled("     ".to_string(), Style::default())),
+        ];
+        ensure_blank_line(&mut lines);
+        assert_eq!(lines.len(), 2, "indented blank should collapse, not stack");
+    }
+
     // ── list blank-line collapsing ────────────────────────────────────────
 
     #[test]
@@ -3441,22 +3463,26 @@ mod tests {
             i >= 1 && result[i - 1].width() > 0,
             "inner items should be compact (no blank before inner2)"
         );
-        // Outer items spaced: blank line before "• outer b".
+        // Outer items spaced: blank line before "• outer b".  The blank is
+        // the nested list's after-margin rendered as an indented
+        // whitespace-only line, so it is visually blank but has nonzero
+        // width.
         let outer_b_idx = result
             .iter()
             .position(|l| l.to_string().contains("outer b"));
         assert!(outer_b_idx.is_some(), "outer b should appear");
         let b = outer_b_idx.unwrap();
         assert!(
-            b >= 1 && result[b - 1].width() == 0,
+            b >= 1 && result[b - 1].to_string().trim().is_empty(),
             "expected blank line before '• outer b', got lines[{}]='{}'",
             b - 1,
             result[b - 1]
         );
-        // No consecutive blank lines anywhere.
+        // No consecutive blank lines anywhere (visually blank includes
+        // indented whitespace-only lines).
         let has_double_blank = result
             .windows(2)
-            .any(|w| w[0].width() == 0 && w[1].width() == 0);
+            .any(|w| w[0].to_string().trim().is_empty() && w[1].to_string().trim().is_empty());
         assert!(
             !has_double_blank,
             "should not have two consecutive blank lines\n{whole}"
@@ -3514,10 +3540,11 @@ mod tests {
             !text.last().is_some_and(|l| l.trim().is_empty()),
             "no trailing blank line after the list\n{whole}"
         );
-        // No consecutive blank lines anywhere.
+        // No consecutive blank lines anywhere (visually blank includes
+        // indented whitespace-only lines).
         let has_double_blank = result
             .windows(2)
-            .any(|w| w[0].width() == 0 && w[1].width() == 0);
+            .any(|w| w[0].to_string().trim().is_empty() && w[1].to_string().trim().is_empty());
         assert!(!has_double_blank, "no consecutive blank lines\n{whole}");
     }
 
@@ -3532,6 +3559,58 @@ mod tests {
             blank.iter().filter(|&&b| b).count(),
             0,
             "single-line ordered items should have no blank lines between them"
+        );
+    }
+
+    #[test]
+    fn spaced_list_nested_list_single_blank_between_items() {
+        // A spaced outer list (majority of items wrap) where an item contains
+        // a nested list: the nested list's after-margin is an indented
+        // whitespace-only line, and the between-item margin must collapse
+        // into it — exactly one blank row, not two.  This is the reported
+        // regression: the old ensure_blank_line only collapsed zero-width
+        // lines and stacked a second blank after the indented one.
+        let long = "a".repeat(60);
+        let md = format!(
+            "1. {long} Options:\n      - inner one\n      - inner two\n2. {long}\n3. short"
+        );
+        let result = markdown_lines(&md, 40);
+        let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        let whole = text.join("\n");
+        let idx2 = text
+            .iter()
+            .position(|l| l.trim_start().starts_with("2. "))
+            .expect("item 2");
+        // Exactly one blank row between the nested list and item 2.
+        assert!(
+            text[idx2 - 1].trim().is_empty(),
+            "expected a blank line before '2. '\n{whole}"
+        );
+        assert!(
+            !text[idx2 - 2].trim().is_empty(),
+            "expected exactly one blank line before '2. ', got two\n{whole}"
+        );
+        // No two consecutive visually-blank rows anywhere.
+        let has_double_blank = text
+            .windows(2)
+            .any(|w| w[0].trim().is_empty() && w[1].trim().is_empty());
+        assert!(!has_double_blank, "no two consecutive blank lines\n{whole}");
+    }
+
+    #[test]
+    fn list_ending_with_nested_list_has_no_trailing_blank() {
+        // The document's last item ends with a nested list.  The nested
+        // list's after-margin is an indented whitespace-only line and the
+        // outer list's own after-margin collapses into it; that trailing
+        // whitespace line must be stripped by markdown_lines just like a
+        // zero-width blank.
+        let md = "1. first\n2. outer\n      - inner\n      - inner2";
+        let result = markdown_lines(md, 80);
+        let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        assert!(
+            !text.last().is_some_and(|l| l.trim().is_empty()),
+            "no trailing blank line\n{}",
+            text.join("\n")
         );
     }
 
