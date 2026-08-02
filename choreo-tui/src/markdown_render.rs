@@ -1119,7 +1119,7 @@ fn pad_aligned(text: &str, width: usize, alignment: MarkdownAlignment) -> String
     let remaining = width - text_width;
     let (left, right) = match alignment {
         MarkdownAlignment::Right => (remaining, 0),
-        MarkdownAlignment::Center => (remaining / 2, remaining - (remaining / 2)),
+        MarkdownAlignment::Center => (remaining / 2, remaining.div_ceil(2)),
         MarkdownAlignment::Left | MarkdownAlignment::None => (0, remaining),
     };
     format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
