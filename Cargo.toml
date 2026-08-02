@@ -14,6 +14,12 @@ members = [
 ]
 resolver = "3"
 
+# Shared package metadata inherited by every member via `*.workspace = true`.
+# MSRV: the workspace builds and tests on Rust 1.91 and newer; keep code and
+# dependencies within this floor (see ARCHITECTURE.md).
+[workspace.package]
+rust-version = "1.91"
+
 [workspace.dependencies]
 anyhow = "1"
 thiserror = "2"

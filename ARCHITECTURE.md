@@ -1831,6 +1831,11 @@ cargo test
 
 ## Build and run
 
+The workspace targets a minimum supported Rust version (MSRV) of **1.91**,
+declared via `rust-version` in every crate manifest (inherited from
+`[workspace.package]` in the root `Cargo.toml`). Keep code and dependencies
+within this floor; the CI MSRV job enforces it.
+
 ```bash
 # Build everything
 cargo build

@@ -167,9 +167,10 @@ Choreographr will have an option to automate this process, so it can be left alo
 
 ## Quick start
 
-Requires a [Rust toolchain](https://rustup.rs/).
+Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.91**.
 
 ```bash
+rustup toolchain install 1.91.0
 cargo build --release
 ```
 

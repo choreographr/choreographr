@@ -254,15 +254,11 @@ mod tests {
                 "empty model for {}",
                 entry.slug
             );
+            // `context_window` is a `u32` where 0 means "unknown"; the previous
+            // `== 0 || > 0` check was vacuously true for every model, so it is
+            // dropped (clippy::double_comparisons).
             for m in &entry.models {
                 assert!(!m.model.is_empty(), "empty model slug in {}", entry.slug);
-                assert!(
-                    m.context_window == 0 || m.context_window > 0,
-                    "invalid context window {} for slug '{}' in {}",
-                    m.context_window,
-                    m.model,
-                    entry.slug
-                );
             }
         }
     }

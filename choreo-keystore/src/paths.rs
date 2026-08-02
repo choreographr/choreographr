@@ -2,7 +2,6 @@ use crate::error::KeystoreError;
 use std::path::PathBuf;
 use tracing::debug;
 
-#[doc(hidden)]
 thread_local! {
     /// Test-only override for config_dir. When set, config_dir() returns
     /// a choreographr subdirectory inside this path instead of the real

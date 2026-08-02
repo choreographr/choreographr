@@ -2,6 +2,7 @@
 name = "choreo-markdown"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 
 [dependencies]
 pulldown-cmark = "0.13"

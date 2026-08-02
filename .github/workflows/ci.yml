@@ -1,0 +1,36 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  msrv:
+    name: Check MSRV (1.91.0)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust 1.91.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91.0"
+      - name: cargo check --all-targets
+        # --all-targets ensures tests/examples/benches compile at the MSRV,
+        # not just libs/bins. --locked ensures the checked-in lockfile is used.
+        run: cargo check --workspace --all-targets --locked
+
+  stable:
+    name: Stable quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo clippy --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test --workspace
+        # Integration tests live in crate-level tests/ dirs and are marked
+        # #[ignore]; this runs the unit-test suite only.
+        run: cargo test --workspace --locked
