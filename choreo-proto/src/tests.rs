@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Cursor;
 
 #[test]
@@ -503,4 +503,101 @@ fn turn_finalized_serde_round_trip() {
     let frame = encode_frame(&msg).expect("encode");
     let decoded: DaemonMessage = decode_frame(&frame[4..]).expect("decode");
     assert_eq!(decoded, msg);
+}
+
+// ── InferenceError metric_label tests ─────────────────────────
+
+#[test]
+fn inference_error_metric_labels_are_stable() {
+    assert_eq!(
+        InferenceError::Unauthorized {
+            status: 401,
+            detail: "x".into()
+        }
+        .metric_label(),
+        "unauthorized"
+    );
+    assert_eq!(
+        InferenceError::RateLimited {
+            retry_after_secs: None,
+            detail: "x".into()
+        }
+        .metric_label(),
+        "rate_limited"
+    );
+    assert_eq!(
+        InferenceError::ServerError {
+            status: 500,
+            detail: "x".into()
+        }
+        .metric_label(),
+        "server_error"
+    );
+    assert_eq!(
+        InferenceError::ClientError {
+            status: 400,
+            detail: "x".into()
+        }
+        .metric_label(),
+        "client_error"
+    );
+    assert_eq!(
+        InferenceError::EmptyResponse.metric_label(),
+        "empty_response"
+    );
+    assert_eq!(InferenceError::Cancelled.metric_label(), "cancelled");
+    assert_eq!(
+        InferenceError::TruncatedToolCall {
+            discarded: vec![DiscardedToolCall {
+                name: "t".into(),
+                arguments_json: "{}".into()
+            }]
+        }
+        .metric_label(),
+        "truncated_tool_call"
+    );
+    assert_eq!(
+        InferenceError::Io(std::io::Error::other("oops")).metric_label(),
+        "other"
+    );
+}
+
+#[test]
+fn inference_error_metric_labels_are_distinct() {
+    // Every variant must map to a unique label. Collisions would silently
+    // merge distinct error classes in the Prometheus counters, hiding real
+    // failure modes behind a single `error_type` value.
+    let labels: HashSet<&str> = [
+        InferenceError::Unauthorized {
+            status: 401,
+            detail: "x".into(),
+        }
+        .metric_label(),
+        InferenceError::RateLimited {
+            retry_after_secs: None,
+            detail: "x".into(),
+        }
+        .metric_label(),
+        InferenceError::ServerError {
+            status: 500,
+            detail: "x".into(),
+        }
+        .metric_label(),
+        InferenceError::ClientError {
+            status: 400,
+            detail: "x".into(),
+        }
+        .metric_label(),
+        InferenceError::EmptyResponse.metric_label(),
+        InferenceError::Cancelled.metric_label(),
+        InferenceError::TruncatedToolCall { discarded: vec![] }.metric_label(),
+        InferenceError::Io(std::io::Error::other("oops")).metric_label(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        labels.len(),
+        8,
+        "each InferenceError variant must have a distinct metric label"
+    );
 }

@@ -81,20 +81,35 @@ impl GoogleConfig {
 pub use crate::shared::ProviderError as GoogleError;
 
 /// The Google Gemini API client.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct GoogleClient {
     config: GoogleConfig,
-    api_key: String,
+    api_key: zeroize::Zeroizing<String>,
     http: ureq::Agent,
+}
+
+// Manual Debug impl: derived Debug would print the raw API key if a client is
+// ever logged.  Redact the key (`***`) while still delegating the other fields
+// (config, http) so the struct stays useful in logs.
+impl std::fmt::Debug for GoogleClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleClient")
+            .field("config", &self.config)
+            .field("api_key", &"***")
+            .field("http", &self.http)
+            .finish()
+    }
 }
 
 impl GoogleClient {
     pub fn new(config: GoogleConfig, api_key: String) -> io::Result<Self> {
         let http =
             crate::shared::build_agent(config.connect_timeout_secs, config.request_timeout_secs);
+        // Zeroizing<String> wipes the key bytes from memory when the client is
+        // dropped; `new` keeps its `String` signature so callers are unaffected.
         Ok(Self {
             config,
-            api_key,
+            api_key: zeroize::Zeroizing::new(api_key),
             http,
         })
     }
@@ -104,7 +119,8 @@ impl GoogleClient {
     }
 
     pub fn api_key(&self) -> &str {
-        &self.api_key
+        // `Zeroizing<String>` derefs to `String`, so `as_str()` works directly.
+        self.api_key.as_str()
     }
 
     /// List available models from the API, falling back to the curated static list

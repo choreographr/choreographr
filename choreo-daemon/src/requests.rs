@@ -919,6 +919,10 @@ pub(crate) fn run_agent_loop(
                             },
                         ));
                     }
+                    // `StreamEvent` is #[non_exhaustive] — a future event kind
+                    // this loop doesn't forward should be ignored, not crash
+                    // the agent loop.
+                    _ => {}
                 }
                 Ok(())
             },
@@ -1265,6 +1269,16 @@ pub(crate) fn run_agent_loop(
                 for change in &pending_config_changes {
                     apply_pending_config_change(session, change);
                 }
+            }
+            Ok(_) => {
+                // A new ChatTurnResult variant (this enum is #[non_exhaustive])
+                // is not handled here — fail loudly rather than silently
+                // treating unknown output as success.
+                warn!("provider returned an unhandled ChatTurnResult variant");
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider returned an unhandled turn result variant",
+                ));
             }
             Err(choreo_proto::InferenceError::Cancelled) => {
                 return Ok(true);

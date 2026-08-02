@@ -162,17 +162,7 @@ impl AccountConfig {
     /// fields are not represented — they are applied directly via
     /// [`apply_overrides`](Self::apply_overrides).
     pub fn provider_overrides(&self) -> choreo_ai_protocols::ProviderOverrides {
-        choreo_ai_protocols::ProviderOverrides {
-            base_url: self.base_url.clone(),
-            streaming: self.streaming,
-            retry_max_attempts: self.retry_max_attempts,
-            connect_timeout_secs: self.connect_timeout_secs,
-            request_timeout_secs: self.request_timeout_secs,
-            retry_initial_backoff_ms: self.retry_initial_backoff_ms,
-            retry_max_backoff_ms: self.retry_max_backoff_ms,
-            context_window: self.context_window,
-            model_context_windows: self.model_context_windows.clone(),
-        }
+        choreo_ai_protocols::ProviderOverrides::from(self)
     }
 
     pub fn to_info(&self, has_credential: bool) -> AccountInfo {
@@ -180,6 +170,30 @@ impl AccountConfig {
             name: self.name.clone(),
             provider: self.provider.clone(),
             has_credential,
+        }
+    }
+}
+
+/// Convert the shared override fields of an [`AccountConfig`] into the
+/// protocol-agnostic carrier used by the provider crates.
+///
+/// Kept as a `From` impl so `provider_overrides()` construction can't drift
+/// from this field list (the carrier is the single source of truth for what
+/// gets forwarded to every provider).  OpenAI-specific fields are deliberately
+/// not represented here — they are applied directly via
+/// [`AccountConfig::apply_overrides`].
+impl From<&AccountConfig> for choreo_ai_protocols::ProviderOverrides {
+    fn from(config: &AccountConfig) -> Self {
+        choreo_ai_protocols::ProviderOverrides {
+            base_url: config.base_url.clone(),
+            streaming: config.streaming,
+            retry_max_attempts: config.retry_max_attempts,
+            connect_timeout_secs: config.connect_timeout_secs,
+            request_timeout_secs: config.request_timeout_secs,
+            retry_initial_backoff_ms: config.retry_initial_backoff_ms,
+            retry_max_backoff_ms: config.retry_max_backoff_ms,
+            context_window: config.context_window,
+            model_context_windows: config.model_context_windows.clone(),
         }
     }
 }

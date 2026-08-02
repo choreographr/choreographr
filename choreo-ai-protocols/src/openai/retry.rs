@@ -22,12 +22,15 @@ pub(crate) fn retry_send(
     on_retry: &mut Option<RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
-    let auth_header = format!("Bearer {}", api_key.trim());
+    let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", api_key.trim()));
+    // The closure captures `auth_header` by reference (it stays `Fn`); the
+    // Zeroizing wrapper ensures the temporary `Bearer …` string is wiped when
+    // it goes out of scope.
     retry::retry_loop(
         || {
             agent
                 .post(url)
-                .header("Authorization", &auth_header)
+                .header("Authorization", auth_header.as_str())
                 .send_json(body.clone())
         },
         retry_cfg,
@@ -45,9 +48,17 @@ pub(crate) fn retry_send_get(
     on_retry: &mut Option<RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
-    let auth_header = format!("Bearer {}", api_key.trim());
+    let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", api_key.trim()));
+    // The closure captures `auth_header` by reference (it stays `Fn`); the
+    // Zeroizing wrapper ensures the temporary `Bearer …` string is wiped when
+    // it goes out of scope.
     retry::retry_loop(
-        || agent.get(url).header("Authorization", &auth_header).call(),
+        || {
+            agent
+                .get(url)
+                .header("Authorization", auth_header.as_str())
+                .call()
+        },
         retry_cfg,
         on_retry,
         cancel_rx,

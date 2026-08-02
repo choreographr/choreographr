@@ -147,6 +147,27 @@ pub enum InferenceError {
     Io(#[from] std::io::Error),
 }
 
+impl InferenceError {
+    /// Map this error variant to a stable, metrics-safe label string.
+    ///
+    /// Labels are lowercase snake_case constants consumed by the daemon's
+    /// Prometheus counters (e.g. `choreo_api_errors_total{error_type=...}`).
+    /// They are part of the public metrics contract: renaming a label changes
+    /// dashboards/alerts, so keep existing values stable.
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            InferenceError::Unauthorized { .. } => "unauthorized",
+            InferenceError::RateLimited { .. } => "rate_limited",
+            InferenceError::ServerError { .. } => "server_error",
+            InferenceError::ClientError { .. } => "client_error",
+            InferenceError::EmptyResponse => "empty_response",
+            InferenceError::Cancelled => "cancelled",
+            InferenceError::TruncatedToolCall { .. } => "truncated_tool_call",
+            InferenceError::Io(_) => "other",
+        }
+    }
+}
+
 impl From<InferenceError> for std::io::Error {
     fn from(e: InferenceError) -> Self {
         match e {

@@ -105,11 +105,9 @@ impl ServiceConfig {
         self.context_window_config.context_window_for_model(model)
     }
 
-    /// Resolve which JSON field to use for the token limit for a given model.
-    /// Per-model overrides take precedence over the default.
     /// Returns whether programmatic tool calling should be enabled for a given model.
     ///
-    /// Auto-enables for gpt-5.6+ models when the default is Responses API.
+    /// Auto-enables for gpt-5.6+ models when the default is the Responses API.
     /// The account-level `programmatic_tool_calling` override takes precedence.
     pub fn programmatic_tool_calling_for_model(&self, model: &str) -> bool {
         if self.programmatic_tool_calling {

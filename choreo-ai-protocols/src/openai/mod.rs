@@ -165,20 +165,35 @@ impl ChatToolDefinition {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OpenAiClient {
     config: ServiceConfig,
-    api_key: String,
+    api_key: zeroize::Zeroizing<String>,
     http: ureq::Agent,
+}
+
+// Manual Debug impl: derived Debug would print the raw API key if a client is
+// ever logged.  Redact the key (`***`) while still delegating the other fields
+// (config, http) so the struct stays useful in logs.
+impl std::fmt::Debug for OpenAiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiClient")
+            .field("config", &self.config)
+            .field("api_key", &"***")
+            .field("http", &self.http)
+            .finish()
+    }
 }
 
 impl OpenAiClient {
     pub fn new(config: ServiceConfig, api_key: String) -> io::Result<Self> {
         let http =
             crate::shared::build_agent(config.connect_timeout_secs, config.request_timeout_secs);
+        // Zeroizing<String> wipes the key bytes from memory when the client is
+        // dropped; `new` keeps its `String` signature so callers are unaffected.
         Ok(Self {
             config,
-            api_key,
+            api_key: zeroize::Zeroizing::new(api_key),
             http,
         })
     }
@@ -188,7 +203,8 @@ impl OpenAiClient {
     }
 
     pub fn api_key(&self) -> &str {
-        &self.api_key
+        // `Zeroizing<String>` derefs to `String`, so `as_str()` works directly.
+        self.api_key.as_str()
     }
 
     // ── High-level dispatch methods ────────────────────────────────────

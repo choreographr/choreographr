@@ -27,8 +27,10 @@ pub fn config_path() -> io::Result<PathBuf> {
 
 /// Load daemon-level configuration from config.toml.
 ///
-/// Emits `tracing::warn!` for any provider-level fields that are still
-/// present in config.toml (they should be in accounts.toml instead).
+/// Only daemon-level fields are parsed (`max_turns`, `[context]`);
+/// provider-level fields are ignored (they belong in accounts.toml, see
+/// [`crate::accounts`]). Returns `DaemonConfig::default()` when the file
+/// does not exist.
 pub fn load_daemon_config() -> io::Result<DaemonConfig> {
     let path = config_path()?;
     if !path.exists() {

@@ -35,6 +35,7 @@ pub struct FinalTextResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChatTurnResult {
     FinalText(FinalTextResult),
     ToolUse(ChatAssistantToolUse),
@@ -48,6 +49,7 @@ pub enum ChatTurnResult {
 /// [`chat_completion_turn_streaming`](crate::ProviderClient::chat_completion_turn_streaming)
 /// and can use them for real-time UI updates.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamEvent {
     Answer(String),
     Reasoning(String),

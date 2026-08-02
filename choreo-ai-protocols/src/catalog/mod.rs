@@ -44,6 +44,7 @@ pub struct ModelEntry {
 
 /// Protocol variant — selects wire format and carries protocol-specific fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProviderProtocol {
     OpenAi { max_tokens_field: MaxTokensField },
     AnthropicMessages,

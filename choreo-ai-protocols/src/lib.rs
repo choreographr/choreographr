@@ -45,8 +45,9 @@ pub use catalog::{
 };
 pub use context_window::ContextWindowConfig;
 pub use google::{GoogleClient, GoogleConfig};
-pub use openai::{OpenAiClient, ServiceConfig};
+pub use openai::{AllowedCaller, OpenAiClient, RequestFormat, ServiceConfig};
 pub use overrides::ProviderOverrides;
+pub use retry::RetryCallback;
 pub use shared::{MaxTokensField, ProviderError};
 pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
 pub use types::{

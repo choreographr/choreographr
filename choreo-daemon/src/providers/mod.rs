@@ -42,6 +42,13 @@ impl InferenceProvider {
         }
     }
 
+    pub fn from_google(client: GoogleClient) -> Self {
+        Self {
+            client: Arc::new(client),
+            slug: "google",
+        }
+    }
+
     /// Create a provider from an account config + credential key.
     /// Applies all account-level overrides (base_url, streaming, timeouts)
     /// onto the service config before constructing the client.
@@ -104,6 +111,13 @@ impl InferenceProvider {
                     slug: entry.slug.as_str(),
                 })
             }
+            // `ProviderProtocol` is #[non_exhaustive] — a new protocol added
+            // in choreo-ai-protocols must not silently fall through to a
+            // bogus provider; surface it as an explicit error instead.
+            _ => Err(format!(
+                "unsupported provider protocol for '{}'",
+                config.provider
+            )),
         }
     }
 
@@ -112,9 +126,12 @@ impl InferenceProvider {
         params: ChatTurnRequest<'_>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let start = std::time::Instant::now();
-        let model = params.model.to_string();
+        // `params.model` is a `&'a str` (Copy) — capture it before moving
+        // `params` into the client call so metrics recording needs no
+        // per-turn heap allocation.
+        let model = params.model;
         let result = self.client.chat_completion_turn(params);
-        self.record_api_metrics(&model, start, &result);
+        self.record_api_metrics(model, start, &result);
         result
     }
 
@@ -124,9 +141,12 @@ impl InferenceProvider {
         on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
     ) -> Result<ChatTurnResult, InferenceError> {
         let start = std::time::Instant::now();
-        let model = params.model.to_string();
+        // Same borrow-safe capture as in `chat_completion_turn`: the model
+        // name outlives `params` (it borrows from the caller), so copying the
+        // `&str` before the move avoids allocating a String per turn.
+        let model = params.model;
         let result = self.client.chat_completion_turn_streaming(params, on_event);
-        self.record_api_metrics(&model, start, &result);
+        self.record_api_metrics(model, start, &result);
         result
     }
 
@@ -143,7 +163,10 @@ impl InferenceProvider {
         let elapsed = start.elapsed().as_secs_f64();
         crate::metrics::record_api_call(model, self.slug, elapsed);
         if let Err(e) = result {
-            crate::metrics::record_api_error(model, inference_error_label(e));
+            // The error→label mapping lives with the error type in
+            // choreo-proto (InferenceError::metric_label) so it can't drift
+            // from the variant list; reuse it rather than duplicating here.
+            crate::metrics::record_api_error(model, e.metric_label());
         }
     }
 
@@ -166,23 +189,6 @@ impl InferenceProvider {
 
     pub fn supports_programmatic_tool_calling(&self, model: &str) -> bool {
         self.client.supports_programmatic_tool_calling(model)
-    }
-}
-
-/// Map an [`InferenceError`] variant to a stable label string for metrics.
-///
-/// Mirrors the label set the provider crates used to emit internally; the
-/// mapping moved here when metrics recording moved to the daemon boundary.
-fn inference_error_label(e: &InferenceError) -> &'static str {
-    match e {
-        InferenceError::Unauthorized { .. } => "unauthorized",
-        InferenceError::RateLimited { .. } => "rate_limited",
-        InferenceError::ServerError { .. } => "server_error",
-        InferenceError::ClientError { .. } => "client_error",
-        InferenceError::EmptyResponse => "empty_response",
-        InferenceError::Cancelled => "cancelled",
-        InferenceError::TruncatedToolCall { .. } => "truncated_tool_call",
-        InferenceError::Io(_) => "other",
     }
 }
 

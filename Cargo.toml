@@ -50,6 +50,7 @@ signal-hook = "0.4"
 serial_test = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+toml = "1.1"
 lru = "0.18"
 chrono = "0.4"
 zeroize = { version = "1", features = ["derive"] }
