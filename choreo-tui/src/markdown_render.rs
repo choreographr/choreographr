@@ -843,6 +843,20 @@ fn render_markdown_block(
                     ensure_blank_line(lines);
                 }
             }
+
+            // A list is delimited: emit a collapsing blank line after its
+            // items.  Blocks between lists get their separation from the
+            // *next* block's before-margin, but a nested list's successor is
+            // the next item marker of the enclosing list, which never
+            // receives a before-margin — without this margin the marker would
+            // run flush against the nested list's last line.  ensure_blank_line
+            // collapses this margin with any following before-margin, and
+            // markdown_lines strips it when the list is the document's last
+            // block, so the rule is invisible everywhere except the boundary
+            // that was previously missing it.
+            if !items.is_empty() {
+                ensure_blank_line(lines);
+            }
         }
         MarkdownBlock::Table {
             alignments,
@@ -3447,6 +3461,64 @@ mod tests {
             !has_double_blank,
             "should not have two consecutive blank lines\n{whole}"
         );
+    }
+
+    #[test]
+    fn nested_list_gets_blank_line_before_next_item() {
+        // A tight ordered list where one item contains a nested bullet list:
+        // the next sibling's marker must not run directly against the nested
+        // list's last line (the originally reported bug).  Every list is
+        // delimited by a collapsing margin after it, so the boundary after
+        // the nested list is separated while single-line items stay tight.
+        // Raw string so the bullet indentation survives into the parser.
+        let md = r#"1. What the model is (context for sizing)
+2. The fundamental requirement: ~150-600 GB of memory depending on quantization
+3. Options table:
+      - Budget/self-host small: 2× DGX Spark (~$8K one-time)
+      - Mid: 4× RTX PRO 6000 / 8× A100 80GB
+      - Production cloud: 8× H200 node
+      - Extreme: 8× H100/H200 for FP16
+4. Cloud monthly costs (table with providers)
+5. On-prem purchase costs
+6. Throughput expectations
+7. Business reality check
+8. Software stack: vLLM, FP8"#;
+        let result = markdown_lines(md, 100);
+        let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        let whole = text.join("\n");
+        // Blank line before item 4 (the sibling after the nested-list item).
+        let idx4 = text
+            .iter()
+            .position(|l| l.contains("4. Cloud"))
+            .expect("item 4");
+        assert!(
+            idx4 >= 1 && text[idx4 - 1].trim().is_empty(),
+            "expected a blank line before '4. Cloud monthly costs', got lines[{}]='{}'\n{whole}",
+            idx4 - 1,
+            text[idx4 - 1]
+        );
+        // Items 2 and 3 stay tight — the margin delimits the list, it does
+        // not space out the items themselves.
+        let idx3 = text
+            .iter()
+            .position(|l| l.contains("3. Options table:"))
+            .unwrap();
+        assert_eq!(
+            text[idx3 - 1],
+            "2. The fundamental requirement: ~150-600 GB of memory depending on quantization",
+            "items 2 and 3 should stay tight\n{whole}"
+        );
+        // No trailing blank line: the list margin at the end of the document
+        // is stripped by markdown_lines.
+        assert!(
+            !text.last().is_some_and(|l| l.trim().is_empty()),
+            "no trailing blank line after the list\n{whole}"
+        );
+        // No consecutive blank lines anywhere.
+        let has_double_blank = result
+            .windows(2)
+            .any(|w| w[0].width() == 0 && w[1].width() == 0);
+        assert!(!has_double_blank, "no consecutive blank lines\n{whole}");
     }
 
     #[test]
