@@ -1037,6 +1037,46 @@ byte cap across appended lines.
   holding at most one capped line plus the output budget in memory regardless of file
   size (previously the whole file was loaded via `read_to_string`).
 
+### PDF tools
+
+`pdf_classify` and `pdf_to_markdown` (both in `tools/pdf.rs`) give the agent native PDF
+ingestion by wrapping `pdf-inspector` (Firecrawl) — a pure-Rust, extraction-only PDF
+parser built on `lopdf`. The parser has no JavaScript engine, never renders pages, and
+never executes embedded files or `/Launch` actions, so the classic PDF malware
+*execution* vectors are excluded by construction.
+
+> **Dependency pin — security.** `choreo-daemon` depends on `pdf-inspector` by **SHA**
+> (`omeileo/pdf-inspector@f86decf`, upstream PR firecrawl/pdf-inspector#198) rather than
+> a crates.io release, because upstream still ships `lopdf ^0.41.0` which is vulnerable to
+> RUSTSEC-2026-0187: a ~21 KB crafted PDF with ~10,000-deep nested objects aborts the
+> process via stack overflow — a SIGABRT that `catch_unwind` **cannot** intercept. The
+> pinned fork bumps `lopdf` to 0.42.0 (MAX_NESTING_DEPTH), verified source-compatible by
+> the PR author (860 tests green; the PoC now yields `Type: SCANNED` and exit 0 instead of
+> SIGABRT). The regression guard is `nested_array_poc_does_not_abort_process` in
+> `tests/pdf_tool_integration.rs`. Revert to a crates.io release once upstream merges and
+> publishes the fix (see the comment in `choreo-daemon/Cargo.toml`).
+
+- **`pdf_classify`** runs `pdf_inspector::detect_pdf_mem` (DetectOnly mode, ~10–50ms) and
+  reports `pdf_type` (text_based / scanned / image_based / mixed), `confidence`,
+  `page_count`, and `pages_needing_ocr` — the smart-routing signal for deciding between
+  local extraction and OCR.
+- **`pdf_to_markdown`** runs `process_pdf_mem_with_options` (Full mode) with optional
+  1-indexed `pages` and an opt-in `compact` profile (`MarkdownProfile::Compact`, which
+  collapses long dot leaders for token efficiency). Scanned/image-based PDFs return an
+  OCR-routing notice instead of empty output.
+
+Both tools funnel through `read_validated_pdf`, which resolves the path (working dir + `~`),
+requires a regular file, caps input at 50 MiB, and rejects anything without the `%PDF-` magic
+header *before* the parser sees it. Extracted markdown is treated as **untrusted data
+end-to-end**: it is wrapped in an explicit `UNTRUSTED content extracted from PDF…` delimiter
+(prompt-injection guard), C0 control characters other than tab/newline/CR are escaped
+(terminal-escape guard), and output is capped at the shared 128 KiB
+`MAX_TOOL_OUTPUT_BYTES` budget with the standard `...[truncated]` marker. `PdfError`
+variants map to actionable one-line messages (e.g. encrypted → “pass a decrypted copy”).
+Malformed-PDF panics from `lopdf` are contained by the request worker's `catch_unwind`
+boundary (see the worker thread discussion above); OS-level sandboxing
+(Landlock/seccomp/Seatbelt) for extension-process parsing is a planned follow-up.
+
 ### Postcard binary encoding
 
 Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protocol:
@@ -1052,11 +1092,11 @@ Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protoc
   specific error variants (e.g. `DbError::NotFound`, `HttpError::InvalidUrl`).
 - **Tool call frame (VM → host):** `[tool_name: postcard String][args: postcard-encoded Args]`
 
-### Available tools (up to 35 total, some dependent on installed binaries)
+### Available tools (up to 46 total, some dependent on installed binaries)
 
 | Group | Tools |
 |---|---|
-| **Core** | `list_sessions`, `get_session`, `load_skill`, `set_session_title`, `set_working_dir`, `load_tools`, `unload_tools`, `read_file`, `read_file_range`, `write_file`, `edit_file`, `list_files`, `delete_files`, `line_count`, `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed), `get_current_time` (Unix millisecond timestamp) |
+| **Core** | `list_sessions`, `get_session`, `load_skill`, `set_session_title`, `set_working_dir`, `load_tools`, `unload_tools`, `read_file`, `read_file_range`, `write_file`, `edit_file`, `list_files`, `delete_files`, `line_count`, `random` (integers, floats, booleans, bytes, UUID v4 — with optional seed), `get_current_time` (Unix millisecond timestamp), `pdf_classify` (PDF type/confidence/OCR pages), `pdf_to_markdown` (PDF → Markdown, optional pages + compact) |
 | **HTTP** | `http_request` (GET/POST/HEAD with headers, body, timeout) |
 | **Image** | `display_image` (from path, URL, base64, or SVG text) |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, `git_push`, `git_show` |
@@ -1078,7 +1118,7 @@ via `fn group() -> &'static str` on the `Tool` trait. Groups are:
 
 | Group | Default | Description |
 |---|---|---|
-| `core` | always on | File system, HTTP, images, file search, random values, and time queries |
+| `core` | always on | File system, HTTP, images, PDF classification/Markdown extraction, file search, random values, and time queries |
 | `desktop` | off | Desktop notifications via notify-send |
 | `db` | off | Session-scoped key-value database |
 | `git` | on | Local Git operations |

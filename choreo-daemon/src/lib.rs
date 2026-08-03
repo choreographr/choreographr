@@ -33,6 +33,9 @@ pub use crate::tools::git::{
 pub use crate::tools::grep::{GrepArgs, execute_grep_tool};
 pub use crate::tools::notify::{NotifySendArgs, execute_notify_send};
 pub use crate::tools::nu::{NuArgs, execute_nu_tool};
+pub use crate::tools::pdf::{
+    PdfClassifyArgs, PdfToMarkdownArgs, execute_pdf_classify, execute_pdf_to_markdown,
+};
 pub use crate::tools::sh::{ShArgs, Shell, execute_sh_tool};
 #[cfg(test)]
 pub(crate) use crate::tools::sha256_hex;

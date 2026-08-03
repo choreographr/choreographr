@@ -130,6 +130,7 @@ pub mod http;
 mod image;
 pub(crate) mod notify;
 pub(crate) mod nu;
+pub(crate) mod pdf;
 pub(crate) mod random;
 pub(crate) mod read_file;
 pub(crate) mod read_file_range;
@@ -557,7 +558,7 @@ pub fn static_groups() -> &'static [ToolGroup] {
         vec![
             ToolGroup {
                 name: "core".into(),
-                description: "File system operations, HTTP requests, image display, file search, random values, time queries, and series execution".into(),
+                description: "File system operations, HTTP requests, image display, PDF classification and Markdown extraction, file search, random values, time queries, and series execution".into(),
             },
             ToolGroup {
                 name: "desktop".into(),
@@ -630,6 +631,8 @@ impl ToolRegistry {
         reg.register(exec::Exec);
         reg.register(grep::Grep);
         reg.register(find::Find);
+        reg.register(pdf::PdfClassify);
+        reg.register(pdf::PdfToMarkdown);
         reg.register(random::Random);
         reg.register(notify::NotifySend);
         reg.register(time::GetCurrentTime);

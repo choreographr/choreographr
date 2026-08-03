@@ -272,9 +272,10 @@ working directory, runs its own full agent loop independently, and returns its
 output as the parent's tool result. Subsessions persist permanently.
 
 **Tool.** A function the LLM can call to interact with the outside world (read
-files, make HTTP requests, run git commands, query blockchains, post to X,
-etc.). Tools implement the `Tool` trait (name, group, description, JSON Schema,
-`fn execute`) and are registered in a `ToolRegistry` at daemon startup.
+files, make HTTP requests, run git commands, classify PDFs and convert them to
+Markdown, query blockchains, post to X, etc.). Tools implement the `Tool` trait
+(name, group, description, JSON Schema, `fn execute`) and are registered in a
+`ToolRegistry` at daemon startup.
 
 **Tool group.** Tools are organized into groups (`core`, `git`, `shell`, `x`,
 `vm`, `db`, `mcp`). Only `core`, `git`, and `shell` are active by default. The
