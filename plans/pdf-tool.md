@@ -1,9 +1,18 @@
 # Native PDF Tools (`pdf_classify`, `pdf_to_markdown`) in choreo-daemon
 
-> **Status: implemented.** Both tools landed in `choreo-daemon/src/tools/pdf.rs`
+> **Status: implemented.** Both tools landed under `choreo-daemon/src/tools/pdf/`
+> (one file per tool — `classify.rs`, `markdown.rs` — with shared helpers in `mod.rs`)
 > with unit + `#[ignore]` integration tests, registered in the always-on `core`
 > group, and documented in ARCHITECTURE.md / README.md. The `compact` opt-in
 > (requested during review) is exposed as `PdfToMarkdownArgs::compact`.
+>
+> **Review follow-ups (implemented):** the untrusted-content closing delimiter is now
+> appended *past* the 128 KiB output budget (survives truncation); `read_validated_pdf`
+> tolerates a UTF-8 BOM + leading whitespace (mirroring pdf-inspector's own validator)
+> and validates against a single file handle (TOCTOU-safe bounded read); out-of-range
+> `pages` are rejected against the parsed page count; the PDF fixture builders were
+> deduplicated into `src/tools/pdf/test_fixtures.rs` (shared via `#[path]` with the
+> integration test).
 >
 > **Security pin applied during review.** `cargo audit` flagged RUSTSEC-2026-0187
 > (lopdf 0.41, high): a ~21 KB crafted PDF aborts the process via stack overflow
@@ -113,14 +122,17 @@ harmless, compiled but unused by us.
 
 ### 2. Module layout
 
-One file, `choreo-daemon/src/tools/pdf.rs`, with:
+`choreo-daemon/src/tools/pdf/` as a directory (one tool per file, per the workspace
+convention — see ARCHITECTURE.md "Module layout"):
 
-- `PdfClassify` and `PdfToMarkdown` tool structs (each `impl Tool`), plus
-- shared private helpers: input gating, error mapping, output hygiene.
+- `classify.rs` — `PdfClassify` tool (`impl Tool`), its args, and its tests.
+- `markdown.rs` — `PdfToMarkdown` tool (`impl Tool`), its args, and its tests.
+- `mod.rs` — shared private helpers (input gating, error mapping, output hygiene)
+  plus the tool re-exports used by `tools/mod.rs` registration and `lib.rs`.
+- `test_fixtures.rs` — deterministic PDF fixture builders, compiled into unit tests
+  via `#[cfg(test)] mod test_fixtures;` and into the integration test via `#[path]`.
 
-Single file mirrors the simple single-file tools (`time.rs`, `random.rs`) and
-keeps the two tools' shared code in one place. Add `pub(crate) mod pdf;` to
-`tools/mod.rs`.
+Add `pub(crate) mod pdf;` to `tools/mod.rs`.
 
 ### 3. Input gating (in-tool, no sandbox)
 
@@ -133,10 +145,19 @@ const MAX_PDF_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB input cap
 /// Read + validate a PDF path. Returns the bytes for the *mem APIs.
 fn read_validated_pdf(path: &str, working_dir: Option<&Path>) -> Result<Vec<u8>, ToolExecError> {
     let resolved = super::resolve_path(path, working_dir);
-    let meta = std::fs::metadata(&resolved)?;                      // exists + regular file
+    // Open once and validate against the SAME handle (TOCTOU-safe): the size
+    // check and the read observe the same inode, and the read is bounded to
+    // cap + 1 bytes so a file grown after `metadata` cannot slurp more than
+    // the cap into memory.
+    let file = std::fs::File::open(&resolved)?;                       // exists
+    let meta = file.metadata()?;                                      // regular file
     if meta.len() > MAX_PDF_BYTES { ... "PDF exceeds 50 MiB cap" }
-    let bytes = std::fs::read(&resolved)?;
-    if !bytes.starts_with(b"%PDF-") { ... "not a PDF (missing %PDF- magic)" }
+    let mut bytes = Vec::new();
+    file.take(MAX_PDF_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PDF_BYTES { ... "PDF exceeds 50 MiB cap" }
+    // `%PDF-` magic with BOM/whitespace tolerance, mirroring pdf-inspector's
+    // own `validate_pdf_bytes` (a strict starts_with would reject valid PDFs).
+    if !looks_like_pdf(&bytes) { ... "not a PDF (missing %PDF- magic)" }
     Ok(bytes)
 }
 ```
@@ -258,7 +279,7 @@ execution"`.
 Follows AGENTS.md test discipline (unit tests deterministic, no time-based waits;
 integration tests in `tests/`, marked `#[ignore]`).
 
-### Unit tests — `src/tools/pdf.rs` `#[cfg(test)]`
+### Unit tests — `src/tools/pdf/` `#[cfg(test)]` (one `mod tests` per file)
 
 - **Fixture helper** `fn minimal_text_pdf() -> Vec<u8>`: builds a valid
   single-page PDF *programmatically* (computed xref offsets — hand-written xref

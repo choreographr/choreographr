@@ -331,6 +331,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `tools/fs/` | Core filesystem tools (`list_files`, `line_count`, `write_file`, `edit_file`, `delete_files`), one file per tool with shared write helpers in `fs/mod.rs`. |
 | `tools/x/` | X/Twitter API tools (`x_post`, `x_search_recent`, `x_user_lookup`), one file per tool with shared OAuth1/HTTP plumbing in `x/mod.rs`. |
 | `tools/admin/` | Session-admin tools (`list_sessions`, `get_session`, `load_skill`), one file per tool. |
+| `tools/pdf/` | Native PDF ingestion tools (`pdf_classify`, `pdf_to_markdown`), one file per tool (`classify.rs`, `markdown.rs`) with shared input-gating / output-hygiene helpers in `pdf/mod.rs` and the shared PDF fixture builders in `pdf/test_fixtures.rs`. |
 | `tools/glob_util.rs` | `GlobFilter` — shared glob-matching utility used by `delete_files` and `grep` that follows gitignore conventions (patterns without `/` match basename, patterns with `/` match full path). |
 | `tools/vm.rs` | RISC-V sandbox: compiles Rust → ELF via rustc, executes in `ckb-vm` with custom syscall handler (`ChoreographrSyscall`) for tool dispatch. |
 | `mcp/` | `McpManager` — loads MCP server config from `mcp_servers.json`, spawns subprocesses via `McpClient`, wraps discovered tools as `McpToolWrapper` (implements `ToolDyn`) and registers them in the `ToolRegistry` under a `mcp/<slug>` group. |
@@ -1039,7 +1040,9 @@ byte cap across appended lines.
 
 ### PDF tools
 
-`pdf_classify` and `pdf_to_markdown` (both in `tools/pdf.rs`) give the agent native PDF
+`pdf_classify` and `pdf_to_markdown` (both under `tools/pdf/` — one file per tool,
+`classify.rs` and `markdown.rs`, with the shared helpers in `mod.rs` following the
+workspace's one-tool-per-file convention) give the agent native PDF
 ingestion by wrapping `pdf-inspector` (Firecrawl) — a pure-Rust, extraction-only PDF
 parser built on `lopdf`. The parser has no JavaScript engine, never renders pages, and
 never executes embedded files or `/Launch` actions, so the classic PDF malware
@@ -1067,11 +1070,16 @@ never executes embedded files or `/Launch` actions, so the classic PDF malware
 
 Both tools funnel through `read_validated_pdf`, which resolves the path (working dir + `~`),
 requires a regular file, caps input at 50 MiB, and rejects anything without the `%PDF-` magic
-header *before* the parser sees it. Extracted markdown is treated as **untrusted data
-end-to-end**: it is wrapped in an explicit `UNTRUSTED content extracted from PDF…` delimiter
-(prompt-injection guard), C0 control characters other than tab/newline/CR are escaped
-(terminal-escape guard), and output is capped at the shared 128 KiB
-`MAX_TOOL_OUTPUT_BYTES` budget with the standard `...[truncated]` marker. `PdfError`
+header *before* the parser sees it. The magic check tolerates a UTF-8 BOM and leading
+whitespace exactly as `pdf-inspector`'s own validator does, and the size cap + magic check
+run against the **same open file handle** as the (bounded) read, so a file swapped or grown
+between check and read cannot slip past the gates (TOCTOU). Extracted markdown is treated as
+**untrusted data end-to-end**: it is wrapped in an explicit `UNTRUSTED content extracted from
+PDF…` delimiter (prompt-injection guard) whose closing line is appended *past* the shared
+128 KiB `MAX_TOOL_OUTPUT_BYTES` budget, so a truncated extraction still closes its frame;
+C0 control characters other than tab/newline/CR are escaped (terminal-escape guard).
+Out-of-range `pages` requests are rejected against the parsed page count instead of silently
+returning empty output. `PdfError`
 variants map to actionable one-line messages (e.g. encrypted → “pass a decrypted copy”).
 Malformed-PDF panics from `lopdf` are contained by the request worker's `catch_unwind`
 boundary (see the worker thread discussion above); OS-level sandboxing
