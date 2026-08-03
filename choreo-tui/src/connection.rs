@@ -668,23 +668,19 @@ fn handle_paste_event(data: &str, app: &mut App) -> Result<(), ClientError> {
             app.input.insert_str_at_cursor(data);
             app.ensure_input_cursor_visible();
         }
-        Page::AIProviders => match app.ai_providers.view {
-            AIProvidersView::List if app.ai_providers.credential_target.is_some() => {
+        Page::AIProviders => {
+            // The credential page takes priority over the wizard views (it is
+            // reached right after account creation, with `view` already reset
+            // to List), so route pastes there first.
+            if app.ai_providers.credential_target.is_some() {
                 tracing::debug!("[choreo-tui] pasting into credential input");
                 app.ai_providers.credential_input.insert_str_at_cursor(data);
+            } else if app.ai_providers.view == AIProvidersView::SetSlug {
+                // Phase 2: bulk-insert into the slug field.
+                tracing::debug!("[choreo-tui] pasting into new-account slug field");
+                paste_into_text_state(&mut app.ai_providers.slug_state, data);
             }
-            AIProvidersView::NewForm => {
-                // New-account form: bulk-insert into whichever field is focused.
-                if app.ai_providers.new_name_state.is_focused() {
-                    tracing::debug!("[choreo-tui] pasting into new-account name field");
-                    paste_into_text_state(&mut app.ai_providers.new_name_state, data);
-                } else if app.ai_providers.new_api_key_state.is_focused() {
-                    tracing::debug!("[choreo-tui] pasting into new-account API key field");
-                    paste_into_text_state(&mut app.ai_providers.new_api_key_state, data);
-                }
-            }
-            _ => {}
-        },
+        }
         _ => {}
     }
     Ok(())
@@ -1432,7 +1428,10 @@ fn handle_ai_providers_event(
     }
     match app.ai_providers.view {
         AIProvidersView::List => handle_ai_providers_list_key(event, app, client_tx),
-        AIProvidersView::NewForm => handle_ai_providers_new_form_key(event, app, client_tx),
+        AIProvidersView::SelectProvider => {
+            handle_ai_providers_select_provider_key(event, app, client_tx)
+        }
+        AIProvidersView::SetSlug => handle_ai_providers_set_slug_key(event, app, client_tx),
     }
 }
 
@@ -1484,9 +1483,10 @@ fn handle_ai_providers_list_key(
                 app.ai_providers.confirm_remove = Some(account.name.clone());
             }
         }
-        // New account
+        // New account: start the 2-phase wizard (provider → slug, then
+        // the credential page)
         KeyCode::Char('n') => {
-            app.ai_providers.enter_new_form();
+            app.ai_providers.enter_new_account();
         }
         // Set credential (API key) for the selected account
         KeyCode::Char('c') => {
@@ -1569,7 +1569,42 @@ fn handle_ai_providers_credential_key(
     Ok(())
 }
 
-fn handle_ai_providers_new_form_key(
+/// Phase 1 of the new-account wizard: navigate the provider list and
+/// confirm a selection, which moves the flow to phase 2 (slug entry).
+fn handle_ai_providers_select_provider_key(
+    event: Event,
+    app: &mut App,
+    _client_tx: &std::sync::mpsc::Sender<ClientMessage>,
+) -> Result<(), ClientError> {
+    let Event::Key(key) = event else {
+        return Ok(());
+    };
+    if key.kind != KeyEventKind::Press {
+        return Ok(());
+    }
+
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => app.ai_providers.provider_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.ai_providers.provider_down(),
+        // PgUp/PgDn page the selection (the render window follows it), so
+        // browsing the ~90 providers takes a few keypresses, not a
+        // row-by-row walk.
+        KeyCode::PageUp => app.ai_providers.provider_page_up(),
+        KeyCode::PageDown => app.ai_providers.provider_page_down(),
+        // Enter confirms the highlighted provider and advances to the slug
+        // entry page (phase 2).
+        KeyCode::Enter => app.ai_providers.confirm_provider(),
+        // Esc aborts the whole wizard back to the account list.
+        KeyCode::Esc => app.ai_providers.leave_new_account(),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Phase 2 of the new-account wizard: enter the account slug.  Enter
+/// validates and submits `AddAccount`, then redirects to the credential
+/// page for the freshly created account.
+fn handle_ai_providers_set_slug_key(
     event: Event,
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
@@ -1581,90 +1616,58 @@ fn handle_ai_providers_new_form_key(
         return Ok(());
     }
 
-    // Esc -> cancel form back to list
-    if key.code == KeyCode::Esc {
-        app.ai_providers.leave_new_form();
-        return Ok(());
-    }
-
-    // Enter -> validate, advance to next field, or submit
-    if key.code == KeyCode::Enter {
-        if app.ai_providers.new_name_state.is_focused() {
-            let name = app.ai_providers.new_name_state.value().trim().to_string();
-            if name.is_empty() {
-                app.ai_providers.add_error = Some("Account name is required".to_string());
+    match key.code {
+        // Esc backs out to the provider picker (phase 1).
+        KeyCode::Esc => app.ai_providers.back_to_provider(),
+        // Enter validates the slug and creates the account.
+        KeyCode::Enter => {
+            let slug = app.ai_providers.slug_state.value().trim().to_string();
+            if slug.is_empty() {
+                app.ai_providers.add_error = Some("Account slug is required".to_string());
                 return Ok(());
             }
-            if !is_valid_account_name(&name) {
+            if !is_valid_account_name(&slug) {
                 app.ai_providers.add_error = Some(
-                    "account name must be lowercase alphanumeric, hyphens, or underscores"
-                        .to_string(),
+                    "slug must be lowercase alphanumeric, hyphens, or underscores".to_string(),
                 );
                 return Ok(());
             }
             app.ai_providers.add_error = None;
-            app.ai_providers.new_name_state.blur();
-            app.ai_providers.new_provider_state.focus();
-        } else if app.ai_providers.new_provider_state.is_focused() {
-            app.ai_providers.new_provider_state.blur();
-            app.ai_providers.new_api_key_state.focus();
-        } else if app.ai_providers.new_api_key_state.is_focused() {
             submit_new_account(app, client_tx)?;
         }
-        return Ok(());
+        // All other keys go to the slug input buffer.
+        _ => {
+            app.ai_providers.slug_state.handle_key_event(key);
+        }
     }
-
-    // Remap j/k to Up/Down when the provider field is focused, so users
-    // can navigate the SelectPrompt with the same keys as before.
-    let key = match key.code {
-        KeyCode::Char('j') if app.ai_providers.new_provider_state.is_focused() => KeyEvent {
-            code: KeyCode::Down,
-            ..key
-        },
-        KeyCode::Char('k') if app.ai_providers.new_provider_state.is_focused() => KeyEvent {
-            code: KeyCode::Up,
-            ..key
-        },
-        _ => key,
-    };
-
-    // Dispatch all other keys to the focused field's state
-    if app.ai_providers.new_name_state.is_focused() {
-        app.ai_providers.new_name_state.handle_key_event(key);
-    } else if app.ai_providers.new_provider_state.is_focused() {
-        app.ai_providers.new_provider_state.handle_key_event(key);
-    } else if app.ai_providers.new_api_key_state.is_focused() {
-        app.ai_providers.new_api_key_state.handle_key_event(key);
-    }
-
     Ok(())
 }
 
-/// Validate the form, send AddAccount and (optionally) AddCredential
-/// messages, then return to the provider list view.
+/// Send AddAccount for the slug entered in phase 2, then redirect to the
+/// credential page so the user can immediately paste an API key.
 fn submit_new_account(
     app: &mut App,
     client_tx: &std::sync::mpsc::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
-    let name = app.ai_providers.new_name_state.value().trim().to_string();
-
-    let provider_idx = app.ai_providers.new_provider_state.focused_index();
-    let provider_str = PROVIDER_OPTIONS[provider_idx].slug;
-
-    let api_key = app
+    let slug = app.ai_providers.slug_state.value().trim().to_string();
+    let provider_str = app
         .ai_providers
-        .new_api_key_state
-        .value()
-        .trim()
+        .selected_provider_slug()
+        // The provider is always chosen before this page is reachable; if it
+        // somehow is not, fall back to the first option rather than indexing
+        // (the terminal `unwrap_or_default` is unreachable: PROVIDER_OPTIONS
+        // is a non-empty compile-time table).
+        .or_else(|| PROVIDER_OPTIONS.first().map(|p| p.slug))
+        .unwrap_or_default()
         .to_string();
 
     app.ai_providers.add_error = None;
 
-    // Send AddAccount
+    // Create the account (no credential yet — that's the next page).
     client_tx
         .send(ClientMessage::AddAccount {
-            name: name.clone(),
-            provider: provider_str.to_string(),
+            name: slug.clone(),
+            provider: provider_str,
             base_url: None,
             streaming: None,
             retry_max_attempts: None,
@@ -1673,21 +1676,10 @@ fn submit_new_account(
         })
         .map_err(broken_pipe)?;
 
-    // If an API key was provided, encrypt and send the credential,
-    // auto-unlocking the daemon so the account is immediately usable.
-    if !api_key.is_empty() {
-        match build_add_credential_message(name.clone(), "api_key".to_string(), vec![api_key], true)
-        {
-            Ok(msg) => {
-                let _ = client_tx.send(msg);
-            }
-            Err(e) => {
-                app.status = Some(format!("[warning] failed to encrypt API key: {e}"));
-            }
-        }
-    }
-
-    app.ai_providers.leave_new_form();
+    // Reset the wizard and immediately jump to the add-credential page for
+    // the account we just created.
+    app.ai_providers.finish_new_account();
+    app.ai_providers.enter_credential(slug);
     Ok(())
 }
 

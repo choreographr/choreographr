@@ -18,9 +18,7 @@ use ratatui::{
 use ratatui_image::StatefulImage;
 use std::sync::Arc;
 
-use tui_prompts::{
-    Prompt, SelectOption, SelectOptionList, SelectPrompt, TextPrompt, TextRenderStyle,
-};
+use tui_prompts::{Prompt, TextPrompt};
 
 pub(crate) const BG_SHADE: Color = Color::Rgb(53, 53, 53);
 
@@ -978,7 +976,8 @@ fn render_ai_providers(frame: &mut Frame<'_>, app: &mut App) {
     }
     match app.ai_providers.view {
         AIProvidersView::List => render_ai_providers_list(frame, app),
-        AIProvidersView::NewForm => render_ai_providers_new_form(frame, app),
+        AIProvidersView::SelectProvider => render_ai_providers_select_provider(frame, app),
+        AIProvidersView::SetSlug => render_ai_providers_set_slug(frame, app),
     }
 }
 
@@ -1161,7 +1160,11 @@ fn render_ai_providers_credential(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(status, chunks[1]);
 }
 
-fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
+/// Phase 1 of the new-account wizard: browse `PROVIDER_OPTIONS` and pick
+/// one.  Rendered as a compact scrollable one-line-per-provider list of
+/// display names (the canonical slug is not shown), matching the accounts
+/// list's look.
+fn render_ai_providers_select_provider(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1169,7 +1172,81 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
         .split(area);
 
     let block = Block::default()
-        .title(" New AI Provider Account ")
+        .title(" Select AI Provider (1/2) ")
+        .borders(Borders::ALL);
+    let inner = block.inner(chunks[0]);
+    frame.render_widget(block, chunks[0]);
+
+    let list_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let max_rows = list_chunks[0].height as usize;
+    let total = PROVIDER_OPTIONS.len();
+    let mut lines: Vec<Line> = Vec::new();
+
+    // One line per provider, so the visible window holds max_rows entries.
+    // `provider_window` keeps the highlighted row on screen regardless of
+    // how far the user scrolled.
+    let items_per_page = max_rows.max(1);
+    let (win_start, win_count) = app.ai_providers.provider_window(items_per_page);
+    let win_end = (win_start + win_count).min(total);
+
+    for (i, provider) in PROVIDER_OPTIONS
+        .iter()
+        .enumerate()
+        .take(win_end)
+        .skip(win_start)
+    {
+        let is_selected = i == app.ai_providers.provider_selection;
+        let sel = if is_selected { ">" } else { " " };
+
+        let style = if is_selected {
+            Style::default().bg(Color::Blue).fg(Color::White)
+        } else {
+            Style::default()
+        };
+
+        lines.push(Line::from(vec![Span::styled(
+            format!("{sel} {} ", provider.display_name),
+            style,
+        )]));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, list_chunks[0]);
+
+    if total > items_per_page {
+        frame.render_stateful_widget(
+            vertical_scrollbar(),
+            list_chunks[1],
+            &mut SmoothScrollbarState::new(total)
+                .position(win_start)
+                .viewport_content_length(items_per_page),
+        );
+    }
+
+    let status = Paragraph::new(Line::from(format!(
+        " <j/k nav>  <PgUp/PgDn page>  <Enter select>  <Esc back>  —  {} providers",
+        total
+    )));
+    frame.render_widget(status, chunks[1]);
+}
+
+/// Phase 2 of the new-account wizard: enter a slug (the account name).
+/// Explains what a slug is, shows the provider picked in phase 1, and
+/// submits `AddAccount` on Enter (handled in connection.rs), after which
+/// the flow redirects to the credential page.
+fn render_ai_providers_set_slug(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+
+    let block = Block::default()
+        .title(" Set Account Slug (2/2) ")
         .borders(Borders::ALL);
     let inner = block.inner(chunks[0]);
     frame.render_widget(block, chunks[0]);
@@ -1177,31 +1254,47 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(3),
+            Constraint::Length(6),
             Constraint::Length(3),
             Constraint::Length(1),
+            Constraint::Min(1),
         ])
         .split(inner);
 
+    let dim = Style::default().fg(Color::DarkGray);
+    let accent = Style::default().fg(Color::Cyan);
+
+    // Provider picked in phase 1, shown for context.
+    let provider_name = app
+        .ai_providers
+        .selected_provider_slug()
+        .and_then(|slug| PROVIDER_OPTIONS.iter().find(|p| p.slug == slug))
+        .map(|p| p.display_name)
+        .unwrap_or("(none)");
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(String::new(), Style::default()))];
+    lines.push(Line::from(Span::styled(
+        format!("  Provider: {provider_name}"),
+        accent,
+    )));
+    lines.push(Line::from(Span::styled(String::new(), Style::default())));
+    lines.push(Line::from(Span::styled(
+        "  A slug is the unique name this account is stored under.",
+        dim,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  You'll use it to refer to the account, e.g. /account <slug>.",
+        dim,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Lowercase letters, numbers, hyphens, and underscores only.",
+        dim,
+    )));
+    frame.render_widget(Paragraph::new(lines), rows[0]);
+
     let border_style = Style::default().fg(Color::Cyan);
-
-    let name_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("Name:"))
+    let slug_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("Slug:"))
         .with_block(Block::bordered().border_style(border_style));
-    (&name_prompt).draw(frame, rows[0], &mut app.ai_providers.new_name_state);
-
-    let options: SelectOptionList = PROVIDER_OPTIONS
-        .iter()
-        .map(|p| SelectOption::new(p.display_name))
-        .collect::<Vec<_>>()
-        .into();
-    let provider_prompt = SelectPrompt::new(std::borrow::Cow::Borrowed("Provider:"), options);
-    provider_prompt.draw(frame, rows[1], &mut app.ai_providers.new_provider_state);
-
-    let key_prompt = TextPrompt::new(std::borrow::Cow::Borrowed("API Key:"))
-        .with_block(Block::bordered().border_style(border_style))
-        .with_render_style(TextRenderStyle::Password);
-    (&key_prompt).draw(frame, rows[2], &mut app.ai_providers.new_api_key_state);
+    (&slug_prompt).draw(frame, rows[1], &mut app.ai_providers.slug_state);
 
     if let Some(ref err) = app.ai_providers.add_error {
         frame.render_widget(
@@ -1209,11 +1302,11 @@ fn render_ai_providers_new_form(frame: &mut Frame<'_>, app: &mut App) {
                 format!("  Error: {err}"),
                 Style::default().fg(Color::Red),
             ))),
-            rows[3],
+            rows[2],
         );
     }
 
-    let status = Paragraph::new(Line::from(" <Enter next>  <Esc cancel>"));
+    let status = Paragraph::new(Line::from(" <Enter create account>  <Esc back>"));
     frame.render_widget(status, chunks[1]);
 }
 

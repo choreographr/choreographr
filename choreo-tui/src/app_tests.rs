@@ -583,33 +583,31 @@ fn paste_event_inserts_into_credential_input() {
 }
 
 #[test]
-fn paste_event_inserts_into_new_form_name_field() {
+fn paste_event_inserts_into_new_account_slug_field() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
     app.page = Page::AIProviders;
-    app.ai_providers.view = AIProvidersView::NewForm;
-    app.ai_providers.new_name_state.focus();
-    handle_terminal_event(Event::Paste("My Account".to_string()), &mut app, &tx)
-        .expect("handle paste into name field");
-    assert_eq!(app.ai_providers.new_name_state.value(), "My Account");
-    assert_eq!(app.ai_providers.new_name_state.position(), 10);
+    app.ai_providers.view = AIProvidersView::SetSlug;
+    app.ai_providers.slug_state.focus();
+    handle_terminal_event(Event::Paste("my-account".to_string()), &mut app, &tx)
+        .expect("handle paste into slug field");
+    assert_eq!(app.ai_providers.slug_state.value(), "my-account");
+    assert_eq!(app.ai_providers.slug_state.position(), 10);
 }
 
 #[test]
-fn paste_event_inserts_into_new_form_api_key_field() {
+fn paste_event_ignored_on_provider_selection_page() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
 
+    // Phase 1 (provider picker) has no text field — paste is a no-op.
     app.page = Page::AIProviders;
-    app.ai_providers.view = AIProvidersView::NewForm;
-    // Focus the API key field by focusing name then moving focus (simulate).
-    // TextState defaults to unfocused, so we directly focus the right field.
-    app.ai_providers.new_api_key_state.focus();
+    app.ai_providers.view = AIProvidersView::SelectProvider;
     handle_terminal_event(Event::Paste("sk-secret".to_string()), &mut app, &tx)
-        .expect("handle paste into API key field");
-    assert_eq!(app.ai_providers.new_api_key_state.value(), "sk-secret");
-    assert_eq!(app.ai_providers.new_api_key_state.position(), 9);
+        .expect("handle paste on provider selection page");
+    assert_eq!(app.ai_providers.slug_state.value(), "");
+    assert!(app.ai_providers.credential_input.text.is_empty());
 }
 
 #[test]
@@ -2376,121 +2374,237 @@ fn scroll_mouse_outside_history_box_does_not_update_accumulator() {
     );
 }
 
-// ── AI Providers new-account form (tui-prompts) ────────────
+// ── AI Providers new-account wizard (2-phase) ─────────────
 
-fn setup_providers_new_form(app: &mut App) {
+fn setup_providers_new_account(app: &mut App) {
     app.page = Page::AIProviders;
-    app.ai_providers.enter_new_form();
+    app.ai_providers.enter_new_account();
 }
 
-#[test]
-fn ai_providers_new_form_entering_focuses_name() {
-    let mut app = test_app();
-    setup_providers_new_form(&mut app);
-    assert!(app.ai_providers.new_name_state.is_focused());
-    assert!(!app.ai_providers.new_provider_state.is_focused());
-    assert!(!app.ai_providers.new_api_key_state.is_focused());
-}
-
-#[test]
-fn ai_providers_new_form_enter_advances_name_to_provider() {
-    let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
-    setup_providers_new_form(&mut app);
-
-    // Type a valid name
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("char m");
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("char y");
-
-    // Enter to advance
+/// Drive the wizard to phase 2 (slug entry) with the given provider
+/// highlighted, returning nothing.  `provider` is matched by slug.
+fn advance_to_slug_phase(
+    app: &mut App,
+    tx: &std::sync::mpsc::Sender<ClientMessage>,
+    provider: &str,
+) {
+    setup_providers_new_account(app);
+    let idx = PROVIDER_OPTIONS
+        .iter()
+        .position(|p| p.slug == provider)
+        .expect("provider in options");
+    app.ai_providers.provider_selection = idx;
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
+        app,
+        tx,
     )
-    .expect("enter");
+    .expect("enter selects provider");
+}
 
-    assert!(!app.ai_providers.new_name_state.is_focused());
-    assert!(app.ai_providers.new_provider_state.is_focused());
-    assert!(!app.ai_providers.new_api_key_state.is_focused());
+#[test]
+fn ai_providers_new_account_starts_at_provider_selection() {
+    let mut app = test_app();
+    setup_providers_new_account(&mut app);
+    assert_eq!(app.ai_providers.view, AIProvidersView::SelectProvider);
+    assert_eq!(app.ai_providers.provider_selection, 0);
+    assert!(!app.ai_providers.slug_state.is_focused());
     assert!(app.ai_providers.add_error.is_none());
 }
 
 #[test]
-fn ai_providers_new_form_enter_advances_provider_to_apikey() {
+fn ai_providers_new_account_enter_advances_to_slug() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
-    setup_providers_new_form(&mut app);
+    setup_providers_new_account(&mut app);
 
-    // Type name and advance
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("char a");
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .expect("enter advance name");
+    .expect("enter selects first provider");
 
-    assert!(app.ai_providers.new_provider_state.is_focused());
-
-    // Enter on provider advances to API key
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("enter advance provider");
-
-    assert!(!app.ai_providers.new_provider_state.is_focused());
-    assert!(app.ai_providers.new_api_key_state.is_focused());
+    assert_eq!(app.ai_providers.view, AIProvidersView::SetSlug);
+    assert!(app.ai_providers.slug_state.is_focused());
+    assert!(app.ai_providers.add_error.is_none());
 }
 
 #[test]
-fn ai_providers_new_form_name_validation_empty() {
+fn ai_providers_new_account_jk_navigates_provider_list() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
-    setup_providers_new_form(&mut app);
+    setup_providers_new_account(&mut app);
 
-    // Enter on empty name should show error and stay on name
+    // j moves down, k moves back up.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("j down");
+    assert_eq!(app.ai_providers.provider_selection, 1);
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("j down again");
+    assert_eq!(app.ai_providers.provider_selection, 2);
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("k up");
+    assert_eq!(app.ai_providers.provider_selection, 1);
+
+    // j/k must not leak into any text buffer.
+    assert_eq!(app.ai_providers.slug_state.value(), "");
+}
+
+#[test]
+fn ai_providers_new_account_provider_selection_clamps_at_edges() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_account(&mut app);
+
+    // Up at the top stays at 0.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("up at top");
+    assert_eq!(app.ai_providers.provider_selection, 0);
+
+    // Jump to the last provider and try to go past it.
+    app.ai_providers.provider_selection = PROVIDER_OPTIONS.len() - 1;
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("down at bottom");
+    assert_eq!(
+        app.ai_providers.provider_selection,
+        PROVIDER_OPTIONS.len() - 1
+    );
+}
+
+#[test]
+fn ai_providers_new_account_provider_page_keys_move_selection_by_page() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    setup_providers_new_account(&mut app);
+
+    // PgDn moves the selection by a page…
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("page down");
+    assert_eq!(app.ai_providers.provider_selection, PROVIDER_PAGE_LINES);
+
+    // …and PgUp moves it back.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("page up");
+    assert_eq!(app.ai_providers.provider_selection, 0);
+
+    // PgUp at the top clamps to 0.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("page up at top");
+    assert_eq!(app.ai_providers.provider_selection, 0);
+
+    // PgDn past the last provider clamps to it.
+    app.ai_providers.provider_selection = PROVIDER_OPTIONS.len() - 1;
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("page down at bottom");
+    assert_eq!(
+        app.ai_providers.provider_selection,
+        PROVIDER_OPTIONS.len() - 1
+    );
+
+    // Paging must not leak into the slug buffer.
+    assert_eq!(app.ai_providers.slug_state.value(), "");
+}
+
+#[test]
+fn ai_providers_new_account_provider_window_keeps_selection_visible() {
+    let mut app = test_app();
+    setup_providers_new_account(&mut app);
+
+    // The render window (pure) always contains the selection, anchoring it
+    // at the bottom row once it passes the fold.
+    let window = |app: &App| app.ai_providers.provider_window(10);
+    app.ai_providers.provider_selection = 50;
+    let (start, count) = window(&app);
+    assert!(
+        (start..start + count).contains(&50),
+        "window {start}..{} must contain selection 50",
+        start + count
+    );
+
+    // A selection near the top anchors the window at row 0.
+    app.ai_providers.provider_selection = 1;
+    let (start, _count) = window(&app);
+    assert_eq!(start, 0, "window should start at the top for row 1");
+
+    // The window never exceeds the list bounds at the bottom edge.
+    app.ai_providers.provider_selection = PROVIDER_OPTIONS.len() - 1;
+    let (start, count) = window(&app);
+    assert_eq!(
+        start + count,
+        PROVIDER_OPTIONS.len(),
+        "window must end at the last provider"
+    );
+}
+
+#[test]
+fn ai_providers_new_account_slug_validation_empty() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    advance_to_slug_phase(&mut app, &tx, "openai");
+
+    // Enter on an empty slug should show an error and stay on the page.
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .expect("enter empty name");
+    .expect("enter empty slug");
 
+    assert_eq!(app.ai_providers.view, AIProvidersView::SetSlug);
     assert!(
-        app.ai_providers.new_name_state.is_focused(),
-        "should stay on name field when name is empty"
+        app.ai_providers.slug_state.is_focused(),
+        "should stay on slug field when slug is empty"
     );
     assert_eq!(
         app.ai_providers.add_error.as_deref(),
-        Some("Account name is required"),
+        Some("Account slug is required"),
     );
 }
 
 #[test]
-fn ai_providers_new_form_name_validation_invalid() {
+fn ai_providers_new_account_slug_validation_invalid() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
-    setup_providers_new_form(&mut app);
+    advance_to_slug_phase(&mut app, &tx, "openai");
 
-    // Type uppercase (invalid - must be lowercase)
+    // Type uppercase (invalid — must be lowercase).
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE)),
         &mut app,
@@ -2502,40 +2616,77 @@ fn ai_providers_new_form_name_validation_invalid() {
         &mut app,
         &tx,
     )
-    .expect("enter invalid name");
+    .expect("enter invalid slug");
 
+    assert_eq!(app.ai_providers.view, AIProvidersView::SetSlug);
     assert!(
-        app.ai_providers.new_name_state.is_focused(),
-        "should stay on name field when name is invalid"
+        app.ai_providers.slug_state.is_focused(),
+        "should stay on slug field when slug is invalid"
     );
-    assert!(app.ai_providers.add_error.is_some());
+    assert_eq!(
+        app.ai_providers.add_error.as_deref(),
+        Some("slug must be lowercase alphanumeric, hyphens, or underscores"),
+    );
 }
 
 #[test]
-fn ai_providers_new_form_esc_cancels() {
+fn ai_providers_new_account_esc_aborts_wizard() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
-    setup_providers_new_form(&mut app);
+    setup_providers_new_account(&mut app);
 
-    assert_eq!(app.ai_providers.view, AIProvidersView::NewForm);
+    assert_eq!(app.ai_providers.view, AIProvidersView::SelectProvider);
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .expect("esc cancel");
+    .expect("esc cancels wizard");
 
     assert_eq!(app.ai_providers.view, AIProvidersView::List);
+    assert_eq!(app.ai_providers.provider_selection, 0);
 }
 
 #[test]
-fn ai_providers_new_form_enter_on_apikey_submits() {
+fn ai_providers_new_account_esc_backs_to_provider_from_slug() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    advance_to_slug_phase(&mut app, &tx, "anthropic");
+
+    let anthro_idx = PROVIDER_OPTIONS
+        .iter()
+        .position(|p| p.slug == "anthropic")
+        .expect("anthropic in options");
+    assert_eq!(app.ai_providers.provider_selection, anthro_idx);
+
+    // Type a partial slug, then Esc should return to the provider picker
+    // while keeping the previously chosen provider highlighted.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("char m");
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("esc back to provider");
+
+    assert_eq!(app.ai_providers.view, AIProvidersView::SelectProvider);
+    assert_eq!(app.ai_providers.provider_selection, anthro_idx);
+    assert_eq!(app.ai_providers.slug_state.value(), "");
+}
+
+#[test]
+fn ai_providers_new_account_submit_creates_account_and_redirects_to_credential() {
     let mut app = test_app();
     let (tx, rx) = std::sync::mpsc::channel();
-    setup_providers_new_form(&mut app);
+    advance_to_slug_phase(&mut app, &tx, "openai");
 
-    // Type a valid name
+    // Type a valid slug.
     for c in "my-account".chars() {
         handle_terminal_event(
             Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
@@ -2544,43 +2695,16 @@ fn ai_providers_new_form_enter_on_apikey_submits() {
         )
         .expect("char");
     }
-    // Advance to provider
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("enter to provider");
-    // Select OpenAI in the (alphabetically-sorted) provider picker.
-    // The select's options are only populated at render time, so in this
-    // headless test set the focused index directly: "openai" is the 46th
-    // entry (0-based index 45) of PROVIDER_OPTIONS.
-    let openai_idx = PROVIDER_OPTIONS
-        .iter()
-        .position(|p| p.slug == "openai")
-        .expect("openai in provider options");
-    app.ai_providers
-        .new_provider_state
-        .set_focused_index(openai_idx);
-    // Advance to API key
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("enter to apikey");
 
-    // Submit
+    // Submit — creates the account.
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .expect("enter submit");
+    .expect("enter submits slug");
 
-    // Should be back in list view
-    assert_eq!(app.ai_providers.view, AIProvidersView::List);
-    // Should have sent AddAccount
+    // AddAccount was sent with the slug as the account name.
     let msg = rx.recv().expect("AddAccount message");
     assert_eq!(
         msg,
@@ -2594,148 +2718,64 @@ fn ai_providers_new_form_enter_on_apikey_submits() {
             request_timeout_secs: None,
         }
     );
-}
 
-#[test]
-fn ai_providers_new_form_keys_go_to_correct_field() {
-    let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
-    setup_providers_new_form(&mut app);
+    // The wizard resets to the list view and the flow lands on the
+    // add-credential page for the freshly created account.
+    assert_eq!(app.ai_providers.view, AIProvidersView::List);
+    assert_eq!(
+        app.ai_providers.credential_target.as_deref(),
+        Some("my-account")
+    );
+    assert_eq!(app.ai_providers.provider_selection, 0);
+    assert_eq!(app.ai_providers.slug_state.value(), "");
 
-    // Name is focused by default, typing 'x' goes to name
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("char x on name");
-    assert_eq!(app.ai_providers.new_name_state.value(), "x");
-    assert_eq!(app.ai_providers.new_api_key_state.value(), "");
-
-    // Advance to provider (Enter is handled by our code, not SelectState)
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("enter to provider");
-    assert!(app.ai_providers.new_provider_state.is_focused());
-
-    // Advance to API key
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("enter to apikey");
-    assert!(app.ai_providers.new_api_key_state.is_focused());
-
-    // Type in API key — goes to the API key field, not name
+    // A key now goes to the credential input, not the slug field.
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .expect("char s on apikey");
-    assert_eq!(app.ai_providers.new_api_key_state.value(), "s");
-    // The name field should not receive this character (still has "x")
-    assert_eq!(app.ai_providers.new_name_state.value(), "x");
+    .expect("char s on credential");
+    assert_eq!(app.ai_providers.credential_input.text, "s");
+    assert_eq!(app.ai_providers.slug_state.value(), "");
 }
 
 #[test]
-fn ai_providers_new_form_jk_remapped_to_up_down_on_provider() {
+fn ai_providers_new_account_typing_goes_to_slug_field() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
-    setup_providers_new_form(&mut app);
+    advance_to_slug_phase(&mut app, &tx, "openai");
 
-    // Type name and advance to provider
+    // Slug is focused by default; typing goes into the slug buffer.
     handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .expect("char a");
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("enter to provider");
+    .expect("char x on slug");
+    assert_eq!(app.ai_providers.slug_state.value(), "x");
+    assert!(app.ai_providers.credential_input.text.is_empty());
+}
 
-    assert_eq!(app.ai_providers.new_provider_state.focused_index(), 0);
+#[test]
+fn ai_providers_new_account_escaped_slug_input_not_leaked_to_credential() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    advance_to_slug_phase(&mut app, &tx, "openai");
 
-    // j/j should be remapped to Down by the event handler.
-    // SelectState needs options rendered to navigate; test that the
-    // event handler reaches the state (no panic, focus unchanged
-    // because option_count is 0 before rendering).
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("j on provider");
-    // j did NOT leak through as a character into any text field
-    assert_eq!(app.ai_providers.new_name_state.value(), "a");
-    assert_eq!(app.ai_providers.new_api_key_state.value(), "");
-
-    // On the name field, 'k' should type normally (not remapped)
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("esc cancel");
-    setup_providers_new_form(&mut app);
-    // Now on name field, type 'k' — should go into the name buffer
+    // 'k' on the slug page types into the slug field (it is not a nav key
+    // in phase 2).
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
         &mut app,
         &tx,
     )
-    .expect("k on name");
+    .expect("k on slug");
     assert_eq!(
-        app.ai_providers.new_name_state.value(),
+        app.ai_providers.slug_state.value(),
         "k",
-        "k should type into name field when not on provider"
+        "k should type into slug field in phase 2"
     );
-}
-
-#[test]
-fn ai_providers_new_form_down_up_navigates_provider() {
-    let mut app = test_app();
-    let (tx, _rx) = std::sync::mpsc::channel();
-    setup_providers_new_form(&mut app);
-
-    // Type name and advance to provider
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("char a");
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("enter to provider");
-
-    // Up/Down navigation reaches SelectState (index stays 0 because
-    // option_count is 0 before rendering, but no crash).
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("down on provider");
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-        &mut app,
-        &tx,
-    )
-    .expect("up on provider");
-    // No assertion on index — option_count is 0 before render.
-    // This test validates that Down/Up don't trigger other side effects.
 }
 
 // ── handle_daemon_message progress bar integration ──

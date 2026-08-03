@@ -19,7 +19,7 @@ use crate::markdown_render::{
     reasoning_expanded_default, render_turn_lines,
 };
 use ratatui::text::Line;
-use tui_prompts::{SelectState, State, TextState};
+use tui_prompts::{State, TextState};
 
 pub(crate) const STATUS_BAR_HEIGHT: u16 = 1;
 pub(crate) const MIN_INPUT_CONTENT_LINES: u16 = 1;
@@ -48,6 +48,11 @@ pub(crate) const CTRL_HELP_LINE2: &str =
 
 pub(crate) const AI_PROVIDER_ITEM_LINES: usize = 4;
 
+/// Rows a single PgUp/PgDn press jumps in the new-account provider picker
+/// (phase 1).  The render window always follows the selection, so paging the
+/// selection is what actually scrolls the list.
+pub(crate) const PROVIDER_PAGE_LINES: usize = 10;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Page {
     Chat,
@@ -64,7 +69,12 @@ pub(crate) enum SessionManagerView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AIProvidersView {
     List,
-    NewForm,
+    /// Phase 1 of the new-account wizard: pick a provider from
+    /// `PROVIDER_OPTIONS`.
+    SelectProvider,
+    /// Phase 2 of the new-account wizard: enter a slug (account name).
+    /// Submitting creates the account and redirects to the credential page.
+    SetSlug,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -398,9 +408,15 @@ pub(crate) struct AIProvidersState {
     pub(crate) selection: Option<usize>,
     pub(crate) scroll: usize,
     pub(crate) confirm_remove: Option<String>,
-    pub(crate) new_name_state: TextState<'static>,
-    pub(crate) new_provider_state: SelectState,
-    pub(crate) new_api_key_state: TextState<'static>,
+    // ── New-account wizard state ───────────────────────────────
+    // Phase 1 (provider picker): index into PROVIDER_OPTIONS.  The list is
+    // browsed by moving the selection (j/k one row, PgUp/PgDn one page);
+    // the render window always follows the selection, so no separate scroll
+    // offset is needed.
+    pub(crate) provider_selection: usize,
+    // Phase 2 (slug entry): the account name, which doubles as the
+    // account's slug used in commands like `/account <name>`.
+    pub(crate) slug_state: TextState<'static>,
     pub(crate) credential_target: Option<String>,
     pub(crate) credential_input: InputBuffer,
     pub(crate) add_error: Option<String>,
@@ -414,9 +430,8 @@ impl AIProvidersState {
             selection: None,
             scroll: 0,
             confirm_remove: None,
-            new_name_state: TextState::default(),
-            new_provider_state: SelectState::default(),
-            new_api_key_state: TextState::default(),
+            provider_selection: 0,
+            slug_state: TextState::default(),
             credential_target: None,
             credential_input: InputBuffer::new(),
             add_error: None,
@@ -491,13 +506,72 @@ impl AIProvidersState {
         }
     }
 
-    pub(crate) fn enter_new_form(&mut self) {
-        self.view = AIProvidersView::NewForm;
-        self.new_name_state = TextState::default();
-        self.new_provider_state = SelectState::default();
-        self.new_api_key_state = TextState::default();
+    /// Enter phase 1 of the new-account wizard: provider selection.
+    /// Resets all wizard state so a fresh flow always starts at the top.
+    pub(crate) fn enter_new_account(&mut self) {
+        self.view = AIProvidersView::SelectProvider;
+        self.provider_selection = 0;
+        self.slug_state = TextState::default();
         self.add_error = None;
-        self.new_name_state.focus();
+    }
+
+    pub(crate) fn provider_up(&mut self) {
+        self.provider_selection = self.provider_selection.saturating_sub(1);
+    }
+
+    pub(crate) fn provider_down(&mut self) {
+        let max = PROVIDER_OPTIONS.len().saturating_sub(1);
+        if self.provider_selection < max {
+            self.provider_selection += 1;
+        }
+    }
+
+    /// Move the selection up by a page (PgUp).  The render window always
+    /// follows the selection, so paging the selection is what actually
+    /// scrolls the list.
+    pub(crate) fn provider_page_up(&mut self) {
+        self.provider_selection = self.provider_selection.saturating_sub(PROVIDER_PAGE_LINES);
+    }
+
+    /// Move the selection down by a page (PgDn), clamped to the last
+    /// provider.
+    pub(crate) fn provider_page_down(&mut self) {
+        let max = PROVIDER_OPTIONS.len().saturating_sub(1);
+        self.provider_selection = (self.provider_selection + PROVIDER_PAGE_LINES).min(max);
+    }
+
+    /// Compute the `(start, count)` slice of `PROVIDER_OPTIONS` to render
+    /// for a window of `height` provider rows, keeping the highlighted row
+    /// visible.  Pure (`&self`): the renderer must not mutate focus state
+    /// during `draw()`, so repeated calls with the same inputs return
+    /// identical results.  The selection is the only scroll input — the
+    /// window anchors the highlighted row at the bottom once it passes the
+    /// fold, and at the top otherwise.
+    pub(crate) fn provider_window(&self, height: usize) -> (usize, usize) {
+        let len = PROVIDER_OPTIONS.len();
+        if len == 0 || height == 0 {
+            return (0, 0);
+        }
+        let focused = self.provider_selection.min(len - 1);
+        let start = focused.saturating_add(1).saturating_sub(height);
+        (start, height.min(len - start))
+    }
+
+    /// Confirm the highlighted provider and move to phase 2 (slug entry).
+    /// The chosen slug lives in `slug_state`, which starts focused.
+    pub(crate) fn confirm_provider(&mut self) {
+        self.view = AIProvidersView::SetSlug;
+        self.slug_state = TextState::default();
+        self.add_error = None;
+        self.slug_state.focus();
+    }
+
+    /// The currently selected provider's canonical slug, or None when no
+    /// provider has been picked yet (should not happen while in the wizard).
+    pub(crate) fn selected_provider_slug(&self) -> Option<&'static str> {
+        PROVIDER_OPTIONS
+            .get(self.provider_selection)
+            .map(|p| p.slug)
     }
 
     pub(crate) fn enter_credential(&mut self, account_name: String) {
@@ -512,11 +586,34 @@ impl AIProvidersState {
         self.add_error = None;
     }
 
-    pub(crate) fn leave_new_form(&mut self) {
+    /// Abort the wizard and return to the account list, discarding any
+    /// partial input.
+    pub(crate) fn leave_new_account(&mut self) {
+        self.reset_wizard_to_list();
+    }
+
+    /// Back out of phase 2 (slug entry) to phase 1 (provider selection),
+    /// keeping the previously picked provider highlighted.
+    pub(crate) fn back_to_provider(&mut self) {
+        self.view = AIProvidersView::SelectProvider;
+        self.slug_state = TextState::default();
+        self.add_error = None;
+    }
+
+    /// Reset wizard state after the account was submitted; the credential
+    /// page (driven by `credential_target`) takes over from here.
+    pub(crate) fn finish_new_account(&mut self) {
+        self.reset_wizard_to_list();
+    }
+
+    /// Reset all wizard state back to the account list.  Shared by the
+    /// abort path (`leave_new_account`) and the post-submit path
+    /// (`finish_new_account`), which differ only in what the caller does
+    /// next (nothing vs. jumping to the credential page).
+    fn reset_wizard_to_list(&mut self) {
         self.view = AIProvidersView::List;
-        self.new_name_state = TextState::default();
-        self.new_provider_state = SelectState::default();
-        self.new_api_key_state = TextState::default();
+        self.provider_selection = 0;
+        self.slug_state = TextState::default();
         self.add_error = None;
     }
 }
