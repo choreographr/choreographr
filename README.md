@@ -9,11 +9,11 @@
 
 ## What is Choreographr?
 
-Choreographr is a local-first AI agent daemon written entirely in Rust — a server-side engine that runs agent sessions, with 30+ LLM providers across three wire protocols, real tools, encrypted credentials, and a sandboxed RISC-V VM, fronted by clients that can connect and disconnect at any time.
+Choreographr is an all purpose extensible AI agent system written entirely in Rust. It has a client/server architecture and can run many sessions simulataneously. It can be run locally or in the cloud. LLM generated code can be run in a sandboxed RISC-V VM for complete security and observability.
 
-### General Purpose
+### All Purpose
 
-Choreographr is a general purpose agent. It can be used for software development, a personal / business agent, or as a research tool. It can run on your desktop or in the cloud.
+Choreographr is a all-purpose agent. It can be used for software development, a personal / business agent, or as a research tool. It can run on your desktop or in the cloud.
 
 ### Client / Server Architecture
 
@@ -36,10 +36,9 @@ Other clients being developed:
 
 The LLM can invoke the RISC-V VM (powered by [CKB VM](https://github.com/nervosnetwork/ckb-vm)) by either providing a Rust snippet, or pre-compiled bytecode. Other languages will be supported in future.
 
-The VM has full access to the agent's tool calls. The LLM can quickly write a Rust script for a complex task and hand it off to the VM for high-performance execution.
-
-The sandbox VM is single-hart with the RISC-V A (atomic) extension disabled, so guest code must not use `core::sync::atomic` read-modify-write operations (they fail at compile time).
-
+This has 2 main purposes:
+- a tool call scripting language - the LLM can quickly write a little script to call tools with custom logic
+- a complete replacement for the shell tool. Giving the LLM direct access to the shell is potentially very dangerous. Disabling the shell tool and doing everything via the VM provides complete control and observability.
 
 ### Multiple live sessions
 
@@ -55,9 +54,9 @@ Many agents support the concept of "subagents". Choreographr has "subsessions". 
 
 In Choreographr, the LLM or VM can start new sessions that will report back once they are finished. Subsessions are real sessions that can be interacted with like any other session. The user can pause them and provide additional prompting. Subsessions can invoke their own subsessions as necessary.
 
-### Session database
+### Agent databases
 
-Each session has a persistent key/value store. The LLM / VM can store data and retrieve it at a later time.
+LLMs can create persistent key/value databases. The LLM / VM can store data and retrieve it at a later time.
 
 ### High performance Multithreaded Architecture
 
@@ -115,7 +114,7 @@ Programs will be able to run automatically at designated times.
 
 ### Sandboxing
 
-With the agent able to run anything via the shell, there needs to be a robust sandboxing solution.
+While the VM itself is a perfect sandbox, tools are executed outside of this sandbox for example, if the shell tool is enabled. An OS-level sandbox will be required.
 
 On Linux, [Landlock](https://landlock.io/) will be used. On macOS, [Seatbelt](https://theapplewiki.com/wiki/Dev:Seatbelt).
 Windows does not have a good solution for this yet.
@@ -123,7 +122,9 @@ Windows does not have a good solution for this yet.
 
 ### Advanced Context Management
 
-Currently, as with most AI agents, if the LLM wants to see a file it issues the `read_file` tool. This adds it permanently into the session context. A better solution is to enable the LLM to add and remove files from the context at any time, enabling it manage context bloat itself.
+The session context needs to be divided between permanent and temporary context. Permanent context should be append-only (except when undoing) this ensures maximum cache hit rate. 
+
+Currently, as with most AI agents, if the LLM wants to see a file it issues the `read_file` tool. This adds it permanently into the session context. A better solution is to have an `add_to_context` tool with the option to add it to the permanent or temporary context. If it is added the to temporary context it can be removed later by a `remove_from_context` tool.
 
 ### Git Worktree Support
 
@@ -170,7 +171,7 @@ Choreographr will have an option to automate this process, so it can be left alo
 Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.91**.
 
 ```bash
-rustup toolchain install 1.91.0
+rustup install stable
 cargo build --release
 ```
 
@@ -202,9 +203,7 @@ cargo run --release -p choreo-acp     # ACP bridge for editors
 
 1. **Configure an account** in `~/.config/choreographr/accounts.toml` (see
    [Configuration](#configuration)) and add an API key with `/add-key <service> <api_key>`.
-2. **Unlock the daemon** with `/unlock` (reads `identity.pk`, or decrypts
-   `identity.pk.enc` with a passphrase) so it can decrypt your credentials.
-3. Select the account with `/account <name>` and start prompting.
+2. Select the account with `/account <name>` and start prompting.
 
 ```
 ┌──────────────┐   Unix socket /     ┌──────────────┐   HTTP/SSE     ┌────────────────────┐
@@ -221,10 +220,6 @@ cargo run --release -p choreo-acp     # ACP bridge for editors
 │  (ACP bridge)│                     └──────────────┘   RISC-V VM sandbox
 └──────────────┘                                        redb database
 ```
-
-Mistral and the other OpenAI-compatible providers (Ollama, Groq, DeepSeek,
-OpenRouter, …) speak the OpenAI wire protocol; Anthropic Messages and Google
-Gemini each have their own format.
 
 ## Crates
 
