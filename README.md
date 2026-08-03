@@ -5,7 +5,7 @@
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2024_edition-orange" alt="Rust 2024"></a>
   <img src="https://img.shields.io/badge/providers-30+-brightgreen" alt="30+ providers">
   <img src="https://img.shields.io/badge/wire_protocols-3-lightgrey" alt="3 wire protocols">
-  <a href="https://t.me/choreographr_community"><img src="https://img.shields.io/badge/Telegram-Choreographr_Community-2CA5E0?logo=telegram&logoColor=white" alt="Telegram community"></a>
+  <a href="https://t.me/choreographr"><img src="https://img.shields.io/badge/Telegram-Choreographr_Community-2CA5E0?logo=telegram&logoColor=white" alt="Telegram community"></a>
 </p>
 
 ## What is Choreographr?
@@ -18,11 +18,11 @@ Choreographr is a all-purpose agent. It can be used for software development, a 
 
 ## Community
 
-Join the [Choreographr Community](https://t.me/choreographr_community) on
+Join the [Choreographr Community](https://t.me/choreographr) on
 Telegram for announcements, questions, show-and-tell, and development
 chatter.
 
-[![Telegram](https://img.shields.io/badge/Telegram-Join_the_community-2CA5E0?logo=telegram&logoColor=white)](https://t.me/choreographr_community)
+[![Telegram](https://img.shields.io/badge/Telegram-Join_the_community-2CA5E0?logo=telegram&logoColor=white)](https://t.me/choreographr)
 
 ### Client / Server Architecture
 
