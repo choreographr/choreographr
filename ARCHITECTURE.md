@@ -1886,11 +1886,26 @@ registered tools.
 
 ### `exec` — direct program execution (no shell)
 
-`exec` spawns a program directly without shell interpretation. The command is split into argv (program + args array) and passed to `execvp` — no pipes, redirects, glob expansion, or environment variable interpolation.
+`exec` spawns a single program directly without shell interpretation. The command and each
+argument are passed literally to `execvp` — no pipes, redirects, glob expansion, or
+environment variable interpolation.
 
-Sandboxing is identical to the shell tools: timeout, rlimits, env sanitization, output truncation, and non-interactive stdin.
+Two pre-flight guards steer the model away from the tool's two most common misuses; both
+return actionable errors before anything is spawned:
 
-Use `exec` when the command is a single program with explicit arguments. Prefer it over `sh` when you don't need shell features — it avoids shell-injection surface.
+1. **Shell-syntax guard** — a `|`, `>`, `<`, `&`, `;`, `$`, backtick, `*`, `?`, quote, or
+   apostrophe in the command or any argument aborts with a message pointing the model to the
+   `sh`/`nushell`/`fish` tools (pipes, redirects, globs, env vars, and chaining all require a
+   shell).
+2. **Program-existence check** — the command is resolved against PATH (or used directly when
+   it contains a path separator); a miss returns the searched PATH and suggests `command -v
+   <name>` via `sh` or an absolute path.
+
+The tool description leads with the narrow use case (a concrete, existing program) and
+explicitly defaults to `sh` when in doubt.
+
+Sandboxing is identical to the shell tools: timeout, rlimits, env sanitization, output
+truncation, and non-interactive stdin.
 
 ### `sh` — POSIX shell command execution
 
