@@ -2288,13 +2288,34 @@ impl App {
             .unwrap_or((None, None, None, None, None, None, None, None));
         {
             let display = self.display_for(session_id);
-            display.token_usage = token_usage;
-            display.context_window = context_window;
-            display.last_prompt_tokens = last_prompt_tokens;
-            display.account_name = account_name;
-            display.selected_model = selected_model;
-            display.reasoning_effort = reasoning_effort;
-            display.working_dir = working_dir;
+            // Fill gaps from the (potentially stale) session summary, but never
+            // clobber values already accumulated via the all-activity
+            // subscription while this session was in the background: the
+            // summary is refreshed on ListSessions, whereas the display may
+            // hold fresher per-turn token usage / live counts / model that
+            // arrived mid-stream.  Overwriting here would regress the status
+            // bar right after switching into a streaming session.
+            if display.token_usage.is_none() {
+                display.token_usage = token_usage;
+            }
+            if display.context_window.is_none() {
+                display.context_window = context_window;
+            }
+            if display.last_prompt_tokens.is_none() {
+                display.last_prompt_tokens = last_prompt_tokens;
+            }
+            if display.account_name.is_none() {
+                display.account_name = account_name;
+            }
+            if display.selected_model.is_none() {
+                display.selected_model = selected_model;
+            }
+            if display.reasoning_effort.is_none() {
+                display.reasoning_effort = reasoning_effort;
+            }
+            if display.working_dir.is_none() {
+                display.working_dir = working_dir;
+            }
             if let Some(ref st) = status {
                 display.status = Some(format!("{:?}", st));
             }
@@ -2326,27 +2347,32 @@ impl App {
             .find(|s| Some(s.session_id) == self.attached_session_id)
     }
 
+    /// A model was selected on the session `session_id`.  Only that session's
+    /// display (and, when it is the attached session, the summary used by the
+    /// status bar) is updated — a `ModelSelected` broadcast for a background
+    /// session must never overwrite the display the user is currently viewing.
     pub(crate) fn handle_model_selected(
         &mut self,
+        session_id: u64,
         model: &str,
         reasoning_capability: Option<ReasoningCapability>,
     ) {
-        if let Some(d) = self.active_display() {
-            d.selected_model = Some(model.to_owned());
-            d.reasoning_capability = reasoning_capability;
-        }
-        if self.attached_session_id.is_some()
+        let display = self.display_for(session_id);
+        display.selected_model = Some(model.to_owned());
+        display.reasoning_capability = reasoning_capability;
+        if self.attached_session_id == Some(session_id)
             && let Some(s) = self.attached_session_mut()
         {
             s.selected_model = Some(model.to_owned());
         }
     }
 
-    pub(crate) fn handle_reasoning_effort_set(&mut self, effort: String) {
-        if let Some(d) = self.active_display() {
-            d.reasoning_effort = Some(effort.clone());
-        }
-        if self.attached_session_id.is_some()
+    /// A reasoning-effort change was accepted on the session `session_id`.
+    /// Routed to that session's own display only — see `handle_model_selected`.
+    pub(crate) fn handle_reasoning_effort_set(&mut self, session_id: u64, effort: String) {
+        let display = self.display_for(session_id);
+        display.reasoning_effort = Some(effort.clone());
+        if self.attached_session_id == Some(session_id)
             && let Some(s) = self.attached_session_mut()
         {
             s.reasoning_effort = Some(effort);
@@ -2378,11 +2404,15 @@ impl App {
         }
     }
 
-    pub(crate) fn handle_session_account_set(&mut self, account: &str) {
-        if let Some(d) = self.active_display() {
-            d.account_name = Some(account.to_owned());
-        }
-        if self.attached_session_id.is_some() {
+    /// The account for the session `session_id` was set.  Only that session's
+    /// display is updated; the status bar's provider slug and the session
+    /// summary are refreshed only when the message belongs to the attached
+    /// session (a background session's account change must not alter the
+    /// viewed session's identity fields).
+    pub(crate) fn handle_session_account_set(&mut self, session_id: u64, account: &str) {
+        let display = self.display_for(session_id);
+        display.account_name = Some(account.to_owned());
+        if self.attached_session_id == Some(session_id) {
             self.refresh_attached_provider_slug();
             if let Some(s) = self.attached_session_mut() {
                 s.account_name = Some(account.to_owned());
@@ -2452,7 +2482,24 @@ impl App {
                 }
             }
             if self.attached_session_id.is_none() {
-                if let Some(first) = sessions.first() {
+                // Prefer the most recently modified *top-level* session.
+                // Agent-spawned sub-sessions (parent_session_id = Some) are
+                // transient tool artifacts whose last_modified is bumped as
+                // they stream, so they'd otherwise top the list and silently
+                // hijack the view to a session the user never opened — e.g.
+                // its streaming token count would appear on the chat page.
+                let target = sessions
+                    .iter()
+                    .find(|s| s.parent_session_id.is_none())
+                    .or_else(|| sessions.first());
+                if let Some(first) = target {
+                    // Set attachment state immediately (mirroring the session
+                    // manager Enter handler) so a second Sessions reply in the
+                    // same tick cannot auto-attach again to a different
+                    // session, and so the page renders the target session
+                    // instead of a blank screen until SessionAttached arrives.
+                    self.reset_for_session_switch(first.session_id);
+                    self.attached_session_id = Some(first.session_id);
                     client_tx
                         .send(ClientMessage::AttachSession {
                             session_id: first.session_id,

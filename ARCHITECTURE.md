@@ -1518,6 +1518,27 @@ streaming via the all-activity subscription cannot bleed its counts into
 the session on screen — and its counts are already correct by the time the
 user switches to it (`reset_for_session_switch` preserves live estimates).
 
+The same rule extends to every other per-session status message the daemon
+broadcasts over the all-activity subscription.  `ModelSelected`,
+`ReasoningEffortSet`, `ReasoningEffortSetFailed` and `SessionAccountSet`
+are routed to the display of the session they belong to (and only touch the
+status bar's identity fields when that session is the attached one) — a
+background session changing its model, reasoning effort or account must not
+rewrite the fields of the session on screen.
+
+Two session-switch details keep the status bar honest after switching into
+a streaming session:
+
+- `handle_session_attached` fills *missing* display fields from the (possibly
+  stale) session summary but never clobbers values already accumulated via
+the all-activity subscription, so fresher per-turn token usage and live
+counts survive the attach instead of regressing.
+- The startup auto-attach in `handle_sessions` prefers the most recently
+  modified *top-level* session (skipping agent-spawned sub-sessions, whose
+  `last_modified` is bumped as they stream) and sets attachment state
+  immediately so a second `Sessions` reply cannot re-fire the attach to a
+different session.
+
 
 ---
 

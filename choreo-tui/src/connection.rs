@@ -1901,24 +1901,37 @@ pub(crate) fn handle_daemon_message(
             // Fall through to dispatch_daemon_message.
         }
         DaemonMessage::ModelSelected {
+            session_id,
             model,
             reasoning_capability,
             ..
         } => {
-            app.handle_model_selected(model, reasoning_capability.clone());
+            app.handle_model_selected(*session_id, model, reasoning_capability.clone());
         }
-        DaemonMessage::ReasoningEffortSet { effort, .. } => {
-            app.handle_reasoning_effort_set(effort.clone());
+        DaemonMessage::ReasoningEffortSet {
+            session_id, effort, ..
+        } => {
+            app.handle_reasoning_effort_set(*session_id, effort.clone());
         }
-        DaemonMessage::ReasoningEffortSetFailed { effort, error, .. } => {
+        DaemonMessage::ReasoningEffortSetFailed {
+            session_id,
+            effort,
+            error,
+            ..
+        } => {
             tracing::warn!(%effort, %error, "reasoning effort rejected by daemon");
-            if let Some(display) = app.active_display() {
-                display.reasoning_effort = Some("off".to_string());
-            }
+            // Reset only the session the rejection belongs to — a background
+            // session's rejection must not flip the viewed session's effort.
+            let display = app.display_for(*session_id);
+            display.reasoning_effort = Some("off".to_string());
             app.status = Some(format!("reasoning effort rejected: {error}"));
         }
-        DaemonMessage::SessionAccountSet { account, .. } => {
-            app.handle_session_account_set(account);
+        DaemonMessage::SessionAccountSet {
+            session_id,
+            account,
+            ..
+        } => {
+            app.handle_session_account_set(*session_id, account);
         }
         DaemonMessage::ContextWindowResolved {
             session_id,

@@ -3832,6 +3832,322 @@ fn reasoning_effort_set_updates_session_state() {
 }
 
 #[test]
+fn reasoning_effort_set_for_background_session_does_not_touch_attached_display() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    // The user is viewing session 42.
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    // The display exists because the user attached to it (reset_for_session_switch
+    // creates the entry).
+    app.display_for(42).reasoning_effort = Some("off".to_string());
+
+    // A background session (99, streamed via SubscribeAllActivity) reports a
+    // reasoning-effort change.  The handler must route it to session 99's own
+    // display — writing it to the active display would let a background
+    // session's settings bleed into the status bar of the session being viewed.
+    handle_daemon_message(
+        DaemonMessage::ReasoningEffortSet {
+            session_id: 99,
+            effort: "high".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ReasoningEffortSet");
+
+    // The attached display must NOT pick up the background session's effort.
+    assert_eq!(
+        app.display_for(42).reasoning_effort.as_deref(),
+        Some("off"),
+        "attached display must not pick up a background session's reasoning effort"
+    );
+    // The background session's own display received the update.
+    assert_eq!(
+        app.display_for(99).reasoning_effort.as_deref(),
+        Some("high")
+    );
+}
+
+#[test]
+fn model_selected_for_background_session_does_not_touch_attached_display() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    // The user is viewing session 42.
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    // The display exists because the user attached to it.
+    app.display_for(42).selected_model = Some("gpt-main".to_string());
+
+    // A background session (99) changes its model.  The active display must
+    // not show the background session's model in its status bar.
+    handle_daemon_message(
+        DaemonMessage::ModelSelected {
+            session_id: 99,
+            model: "gpt-other".to_string(),
+            reasoning_capability: None,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ModelSelected");
+
+    assert_eq!(
+        app.display_for(42).selected_model.as_deref(),
+        Some("gpt-main"),
+        "attached display must not pick up a background session's model"
+    );
+    assert_eq!(
+        app.display_for(99).selected_model.as_deref(),
+        Some("gpt-other")
+    );
+}
+
+#[test]
+fn model_selected_for_attached_session_updates_display_and_summary() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    // The user is viewing session 42, which is also the attached session.
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.display_for(42).selected_model = Some("gpt-old".to_string());
+    // The summary the status bar's session-identity fields read from.
+    app.session_mgr
+        .set_sessions(vec![make_session(42, "a", "gpt-old", 0)]);
+
+    handle_daemon_message(
+        DaemonMessage::ModelSelected {
+            session_id: 42,
+            model: "gpt-new".to_string(),
+            reasoning_capability: None,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ModelSelected");
+
+    // The attached session's own model change still updates the status bar's
+    // identity fields (display + summary).
+    assert_eq!(
+        app.display_for(42).selected_model.as_deref(),
+        Some("gpt-new")
+    );
+    assert_eq!(
+        app.attached_session_mut()
+            .unwrap()
+            .selected_model
+            .as_deref(),
+        Some("gpt-new")
+    );
+}
+
+#[test]
+fn reasoning_effort_set_for_attached_session_updates_display_and_summary() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.display_for(42).reasoning_effort = Some("off".to_string());
+    app.session_mgr
+        .set_sessions(vec![make_session(42, "a", "m", 0)]);
+
+    handle_daemon_message(
+        DaemonMessage::ReasoningEffortSet {
+            session_id: 42,
+            effort: "high".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ReasoningEffortSet");
+
+    assert_eq!(
+        app.display_for(42).reasoning_effort.as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        app.attached_session_mut()
+            .unwrap()
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
+    );
+}
+
+#[test]
+fn session_account_set_for_background_session_does_not_touch_attached_display() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.display_for(42).account_name = Some("main-account".to_string());
+
+    // A background session (99) changes its account — the viewed session's
+    // identity fields (account, provider slug) must not change.
+    handle_daemon_message(
+        DaemonMessage::SessionAccountSet {
+            session_id: 99,
+            account: "bg-account".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionAccountSet");
+
+    assert_eq!(
+        app.display_for(42).account_name.as_deref(),
+        Some("main-account"),
+        "attached display must not pick up a background session's account"
+    );
+    assert_eq!(
+        app.display_for(99).account_name.as_deref(),
+        Some("bg-account")
+    );
+}
+
+#[test]
+fn reasoning_effort_set_failed_for_background_session_does_not_touch_attached_display() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.display_for(42).reasoning_effort = Some("high".to_string());
+
+    // A background session's rejection must not flip the viewed session's
+    // reasoning-effort display back to "off".
+    handle_daemon_message(
+        DaemonMessage::ReasoningEffortSetFailed {
+            session_id: 99,
+            effort: "high".to_string(),
+            error: "model does not support reasoning".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ReasoningEffortSetFailed");
+
+    assert_eq!(
+        app.display_for(42).reasoning_effort.as_deref(),
+        Some("high"),
+        "attached display must not be reset by a background session's rejection"
+    );
+    assert_eq!(app.display_for(99).reasoning_effort.as_deref(), Some("off"));
+}
+
+#[test]
+fn session_attached_does_not_regress_accumulated_live_state() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    // The user is viewing session 42 and its display already accumulated live
+    // state via the all-activity subscription while it was in the background:
+    // fresher per-turn token usage plus a live streaming count.
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    let display = app.display_for(42);
+    display.token_usage = Some(TokenUsage {
+        input_tokens: 50,
+        output_tokens: 60,
+        total_tokens: 110,
+    });
+    display.live_output_tokens = 5;
+    display.selected_model = Some("gpt-live".to_string());
+
+    // The session summary (refreshed on ListSessions, potentially stale) has
+    // older values for the same fields.
+    app.session_mgr
+        .set_sessions(vec![make_session(42, "a", "gpt-stale", 0)]);
+    {
+        let s = app.session_mgr.sessions.first_mut().unwrap();
+        s.token_usage = Some(TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+        });
+        s.context_window = Some(4096);
+    }
+
+    handle_daemon_message(
+        DaemonMessage::SessionAttached { session_id: 42 },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionAttached");
+
+    // The accumulated (fresher) display state wins — the stale summary must
+    // not regress the status bar's token readout or model right after switch.
+    assert_eq!(
+        app.display_for(42).token_usage,
+        Some(TokenUsage {
+            input_tokens: 50,
+            output_tokens: 60,
+            total_tokens: 110,
+        })
+    );
+    assert_eq!(app.display_for(42).live_output_tokens, 5);
+    assert_eq!(
+        app.display_for(42).selected_model.as_deref(),
+        Some("gpt-live")
+    );
+    // Fields the display never accumulated come from the summary.
+    assert_eq!(app.display_for(42).context_window, Some(4096));
+}
+
+#[test]
+fn handle_sessions_auto_attach_prefers_top_level_session() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Fresh App: nothing attached yet, on the chat page.
+    let mut app = App::new();
+    app.image_job_tx = None;
+
+    // Session 7 is a sub-session (parent_session_id = Some) and is the most
+    // recently modified (it streamed while the parent's agent worked).
+    // Session 3 is the most recently modified top-level session.
+    let mut child = make_session(7, "sub", "m", 0);
+    child.parent_session_id = Some(3);
+    child.last_modified = 3000;
+    let mut top = make_session(3, "main", "m", 0);
+    top.last_modified = 2000;
+    let mut older = make_session(1, "old", "m", 0);
+    older.last_modified = 1000;
+
+    app.handle_sessions(&[child.clone(), top.clone(), older.clone()], &tx)
+        .expect("handle_sessions should succeed");
+
+    // The auto-attach must pick the top-level session, not the sub-session
+    // that happens to be the most recently modified.
+    let msg = rx.recv().expect("auto-attach message");
+    assert_eq!(msg, ClientMessage::AttachSession { session_id: 3 });
+    assert_eq!(app.attached_session_id, Some(3));
+    assert_eq!(app.active_session_id, Some(3));
+
+    // A second Sessions reply in the same tick must not re-fire: attachment
+    // state was set locally, so the guard skips the auto-attach.
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    app.handle_sessions(&[child.clone(), top.clone(), older.clone()], &tx2)
+        .expect("handle_sessions should succeed");
+    assert!(
+        rx2.try_recv().is_err(),
+        "auto-attach must not fire twice for the same startup tick"
+    );
+}
+
+#[test]
+fn handle_sessions_auto_attach_falls_back_to_child_when_no_top_level() {
+    let mut app = App::new();
+    app.image_job_tx = None;
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    let mut child = make_session(7, "sub", "m", 0);
+    child.parent_session_id = Some(3);
+    app.handle_sessions(&[child], &tx)
+        .expect("handle_sessions should succeed");
+
+    // With no top-level session at all, fall back to the most recent session.
+    let msg = rx.recv().expect("auto-attach message");
+    assert_eq!(msg, ClientMessage::AttachSession { session_id: 7 });
+}
+
+#[test]
 fn ctrl_r_with_empty_capability_shows_message() {
     let mut app = test_app();
     let (tx, _rx) = std::sync::mpsc::channel();
