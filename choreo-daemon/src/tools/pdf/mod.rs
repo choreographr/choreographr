@@ -35,9 +35,10 @@ pub use markdown::{PdfToMarkdownArgs, execute_pdf_to_markdown};
 #[cfg(test)]
 mod test_fixtures;
 
-use crate::tools::{ToolExecError, resolve_path};
+use crate::tools::{ToolExecError, resolve_path, sanitize_name};
 use std::io::Read;
 use std::path::Path;
+use tracing::warn;
 
 /// Hard cap on PDF input size (50 MiB). Bounds how much a malicious PDF can
 /// expand via nested FlateDecode streams before the parser ever sees it; the
@@ -56,6 +57,20 @@ const UNTRUSTED_CONTENT_HEADER: &str =
 /// past the shared byte budget: a truncated extraction still closes its
 /// frame instead of leaving the block dangling open at the cut.
 const UNTRUSTED_CONTENT_FOOTER: &str = "--- end untrusted content ---";
+
+/// Replacement emitted wherever the framing literals appear inside extracted
+/// text (see [`redact_delimiters`]) — the frame cannot be spoofed if the
+/// literals can never occur in the body.
+const DELIMITER_REDACTION: &str = "[untrusted-content delimiter redacted]";
+
+/// Hard cap on extracted markdown (256 MiB). Real extracted text is a few MiB
+/// at most; anything near this cap means a small FlateDecode stream expanded
+/// into hundreds of MiB of text — a decompression bomb. This is an
+/// output-bounding stopgap: it refuses to ship the giant string into the LLM
+/// context / TUI and stops repeated attempts with an actionable error, but
+/// peak parser memory is still governed by the process — the hard `RLIMIT_AS`
+/// backstop remains the sandbox phase.
+const MAX_PDF_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
 
 /// Human-readable snake_case labels for [`pdf_inspector::PdfType`].
 fn pdf_type_label(t: pdf_inspector::PdfType) -> &'static str {
@@ -101,21 +116,33 @@ fn looks_like_pdf(bytes: &[u8]) -> bool {
 /// are slurped into memory.
 fn read_validated_pdf(path: &str, working_dir: Option<&Path>) -> Result<Vec<u8>, ToolExecError> {
     let resolved = resolve_path(path, working_dir);
+    // Sanitized path for log fields: a hostile filename must not inject
+    // control characters (terminal escapes) into the log stream.
+    let log_path = sanitize_name(&resolved.display().to_string());
     // Open once and validate against this handle so the size check and the
     // read are atomic with respect to path-based races (a swap between
     // `fs::metadata` and `fs::read` could otherwise observe two files).
-    let file = std::fs::File::open(&resolved)
-        .map_err(|e| ToolExecError(format!("failed to open '{}': {e}", resolved.display())))?;
+    let file = std::fs::File::open(&resolved).map_err(|e| {
+        warn!(path = %log_path, error = %e, "pdf tool: failed to open path");
+        ToolExecError(format!("failed to open '{}': {e}", resolved.display()))
+    })?;
     let meta = file
         .metadata()
         .map_err(|e| ToolExecError(format!("failed to stat '{}': {e}", resolved.display())))?;
     if !meta.is_file() {
+        warn!(path = %log_path, "pdf tool: path is not a regular file");
         return Err(ToolExecError(format!(
             "'{}' is not a regular file",
             resolved.display()
         )));
     }
     if meta.len() > MAX_PDF_BYTES {
+        warn!(
+            path = %log_path,
+            size = meta.len(),
+            "pdf tool: file exceeds the {} MiB size cap",
+            MAX_PDF_BYTES / (1024 * 1024)
+        );
         return Err(ToolExecError(format!(
             "PDF '{}' is {} — exceeds the {} MiB size cap",
             resolved.display(),
@@ -129,8 +156,16 @@ fn read_validated_pdf(path: &str, working_dir: Option<&Path>) -> Result<Vec<u8>,
     let mut bytes = Vec::with_capacity(meta.len().min(MAX_PDF_BYTES) as usize);
     file.take(MAX_PDF_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| ToolExecError(format!("failed to read '{}': {e}", resolved.display())))?;
+        .map_err(|e| {
+            warn!(path = %log_path, error = %e, "pdf tool: failed to read file");
+            ToolExecError(format!("failed to read '{}': {e}", resolved.display()))
+        })?;
     if bytes.len() as u64 > MAX_PDF_BYTES {
+        warn!(
+            path = %log_path,
+            size = bytes.len(),
+            "pdf tool: file grew past the size cap between stat and read"
+        );
         return Err(ToolExecError(format!(
             "PDF '{}' is {} — exceeds the {} MiB size cap",
             resolved.display(),
@@ -139,6 +174,10 @@ fn read_validated_pdf(path: &str, working_dir: Option<&Path>) -> Result<Vec<u8>,
         )));
     }
     if !looks_like_pdf(&bytes) {
+        warn!(
+            path = %log_path,
+            "pdf tool: file is missing the %PDF- magic header"
+        );
         return Err(ToolExecError(format!(
             "'{}' is not a PDF (missing %PDF- magic bytes)",
             resolved.display()
@@ -198,6 +237,34 @@ fn render_page_list(pages: &[u32]) -> String {
         out.push_str(&page.to_string());
     }
     out
+}
+
+/// Redact the untrusted-content frame literals wherever they appear inside
+/// extracted text. The header/footer are constant strings, so without this a
+/// hostile PDF that embeds `--- end untrusted content ---` in its text layer
+/// could close the frame early — everything after it would then read as
+/// trusted output to the model. Exact-match redaction makes the frame
+/// unspoofable: the only occurrences of the literals in the final output are
+/// the genuine lines `pdf_to_markdown` appends itself.
+fn redact_delimiters(text: &str) -> String {
+    text.replace(UNTRUSTED_CONTENT_HEADER, DELIMITER_REDACTION)
+        .replace(UNTRUSTED_CONTENT_FOOTER, DELIMITER_REDACTION)
+}
+
+/// Refuse extracted markdown that exceeds the post-decompress budget (see
+/// [`MAX_PDF_DECOMPRESSED_BYTES`]). Returns an actionable error instead of
+/// letting a decompression-bomb string flow into the LLM context / TUI.
+fn enforce_decompress_budget(markdown_len: usize) -> Result<(), ToolExecError> {
+    if markdown_len > MAX_PDF_DECOMPRESSED_BYTES {
+        Err(ToolExecError(format!(
+            "extracted text is {} — exceeds the {} MiB post-decompress budget; \
+             this PDF is likely a decompression bomb. Route to OCR/external processing.",
+            super::human_size(markdown_len as u64),
+            MAX_PDF_DECOMPRESSED_BYTES / (1024 * 1024),
+        )))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -309,5 +376,36 @@ mod tests {
         assert_eq!(render_page_list(&[]), "");
         assert_eq!(render_page_list(&[1]), "1");
         assert_eq!(render_page_list(&[1, 3, 7]), "1, 3, 7");
+    }
+
+    // ── enforce_decompress_budget ────────────────────────────────────
+
+    #[test]
+    fn decompress_budget_boundary() {
+        // At-or-below the budget is accepted; one byte over is refused with an
+        // actionable bomb message.
+        assert!(enforce_decompress_budget(MAX_PDF_DECOMPRESSED_BYTES).is_ok());
+        let err = enforce_decompress_budget(MAX_PDF_DECOMPRESSED_BYTES + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("post-decompress budget"), "{err}");
+        assert!(err.contains("decompression bomb"), "{err}");
+    }
+
+    // ── redact_delimiters ────────────────────────────────────────────
+
+    #[test]
+    fn redact_delimiters_removes_embedded_frame_literals() {
+        // A hostile PDF can embed the exact framing literals in its text
+        // layer; redaction must remove every occurrence so the only ones left
+        // in the final output are the genuine lines the tool appends itself.
+        let input =
+            format!("before {UNTRUSTED_CONTENT_HEADER} middle {UNTRUSTED_CONTENT_FOOTER} after");
+        let out = redact_delimiters(&input);
+        assert!(!out.contains(UNTRUSTED_CONTENT_HEADER), "{out}");
+        assert!(!out.contains(UNTRUSTED_CONTENT_FOOTER), "{out}");
+        assert_eq!(out.matches(DELIMITER_REDACTION).count(), 2, "{out}");
+        // Plain text is untouched.
+        assert_eq!(redact_delimiters("plain text"), "plain text");
     }
 }

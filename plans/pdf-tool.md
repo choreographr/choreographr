@@ -14,6 +14,14 @@
 > deduplicated into `src/tools/pdf/test_fixtures.rs` (shared via `#[path]` with the
 > integration test).
 >
+> **Review round 2 (implemented):** extracted text is bounded by a hard 256 MiB
+> post-decompress budget (`MAX_PDF_DECOMPRESSED_BYTES`) checked before any further copies —
+> a decompression-bomb stopgap (the hard `RLIMIT_AS` backstop stays in the sandbox phase);
+> the untrusted-content framing literals are redacted from extracted text so a hostile PDF
+> cannot spoof/close the frame early; out-of-range `pages` are rejected *before* extraction
+> using the authoritative page count from a cheap DetectOnly pass (fail-fast); input-gate
+> rejections emit `tracing::warn!` with control-char-sanitized paths.
+>
 > **Security pin applied during review.** `cargo audit` flagged RUSTSEC-2026-0187
 > (lopdf 0.41, high): a ~21 KB crafted PDF aborts the process via stack overflow
 > — not catchable by `catch_unwind`. Fixed by pinning pdf-inspector to the

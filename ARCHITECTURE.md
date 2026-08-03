@@ -1077,9 +1077,17 @@ between check and read cannot slip past the gates (TOCTOU). Extracted markdown i
 **untrusted data end-to-end**: it is wrapped in an explicit `UNTRUSTED content extracted from
 PDF…` delimiter (prompt-injection guard) whose closing line is appended *past* the shared
 128 KiB `MAX_TOOL_OUTPUT_BYTES` budget, so a truncated extraction still closes its frame;
+the framing literals are **redacted from extracted text**, so a hostile PDF that embeds
+`--- end untrusted content ---` cannot close the frame early (frame-spoofing guard);
 C0 control characters other than tab/newline/CR are escaped (terminal-escape guard).
-Out-of-range `pages` requests are rejected against the parsed page count instead of silently
-returning empty output. `PdfError`
+Extracted markdown is additionally bounded by a 256 MiB **post-decompress budget**
+(`MAX_PDF_DECOMPRESSED_BYTES`) — a decompression-bomb stopgap that refuses to ship a giant
+string into the context and returns an actionable error instead (the hard `RLIMIT_AS`
+backstop remains the sandbox phase). Out-of-range `pages` requests are rejected against the
+authoritative parsed page count from a cheap DetectOnly pass *before* the full extraction
+runs (fail-fast; `estimate_page_count_from_bytes` is explicitly non-authoritative and is not
+used). Input-gate rejections (non-regular file, size cap, missing `%PDF-` magic) are logged
+via `tracing::warn!` with the control-char-sanitized path. `PdfError`
 variants map to actionable one-line messages (e.g. encrypted → “pass a decrypted copy”).
 Malformed-PDF panics from `lopdf` are contained by the request worker's `catch_unwind`
 boundary (see the worker thread discussion above); OS-level sandboxing

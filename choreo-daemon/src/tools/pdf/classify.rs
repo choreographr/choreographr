@@ -1,7 +1,7 @@
 //! `pdf_classify` — cheap PDF classification for smart OCR-vs-local routing.
 
 use super::{pdf_type_label, read_validated_pdf, render_page_list};
-use crate::tools::ToolExecError;
+use crate::tools::{ToolExecError, sanitize_name};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -28,7 +28,7 @@ pub fn execute_pdf_classify(
     // deciding whether a PDF should be routed to OCR or parsed locally.
     let result = pdf_inspector::detect_pdf_mem(&bytes).map_err(super::map_pdf_error)?;
     debug!(
-        path = %args.path,
+        path = %sanitize_name(&args.path),
         pdf_type = ?result.pdf_type,
         confidence = result.confidence,
         pages = result.page_count,
