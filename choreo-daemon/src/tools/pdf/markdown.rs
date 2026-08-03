@@ -2,9 +2,10 @@
 
 use super::{
     UNTRUSTED_CONTENT_FOOTER, UNTRUSTED_CONTENT_HEADER, enforce_decompress_budget, map_pdf_error,
-    pdf_type_label, read_validated_pdf, redact_delimiters, render_page_list, sanitize_pdf_text,
+    pdf_text_window, pdf_type_label, read_validated_pdf, redact_delimiters, render_page_list,
+    sanitize_pdf_text,
 };
-use crate::tools::{ToolExecError, finish_tool_output, sanitize_name};
+use crate::tools::{MAX_TOOL_OUTPUT_BYTES, ToolExecError, finish_tool_output, sanitize_name};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::Path;
@@ -54,29 +55,29 @@ pub fn execute_pdf_to_markdown(
                 "pages are 1-indexed; invalid page number {bad}"
             )));
         }
-        // Authoritative page-range validation BEFORE the full extraction. The
-        // parser silently drops out-of-range page filters and returns empty
-        // markdown, so a request beyond the document must fail fast instead of
-        // paying for extract→markdown that is then discarded. A DetectOnly
-        // pass (document load + sampling, ~10-50ms) provides the authoritative
-        // parsed page count; `estimate_page_count_from_bytes` is explicitly a
-        // non-authoritative fallback and is NOT used here. The cost is one
-        // extra parse on the pages path — acceptable for an explicit opt-in
-        // that usually targets large documents.
-        let page_count = pdf_inspector::detect_pdf_mem(&bytes)
-            .map_err(map_pdf_error)?
-            .page_count;
-        if let Some(&bad) = pages.iter().find(|&&p| p > page_count) {
-            return Err(ToolExecError(format!(
-                "page {bad} is out of range — PDF has {} page(s) (1-indexed)",
-                page_count
-            )));
-        }
         options = options.pages(pages.iter().copied());
     }
 
     let result =
         pdf_inspector::process_pdf_mem_with_options(&bytes, options).map_err(map_pdf_error)?;
+
+    // Out-of-range page filters are silently dropped by the parser — an
+    // entirely-out-of-range request would otherwise fall through to the
+    // "scanned/image-based → route to OCR" branch below and mislead the
+    // agent with a bogus OCR recommendation. `result.page_count` is the
+    // *full* document page count regardless of the filter, so this check is
+    // sound, and running it against this same parse keeps the pages path to
+    // a single document parse (no DetectOnly pre-pass). Invalid requests
+    // stay cheap too: a filter that matches nothing produces no markdown,
+    // so the parser skips the expensive rendering work.
+    if let Some(pages) = &args.pages
+        && let Some(&bad) = pages.iter().find(|&&p| p > result.page_count)
+    {
+        return Err(ToolExecError(format!(
+            "page {bad} is out of range — PDF has {} page(s) (1-indexed)",
+            result.page_count
+        )));
+    }
 
     // Scanned / image-based PDFs have no text layer to extract: report the
     // classification and per-page OCR routing instead of returning empty
@@ -97,11 +98,23 @@ pub fn execute_pdf_to_markdown(
         ));
     };
 
-    // Hard post-decompress budget: refuse bomb-scale extractions before any
-    // further copies are made (sanitize/format would duplicate the string).
+    // Hard post-decompress budget: refuse bomb-scale extractions with an
+    // actionable error before any further copies are made.
     enforce_decompress_budget(markdown.len())?;
 
-    let markdown = sanitize_pdf_text(&markdown);
+    // Window the hygiene passes to the bytes `finish_tool_output` can ever
+    // show (MAX_TOOL_OUTPUT_BYTES). `sanitize_pdf_text` can expand control
+    // chars up to ~6x via escape_default and `redact_delimiters` allocates
+    // two more full copies, so running them over the whole extraction would
+    // amplify a just-under-budget, control-char-heavy string into hundreds
+    // of MiB of extra allocations — the very blowup the budget guards
+    // against. Frame-spoofing soundness is preserved: a framing literal
+    // fully inside the window is redacted, and one straddling the window
+    // edge is only a partial match in the output, which cannot close the
+    // frame (the genuine closing line is appended by `finish_tool_output`
+    // itself, past the byte budget).
+    let window = pdf_text_window(&markdown, MAX_TOOL_OUTPUT_BYTES);
+    let markdown = sanitize_pdf_text(window);
     // Frame-spoofing guard: redact the framing literals if the PDF embedded
     // them in its text layer (see `redact_delimiters`).
     let markdown = redact_delimiters(&markdown);
@@ -136,7 +149,11 @@ pub fn execute_pdf_to_markdown(
 }
 
 pub fn describe_pdf_to_markdown_invocation(args: &PdfToMarkdownArgs) -> String {
-    let mut desc = format!("Converting PDF `{}` to Markdown.", args.path);
+    // Sanitize the path: the description renders in the TUI, so a hostile
+    // filename must not inject terminal escapes there either (same policy
+    // as the tracing fields).
+    let path = sanitize_name(&args.path);
+    let mut desc = format!("Converting PDF `{path}` to Markdown.");
     if let Some(pages) = &args.pages {
         desc.push_str(&format!(" pages: [{}].", render_page_list(pages)));
     }
@@ -343,6 +360,19 @@ mod tests {
     }
 
     #[test]
+    fn invocation_description_sanitizes_control_chars_in_path() {
+        // The description renders in the TUI, so a hostile filename with an
+        // embedded newline must arrive escaped, not as a real line break.
+        let markdown = describe_pdf_to_markdown_invocation(&PdfToMarkdownArgs {
+            path: "evil\ndoc.pdf".into(),
+            pages: None,
+            compact: None,
+        });
+        assert!(markdown.contains("evil\\ndoc.pdf"), "{markdown}");
+        assert!(!markdown.contains('\n'), "{markdown}");
+    }
+
+    #[test]
     fn to_markdown_redacts_embedded_frame_literals() {
         // A hostile PDF can embed the exact framing literals in its text
         // layer. Unredacted, a second `--- end untrusted content ---` would
@@ -367,6 +397,31 @@ mod tests {
         // Exactly one genuine header and one genuine footer remain (the
         // framing appended by the tool itself).
         assert_eq!(out.matches(UNTRUSTED_CONTENT_HEADER).count(), 1, "{out}");
+        assert_eq!(out.matches(UNTRUSTED_CONTENT_FOOTER).count(), 1, "{out}");
+    }
+
+    #[test]
+    fn to_markdown_redacts_within_window_and_truncates_past_it() {
+        // A hostile footer placed at the very start of the text (inside the
+        // window that can be shown) must be redacted; one buried past the
+        // window is simply never shown (truncated). Either way exactly one
+        // genuine closing line remains in the output.
+        let big = "A".repeat(150 * 1024);
+        let evil = format!("BT /F1 24 Tf 72 720 Td ({UNTRUSTED_CONTENT_FOOTER}{big}) Tj ET");
+        let file = write_temp(&build_pdf(&[&evil]));
+        let out = execute_pdf_to_markdown(
+            &PdfToMarkdownArgs {
+                path: file.path().to_str().unwrap().to_string(),
+                pages: None,
+                compact: None,
+            },
+            None,
+        )
+        .unwrap();
+        // The embedded footer sits at the start of the extraction (inside
+        // the hygiene window) and must be redacted; the only footer left in
+        // the output is the genuine one appended past the byte budget.
+        assert!(out.contains(DELIMITER_REDACTION), "{out}");
         assert_eq!(out.matches(UNTRUSTED_CONTENT_FOOTER).count(), 1, "{out}");
     }
 }

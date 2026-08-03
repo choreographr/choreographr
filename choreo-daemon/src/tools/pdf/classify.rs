@@ -44,9 +44,12 @@ pub fn execute_pdf_classify(
 }
 
 pub fn describe_pdf_classify_invocation(args: &PdfClassifyArgs) -> String {
+    // Sanitize the path: the description renders in the TUI, so a hostile
+    // filename must not inject terminal escapes there either (same policy
+    // as the tracing fields).
     format!(
         "Classifying PDF `{}` (type, confidence, OCR pages).",
-        args.path
+        sanitize_name(&args.path)
     )
 }
 
@@ -111,5 +114,16 @@ mod tests {
             path: "doc.pdf".into(),
         });
         assert!(classify.contains("doc.pdf"), "{classify}");
+    }
+
+    #[test]
+    fn invocation_description_sanitizes_control_chars_in_path() {
+        // The description renders in the TUI, so a hostile filename with an
+        // embedded newline must arrive escaped, not as a real line break.
+        let classify = describe_pdf_classify_invocation(&PdfClassifyArgs {
+            path: "evil\ndoc.pdf".into(),
+        });
+        assert!(classify.contains("evil\\ndoc.pdf"), "{classify}");
+        assert!(!classify.contains('\n'), "{classify}");
     }
 }

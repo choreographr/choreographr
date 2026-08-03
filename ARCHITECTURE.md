@@ -1083,10 +1083,17 @@ C0 control characters other than tab/newline/CR are escaped (terminal-escape gua
 Extracted markdown is additionally bounded by a 256 MiB **post-decompress budget**
 (`MAX_PDF_DECOMPRESSED_BYTES`) — a decompression-bomb stopgap that refuses to ship a giant
 string into the context and returns an actionable error instead (the hard `RLIMIT_AS`
-backstop remains the sandbox phase). Out-of-range `pages` requests are rejected against the
-authoritative parsed page count from a cheap DetectOnly pass *before* the full extraction
-runs (fail-fast; `estimate_page_count_from_bytes` is explicitly non-authoritative and is not
-used). Input-gate rejections (non-regular file, size cap, missing `%PDF-` magic) are logged
+backstop remains the sandbox phase). The hygiene passes (control-char escaping and frame
+redaction) run only over the first `MAX_TOOL_OUTPUT_BYTES` of the extraction — the region
+the output cap can ever show — so a just-under-budget, control-char-heavy string cannot be
+amplified into multiple multi-hundred-MiB copies (a frame literal straddling the window
+edge is only a partial match and cannot close the frame). Out-of-range `pages` requests are
+rejected against the authoritative parsed page count (`result.page_count` — the *full*
+document count regardless of the filter) *after* the same parse that produced the
+markdown, so the pages path stays a single document parse; an entirely-out-of-range
+request is still cheap because the parser skips markdown rendering for a filter that
+matches nothing, and it is rejected before the scanned/OCR-routing branch can mislead the
+agent. Input-gate rejections (non-regular file, size cap, missing `%PDF-` magic) are logged
 via `tracing::warn!` with the control-char-sanitized path. `PdfError`
 variants map to actionable one-line messages (e.g. encrypted → “pass a decrypted copy”).
 Malformed-PDF panics from `lopdf` are contained by the request worker's `catch_unwind`

@@ -126,9 +126,10 @@ fn read_validated_pdf(path: &str, working_dir: Option<&Path>) -> Result<Vec<u8>,
         warn!(path = %log_path, error = %e, "pdf tool: failed to open path");
         ToolExecError(format!("failed to open '{}': {e}", resolved.display()))
     })?;
-    let meta = file
-        .metadata()
-        .map_err(|e| ToolExecError(format!("failed to stat '{}': {e}", resolved.display())))?;
+    let meta = file.metadata().map_err(|e| {
+        warn!(path = %log_path, error = %e, "pdf tool: failed to stat file");
+        ToolExecError(format!("failed to stat '{}': {e}", resolved.display()))
+    })?;
     if !meta.is_file() {
         warn!(path = %log_path, "pdf tool: path is not a regular file");
         return Err(ToolExecError(format!(
@@ -237,6 +238,22 @@ fn render_page_list(pages: &[u32]) -> String {
         out.push_str(&page.to_string());
     }
     out
+}
+
+/// Slice `text` to the first `budget` bytes on a char boundary — the region
+/// the shared output cap can ever show. Bounds the markdown hygiene passes
+/// (see `execute_pdf_to_markdown`): `sanitize_pdf_text` can expand control
+/// chars up to ~6x via `escape_default` and `redact_delimiters` reallocates
+/// twice, so running them over a full multi-MiB extraction would amplify
+/// memory far past the post-decompress budget. Slicing to the shown region
+/// keeps peak working memory at the raw parser string plus one budget-sized
+/// copy.
+fn pdf_text_window(text: &str, budget: usize) -> &str {
+    if text.len() <= budget {
+        text
+    } else {
+        &text[..text.floor_char_boundary(budget)]
+    }
 }
 
 /// Redact the untrusted-content frame literals wherever they appear inside
@@ -376,6 +393,22 @@ mod tests {
         assert_eq!(render_page_list(&[]), "");
         assert_eq!(render_page_list(&[1]), "1");
         assert_eq!(render_page_list(&[1, 3, 7]), "1, 3, 7");
+    }
+
+    // ── pdf_text_window ────────────────────────────────────────────────
+
+    #[test]
+    fn pdf_text_window_slices_on_char_boundaries() {
+        // Within budget the whole string is returned (borrowed, no copy).
+        assert_eq!(pdf_text_window("hello", 10), "hello");
+        assert_eq!(pdf_text_window("", 10), "");
+        // A budget cutting mid-char falls back to the previous boundary:
+        // "€" is 3 bytes (boundaries at 0, 3, 6, 9), so 4 → 3.
+        assert_eq!(pdf_text_window("€€€", 4), "€");
+        // ASCII prefix up to the boundary before the 3-byte "€" is kept.
+        assert_eq!(pdf_text_window("ab€c", 3), "ab");
+        // Multi-byte chars fully inside the budget survive intact.
+        assert_eq!(pdf_text_window("ab€c", 6), "ab€c");
     }
 
     // ── enforce_decompress_budget ────────────────────────────────────
