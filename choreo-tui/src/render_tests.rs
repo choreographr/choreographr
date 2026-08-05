@@ -117,7 +117,7 @@ fn render_model_selector_loading_and_error_states() {
 // ── Session list table ────────────────────────────────────────────────
 
 #[test]
-fn render_session_list_is_a_table_sorted_newest_first_without_ids() {
+fn render_session_list_shows_ids_parents_and_titles() {
     use crate::test_util::test_app;
     use choreo_proto::SessionStatus;
     use ratatui::Terminal;
@@ -148,7 +148,7 @@ fn render_session_list_is_a_table_sorted_newest_first_without_ids() {
             title: Some("beta".into()),
             selected_model: None,
             reasoning_effort: None,
-            parent_session_id: None,
+            parent_session_id: Some(9001),
             working_dir: None,
             created_at: 1705314000000,
             last_modified: 1705314000001,
@@ -175,12 +175,19 @@ fn render_session_list_is_a_table_sorted_newest_first_without_ids() {
         .map(|c| c.symbol())
         .collect();
 
-    // Table headers are drawn.
+    // Table headers are drawn, including the new id columns.
+    assert!(content.contains("Session"), "session header drawn");
+    assert!(content.contains("Parent"), "parent header drawn");
     assert!(content.contains("Status"), "status header drawn");
     assert!(content.contains("Model"), "model header drawn");
     assert!(content.contains("Turns"), "turns header drawn");
     assert!(content.contains("Modified"), "modified header drawn");
     assert!(content.contains("Title"), "title header drawn");
+
+    // Session ids render as a column, and the parent column shows both a
+    // top-level dash and a child's parent id.
+    assert!(content.contains("9001"), "session_id 9001 displayed");
+    assert!(content.contains("9002"), "session_id 9002 displayed");
 
     // Session titles and a status label are present.
     assert!(content.contains("alpha"));
@@ -191,12 +198,10 @@ fn render_session_list_is_a_table_sorted_newest_first_without_ids() {
     );
 
     // The most recently modified session sorts to the top (earlier row = lower
-    // flat-buffer offset), and session ids are not rendered as a column.
+    // flat-buffer offset), with session 9002's parent column pointing at 9001.
     let beta_at = content.find("beta").expect("beta rendered");
     let alpha_at = content.find("alpha").expect("alpha rendered");
     assert!(beta_at < alpha_at, "newest session appears first");
-    assert!(!content.contains("9001"), "session_id 9001 not displayed");
-    assert!(!content.contains("9002"), "session_id 9002 not displayed");
 }
 
 // ── format_timestamp ──────────────────────────────────────────────────

@@ -739,19 +739,23 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         // ── Column layout ────────────────────────────────────────────────
         // The title column is LAST so it absorbs the remaining width via
         // Constraint::Fill(1) — long titles truncate (with an ellipsis)
-        // instead of squeezing the fixed columns.  session_id is deliberately
-        // not shown; it adds no signal on this page.
+        // instead of squeezing the fixed columns.  Session and parent ids are
+        // fixed-width numeric columns; long ids truncate with an ellipsis.
+        let session_w = 8u16;
+        let parent_w = 8u16;
         let marker_w = 2u16; // ">" selection + "*" attached markers
         let status_w = 14u16;
         let model_w = 16u16;
         let turns_w = 5u16;
         let modified_w = 11u16;
-        let fixed_w = marker_w + status_w + model_w + turns_w + modified_w;
-        // The Table adds `column_spacing(1)` between the 6 columns (5 gaps),
+        let fixed_w = session_w + parent_w + marker_w + status_w + model_w + turns_w + modified_w;
+        // The Table adds `column_spacing(1)` between the 8 columns (7 gaps),
         // so the title column gets the remaining width minus those gaps.
-        let title_w = list_chunks[0].width.saturating_sub(fixed_w + 5).max(1) as usize;
+        let title_w = list_chunks[0].width.saturating_sub(fixed_w + 7).max(1) as usize;
 
         let header = Row::new(vec![
+            Cell::from("Session"),
+            Cell::from("Parent"),
             Cell::from(""),
             Cell::from("Status"),
             Cell::from("Model"),
@@ -781,6 +785,11 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
 
             let sel = if is_selected { ">" } else { " " };
             let att = if is_attached { "*" } else { " " };
+            // Child sessions show their parent's id; top-level sessions get a
+            // dash so the column stays readable at a glance.
+            let parent = session
+                .parent_session_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string());
             let (status_text, status_color) = status_display(&session.status);
             let model = session.selected_model.as_deref().unwrap_or("-");
             let model_display =
@@ -793,6 +802,14 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             let title = session.title.as_deref().unwrap_or("untitled");
 
             rows.push(Row::new(vec![
+                Cell::from(Span::styled(
+                    truncate_str(&session.session_id.to_string(), session_w as usize),
+                    row_style,
+                )),
+                Cell::from(Span::styled(
+                    truncate_str(&parent, parent_w as usize),
+                    row_style,
+                )),
                 Cell::from(Span::styled(format!("{sel}{att}"), row_style)),
                 // Keep the status colour even on the highlighted row so
                 // active/inferring sessions stay recognisable at a glance.
@@ -819,6 +836,8 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         let table = Table::new(
             rows,
             [
+                Constraint::Length(session_w),
+                Constraint::Length(parent_w),
                 Constraint::Length(marker_w),
                 Constraint::Length(status_w),
                 Constraint::Length(model_w),
