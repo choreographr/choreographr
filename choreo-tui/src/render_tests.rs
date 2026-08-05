@@ -294,6 +294,73 @@ fn session_list_selected_row_highlight_is_solid_across_width() {
     }
 }
 
+// ── Session list scrolls with selection ──────────────────────────────
+
+#[test]
+fn session_list_scrolls_to_keep_selection_visible() {
+    use crate::test_util::test_app;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    // 30 sessions on a 100x24 terminal: the bordered list block leaves
+    // 21 content rows, one of which is the table header, so 20 session
+    // rows fit.  With the selection on row 25 the window must start at
+    // 6 — the top six rows scroll off and the highlighted row stays
+    // pinned to the last visible row.  All timestamps are equal so the
+    // stable sort in `set_sessions` keeps the ids in input order
+    // (index i = session id i+1).
+    let mut app = test_app();
+    app.page = crate::state::Page::SessionManager;
+    let sessions: Vec<SessionSummary> = (1..=30)
+        .map(|i| SessionSummary {
+            session_id: i,
+            title: Some(format!("session {i} with a fairly long title")),
+            selected_model: Some("gpt-4".into()),
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            created_at: 1705314000000,
+            last_modified: 1705314000000,
+            turn_count: i as u32,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: None,
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+        })
+        .collect();
+    app.session_mgr.set_sessions(sessions);
+    app.session_mgr.selection = Some(25);
+
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render scrolled list");
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+
+    // First visible row is index 6 ("session 7"); the selected row 25
+    // ("session 26") must be on screen.  A trailing space disambiguates
+    // whole ids ("session 1 " vs "session 11 ").
+    assert!(content.contains("session 7 "), "window start scrolled in");
+    assert!(
+        content.contains("session 26 "),
+        "selected row stays on screen"
+    );
+    // Rows above the window must have scrolled off.
+    assert!(
+        !content.contains("session 1 ") && !content.contains("session 6 "),
+        "top rows scrolled out of view"
+    );
+}
+
 // ── format_timestamp ──────────────────────────────────────────────────
 
 #[test]

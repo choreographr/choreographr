@@ -715,9 +715,16 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    let scroll = app.session_mgr.scroll;
     let max_rows = list_chunks[0].height as usize;
     let total_items = app.session_mgr.sessions.len();
+    // The table header occupies one of `max_rows` rows, so only `list_rows`
+    // session rows fit below it.  The window and scrollbar math must use
+    // this content height — otherwise the highlighted row can sit one row
+    // below the last drawn session row.  `window()` is pure (no state
+    // mutation during `draw()`), and the returned start doubles as the
+    // scrollbar position.
+    let list_rows = max_rows.saturating_sub(1);
+    let (scroll, _count) = app.session_mgr.window(list_rows);
 
     if let Some(ref err) = app.session_mgr.error {
         let err_style = Style::default().fg(Color::Red);
@@ -771,7 +778,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
 
         // Only render the visible slice; the scrollbar below reflects the
         // full list length.
-        let end = (scroll + max_rows).min(total_items);
+        let end = (scroll + list_rows).min(total_items);
         let mut rows = Vec::with_capacity(end.saturating_sub(scroll));
         for i in scroll..end {
             let session = &app.session_mgr.sessions[i];
@@ -850,13 +857,13 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         frame.render_widget(table, list_chunks[0]);
     }
 
-    if total_items > max_rows {
+    if total_items > list_rows {
         frame.render_stateful_widget(
             vertical_scrollbar(),
             list_chunks[1],
             &mut SmoothScrollbarState::new(total_items)
                 .position(scroll)
-                .viewport_content_length(max_rows),
+                .viewport_content_length(list_rows),
         );
     }
 

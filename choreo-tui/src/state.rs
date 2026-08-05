@@ -640,7 +640,6 @@ pub(crate) struct SessionManagerState {
     pub(crate) sessions: Vec<SessionSummary>,
     pub(crate) view: SessionManagerView,
     pub(crate) selection: Option<usize>,
-    pub(crate) scroll: usize,
     pub(crate) detail_data: Option<SessionDetailData>,
     pub(crate) confirm_delete: Option<(u64, String)>,
     pub(crate) error: Option<String>,
@@ -1125,7 +1124,6 @@ impl SessionManagerState {
             sessions: Vec::new(),
             view: SessionManagerView::List,
             selection: None,
-            scroll: 0,
             detail_data: None,
             confirm_delete: None,
             error: None,
@@ -1148,7 +1146,6 @@ impl SessionManagerState {
                 .unwrap_or(0);
             Some(idx)
         };
-        self.scroll = 0;
     }
 
     /// Order sessions newest-first by `last_modified`.  Uses a STABLE sort:
@@ -1178,9 +1175,6 @@ impl SessionManagerState {
         let sel = self.selection.unwrap_or(0);
         if sel > 0 {
             self.selection = Some(sel - 1);
-            if sel - 1 < self.scroll {
-                self.scroll = self.scroll.saturating_sub(1);
-            }
         }
     }
 
@@ -1192,15 +1186,38 @@ impl SessionManagerState {
         }
     }
 
+    /// Move the selection up by a page (PgUp).  The render window always
+    /// follows the selection (see [`SessionManagerState::window`]), so paging
+    /// the selection is what actually scrolls the list.
     pub(crate) fn scroll_up_page(&mut self) {
-        self.scroll = self.scroll.saturating_sub(PAGE_SCROLL_LINES);
+        if let Some(sel) = self.selection {
+            self.selection = Some(sel.saturating_sub(PAGE_SCROLL_LINES));
+        }
     }
 
+    /// Move the selection down by a page (PgDn), clamped to the last row.
     pub(crate) fn scroll_down_page(&mut self) {
-        if !self.sessions.is_empty() {
-            let max_scroll = self.sessions.len().saturating_sub(1);
-            self.scroll = (self.scroll + PAGE_SCROLL_LINES).min(max_scroll);
+        let max = self.sessions.len().saturating_sub(1);
+        if let Some(sel) = self.selection {
+            self.selection = Some((sel + PAGE_SCROLL_LINES).min(max));
         }
+    }
+
+    /// Compute the `(start, count)` slice of `sessions` to render for a
+    /// window of `height` rows, keeping the highlighted row visible.  Pure
+    /// (`&self`): the renderer must not mutate focus state during `draw()`,
+    /// so repeated calls with the same inputs return identical results.  The
+    /// selection is the only scroll input — the window anchors the highlighted
+    /// row at the bottom once it passes the fold, and at the top otherwise.
+    /// This mirrors `AIProvidersState::provider_window`.
+    pub(crate) fn window(&self, height: usize) -> (usize, usize) {
+        let len = self.sessions.len();
+        if len == 0 || height == 0 {
+            return (0, 0);
+        }
+        let focused = self.selection.unwrap_or(0).min(len - 1);
+        let start = focused.saturating_add(1).saturating_sub(height);
+        (start, height.min(len - start))
     }
 
     pub(crate) fn enter_detail(&mut self) {
@@ -1259,8 +1276,6 @@ impl SessionManagerState {
                 Some(self.sessions.len().saturating_sub(1))
             };
         }
-        let max_scroll = self.sessions.len().saturating_sub(1);
-        self.scroll = self.scroll.min(max_scroll);
         if self
             .detail_data
             .as_ref()
@@ -3709,19 +3724,125 @@ mod tests {
         assert!(mgr.confirm_delete.is_none());
     }
 
+    // ── window (selection-driven scroll) ──
+
+    /// Assert the highlighted row always lies inside the returned window.
+    fn assert_selection_in_window(mgr: &SessionManagerState, height: usize) {
+        let (start, count) = mgr.window(height);
+        if mgr.sessions.is_empty() {
+            assert_eq!((start, count), (0, 0));
+            return;
+        }
+        assert!(count > 0, "non-empty list must yield rows");
+        assert_eq!(start + count, mgr.sessions.len().min(start + height));
+        if let Some(sel) = mgr.selection {
+            assert!(
+                (start..start + count).contains(&sel),
+                "selection {sel} outside window {start}..{}",
+                start + count
+            );
+        }
+    }
+
     #[test]
-    fn remove_session_preserves_scroll_within_bounds() {
+    fn window_empty_and_zero_height() {
         let mut mgr = SessionManagerState::new();
-        mgr.sessions = vec![
-            make_session(1, "a"),
-            make_session(2, "b"),
-            make_session(3, "c"),
-        ];
-        mgr.selection = Some(2);
-        mgr.scroll = 1;
+        assert_eq!(mgr.window(10), (0, 0), "empty list");
+        mgr.set_sessions(vec![make_session(1, "a")]);
+        assert_eq!(mgr.window(0), (0, 0), "zero height");
+    }
+
+    #[test]
+    fn window_anchors_selection_at_bottom_past_the_fold() {
+        // 30 sessions in a 10-row window: the selection walks down the
+        // visible window and only once it passes the last visible row does
+        // the window start advance — i.e. the list scrolls.
+        let mut mgr = SessionManagerState::new();
+        let sessions: Vec<_> = (1..=30).map(|id| make_session(id, "s")).collect();
+        mgr.set_sessions(sessions);
+        let height = 10;
+
+        // From the top the window is anchored at row 0.
+        for _ in 0..=9 {
+            assert_selection_in_window(&mgr, height);
+            assert_eq!(mgr.window(height).0, 0);
+            mgr.select_down();
+        }
+        // Selection is now 10; the window must have scrolled to row 1.
+        assert_eq!(mgr.selection, Some(10));
+        assert_eq!(mgr.window(height).0, 1);
+        assert_selection_in_window(&mgr, height);
+
+        // Scrolling all the way down clamps at the last session, with the
+        // window ending at the final row.
+        for _ in 0..30 {
+            mgr.select_down();
+        }
+        assert_eq!(mgr.selection, Some(29));
+        assert_eq!(mgr.window(height), (20, 10));
+        assert_selection_in_window(&mgr, height);
+
+        // Moving back up re-anchors the window without gaps.
+        mgr.select_up();
+        assert_eq!(mgr.selection, Some(28));
+        assert_eq!(mgr.window(height).0, 19);
+        assert_selection_in_window(&mgr, height);
+    }
+
+    #[test]
+    fn window_follows_selection_on_reorder_and_removal() {
+        // After a status change moves a session to the top, the window must
+        // re-derive from the (new) selection instead of showing stale rows.
+        let mut mgr = SessionManagerState::new();
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        mgr.select_down();
         mgr.remove_session(1);
-        assert_eq!(mgr.scroll, 1);
-        assert_eq!(mgr.sessions.len(), 2);
+        assert_selection_in_window(&mgr, 1);
+        assert_eq!(mgr.selection, Some(0));
+        assert_eq!(mgr.window(1), (0, 1));
+    }
+
+    // ── paging the selection ──
+
+    #[test]
+    fn page_up_down_moves_selection_and_keeps_it_in_window() {
+        let mut mgr = SessionManagerState::new();
+        let sessions: Vec<_> = (1..=20).map(|id| make_session(id, "s")).collect();
+        mgr.set_sessions(sessions);
+
+        mgr.scroll_down_page();
+        assert_eq!(mgr.selection, Some(PAGE_SCROLL_LINES));
+        assert_selection_in_window(&mgr, 10);
+
+        mgr.scroll_down_page();
+        assert_eq!(mgr.selection, Some(PAGE_SCROLL_LINES * 2));
+        assert_selection_in_window(&mgr, 10);
+
+        // Paging past the end clamps to the last row.
+        for _ in 0..10 {
+            mgr.scroll_down_page();
+        }
+        assert_eq!(mgr.selection, Some(19));
+        assert_selection_in_window(&mgr, 10);
+
+        mgr.scroll_up_page();
+        assert_eq!(mgr.selection, Some(16));
+        assert_selection_in_window(&mgr, 10);
+
+        // Paging up past the top clamps to row 0.
+        for _ in 0..10 {
+            mgr.scroll_up_page();
+        }
+        assert_eq!(mgr.selection, Some(0));
+        assert_selection_in_window(&mgr, 10);
+    }
+
+    #[test]
+    fn paging_with_no_selection_is_a_noop() {
+        let mut mgr = SessionManagerState::new();
+        mgr.scroll_up_page();
+        mgr.scroll_down_page();
+        assert_eq!(mgr.selection, None);
     }
 
     // ── scroll_to_content_line ──
