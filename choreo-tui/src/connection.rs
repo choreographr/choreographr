@@ -53,11 +53,12 @@ const UI_EVENT_CHANNEL_SIZE: usize = 4096;
 /// encoding means IME-composed text arrives as plain UTF-8 bytes, which
 /// crossterm parses into the correct `Char` events.
 ///
-/// Trade-off: with `DISAMBIGUATE_ESCAPE_CODES` alone, the Enter/Tab/Backspace
-/// keys stay in their legacy encodings (per the protocol), so Shift+Enter no
-/// longer arrives distinctly on kitty-protocol terminals — it collapses to a
-/// plain Enter.  `Ctrl+J` (line feed, 0x0A) remains available as an explicit
-/// newline-insert binding on the chat page.
+/// Trade-off: with `DISAMBIGUATE_ESCAPE_CODES` alone, the *plain* Enter/Tab/
+/// Backspace keys stay in their legacy encodings (per the protocol), so Ctrl+M
+/// stays distinct from Enter while those keys remain shell-friendly.  Key
+/// combinations with no legacy byte encoding — e.g. Shift+Enter — are still
+/// reported as CSI-u (`CSI 13;2 u`), so modifier variants like Shift+Enter
+/// (newline) remain distinguishable.
 ///
 /// Terminals that do not implement the kitty protocol simply ignore the push
 /// and keep legacy encodings (there Ctrl+M arrives as Enter); supporting
@@ -1270,19 +1271,6 @@ fn handle_chat_ctrl_key(
             client_tx
                 .send(ClientMessage::ListModels)
                 .map_err(broken_pipe)?;
-        }
-        // Ctrl+J (line feed, 0x0A) inserts a literal newline — the reliable
-        // multi-line newline shortcut on every terminal.  With only
-        // DISAMBIGUATE_ESCAPE_CODES requested (see KITTY_KEYBOARD_FLAGS),
-        // kitty-protocol terminals collapse Shift+Enter to a plain Enter
-        // (Enter stays legacy-encoded per the protocol), so Ctrl+J is what
-        // keeps multi-line input reachable there.  On legacy terminals Ctrl+J
-        // already arrives as the 0x0A byte and inserts a newline via the
-        // input handler; this arm makes kitty-protocol terminals (which send
-        // `CSI 106;5 u` → Char('j') + CONTROL) behave identically.
-        KeyCode::Char('j') => {
-            app.input.insert_char_at_cursor('\n');
-            app.ensure_input_cursor_visible();
         }
         // Ctrl+C is a deliberate no-op on the chat page (no copy/sigint
         // in raw mode). Absorb it here so it doesn't fall through to the
