@@ -99,7 +99,7 @@ Defines all shared message types and framing. No dependencies on other workspace
 | `ReasoningCapability` | Struct with `available_effort_levels: Vec<String>` — the reasoning effort slugs a model supports (e.g. `"off"`, `"low"`, `"medium"`, `"high"`, `"max"`). Empty means reasoning is not supported. Cycle helper validates/rotates through slugs. |
 | `TokenUsage` | Tracks LLM token consumption (`input_tokens`, `output_tokens`, `total_tokens`). Embedded in `SessionMessageKind::AssistantText` and `SessionMessageKind::AssistantToolUse` for per-turn accounting, in `SessionSummary` and `DaemonMessage::SessionState` for session-level totals, and in `DaemonMessage::Done` for per-request usage. |
 | `last_prompt_tokens` | `Option<u32>` field on session metadata and protocol messages tracking the `input_tokens` from the most recent API response — the actual context size being sent to the model, used for context-window progress displays. |
-| `last_modified` | `i64` Unix-epoch-**milliseconds** on `SessionSummary` / `DaemonMessage::SessionStatusChanged` (proto) and `SessionMetadata` / `SessionConfig` / `SessionRecord` (daemon). Bumped on status transitions, turn completion, and title/model edits; the sessions list is ordered by it (newest first) and it survives restarts via `SessionRecord`. All session-level timestamps (`created_at`, `last_modified`) are milliseconds to match `Turn.created_at` (`TimestampMs`). |
+| `last_modified` | `i64` Unix-epoch-**milliseconds** on `SessionSummary` / `DaemonMessage::SessionStatusChanged` (proto) and `SessionMetadata` / `SessionConfig` / `SessionRecord` (daemon). Bumped on **completed requests**, session creation, and explicit metadata edits (title/model/account/reasoning) — NOT on transient status transitions (Inference/ToolCall/Retrying), which would re-sort the sessions list mid-request. The sessions list is ordered by it (newest first) and it survives restarts via `SessionRecord`. All session-level timestamps (`created_at`, `last_modified`) are milliseconds to match `Turn.created_at` (`TimestampMs`). |
 | `SessionStatus` | Enum representing the current session state: `Inactive`, `Inference`, `ToolCall(String)`, `Retrying {…}`, `Sleeping`. Included in `SessionSummary` and `DaemonMessage::SessionState` for live status display in client toolbars. |
 | `ToolResultRecord` | Persisted tool result with fields `call_id`, `name`, `content`, `is_error`, and `invocation_description` — a human-readable sentence from `Tool::describe_invocation` describing what the tool did. Used for UI display only; excluded from LLM message construction. |
 
@@ -539,10 +539,12 @@ LLM provider (API response)
         │  SessionSummary)
         └─ status flows through DaemonMessage::SessionState.status and
            DaemonMessage::SessionStatusChanged for live toolbar display.
-           Every status transition ALSO bumps last_modified and refreshes the
-           daemon's session_metadata index in handle_broadcast_session_status
-           (daemon.rs) so a later ListSessions never serves a stale status;
-           the index is the source of truth for the sessions list.
+           Every status transition refreshes the daemon's session_metadata
+           index in handle_broadcast_session_status (daemon.rs) so a later
+           ListSessions never serves a stale status — but it does NOT bump
+           last_modified (status transitions are pipeline churn, not
+           modifications); the index is the source of truth for the sessions
+           list.
         └─ the sessions list (ListSessions) is sorted newest-first by
            last_modified (id-desc tiebreak) — see handle_list_sessions.
         │
@@ -1625,9 +1627,9 @@ the all-activity subscription, so fresher per-turn token usage and live
 counts survive the attach instead of regressing.
 - The startup auto-attach in `handle_sessions` prefers the most recently
   modified *top-level* session (skipping agent-spawned sub-sessions, whose
-  `last_modified` is bumped as they stream) and sets attachment state
-  immediately so a second `Sessions` reply cannot re-fire the attach to a
-different session.
+  `last_modified` is bumped each time one of their requests completes and
+  would otherwise hijack the view) and sets attachment state immediately so a
+  second `Sessions` reply cannot re-fire the attach to a different session.
 
 
 ---

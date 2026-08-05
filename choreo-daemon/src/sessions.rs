@@ -1309,18 +1309,21 @@ fn validate_model_via_daemon(model: &str, ctx: &RequestContext) -> Result<(), St
 
 /// Update the session status and broadcast to subscribers and daemon.
 ///
-/// Bumps `last_modified` on the session's config so the status transition
-/// counts as a modification; the daemon mirrors this onto its metadata index
-/// in `handle_broadcast_session_status` (which is also what fixes stale
-/// statuses in listings — see daemon.rs).
+/// Status transitions (Inference, ToolCall, Retrying) are internal pipeline
+/// churn, NOT user-visible modifications — the status is refreshed everywhere
+/// but `last_modified` is deliberately left untouched so the sessions list
+/// does not re-sort on every tool call mid-request.  Only completed requests
+/// (`handle_request_finished`) and explicit metadata edits
+/// (`persist_session_metadata`) bump the timestamp.  The message carries the
+/// session's *current* `last_modified`, so clients' monotonic `max()` guards
+/// keep the value stable.
 fn handle_status_changed(
     new_status: SessionStatus,
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
-    let last_modified = TimestampMs::now().as_millis();
     state.config.status = new_status.clone();
-    state.config.last_modified = state.config.last_modified.max(last_modified);
+    let last_modified = state.config.last_modified;
     broadcast(
         &mut state.subscribers,
         &ctx.daemon_tx,
@@ -1455,9 +1458,13 @@ fn handle_request_finished(
     // preserved without needing an explicit save/restore list.
     state.config.apply_worker_snapshot(&snapshot.config);
 
-    // A completed turn is a modification: bump the timestamp BEFORE persisting
-    // the record and refreshing the daemon index so both reflect the change.
-    state.config.last_modified = TimestampMs::now().as_millis();
+    // A completed request is a modification: bump the timestamp exactly once,
+    // BEFORE persisting the record and refreshing the daemon index, so the
+    // on-disk record, the daemon index, and the broadcast all agree on the
+    // same value.  `.max()` keeps the bump monotonic — a future-dated value
+    // (clock skew) can never regress.
+    let last_modified = TimestampMs::now().as_millis();
+    state.config.last_modified = state.config.last_modified.max(last_modified);
 
     // Persist the updated session config (accumulated usage, context_window, etc.)
     // so resolved values survive daemon restarts.
@@ -1495,9 +1502,7 @@ fn handle_request_finished(
     }
 
     state.active_requests.remove(&request_id);
-    let last_modified = TimestampMs::now().as_millis();
     state.config.status = SessionStatus::Inactive;
-    state.config.last_modified = state.config.last_modified.max(last_modified);
     let _ = ctx.daemon_tx.send(DaemonCommand::UpdateMetadata {
         session_id: ctx.session_id,
         metadata: SessionMetadata::from(&*state),

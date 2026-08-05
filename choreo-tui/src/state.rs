@@ -3597,7 +3597,7 @@ mod tests {
     }
 
     #[test]
-    fn status_change_reorders_list_and_preserves_selection() {
+    fn status_change_reorders_only_when_timestamp_advances() {
         let mut app = test_app();
         app.session_mgr
             .set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
@@ -3606,14 +3606,30 @@ mod tests {
         app.session_mgr.select_down();
         assert_eq!(app.session_mgr.selection, Some(1));
 
-        // Session 2 becomes active: the daemon bumps last_modified, and the
-        // TUI re-sorts so it jumps to the top while the cursor follows it.
-        app.handle_session_status_changed(2, &SessionStatus::Inference, 9999);
+        // A pure status transition (Inference at request start) carries the
+        // session's *current* last_modified — the daemon no longer bumps the
+        // timestamp for internal pipeline churn, so the list must NOT re-sort.
+        let ts = app.session_mgr.sessions[1].last_modified;
+        app.handle_session_status_changed(2, &SessionStatus::Inference, ts);
+        assert_eq!(
+            app.session_mgr.sessions[0].session_id, 1,
+            "no reorder on status-only change"
+        );
+        assert_eq!(
+            app.session_mgr.sessions[1].status,
+            SessionStatus::Inference,
+            "status still updates without reordering"
+        );
+        assert_eq!(app.session_mgr.selection, Some(1));
+
+        // Only when the timestamp actually advances (a request completed) does
+        // the session jump to the top, with the cursor following it.
+        app.handle_session_status_changed(2, &SessionStatus::Inactive, ts + 1000);
         assert_eq!(
             app.session_mgr.sessions[0].session_id, 2,
-            "active session re-sorted to top"
+            "completed session re-sorted to top"
         );
-        assert_eq!(app.session_mgr.sessions[0].status, SessionStatus::Inference);
+        assert_eq!(app.session_mgr.sessions[0].status, SessionStatus::Inactive);
         assert_eq!(
             app.session_mgr.selection,
             Some(0),

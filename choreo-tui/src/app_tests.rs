@@ -4141,7 +4141,8 @@ fn handle_sessions_auto_attach_prefers_top_level_session() {
     app.image_job_tx = None;
 
     // Session 7 is a sub-session (parent_session_id = Some) and is the most
-    // recently modified (it streamed while the parent's agent worked).
+    // recently modified (its requests completed while the parent's agent
+    // worked, each bumping last_modified).
     // Session 3 is the most recently modified top-level session.
     let mut child = make_session(7, "sub", "m", 0);
     child.parent_session_id = Some(3);

@@ -748,15 +748,20 @@ impl DaemonState {
             }
         }
 
-        // Capture a single timestamp for both the index bump and the
-        // broadcast message so the two can never disagree by a millisecond
-        // (the max() guard on the index makes a skew harmless, but a single
-        // read is simpler to reason about).
-        let last_modified = TimestampMs::now().as_millis();
-        if let Some(meta) = self.session_metadata.get_mut(&session_id) {
-            meta.status = SessionStatus::Sleeping;
-            meta.last_modified = meta.last_modified.max(last_modified);
-        }
+        // Exiting (the last subscriber detached) is lifecycle noise, not a
+        // modification — the session produced no new content by shutting
+        // down, so the sessions list must NOT re-sort here.  Update the
+        // index *status* and reuse its current `last_modified` for the
+        // broadcast so clients' monotonic `max()` guards keep both sides in
+        // sync.  (The daemon-side timestamp for a request that just finished
+        // was already set by `UpdateMetadata` in `handle_request_finished`.)
+        let last_modified = match self.session_metadata.get_mut(&session_id) {
+            Some(meta) => {
+                meta.status = SessionStatus::Sleeping;
+                meta.last_modified
+            }
+            None => 0,
+        };
         // Only broadcast for sessions that still exist: a deleted session's
         // shutting-down thread must not emit a ghost "sleeping" status for a
         // session the user removed.
@@ -988,14 +993,25 @@ impl DaemonState {
     /// the session thread broadcasts status changes (see `handle_status_changed`
     /// in sessions.rs) but never updates the daemon's `session_metadata` index,
     /// so a subsequent ListSessions would serve an outdated status.  Updating
-    /// the index here — and bumping `last_modified` so the list reorders —
-    /// covers every status-transition path.
+    /// the index here covers every status-transition path.
+    ///
+    /// Status transitions are internal pipeline churn, not modifications: the
+    /// index *status* is refreshed but `last_modified` is left untouched, so
+    /// the sessions list does not re-sort on every tool call mid-request.
+    /// Only completed requests / explicit edits bump the timestamp (via
+    /// `UpdateMetadata`).  The message carries the index's current
+    /// `last_modified` so clients' monotonic `max()` guards keep both sides
+    /// in sync.
     fn handle_broadcast_session_status(&mut self, session_id: u64, status: SessionStatus) {
-        let last_modified = TimestampMs::now().as_millis();
-        if let Some(meta) = self.session_metadata.get_mut(&session_id) {
-            meta.status = status.clone();
-            meta.last_modified = meta.last_modified.max(last_modified);
-        }
+        let last_modified = match self.session_metadata.get_mut(&session_id) {
+            Some(meta) => {
+                meta.status = status.clone();
+                meta.last_modified
+            }
+            // Deleted sessions have no index entry; the message is dropped
+            // below anyway, so a default timestamp is harmless.
+            None => 0,
+        };
         let msg = DaemonMessage::SessionStatusChanged {
             session_id,
             status,
@@ -2029,9 +2045,13 @@ mod tests {
         // the fresh status (this is the stale-status bug fix).
         let meta = state.session_metadata.get(&42).expect("index updated");
         assert_eq!(meta.status, SessionStatus::Inference);
-        assert!(
-            meta.last_modified > 0,
-            "last_modified bumped on status change"
+        // Status transitions are internal churn, not modifications: the index
+        // status refreshes but the timestamp must stay put so the sessions
+        // list does not re-sort mid-request.
+        assert_eq!(
+            meta.last_modified, 1000,
+            "status transitions must not bump last_modified \
+             (only completed requests and explicit edits do)"
         );
     }
 
