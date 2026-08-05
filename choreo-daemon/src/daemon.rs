@@ -1324,9 +1324,9 @@ impl DaemonState {
     }
 
     /// Remove any stale deletion tombstone for `session_id` left by an earlier
-    /// interrupted delete.  Only called when the record is being deleted with
-    /// no live session thread, so no pending delete can own the tombstone (a
-    /// deferred finalize clears it otherwise).
+    /// interrupted delete.  Callers must only invoke this when no delete is
+    /// pending for the id: while a deferred delete's thread is still shutting
+    /// down, the tombstone is owned by (and cleared by) its finalize.
     fn clear_stale_session_tombstone(&self, session_id: u64) {
         if let Err(e) = db::clear_session_tombstone(&self.db, session_id) {
             warn!(session_id, error = %e, "failed to clear stale session-deletion tombstone");
@@ -1383,7 +1383,16 @@ impl DaemonState {
             // No live thread: nothing can re-create the record, so delete it
             // now.  This is the only path that can fail here.
             db::delete_session(&self.db, session_id)?;
-            self.clear_stale_session_tombstone(session_id);
+            // Sweep any stale tombstone from an earlier interrupted delete of
+            // this id — but only when no delete is still pending.  A pending
+            // deferred delete (from an earlier DeleteSession while the thread
+            // was alive) owns the tombstone: its thread is still shutting down
+            // and can re-create the record via `persist_and_exit` before the
+            // finalize clears it, so sweeping here would reopen the crash
+            // window (a restart could resurrect the deleted session).
+            if !self.deleted_sessions.contains(&session_id) {
+                self.clear_stale_session_tombstone(session_id);
+            }
         }
         // Remove from in-memory metadata and broadcast deletion immediately:
         // from here on the session is invisible (index removed) and
@@ -2337,6 +2346,65 @@ mod tests {
             db::purge_tombstoned_sessions(&state.db).unwrap(),
             1,
             "deferred delete must write a tombstone"
+        );
+
+        // Release the stand-in thread so it exits (no leaked threads).
+        drop(release_tx);
+    }
+
+    #[test]
+    fn delete_session_keeps_tombstone_while_a_delete_is_pending() {
+        // A second DeleteSession arriving while an earlier deferred delete is
+        // still shutting its thread down must NOT sweep the pending delete's
+        // tombstone: the thread can re-create the record via
+        // `persist_and_exit` before its finalize runs, and a swept tombstone
+        // would let a crash in that window resurrect the deleted session at
+        // the next startup.
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let record = SessionRecord {
+            title: Some("double-deleted".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            turn_count: 0,
+            created_at: 1000,
+            last_modified: 1000,
+            active_tool_groups: vec![],
+            context_config: ContextConfig::default(),
+            account_name: None,
+        };
+        db::write_session(&state.db, 5, &record).unwrap();
+        // First delete defers: live thread → marker set, tombstone written,
+        // entry removed (the record stays until the thread exits).
+        let (_cmd_rx, release_tx) = insert_active_session(&mut state, 5);
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::DeleteSession {
+            session_id: 5,
+            reply,
+        });
+        assert!(rx.recv().unwrap().is_ok());
+        assert!(state.deleted_sessions.contains(&5));
+
+        // Second delete arrives before the thread has exited: there is no live
+        // entry now, so it takes the immediate-delete branch — but the pending
+        // delete still owns the tombstone, which must survive.  (The tombstone
+        // is probed with `purge_tombstoned_sessions` only once, at the end,
+        // because the purge both deletes the record and clears tombstones.)
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::DeleteSession {
+            session_id: 5,
+            reply,
+        });
+        assert!(rx.recv().unwrap().is_ok());
+        assert!(
+            state.deleted_sessions.contains(&5),
+            "marker must stay while the deferred delete is pending"
+        );
+        assert_eq!(
+            db::purge_tombstoned_sessions(&state.db).unwrap(),
+            1,
+            "the pending delete's tombstone must not be swept by a second delete"
         );
 
         // Release the stand-in thread so it exits (no leaked threads).

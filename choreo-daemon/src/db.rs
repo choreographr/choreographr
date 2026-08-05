@@ -191,6 +191,18 @@ pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRec
     Ok(sessions)
 }
 
+/// Exclusive upper-bound session id for the range queries that span a single
+/// session's keys: `(session_id, …)..(session_range_end(session_id), …)`
+/// covers every key whose first tuple element is `session_id`.
+///
+/// `saturating_add` keeps the bound total even at the theoretical
+/// `session_id == u64::MAX` (which the daemon's monotonic id counter can
+/// never reach in practice): the range would simply be empty for that id
+/// instead of overflowing (debug) or wrapping (release).
+fn session_range_end(session_id: u64) -> u64 {
+    session_id.saturating_add(1)
+}
+
 pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
     debug!("delete_session: id={}", session_id);
     let write_txn = db
@@ -212,7 +224,7 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
         // iterating the whole table (the old full-table scan made each delete
         // O(total turns) — costly for the largest sessions).
         let keys_to_remove: Vec<(u64, u32)> = turns
-            .range::<(u64, u32)>((session_id, 0u32)..(session_id + 1, 0u32))
+            .range::<(u64, u32)>((session_id, 0u32)..(session_range_end(session_id), 0u32))
             .map_err(|e| db_err(format!("redb range turns: {e}")))?
             .filter_map(|result| result.ok())
             .map(|(key, _)| key.value())
@@ -228,7 +240,9 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
             .open_table(SESSION_KV)
             .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
         let kv_keys: Vec<(u64, String)> = kv_table
-            .range::<(u64, String)>((session_id, String::new())..(session_id + 1, String::new()))
+            .range::<(u64, String)>(
+                (session_id, String::new())..(session_range_end(session_id), String::new()),
+            )
             .map_err(|e| db_err(format!("redb range session_kv: {e}")))?
             .filter_map(|result| result.ok())
             .map(|(k, _)| k.value())
@@ -601,7 +615,7 @@ pub fn kv_delete_range(
             }
             None => {
                 let range_start = (session_id, start.to_string());
-                let range_end = (session_id + 1, String::new());
+                let range_end = (session_range_end(session_id), String::new());
                 table
                     .range::<(u64, String)>((range_start)..(range_end))
                     .map_err(|e| db_err(format!("redb range kv_delete_range: {e}")))?
@@ -654,7 +668,7 @@ pub fn kv_get_range(
         }
         None => {
             let range_start = (session_id, start.to_string());
-            let range_end = (session_id + 1, String::new());
+            let range_end = (session_range_end(session_id), String::new());
             table
                 .range::<(u64, String)>((range_start)..(range_end))
                 .map_err(|e| db_err(format!("redb range kv_get_range: {e}")))?
@@ -696,7 +710,7 @@ pub fn kv_list(
         }
         (Some(start), None) => {
             let range_start = (session_id, start.to_string());
-            let range_end = (session_id + 1, String::new());
+            let range_end = (session_range_end(session_id), String::new());
             Box::new(
                 table
                     .range::<(u64, String)>((range_start)..(range_end))
@@ -714,7 +728,7 @@ pub fn kv_list(
         }
         (None, None) => {
             let range_start = (session_id, String::new());
-            let range_end = (session_id + 1, String::new());
+            let range_end = (session_range_end(session_id), String::new());
             Box::new(
                 table
                     .range::<(u64, String)>((range_start)..(range_end))
@@ -761,7 +775,7 @@ pub fn kv_count(db: &redb::Database, session_id: u64, prefix: Option<&str>) -> i
         }
         None => {
             let range_start = (session_id, String::new());
-            let range_end = (session_id + 1, String::new());
+            let range_end = (session_range_end(session_id), String::new());
             table
                 .range::<(u64, String)>((range_start)..(range_end))
                 .map_err(|e| db_err(format!("redb range kv_count: {e}")))?
