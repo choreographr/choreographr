@@ -39,17 +39,31 @@ const UI_EVENT_CHANNEL_SIZE: usize = 4096;
 ///
 /// `DISAMBIGUATE_ESCAPE_CODES` makes `Ctrl+letter` (e.g. Ctrl+M) arrive as an
 /// unambiguous CSI-u sequence (`CSI 109;5 u`) instead of the legacy control
-/// byte (0x0D — identical to Enter).  `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
-/// additionally reports *every* key, including plain text keys, as CSI-u,
-/// which guarantees Ctrl+M stays distinguishable on terminals that implement
-/// the protocol.
+/// byte (0x0D — identical to Enter), while plain text keys stay as legacy
+/// UTF-8 bytes.
+///
+/// `REPORT_ALL_KEYS_AS_ESCAPE_CODES` is deliberately **not** requested.  With
+/// it enabled, kitty-protocol terminals report *every* key as a CSI-u event,
+/// and text produced by an input method (IME) — e.g. Vietnamese composed by
+/// OpenKey — arrives as a pure "text event" with key number 0
+/// (`CSI 0;;<codepoints>u`, the third field carrying the composed text).
+/// crossterm 0.29 has no `KeyEvent` text field and silently drops that third
+/// field, turning the event into `KeyCode::Char('\0')`; the composed text is
+/// lost and the chat input receives a NUL.  Keeping text keys in legacy
+/// encoding means IME-composed text arrives as plain UTF-8 bytes, which
+/// crossterm parses into the correct `Char` events.
+///
+/// Trade-off: with `DISAMBIGUATE_ESCAPE_CODES` alone, the Enter/Tab/Backspace
+/// keys stay in their legacy encodings (per the protocol), so Shift+Enter no
+/// longer arrives distinctly on kitty-protocol terminals — it collapses to a
+/// plain Enter.  `Ctrl+J` (line feed, 0x0A) remains available as an explicit
+/// newline-insert binding on the chat page.
 ///
 /// Terminals that do not implement the kitty protocol simply ignore the push
 /// and keep legacy encodings (there Ctrl+M arrives as Enter); supporting
 /// those terminals is out of scope for now.
 const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags = KeyboardEnhancementFlags::from_bits_retain(
-    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits()
-        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES.bits(),
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits(),
 );
 
 /// Commands sent from the terminal-event thread to the main loop for
@@ -1257,6 +1271,19 @@ fn handle_chat_ctrl_key(
                 .send(ClientMessage::ListModels)
                 .map_err(broken_pipe)?;
         }
+        // Ctrl+J (line feed, 0x0A) inserts a literal newline — the reliable
+        // multi-line newline shortcut on every terminal.  With only
+        // DISAMBIGUATE_ESCAPE_CODES requested (see KITTY_KEYBOARD_FLAGS),
+        // kitty-protocol terminals collapse Shift+Enter to a plain Enter
+        // (Enter stays legacy-encoded per the protocol), so Ctrl+J is what
+        // keeps multi-line input reachable there.  On legacy terminals Ctrl+J
+        // already arrives as the 0x0A byte and inserts a newline via the
+        // input handler; this arm makes kitty-protocol terminals (which send
+        // `CSI 106;5 u` → Char('j') + CONTROL) behave identically.
+        KeyCode::Char('j') => {
+            app.input.insert_char_at_cursor('\n');
+            app.ensure_input_cursor_visible();
+        }
         // Ctrl+C is a deliberate no-op on the chat page (no copy/sigint
         // in raw mode). Absorb it here so it doesn't fall through to the
         // input handler which would insert a literal 'c'.
@@ -2049,15 +2076,20 @@ mod tests {
     // ── Kitty keyboard protocol ──
 
     #[test]
-    fn kitty_flags_include_report_all_keys() {
-        // Ctrl+M must arrive as a distinct CSI-u key event; REPORT_ALL_KEYS is
-        // what guarantees text keys are reported as key events on terminals
-        // that implement the kitty protocol.
-        assert!(
-            KITTY_KEYBOARD_FLAGS
-                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
-        );
+    fn kitty_flags_disambiguate_without_report_all_keys() {
+        // Ctrl+M must arrive as a distinct CSI-u key event (CSI 109;5 u);
+        // DISAMBIGUATE_ESCAPE_CODES alone gives us that because Ctrl+letter is
+        // a "disambiguated" key, while plain text stays as legacy bytes.
         assert!(KITTY_KEYBOARD_FLAGS.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        // REPORT_ALL_KEYS_AS_ESCAPE_CODES must stay OFF: it makes IME-composed
+        // text arrive as a `CSI 0;;<codepoints>u` text event, which crossterm
+        // 0.29 mangles into `Char('\0')` (dropping the composed text) — so
+        // Vietnamese/other IME input would type as nothing.
+        assert!(
+            !KITTY_KEYBOARD_FLAGS
+                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES),
+            "REPORT_ALL_KEYS breaks IME text input (crossterm drops the associated-text field)"
+        );
     }
 
     #[test]

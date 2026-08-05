@@ -4591,3 +4591,75 @@ fn model_selector_filter_receives_shifted_chars() {
 
     assert_eq!(app.model_selector.filter.text, "G");
 }
+
+// ── IME text input (Vietnamese, CJK, …) ──
+//
+// crossterm 0.29 has no KeyEvent.text field, so kitty-protocol "text events"
+// (CSI 0;;<codepoints>u — how IME-composed text is delivered when
+// REPORT_ALL_KEYS_AS_ESCAPE_CODES is enabled) are parsed as Char('\0') with
+// the composed text silently dropped.  We therefore never request
+// REPORT_ALL_KEYS (see KITTY_KEYBOARD_FLAGS in connection.rs); these tests
+// pin the defence-in-depth behaviours that keep NUL garbage out of the input.
+
+#[test]
+fn ime_text_event_must_not_insert_nul_into_chat_input() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.input.text = "xin chào".to_string();
+    app.input.cursor = app.input.text.len();
+
+    // This is exactly the Event crossterm 0.29 yields for the IME text event
+    // `CSI 0;;7871u` ('ế') — key code 0, associated text dropped.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('\0'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ime text event");
+
+    assert_eq!(
+        app.input.text, "xin chào",
+        "a NUL from a mangled IME text event must never enter the buffer"
+    );
+}
+
+#[test]
+fn ctrl_j_inserts_newline_in_chat_input() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.input.text = "xin".to_string();
+    app.input.cursor = app.input.text.len();
+
+    // Kitty-protocol terminals send Ctrl+J as `CSI 106;5 u` → Char('j') +
+    // CONTROL (+SHIFT, stripped by the normaliser).  This is the reliable
+    // multi-line newline shortcut now that Shift+Enter collapses to a plain
+    // Enter under DISAMBIGUATE-only flags.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+j");
+
+    assert_eq!(app.input.text, "xin\n");
+}
+
+#[test]
+fn legacy_ctrl_j_byte_inserts_newline_in_chat_input() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = test_app();
+    app.input.text = "xin".to_string();
+    app.input.cursor = app.input.text.len();
+
+    // Legacy terminals send Ctrl+J as the raw line-feed byte 0x0A, which
+    // crossterm parses as Char('\n') in raw mode.  It must keep inserting a
+    // newline (and the NUL guard must not broaden into rejecting it).
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ctrl+j (legacy 0x0A)");
+
+    assert_eq!(app.input.text, "xin\n");
+}

@@ -427,6 +427,7 @@ In `choreo-tui`:
 - `/reasoning` — show current reasoning effort slug
 - `/reasoning <slug>` — set reasoning effort (e.g. `off`, `low`, `medium`, `high`, `on`, `xhigh`, `max`; available values depend on the model)
 - `Ctrl+R` — cycle reasoning effort through available slugs for the attached session's model
+- `Ctrl+J` — insert a newline in the chat input (multi-line prompts; also `Shift+Enter` on terminals that can still encode it)
 - `Ctrl+M` — open the model selector: list models available on the attached session's account, type to filter, Enter to select, Esc to dismiss (requires a terminal that implements the kitty keyboard protocol — e.g. kitty, foot, wezterm, ghostty, alacritty; on other terminals Ctrl+M arrives as Enter)
 - `/continue` — continue a stopped/idle session by sending a "Please continue." prompt
 - `/stop` — cancel whatever request is currently active on the attached session (same as `/cancel 0`)

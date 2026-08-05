@@ -1591,6 +1591,18 @@ impl InputBuffer {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
+                if c == '\0' {
+                    // A NUL must never enter the text buffer.  crossterm 0.29
+                    // parses kitty-protocol IME "text events"
+                    // (`CSI 0;;<codepoints>u`, how terminals deliver composed
+                    // text like Vietnamese) as `Char('\0')` because it drops
+                    // the associated-text field.  We avoid that mode entirely
+                    // (see KITTY_KEYBOARD_FLAGS in connection.rs), but if a
+                    // terminal sends a NUL anyway (e.g. Ctrl+Space in legacy
+                    // mode) dropping it is strictly better than inserting
+                    // invisible control text.
+                    return false;
+                }
                 self.insert_char_at_cursor(c);
                 true
             }
@@ -3652,6 +3664,18 @@ mod tests {
     }
 
     // ── last_modified ordering ──
+
+    #[test]
+    fn input_buffer_drops_nul_and_keeps_newline() {
+        // crossterm 0.29 parses kitty-protocol IME "text events"
+        // (`CSI 0;;<codepoints>u`) as Char('\0') with the composed text
+        // dropped.  The guard in handle_key must refuse to insert the NUL
+        // while still accepting a literal newline (legacy Ctrl+J = 0x0A).
+        let mut buf = InputBuffer::new();
+        assert!(!buf.handle_key(KeyEvent::new(KeyCode::Char('\0'), KeyModifiers::NONE)));
+        assert!(buf.handle_key(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE)));
+        assert_eq!(buf.text, "\n");
+    }
 
     #[test]
     fn set_sessions_orders_by_last_modified_desc() {
