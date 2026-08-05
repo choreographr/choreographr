@@ -1588,6 +1588,8 @@ fn session_manager_state_new_is_empty() {
     assert!(state.sessions.is_empty());
     assert!(state.selection.is_none());
     assert_eq!(state.view, SessionManagerView::List);
+    assert_eq!(state.scroll, 0);
+    assert_eq!(state.viewport_height, 0);
     assert!(state.detail_data.is_none());
 }
 

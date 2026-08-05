@@ -640,6 +640,15 @@ pub(crate) struct SessionManagerState {
     pub(crate) sessions: Vec<SessionSummary>,
     pub(crate) view: SessionManagerView,
     pub(crate) selection: Option<usize>,
+    /// Index of the first visible session row.  Navigation shifts this
+    /// anchor directionally — only when the selection would leave the
+    /// window — which is what keeps the list from scrolling back up
+    /// immediately after scrolling down (see [`SessionManagerState::window`]).
+    pub(crate) scroll: usize,
+    /// Session-row viewport height, cached by `update_viewport_from_terminal_size`
+    /// (outside the draw closure) so navigation can decide when to shift
+    /// `scroll`.  0 until the first frame; navigation defers shifts then.
+    pub(crate) viewport_height: usize,
     pub(crate) detail_data: Option<SessionDetailData>,
     pub(crate) confirm_delete: Option<(u64, String)>,
     pub(crate) error: Option<String>,
@@ -1124,6 +1133,8 @@ impl SessionManagerState {
             sessions: Vec::new(),
             view: SessionManagerView::List,
             selection: None,
+            scroll: 0,
+            viewport_height: 0,
             detail_data: None,
             confirm_delete: None,
             error: None,
@@ -1172,51 +1183,104 @@ impl SessionManagerState {
     }
 
     pub(crate) fn select_up(&mut self) {
+        self.reanchor_scroll();
         let sel = self.selection.unwrap_or(0);
         if sel > 0 {
-            self.selection = Some(sel - 1);
+            let new_sel = sel - 1;
+            self.selection = Some(new_sel);
+            // Shift the window up only once the selection reaches the top
+            // edge of the visible area; until then it climbs freely inside
+            // the window.  This is the fix for the list scrolling back up
+            // immediately after scrolling down.
+            if new_sel < self.scroll {
+                self.scroll = new_sel;
+            }
         }
     }
 
     pub(crate) fn select_down(&mut self) {
+        self.reanchor_scroll();
         let max = self.sessions.len().saturating_sub(1);
         let sel = self.selection.unwrap_or(0);
         if sel < max {
-            self.selection = Some(sel + 1);
+            let new_sel = sel + 1;
+            self.selection = Some(new_sel);
+            // Shift the window down only once the selection passes the
+            // bottom edge, pinning it to the last visible row.  The
+            // viewport height is cached by the renderer; until the first
+            // frame it is unknown (0), so navigation defers the shift and
+            // `window()` clamps at render time.
+            let h = self.viewport_height;
+            if h > 0 && new_sel >= self.scroll + h {
+                self.scroll = new_sel + 1 - h;
+            }
         }
     }
 
-    /// Move the selection up by a page (PgUp).  The render window always
-    /// follows the selection (see [`SessionManagerState::window`]), so paging
-    /// the selection is what actually scrolls the list.
+    /// Move the selection up by a page (PgUp).  The render window follows
+    /// the selection with the same directional anchoring as `select_up`.
     pub(crate) fn scroll_up_page(&mut self) {
+        self.reanchor_scroll();
         if let Some(sel) = self.selection {
-            self.selection = Some(sel.saturating_sub(PAGE_SCROLL_LINES));
+            let new_sel = sel.saturating_sub(PAGE_SCROLL_LINES);
+            self.selection = Some(new_sel);
+            if new_sel < self.scroll {
+                self.scroll = new_sel;
+            }
         }
     }
 
     /// Move the selection down by a page (PgDn), clamped to the last row.
     pub(crate) fn scroll_down_page(&mut self) {
+        self.reanchor_scroll();
         let max = self.sessions.len().saturating_sub(1);
         if let Some(sel) = self.selection {
-            self.selection = Some((sel + PAGE_SCROLL_LINES).min(max));
+            let new_sel = (sel + PAGE_SCROLL_LINES).min(max);
+            self.selection = Some(new_sel);
+            let h = self.viewport_height;
+            if h > 0 && new_sel >= self.scroll + h {
+                self.scroll = new_sel + 1 - h;
+            }
         }
     }
 
+    /// Sync `scroll` with the window the renderer derives, so directional
+    /// shifts always start from what is actually displayed.  Reorders,
+    /// removals, terminal resizes, and direct selection changes can leave
+    /// the stored anchor stale; re-anchoring from `window()` (which clamps
+    /// the anchor to keep the selection visible) resolves that before every
+    /// navigation step.  A no-op while the viewport height is unknown.
+    fn reanchor_scroll(&mut self) {
+        let start = self.window(self.viewport_height).0;
+        self.scroll = start;
+    }
+
     /// Compute the `(start, count)` slice of `sessions` to render for a
-    /// window of `height` rows, keeping the highlighted row visible.  Pure
-    /// (`&self`): the renderer must not mutate focus state during `draw()`,
-    /// so repeated calls with the same inputs return identical results.  The
-    /// selection is the only scroll input — the window anchors the highlighted
-    /// row at the bottom once it passes the fold, and at the top otherwise.
-    /// This mirrors `AIProvidersState::provider_window`.
+    /// window of `height` rows.  Pure (`&self`): the renderer must not mutate
+    /// focus state during `draw()`, so repeated calls with the same inputs
+    /// return identical results.
+    ///
+    /// The window is anchored on the navigation-maintained [`Self::scroll`]
+    /// (the first visible row), clamped only so the highlighted row stays
+    /// visible: the window shifts by the minimum amount when the selection
+    /// would leave it, and not otherwise.  That directional behaviour is what
+    /// lets the user scroll down and then press up without the window
+    /// scrolling back immediately.  Reorders, removals and terminal resizes
+    /// can leave `scroll` stale; the clamp re-anchors it to the selection.
     pub(crate) fn window(&self, height: usize) -> (usize, usize) {
         let len = self.sessions.len();
         if len == 0 || height == 0 {
             return (0, 0);
         }
         let focused = self.selection.unwrap_or(0).min(len - 1);
-        let start = focused.saturating_add(1).saturating_sub(height);
+        let max_start = len.saturating_sub(height);
+        // Pull the window up when the selection is above it (upper bound),
+        // push it down when below (lower bound), otherwise keep the anchor.
+        let start = self
+            .scroll
+            .min(max_start)
+            .min(focused)
+            .max(focused.saturating_add(1).saturating_sub(height));
         (start, height.min(len - start))
     }
 
@@ -1990,6 +2054,13 @@ impl App {
                 }
             }
         }
+        // Session-manager list rows: full height minus the status bar (1),
+        // the bordered list block (2), and the table header (1).  Must stay
+        // in sync with render_session_list_view's layout; navigation uses
+        // this cached height to decide when to shift the list window.
+        // Computed here (outside the draw closure) because the renderer
+        // never mutates app state.
+        self.session_mgr.viewport_height = height.saturating_sub(4) as usize;
     }
 
     pub(crate) fn mark_terminal_resized(&mut self) {
@@ -3753,48 +3824,122 @@ mod tests {
     }
 
     #[test]
-    fn window_anchors_selection_at_bottom_past_the_fold() {
-        // 30 sessions in a 10-row window: the selection walks down the
-        // visible window and only once it passes the last visible row does
-        // the window start advance — i.e. the list scrolls.
+    fn window_does_not_scroll_down_until_selection_reaches_bottom_edge() {
         let mut mgr = SessionManagerState::new();
         let sessions: Vec<_> = (1..=30).map(|id| make_session(id, "s")).collect();
         mgr.set_sessions(sessions);
         let height = 10;
+        mgr.viewport_height = height;
 
-        // From the top the window is anchored at row 0.
-        for _ in 0..=9 {
-            assert_selection_in_window(&mgr, height);
-            assert_eq!(mgr.window(height).0, 0);
+        // The first `height - 1` presses move the selection through the
+        // visible window without scrolling it: the window stays at 0 with
+        // the selection pinned to the bottom edge.
+        for _ in 0..height - 1 {
             mgr.select_down();
         }
-        // Selection is now 10; the window must have scrolled to row 1.
+        assert_eq!(mgr.selection, Some(9));
+        assert_eq!(mgr.window(height), (0, 10), "window must not move yet");
+
+        // One more press pushes the selection past the bottom edge, so the
+        // window scrolls down by exactly one row to keep it visible.
+        mgr.select_down();
         assert_eq!(mgr.selection, Some(10));
-        assert_eq!(mgr.window(height).0, 1);
-        assert_selection_in_window(&mgr, height);
-
-        // Scrolling all the way down clamps at the last session, with the
-        // window ending at the final row.
-        for _ in 0..30 {
-            mgr.select_down();
-        }
-        assert_eq!(mgr.selection, Some(29));
-        assert_eq!(mgr.window(height), (20, 10));
-        assert_selection_in_window(&mgr, height);
-
-        // Moving back up re-anchors the window without gaps.
-        mgr.select_up();
-        assert_eq!(mgr.selection, Some(28));
-        assert_eq!(mgr.window(height).0, 19);
+        assert_eq!(mgr.window(height), (1, 10));
         assert_selection_in_window(&mgr, height);
     }
 
     #[test]
-    fn window_follows_selection_on_reorder_and_removal() {
-        // After a status change moves a session to the top, the window must
-        // re-derive from the (new) selection instead of showing stale rows.
+    fn window_does_not_scroll_up_immediately_after_scrolling_down() {
+        // Regression: after scrolling to the bottom, pressing up must move
+        // the highlight through the visible rows — the window may only
+        // scroll back up once the selection reaches the top edge.
+        let mut mgr = SessionManagerState::new();
+        let sessions: Vec<_> = (1..=30).map(|id| make_session(id, "s")).collect();
+        mgr.set_sessions(sessions);
+        let height = 10;
+        mgr.viewport_height = height;
+
+        // Scroll to the bottom: selection 29, window rows 20..29.
+        for _ in 0..29 {
+            mgr.select_down();
+        }
+        assert_eq!(mgr.selection, Some(29));
+        assert_eq!(mgr.window(height), (20, 10));
+
+        // The first nine presses up climb the selection from 29 to 20 (the
+        // top edge of the window) without moving the window.
+        for _ in 0..9 {
+            mgr.select_up();
+        }
+        assert_eq!(mgr.selection, Some(20));
+        assert_eq!(
+            mgr.window(height),
+            (20, 10),
+            "window must stay fixed while the selection climbs"
+        );
+        assert_selection_in_window(&mgr, height);
+
+        // One more press up leaves the top edge, so the window scrolls up.
+        mgr.select_up();
+        assert_eq!(mgr.selection, Some(19));
+        assert_eq!(mgr.window(height), (19, 10));
+        assert_selection_in_window(&mgr, height);
+    }
+
+    #[test]
+    fn window_scrolls_down_again_from_top_of_scrolled_window() {
+        // After scrolling up so the selection sits at the top edge of the
+        // window, pressing down must move the highlight down within the
+        // window — not scroll it back down immediately.
+        let mut mgr = SessionManagerState::new();
+        let sessions: Vec<_> = (1..=30).map(|id| make_session(id, "s")).collect();
+        mgr.set_sessions(sessions);
+        let height = 10;
+        mgr.viewport_height = height;
+
+        // Scroll to the bottom then back up one: selection 28, window
+        // rows 20..29.
+        for _ in 0..29 {
+            mgr.select_down();
+        }
+        mgr.select_up();
+        assert_eq!(mgr.selection, Some(28));
+        assert_eq!(mgr.window(height), (20, 10));
+
+        // Pressing down moves the selection within the window without
+        // scrolling it.
+        mgr.select_down();
+        assert_eq!(mgr.selection, Some(29));
+        assert_eq!(mgr.window(height), (20, 10));
+    }
+
+    #[test]
+    fn window_reanchors_after_stale_scroll() {
+        // A reorder/removal can leave `scroll` pointing below the new
+        // selection.  The window must clamp back up so the selection stays
+        // visible, and the next navigation step re-anchors from that.
         let mut mgr = SessionManagerState::new();
         mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        mgr.viewport_height = 2;
+        mgr.selection = Some(1);
+        mgr.scroll = 5; // stale anchor below the selection
+        assert_eq!(mgr.window(2), (0, 2), "window clamps up to keep selection");
+
+        // Navigation re-anchors before shifting, so the next move up works
+        // from the displayed window instead of the stale anchor.
+        mgr.select_up();
+        assert_eq!(mgr.selection, Some(0));
+        assert_eq!(mgr.scroll, 0);
+        assert_eq!(mgr.window(2), (0, 2));
+    }
+
+    #[test]
+    fn window_follows_selection_on_reorder_and_removal() {
+        // After a removal the selection clamps and the window re-derives
+        // from the (new) selection instead of showing stale rows.
+        let mut mgr = SessionManagerState::new();
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        mgr.viewport_height = 1;
         mgr.select_down();
         mgr.remove_session(1);
         assert_selection_in_window(&mgr, 1);
@@ -3809,6 +3954,7 @@ mod tests {
         let mut mgr = SessionManagerState::new();
         let sessions: Vec<_> = (1..=20).map(|id| make_session(id, "s")).collect();
         mgr.set_sessions(sessions);
+        mgr.viewport_height = 10;
 
         mgr.scroll_down_page();
         assert_eq!(mgr.selection, Some(PAGE_SCROLL_LINES));

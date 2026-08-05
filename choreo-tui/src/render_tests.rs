@@ -361,6 +361,114 @@ fn session_list_scrolls_to_keep_selection_visible() {
     );
 }
 
+// ── Session list directional scrolling ──────────────────────────────
+
+#[test]
+fn session_list_scrolls_down_then_up_directionally() {
+    use crate::connection::handle_terminal_event;
+    use crate::test_util::test_app;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut app = test_app();
+    app.page = crate::state::Page::SessionManager;
+    let sessions: Vec<SessionSummary> = (1..=30)
+        .map(|i| SessionSummary {
+            session_id: i,
+            title: Some(format!("session {i}")),
+            selected_model: Some("gpt-4".into()),
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            created_at: 1705314000000,
+            last_modified: 1705314000000,
+            turn_count: i as u32,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: None,
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+        })
+        .collect();
+    app.session_mgr.set_sessions(sessions);
+    // A 100x24 terminal fits 20 session rows below the table header (see
+    // render_session_list_view); cache the height the way the event loop's
+    // update_viewport_from_terminal_size does.
+    app.session_mgr.viewport_height = 20;
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+    let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+
+    // Scroll to the bottom: 29 × j.  Window rows 10..29 (sessions 11..30).
+    for _ in 0..29 {
+        handle_terminal_event(key(KeyCode::Char('j')), &mut app, &tx).expect("j");
+    }
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render");
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(content.contains("session 11 "), "scrolled past the fold");
+    assert!(content.contains("session 30 "), "last session visible");
+    assert!(!content.contains("session 1 "), "top row scrolled off");
+
+    // Press up 19 times: the selection climbs 29 → 10 (the top edge of the
+    // window), but the window must NOT scroll back — the bottom of the list
+    // stays on screen.
+    for _ in 0..19 {
+        handle_terminal_event(key(KeyCode::Char('k')), &mut app, &tx).expect("k");
+    }
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render");
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        content.contains("session 11 "),
+        "window start unchanged while selection climbs"
+    );
+    assert!(content.contains("session 30 "), "bottom still visible");
+    assert!(
+        !content.contains("session 1 "),
+        "top row still scrolled off"
+    );
+
+    // One more up: the selection (now 9) leaves the top edge, so the
+    // window finally scrolls up one row (sessions 10..29).
+    handle_terminal_event(key(KeyCode::Char('k')), &mut app, &tx).expect("k");
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render");
+    let content: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        content.contains("session 10 "),
+        "window scrolled up one row"
+    );
+    assert!(
+        !content.contains("session 30 "),
+        "bottom row scrolled off after window shift"
+    );
+}
+
 // ── format_timestamp ──────────────────────────────────────────────────
 
 #[test]
