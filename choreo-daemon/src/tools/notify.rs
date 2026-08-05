@@ -129,8 +129,20 @@ pub fn execute_notify_send(
     if let Some(body) = &args.body {
         notification.body(body);
     }
+    // `urgency()` is only exposed by notify-rust on the XDG (Linux/BSD) and
+    // Windows backends; the macOS `NSUserNotificationCenter` backend omits it
+    // (interruption levels require the experimental `preview-macos-un` feature).
+    // On platforms without support we accept the field but ignore it, rather
+    // than failing the whole notification over a non-essential hint.
+    #[cfg(all(unix, not(target_os = "macos")))]
     if let Some(urgency) = &args.urgency {
         notification.urgency(Urgency::from(*urgency));
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    if args.urgency.is_some() {
+        tracing::debug!(
+            "notify_send: urgency requested but unsupported on this platform; ignoring"
+        );
     }
     if let Some(timeout) = &args.timeout {
         notification.timeout(*timeout);
@@ -139,16 +151,31 @@ pub fn execute_notify_send(
         notification.icon(icon);
     }
 
-    // `show()` sends the notification over DBus and returns a handle whose
-    // `id()` is the server-assigned notification ID (useful for callers that
-    // want to reference or replace the notification later).
+    // `show()` sends the notification; on the XDG (Linux/BSD) backend the
+    // returned handle's `id()` is the server-assigned notification ID (useful
+    // for callers that want to reference or replace the notification later).
+    // The macOS `NSUserNotificationCenter` backend returns a handle with no
+    // such ID, so we only report it where the platform provides one.
     let handle = notification.show().map_err(|e| {
         tracing::error!(error = %e, summary = %args.summary, "desktop notification failed");
         ToolExecError(format!("notification failed: {e}"))
     })?;
 
-    tracing::info!(id = handle.id(), summary = %args.summary, "desktop notification sent");
-    Ok(format!("Notification sent (id: {})", handle.id()))
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let id = handle.id();
+        tracing::info!(id, summary = %args.summary, "desktop notification sent");
+        return Ok(format!("Notification sent (id: {id})"));
+    }
+
+    // macOS: the handle exposes no server-assigned ID — the platform has no
+    // equivalent concept on the NSUserNotificationCenter backend.
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = handle;
+        tracing::info!(summary = %args.summary, "desktop notification sent");
+        Ok("Notification sent".to_string())
+    }
 }
 
 pub fn describe_notify_send_invocation(args: &NotifySendArgs) -> String {

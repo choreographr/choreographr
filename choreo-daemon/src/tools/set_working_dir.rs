@@ -214,7 +214,10 @@ mod tests {
     #[test]
     fn execute_set_working_dir_sends_daemon_command() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().into_owned();
+        // canonicalize() resolves the `/var` → `/private/var` symlink on macOS,
+        // so the expected path is the canonical form the tool reports.
+        let canonical = dir.path().canonicalize().unwrap();
+        let path = canonical.to_string_lossy().into_owned();
         let args = SetWorkingDirArgs { path: path.clone() };
 
         let (result, cmd) = run_with_daemon_reply(args, None, Ok(path.clone()));
@@ -250,7 +253,7 @@ mod tests {
         assert!(result.is_ok(), "expected ok: {:?}", result.err());
         assert_eq!(
             result.unwrap().path,
-            sub.to_string_lossy(),
+            sub.canonicalize().unwrap().to_string_lossy(),
             "relative path should resolve against working_dir and canonicalize"
         );
     }

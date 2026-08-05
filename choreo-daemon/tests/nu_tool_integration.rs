@@ -35,7 +35,9 @@ fn exit_nonzero() {
 #[test]
 #[ignore]
 fn working_directory() {
-    let dir = std::env::temp_dir();
+    // `pwd` prints the physical (symlink-resolved) directory, so on macOS the
+    // expected path must be canonicalized (/var → /private/var).
+    let dir = std::env::temp_dir().canonicalize().unwrap();
     let result = execute_nu_tool(
         &NuArgs {
             command: "pwd".into(),

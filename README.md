@@ -177,10 +177,11 @@ Choreographr will have an option to automate this process, so it can be left alo
 
 ## Quick start
 
-Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.91**.
+Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.91** — and a [Zig toolchain](https://ziglang.org/) (`brew install zig`), which `choreo-daemon` needs to compile the `zlob` glob/walker dependency.
 
 ```bash
 rustup install stable
+brew install zig
 cargo build --release
 ```
 

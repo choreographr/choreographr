@@ -358,7 +358,17 @@ pub fn subdirectory_hints(
     let mut new_paths = Vec::new();
     let mut current = Some(parent.to_path_buf());
     while let Some(dir) = current {
-        if !dir.starts_with(&working_dir_canonical) || dir == working_dir_canonical {
+        // Perform the containment check in canonical space: the tool's
+        // resolved path may carry a raw `/var` prefix while the working dir is
+        // symlink-resolved, and on macOS `/var` → `/private/var`. Comparing
+        // raw paths here would wrongly break out of the loop before reaching
+        // any hints. We canonicalize only for the comparison — the returned
+        // paths stay raw so they round-trip consistently through the caller's
+        // `known_hint_paths` tracking.
+        let dir_canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if !dir_canonical.starts_with(&working_dir_canonical)
+            || dir_canonical == working_dir_canonical
+        {
             break;
         }
 

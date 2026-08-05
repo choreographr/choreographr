@@ -28,8 +28,34 @@ fn default_true() -> bool {
     true
 }
 
+thread_local! {
+    /// Test-only override for the base config directory. When set,
+    /// `mcp_config_path()` returns `<root>/choreographr/mcp_servers.json`
+    /// instead of the user's real config dir.
+    ///
+    /// Deliberately NOT `#[cfg(test)]`-gated: integration tests in `tests/`
+    /// compile the crate without `cfg(test)`, so the hook must exist in
+    /// normal builds too (it is a no-op unless explicitly set).
+    static TEST_CONFIG_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only override for the base config directory (see `TEST_CONFIG_ROOT`).
+///
+/// This is needed because `dirs::config_dir()` honors `XDG_CONFIG_HOME` only
+/// on Linux — on macOS it always returns `$HOME/Library/Application Support`,
+/// so an integration test cannot redirect the config path via environment
+/// variables.
+#[doc(hidden)]
+pub fn set_test_config_root(root: Option<PathBuf>) {
+    TEST_CONFIG_ROOT.with(|cell| cell.replace(root));
+}
+
 /// Resolve the path to mcp_servers.json.
 pub fn mcp_config_path() -> Result<PathBuf> {
+    if let Some(root) = TEST_CONFIG_ROOT.with(|cell| cell.borrow().clone()) {
+        return Ok(root.join("choreographr").join("mcp_servers.json"));
+    }
     let config_dir = dirs::config_dir().context("could not determine config directory")?;
     Ok(config_dir.join("choreographr").join("mcp_servers.json"))
 }
