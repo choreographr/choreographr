@@ -4,8 +4,8 @@ use crate::state::*;
 use crate::test_util::test_app;
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{
-    ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata, ReasoningCapability,
-    SessionStatus, TokenUsage, Turn,
+    AccountInfo, ClientMessage, DaemonMessage, DisplayedImageRecord, ImageMetadata,
+    ReasoningCapability, SessionStatus, TokenUsage, Turn,
 };
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2778,6 +2778,50 @@ fn ai_providers_new_account_escaped_slug_input_not_leaked_to_credential() {
         "k",
         "k should type into slug field in phase 2"
     );
+}
+
+#[test]
+fn ai_providers_credential_added_refreshes_account_list() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    // Seed the accounts page with an account that has no credential yet.
+    app.ai_providers.set_accounts(vec![AccountInfo {
+        name: "my-account".to_string(),
+        provider: "openai".to_string(),
+        has_credential: false,
+    }]);
+
+    // The daemon confirms the credential was stored.  CredentialAdded does
+    // not carry account data, so the accounts page must re-request the list
+    // — otherwise `has_credential` stays stale (no) until the user leaves
+    // and re-enters the page.
+    handle_daemon_message(
+        DaemonMessage::CredentialAdded {
+            service: "my-account".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle CredentialAdded");
+
+    let msg = rx.recv().expect("ListAccounts sent after credential added");
+    assert_eq!(msg, ClientMessage::ListAccounts);
+
+    // Removal refreshes the list the same way.
+    handle_daemon_message(
+        DaemonMessage::CredentialRemoved {
+            service: "my-account".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle CredentialRemoved");
+
+    let msg = rx
+        .recv()
+        .expect("ListAccounts sent after credential removed");
+    assert_eq!(msg, ClientMessage::ListAccounts);
 }
 
 // ── handle_daemon_message progress bar integration ──

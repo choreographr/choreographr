@@ -1808,6 +1808,18 @@ pub(crate) fn handle_daemon_message(
         DaemonMessage::AccountRemoveFailed { name, error } => {
             app.error = Some(format!("[daemon] failed to remove account {name}: {error}"));
         }
+        // A credential mutation does not carry the updated account list, so
+        // re-request it: the accounts page renders `has_credential` per
+        // account, and without a refresh it would keep showing the stale
+        // pre-credential state until the user leaves and re-enters the page.
+        DaemonMessage::CredentialAdded { service } => {
+            app.status = Some(format!("[daemon] credential added: {service}"));
+            let _ = client_tx.send(ClientMessage::ListAccounts);
+        }
+        DaemonMessage::CredentialRemoved { service } => {
+            app.status = Some(format!("[daemon] credential removed: {service}"));
+            let _ = client_tx.send(ClientMessage::ListAccounts);
+        }
 
         DaemonMessage::SessionState {
             session_id,
