@@ -2010,6 +2010,12 @@ declared via `rust-version` in every crate manifest (inherited from
 `[workspace.package]` in the root `Cargo.toml`). Keep code and dependencies
 within this floor; the CI MSRV job enforces it.
 
+The `choreo-daemon` crate depends on `zlob` (a Zig-implemented glob and
+gitignore-aware directory walker used by `grep`, `find`, `delete_files`, and
+pathspec matching). Building it therefore requires the **Zig toolchain** on
+`PATH` (or the `ZIG` environment variable pointing at the `zig` binary).
+Install with Homebrew: `brew install zig`.
+
 ```bash
 # Build everything
 cargo build

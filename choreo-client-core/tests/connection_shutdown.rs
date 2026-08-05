@@ -2,21 +2,17 @@ use std::fs;
 use std::os::unix::net::UnixListener;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use choreo_client_core::run_daemon_connection;
 
 #[ignore]
 #[test]
 fn local_shutdown_unblocks_daemon_connection_without_eof() {
-    let socket_path = std::env::temp_dir().join(format!(
-        "choreo-client-core-shutdown-{}-{}.sock",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos()
-    ));
+    // Keep the socket name short: macOS caps Unix socket paths at ~104 bytes,
+    // and the temp dir itself is already long (/var/folders/.../T/). A
+    // long unique suffix would overflow that limit and make bind() fail with
+    // EINVAL. pid + a short prefix is unique enough within a test run.
+    let socket_path = std::env::temp_dir().join(format!("ccs-{}.sock", std::process::id()));
     let _ = fs::remove_file(&socket_path);
 
     let listener = UnixListener::bind(&socket_path).expect("bind listener");

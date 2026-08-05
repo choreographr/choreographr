@@ -229,6 +229,15 @@ pub(crate) fn resolve_pathspec_prefix(
         return Ok(None);
     };
 
+    // Canonicalize the worktree root too: `working_dir` below is canonical,
+    // and gix's `workdir()` returns the path exactly as it was stored at
+    // discovery (no symlink resolution). On macOS `/var` is a symlink to
+    // `/private/var`, so comparing the two raw paths would make `strip_prefix`
+    // below silently fail and return `None` for every subdirectory.
+    let workdir = workdir
+        .canonicalize()
+        .unwrap_or_else(|_| workdir.to_path_buf());
+
     // Canonicalize working_dir once so all path resolution below is
     // consistent with repo.workdir() (which always returns the real,
     // canonical path).  This handles symlinks (e.g. macOS /var → /private/var).
@@ -262,6 +271,14 @@ pub(crate) fn resolve_pathspec_prefix(
             None => return Ok(None),
         },
     };
+
+    // Canonicalize `base` as well so it is on the same footing as the
+    // canonicalized `workdir` above: an absolute `repo_path` (or one joined
+    // onto a raw working dir) may carry the unresolved `/var` → `/private/var`
+    // prefix, which would otherwise make `strip_prefix` fail. Falls back to
+    // the raw path when it doesn't exist yet (callers can path-prefix
+    // not-yet-created paths).
+    let base = base.canonicalize().unwrap_or(base);
 
     let Ok(prefix) = base.strip_prefix(workdir) else {
         return Ok(None);

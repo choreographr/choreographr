@@ -298,27 +298,27 @@ mod tests {
     #[test]
     fn ensure_keypair_is_race_safe() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let prev = std::env::var("XDG_CONFIG_HOME").ok();
-        // SAFETY: the env var is process-wide and restored after both threads
-        // finish. In spawned threads the paths::TEST_CONFIG_ROOT thread-local
-        // is unset, so config_dir() falls back to dirs::config_dir(), which
-        // honours XDG_CONFIG_HOME — both threads therefore target the same
-        // temp config dir while the two racing calls are in flight.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path());
-        }
-
         // Both threads race to generate/write the keypair against the same
         // paths; the advisory file lock must serialize them.
-        let handle_a = std::thread::spawn(ensure_keypair);
-        let handle_b = std::thread::spawn(ensure_keypair);
+        //
+        // `set_test_config_root` is thread-local, so the override must be
+        // installed inside each spawned thread (the guard resets it on drop).
+        // We cannot rely on XDG_CONFIG_HOME here: `dirs::config_dir()` honors
+        // it only on Linux — on macOS it always returns
+        // `$HOME/Library/Application Support`, so the test would write the
+        // keypair into the user's real config directory instead.
+        let root = temp.path().to_path_buf();
+        let root_a = root.clone();
+        let handle_a = std::thread::spawn(move || {
+            let _guard = paths::TestConfigGuard::set_root(Some(root_a));
+            ensure_keypair()
+        });
+        let handle_b = std::thread::spawn(move || {
+            let _guard = paths::TestConfigGuard::set_root(Some(root));
+            ensure_keypair()
+        });
         let result_a = handle_a.join();
         let result_b = handle_b.join();
-
-        match prev {
-            Some(val) => unsafe { std::env::set_var("XDG_CONFIG_HOME", val) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
 
         result_a
             .expect("thread A panicked")

@@ -3,6 +3,20 @@ use tracing::{debug, info};
 
 use crate::error::TransportError;
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only override for the keypair directory. When set, `keypair_dir()`
+    /// returns `<root>/choreographr` instead of the user's real config dir.
+    static TEST_CONFIG_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only override for the keypair directory (see `TEST_CONFIG_ROOT`).
+#[cfg(test)]
+pub(crate) fn set_test_config_root(root: Option<PathBuf>) {
+    TEST_CONFIG_ROOT.with(|cell| cell.replace(root));
+}
+
 /// A Noise IK transport secret key (32-byte X25519 secret).
 ///
 /// Provides type safety over a raw `[u8; 32]` so the key cannot be
@@ -47,16 +61,30 @@ fn generate_keypair() -> ([u8; 32], [u8; 32]) {
     (secret.to_bytes(), public.to_bytes())
 }
 
+/// Directory that holds the transport keypair files (`<config>/choreographr`).
+///
+/// Under test, `set_test_config_root` redirects this to a temp dir. This
+/// cannot be done via `XDG_CONFIG_HOME`: `dirs::config_dir()` honors it only
+/// on Linux — on macOS it always returns `$HOME/Library/Application Support`,
+/// so a test relying on it would write the keypair into the user's real
+/// config directory.
+fn keypair_dir() -> Result<PathBuf, TransportError> {
+    #[cfg(test)]
+    if let Some(root) = TEST_CONFIG_ROOT.with(|cell| cell.borrow().clone()) {
+        return Ok(root.join("choreographr"));
+    }
+    let config = dirs::config_dir().ok_or(TransportError::ConfigDirNotFound)?;
+    Ok(config.join("choreographr"))
+}
+
 /// Path to the Noise IK static secret key (~/.config/choreographr/transport.sec)
 pub fn transport_sec_path() -> Result<PathBuf, TransportError> {
-    let config = dirs::config_dir().ok_or(TransportError::ConfigDirNotFound)?;
-    Ok(config.join("choreographr").join("transport.sec"))
+    Ok(keypair_dir()?.join("transport.sec"))
 }
 
 /// Path to the Noise IK static public key (~/.config/choreographr/transport.pub)
 pub fn transport_pub_path() -> Result<PathBuf, TransportError> {
-    let config = dirs::config_dir().ok_or(TransportError::ConfigDirNotFound)?;
-    Ok(config.join("choreographr").join("transport.pub"))
+    Ok(keypair_dir()?.join("transport.pub"))
 }
 
 /// Resolve a server public key value from an optional file path.
@@ -187,26 +215,21 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    // These two tests mutate the process-global XDG_CONFIG_HOME env var.
-    // Running them in parallel would clobber each other's temp config dir
+    // These two tests mutate the shared test-config-root override.
+    // Running them in parallel would clobber each other's temp dir
     // mid-flight (one test's restore racing the other's setup), so they are
     // serialized with `#[serial]` to keep them deterministic.
     #[test]
     #[serial]
     fn ensure_transport_keypair_generates_and_loads() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let prev = std::env::var("XDG_CONFIG_HOME").ok();
-        // SAFETY: we immediately restore the old value and run single-threaded.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path());
-        }
+        // Redirect the keypair dir to the temp dir. XDG_CONFIG_HOME cannot be
+        // used for this: on macOS `dirs::config_dir()` ignores it.
+        set_test_config_root(Some(temp.path().to_path_buf()));
 
         let result = ensure_transport_keypair();
 
-        match prev {
-            Some(val) => unsafe { std::env::set_var("XDG_CONFIG_HOME", val) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
+        set_test_config_root(None);
 
         let (sk, pk) = result.expect("ensure_transport_keypair should succeed in temp dir");
         assert_eq!(sk.as_bytes().len(), 32);
@@ -230,26 +253,24 @@ mod tests {
     #[serial]
     fn ensure_transport_keypair_is_race_safe() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let prev = std::env::var("XDG_CONFIG_HOME").ok();
-        // SAFETY: the env var is process-wide and restored after both threads
-        // finish, so both threads resolve the same temp config dir while the
-        // two racing calls are in flight.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path());
-        }
+        // The config-root override is thread-local, so each spawned thread
+        // must install it itself before racing; both target the same temp dir.
+        let root_a = temp.path().to_path_buf();
+        let root_b = root_a.clone();
 
         // Both threads race to generate/write the keypair against the same
         // paths; the advisory file lock must serialize them so they converge
         // on one pair instead of interleaving torn writes.
-        let handle_a = std::thread::spawn(ensure_transport_keypair);
-        let handle_b = std::thread::spawn(ensure_transport_keypair);
+        let handle_a = std::thread::spawn(move || {
+            set_test_config_root(Some(root_a));
+            ensure_transport_keypair()
+        });
+        let handle_b = std::thread::spawn(move || {
+            set_test_config_root(Some(root_b));
+            ensure_transport_keypair()
+        });
         let result_a = handle_a.join();
         let result_b = handle_b.join();
-
-        match prev {
-            Some(val) => unsafe { std::env::set_var("XDG_CONFIG_HOME", val) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
 
         let (sk_a, pk_a) = result_a
             .expect("thread A panicked")

@@ -54,11 +54,11 @@ fn mcp_server_everything_tools_are_discovered_and_callable() {
     )
     .expect("write mcp_servers.json");
 
-    // ── 2. Override XDG_CONFIG_HOME so load_mcp_config finds our file ──
-    let prev_config_home = std::env::var("XDG_CONFIG_HOME").ok();
-    // SAFETY: Single-threaded test; no other code reads XDG_CONFIG_HOME at
-    // this point, so the unsafe env mutation is sound.
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", config_dir.path()) };
+    // ── 2. Override the config dir so load_mcp_config finds our file ──
+    // XDG_CONFIG_HOME cannot be used for this: `dirs::config_dir()` ignores it
+    // on macOS (it always returns $HOME/Library/Application Support). The
+    // daemon exposes a test-only config-root hook instead.
+    choreographr::mcp::config::set_test_config_root(Some(config_dir.path().to_path_buf()));
 
     // ── 3. Build registry and spawn MCP servers via McpManager ──
     let mut registry = choreographr::tools::ToolRegistry::new();
@@ -112,12 +112,6 @@ fn mcp_server_everything_tools_are_discovered_and_callable() {
     // ── 7. Shut down ──
     drop(mcp_manager);
 
-    // ── 8. Restore XDG_CONFIG_HOME ──
-    // SAFETY: Single-threaded test; restoring env var to previous state.
-    unsafe {
-        match prev_config_home {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-    }
+    // ── 8. Restore the config-root override ──
+    choreographr::mcp::config::set_test_config_root(None);
 }
