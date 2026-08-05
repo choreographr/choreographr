@@ -1,6 +1,6 @@
 use std::sync::mpsc;
 
-pub use crate::retry::{RetryCallback, RetryConfig, check_cancelled};
+pub use crate::retry::{RetryCallback, RetryConfig};
 
 use super::{OpenAiError, ServiceConfig};
 use crate::retry;

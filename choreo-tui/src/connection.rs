@@ -1673,6 +1673,7 @@ fn submit_new_account(
             retry_max_attempts: None,
             connect_timeout_secs: None,
             request_timeout_secs: None,
+            total_timeout_secs: None,
         })
         .map_err(broken_pipe)?;
 

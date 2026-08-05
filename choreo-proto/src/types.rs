@@ -342,6 +342,7 @@ pub enum ClientMessage {
         retry_max_attempts: Option<u32>,
         connect_timeout_secs: Option<u64>,
         request_timeout_secs: Option<u64>,
+        total_timeout_secs: Option<u64>,
     },
     RemoveAccount {
         name: String,

@@ -187,8 +187,11 @@ impl std::fmt::Debug for OpenAiClient {
 
 impl OpenAiClient {
     pub fn new(config: ServiceConfig, api_key: String) -> io::Result<Self> {
-        let http =
-            crate::shared::build_agent(config.connect_timeout_secs, config.request_timeout_secs);
+        let http = crate::shared::build_agent(
+            config.connect_timeout_secs,
+            config.request_timeout_secs,
+            config.total_timeout_secs,
+        );
         // Zeroizing<String> wipes the key bytes from memory when the client is
         // dropped; `new` keeps its `String` signature so callers are unaffected.
         Ok(Self {

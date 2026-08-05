@@ -2716,6 +2716,7 @@ fn ai_providers_new_account_submit_creates_account_and_redirects_to_credential()
             retry_max_attempts: None,
             connect_timeout_secs: None,
             request_timeout_secs: None,
+            total_timeout_secs: None,
         }
     );
 

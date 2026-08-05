@@ -32,6 +32,11 @@ pub struct AnthropicConfig {
     pub retry_max_backoff_ms: u64,
     pub connect_timeout_secs: u64,
     pub request_timeout_secs: u64,
+    /// Hard wall-clock deadline for the whole request, including the streaming
+    /// body read; 0 disables.  Unlike `request_timeout_secs` (an idle/no-progress
+    /// timeout that resets per chunk), this fires even when a provider trickles
+    /// keep-alive bytes, so it bounds a stalled SSE stream.
+    pub total_timeout_secs: u64,
 }
 
 impl Default for AnthropicConfig {
@@ -47,6 +52,7 @@ impl Default for AnthropicConfig {
             retry_max_backoff_ms: 30000,
             connect_timeout_secs: 30,
             request_timeout_secs: 120,
+            total_timeout_secs: 3600,
         }
     }
 }
@@ -72,6 +78,9 @@ impl AnthropicConfig {
         }
         if let Some(request) = overrides.request_timeout_secs {
             self.request_timeout_secs = request;
+        }
+        if let Some(total) = overrides.total_timeout_secs {
+            self.total_timeout_secs = total;
         }
         if let Some(ms) = overrides.retry_initial_backoff_ms {
             self.retry_initial_backoff_ms = ms;
@@ -151,8 +160,11 @@ impl ProviderClient for AnthropicClient {
 
 impl AnthropicClient {
     pub fn new(config: AnthropicConfig, api_key: String) -> io::Result<Self> {
-        let http =
-            crate::shared::build_agent(config.connect_timeout_secs, config.request_timeout_secs);
+        let http = crate::shared::build_agent(
+            config.connect_timeout_secs,
+            config.request_timeout_secs,
+            config.total_timeout_secs,
+        );
         // Zeroizing<String> wipes the key bytes from memory when the client is
         // dropped; `new` keeps its `String` signature so callers are unaffected.
         Ok(Self {

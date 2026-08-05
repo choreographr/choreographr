@@ -312,13 +312,13 @@ where
     .map_err(io::Error::other)?;
     let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut None, cancel_rx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
+    // The blocking socket read lives on a dedicated thread (see
+    // `crate::stream`): `recv_sse_event` below polls the channel with a short
+    // timeout, so an Escape during a stalled stream is noticed within ~200 ms
+    // instead of never (the old code only checked cancellation between reads).
+    let sse_rx = crate::stream::spawn_sse_reader(move || reader.next_event());
     let mut has_any_output = false;
-    loop {
-        retry::check_cancelled(cancel_rx)?;
-
-        let Some(data) = reader.next_event()? else {
-            break;
-        };
+    while let Some(data) = crate::stream::recv_sse_event(&sse_rx, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
         for choice in payload.choices {
@@ -458,12 +458,10 @@ where
     // Track usage from the final SSE chunk (OpenAI sends a usage chunk with
     // choices: [] when stream_options.include_usage is true).
     let mut last_usage: Option<TokenUsage> = None;
-    loop {
-        retry::check_cancelled(cancel_rx)?;
-
-        let Some(data) = reader.next_event()? else {
-            break;
-        };
+    // Reader thread decouples the blocking socket read from cancellation
+    // polling (see `crate::stream`).
+    let sse_rx = crate::stream::spawn_sse_reader(move || reader.next_event());
+    while let Some(data) = crate::stream::recv_sse_event(&sse_rx, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
 

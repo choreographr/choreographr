@@ -29,6 +29,54 @@ pub(crate) const CANCEL_ALL: u32 = 0;
 /// this constant to avoid duplication.
 pub(crate) const MAX_TITLE_CHARS: usize = 200;
 
+/// Grace period allowed for a session thread to persist and exit after
+/// `Shutdown` is signalled.  If a request worker is stuck in a provider
+/// read that a cancel cannot interrupt, the session thread never receives
+/// `RequestFinished` and would otherwise hang the daemon's shutdown join.
+/// Abandoning the join is safe: per-turn state is persisted as turns
+/// finalize, and process exit reaps the abandoned thread.
+pub(crate) const SESSION_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Join a session thread after `Shutdown`, bounded by
+/// [`SESSION_SHUTDOWN_GRACE`].  Returns `true` if the thread exited within
+/// the grace period, `false` if it was abandoned.
+pub(crate) fn join_session_shutdown(handle: std::thread::JoinHandle<()>, session_id: u64) -> bool {
+    join_session_shutdown_with_grace(handle, session_id, SESSION_SHUTDOWN_GRACE)
+}
+
+/// Poll [`JoinHandle::is_finished`] until the thread exits or `grace`
+/// elapses.  The loop (rather than a bare timed join, which the std library
+/// does not offer) lets us stop the instant the thread finishes on the fast
+/// path, so graceful shutdowns pay no fixed delay.  When the deadline hits
+/// we abandon the handle: the daemon must not hang on a worker stuck in a
+/// provider read — completed turns are already durable and process exit
+/// reaps the leaked thread.
+fn join_session_shutdown_with_grace(
+    handle: std::thread::JoinHandle<()>,
+    session_id: u64,
+    grace: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if handle.is_finished() {
+            // The thread exited; join it now to reap its resources.
+            let _ = handle.join();
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                session_id,
+                grace_ms = grace.as_millis(),
+                "session thread did not exit within shutdown grace period; abandoning join \
+                 (process exit will reap the thread, completed turns are already persisted)",
+            );
+            return false;
+        }
+        // Sleep briefly between polls to avoid burning CPU while waiting.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 pub enum SessionCommand {
     RunInput {
         request_id: u32,
@@ -2925,5 +2973,31 @@ mod tests {
             restored.context_cache,
             Some((42, Arc::new("cached content".to_string())))
         );
+    }
+
+    #[test]
+    fn join_session_shutdown_abandons_stuck_thread() {
+        // A thread blocked on a channel that is never sent to models a
+        // request worker stuck in a provider read that a cancel cannot
+        // interrupt.  The bounded join must give up after the grace period
+        // instead of hanging the caller forever.
+        let (tx, rx) = mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _ = rx.recv();
+            let _ = tx; // keep the sender alive so recv never errors out
+        });
+        let exited =
+            join_session_shutdown_with_grace(handle, 1, std::time::Duration::from_millis(30));
+        assert!(!exited, "stuck thread must be abandoned, not joined");
+    }
+
+    #[test]
+    fn join_session_shutdown_joins_finished_thread() {
+        // A thread that returns immediately exits before the grace period
+        // elapses, so the bounded join must report success.
+        let handle = std::thread::spawn(|| {});
+        let exited =
+            join_session_shutdown_with_grace(handle, 1, std::time::Duration::from_millis(30));
+        assert!(exited, "finished thread must be joined successfully");
     }
 }

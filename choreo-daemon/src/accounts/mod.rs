@@ -24,6 +24,8 @@ pub struct AccountConfig {
     pub connect_timeout_secs: Option<u64>,
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub total_timeout_secs: Option<u64>,
     // Endpoint path overrides (OpenAI-compatible only)
     #[serde(default)]
     pub model_list_path: Option<String>,
@@ -75,6 +77,7 @@ impl AccountConfig {
             retry_max_attempts: None,
             connect_timeout_secs: None,
             request_timeout_secs: None,
+            total_timeout_secs: None,
             model_list_path: None,
             responses_path: None,
             chat_completions_path: None,
@@ -112,6 +115,12 @@ impl AccountConfig {
         }
         if let Some(request) = self.request_timeout_secs {
             config.request_timeout_secs = request;
+        }
+        // Hard wall-clock deadline for the whole request (incl. streaming
+        // body).  Mirrors `request_timeout_secs` (idle/no-progress) as the
+        // second half of the timeout pair applied by the provider crates.
+        if let Some(total) = self.total_timeout_secs {
+            config.total_timeout_secs = total;
         }
         if let Some(path) = &self.model_list_path {
             config.model_list_path = path.clone();
@@ -190,6 +199,7 @@ impl From<&AccountConfig> for choreo_ai_protocols::ProviderOverrides {
             retry_max_attempts: config.retry_max_attempts,
             connect_timeout_secs: config.connect_timeout_secs,
             request_timeout_secs: config.request_timeout_secs,
+            total_timeout_secs: config.total_timeout_secs,
             retry_initial_backoff_ms: config.retry_initial_backoff_ms,
             retry_max_backoff_ms: config.retry_max_backoff_ms,
             context_window: config.context_window,
@@ -518,6 +528,7 @@ model = "claude-4"
             retry_max_attempts: Some(5),
             connect_timeout_secs: Some(30),
             request_timeout_secs: Some(120),
+            total_timeout_secs: Some(1800),
             model_list_path: Some("/v2/models".to_string()),
             responses_path: Some("/v2/responses".to_string()),
             chat_completions_path: Some("/v2/chat".to_string()),
@@ -541,6 +552,7 @@ model = "claude-4"
         assert_eq!(svc_config.retry_max_attempts, 5);
         assert_eq!(svc_config.connect_timeout_secs, 30);
         assert_eq!(svc_config.request_timeout_secs, 120);
+        assert_eq!(svc_config.total_timeout_secs, 1800);
         assert_eq!(svc_config.model_list_path, "/v2/models");
         assert_eq!(svc_config.responses_path, "/v2/responses");
         assert_eq!(svc_config.chat_completions_path, "/v2/chat");
@@ -560,5 +572,21 @@ model = "claude-4"
             svc_config.model_responses_max_output_tokens.get("gpt-4"),
             Some(&8192)
         );
+    }
+
+    #[test]
+    fn provider_overrides_carries_total_timeout() {
+        let cfg = AccountConfig {
+            connect_timeout_secs: Some(15),
+            request_timeout_secs: Some(60),
+            total_timeout_secs: Some(7200),
+            ..AccountConfig::simple("ovr", "openai")
+        };
+        let overrides = cfg.provider_overrides();
+        // The protocol-agnostic carrier must forward every shared timeout
+        // field so the non-OpenAI provider crates see the same values.
+        assert_eq!(overrides.connect_timeout_secs, Some(15));
+        assert_eq!(overrides.request_timeout_secs, Some(60));
+        assert_eq!(overrides.total_timeout_secs, Some(7200));
     }
 }

@@ -35,6 +35,7 @@ pub mod retry;
 mod context_window;
 mod overrides;
 mod shared;
+mod stream;
 mod traits;
 mod types;
 

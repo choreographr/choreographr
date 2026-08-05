@@ -69,8 +69,13 @@ pub fn run_server(
         for entry in active_sessions.values() {
             let _ = entry.cmd_tx.send(SessionCommand::Shutdown);
         }
-        for (_, entry) in active_sessions {
-            let _ = entry.handle.join();
+        // Join each session thread with a bounded grace period: a request
+        // worker stuck in an LLM provider read (which a cancel cannot
+        // interrupt promptly) must not hang the daemon's shutdown.  The
+        // graceful path exits promptly because the worker responds to the
+        // cancel; only pathological cases hit the grace deadline.
+        for (session_id, entry) in active_sessions {
+            crate::sessions::join_session_shutdown(entry.handle, session_id);
         }
         // Shut down MCP servers after all sessions have exited.
         state.mcp_manager.shutdown_all();

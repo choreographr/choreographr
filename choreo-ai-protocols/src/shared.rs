@@ -119,16 +119,35 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
     }
 }
 
-/// Build a ureq agent with connect and read (inactivity) timeouts.
+/// Build a ureq agent with connect, idle-read, and total-deadline timeouts.
 ///
-/// `read_timeout_secs` is an *idle* timeout — it resets each time a new
-/// chunk arrives on a streaming response.  A value of `0` means no limit.
-pub(crate) fn build_agent(connect_timeout_secs: u64, read_timeout_secs: u64) -> ureq::Agent {
+/// Two distinct read-side bounds are applied, because a streaming SSE body
+/// needs both:
+///
+/// - `read_timeout_secs` is an *idle*/no-progress timeout — it resets each
+///   time a new chunk arrives on a streaming response.  A value of `0` means
+///   no limit.  It cannot interrupt a stream that keeps trickling keep-alive
+///   bytes without ever forming a complete event.
+/// - `total_timeout_secs` is a hard wall-clock deadline for the entire
+///   request, from DNS lookup through the last byte of the body read.  ureq's
+///   `timeout_global` is the only timeout that fires even when keep-alive
+///   data trickles in, so it is the backstop that prevents a stalled SSE
+///   stream from hanging the worker forever.  A value of `0` means no limit.
+pub(crate) fn build_agent(
+    connect_timeout_secs: u64,
+    read_timeout_secs: u64,
+    total_timeout_secs: u64,
+) -> ureq::Agent {
     ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_connect(Some(std::time::Duration::from_secs(connect_timeout_secs)))
             .timeout_recv_body(if read_timeout_secs > 0 {
                 Some(std::time::Duration::from_secs(read_timeout_secs))
+            } else {
+                None
+            })
+            .timeout_global(if total_timeout_secs > 0 {
+                Some(std::time::Duration::from_secs(total_timeout_secs))
             } else {
                 None
             })

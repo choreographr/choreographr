@@ -256,6 +256,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             retry_max_attempts,
             connect_timeout_secs,
             request_timeout_secs,
+            total_timeout_secs,
         } => {
             let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::AddAccountCmd {
                 name: name.clone(),
@@ -265,6 +266,7 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
                 retry_max_attempts,
                 connect_timeout_secs,
                 request_timeout_secs,
+                total_timeout_secs,
                 reply,
             });
             match result {

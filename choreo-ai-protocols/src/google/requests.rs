@@ -214,18 +214,16 @@ where
     }
 
     let mut reader = GeminiSseReader::from_reader(response.into_body().into_reader());
+    // Reader thread decouples the blocking socket read from cancellation
+    // polling (see `crate::stream`).
+    let sse_rx = crate::stream::spawn_sse_reader(move || reader.next_event());
     let mut has_any_output = false;
     let mut full_text = String::new();
     let mut full_reasoning = String::new();
     let mut pending_tool_calls: Vec<super::ChatToolCall> = Vec::new();
     let mut stream_usage: Option<TokenUsage> = None;
 
-    loop {
-        retry::check_cancelled(cancel_rx)?;
-
-        let Some(data) = reader.next_event()? else {
-            break;
-        };
+    while let Some(data) = crate::stream::recv_sse_event(&sse_rx, cancel_rx)? {
         let payload: GenerateContentResponse =
             serde_json::from_str(&data).map_err(|e| GoogleError::Io(io::Error::other(e)))?;
 

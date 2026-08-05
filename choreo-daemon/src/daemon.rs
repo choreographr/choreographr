@@ -155,6 +155,7 @@ pub enum DaemonCommand {
         retry_max_attempts: Option<u32>,
         connect_timeout_secs: Option<u64>,
         request_timeout_secs: Option<u64>,
+        total_timeout_secs: Option<u64>,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
     RemoveAccountCmd {
@@ -308,6 +309,7 @@ impl DaemonState {
                 retry_max_attempts,
                 connect_timeout_secs,
                 request_timeout_secs,
+                total_timeout_secs,
                 reply,
             } => self.handle_add_account(
                 name,
@@ -317,6 +319,7 @@ impl DaemonState {
                 retry_max_attempts,
                 connect_timeout_secs,
                 request_timeout_secs,
+                total_timeout_secs,
                 reply,
             ),
             DaemonCommand::RemoveAccountCmd { name, reply } => {
@@ -1192,7 +1195,11 @@ impl DaemonState {
             if entry.cmd_tx.send(SessionCommand::Shutdown).is_err() {
                 warn!("delete_session_inner: failed to send Shutdown to session {session_id}");
             }
-            let _ = entry.handle.join();
+            // Bound the join so a request worker stuck in a provider read
+            // (which a cancel cannot interrupt promptly) can't hang the
+            // daemon's command thread.  The graceful path exits within the
+            // grace period; an abandoned thread is reaped at process exit.
+            crate::sessions::join_session_shutdown(entry.handle, session_id);
         }
         // Remove from in-memory metadata
         self.session_metadata.remove(&session_id);
@@ -1214,6 +1221,7 @@ impl DaemonState {
         retry_max_attempts: Option<u32>,
         connect_timeout_secs: Option<u64>,
         request_timeout_secs: Option<u64>,
+        total_timeout_secs: Option<u64>,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     ) {
         let config = AccountConfig {
@@ -1222,6 +1230,7 @@ impl DaemonState {
             retry_max_attempts,
             connect_timeout_secs,
             request_timeout_secs,
+            total_timeout_secs,
             ..AccountConfig::simple(&name, &provider)
         };
         let result = self.accounts.add(config);

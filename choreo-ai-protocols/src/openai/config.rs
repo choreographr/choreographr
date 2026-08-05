@@ -35,6 +35,11 @@ pub struct ServiceConfig {
     pub retry_max_backoff_ms: u64,
     pub connect_timeout_secs: u64,
     pub request_timeout_secs: u64,
+    /// Hard wall-clock deadline for the whole request, including the streaming
+    /// body read; 0 disables.  Unlike `request_timeout_secs` (an idle/no-progress
+    /// timeout that resets per chunk), this fires even when a provider trickles
+    /// keep-alive bytes, so it bounds a stalled SSE stream.
+    pub total_timeout_secs: u64,
     pub context: ContextConfig,
     pub programmatic_tool_calling: bool,
 }
@@ -63,6 +68,7 @@ impl Default for ServiceConfig {
             retry_max_backoff_ms: 30000,
             connect_timeout_secs: 30,
             request_timeout_secs: 120,
+            total_timeout_secs: 3600,
             context: ContextConfig::default(),
             programmatic_tool_calling: false,
         }

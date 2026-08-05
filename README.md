@@ -375,6 +375,7 @@ override any field per-account:
 | `retry_max_backoff_ms` | Max backoff between retries (ms) |
 | `connect_timeout_secs` | TCP connect timeout |
 | `request_timeout_secs` | HTTP request timeout |
+| `total_timeout_secs` | Hard wall-clock deadline for the whole request including streaming body (default 3600s; 0 disables). Complements `request_timeout_secs` (idle/no-progress). |
 | `model_list_path` | Custom models list endpoint path |
 | `responses_path` | Custom responses endpoint path |
 | `chat_completions_path` | Custom chat completions endpoint path |

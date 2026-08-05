@@ -387,13 +387,11 @@ where
     let retry = retry::retry_config_from_config(config);
     let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut None, cancel_rx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
+    // Reader thread decouples the blocking socket read from cancellation
+    // polling (see `crate::stream`).
+    let sse_rx = crate::stream::spawn_sse_reader(move || reader.next_event());
     let mut has_any_output = false;
-    loop {
-        retry::check_cancelled(cancel_rx)?;
-
-        let Some(data) = reader.next_event()? else {
-            break;
-        };
+    while let Some(data) = crate::stream::recv_sse_event(&sse_rx, cancel_rx)? {
         let event = parse_responses_stream_event(&data)?;
         match event {
             Some(ResponsesStreamEvent::TextDelta(text)) => {
@@ -707,12 +705,10 @@ where
     let mut next_tool_index: u32 = 0;
 
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
-    loop {
-        retry::check_cancelled(cancel_rx)?;
-
-        let Some(data) = reader.next_event()? else {
-            break;
-        };
+    // Reader thread decouples the blocking socket read from cancellation
+    // polling (see `crate::stream`).
+    let sse_rx = crate::stream::spawn_sse_reader(move || reader.next_event());
+    while let Some(data) = crate::stream::recv_sse_event(&sse_rx, cancel_rx)? {
         let event = parse_responses_stream_event(&data)?;
         match event {
             Some(ResponsesStreamEvent::TextDelta(text)) => {

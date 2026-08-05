@@ -240,10 +240,11 @@ account configuration, no sessions — so it can be consumed independently of
 | `google/` | Google Gemini API client (`GoogleClient`, `GoogleConfig`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
 | `traits.rs` | `ProviderClient` trait, `ChatTurnRequest`, `ToolResultItem` |
 | `types.rs` | `ChatTurnResult`, `ChatToolCall`, `ChatAssistantToolUse`, `FinalTextResult`, `CallerInfo`, `StreamEvent` |
-| `shared.rs` | `ProviderError` (unified error type re-exported as `OpenAiError`/`AnthropicError`/`GoogleError`), `MaxTokensField`, `MAX_TOOL_CALLS`, `build_agent()`, `provider_error_to_inference()`, `emit_non_streaming_events()`, `list_models_with_fallback()` |
+| `shared.rs` | `ProviderError` (unified error type re-exported as `OpenAiError`/`AnthropicError`/`GoogleError`), `MaxTokensField`, `MAX_TOOL_CALLS`, `build_agent()` (applies three timeouts: connect, idle `request_timeout_secs` per chunk, and hard `total_timeout_secs` wall-clock deadline via ureq's `timeout_global`), `provider_error_to_inference()`, `emit_non_streaming_events()`, `list_models_with_fallback()` |
 | `context_window.rs` | `ContextWindowConfig` — per-model/global context window resolution shared by all configs |
 | `overrides.rs` | `ProviderOverrides` — protocol-agnostic account overrides carrier (the daemon converts its `AccountConfig` into this) |
 | `retry.rs` | Shared HTTP retry logic. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. |
+| `stream.rs` | Cancellable SSE reader plumbing: `spawn_sse_reader()` runs the blocking socket read on a dedicated thread and forwards parsed events through an mpsc channel; `recv_sse_event()` polls that channel with a ~200 ms `recv_timeout` and re-checks cancellation each iteration, so Escape interrupts a stalled/trickling stream instead of blocking forever inside `read()`. |
 | `catalog/` | `ProviderProtocol` enum + `ProviderEntry`/`ModelEntry`, `PROVIDER_CATALOG` (bundled TOML, one `catalog/<slug>.toml` per provider), and lookups (`lookup_provider`, `lookup_context_window`, `model_reasoning_capability`, `model_request_format`, `all_slugs`, `all_display_names`) |
 
 **Root re-exports** give consumers a stable front door: the client types
@@ -319,7 +320,7 @@ in the daemon's own logic. All I/O uses blocking `std` APIs on dedicated threads
 | `server/lifecycle.rs` | Accept loop (non-blocking `UnixListener` + 50ms poll), signal handling (`signal_hook::flag`), shutdown orchestration. |
 | `server/connection.rs` | Per-client `client_thread` — reads `ClientMessages` from socket, dispatches via `daemon_tx` mpsc channel. |
 | `daemon.rs` | `DaemonCommand` handler loop on a dedicated thread — session CRUD, attach/detach, listing, locking, account management. `DaemonState` is owned by this thread only (no shared state). |
-| `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` and converts the shared fields into `ProviderOverrides` for the other protocols. |
+| `accounts/` | `AccountManager` — loads/saves `accounts.toml`, manages named inference accounts with per-account config overrides. `AccountConfig` applies OpenAI-specific overrides directly to `ServiceConfig` (including `total_timeout_secs`) and converts the shared fields into `ProviderOverrides` for the other protocols. |
 | `config.rs` | Daemon-level configuration: `DaemonConfig` (`max_turns`, `[context]`), `config_path()`, `load_daemon_config()`, and the deprecated `load_service_config()`. (Previously lived in `openai/config.rs`; it is daemon config, not provider config.) |
 | `providers/mod.rs` | `InferenceProvider` — protocol-erased facade wrapping `Arc<dyn ProviderClient>` plus the catalog slug. `from_account_config()` dispatches by `ProviderProtocol` and constructs the right client from `choreo-ai-protocols`. Records API metrics (`record_api_call`/`record_api_error`) around each turn — timing lives here, not in the provider crate. |
 | `sessions.rs` | `SessionState` (split into `SessionConfig` for persisted fields + runtime state), `RequestContext` dependency bundle, `SessionCommand` enum and its handler functions. Each session has a control thread running `session_main()`; request work runs on separate worker threads via `run_request_worker()`. Sessions form a tree (parent → child sub-sessions), each with an optional working directory. |
@@ -1350,7 +1351,7 @@ to operate in the same directory as their parent.
 - **Message append**: Each `SessionMessage` (including `DisplayedImage` records for
   persisted images) is written to the DB alongside the in-memory push via
   `append_message_and_persist()`.
-- **Shutdown**: The daemon sends `SessionCommand::Shutdown` to each active session, waits for request workers to drain, then exits cleanly.
+- **Shutdown**: The daemon sends `SessionCommand::Shutdown` to each active session, then joins each session thread bounded by `SESSION_SHUTDOWN_GRACE` (5s). The graceful path exits promptly once request workers drain; a worker stuck in an LLM provider read that a cancel cannot interrupt is abandoned rather than hanging the daemon — process exit reaps the thread, and completed turns are already persisted as they finalize.
 
 ### Multiple concurrent sessions
 
@@ -1642,6 +1643,11 @@ different session.
    for OpenAI SSE, giving full control over parsing and buffering behavior. The Anthropic
    module has its own `AnthropicSseReader` that handles both `event:` and `data:` lines
    (required by the Anthropic Messages streaming format) and yields `(event_type, data)` pairs.
+   The blocking socket read is decoupled onto a dedicated reader thread (`stream.rs`) that
+   forwards parsed events through an mpsc channel, so the caller can poll with a short
+   `recv_timeout` and observe cancellation within ~200 ms even on a quiet stream. A hard
+   wall-clock deadline (`total_timeout_secs`, via ureq's `timeout_global`) backstops the
+   entire request — the only timeout that fires even when a provider trickles keep-alive bytes.
 
 9. **Markdown as the intermediate format** — all text (tool output, assistant text, error
     messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
