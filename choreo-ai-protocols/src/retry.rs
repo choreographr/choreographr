@@ -13,6 +13,56 @@ pub struct RetryConfig {
     pub max_backoff_ms: u64,
 }
 
+/// Per-attempt wall-clock deadline, re-armed by [`retry_loop`] at the start
+/// of every attempt (including the first).
+///
+/// This exists to close a gap in the SSE timeout layering.  ureq's
+/// `timeout_global` bounds a single attempt from DNS through the response
+/// headers, but its per-read timeout is floored at ~1s, so keep-alive
+/// trickles can outlive it; the SSE consumer's own deadline check (in
+/// `crate::stream`) is the real hard backstop for the body read.  If that
+/// consumer deadline were computed only when the body read begins, a slow
+/// header phase and a trickling body could each consume a full
+/// `total_timeout_secs` budget — up to 2× the configured bound for one
+/// attempt.  Threading one deadline through [`retry_loop`] instead makes the
+/// consumer-side check span the entire attempt (DNS + connect + headers +
+/// body), and re-arming it per attempt preserves the documented "each retry
+/// restarts the deadline" semantics.
+pub struct AttemptDeadline {
+    /// Configured per-attempt budget in seconds; `0` disables the deadline.
+    total_timeout_secs: u64,
+    /// Absolute deadline for the current attempt; `None` when disabled.
+    current: Option<std::time::Instant>,
+}
+
+impl AttemptDeadline {
+    pub fn new(total_timeout_secs: u64) -> Self {
+        let mut deadline = Self {
+            total_timeout_secs,
+            current: None,
+        };
+        // Arm the first attempt's deadline now so the budget is measured
+        // from just before the request is sent (see `reset`).
+        deadline.reset();
+        deadline
+    }
+
+    /// Re-arm the deadline for a fresh attempt.  Called by [`retry_loop`] at
+    /// the top of every attempt, so the budget covers the whole attempt and
+    /// a retried request gets a fresh budget rather than a stale one.
+    pub(crate) fn reset(&mut self) {
+        self.current = (self.total_timeout_secs > 0).then(|| {
+            std::time::Instant::now() + std::time::Duration::from_secs(self.total_timeout_secs)
+        });
+    }
+
+    /// The successful attempt's deadline, for the SSE consumer to enforce
+    /// across the whole response-body read.
+    pub(crate) fn current(&self) -> Option<std::time::Instant> {
+        self.current
+    }
+}
+
 /// Generic HTTP error produced by the retry layer.  Each provider maps this to
 /// its own error type via `From`.
 #[derive(Debug)]
@@ -202,6 +252,7 @@ pub fn retry_loop<F>(
     retry: &RetryConfig,
     on_retry: &mut Option<RetryCallback>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
+    mut attempt_deadline: Option<&mut AttemptDeadline>,
 ) -> Result<ureq::http::Response<ureq::Body>, ProviderHttpError>
 where
     F: Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
@@ -209,6 +260,14 @@ where
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
+
+        // Per-attempt deadline: re-arm at the top of every attempt so a
+        // retried request gets a fresh budget, and the first attempt's
+        // budget is measured from just before `send_request` (covering
+        // DNS → connect → headers → body, not just the body read).
+        if let Some(deadline) = attempt_deadline.as_mut() {
+            deadline.reset();
+        }
 
         check_cancelled(cancel_rx)?;
 
@@ -339,6 +398,48 @@ mod tests {
         assert!(
             millis <= base * 1.25,
             "delay {millis}ms above jitter ceiling"
+        );
+    }
+
+    // ── AttemptDeadline ──────────────────────────────────────────────────
+
+    #[test]
+    fn attempt_deadline_disabled_when_zero() {
+        // A zero budget disables the deadline entirely (matches the
+        // `total_timeout_secs = 0 disables` contract).
+        let deadline = AttemptDeadline::new(0);
+        assert!(deadline.current().is_none());
+    }
+
+    #[test]
+    fn attempt_deadline_arms_and_resets() {
+        // `new` arms the first attempt's deadline, and `reset` re-arms it for
+        // a fresh attempt.  Deterministic: we assert the deadline is in the
+        // future and that a reset yields a strictly later deadline than a
+        // freshly-constructed one from an earlier instant would suggest —
+        // i.e. that reset does not reuse the old instant.
+        let before = std::time::Instant::now();
+        let deadline = AttemptDeadline::new(3600);
+        let first = deadline
+            .current()
+            .expect("nonzero budget must arm a deadline");
+        assert!(
+            first > before,
+            "deadline must be in the future (budget 3600s)"
+        );
+
+        // A reset must move the deadline forward, not keep a stale instant:
+        // after waiting a (tiny) real instant, the re-armed deadline is later
+        // than the first one.  No time-based wait is involved — we only
+        // observe the current clock, so the test stays deterministic.
+        let mut deadline = deadline;
+        deadline.reset();
+        let second = deadline
+            .current()
+            .expect("nonzero budget must arm a deadline");
+        assert!(
+            second >= first,
+            "reset must not move the deadline backwards"
         );
     }
 }

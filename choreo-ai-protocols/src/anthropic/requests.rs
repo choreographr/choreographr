@@ -55,6 +55,7 @@ pub(super) fn list_models_request(
         &retry_cfg,
         &mut None,
         None,
+        None,
     )?;
 
     let payload: ModelListResponse = response
@@ -135,6 +136,7 @@ pub(super) fn messages_request(
         &retry_cfg,
         on_retry,
         cancel_rx,
+        None,
     )
     .map_err(AnthropicError::from)?;
 
@@ -196,6 +198,10 @@ where
     })
     .map_err(io::Error::other)?;
 
+    // Per-attempt wall-clock deadline for the whole request (DNS → headers →
+    // body), re-armed on each retry by `retry_loop`; the consumer-side check
+    // in `recv_sse_event` enforces it (see `retry::AttemptDeadline`).
+    let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let response = retry::retry_loop(
         || {
             agent
@@ -207,6 +213,7 @@ where
         &retry_cfg,
         on_retry,
         cancel_rx,
+        Some(&mut deadline),
     )
     .map_err(AnthropicError::from)?;
 
@@ -215,8 +222,7 @@ where
     // (see `crate::stream`); the abort flag on `sse` stops the thread at its
     // next loop boundary once the consumer cancels or drops it.
     let mut reader = AnthropicSseReader::from_reader(response.into_body().into_reader());
-    let sse =
-        crate::stream::spawn_sse_reader(move || reader.next_event(), config.total_timeout_secs);
+    let sse = crate::stream::spawn_sse_reader(move || reader.next_event(), deadline.current());
     let mut has_any_output = false;
     let mut full_text = String::new();
     let mut full_reasoning = String::new();

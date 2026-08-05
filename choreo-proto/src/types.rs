@@ -141,6 +141,8 @@ pub enum InferenceError {
     EmptyResponse,
     #[error("request cancelled during retry backoff")]
     Cancelled,
+    #[error("total request deadline exceeded while reading streaming response")]
+    DeadlineExceeded,
     #[error("tool call arguments truncated by provider: {}", .discarded.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "))]
     TruncatedToolCall { discarded: Vec<DiscardedToolCall> },
     #[error("{0}")]
@@ -162,6 +164,7 @@ impl InferenceError {
             InferenceError::ClientError { .. } => "client_error",
             InferenceError::EmptyResponse => "empty_response",
             InferenceError::Cancelled => "cancelled",
+            InferenceError::DeadlineExceeded => "deadline_exceeded",
             InferenceError::TruncatedToolCall { .. } => "truncated_tool_call",
             InferenceError::Io(_) => "other",
         }

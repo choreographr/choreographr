@@ -243,8 +243,8 @@ account configuration, no sessions — so it can be consumed independently of
 | `shared.rs` | `ProviderError` (unified error type re-exported as `OpenAiError`/`AnthropicError`/`GoogleError`), `MaxTokensField`, `MAX_TOOL_CALLS`, `build_agent()` (applies three timeouts: connect, idle `request_timeout_secs` per chunk, and a `total_timeout_secs` wall-clock deadline per attempt via ureq's `timeout_global` — each retry restarts it), `provider_error_to_inference()`, `emit_non_streaming_events()`, `list_models_with_fallback()` |
 | `context_window.rs` | `ContextWindowConfig` — per-model/global context window resolution shared by all configs |
 | `overrides.rs` | `ProviderOverrides` — protocol-agnostic account overrides carrier (the daemon converts its `AccountConfig` into this) |
-| `retry.rs` | Shared HTTP retry logic. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. |
-| `stream.rs` | Cancellable SSE reader plumbing: `spawn_sse_reader()` runs the blocking socket read on a dedicated thread and forwards parsed events through a bounded mpsc channel (backpressure — the reader blocks on `send` instead of buffering unboundedly); an mpsc abort signal stops the thread at its next loop boundary on cancel/drop; `recv_sse_event()` polls the channel with a ~200 ms `recv_timeout`, re-checks cancellation each iteration, and enforces the `total_timeout_secs` wall-clock deadline on the consumer side (the real backstop — ureq's `timeout_global` is floored at ~1 s per socket read, so sub-second keep-alive trickles could otherwise evade it), so Escape interrupts a stalled/trickling stream instead of blocking forever inside `read()`. |
+| `retry.rs` | Shared HTTP retry logic. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, cancellation support, and a per-attempt wall-clock deadline (`AttemptDeadline`, re-armed at the start of every attempt). |
+| `stream.rs` | Cancellable SSE reader plumbing: `spawn_sse_reader()` runs the blocking socket read on a dedicated thread and forwards parsed events through a bounded mpsc channel (backpressure — the reader blocks on `send` instead of buffering unboundedly); an mpsc abort signal stops the thread at its next loop boundary on cancel/drop; `recv_sse_event()` polls the channel with a ~200 ms `recv_timeout`, re-checks cancellation each iteration, and enforces the per-attempt wall-clock deadline supplied by the caller (`retry::AttemptDeadline` — armed *before* the request is sent and re-armed on each retry, so it spans DNS → connect → headers → body; the real backstop — ureq's `timeout_global` is floored at ~1 s per socket read, so sub-second keep-alive trickles could otherwise evade it), so Escape interrupts a stalled/trickling stream instead of blocking forever inside `read()`. Deadline expiry surfaces as a dedicated `ProviderError::DeadlineExceeded` (non-retryable, distinct from a socket `Io` error). |
 | `catalog/` | `ProviderProtocol` enum + `ProviderEntry`/`ModelEntry`, `PROVIDER_CATALOG` (bundled TOML, one `catalog/<slug>.toml` per provider), and lookups (`lookup_provider`, `lookup_context_window`, `model_reasoning_capability`, `model_request_format`, `all_slugs`, `all_display_names`) |
 
 **Root re-exports** give consumers a stable front door: the client types
@@ -1282,12 +1282,19 @@ deletion**:
   (`deleted_sessions` DB table). The actual record delete is deferred to
   `handle_session_exited` — the thread's `persist_and_exit` runs *before* it sends
   `SessionExited`, so by the time the handler runs the record on disk is the thread's
-  final state and can be removed without a re-create race. Only a *successful* delete drops
-  the `deleted_sessions` marker; on failure the marker and tombstone stay in place so the
+  final state and can be removed without a re-create race. That delete runs on a
+  **background thread** (a pathologically large session — `db::delete_session` walks every
+  turn and kv entry — cannot block the command loop) and reports back via
+  `DaemonCommand::SessionDeleteFinalized`; only a *successful* delete drops the
+  `deleted_sessions` marker, on failure the marker and tombstone stay in place so the
   session cannot be attached or resurrected, and the startup purge
-  (`db::purge_tombstoned_sessions`) retries. The tombstone also covers the crash window: if
-  the daemon dies while the thread is still shutting down, the next startup removes any
-  record the zombie left behind.
+  (`db::purge_tombstoned_sessions`) retries. Two fast paths avoid the tombstone and the
+  deferred finalize entirely: deleting a session with **no live thread** (nothing can
+  re-create the record), and deleting a session whose thread has **already terminated**
+  (`JoinHandle::is_finished()` — its `persist_and_exit` ran and its `SessionExited` is
+  queued), both delete the record immediately and sweep any stale tombstone. The tombstone
+  also covers the crash window: if the daemon dies while the thread is still shutting down,
+  the next startup removes any record the zombie left behind.
 
 The child session uses `ToolContext` (`active_tool_groups`, `reasoning_effort`, `working_dir`,
 `daemon_tx`) to inherit parent config and communicate with the daemon command loop.
@@ -1308,7 +1315,7 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 | `session_turns` | `(u64, u32)` (session ID, turn ID) | postcard(`Turn`) |
 | `credentials` | `&str` service name | encrypted blob |
 | `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
-| `deleted_sessions` | `u64` session ID | `()` tombstone — marks a deleted session whose still-shutting-down thread may re-create the record; written on delete, cleared once the exit finalize re-deletes the record, purged at startup |
+| `deleted_sessions` | `u64` session ID | `()` tombstone — marks a deleted session whose still-shutting-down thread may re-create the record; written only when the delete is deferred (a live thread exists), cleared once the exit finalize re-deletes the record, purged at startup |
 | `meta` | `&str` | `u64` counter |
 
 `SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `working_dir`,
@@ -1661,11 +1668,15 @@ different session.
    `recv_timeout` and observe cancellation within ~200 ms even on a quiet stream; an mpsc
    abort signal stops the reader thread at its next loop boundary once the consumer cancels
    or drops the stream. A wall-clock deadline (`total_timeout_secs`) backstops each request
-   attempt: ureq's `timeout_global` bounds the attempt from DNS through the first byte of the
-   body read, and the SSE consumer additionally enforces the same deadline on every poll (the
-   real hard cap — ureq floors its per-read timeout at ~1 s, so sub-second keep-alive
-   trickles could otherwise outlive the deadline). Each retry restarts the deadline, so
-   retries plus their backoff can exceed the configured value in aggregate.
+   attempt: the deadline is armed by `retry::AttemptDeadline` *before* the request is sent
+   and re-armed at the start of every retry, so a single attempt's budget spans DNS →
+   connect → headers → body (ureq's `timeout_global` bounds the attempt from DNS through
+   the first body byte, and the SSE consumer enforces the same deadline on every poll — the
+   real hard cap, since ureq floors its per-read timeout at ~1 s so sub-second keep-alive
+   trickles could otherwise outlive the deadline). Expiry surfaces as a dedicated
+   `ProviderError::DeadlineExceeded` — non-retryable and distinct from a socket `Io` error.
+   Each retry restarts the deadline, so retries plus their backoff can exceed the configured
+   value in aggregate.
 
 9. **Markdown as the intermediate format** — all text (tool output, assistant text, error
     messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output

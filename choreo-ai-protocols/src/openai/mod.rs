@@ -220,8 +220,15 @@ impl OpenAiClient {
         info!("listing models from {}", self.config.base_url);
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
         let retry = retry::retry_config_from_config(&self.config);
-        let response =
-            retry::retry_send_get(&self.http, &url, &self.api_key, &retry, &mut None, None)?;
+        let response = retry::retry_send_get(
+            &self.http,
+            &url,
+            &self.api_key,
+            &retry,
+            &mut None,
+            None,
+            None,
+        )?;
         let payload: ModelListResponse = response
             .into_body()
             .read_json()

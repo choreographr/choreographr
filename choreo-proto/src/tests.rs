@@ -547,6 +547,10 @@ fn inference_error_metric_labels_are_stable() {
     );
     assert_eq!(InferenceError::Cancelled.metric_label(), "cancelled");
     assert_eq!(
+        InferenceError::DeadlineExceeded.metric_label(),
+        "deadline_exceeded"
+    );
+    assert_eq!(
         InferenceError::TruncatedToolCall {
             discarded: vec![DiscardedToolCall {
                 name: "t".into(),
@@ -590,6 +594,7 @@ fn inference_error_metric_labels_are_distinct() {
         .metric_label(),
         InferenceError::EmptyResponse.metric_label(),
         InferenceError::Cancelled.metric_label(),
+        InferenceError::DeadlineExceeded.metric_label(),
         InferenceError::TruncatedToolCall { discarded: vec![] }.metric_label(),
         InferenceError::Io(std::io::Error::other("oops")).metric_label(),
     ]
@@ -597,7 +602,7 @@ fn inference_error_metric_labels_are_distinct() {
     .collect();
     assert_eq!(
         labels.len(),
-        8,
+        9,
         "each InferenceError variant must have a distinct metric label"
     );
 }

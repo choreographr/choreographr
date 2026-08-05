@@ -94,6 +94,13 @@ pub enum DaemonCommand {
     SessionExited {
         session_id: u64,
     },
+    /// Sent by the background delete-finalize thread after it has removed the
+    /// record of a deleted session (and cleared its tombstone).  Distinct from
+    /// `SessionExited`: the record is only gone once this re-delete commits, so
+    /// only this message drops the `deleted_sessions` marker.
+    SessionDeleteFinalized {
+        session_id: u64,
+    },
     Unlock {
         private_key: Vec<u8>,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
@@ -265,6 +272,9 @@ impl DaemonState {
                 metadata,
             } => self.handle_update_metadata(session_id, metadata),
             DaemonCommand::SessionExited { session_id } => self.handle_session_exited(session_id),
+            DaemonCommand::SessionDeleteFinalized { session_id } => {
+                self.handle_session_delete_finalized(session_id)
+            }
             DaemonCommand::Unlock { private_key, reply } => self.handle_unlock(private_key, reply),
             DaemonCommand::SaveCredential {
                 service,
@@ -684,7 +694,10 @@ impl DaemonState {
     /// where the delete is finalized: the thread's `persist_and_exit` runs
     /// *before* it sends `SessionExited`, so by the time this handler runs the
     /// record on disk is the thread's final state — safe to delete without a
-    /// re-create race, and without ever blocking the command loop on a join.
+    /// re-create race.  The delete runs on a background thread (see
+    /// [`DaemonCommand::SessionDeleteFinalized`]) so a pathologically large
+    /// session — `db::delete_session` walks every turn and kv entry — cannot
+    /// block the command loop.
     fn handle_session_exited(&mut self, session_id: u64) {
         info!("SessionExited: id={}", session_id);
         crate::metrics::record_session_exited();
@@ -723,32 +736,48 @@ impl DaemonState {
 
         // Finalize a pending delete: the thread has fully exited and
         // persisted, so the record can now be removed without a re-create
-        // race.  Only a *successful* delete drops the marker — on failure the
-        // marker and tombstone stay in place so the session cannot be
-        // attached or resurrected, and the startup purge retries the delete.
+        // race.  The actual DB work is handed to a detached thread so a large
+        // session cannot block the command loop; the `deleted_sessions` marker
+        // (which blocks `AttachSession` resurrection) stays in place until
+        // that thread reports back with `SessionDeleteFinalized`.
         if self.deleted_sessions.contains(&session_id) {
-            match db::delete_session(&self.db, session_id) {
-                Ok(()) => {
-                    // The deletion tombstone (written by `delete_session_inner`)
-                    // is no longer needed now that the record is gone for good.
-                    if let Err(e) = db::clear_session_tombstone(&self.db, session_id) {
-                        warn!(session_id, error = %e, "failed to clear session-deletion tombstone");
+            let db = Arc::clone(&self.db);
+            let daemon_tx = self.daemon_tx.clone();
+            std::thread::spawn(move || {
+                match db::delete_session(&db, session_id) {
+                    Ok(()) => {
+                        // The deletion tombstone (written by
+                        // `delete_session_inner`) is no longer needed now that
+                        // the record is gone for good.
+                        if let Err(e) = db::clear_session_tombstone(&db, session_id) {
+                            warn!(session_id, error = %e, "failed to clear session-deletion tombstone");
+                        }
+                        let _ =
+                            daemon_tx.send(DaemonCommand::SessionDeleteFinalized { session_id });
                     }
-                    self.deleted_sessions.remove(&session_id);
-                    info!(session_id, "finalized delete after session thread exited");
+                    Err(e) => {
+                        // Keep the marker (and tombstone) so the deleted
+                        // session cannot be attached or resurrected;
+                        // `purge_tombstoned_sessions` at the next startup
+                        // retries the delete.
+                        error!(
+                            session_id,
+                            error = %e,
+                            "failed to delete session record during exit finalize; keeping tombstone"
+                        );
+                    }
                 }
-                Err(e) => {
-                    // Keep the marker (and tombstone) so the deleted session
-                    // cannot be resurrected; purge_tombstoned_sessions at the
-                    // next startup retries the delete.
-                    error!(
-                        session_id,
-                        error = %e,
-                        "failed to delete session record during exit finalize; keeping tombstone"
-                    );
-                }
-            }
+            });
         }
+    }
+
+    /// The background finalize has deleted the record the still-shutting-down
+    /// thread left behind (and cleared its tombstone).  Only now is it safe to
+    /// drop the `deleted_sessions` marker — the record is gone for good, so no
+    /// attach or straggler message can resurrect the session.
+    fn handle_session_delete_finalized(&mut self, session_id: u64) {
+        debug!("SessionDeleteFinalized: id={}", session_id);
+        self.deleted_sessions.remove(&session_id);
     }
 
     /// Attempt to unlock the daemon with the given private key.
@@ -1266,6 +1295,27 @@ impl DaemonState {
     fn delete_session_inner(&mut self, session_id: u64) -> io::Result<()> {
         info!("DeleteSession (inner): id={}", session_id);
         if let Some(entry) = self.active_sessions.remove(&session_id) {
+            // Fast path: the session thread has ALREADY terminated (its final
+            // `persist_and_exit` ran and its `SessionExited` is queued behind
+            // this command).  Nothing can re-create the record now, so delete
+            // it immediately — no tombstone write, no deferred finalize — and
+            // the queued `SessionExited` becomes a harmless no-op for this id
+            // (the marker was never set, so no finalize runs).
+            if entry.handle.is_finished() {
+                db::delete_session(&self.db, session_id)?;
+                // No pending delete for this id: sweep any stale tombstone
+                // left by an earlier interrupted delete of the same id so it
+                // does not accumulate (the record is gone, so the tombstone
+                // would only trigger a redundant startup purge).
+                if !self.deleted_sessions.contains(&session_id)
+                    && let Err(e) = db::clear_session_tombstone(&self.db, session_id)
+                {
+                    warn!(session_id, error = %e, "failed to clear stale session-deletion tombstone");
+                }
+                self.session_metadata.remove(&session_id);
+                self.broadcast(DaemonMessage::SessionDeleted { session_id });
+                return Ok(());
+            }
             // Gracefully shut the session thread down so it can persist its
             // final state; the record is deleted later in
             // `handle_session_exited` (after `persist_and_exit` has run), so
@@ -1292,8 +1342,10 @@ impl DaemonState {
             // Deletion tombstone: if the daemon crashes before the thread exits
             // (and finalize runs), `purge_tombstoned_sessions` at the next
             // startup removes whatever record the still-shutting-down thread
-            // left behind, so a
-            // deleted session cannot resurface after a restart.
+            // left behind, so a deleted session cannot resurface after a
+            // restart.  Only written when the delete is actually deferred (the
+            // fast path above and the no-thread branch delete immediately), so
+            // a clean delete does not pay an extra tombstone write.
             if let Err(e) = db::mark_session_deleted(&self.db, session_id) {
                 warn!(session_id, error = %e, "failed to write session-deletion tombstone");
             }
@@ -1301,6 +1353,15 @@ impl DaemonState {
             // No live thread: nothing can re-create the record, so delete it
             // now.  This is the only path that can fail here.
             db::delete_session(&self.db, session_id)?;
+            // Sweep any stale tombstone from an earlier interrupted delete of
+            // this id, unless a delete is still pending (in which case the
+            // deferred finalize owns the tombstone until it clears it — see
+            // `handle_session_delete_finalized`).
+            if !self.deleted_sessions.contains(&session_id)
+                && let Err(e) = db::clear_session_tombstone(&self.db, session_id)
+            {
+                warn!(session_id, error = %e, "failed to clear stale session-deletion tombstone");
+            }
         }
         // Remove from in-memory metadata and broadcast deletion immediately:
         // from here on the session is invisible (index removed) and
@@ -2034,8 +2095,12 @@ mod tests {
         // A deleted session's thread exits: `handle_session_exited` must
         // delete the record, clear the deletion tombstone, and drop the
         // deleted marker, so the session cannot resurface and no stale
-        // tombstone is left for the startup purge.
-        let (mut state, _daemon_rx) = make_daemon_state();
+        // tombstone is left for the startup purge.  The delete now runs on a
+        // background thread; wait for its `SessionDeleteFinalized`
+        // confirmation — deterministic, because the thread sends it only
+        // after the delete and tombstone clear have committed, so `recv`
+        // unblocks with the DB already in its final state.
+        let (mut state, daemon_rx) = make_daemon_state();
         let record = SessionRecord {
             title: Some("doomed".into()),
             selected_model: None,
@@ -2055,6 +2120,19 @@ mod tests {
 
         state.handle_command(DaemonCommand::SessionExited { session_id: 7 });
 
+        // The background finalize reports back once the record is gone; route
+        // it through the command handler exactly as the daemon loop would so
+        // the `deleted_sessions` marker is dropped.
+        match daemon_rx.recv() {
+            Ok(DaemonCommand::SessionDeleteFinalized { session_id: 7 }) => {
+                state.handle_command(DaemonCommand::SessionDeleteFinalized { session_id: 7 });
+            }
+            other => panic!(
+                "expected SessionDeleteFinalized for session 7, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
         // Marker dropped, record gone, tombstone gone (purge is a no-op).
         assert!(!state.deleted_sessions.contains(&7));
         assert!(db::read_session(&state.db, 7).unwrap().is_none());
@@ -2063,6 +2141,106 @@ mod tests {
             0,
             "tombstone must be cleared once the record is deleted"
         );
+    }
+
+    #[test]
+    fn delete_session_clears_stale_tombstone_when_no_live_thread() {
+        // Deleting a session that has no live thread deletes the record
+        // immediately AND sweeps any stale deletion tombstone left by an
+        // earlier interrupted delete of the same id, so the tombstone cannot
+        // accumulate or trigger a redundant startup purge.
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let record = SessionRecord {
+            title: Some("stale".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            turn_count: 0,
+            created_at: 1000,
+            last_modified: 1000,
+            active_tool_groups: vec![],
+            context_config: ContextConfig::default(),
+            account_name: None,
+        };
+        db::write_session(&state.db, 3, &record).unwrap();
+        db::mark_session_deleted(&state.db, 3).unwrap();
+
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::DeleteSession {
+            session_id: 3,
+            reply,
+        });
+        assert!(rx.recv().unwrap().is_ok());
+
+        // Record gone, tombstone swept, and no deleted marker leaked (there
+        // was no live thread to defer to).
+        assert!(db::read_session(&state.db, 3).unwrap().is_none());
+        assert_eq!(
+            db::purge_tombstoned_sessions(&state.db).unwrap(),
+            0,
+            "stale tombstone must be cleared on immediate delete"
+        );
+        assert!(!state.deleted_sessions.contains(&3));
+    }
+
+    #[test]
+    fn delete_session_defers_when_thread_alive() {
+        // Deleting a session whose thread is still running must NOT delete
+        // the record synchronously — the thread can re-create it via
+        // `persist_and_exit` during shutdown.  Instead it marks the session
+        // deleted and writes a tombstone (crash-window safety); the record is
+        // removed later by `handle_session_exited`'s background finalize.
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let record = SessionRecord {
+            title: Some("deferred".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            turn_count: 0,
+            created_at: 1000,
+            last_modified: 1000,
+            active_tool_groups: vec![],
+            context_config: ContextConfig::default(),
+            account_name: None,
+        };
+        db::write_session(&state.db, 4, &record).unwrap();
+        // A blocking stand-in session thread: not finished, so the delete
+        // must take the deferred path.
+        let (_cmd_rx, release_tx) = insert_active_session(&mut state, 4);
+
+        let (reply, rx) = mpsc::channel();
+        state.handle_command(DaemonCommand::DeleteSession {
+            session_id: 4,
+            reply,
+        });
+        assert!(rx.recv().unwrap().is_ok());
+
+        // Deferred: record still present, marker set, tombstone written
+        // (a startup purge would clean it up if the daemon died now).
+        assert!(db::read_session(&state.db, 4).unwrap().is_some());
+        assert!(state.deleted_sessions.contains(&4));
+        assert_eq!(
+            db::purge_tombstoned_sessions(&state.db).unwrap(),
+            1,
+            "deferred delete must write a tombstone"
+        );
+
+        // Release the stand-in thread so it exits (no leaked threads).
+        drop(release_tx);
+    }
+
+    #[test]
+    fn session_delete_finalized_drops_marker() {
+        // The background finalize's confirmation must be the thing that drops
+        // the `deleted_sessions` marker — clearing it earlier (e.g. on the
+        // zombie's `SessionExited`) would reopen an attach-resurrection
+        // window while the record is still on disk.
+        let (mut state, _daemon_rx) = make_daemon_state();
+        state.deleted_sessions.insert(9);
+        state.handle_command(DaemonCommand::SessionDeleteFinalized { session_id: 9 });
+        assert!(!state.deleted_sessions.contains(&9));
     }
 
     #[test]

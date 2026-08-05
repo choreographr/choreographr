@@ -139,7 +139,9 @@ pub(crate) fn chat_completions_request(
         reasoning_effort: None,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut None, cancel_rx)?;
+    let response = retry::retry_send(
+        agent, &url, api_key, &body, &retry, &mut None, cancel_rx, None,
+    )?;
     let payload: ChatCompletionsResponse = response
         .into_body()
         .read_json()
@@ -190,7 +192,9 @@ pub(crate) fn chat_completions_request_with_tools(
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
+    let response = retry::retry_send(
+        agent, &url, api_key, &body, &retry, on_retry, cancel_rx, None,
+    )?;
     let payload: ChatCompletionsResponse = response
         .into_body()
         .read_json()
@@ -310,7 +314,21 @@ where
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut None, cancel_rx)?;
+    // Per-attempt wall-clock deadline for the whole request (DNS → headers →
+    // body): computed before the request is sent and re-armed on each retry by
+    // `retry_loop`, so the consumer-side check in `recv_sse_event` spans the
+    // entire attempt instead of just the body read (see `retry::AttemptDeadline`).
+    let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
+    let response = retry::retry_send(
+        agent,
+        &url,
+        api_key,
+        &body,
+        &retry,
+        &mut None,
+        cancel_rx,
+        Some(&mut deadline),
+    )?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // The blocking socket read lives on a dedicated thread (see
     // `crate::stream`): `recv_sse_event` below polls the channel with a short
@@ -318,8 +336,7 @@ where
     // instead of never (the old code only checked cancellation between reads).
     // Cancelling also arms the reader thread's abort flag, so it stops at its
     // next loop boundary instead of parsing the remainder of the stream.
-    let sse =
-        crate::stream::spawn_sse_reader(move || reader.next_event(), config.total_timeout_secs);
+    let sse = crate::stream::spawn_sse_reader(move || reader.next_event(), deadline.current());
     let mut has_any_output = false;
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
@@ -447,7 +464,21 @@ where
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send(agent, &url, api_key, &body, &retry, on_retry, cancel_rx)?;
+    // Per-attempt wall-clock deadline spanning the whole request (DNS →
+    // headers → body), re-armed on each retry by `retry_loop`; the
+    // consumer-side check in `recv_sse_event` enforces it (see
+    // `retry::AttemptDeadline`).
+    let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
+    let response = retry::retry_send(
+        agent,
+        &url,
+        api_key,
+        &body,
+        &retry,
+        on_retry,
+        cancel_rx,
+        Some(&mut deadline),
+    )?;
     let mut has_any_output = false;
     let mut full_content = String::new();
     let mut full_reasoning = String::new();
@@ -464,8 +495,7 @@ where
     // Reader thread decouples the blocking socket read from cancellation
     // polling (see `crate::stream`); the abort flag on `sse` stops the thread
     // at its next loop boundary once the consumer cancels or drops it.
-    let sse =
-        crate::stream::spawn_sse_reader(move || reader.next_event(), config.total_timeout_secs);
+    let sse = crate::stream::spawn_sse_reader(move || reader.next_event(), deadline.current());
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;

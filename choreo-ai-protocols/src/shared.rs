@@ -39,6 +39,8 @@ pub enum ProviderError {
     EmptyResponse,
     #[error("request cancelled during retry backoff")]
     Cancelled,
+    #[error("total request deadline exceeded while reading streaming response")]
+    DeadlineExceeded,
     #[error("tool call arguments truncated by provider: {}", .discarded.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "))]
     TruncatedToolCall {
         discarded: Vec<choreo_proto::DiscardedToolCall>,
@@ -112,6 +114,7 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
         }
         ProviderError::EmptyResponse => InferenceError::EmptyResponse,
         ProviderError::Cancelled => InferenceError::Cancelled,
+        ProviderError::DeadlineExceeded => InferenceError::DeadlineExceeded,
         ProviderError::TruncatedToolCall { discarded } => {
             InferenceError::TruncatedToolCall { discarded }
         }
