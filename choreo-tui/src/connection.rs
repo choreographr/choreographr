@@ -109,13 +109,23 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // terminal protocol encoding without blocking the UI thread.
     let worker = ImageWorker::spawn(picker);
 
-    // Use the self-pipe trick to catch SIGCONT and SIGTSTP on any POSIX
-    // platform (the signalfd approach used here previously was Linux-only).
+    // Use the self-pipe trick to catch SIGCONT, SIGTSTP, and SIGWINCH on any
+    // POSIX platform (the signalfd approach used here previously was Linux-only).
     // Compatible with Linux and macOS.
     //
-    // signal_hook installs signal handlers that atomically write the signal
-    // number to a pipe; the terminal-event thread monitors the pipe's read
-    // end via mio::Poll alongside stdin and the notification pipe.
+    // signal_hook installs signal handlers that atomically write a byte to a
+    // pipe; the terminal-event thread monitors the pipe's read end via
+    // mio::Poll alongside stdin and the notification pipe.
+    //
+    // SIGWINCH is essential here: crossterm 0.29 only reports terminal resizes
+    // as `Event::Resize` from a SIGWINCH handler it installs internally, and that
+    // event is only produced while draining crossterm events (inside
+    // `event::poll`/`event::read`).  Without registering SIGWINCH on our own
+    // pipe, a resize (e.g. toggling fullscreen in Ghostty with Ctrl+Enter) never
+    // wakes the mio poll, so the resize stays undetected until the next keypress
+    // and the viewport keeps the stale size — breaking the layout.  Registering
+    // SIGWINCH here makes the poll wake so the drain loop below picks up the
+    // queued `Event::Resize` and the app reflows immediately.
     //
     // NOTE: In raw mode, termios ISIG is disabled, so pressing Ctrl+Z in the
     // terminal sends byte 0x1A to stdin as a regular character — it does NOT
@@ -132,6 +142,7 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     fcntl(&signal_rx, F_SETFL(OFlag::O_NONBLOCK))?;
     fcntl(&signal_tx, F_SETFD(FdFlag::FD_CLOEXEC))?;
     signal_pipe::register(Signal::SIGCONT as i32, signal_tx.try_clone()?)?;
+    signal_pipe::register(Signal::SIGWINCH as i32, signal_tx.try_clone()?)?;
     signal_pipe::register(Signal::SIGTSTP as i32, signal_tx)?;
     let mut signal_rx_file: std::fs::File = signal_rx.into();
     let signal_rx_fd = signal_rx_file.as_raw_fd();
@@ -185,6 +196,16 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    // Prime crossterm's internal event reader before the terminal thread starts
+    // blocking in mio::Poll.  crossterm installs its SIGWINCH handler lazily on
+    // the first `event::poll`/`event::read` call, and that handler is what turns
+    // a resize into `Event::Resize`.  Without this priming, a resize that arrives
+    // before the first drain (e.g. the user toggling fullscreen immediately at
+    // startup) would be missed: nothing would wake the thread, the event reader
+    // would never even be initialised, and the layout would stay stale until the
+    // next keypress.  A zero-timeout poll is non-blocking and consumes nothing.
+    let _ = event::poll(Duration::ZERO);
 
     // Spawn a background thread that reads terminal events via crossterm and
     // forwards them through a crossbeam channel so the main loop can block on
@@ -250,6 +271,14 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
                         // Drain all pending signals from the self-pipe,
                         // logging and discarding read errors so a
                         // transient fd issue doesn't hang the thread.
+                        //
+                        // SIGWINCH is intentionally not mapped to a
+                        // ResumeCommand: the point of catching it here is
+                        // purely to wake the mio poll so the drain loop
+                        // below runs `event::poll`/`event::read`, which is
+                        // when crossterm converts its internal SIGWINCH
+                        // notification into the `Event::Resize` that
+                        // reflows the UI.
                         loop {
                             let mut buf = [0u8; 4];
                             match signal_rx_file.read(&mut buf) {
@@ -2048,6 +2077,16 @@ mod tests {
             signal_to_resume_command(Signal::SIGTSTP as i32),
             Some(ResumeCommand::PrepareForSuspend),
         ));
+    }
+
+    #[test]
+    fn sigwinch_is_not_a_resume_command() {
+        // SIGWINCH is registered on the self-pipe purely to wake the terminal
+        // thread's mio poll; the actual resize is then reported by crossterm's
+        // `event::poll`/`event::read` drain as `Event::Resize`.  Mapping it to a
+        // ResumeCommand would be wrong — resizing must never trigger a terminal
+        // teardown/reinit.
+        assert!(signal_to_resume_command(Signal::SIGWINCH as i32).is_none());
     }
 
     #[test]

@@ -609,22 +609,36 @@ main()
 ├── terminal-event thread: mio::Poll on three sources —
 │   ├── stdin (fd 0) → crossterm events (keyboard, mouse, resize)
 │   ├── notification pipe → clean shutdown signal
-│   └── signal pipe (self-pipe trick) → SIGCONT/SIGTSTP (suspend/resume)
+│   └── signal pipe (self-pipe trick) → SIGCONT/SIGTSTP (suspend/resume),
+│       SIGWINCH (resize wakeup)
 │       └── forwards signals as ResumeCommand via crossbeam channel
+│           (SIGWINCH is not a ResumeCommand — it only wakes the poll so the
+│           crossterm drain below reports `Event::Resize`)
 └── UI loop: crossbeam select! on five event sources + ratatui rendering
 ```
 
-**Signal handling (suspend/resume):**
+**Signal handling (suspend/resume + resize wakeup):**
 
-`SIGCONT` and `SIGTSTP` are caught using the self-pipe trick for POSIX
-portability (Linux and macOS). A pair of pipe fds (FD_CLOEXEC) is created;
-the read end is registered with `mio::Poll` in the terminal-event thread,
-and `signal_hook::low_level::pipe` installs signal handlers that atomically
-write the signal number to the write end. The terminal-event thread reads
+`SIGCONT`, `SIGTSTP`, and `SIGWINCH` are caught using the self-pipe trick for
+POSIX portability (Linux and macOS). A pair of pipe fds (FD_CLOEXEC) is
+created; the read end is registered with `mio::Poll` in the terminal-event
+thread, and `signal_hook::low_level::pipe` installs signal handlers that
+atomically write a byte to the write end. The terminal-event thread reads
 from the pipe and forwards `ResumeCommand` messages through a crossbeam
 channel to the UI loop. The UI loop handles `PrepareForSuspend`
 (disable raw mode, leave alternate screen, `raise(SIGSTOP)`) and
 `ReinitTerminal` (re-enable raw mode, re-enter alternate screen, clear).
+
+`SIGWINCH` is deliberately *not* mapped to a `ResumeCommand`. Its only purpose
+is to wake the terminal thread's `mio::Poll` (which otherwise sleeps on stdin
+and would miss a resize entirely), so the thread's event drain calls
+`crossterm::event::poll`/`read` and picks up the `Event::Resize` that
+crossterm 0.29 generates from its own internal SIGWINCH handler. Without this,
+a terminal resize — e.g. toggling fullscreen in Ghostty — would leave the
+viewport at the stale size until the next keypress, breaking the layout.
+`run_app` also primes crossterm's event reader once at startup (a
+zero-timeout `event::poll`) so that lazy SIGWINCH handler is installed before
+the first resize can arrive.
 
 > **Note:** In raw mode, `termios` `ISIG` is disabled, so pressing Ctrl+Z in the
 > terminal sends byte `0x1A` to stdin as a regular character — it does **not**
