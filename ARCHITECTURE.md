@@ -240,11 +240,11 @@ account configuration, no sessions — so it can be consumed independently of
 | `google/` | Google Gemini API client (`GoogleClient`, `GoogleConfig`). Implements `ProviderClient`. Uses its own SSE reader for streaming. |
 | `traits.rs` | `ProviderClient` trait, `ChatTurnRequest`, `ToolResultItem` |
 | `types.rs` | `ChatTurnResult`, `ChatToolCall`, `ChatAssistantToolUse`, `FinalTextResult`, `CallerInfo`, `StreamEvent` |
-| `shared.rs` | `ProviderError` (unified error type re-exported as `OpenAiError`/`AnthropicError`/`GoogleError`), `MaxTokensField`, `MAX_TOOL_CALLS`, `build_agent()` (applies three timeouts: connect, idle `request_timeout_secs` per chunk, and hard `total_timeout_secs` wall-clock deadline via ureq's `timeout_global`), `provider_error_to_inference()`, `emit_non_streaming_events()`, `list_models_with_fallback()` |
+| `shared.rs` | `ProviderError` (unified error type re-exported as `OpenAiError`/`AnthropicError`/`GoogleError`), `MaxTokensField`, `MAX_TOOL_CALLS`, `build_agent()` (applies three timeouts: connect, idle `request_timeout_secs` per chunk, and hard `total_timeout_secs` wall-clock deadline per attempt via ureq's `timeout_global` — each retry restarts it), `provider_error_to_inference()`, `emit_non_streaming_events()`, `list_models_with_fallback()` |
 | `context_window.rs` | `ContextWindowConfig` — per-model/global context window resolution shared by all configs |
 | `overrides.rs` | `ProviderOverrides` — protocol-agnostic account overrides carrier (the daemon converts its `AccountConfig` into this) |
 | `retry.rs` | Shared HTTP retry logic. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, and cancellation support. |
-| `stream.rs` | Cancellable SSE reader plumbing: `spawn_sse_reader()` runs the blocking socket read on a dedicated thread and forwards parsed events through an mpsc channel; `recv_sse_event()` polls that channel with a ~200 ms `recv_timeout` and re-checks cancellation each iteration, so Escape interrupts a stalled/trickling stream instead of blocking forever inside `read()`. |
+| `stream.rs` | Cancellable SSE reader plumbing: `spawn_sse_reader()` runs the blocking socket read on a dedicated thread and forwards parsed events through a bounded mpsc channel (backpressure — the reader blocks on `send` instead of buffering unboundedly); an mpsc abort signal stops the thread at its next loop boundary on cancel/drop; `recv_sse_event()` polls the channel with a ~200 ms `recv_timeout` and re-checks cancellation each iteration, so Escape interrupts a stalled/trickling stream instead of blocking forever inside `read()`. |
 | `catalog/` | `ProviderProtocol` enum + `ProviderEntry`/`ModelEntry`, `PROVIDER_CATALOG` (bundled TOML, one `catalog/<slug>.toml` per provider), and lookups (`lookup_provider`, `lookup_context_window`, `model_reasoning_capability`, `model_request_format`, `all_slugs`, `all_display_names`) |
 
 **Root re-exports** give consumers a stable front door: the client types
@@ -1276,9 +1276,14 @@ deletion**:
 - **Session deletion:** `handle_delete_session` cascade-deletes children before the parent by
   calling `delete_session_inner()` on each child, logging but continuing if a child's DB
   delete fails. `delete_session_inner` also records the id in `DaemonState::deleted_sessions`
-  so straggler `UpdateMetadata`/status messages from an abandoned (still-alive) session
-  thread cannot re-insert the session into the in-memory index; the marker is cleared once
-  the thread's `SessionExited` arrives.
+  so straggler `UpdateMetadata`/status messages from a still-shutting-down session thread
+  cannot re-insert the session into the in-memory index. The marker is dropped on the
+  thread's `SessionExited` for clean exits; an abandoned thread keeps it until the
+  background reaper confirms with `SessionReaped` (the record it re-created is only gone
+  once the reaper re-deletes it — clearing earlier would let an `AttachSession` resurrect
+  the session). A deletion tombstone (`deleted_sessions` DB table) plus a startup purge
+  (`db::purge_tombstoned_sessions`) additionally prevent a deleted session from
+  resurfacing after a crash while the zombie was still alive.
 
 The child session uses `ToolContext` (`active_tool_groups`, `reasoning_effort`, `working_dir`,
 `daemon_tx`) to inherit parent config and communicate with the daemon command loop.
@@ -1291,7 +1296,7 @@ The child session uses `ToolContext` (`active_tool_groups`, `reasoning_effort`, 
 ### Data model
 
 Sessions are persisted to a `redb` (v4) embedded key-value store at
-`~/.local/share/choreographr/state.redb`. Five tables:
+`~/.local/share/choreographr/state.redb`. Six tables:
 
 | Table | Key | Value |
 |---|---|---|
@@ -1299,6 +1304,7 @@ Sessions are persisted to a `redb` (v4) embedded key-value store at
 | `session_turns` | `(u64, u32)` (session ID, turn ID) | postcard(`Turn`) |
 | `credentials` | `&str` service name | encrypted blob |
 | `session_kv` | `(u64, String)` (session ID, key) | `Vec<u8>` |
+| `deleted_sessions` | `u64` session ID | `()` tombstone — marks a deleted session whose record may be re-created by an abandoned thread; purged at startup |
 | `meta` | `&str` | `u64` counter |
 
 `SessionRecord` fields: `title`, `selected_model`, `parent_session_id`, `working_dir`,
@@ -1354,7 +1360,7 @@ to operate in the same directory as their parent.
 - **Message append**: Each `SessionMessage` (including `DisplayedImage` records for
   persisted images) is written to the DB alongside the in-memory push via
   `append_message_and_persist()`.
-- **Shutdown**: The daemon sends `SessionCommand::Shutdown` to each active session, then joins each session thread bounded by `SESSION_SHUTDOWN_GRACE` (5s). The graceful path exits promptly once request workers drain; a worker stuck in an LLM provider read that a cancel cannot interrupt is abandoned rather than hanging the daemon — completed turns are already persisted as they finalize. Session joins happen concurrently (one join thread per session), so N stuck sessions cost ~one grace period, not N × grace. An abandoned `JoinHandle` from a delete is handed to a background reaper (`sessions::reap_abandoned_session`) that joins the thread once the stuck worker unblocks and then re-deletes the session record, so a deleted session cannot be resurrected on the next daemon start.
+- **Shutdown**: The daemon sends `SessionCommand::Shutdown` to each active session, then joins each session thread bounded by `SESSION_SHUTDOWN_GRACE` (5s). The graceful path exits promptly once request workers drain; a worker stuck in an LLM provider read that a cancel cannot interrupt is abandoned rather than hanging the daemon — completed turns are already persisted as they finalize. Session joins happen concurrently (one join thread per session), so N stuck sessions cost ~one grace period, not N × grace. An abandoned `JoinHandle` from a delete is handed to a background reaper (`sessions::reap_abandoned_session`) that joins the thread once the stuck worker unblocks, re-deletes the session record it re-created, clears the deletion tombstone, and reports back with `SessionReaped` — so a deleted session cannot be resurrected by an attach, on the next daemon start, or after a crash mid-window.
 
 ### Multiple concurrent sessions
 
@@ -1647,10 +1653,13 @@ different session.
    module has its own `AnthropicSseReader` that handles both `event:` and `data:` lines
    (required by the Anthropic Messages streaming format) and yields `(event_type, data)` pairs.
    The blocking socket read is decoupled onto a dedicated reader thread (`stream.rs`) that
-   forwards parsed events through an mpsc channel, so the caller can poll with a short
-   `recv_timeout` and observe cancellation within ~200 ms even on a quiet stream. A hard
-   wall-clock deadline (`total_timeout_secs`, via ureq's `timeout_global`) backstops the
-   entire request — the only timeout that fires even when a provider trickles keep-alive bytes.
+   forwards parsed events through a bounded mpsc channel, so the caller can poll with a short
+   `recv_timeout` and observe cancellation within ~200 ms even on a quiet stream; an mpsc
+   abort signal stops the reader thread at its next loop boundary once the consumer cancels
+   or drops the stream. A hard wall-clock deadline (`total_timeout_secs`, via ureq's
+   `timeout_global`) backstops each request attempt — the only timeout that fires even when
+   a provider trickles keep-alive bytes; each retry restarts it, so retries plus their
+   backoff can exceed the configured value in aggregate.
 
 9. **Markdown as the intermediate format** — all text (tool output, assistant text, error
     messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output

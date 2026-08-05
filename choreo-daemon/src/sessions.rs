@@ -37,11 +37,20 @@ pub(crate) const MAX_TITLE_CHARS: usize = 200;
 /// finalize, and a background reaper (or process exit) reaps the thread.
 pub(crate) const SESSION_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Result of a bounded session-thread join.
+pub(crate) struct SessionJoinOutcome {
+    /// Whether the thread exited within the grace period (and was reaped).
+    pub(crate) exited: bool,
+    /// The live join handle when the thread was abandoned, so the caller can
+    /// reap it on a background thread; `None` when it was joined.
+    pub(crate) handle: Option<std::thread::JoinHandle<()>>,
+}
+
 /// Join a session thread after `Shutdown`, bounded by
 /// [`SESSION_SHUTDOWN_GRACE`].  Returns `true` if the thread exited within
 /// the grace period, `false` if it was abandoned.
 pub fn join_session_shutdown(handle: std::thread::JoinHandle<()>, session_id: u64) -> bool {
-    join_session_shutdown_keep(handle, session_id).0
+    join_session_shutdown_keep(handle, session_id).exited
 }
 
 /// Bounded join that also returns the handle when the thread was abandoned,
@@ -50,7 +59,7 @@ pub fn join_session_shutdown(handle: std::thread::JoinHandle<()>, session_id: u6
 pub(crate) fn join_session_shutdown_keep(
     handle: std::thread::JoinHandle<()>,
     session_id: u64,
-) -> (bool, Option<std::thread::JoinHandle<()>>) {
+) -> SessionJoinOutcome {
     // Production callers use the real clock and real sleep; tests inject
     // fake ones through `join_session_shutdown_poll` directly.
     join_session_shutdown_poll(
@@ -73,7 +82,7 @@ fn join_session_shutdown_poll<F, S>(
     grace: std::time::Duration,
     now: F,
     sleep: S,
-) -> (bool, Option<std::thread::JoinHandle<()>>)
+) -> SessionJoinOutcome
 where
     F: FnMut() -> std::time::Instant,
     S: FnMut(std::time::Duration),
@@ -94,7 +103,10 @@ where
         now,
         sleep,
     );
-    (exited, handle.into_inner())
+    SessionJoinOutcome {
+        exited,
+        handle: handle.into_inner(),
+    }
 }
 
 /// Poll a thread-exit check until it passes or `grace` elapses.
@@ -144,10 +156,17 @@ fn shutdown_join_poll(
 /// (waiting out however long the stuck worker needs — bounded by the provider
 /// timeouts, which the worker respects) and then deletes the record again, so
 /// a deleted session cannot be resurrected on the next daemon start.
+///
+/// After the re-delete it reports back to the daemon with
+/// [`DaemonCommand::SessionReaped`]: the zombie's own `SessionExited` alone is
+/// not enough to drop the deleted-session marker, because the record it
+/// re-created is only gone once this re-delete commits — clearing the marker
+/// earlier would reopen an attach-resurrection window.
 pub(crate) fn reap_abandoned_session(
     handle: std::thread::JoinHandle<()>,
     session_id: u64,
     db: Arc<redb::Database>,
+    daemon_tx: mpsc::Sender<DaemonCommand>,
 ) {
     tracing::warn!(
         session_id,
@@ -156,6 +175,11 @@ pub(crate) fn reap_abandoned_session(
     let _ = handle.join();
     match crate::db::delete_session(&db, session_id) {
         Ok(()) => {
+            // The deletion tombstone (written by `delete_session_inner`) is no
+            // longer needed now that the record is gone for good.
+            if let Err(e) = crate::db::clear_session_tombstone(&db, session_id) {
+                tracing::warn!(session_id, error = %e, "reaper: failed to clear session tombstone");
+            }
             tracing::info!(
                 session_id,
                 "reaper: re-deleted session record after abandoned thread exited"
@@ -165,6 +189,7 @@ pub(crate) fn reap_abandoned_session(
             tracing::warn!(session_id, error = %e, "reaper: failed to re-delete session record");
         }
     }
+    let _ = daemon_tx.send(DaemonCommand::SessionReaped { session_id });
 }
 
 /// Test-only seam: bounded join with a caller-supplied grace period so
@@ -184,7 +209,7 @@ pub fn join_session_shutdown_with_grace_for_test(
         std::time::Instant::now,
         std::thread::sleep,
     )
-    .0
+    .exited
 }
 
 pub enum SessionCommand {
@@ -3152,16 +3177,19 @@ mod tests {
             base + elapsed
         };
         let mut no_sleep = |_: std::time::Duration| {};
-        let (exited, handle) = join_session_shutdown_poll(
+        let outcome = join_session_shutdown_poll(
             handle,
             1,
             std::time::Duration::from_millis(30),
             &mut clock,
             &mut no_sleep,
         );
-        assert!(!exited, "stuck thread must be abandoned, not joined");
         assert!(
-            handle.is_some(),
+            !outcome.exited,
+            "stuck thread must be abandoned, not joined"
+        );
+        assert!(
+            outcome.handle.is_some(),
             "the live handle must be returned so the caller can reap the thread"
         );
     }

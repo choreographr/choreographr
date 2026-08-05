@@ -17,10 +17,12 @@ pub struct ProviderOverrides {
     pub connect_timeout_secs: Option<u64>,
     /// Request (idle) timeout in seconds.
     pub request_timeout_secs: Option<u64>,
-    /// Hard wall-clock deadline for the whole request including the streaming
-    /// body read, in seconds; `None` = provider default.  Unlike
+    /// Hard wall-clock deadline for a single HTTP request attempt, including
+    /// the streaming body read, in seconds; `None` = provider default.  Unlike
     /// `request_timeout_secs` (an idle/no-progress timeout), this fires even
-    /// when a provider trickles keep-alive bytes, bounding a stalled SSE stream.
+    /// when a provider trickles keep-alive bytes, bounding a stalled SSE
+    /// stream.  It covers one attempt: each retry restarts the deadline, so
+    /// retries plus their backoff can exceed this value in aggregate.
     pub total_timeout_secs: Option<u64>,
     /// Initial retry backoff in milliseconds.
     pub retry_initial_backoff_ms: Option<u64>,

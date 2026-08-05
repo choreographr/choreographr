@@ -128,11 +128,13 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
 ///   time a new chunk arrives on a streaming response.  A value of `0` means
 ///   no limit.  It cannot interrupt a stream that keeps trickling keep-alive
 ///   bytes without ever forming a complete event.
-/// - `total_timeout_secs` is a hard wall-clock deadline for the entire
-///   request, from DNS lookup through the last byte of the body read.  ureq's
-///   `timeout_global` is the only timeout that fires even when keep-alive
-///   data trickles in, so it is the backstop that prevents a stalled SSE
-///   stream from hanging the worker forever.  A value of `0` means no limit.
+/// - `total_timeout_secs` is a hard wall-clock deadline for a single HTTP
+///   attempt, from DNS lookup through the last byte of the body read.  ureq's
+///   `timeout_global` is the only timeout that fires even when keep-alive data
+///   trickles in, so it is the backstop that prevents a stalled SSE stream
+///   from hanging the worker forever.  A value of `0` means no limit.  It
+///   covers one attempt: each retry restarts the deadline, so retries plus
+///   their backoff can exceed this value in aggregate.
 pub(crate) fn build_agent(
     connect_timeout_secs: u64,
     read_timeout_secs: u64,

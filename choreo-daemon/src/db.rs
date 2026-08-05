@@ -16,6 +16,10 @@ const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credenti
 #[cfg(test)]
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const SESSION_KV: TableDefinition<(u64, String), Vec<u8>> = TableDefinition::new("session_kv");
+/// Tombstones for deleted sessions whose (abandoned) session thread may still
+/// re-create the record.  Keyed by session id; present means "deleted — purge
+/// any record bearing this id at next startup" (see [`purge_tombstoned_sessions`]).
+const DELETED_SESSIONS: TableDefinition<u64, ()> = TableDefinition::new("deleted_sessions");
 
 /// Iterator type returned by redb range queries on SESSION_KV.
 type KvRangeIter<'a> = Box<
@@ -243,6 +247,98 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
         .commit()
         .map_err(|e| db_err(format!("redb commit delete: {e}")))?;
     Ok(())
+}
+
+/// Write a deletion tombstone for `session_id`.
+///
+/// Called by the daemon after a successful session delete.  If the session's
+/// abandoned thread re-creates the record (via `persist_and_exit`) and the
+/// daemon crashes before the background reaper re-deletes it, the tombstone
+/// survives so [`purge_tombstoned_sessions`] removes the record at the next
+/// startup instead of letting a deleted session reappear.
+pub fn mark_session_deleted(db: &redb::Database, session_id: u64) -> io::Result<()> {
+    debug!("mark_session_deleted: id={}", session_id);
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+    {
+        let mut table = write_txn
+            .open_table(DELETED_SESSIONS)
+            .map_err(|e| db_err(format!("redb open deleted_sessions: {e}")))?;
+        table
+            .insert(session_id, ())
+            .map_err(|e| db_err(format!("redb insert tombstone: {e}")))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| db_err(format!("redb commit tombstone: {e}")))?;
+    Ok(())
+}
+
+/// Remove the deletion tombstone for `session_id`.
+///
+/// Called by the background reaper once it has re-deleted the record the
+/// zombie thread re-created, so the tombstone does not accumulate.
+pub fn clear_session_tombstone(db: &redb::Database, session_id: u64) -> io::Result<()> {
+    debug!("clear_session_tombstone: id={}", session_id);
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+    {
+        let mut table = write_txn
+            .open_table(DELETED_SESSIONS)
+            .map_err(|e| db_err(format!("redb open deleted_sessions: {e}")))?;
+        table
+            .remove(session_id)
+            .map_err(|e| db_err(format!("redb remove tombstone: {e}")))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| db_err(format!("redb commit tombstone: {e}")))?;
+    Ok(())
+}
+
+/// Delete every session that carries a deletion tombstone and clear the
+/// tombstones.  Returns the number of sessions purged.
+///
+/// Called once at daemon startup, before the session index is loaded: a
+/// deleted session whose abandoned thread re-created the record, then died
+/// with a crashed daemon before the reaper could re-delete it, must not
+/// resurface.  Deleting a record that is already gone is a harmless no-op.
+pub fn purge_tombstoned_sessions(db: &redb::Database) -> io::Result<usize> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+    let table = match read_txn.open_table(DELETED_SESSIONS) {
+        Ok(table) => table,
+        // No tombstone table yet (e.g. a pre-upgrade database): nothing to purge.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(db_err(format!("redb open deleted_sessions: {e}"))),
+    };
+    let ids: Vec<u64> = table
+        .iter()
+        .map_err(|e| db_err(format!("redb iter deleted_sessions: {e}")))?
+        .filter_map(|result| result.ok())
+        .map(|(key, _)| key.value())
+        .collect();
+    drop(read_txn);
+
+    let mut purged = 0usize;
+    for id in ids {
+        if let Err(e) = delete_session(db, id) {
+            warn!(session_id = id, error = %e, "purge: failed to delete tombstoned session");
+            continue;
+        }
+        if let Err(e) = clear_session_tombstone(db, id) {
+            warn!(session_id = id, error = %e, "purge: failed to clear tombstone");
+        }
+        purged += 1;
+        info!(
+            session_id = id,
+            "purged session record left behind by a deleted-session zombie"
+        );
+    }
+    Ok(purged)
 }
 
 pub fn write_turn(
@@ -827,5 +923,78 @@ mod tests {
         assert_eq!(turns.len(), 2, "corrupt turn should be skipped");
         assert_eq!(turns[0].1, valid_turn);
         assert_eq!(turns[1].1, valid_turn2);
+    }
+
+    #[test]
+    fn purge_removes_tombstoned_resurrected_record() {
+        // Simulates the crash window: a session is deleted (tombstone
+        // written), its abandoned thread re-creates the record, and the
+        // daemon dies before the reaper can re-delete it.  The startup purge
+        // must remove the record so the deleted session cannot resurface.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let record = SessionRecord {
+            title: Some("ghost".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            turn_count: 0,
+            created_at: 1000,
+            last_modified: 1000,
+            active_tool_groups: vec![],
+            context_config: ContextConfig::default(),
+            account_name: None,
+        };
+
+        write_session(&db, 5, &record).unwrap();
+        mark_session_deleted(&db, 5).unwrap();
+        // Zombie re-creates the record after the delete…
+        write_session(&db, 5, &record).unwrap();
+
+        let purged = purge_tombstoned_sessions(&db).unwrap();
+        assert_eq!(purged, 1, "the resurrected record must be purged");
+        assert!(
+            read_session(&db, 5).unwrap().is_none(),
+            "tombstoned session must not survive the purge"
+        );
+        // Purge is idempotent: the tombstone was cleared, so a second run
+        // has nothing to do.
+        assert_eq!(purge_tombstoned_sessions(&db).unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_tombstone_prevents_purge_of_live_record() {
+        // A tombstone that is cleared (reaper finished) must not cause a
+        // still-valid record to be purged.
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let record = SessionRecord {
+            title: Some("live".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            turn_count: 0,
+            created_at: 1000,
+            last_modified: 1000,
+            active_tool_groups: vec![],
+            context_config: ContextConfig::default(),
+            account_name: None,
+        };
+        write_session(&db, 6, &record).unwrap();
+        mark_session_deleted(&db, 6).unwrap();
+        clear_session_tombstone(&db, 6).unwrap();
+
+        let purged = purge_tombstoned_sessions(&db).unwrap();
+        assert_eq!(purged, 0);
+        assert!(read_session(&db, 6).unwrap().is_some());
+    }
+
+    #[test]
+    fn purge_empty_database_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        assert_eq!(purge_tombstoned_sessions(&db).unwrap(), 0);
     }
 }
