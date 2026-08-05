@@ -17,9 +17,11 @@ pub use crate::requests::{
     REQUEST_IMAGE_BYTES, REQUEST_IMAGE_HEIGHT, REQUEST_IMAGE_MIME_TYPE, REQUEST_IMAGE_WIDTH,
 };
 pub use crate::server::run_server;
+#[cfg(feature = "test-utils")]
+pub use crate::sessions::join_session_shutdown_with_grace_for_test;
 pub use crate::sessions::{
     ActiveSessionEntry, ChildResult, RequestContext, SessionCommand, SessionMetadata, SessionState,
-    join_session_shutdown, join_session_shutdown_with_grace_for_test, session_main,
+    session_main,
 };
 pub use crate::tools::exec::{ExecArgs, execute_exec_tool};
 pub use crate::tools::find::{FindArgs, execute_find_tool};

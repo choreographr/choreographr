@@ -318,7 +318,8 @@ where
     // instead of never (the old code only checked cancellation between reads).
     // Cancelling also arms the reader thread's abort flag, so it stops at its
     // next loop boundary instead of parsing the remainder of the stream.
-    let sse = crate::stream::spawn_sse_reader(move || reader.next_event());
+    let sse =
+        crate::stream::spawn_sse_reader(move || reader.next_event(), config.total_timeout_secs);
     let mut has_any_output = false;
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
@@ -463,7 +464,8 @@ where
     // Reader thread decouples the blocking socket read from cancellation
     // polling (see `crate::stream`); the abort flag on `sse` stops the thread
     // at its next loop boundary once the consumer cancels or drops it.
-    let sse = crate::stream::spawn_sse_reader(move || reader.next_event());
+    let sse =
+        crate::stream::spawn_sse_reader(move || reader.next_event(), config.total_timeout_secs);
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;

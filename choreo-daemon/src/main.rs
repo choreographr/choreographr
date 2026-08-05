@@ -103,14 +103,14 @@ fn main() -> anyhow::Result<()> {
 
     let db = Arc::new(choreographr::db::open_db().context("failed to open database")?);
 
-    // Purge any sessions that were deleted while their (abandoned) thread was
-    // still alive and then re-created the record before the daemon crashed:
+    // Purge any sessions that were deleted while their still-shutting-down
+    // thread was alive and re-created the record before the daemon crashed:
     // without this, a deleted session could reappear after a restart.  Runs
     // before the session index is loaded so the record never surfaces.
     match choreographr::db::purge_tombstoned_sessions(&db) {
         Ok(n) if n > 0 => warn!(
             purged = n,
-            "purged sessions left behind by deleted-session zombies"
+            "purged records left behind by interrupted session deletions"
         ),
         Ok(_) => {}
         Err(e) => warn!(error = %e, "failed to purge tombstoned sessions; continuing"),
@@ -168,7 +168,6 @@ fn main() -> anyhow::Result<()> {
         active_sessions: std::collections::HashMap::new(),
         session_metadata,
         deleted_sessions: std::collections::HashSet::new(),
-        reaper_pending: std::collections::HashSet::new(),
         children: std::collections::HashMap::new(),
         accounts,
         providers: HashMap::new(),

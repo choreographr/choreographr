@@ -34,35 +34,17 @@ pub(crate) const MAX_TITLE_CHARS: usize = 200;
 /// read that a cancel cannot interrupt, the session thread never receives
 /// `RequestFinished` and would otherwise hang the daemon's shutdown join.
 /// Abandoning the join is safe: per-turn state is persisted as turns
-/// finalize, and a background reaper (or process exit) reaps the thread.
+/// finalize, and process exit (or the delete path's finalize on
+/// `SessionExited`) reaps the thread.
 pub(crate) const SESSION_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Result of a bounded session-thread join.
-pub(crate) struct SessionJoinOutcome {
-    /// Whether the thread exited within the grace period (and was reaped).
-    pub(crate) exited: bool,
-    /// The live join handle when the thread was abandoned, so the caller can
-    /// reap it on a background thread; `None` when it was joined.
-    pub(crate) handle: Option<std::thread::JoinHandle<()>>,
-}
 
 /// Join a session thread after `Shutdown`, bounded by
 /// [`SESSION_SHUTDOWN_GRACE`].  Returns `true` if the thread exited within
-/// the grace period, `false` if it was abandoned.
-pub fn join_session_shutdown(handle: std::thread::JoinHandle<()>, session_id: u64) -> bool {
-    join_session_shutdown_keep(handle, session_id).exited
-}
-
-/// Bounded join that also returns the handle when the thread was abandoned,
-/// so the caller can reap it on a background thread once it eventually exits
-/// (see [`reap_abandoned_session`]).
-pub(crate) fn join_session_shutdown_keep(
-    handle: std::thread::JoinHandle<()>,
-    session_id: u64,
-) -> SessionJoinOutcome {
-    // Production callers use the real clock and real sleep; tests inject
-    // fake ones through `join_session_shutdown_poll` directly.
-    join_session_shutdown_poll(
+/// the grace period, `false` if it was abandoned (the caller then relies on
+/// process exit — or the delete path's finalize-on-`SessionExited` — to reap
+/// the thread).  Used by the daemon's lifecycle shutdown.
+pub(crate) fn join_session_shutdown(handle: std::thread::JoinHandle<()>, session_id: u64) -> bool {
+    poll_join_with_grace(
         handle,
         session_id,
         SESSION_SHUTDOWN_GRACE,
@@ -71,18 +53,18 @@ pub(crate) fn join_session_shutdown_keep(
     )
 }
 
-/// The `JoinHandle` wrapper around [`shutdown_join_poll`]: polls
-/// `handle.is_finished()` and reaps via `join()`.
+/// Poll a `JoinHandle`'s exit until it finishes or `grace` elapses, then reap
+/// it via `join()`.  Returns whether the thread exited within the grace period.
 ///
 /// The clock (`now`) and sleep are injected so unit tests can exercise both
 /// outcomes deterministically — no real time-based waits.
-fn join_session_shutdown_poll<F, S>(
+fn poll_join_with_grace<F, S>(
     handle: std::thread::JoinHandle<()>,
     session_id: u64,
     grace: std::time::Duration,
     now: F,
     sleep: S,
-) -> SessionJoinOutcome
+) -> bool
 where
     F: FnMut() -> std::time::Instant,
     S: FnMut(std::time::Duration),
@@ -91,7 +73,7 @@ where
     // closures, so it lives in a RefCell that is created and consumed on this
     // thread only (never shared across threads).
     let handle = std::cell::RefCell::new(Some(handle));
-    let exited = shutdown_join_poll(
+    shutdown_join_poll(
         session_id,
         grace,
         || handle.borrow().as_ref().is_some_and(|h| h.is_finished()),
@@ -102,11 +84,7 @@ where
         },
         now,
         sleep,
-    );
-    SessionJoinOutcome {
-        exited,
-        handle: handle.into_inner(),
-    }
+    )
 }
 
 /// Poll a thread-exit check until it passes or `grace` elapses.
@@ -136,8 +114,7 @@ fn shutdown_join_poll(
                 session_id,
                 grace_ms = grace.as_millis(),
                 "session thread did not exit within shutdown grace period; abandoning join \
-                 (a background reaper or process exit will reap the thread; completed turns \
-                 are already persisted)",
+                 (process exit will reap the thread; completed turns are already persisted)",
             );
             return false;
         }
@@ -145,71 +122,27 @@ fn shutdown_join_poll(
     }
 }
 
-/// Reap a session thread that was abandoned by a bounded shutdown join and
-/// re-delete its session record.
-///
-/// When [`join_session_shutdown_keep`] abandons a join (request worker stuck
-/// in a provider read past the grace period), the session thread is still
-/// alive and can re-create the session record via `persist_and_exit` /
-/// `RequestFinished` after the caller already deleted it.  This function runs
-/// on a detached thread owned by the caller: it joins the session thread
-/// (waiting out however long the stuck worker needs — bounded by the provider
-/// timeouts, which the worker respects) and then deletes the record again, so
-/// a deleted session cannot be resurrected on the next daemon start.
-///
-/// After the re-delete it reports back to the daemon with
-/// [`DaemonCommand::SessionReaped`]: the zombie's own `SessionExited` alone is
-/// not enough to drop the deleted-session marker, because the record it
-/// re-created is only gone once this re-delete commits — clearing the marker
-/// earlier would reopen an attach-resurrection window.
-pub(crate) fn reap_abandoned_session(
-    handle: std::thread::JoinHandle<()>,
-    session_id: u64,
-    db: Arc<redb::Database>,
-    daemon_tx: mpsc::Sender<DaemonCommand>,
-) {
-    tracing::warn!(
-        session_id,
-        "reaping abandoned session thread; will re-delete the session record once it exits",
-    );
-    let _ = handle.join();
-    match crate::db::delete_session(&db, session_id) {
-        Ok(()) => {
-            // The deletion tombstone (written by `delete_session_inner`) is no
-            // longer needed now that the record is gone for good.
-            if let Err(e) = crate::db::clear_session_tombstone(&db, session_id) {
-                tracing::warn!(session_id, error = %e, "reaper: failed to clear session tombstone");
-            }
-            tracing::info!(
-                session_id,
-                "reaper: re-deleted session record after abandoned thread exited"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(session_id, error = %e, "reaper: failed to re-delete session record");
-        }
-    }
-    let _ = daemon_tx.send(DaemonCommand::SessionReaped { session_id });
-}
-
 /// Test-only seam: bounded join with a caller-supplied grace period so
 /// integration tests can exercise both outcomes in a few hundred ms instead
 /// of waiting out the production 5s grace.  Uses the real clock and sleep.
-/// Not `#[cfg(test)]`: integration tests (crate-level `tests/`) need it.
+///
+/// Only compiled under the `test-utils` feature, which the crate's own
+/// dev-dependency enables for test builds, so it never leaks into the
+/// published public API.
+#[cfg(feature = "test-utils")]
 #[doc(hidden)]
 pub fn join_session_shutdown_with_grace_for_test(
     handle: std::thread::JoinHandle<()>,
     session_id: u64,
     grace: std::time::Duration,
 ) -> bool {
-    join_session_shutdown_poll(
+    poll_join_with_grace(
         handle,
         session_id,
         grace,
         std::time::Instant::now,
         std::thread::sleep,
     )
-    .exited
 }
 
 pub enum SessionCommand {
@@ -3158,17 +3091,15 @@ mod tests {
     }
 
     #[test]
-    fn join_session_shutdown_abandons_stuck_thread_and_returns_handle() {
+    fn poll_join_with_grace_abandons_stuck_thread() {
         // A thread blocked on a channel that is never sent to models a request
         // worker stuck in a provider read that a cancel cannot interrupt.  The
         // bounded join must give up after the grace period instead of hanging
-        // the caller forever, and must hand the live handle back so the caller
-        // can reap the thread later.  Fully deterministic: the fake clock
-        // advances instantly and `sleep` is a no-op, so no real time elapses.
+        // the caller forever.  Fully deterministic: the fake clock advances
+        // instantly and `sleep` is a no-op, so no real time elapses.
         let (tx, rx) = mpsc::channel::<()>();
         let handle = std::thread::spawn(move || {
             let _ = rx.recv();
-            let _ = tx; // keep the sender alive so recv never errors out
         });
         let base = std::time::Instant::now();
         let mut elapsed = std::time::Duration::ZERO;
@@ -3177,20 +3108,16 @@ mod tests {
             base + elapsed
         };
         let mut no_sleep = |_: std::time::Duration| {};
-        let outcome = join_session_shutdown_poll(
+        let exited = poll_join_with_grace(
             handle,
             1,
             std::time::Duration::from_millis(30),
             &mut clock,
             &mut no_sleep,
         );
-        assert!(
-            !outcome.exited,
-            "stuck thread must be abandoned, not joined"
-        );
-        assert!(
-            outcome.handle.is_some(),
-            "the live handle must be returned so the caller can reap the thread"
-        );
+        assert!(!exited, "stuck thread must be abandoned, not joined");
+        // Drop the last sender so the blocked thread's `recv` errors out and
+        // it exits promptly (no leaked threads in the test runner).
+        drop(tx);
     }
 }

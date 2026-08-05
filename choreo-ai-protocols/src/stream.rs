@@ -57,6 +57,14 @@ pub(crate) struct SseStream<T> {
     /// repo's thread-communication rules); the unbounded channel never blocks
     /// `Drop`.
     abort_tx: mpsc::Sender<()>,
+    /// Hard wall-clock deadline for the whole response-body read, computed at
+    /// spawn from `total_timeout_secs` (per attempt — each retry creates a
+    /// fresh reader and thus a fresh deadline).  `None` disables.  ureq's own
+    /// `timeout_global` cannot hard-cap a stream that keeps trickling
+    /// keep-alive bytes faster than its ~1 s minimum socket timeout, so this
+    /// consumer-side check is the real backstop: it fires on every poll
+    /// regardless of incoming data.
+    deadline: Option<std::time::Instant>,
 }
 
 impl<T> Drop for SseStream<T> {
@@ -84,6 +92,9 @@ impl<T> Drop for SseStream<T> {
 /// Spawn a dedicated thread that runs the blocking SSE read loop and
 /// forwards each parsed event through an mpsc channel.
 ///
+/// `total_timeout_secs` is the hard wall-clock deadline for this response's
+/// streaming body read (0 disables); see [`SseStream::deadline`].
+///
 /// # Why a thread at all
 ///
 /// `SseReader::next_event()` blocks inside `BufReader::read()` on the socket.
@@ -103,14 +114,18 @@ impl<T> Drop for SseStream<T> {
 /// unblocks, but it holds no locks or shared state (the `Reader` is moved
 /// in), is bounded by the agent's idle/global timeouts, and dies with the
 /// process.
-pub(crate) fn spawn_sse_reader<T, F>(mut next: F) -> SseStream<T>
+pub(crate) fn spawn_sse_reader<T, F>(mut next: F, total_timeout_secs: u64) -> SseStream<T>
 where
     T: Send + 'static,
     F: FnMut() -> io::Result<Option<T>> + Send + 'static,
 {
     let (tx, rx) = mpsc::sync_channel(SSE_CHANNEL_CAPACITY);
     let (abort_tx, abort_rx) = mpsc::channel::<()>();
-    tracing::trace!("spawning SSE reader thread");
+    // Per-attempt deadline: each retry creates a fresh reader and thus a
+    // fresh deadline, matching the documented `total_timeout_secs` semantics.
+    let deadline = (total_timeout_secs > 0)
+        .then(|| std::time::Instant::now() + Duration::from_secs(total_timeout_secs));
+    tracing::trace!(total_timeout_secs, "spawning SSE reader thread");
     let handle = std::thread::spawn(move || {
         loop {
             // Abort check at the loop boundary: the consumer cancelling (or
@@ -151,6 +166,7 @@ where
         rx,
         handle: Some(handle),
         abort_tx,
+        deadline,
     }
 }
 
@@ -178,6 +194,20 @@ pub(crate) fn recv_sse_event<T>(
             let _ = sse.abort_tx.send(());
             tracing::debug!("SSE stream cancelled by user");
             return Err(ProviderError::Cancelled);
+        }
+
+        // Hard wall-clock deadline: fires even when a provider keeps trickling
+        // keep-alive bytes (ureq's global timeout is floored at ~1 s per
+        // socket read, so sub-second trickles can evade it).  Signal the
+        // reader thread to stop, then surface a timeout to the caller.
+        if let Some(deadline) = sse.deadline
+            && std::time::Instant::now() >= deadline
+        {
+            let _ = sse.abort_tx.send(());
+            tracing::warn!("SSE stream exceeded total request deadline");
+            return Err(ProviderError::Io(io::Error::other(
+                "total request deadline exceeded while reading streaming response",
+            )));
         }
 
         match sse.rx.recv_timeout(SSE_POLL_INTERVAL) {
@@ -215,7 +245,7 @@ mod tests {
         // Three events followed by a clean end, produced by a pure iterator
         // driven inside a closure (each call to `next()` advances one item).
         let mut items = (0..3).map(|i| Ok(Some(i))).chain(std::iter::once(Ok(None)));
-        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)), 0);
 
         assert!(matches!(sse.rx.recv(), Ok(SseStreamMsg::Event(0))));
         assert!(matches!(sse.rx.recv(), Ok(SseStreamMsg::Event(1))));
@@ -228,7 +258,7 @@ mod tests {
         // A reader that immediately fails surfaces the io::Error verbatim.
         // (T is annotated — nothing constrains it when the closure only errs.)
         let mut items = std::iter::once(Err(io::Error::other("boom")));
-        let sse: SseStream<i32> = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let sse: SseStream<i32> = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)), 0);
         match sse.rx.recv() {
             Ok(SseStreamMsg::Err(e)) => assert_eq!(e.to_string(), "boom"),
             other => panic!("expected SseStreamMsg::Err, got {other:?}"),
@@ -240,7 +270,7 @@ mod tests {
         // One event, then a failure — both forwarded in order.
         let mut items =
             std::iter::once(Ok(Some(7))).chain(std::iter::once(Err(io::Error::other("late"))));
-        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)), 0);
         assert!(matches!(sse.rx.recv(), Ok(SseStreamMsg::Event(7))));
         match sse.rx.recv() {
             Ok(SseStreamMsg::Err(e)) => assert_eq!(e.to_string(), "late"),
@@ -261,7 +291,7 @@ mod tests {
         cancel_tx.send(()).unwrap();
 
         let mut items = std::iter::repeat_with(|| Ok(Some(0)));
-        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)), 0);
         let err = recv_sse_event(&sse, Some(&cancel_rx)).unwrap_err();
         assert!(matches!(err, ProviderError::Cancelled));
     }
@@ -276,7 +306,7 @@ mod tests {
         cancel_tx.send(()).unwrap();
 
         let mut items = std::iter::repeat_with(|| Ok(Some(0)));
-        let mut sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let mut sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)), 0);
         let err = recv_sse_event(&sse, Some(&cancel_rx)).unwrap_err();
         assert!(matches!(err, ProviderError::Cancelled));
         // Take the join handle out, then drop the stream: dropping the
@@ -294,14 +324,14 @@ mod tests {
         // the loop's "clean break" signal.  (T is annotated — the closure
         // only yields None, so the item type is otherwise unconstrained.)
         let mut items = std::iter::once(Ok(None));
-        let sse: SseStream<i32> = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let sse: SseStream<i32> = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)), 0);
         assert_eq!(recv_sse_event(&sse, None).unwrap(), None);
     }
 
     #[test]
     fn event_maps_to_ok_some() {
         let mut items = std::iter::once(Ok(Some("hello".to_string())));
-        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)), 0);
         let item = recv_sse_event(&sse, None).unwrap().expect("event");
         assert_eq!(item, "hello");
     }
@@ -319,6 +349,7 @@ mod tests {
             rx,
             handle: None,
             abort_tx,
+            deadline: None,
         };
         match recv_sse_event(&sse, None) {
             Err(ProviderError::Io(e)) => {
@@ -329,9 +360,45 @@ mod tests {
     }
 
     #[test]
+    fn expired_deadline_returns_timeout_error() {
+        // A stream whose deadline is already in the past must fail immediately
+        // with a timeout error, before the reader produces anything.  Fully
+        // deterministic: the past deadline is checked on the first poll, and
+        // the channel is never touched.
+        let (tx, rx) = mpsc::sync_channel::<SseStreamMsg<i32>>(SSE_CHANNEL_CAPACITY);
+        let (abort_tx, _abort_rx) = mpsc::channel();
+        let sse = SseStream {
+            rx,
+            handle: None,
+            abort_tx,
+            deadline: Some(std::time::Instant::now() - Duration::from_secs(1)),
+        };
+        match recv_sse_event(&sse, None) {
+            Err(ProviderError::Io(e)) => {
+                assert!(
+                    e.to_string().contains("total request deadline exceeded"),
+                    "unexpected timeout error message: {e}"
+                )
+            }
+            other => panic!("expected Io timeout error, got {other:?}"),
+        }
+        drop(tx);
+    }
+
+    #[test]
+    fn future_deadline_allows_events() {
+        // A deadline far in the future must not interfere with normal event
+        // flow (the deadline check only fires once the deadline has passed).
+        let mut items = std::iter::once(Ok(Some("hello".to_string())));
+        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)), 3600);
+        let item = recv_sse_event(&sse, None).unwrap().expect("event");
+        assert_eq!(item, "hello");
+    }
+
+    #[test]
     fn reader_error_maps_to_io_error() {
         let mut items = std::iter::once(Err(io::Error::other("socket reset")));
-        let sse: SseStream<i32> = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let sse: SseStream<i32> = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)), 0);
         match recv_sse_event(&sse, None) {
             Err(ProviderError::Io(e)) => assert_eq!(e.to_string(), "socket reset"),
             other => panic!("expected ProviderError::Io, got {other:?}"),

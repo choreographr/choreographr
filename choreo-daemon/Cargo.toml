@@ -86,6 +86,15 @@ notify-rust = { version = "4.18.0", default-features = false, features = ["d"] }
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 notify-rust = { version = "4.18.0", default-features = false }
 
+[features]
+# Test-only: exposes the bounded-shutdown seam (`join_session_shutdown_with_grace_for_test`)
+# used by tests/session_shutdown.rs.  Enabled for test builds via the self
+# dev-dependency below, so it never leaks into the published public API.
+test-utils = []
+
 [dev-dependencies]
 filetime = "0.2"
 serial_test.workspace = true
+# Enable the `test-utils` feature when building tests/examples/benchmarks for
+# this package (a package may depend on itself in dev-dependencies).
+choreo-daemon = { path = ".", features = ["test-utils"] }

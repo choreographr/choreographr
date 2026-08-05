@@ -16,7 +16,7 @@ const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credenti
 #[cfg(test)]
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const SESSION_KV: TableDefinition<(u64, String), Vec<u8>> = TableDefinition::new("session_kv");
-/// Tombstones for deleted sessions whose (abandoned) session thread may still
+/// Tombstones for deleted sessions whose still-shutting-down thread may
 /// re-create the record.  Keyed by session id; present means "deleted — purge
 /// any record bearing this id at next startup" (see [`purge_tombstoned_sessions`]).
 const DELETED_SESSIONS: TableDefinition<u64, ()> = TableDefinition::new("deleted_sessions");
@@ -251,11 +251,11 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
 
 /// Write a deletion tombstone for `session_id`.
 ///
-/// Called by the daemon after a successful session delete.  If the session's
-/// abandoned thread re-creates the record (via `persist_and_exit`) and the
-/// daemon crashes before the background reaper re-deletes it, the tombstone
-/// survives so [`purge_tombstoned_sessions`] removes the record at the next
-/// startup instead of letting a deleted session reappear.
+/// Called by the daemon when deleting a session whose thread is still alive.
+/// If that thread re-creates the record (via `persist_and_exit`) and the
+/// daemon crashes before `handle_session_exited` finalizes the delete, the
+/// tombstone survives so [`purge_tombstoned_sessions`] removes the record at
+/// the next startup instead of letting a deleted session reappear.
 pub fn mark_session_deleted(db: &redb::Database, session_id: u64) -> io::Result<()> {
     debug!("mark_session_deleted: id={}", session_id);
     let write_txn = db
@@ -277,8 +277,9 @@ pub fn mark_session_deleted(db: &redb::Database, session_id: u64) -> io::Result<
 
 /// Remove the deletion tombstone for `session_id`.
 ///
-/// Called by the background reaper once it has re-deleted the record the
-/// zombie thread re-created, so the tombstone does not accumulate.
+/// Called once `handle_session_exited` has deleted the record the
+/// still-shutting-down thread re-created, so the tombstone does not
+/// accumulate.
 pub fn clear_session_tombstone(db: &redb::Database, session_id: u64) -> io::Result<()> {
     debug!("clear_session_tombstone: id={}", session_id);
     let write_txn = db
@@ -302,9 +303,10 @@ pub fn clear_session_tombstone(db: &redb::Database, session_id: u64) -> io::Resu
 /// tombstones.  Returns the number of sessions purged.
 ///
 /// Called once at daemon startup, before the session index is loaded: a
-/// deleted session whose abandoned thread re-created the record, then died
-/// with a crashed daemon before the reaper could re-delete it, must not
-/// resurface.  Deleting a record that is already gone is a harmless no-op.
+/// deleted session whose still-shutting-down thread re-created the record,
+/// then died with a crashed daemon before the delete could be finalized,
+/// must not resurface.  Deleting a record that is already gone is a harmless
+/// no-op.
 pub fn purge_tombstoned_sessions(db: &redb::Database) -> io::Result<usize> {
     let read_txn = db
         .begin_read()
@@ -335,7 +337,7 @@ pub fn purge_tombstoned_sessions(db: &redb::Database) -> io::Result<usize> {
         purged += 1;
         info!(
             session_id = id,
-            "purged session record left behind by a deleted-session zombie"
+            "purged session record left behind by a deleted-session shutdown"
         );
     }
     Ok(purged)
@@ -928,8 +930,8 @@ mod tests {
     #[test]
     fn purge_removes_tombstoned_resurrected_record() {
         // Simulates the crash window: a session is deleted (tombstone
-        // written), its abandoned thread re-creates the record, and the
-        // daemon dies before the reaper can re-delete it.  The startup purge
+        // written), its still-shutting-down thread re-creates the record, and
+        // the daemon dies before the delete is finalized.  The startup purge
         // must remove the record so the deleted session cannot resurface.
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
@@ -949,7 +951,7 @@ mod tests {
 
         write_session(&db, 5, &record).unwrap();
         mark_session_deleted(&db, 5).unwrap();
-        // Zombie re-creates the record after the delete…
+        // The still-shutting-down thread re-creates the record after the delete…
         write_session(&db, 5, &record).unwrap();
 
         let purged = purge_tombstoned_sessions(&db).unwrap();
@@ -965,8 +967,8 @@ mod tests {
 
     #[test]
     fn clear_tombstone_prevents_purge_of_live_record() {
-        // A tombstone that is cleared (reaper finished) must not cause a
-        // still-valid record to be purged.
+        // A tombstone that is cleared (the exit finalize finished) must not
+        // cause a still-valid record to be purged.
         let dir = tempfile::tempdir().unwrap();
         let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
         let record = SessionRecord {

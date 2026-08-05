@@ -217,7 +217,8 @@ where
     // Reader thread decouples the blocking socket read from cancellation
     // polling (see `crate::stream`); the abort flag on `sse` stops the thread
     // at its next loop boundary once the consumer cancels or drops it.
-    let sse = crate::stream::spawn_sse_reader(move || reader.next_event());
+    let sse =
+        crate::stream::spawn_sse_reader(move || reader.next_event(), config.total_timeout_secs);
     let mut has_any_output = false;
     let mut full_text = String::new();
     let mut full_reasoning = String::new();

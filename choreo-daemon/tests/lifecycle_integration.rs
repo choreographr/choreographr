@@ -26,7 +26,6 @@ fn test_daemon_state() -> DaemonState {
         active_sessions: HashMap::new(),
         session_metadata: HashMap::new(),
         deleted_sessions: std::collections::HashSet::new(),
-        reaper_pending: std::collections::HashSet::new(),
         children: HashMap::new(),
         accounts: AccountManager::load(&accounts_path).unwrap(),
         providers: HashMap::new(),

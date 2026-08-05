@@ -390,7 +390,8 @@ where
     // Reader thread decouples the blocking socket read from cancellation
     // polling (see `crate::stream`); the abort flag on `sse` stops the thread
     // at its next loop boundary once the consumer cancels or drops it.
-    let sse = crate::stream::spawn_sse_reader(move || reader.next_event());
+    let sse =
+        crate::stream::spawn_sse_reader(move || reader.next_event(), config.total_timeout_secs);
     let mut has_any_output = false;
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let event = parse_responses_stream_event(&data)?;
@@ -709,7 +710,8 @@ where
     // Reader thread decouples the blocking socket read from cancellation
     // polling (see `crate::stream`); the abort flag on `sse` stops the thread
     // at its next loop boundary once the consumer cancels or drops it.
-    let sse = crate::stream::spawn_sse_reader(move || reader.next_event());
+    let sse =
+        crate::stream::spawn_sse_reader(move || reader.next_event(), config.total_timeout_secs);
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let event = parse_responses_stream_event(&data)?;
         match event {

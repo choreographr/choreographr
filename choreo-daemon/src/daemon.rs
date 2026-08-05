@@ -31,19 +31,16 @@ pub struct DaemonState {
     pub max_turns: u32,
     pub active_sessions: HashMap<u64, ActiveSessionEntry>,
     pub session_metadata: HashMap<u64, SessionMetadata>,
-    /// Sessions that have been deleted but whose (abandoned) session thread
-    /// may still be alive.  Guards the in-memory index against straggler
-    /// `UpdateMetadata` / status messages from the zombie thread re-creating
-    /// a session the user deleted (the DB-side race is handled by
-    /// `sessions::reap_abandoned_session`).
+    /// Sessions that have been deleted but whose session thread may still be
+    /// alive (shutting down after `Cancel`/`Shutdown`).  Guards the in-memory
+    /// index against straggler `UpdateMetadata` / status messages from that
+    /// thread re-creating a session the user deleted, and makes
+    /// `AttachSession` refuse to resurrect it while its record is still in
+    /// the DB.  The marker is dropped by `handle_session_exited` once the
+    /// thread's `SessionExited` arrives and the record has been deleted;
+    /// on a delete failure the marker is kept (with the deletion tombstone)
+    /// so the session cannot resurface until the startup purge retries.
     pub deleted_sessions: HashSet<u64>,
-    /// Deleted sessions for which a background reaper is still running (the
-    /// abandoned session thread has not yet been joined and its record
-    /// re-deleted).  While an id is here, `handle_session_exited` keeps the
-    /// `deleted_sessions` marker in place: the zombie's `SessionExited` alone
-    /// does not mean the record it re-created is gone — only the reaper's
-    /// re-delete does.  Cleared by `DaemonCommand::SessionReaped`.
-    pub reaper_pending: HashSet<u64>,
     /// Tracks parent→children session relationships so that cancelling or
     /// deleting a parent session also stops its child sub-sessions.
     pub children: HashMap<u64, Vec<u64>>,
@@ -95,14 +92,6 @@ pub enum DaemonCommand {
         metadata: SessionMetadata,
     },
     SessionExited {
-        session_id: u64,
-    },
-    /// Sent by the background reaper after an abandoned session thread has
-    /// been joined and the record it re-created has been re-deleted (and its
-    /// tombstone cleared).  Distinct from `SessionExited`: the record is only
-    /// gone once this re-delete commits, so only this message drops the
-    /// `deleted_sessions` marker for a reaped session.
-    SessionReaped {
         session_id: u64,
     },
     Unlock {
@@ -276,7 +265,6 @@ impl DaemonState {
                 metadata,
             } => self.handle_update_metadata(session_id, metadata),
             DaemonCommand::SessionExited { session_id } => self.handle_session_exited(session_id),
-            DaemonCommand::SessionReaped { session_id } => self.handle_session_reaped(session_id),
             DaemonCommand::Unlock { private_key, reply } => self.handle_unlock(private_key, reply),
             DaemonCommand::SaveCredential {
                 service,
@@ -580,10 +568,10 @@ impl DaemonState {
         // Credentials are only needed to run models (RunInput), not
         // to browse or attach to existing sessions.
         //
-        // A deleted session's abandoned thread can re-create the DB record
-        // before the background reaper re-deletes it (and before its
-        // `SessionReaped` clears the marker).  Without this guard, an attach
-        // in that window would resurrect a session the user deleted — the
+        // A deleted session's still-shutting-down thread can leave the DB
+        // record in place until `handle_session_exited` finalizes the delete
+        // (and drops the deleted marker).  Without this guard, an attach in
+        // that window would resurrect a session the user deleted — the
         // record would be gone moments later, stranding the new session.
         if self.deleted_sessions.contains(&session_id) {
             debug!(
@@ -659,9 +647,9 @@ impl DaemonState {
             "UpdateMetadata: id={}, model={:?}",
             session_id, metadata.selected_model
         );
-        // A deleted session's zombie thread may still emit metadata updates
-        // before it exits (e.g. a straggler RequestFinished).  Never re-insert
-        // a deleted session into the index.
+        // A deleted session's still-shutting-down thread may still emit
+        // metadata updates before it exits (e.g. a straggler
+        // RequestFinished).  Never re-insert a deleted session into the index.
         if self.deleted_sessions.contains(&session_id) {
             debug!(session_id, "ignoring UpdateMetadata for deleted session");
             return;
@@ -691,6 +679,12 @@ impl DaemonState {
     /// Mark a session as exited (sleeping) and broadcast the status change.
     /// If the session has any children, cancel and shut them down so they
     /// don't continue running as orphans.
+    ///
+    /// If the session was deleted while its thread was alive, this is also
+    /// where the delete is finalized: the thread's `persist_and_exit` runs
+    /// *before* it sends `SessionExited`, so by the time this handler runs the
+    /// record on disk is the thread's final state — safe to delete without a
+    /// re-create race, and without ever blocking the command loop on a join.
     fn handle_session_exited(&mut self, session_id: u64) {
         info!("SessionExited: id={}", session_id);
         crate::metrics::record_session_exited();
@@ -716,13 +710,8 @@ impl DaemonState {
             meta.last_modified = meta.last_modified.max(last_modified);
         }
         // Only broadcast for sessions that still exist: a deleted session's
-        // zombie thread eventually exits, and must not emit a ghost
-        // "sleeping" status for a session the user removed.  The deleted
-        // marker is dropped now that the thread is gone — but only for
-        // clean exits: an abandoned thread is guarded by `reaper_pending`
-        // and keeps its marker until the reaper's `SessionReaped` confirms
-        // the re-created record is gone (otherwise an attach could
-        // resurrect it in the gap).
+        // shutting-down thread must not emit a ghost "sleeping" status for a
+        // session the user removed.
         if self.session_metadata.contains_key(&session_id) {
             let msg = DaemonMessage::SessionStatusChanged {
                 session_id,
@@ -731,20 +720,35 @@ impl DaemonState {
             };
             self.broadcast(msg);
         }
-        if !self.reaper_pending.contains(&session_id) {
-            self.deleted_sessions.remove(&session_id);
-        }
-    }
 
-    /// The background reaper has finished an abandoned session: the zombie
-    /// thread is joined, its re-created record is re-deleted, and its
-    /// tombstone is cleared.  Only now is it safe to drop the
-    /// `deleted_sessions` marker — the record the zombie wrote is gone for
-    /// good, so no attach or straggler message can resurrect the session.
-    fn handle_session_reaped(&mut self, session_id: u64) {
-        debug!("SessionReaped: id={}", session_id);
-        self.reaper_pending.remove(&session_id);
-        self.deleted_sessions.remove(&session_id);
+        // Finalize a pending delete: the thread has fully exited and
+        // persisted, so the record can now be removed without a re-create
+        // race.  Only a *successful* delete drops the marker — on failure the
+        // marker and tombstone stay in place so the session cannot be
+        // attached or resurrected, and the startup purge retries the delete.
+        if self.deleted_sessions.contains(&session_id) {
+            match db::delete_session(&self.db, session_id) {
+                Ok(()) => {
+                    // The deletion tombstone (written by `delete_session_inner`)
+                    // is no longer needed now that the record is gone for good.
+                    if let Err(e) = db::clear_session_tombstone(&self.db, session_id) {
+                        warn!(session_id, error = %e, "failed to clear session-deletion tombstone");
+                    }
+                    self.deleted_sessions.remove(&session_id);
+                    info!(session_id, "finalized delete after session thread exited");
+                }
+                Err(e) => {
+                    // Keep the marker (and tombstone) so the deleted session
+                    // cannot be resurrected; purge_tombstoned_sessions at the
+                    // next startup retries the delete.
+                    error!(
+                        session_id,
+                        error = %e,
+                        "failed to delete session record during exit finalize; keeping tombstone"
+                    );
+                }
+            }
+        }
     }
 
     /// Attempt to unlock the daemon with the given private key.
@@ -953,9 +957,10 @@ impl DaemonState {
             status,
             last_modified,
         };
-        // A deleted session's zombie thread must not emit ghost status events
-        // for a session the user removed; the index is empty for deleted
-        // sessions, so use its presence as the "session exists" signal.
+        // A deleted session's still-shutting-down thread must not emit ghost
+        // status events for a session the user removed; the index is empty
+        // for deleted sessions, so use its presence as the "session exists"
+        // signal.
         if self.session_metadata.contains_key(&session_id) {
             self.broadcast(msg);
         }
@@ -1249,15 +1254,22 @@ impl DaemonState {
 
     /// Shared session-teardown logic used by both `handle_delete_session`
     /// (with permission checks) and cascade-deletion of children.
-    /// Returns an error if the database delete fails; callers decide whether
-    /// to stop or continue (cascade-delete continues on error).
+    ///
+    /// Returns an error only when there is no live thread to defer to and the
+    /// immediate DB delete fails; callers decide whether to stop or continue
+    /// (cascade-delete continues on error).
+    ///
+    /// Never blocks the command loop: when the session thread is alive we send
+    /// it `Cancel` + `Shutdown`, mark it deleted, write a deletion tombstone
+    /// (crash-window safety), and let `handle_session_exited` delete the record
+    /// once the thread's final `persist_and_exit` lands — no bounded join here.
     fn delete_session_inner(&mut self, session_id: u64) -> io::Result<()> {
         info!("DeleteSession (inner): id={}", session_id);
-        // Gracefully shut down the session thread so it can persist its
-        // final state before we delete from the DB — otherwise the
-        // session's persist_and_exit would re-write the session
-        // back to the DB after we delete it.
         if let Some(entry) = self.active_sessions.remove(&session_id) {
+            // Gracefully shut the session thread down so it can persist its
+            // final state; the record is deleted later in
+            // `handle_session_exited` (after `persist_and_exit` has run), so
+            // the thread cannot re-create the record after we remove it.
             if entry
                 .cmd_tx
                 .send(SessionCommand::Cancel {
@@ -1270,62 +1282,31 @@ impl DaemonState {
             if entry.cmd_tx.send(SessionCommand::Shutdown).is_err() {
                 warn!("delete_session_inner: failed to send Shutdown to session {session_id}");
             }
-            // Bound the join so a request worker stuck in a provider read
-            // (which a cancel cannot interrupt promptly) can't hang the
-            // daemon's command thread.  The graceful path exits within the
-            // grace period.
-            let outcome = crate::sessions::join_session_shutdown_keep(entry.handle, session_id);
-            if !outcome.exited
-                && let Some(handle) = outcome.handle
-            {
-                // The session thread is still alive (worker stuck past the
-                // grace period).  It can re-create the session record via
-                // `persist_and_exit` / `RequestFinished` once the worker
-                // unblocks, so hand the handle to a background reaper that
-                // joins it, deletes the record again, and reports back with
-                // `SessionReaped` — a deleted session must not be
-                // resurrected by an attach in the gap or on the next daemon
-                // start.  The reaper never blocks this command thread; a
-                // deletion tombstone (written below) additionally protects
-                // against a crash while the zombie is still alive.
-                let db = Arc::clone(&self.db);
-                let sid = session_id;
-                let daemon_tx = self.daemon_tx.clone();
-                std::thread::spawn(move || {
-                    crate::sessions::reap_abandoned_session(handle, sid, db, daemon_tx);
-                });
-                // Keep the deleted marker until the reaper confirms: the
-                // zombie's `SessionExited` arrives before its record is
-                // re-deleted, so clearing on `SessionExited` alone would
-                // reopen the attach-resurrection window (see
-                // `handle_session_reaped`).
-                self.reaper_pending.insert(session_id);
-            }
-            // Mark the session as deleted so straggler messages from a
-            // session thread that is still shutting down cannot re-insert it
-            // into the in-memory index (see `handle_update_metadata` /
-            // `handle_broadcast_session_status`).  This is unconditional
-            // whenever an entry existed: even a thread that exits *cleanly*
-            // within the grace period can have `UpdateMetadata` / status
-            // messages queued ahead of its `SessionExited`, and without the
-            // marker those would re-insert the session.  The marker is
-            // cleared by `handle_session_exited` for clean exits, or by
-            // `handle_session_reaped` for abandoned threads.
+            // The thread is still alive and will emit `UpdateMetadata` / status
+            // messages while it shuts down.  Mark it deleted so those stragglers
+            // cannot re-insert the session into the in-memory index (see
+            // `handle_update_metadata` / `handle_broadcast_session_status`), and
+            // so `AttachSession` refuses to resurrect it — its record is still
+            // in the DB until `handle_session_exited` finalizes the delete.
             self.deleted_sessions.insert(session_id);
+            // Deletion tombstone: if the daemon crashes before the thread exits
+            // (and finalize runs), `purge_tombstoned_sessions` at the next
+            // startup removes whatever record the still-shutting-down thread
+            // left behind, so a
+            // deleted session cannot resurface after a restart.
+            if let Err(e) = db::mark_session_deleted(&self.db, session_id) {
+                warn!(session_id, error = %e, "failed to write session-deletion tombstone");
+            }
+        } else {
+            // No live thread: nothing can re-create the record, so delete it
+            // now.  This is the only path that can fail here.
+            db::delete_session(&self.db, session_id)?;
         }
-        // Remove from in-memory metadata
+        // Remove from in-memory metadata and broadcast deletion immediately:
+        // from here on the session is invisible (index removed) and
+        // unattachable (deleted marker), even while its record is still being
+        // cleaned up in the background.
         self.session_metadata.remove(&session_id);
-        // Remove from database
-        db::delete_session(&self.db, session_id)?;
-        // Persist a deletion tombstone.  If the abandoned session thread
-        // re-creates this record and the daemon crashes before the reaper
-        // re-deletes it, the record would otherwise survive into the next
-        // startup; the startup purge (`db::purge_tombstoned_sessions`)
-        // removes anything still tombstoned.
-        if let Err(e) = db::mark_session_deleted(&self.db, session_id) {
-            warn!(session_id, error = %e, "failed to write session-deletion tombstone");
-        }
-        // Broadcast deletion to subscribers
         self.broadcast(DaemonMessage::SessionDeleted { session_id });
         Ok(())
     }
@@ -1636,7 +1617,6 @@ mod tests {
             active_sessions: HashMap::new(),
             session_metadata: HashMap::new(),
             deleted_sessions: HashSet::new(),
-            reaper_pending: HashSet::new(),
             children: HashMap::new(),
             accounts: AccountManager::load(&accounts_path).unwrap(),
             providers: HashMap::new(),
@@ -2011,9 +1991,10 @@ mod tests {
 
     #[test]
     fn handle_attach_session_rejects_deleted_session() {
-        // A deleted session's abandoned thread can re-create the DB record
-        // before the background reaper re-deletes it.  The attach guard must
-        // refuse to resurrect it even though a record exists on disk.
+        // A deleted session's still-shutting-down thread can leave the DB
+        // record in place until `handle_session_exited` finalizes the delete.
+        // The attach guard must refuse to resurrect it even though a record
+        // exists on disk.
         let (mut state, _daemon_rx) = make_daemon_state();
         let record = SessionRecord {
             title: Some("ghost".into()),
@@ -2029,8 +2010,8 @@ mod tests {
             account_name: None,
         };
         db::write_session(&state.db, 1, &record).unwrap();
-        // The deleted marker is set (the zombie thread has not yet been
-        // reaped, so no SessionReaped has arrived).
+        // The deleted marker is set (the session thread has not yet exited,
+        // so the record has not been finalized/deleted yet).
         state.deleted_sessions.insert(1);
 
         let (reply, rx) = mpsc::channel();
@@ -2046,6 +2027,67 @@ mod tests {
         // And it must not have been re-inserted into the in-memory index.
         assert!(!state.session_metadata.contains_key(&1));
         assert!(!state.active_sessions.contains_key(&1));
+    }
+
+    #[test]
+    fn session_exited_finalizes_pending_delete() {
+        // A deleted session's thread exits: `handle_session_exited` must
+        // delete the record, clear the deletion tombstone, and drop the
+        // deleted marker, so the session cannot resurface and no stale
+        // tombstone is left for the startup purge.
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let record = SessionRecord {
+            title: Some("doomed".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            turn_count: 0,
+            created_at: 1000,
+            last_modified: 1000,
+            active_tool_groups: vec![],
+            context_config: ContextConfig::default(),
+            account_name: None,
+        };
+        db::write_session(&state.db, 7, &record).unwrap();
+        db::mark_session_deleted(&state.db, 7).unwrap();
+        state.deleted_sessions.insert(7);
+
+        state.handle_command(DaemonCommand::SessionExited { session_id: 7 });
+
+        // Marker dropped, record gone, tombstone gone (purge is a no-op).
+        assert!(!state.deleted_sessions.contains(&7));
+        assert!(db::read_session(&state.db, 7).unwrap().is_none());
+        assert_eq!(
+            db::purge_tombstoned_sessions(&state.db).unwrap(),
+            0,
+            "tombstone must be cleared once the record is deleted"
+        );
+    }
+
+    #[test]
+    fn session_exited_does_not_delete_non_deleted_session() {
+        // A normal (non-deleted) session exit must leave the record alone —
+        // finalize only runs for sessions whose delete is still pending.
+        let (mut state, _daemon_rx) = make_daemon_state();
+        let record = SessionRecord {
+            title: Some("alive".into()),
+            selected_model: None,
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            turn_count: 0,
+            created_at: 1000,
+            last_modified: 1000,
+            active_tool_groups: vec![],
+            context_config: ContextConfig::default(),
+            account_name: None,
+        };
+        db::write_session(&state.db, 8, &record).unwrap();
+
+        state.handle_command(DaemonCommand::SessionExited { session_id: 8 });
+
+        assert!(db::read_session(&state.db, 8).unwrap().is_some());
     }
 
     #[test]
