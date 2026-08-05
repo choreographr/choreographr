@@ -1,7 +1,10 @@
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::retry::cancellation_pending;
 use crate::shared::ProviderError;
 
 /// How often the consumer polls for new SSE events (and re-checks
@@ -29,6 +32,39 @@ pub(crate) enum SseStreamMsg<T> {
     Err(io::Error),
 }
 
+/// Handle to a spawned SSE reader thread: the parsed-event channel plus the
+/// thread's abort flag and join handle.
+///
+/// Dropping the handle signals the reader thread to stop at its next loop
+/// boundary (see [`SseStream::drop`]) and reaps the thread immediately if it
+/// has already exited.
+pub(crate) struct SseStream<T> {
+    rx: mpsc::Receiver<SseStreamMsg<T>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    /// Set when the consumer cancels (or drops the stream) so the reader
+    /// thread stops at its next loop boundary instead of parsing the
+    /// remainder of a live stream.
+    abort: Arc<AtomicBool>,
+}
+
+impl<T> Drop for SseStream<T> {
+    fn drop(&mut self) {
+        // Abort the reader thread.  If it is blocked mid-`read()` it cannot
+        // react until the socket read unblocks (bounded by the agent's
+        // idle/global timeouts), but it will stop immediately at its next
+        // loop boundary rather than keep parsing the stream.
+        self.abort.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take()
+            && handle.is_finished()
+        {
+            // Already exited — reap now (no blocking).
+            let _ = handle.join();
+        }
+        // Otherwise dropping the JoinHandle detaches the thread; the abort
+        // flag stops it at the next opportunity.
+    }
+}
+
 /// Spawn a dedicated thread that runs the blocking SSE read loop and
 /// forwards each parsed event through an mpsc channel.
 ///
@@ -44,19 +80,31 @@ pub(crate) enum SseStreamMsg<T> {
 ///
 /// # Reader-thread lifetime
 ///
-/// The thread lingers only if it is mid-`read()` when the consumer bails
-/// (e.g. on cancellation).  It is detached, holds no locks or shared state
-/// (the `Reader` is moved in), and is bounded by the agent's idle/global
-/// timeouts, so it cannot wedge the process — and it dies with the process.
-pub(crate) fn spawn_sse_reader<T, F>(mut next: F) -> mpsc::Receiver<SseStreamMsg<T>>
+/// The returned [`SseStream`] carries an abort flag that the reader thread
+/// checks at every loop boundary, so a cancelled or dropped stream stops the
+/// thread as soon as it is not blocked inside a socket `read()`.  If the
+/// thread is mid-`read()` when the consumer bails it lingers until the read
+/// unblocks, but it holds no locks or shared state (the `Reader` is moved
+/// in), is bounded by the agent's idle/global timeouts, and dies with the
+/// process.
+pub(crate) fn spawn_sse_reader<T, F>(mut next: F) -> SseStream<T>
 where
     T: Send + 'static,
     F: FnMut() -> io::Result<Option<T>> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
+    let abort = Arc::new(AtomicBool::new(false));
+    let abort_thread = Arc::clone(&abort);
     tracing::trace!("spawning SSE reader thread");
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         loop {
+            // Abort check at the loop boundary: the consumer cancelling (or
+            // dropping the stream) must stop the thread as soon as it is not
+            // blocked inside a socket read.
+            if abort_thread.load(Ordering::Relaxed) {
+                tracing::debug!("SSE reader thread aborted");
+                return;
+            }
             match next() {
                 Ok(Some(item)) => {
                     // If the consumer has dropped the receiver (cancelled or
@@ -80,18 +128,24 @@ where
             }
         }
     });
-    rx
+    SseStream {
+        rx,
+        handle: Some(handle),
+        abort,
+    }
 }
 
-/// Receive the next SSE event, polling with [`SSE_POLL_INTERVAL`] so that a
-/// cancellation signal on `cancel_rx` is observed within ~200 ms even when
-/// the stream is quiet or stalled.
+/// Receive the next SSE event from a spawned reader thread, polling with
+/// [`SSE_POLL_INTERVAL`] so that a cancellation signal on `cancel_rx` is
+/// observed within ~200 ms even when the stream is quiet or stalled.
 ///
 /// Returns `Ok(None)` on a clean stream end, `Err(ProviderError::Cancelled)`
 /// when a cancellation is pending, and `Err(ProviderError::Io(..))` when the
-/// reader thread reports a read error or dies unexpectedly.
+/// reader thread reports a read error or dies unexpectedly.  On cancellation
+/// the reader thread's abort flag is armed so it stops at its next loop
+/// boundary instead of parsing the remainder of the stream.
 pub(crate) fn recv_sse_event<T>(
-    rx: &mpsc::Receiver<SseStreamMsg<T>>,
+    sse: &SseStream<T>,
     cancel_rx: Option<&mpsc::Receiver<()>>,
 ) -> Result<Option<T>, ProviderError> {
     loop {
@@ -99,14 +153,15 @@ pub(crate) fn recv_sse_event<T>(
         // decouples the blocking read from this loop, a cancel that arrives
         // while we are inside `recv_timeout` is noticed on the next iteration
         // at most ~200 ms later.
-        if let Some(rx) = cancel_rx
-            && rx.try_recv().is_ok()
-        {
+        if cancellation_pending(cancel_rx) {
+            // Cancel wins: signal the reader thread to stop at its next
+            // opportunity, then report cancellation to the caller.
+            sse.abort.store(true, Ordering::Relaxed);
             tracing::debug!("SSE stream cancelled by user");
             return Err(ProviderError::Cancelled);
         }
 
-        match rx.recv_timeout(SSE_POLL_INTERVAL) {
+        match sse.rx.recv_timeout(SSE_POLL_INTERVAL) {
             Ok(SseStreamMsg::Event(item)) => return Ok(Some(item)),
             Ok(SseStreamMsg::End) => return Ok(None),
             Ok(SseStreamMsg::Err(e)) => return Err(ProviderError::Io(e)),
@@ -141,12 +196,12 @@ mod tests {
         // Three events followed by a clean end, produced by a pure iterator
         // driven inside a closure (each call to `next()` advances one item).
         let mut items = (0..3).map(|i| Ok(Some(i))).chain(std::iter::once(Ok(None)));
-        let rx = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
 
-        assert!(matches!(rx.recv(), Ok(SseStreamMsg::Event(0))));
-        assert!(matches!(rx.recv(), Ok(SseStreamMsg::Event(1))));
-        assert!(matches!(rx.recv(), Ok(SseStreamMsg::Event(2))));
-        assert!(matches!(rx.recv(), Ok(SseStreamMsg::End)));
+        assert!(matches!(sse.rx.recv(), Ok(SseStreamMsg::Event(0))));
+        assert!(matches!(sse.rx.recv(), Ok(SseStreamMsg::Event(1))));
+        assert!(matches!(sse.rx.recv(), Ok(SseStreamMsg::Event(2))));
+        assert!(matches!(sse.rx.recv(), Ok(SseStreamMsg::End)));
     }
 
     #[test]
@@ -154,9 +209,8 @@ mod tests {
         // A reader that immediately fails surfaces the io::Error verbatim.
         // (T is annotated — nothing constrains it when the closure only errs.)
         let mut items = std::iter::once(Err(io::Error::other("boom")));
-        let rx: mpsc::Receiver<SseStreamMsg<i32>> =
-            spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
-        match rx.recv() {
+        let sse: SseStream<i32> = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        match sse.rx.recv() {
             Ok(SseStreamMsg::Err(e)) => assert_eq!(e.to_string(), "boom"),
             other => panic!("expected SseStreamMsg::Err, got {other:?}"),
         }
@@ -167,9 +221,9 @@ mod tests {
         // One event, then a failure — both forwarded in order.
         let mut items =
             std::iter::once(Ok(Some(7))).chain(std::iter::once(Err(io::Error::other("late"))));
-        let rx = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
-        assert!(matches!(rx.recv(), Ok(SseStreamMsg::Event(7))));
-        match rx.recv() {
+        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        assert!(matches!(sse.rx.recv(), Ok(SseStreamMsg::Event(7))));
+        match sse.rx.recv() {
             Ok(SseStreamMsg::Err(e)) => assert_eq!(e.to_string(), "late"),
             other => panic!("expected SseStreamMsg::Err, got {other:?}"),
         }
@@ -181,15 +235,34 @@ mod tests {
     fn pre_sent_cancel_returns_cancelled_immediately() {
         // A cancel signal sent BEFORE the call must win on the first
         // iteration, regardless of what the reader produces.  The reader
-        // yields forever here; once the receiver is dropped at test end the
-        // thread exits on its next failed send, so nothing leaks.
+        // yields forever here; the abort flag armed by the cancellation stops
+        // the thread at its next loop boundary, and once the receiver is
+        // dropped at test end the thread exits, so nothing leaks.
         let (cancel_tx, cancel_rx) = mpsc::channel();
         cancel_tx.send(()).unwrap();
 
         let mut items = std::iter::repeat_with(|| Ok(Some(0)));
-        let rx = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
-        let err = recv_sse_event(&rx, Some(&cancel_rx)).unwrap_err();
+        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let err = recv_sse_event(&sse, Some(&cancel_rx)).unwrap_err();
         assert!(matches!(err, ProviderError::Cancelled));
+    }
+
+    #[test]
+    fn cancel_arms_reader_abort() {
+        // A pre-sent cancel must not only return `Cancelled` but also arm the
+        // reader thread's abort flag, so the thread stops at its next loop
+        // boundary instead of parsing the remainder of the stream.
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        cancel_tx.send(()).unwrap();
+
+        let mut items = std::iter::repeat_with(|| Ok(Some(0)));
+        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let err = recv_sse_event(&sse, Some(&cancel_rx)).unwrap_err();
+        assert!(matches!(err, ProviderError::Cancelled));
+        assert!(
+            sse.abort.load(Ordering::Relaxed),
+            "abort flag must be armed when the consumer cancels"
+        );
     }
 
     #[test]
@@ -198,16 +271,15 @@ mod tests {
         // the loop's "clean break" signal.  (T is annotated — the closure
         // only yields None, so the item type is otherwise unconstrained.)
         let mut items = std::iter::once(Ok(None));
-        let rx: mpsc::Receiver<SseStreamMsg<i32>> =
-            spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
-        assert_eq!(recv_sse_event(&rx, None).unwrap(), None);
+        let sse: SseStream<i32> = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        assert_eq!(recv_sse_event(&sse, None).unwrap(), None);
     }
 
     #[test]
     fn event_maps_to_ok_some() {
         let mut items = std::iter::once(Ok(Some("hello".to_string())));
-        let rx = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
-        let item = recv_sse_event(&rx, None).unwrap().expect("event");
+        let sse = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        let item = recv_sse_event(&sse, None).unwrap().expect("event");
         assert_eq!(item, "hello");
     }
 
@@ -219,7 +291,12 @@ mod tests {
         // is fully deterministic — no thread, no race with the reader.
         let (tx, rx) = mpsc::channel::<SseStreamMsg<i32>>();
         drop(tx);
-        match recv_sse_event(&rx, None) {
+        let sse = SseStream {
+            rx,
+            handle: None,
+            abort: Arc::new(AtomicBool::new(false)),
+        };
+        match recv_sse_event(&sse, None) {
             Err(ProviderError::Io(e)) => {
                 assert!(e.to_string().contains("terminated unexpectedly"))
             }
@@ -230,9 +307,8 @@ mod tests {
     #[test]
     fn reader_error_maps_to_io_error() {
         let mut items = std::iter::once(Err(io::Error::other("socket reset")));
-        let rx: mpsc::Receiver<SseStreamMsg<i32>> =
-            spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
-        match recv_sse_event(&rx, None) {
+        let sse: SseStream<i32> = spawn_sse_reader(move || items.next().unwrap_or(Ok(None)));
+        match recv_sse_event(&sse, None) {
             Err(ProviderError::Io(e)) => assert_eq!(e.to_string(), "socket reset"),
             other => panic!("expected ProviderError::Io, got {other:?}"),
         }

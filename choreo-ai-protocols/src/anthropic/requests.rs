@@ -212,9 +212,10 @@ where
 
     // Parse the SSE stream using an Anthropic-specific reader, moved onto a
     // dedicated thread so a stalled/trickling stream cannot block cancellation
-    // (see `crate::stream`).
+    // (see `crate::stream`); the abort flag on `sse` stops the thread at its
+    // next loop boundary once the consumer cancels or drops it.
     let mut reader = AnthropicSseReader::from_reader(response.into_body().into_reader());
-    let sse_rx = crate::stream::spawn_sse_reader(move || reader.next_event());
+    let sse = crate::stream::spawn_sse_reader(move || reader.next_event());
     let mut has_any_output = false;
     let mut full_text = String::new();
     let mut full_reasoning = String::new();
@@ -225,7 +226,7 @@ where
     let mut input_tokens: Option<u32> = None;
     let mut output_tokens: Option<u32> = None;
 
-    while let Some((event_type, data)) = crate::stream::recv_sse_event(&sse_rx, cancel_rx)? {
+    while let Some((event_type, data)) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         match event_type.as_str() {
             "content_block_start" => {
                 let start: ContentBlockStart = serde_json::from_str(&data)

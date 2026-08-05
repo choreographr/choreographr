@@ -74,8 +74,20 @@ pub fn run_server(
         // interrupt promptly) must not hang the daemon's shutdown.  The
         // graceful path exits promptly because the worker responds to the
         // cancel; only pathological cases hit the grace deadline.
-        for (session_id, entry) in active_sessions {
-            crate::sessions::join_session_shutdown(entry.handle, session_id);
+        //
+        // Join the session threads concurrently (bounded by
+        // SESSION_SHUTDOWN_GRACE per session) so N stuck sessions cost ~one
+        // grace period instead of N × grace.
+        let joiners: Vec<_> = active_sessions
+            .into_iter()
+            .map(|(session_id, entry)| {
+                std::thread::spawn(move || {
+                    crate::sessions::join_session_shutdown(entry.handle, session_id)
+                })
+            })
+            .collect();
+        for joiner in joiners {
+            let _ = joiner.join();
         }
         // Shut down MCP servers after all sessions have exited.
         state.mcp_manager.shutdown_all();

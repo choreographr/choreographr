@@ -31,6 +31,12 @@ pub struct DaemonState {
     pub max_turns: u32,
     pub active_sessions: HashMap<u64, ActiveSessionEntry>,
     pub session_metadata: HashMap<u64, SessionMetadata>,
+    /// Sessions that have been deleted but whose (abandoned) session thread
+    /// may still be alive.  Guards the in-memory index against straggler
+    /// `UpdateMetadata` / status messages from the zombie thread re-creating
+    /// a session the user deleted (the DB-side race is handled by
+    /// `sessions::reap_abandoned_session`).
+    pub deleted_sessions: HashSet<u64>,
     /// Tracks parent→children session relationships so that cancelling or
     /// deleting a parent session also stops its child sub-sessions.
     pub children: HashMap<u64, Vec<u64>>,
@@ -620,6 +626,13 @@ impl DaemonState {
             "UpdateMetadata: id={}, model={:?}",
             session_id, metadata.selected_model
         );
+        // A deleted session's zombie thread may still emit metadata updates
+        // before it exits (e.g. a straggler RequestFinished).  Never re-insert
+        // a deleted session into the index.
+        if self.deleted_sessions.contains(&session_id) {
+            debug!(session_id, "ignoring UpdateMetadata for deleted session");
+            return;
+        }
         if let Some(existing) = self.session_metadata.get(&session_id) {
             // last_modified is monotonic: never let a stale (older) update
             // regress the timestamp the session thread or a status broadcast
@@ -669,12 +682,20 @@ impl DaemonState {
             meta.status = SessionStatus::Sleeping;
             meta.last_modified = meta.last_modified.max(last_modified);
         }
-        let msg = DaemonMessage::SessionStatusChanged {
-            session_id,
-            status: SessionStatus::Sleeping,
-            last_modified,
-        };
-        self.broadcast(msg);
+        // Only broadcast for sessions that still exist: a deleted session's
+        // zombie thread eventually exits, and must not emit a ghost
+        // "sleeping" status for a session the user removed.  The deleted
+        // marker is cleared now that the thread is gone — no further
+        // messages can arrive from it.
+        if self.session_metadata.contains_key(&session_id) {
+            let msg = DaemonMessage::SessionStatusChanged {
+                session_id,
+                status: SessionStatus::Sleeping,
+                last_modified,
+            };
+            self.broadcast(msg);
+        }
+        self.deleted_sessions.remove(&session_id);
     }
 
     /// Attempt to unlock the daemon with the given private key.
@@ -883,7 +904,12 @@ impl DaemonState {
             status,
             last_modified,
         };
-        self.broadcast(msg);
+        // A deleted session's zombie thread must not emit ghost status events
+        // for a session the user removed; the index is empty for deleted
+        // sessions, so use its presence as the "session exists" signal.
+        if self.session_metadata.contains_key(&session_id) {
+            self.broadcast(msg);
+        }
     }
 
     /// Register a client to receive all session activity broadcasts.
@@ -1198,8 +1224,31 @@ impl DaemonState {
             // Bound the join so a request worker stuck in a provider read
             // (which a cancel cannot interrupt promptly) can't hang the
             // daemon's command thread.  The graceful path exits within the
-            // grace period; an abandoned thread is reaped at process exit.
-            crate::sessions::join_session_shutdown(entry.handle, session_id);
+            // grace period.
+            let (exited, handle) =
+                crate::sessions::join_session_shutdown_keep(entry.handle, session_id);
+            if !exited && let Some(handle) = handle {
+                // The session thread is still alive (worker stuck past the
+                // grace period).  It can re-create the session record via
+                // `persist_and_exit` / `RequestFinished` once the worker
+                // unblocks, so hand the handle to a background reaper that
+                // joins it and deletes the record again — a deleted session
+                // must not be resurrected on the next daemon start.  The
+                // reaper never blocks this command thread.
+                let db = Arc::clone(&self.db);
+                let sid = session_id;
+                std::thread::spawn(move || {
+                    crate::sessions::reap_abandoned_session(handle, sid, db);
+                });
+            }
+            // Mark the session as deleted so straggler messages from an
+            // abandoned (still-alive) session thread cannot re-insert it into
+            // the in-memory index (see `handle_update_metadata` /
+            // `handle_broadcast_session_status`).  Only sessions that had a
+            // live thread need the guard — an already-exited session can emit
+            // no further messages, and its marker would never be cleared
+            // (no `SessionExited` would arrive to remove it).
+            self.deleted_sessions.insert(session_id);
         }
         // Remove from in-memory metadata
         self.session_metadata.remove(&session_id);
@@ -1515,6 +1564,7 @@ mod tests {
             max_turns: 10,
             active_sessions: HashMap::new(),
             session_metadata: HashMap::new(),
+            deleted_sessions: HashSet::new(),
             children: HashMap::new(),
             accounts: AccountManager::load(&accounts_path).unwrap(),
             providers: HashMap::new(),

@@ -154,6 +154,7 @@ fn main() -> anyhow::Result<()> {
         max_turns,
         active_sessions: std::collections::HashMap::new(),
         session_metadata,
+        deleted_sessions: std::collections::HashSet::new(),
         children: std::collections::HashMap::new(),
         accounts,
         providers: HashMap::new(),

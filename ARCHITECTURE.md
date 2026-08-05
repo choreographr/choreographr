@@ -1275,7 +1275,10 @@ deletion**:
   `cancel_and_shutdown_child()` on each child to shut them down gracefully.
 - **Session deletion:** `handle_delete_session` cascade-deletes children before the parent by
   calling `delete_session_inner()` on each child, logging but continuing if a child's DB
-  delete fails.
+  delete fails. `delete_session_inner` also records the id in `DaemonState::deleted_sessions`
+  so straggler `UpdateMetadata`/status messages from an abandoned (still-alive) session
+  thread cannot re-insert the session into the in-memory index; the marker is cleared once
+  the thread's `SessionExited` arrives.
 
 The child session uses `ToolContext` (`active_tool_groups`, `reasoning_effort`, `working_dir`,
 `daemon_tx`) to inherit parent config and communicate with the daemon command loop.
@@ -1351,7 +1354,7 @@ to operate in the same directory as their parent.
 - **Message append**: Each `SessionMessage` (including `DisplayedImage` records for
   persisted images) is written to the DB alongside the in-memory push via
   `append_message_and_persist()`.
-- **Shutdown**: The daemon sends `SessionCommand::Shutdown` to each active session, then joins each session thread bounded by `SESSION_SHUTDOWN_GRACE` (5s). The graceful path exits promptly once request workers drain; a worker stuck in an LLM provider read that a cancel cannot interrupt is abandoned rather than hanging the daemon — process exit reaps the thread, and completed turns are already persisted as they finalize.
+- **Shutdown**: The daemon sends `SessionCommand::Shutdown` to each active session, then joins each session thread bounded by `SESSION_SHUTDOWN_GRACE` (5s). The graceful path exits promptly once request workers drain; a worker stuck in an LLM provider read that a cancel cannot interrupt is abandoned rather than hanging the daemon — completed turns are already persisted as they finalize. Session joins happen concurrently (one join thread per session), so N stuck sessions cost ~one grace period, not N × grace. An abandoned `JoinHandle` from a delete is handed to a background reaper (`sessions::reap_abandoned_session`) that joins the thread once the stuck worker unblocks and then re-deletes the session record, so a deleted session cannot be resurrected on the next daemon start.
 
 ### Multiple concurrent sessions
 

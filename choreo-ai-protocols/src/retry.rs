@@ -94,14 +94,18 @@ pub fn parse_retry_after_secs(value: Option<&str>) -> Option<u64> {
     value.and_then(|v| v.parse::<u64>().ok())
 }
 
+/// Returns `true` when a cancellation signal is pending on `cancel_rx`.
+/// With no channel provided, cancellation is never pending.
+pub(crate) fn cancellation_pending(cancel_rx: Option<&mpsc::Receiver<()>>) -> bool {
+    cancel_rx.is_some_and(|rx| rx.try_recv().is_ok())
+}
+
 /// Check whether a cancellation signal has been received on `cancel_rx`.
 /// Returns `Err(ProviderHttpError::Cancelled)` if the channel contains a
 /// pending message, or `Ok(())` when no cancellation is pending (or when
 /// no channel is provided).
 pub fn check_cancelled(cancel_rx: Option<&mpsc::Receiver<()>>) -> Result<(), ProviderHttpError> {
-    if let Some(rx) = cancel_rx
-        && rx.try_recv().is_ok()
-    {
+    if cancellation_pending(cancel_rx) {
         tracing::debug!("operation cancelled by user");
         return Err(ProviderHttpError::Cancelled);
     }

@@ -316,9 +316,11 @@ where
     // `crate::stream`): `recv_sse_event` below polls the channel with a short
     // timeout, so an Escape during a stalled stream is noticed within ~200 ms
     // instead of never (the old code only checked cancellation between reads).
-    let sse_rx = crate::stream::spawn_sse_reader(move || reader.next_event());
+    // Cancelling also arms the reader thread's abort flag, so it stops at its
+    // next loop boundary instead of parsing the remainder of the stream.
+    let sse = crate::stream::spawn_sse_reader(move || reader.next_event());
     let mut has_any_output = false;
-    while let Some(data) = crate::stream::recv_sse_event(&sse_rx, cancel_rx)? {
+    while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
         for choice in payload.choices {
@@ -459,9 +461,10 @@ where
     // choices: [] when stream_options.include_usage is true).
     let mut last_usage: Option<TokenUsage> = None;
     // Reader thread decouples the blocking socket read from cancellation
-    // polling (see `crate::stream`).
-    let sse_rx = crate::stream::spawn_sse_reader(move || reader.next_event());
-    while let Some(data) = crate::stream::recv_sse_event(&sse_rx, cancel_rx)? {
+    // polling (see `crate::stream`); the abort flag on `sse` stops the thread
+    // at its next loop boundary once the consumer cancels or drops it.
+    let sse = crate::stream::spawn_sse_reader(move || reader.next_event());
+    while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
 

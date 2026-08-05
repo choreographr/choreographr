@@ -19,7 +19,7 @@ pub use crate::requests::{
 pub use crate::server::run_server;
 pub use crate::sessions::{
     ActiveSessionEntry, ChildResult, RequestContext, SessionCommand, SessionMetadata, SessionState,
-    session_main,
+    join_session_shutdown, join_session_shutdown_with_grace_for_test, session_main,
 };
 pub use crate::tools::exec::{ExecArgs, execute_exec_tool};
 pub use crate::tools::find::{FindArgs, execute_find_tool};

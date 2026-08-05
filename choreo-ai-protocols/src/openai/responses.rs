@@ -388,10 +388,11 @@ where
     let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut None, cancel_rx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // Reader thread decouples the blocking socket read from cancellation
-    // polling (see `crate::stream`).
-    let sse_rx = crate::stream::spawn_sse_reader(move || reader.next_event());
+    // polling (see `crate::stream`); the abort flag on `sse` stops the thread
+    // at its next loop boundary once the consumer cancels or drops it.
+    let sse = crate::stream::spawn_sse_reader(move || reader.next_event());
     let mut has_any_output = false;
-    while let Some(data) = crate::stream::recv_sse_event(&sse_rx, cancel_rx)? {
+    while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let event = parse_responses_stream_event(&data)?;
         match event {
             Some(ResponsesStreamEvent::TextDelta(text)) => {
@@ -706,9 +707,10 @@ where
 
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // Reader thread decouples the blocking socket read from cancellation
-    // polling (see `crate::stream`).
-    let sse_rx = crate::stream::spawn_sse_reader(move || reader.next_event());
-    while let Some(data) = crate::stream::recv_sse_event(&sse_rx, cancel_rx)? {
+    // polling (see `crate::stream`); the abort flag on `sse` stops the thread
+    // at its next loop boundary once the consumer cancels or drops it.
+    let sse = crate::stream::spawn_sse_reader(move || reader.next_event());
+    while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let event = parse_responses_stream_event(&data)?;
         match event {
             Some(ResponsesStreamEvent::TextDelta(text)) => {
