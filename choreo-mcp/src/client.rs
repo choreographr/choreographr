@@ -1,6 +1,7 @@
 use crate::error::McpError;
 use crate::protocol::{
-    CallToolParams, CallToolResult, JsonRpcRequest, McpTool, make_initialize_request,
+    CallToolParams, CallToolResult, JsonRpcNotification, JsonRpcRequest, McpTool,
+    make_initialize_request,
 };
 use crate::transport::StdioTransport;
 use serde_json::Value;
@@ -84,14 +85,15 @@ impl McpClient {
             "MCP server initialized"
         );
 
-        // Send initialized notification (fire-and-forget).
-        let initialized = JsonRpcRequest {
+        // Send initialized notification (fire-and-forget). Per the MCP spec
+        // this is a notification, so it must carry NO `id` — servers validate
+        // the shape and may reject a request with an unknown method name.
+        let initialized = JsonRpcNotification {
             jsonrpc: "2.0".into(),
-            id: 2,
             method: "notifications/initialized".into(),
             params: None,
         };
-        let _ = transport.send_request(&initialized);
+        let _ = transport.send_notification(&initialized);
 
         Ok(Self {
             transport,

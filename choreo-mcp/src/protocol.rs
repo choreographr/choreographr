@@ -47,6 +47,7 @@ pub struct JsonRpcNotification {
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
     pub protocol_version: String,
     pub capabilities: ClientCapabilities,
@@ -54,6 +55,7 @@ pub struct InitializeParams {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<HashMap<String, serde_json::Value>>,
@@ -64,12 +66,14 @@ pub struct ClientCapabilities {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientInfo {
     pub name: String,
     pub version: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerCapabilities {
     pub protocol_version: String,
     pub server_info: ServerInfo,
@@ -78,6 +82,7 @@ pub struct ServerCapabilities {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
     pub name: String,
     pub version: String,
@@ -279,6 +284,26 @@ mod tests {
         assert_eq!(req.id, 1);
         assert_eq!(req.method, "initialize");
         assert!(req.params.is_some());
+    }
+
+    #[test]
+    fn initialize_request_uses_camel_case_wire_names() {
+        // The MCP spec requires camelCase field names on the wire; the server
+        // rejects snake_case (`protocol_version` / `client_info`) with -32603.
+        let req = make_initialize_request(1).expect("initialize request should succeed");
+        let json = serde_json::to_string(&req).expect("serialize initialize request");
+        assert!(
+            json.contains("\"protocolVersion\""),
+            "missing protocolVersion: {json}"
+        );
+        assert!(
+            json.contains("\"clientInfo\""),
+            "missing clientInfo: {json}"
+        );
+        assert!(
+            !json.contains("protocol_version") && !json.contains("client_info"),
+            "snake_case leaked onto the wire: {json}"
+        );
     }
 
     #[test]

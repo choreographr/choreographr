@@ -18,10 +18,21 @@ use choreographr::tools::ToolOutputFormat;
 /// tests/ directories and must be ignored; `cargo test` runs only unit tests.
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 #[ignore]
 fn mcp_server_everything_tools_are_discovered_and_callable() {
+    // The stdlib test harness has no per-test timeout, so a regression in the
+    // MCP stack (e.g. a shutdown that blocks) would hang CI forever. Install a
+    // watchdog that aborts the process if the test body outlives its budget;
+    // the internal protocol timeouts bound a healthy run to well under this.
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(120));
+        eprintln!("mcp_integration: test exceeded 120s; aborting to avoid an indefinite hang");
+        std::process::abort();
+    });
+
     // ── 1. Create a temporary config directory with mcp_servers.json ──
     let config_dir = tempfile::tempdir().expect("tempdir for config");
     let config_path = config_dir.path().join("choreographr");

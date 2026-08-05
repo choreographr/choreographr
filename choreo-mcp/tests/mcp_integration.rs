@@ -12,6 +12,15 @@
 #[test]
 #[ignore]
 fn mcp_server_everything_can_be_spawned_and_tools_listed() {
+    // Watchdog: the stdlib test harness has no per-test timeout, so a
+    // regression in spawn/shutdown would hang CI forever. Abort if the test
+    // body outlives its budget; protocol timeouts bound a healthy run lower.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        eprintln!("mcp_integration: test exceeded 120s; aborting to avoid an indefinite hang");
+        std::process::abort();
+    });
+
     let config = choreo_mcp::McpServerConfig {
         slug: "everything".to_string(),
         command: "npx".to_string(),
