@@ -340,9 +340,11 @@ pub(crate) fn responses_request(
 ) -> Result<String, super::OpenAiError> {
     let (url, body) = build_simple_responses_body(config, model, prompt, false)?;
     let retry = retry::retry_config_from_config(config);
-    let response = retry::retry_send(
-        agent, &url, api_key, &body, &retry, &mut None, cancel_rx, None,
-    )?;
+    // Hoist the no-op retry callback into a named local: a bare `&mut None`
+    // temporary would be dropped before the retry call below (E0716).
+    let mut no_retry = None;
+    let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, None);
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
     let payload: ResponsesResponse = response
         .into_body()
         .read_json()
@@ -387,20 +389,13 @@ where
 {
     let (url, body) = build_simple_responses_body(config, model, prompt, true)?;
     let retry = retry::retry_config_from_config(config);
-    // Per-attempt wall-clock deadline for the whole request (DNS → headers →
-    // body), re-armed on each retry by `retry_loop`; the consumer-side check
-    // in `recv_sse_event` enforces it (see `retry::AttemptDeadline`).
+    // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let response = retry::retry_send(
-        agent,
-        &url,
-        api_key,
-        &body,
-        &retry,
-        &mut None,
-        cancel_rx,
-        Some(&mut deadline),
-    )?;
+    // Hoist the no-op retry callback into a named local: a bare `&mut None`
+    // temporary would be dropped before the retry call below (E0716).
+    let mut no_retry = None;
+    let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, Some(&mut deadline));
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // Reader thread decouples the blocking socket read from cancellation
     // polling (see `crate::stream`); the abort flag on `sse` stops the thread
@@ -482,9 +477,8 @@ pub(crate) fn responses_request_with_tools(
     );
 
     let retry = retry::retry_config_from_config(config);
-    let response = retry::retry_send(
-        agent, &url, api_key, &body, &retry, on_retry, cancel_rx, None,
-    )?;
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
     let payload: ResponsesResponse = response
         .into_body()
         .read_json()
@@ -711,20 +705,10 @@ where
     );
 
     let retry = retry::retry_config_from_config(config);
-    // Per-attempt wall-clock deadline for the whole request (DNS → headers →
-    // body), re-armed on each retry by `retry_loop`; the consumer-side check
-    // in `recv_sse_event` enforces it (see `retry::AttemptDeadline`).
+    // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let response = retry::retry_send(
-        agent,
-        &url,
-        api_key,
-        &body,
-        &retry,
-        on_retry,
-        cancel_rx,
-        Some(&mut deadline),
-    )?;
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
 
     let mut has_any_output = false;
     let mut full_content = String::new();

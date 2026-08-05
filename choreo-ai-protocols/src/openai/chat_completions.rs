@@ -139,9 +139,11 @@ pub(crate) fn chat_completions_request(
         reasoning_effort: None,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send(
-        agent, &url, api_key, &body, &retry, &mut None, cancel_rx, None,
-    )?;
+    // Hoist the no-op retry callback into a named local: a bare `&mut None`
+    // temporary would be dropped before the retry call below (E0716).
+    let mut no_retry = None;
+    let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, None);
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
     let payload: ChatCompletionsResponse = response
         .into_body()
         .read_json()
@@ -192,9 +194,8 @@ pub(crate) fn chat_completions_request_with_tools(
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    let response = retry::retry_send(
-        agent, &url, api_key, &body, &retry, on_retry, cancel_rx, None,
-    )?;
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
     let payload: ChatCompletionsResponse = response
         .into_body()
         .read_json()
@@ -314,21 +315,13 @@ where
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    // Per-attempt wall-clock deadline for the whole request (DNS → headers →
-    // body): computed before the request is sent and re-armed on each retry by
-    // `retry_loop`, so the consumer-side check in `recv_sse_event` spans the
-    // entire attempt instead of just the body read (see `retry::AttemptDeadline`).
+    // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let response = retry::retry_send(
-        agent,
-        &url,
-        api_key,
-        &body,
-        &retry,
-        &mut None,
-        cancel_rx,
-        Some(&mut deadline),
-    )?;
+    // Hoist the no-op retry callback into a named local: a bare `&mut None`
+    // temporary would be dropped before the retry call below (E0716).
+    let mut no_retry = None;
+    let mut ctx = retry::AttemptContext::new(&mut no_retry, cancel_rx, Some(&mut deadline));
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
     // The blocking socket read lives on a dedicated thread (see
     // `crate::stream`): `recv_sse_event` below polls the channel with a short
@@ -464,21 +457,10 @@ where
         reasoning_effort,
     })
     .map_err(io::Error::other)?;
-    // Per-attempt wall-clock deadline spanning the whole request (DNS →
-    // headers → body), re-armed on each retry by `retry_loop`; the
-    // consumer-side check in `recv_sse_event` enforces it (see
-    // `retry::AttemptDeadline`).
+    // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
-    let response = retry::retry_send(
-        agent,
-        &url,
-        api_key,
-        &body,
-        &retry,
-        on_retry,
-        cancel_rx,
-        Some(&mut deadline),
-    )?;
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
+    let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
     let mut has_any_output = false;
     let mut full_content = String::new();
     let mut full_reasoning = String::new();

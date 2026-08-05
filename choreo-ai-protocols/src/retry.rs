@@ -36,15 +36,14 @@ pub struct AttemptDeadline {
 }
 
 impl AttemptDeadline {
+    /// Create a deadline for the given budget, left unarmed until
+    /// [`AttemptDeadline::reset`] is called — [`retry_loop`] does that at the
+    /// top of every attempt, including the first.
     pub fn new(total_timeout_secs: u64) -> Self {
-        let mut deadline = Self {
+        Self {
             total_timeout_secs,
             current: None,
-        };
-        // Arm the first attempt's deadline now so the budget is measured
-        // from just before the request is sent (see `reset`).
-        deadline.reset();
-        deadline
+        }
     }
 
     /// Re-arm the deadline for a fresh attempt.  Called by [`retry_loop`] at
@@ -60,6 +59,34 @@ impl AttemptDeadline {
     /// across the whole response-body read.
     pub(crate) fn current(&self) -> Option<std::time::Instant> {
         self.current
+    }
+}
+
+/// Per-call retry context threaded through [`retry_loop`]: the retry
+/// callback, the cancellation channel, and the optional per-attempt
+/// wall-clock deadline.  Bundled so the retry entry points do not grow a new
+/// parameter every time a knob is added.
+pub struct AttemptContext<'a> {
+    /// Invoked before each retry wait with (attempt, max_attempts, delay).
+    pub on_retry: &'a mut Option<RetryCallback>,
+    /// Cancellation channel; `None` when cancellation is not wired up.
+    pub cancel_rx: Option<&'a mpsc::Receiver<()>>,
+    /// Per-attempt wall-clock deadline, re-armed at the top of every attempt;
+    /// `None` when the deadline is disabled or not provided.
+    pub attempt_deadline: Option<&'a mut AttemptDeadline>,
+}
+
+impl<'a> AttemptContext<'a> {
+    pub fn new(
+        on_retry: &'a mut Option<RetryCallback>,
+        cancel_rx: Option<&'a mpsc::Receiver<()>>,
+        attempt_deadline: Option<&'a mut AttemptDeadline>,
+    ) -> Self {
+        Self {
+            on_retry,
+            cancel_rx,
+            attempt_deadline,
+        }
     }
 }
 
@@ -250,9 +277,7 @@ fn status_to_error(status: u16, detail: &str, retry_after_secs: Option<u64>) -> 
 pub fn retry_loop<F>(
     send_request: F,
     retry: &RetryConfig,
-    on_retry: &mut Option<RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
-    mut attempt_deadline: Option<&mut AttemptDeadline>,
+    ctx: &mut AttemptContext,
 ) -> Result<ureq::http::Response<ureq::Body>, ProviderHttpError>
 where
     F: Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
@@ -265,11 +290,11 @@ where
         // retried request gets a fresh budget, and the first attempt's
         // budget is measured from just before `send_request` (covering
         // DNS → connect → headers → body, not just the body read).
-        if let Some(deadline) = attempt_deadline.as_mut() {
+        if let Some(deadline) = ctx.attempt_deadline.as_deref_mut() {
             deadline.reset();
         }
 
-        check_cancelled(cancel_rx)?;
+        check_cancelled(ctx.cancel_rx)?;
 
         // With http_status_as_error(false), all HTTP responses (even 4xx/5xx)
         // arrive as Ok; only transport errors are Err.
@@ -285,7 +310,13 @@ where
                         delay_ms = delay.as_millis(),
                         "retrying request after transport error"
                     );
-                    wait_before_retry(attempt, retry.max_attempts, delay, on_retry, cancel_rx)?;
+                    wait_before_retry(
+                        attempt,
+                        retry.max_attempts,
+                        delay,
+                        ctx.on_retry,
+                        ctx.cancel_rx,
+                    )?;
                     continue;
                 }
                 return Err(ProviderHttpError::Io(io::Error::other(format!("{err}"))));
@@ -316,7 +347,13 @@ where
                 delay_ms = delay.as_millis(),
                 "retrying request"
             );
-            wait_before_retry(attempt, retry.max_attempts, delay, on_retry, cancel_rx)?;
+            wait_before_retry(
+                attempt,
+                retry.max_attempts,
+                delay,
+                ctx.on_retry,
+                ctx.cancel_rx,
+            )?;
             continue;
         }
 
@@ -412,31 +449,30 @@ mod tests {
     }
 
     #[test]
-    fn attempt_deadline_arms_and_resets() {
-        // `new` arms the first attempt's deadline, and `reset` re-arms it for
-        // a fresh attempt.  Deterministic: we assert the deadline is in the
-        // future and that a reset yields a strictly later deadline than a
-        // freshly-constructed one from an earlier instant would suggest —
-        // i.e. that reset does not reuse the old instant.
+    fn attempt_deadline_arms_on_reset() {
+        // `new` leaves the deadline unarmed; `reset` arms it for an attempt
+        // (`retry_loop` calls reset at the top of every attempt, including
+        // the first).  Deterministic: we only observe the clock — no waiting.
         let before = std::time::Instant::now();
-        let deadline = AttemptDeadline::new(3600);
+        let mut deadline = AttemptDeadline::new(3600);
+        assert!(
+            deadline.current().is_none(),
+            "new() must not arm the deadline; retry_loop does that on reset"
+        );
+        deadline.reset();
         let first = deadline
             .current()
-            .expect("nonzero budget must arm a deadline");
+            .expect("reset must arm a deadline with a nonzero budget");
         assert!(
             first > before,
             "deadline must be in the future (budget 3600s)"
         );
-
-        // A reset must move the deadline forward, not keep a stale instant:
-        // after waiting a (tiny) real instant, the re-armed deadline is later
-        // than the first one.  No time-based wait is involved — we only
-        // observe the current clock, so the test stays deterministic.
-        let mut deadline = deadline;
+        // A second reset must move the deadline forward, not keep a stale
+        // instant.
         deadline.reset();
         let second = deadline
             .current()
-            .expect("nonzero budget must arm a deadline");
+            .expect("reset must keep the deadline armed");
         assert!(
             second >= first,
             "reset must not move the deadline backwards"

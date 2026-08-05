@@ -243,7 +243,7 @@ account configuration, no sessions — so it can be consumed independently of
 | `shared.rs` | `ProviderError` (unified error type re-exported as `OpenAiError`/`AnthropicError`/`GoogleError`), `MaxTokensField`, `MAX_TOOL_CALLS`, `build_agent()` (applies three timeouts: connect, idle `request_timeout_secs` per chunk, and a `total_timeout_secs` wall-clock deadline per attempt via ureq's `timeout_global` — each retry restarts it), `provider_error_to_inference()`, `emit_non_streaming_events()`, `list_models_with_fallback()` |
 | `context_window.rs` | `ContextWindowConfig` — per-model/global context window resolution shared by all configs |
 | `overrides.rs` | `ProviderOverrides` — protocol-agnostic account overrides carrier (the daemon converts its `AccountConfig` into this) |
-| `retry.rs` | Shared HTTP retry logic. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, cancellation support, and a per-attempt wall-clock deadline (`AttemptDeadline`, re-armed at the start of every attempt). |
+| `retry.rs` | Shared HTTP retry logic. `ProviderHttpError` enum captures HTTP error codes generically; `retry_loop()` provides exponential backoff with jitter, retryable status detection, cancellation support, and a per-attempt wall-clock deadline (`AttemptDeadline`, re-armed at the start of every attempt). `AttemptContext` bundles the per-call retry inputs (`on_retry` callback, `cancel_rx`, `attempt_deadline`) so the retry entry points do not grow a parameter per knob. |
 | `stream.rs` | Cancellable SSE reader plumbing: `spawn_sse_reader()` runs the blocking socket read on a dedicated thread and forwards parsed events through a bounded mpsc channel (backpressure — the reader blocks on `send` instead of buffering unboundedly); an mpsc abort signal stops the thread at its next loop boundary on cancel/drop; `recv_sse_event()` polls the channel with a ~200 ms `recv_timeout`, re-checks cancellation each iteration, and enforces the per-attempt wall-clock deadline supplied by the caller (`retry::AttemptDeadline` — armed *before* the request is sent and re-armed on each retry, so it spans DNS → connect → headers → body; the real backstop — ureq's `timeout_global` is floored at ~1 s per socket read, so sub-second keep-alive trickles could otherwise evade it), so Escape interrupts a stalled/trickling stream instead of blocking forever inside `read()`. Deadline expiry surfaces as a dedicated `ProviderError::DeadlineExceeded` (non-retryable, distinct from a socket `Io` error). |
 | `catalog/` | `ProviderProtocol` enum + `ProviderEntry`/`ModelEntry`, `PROVIDER_CATALOG` (bundled TOML, one `catalog/<slug>.toml` per provider), and lookups (`lookup_provider`, `lookup_context_window`, `model_reasoning_capability`, `model_request_format`, `all_slugs`, `all_display_names`) |
 
@@ -1276,25 +1276,31 @@ deletion**:
 - **Session deletion:** `handle_delete_session` cascade-deletes children before the parent by
   calling `delete_session_inner()` on each child, logging but continuing if a child's DB
   delete fails. `delete_session_inner` never blocks the command loop: it removes the entry,
-  sends the thread `Cancel` + `Shutdown`, records the id in `DaemonState::deleted_sessions`
-  so straggler `UpdateMetadata`/status messages from the still-shutting-down thread cannot
-  re-insert the session into the in-memory index, and writes a deletion tombstone
-  (`deleted_sessions` DB table). The actual record delete is deferred to
+  records the id in `DaemonState::deleted_sessions` and writes a deletion tombstone
+  (`deleted_sessions` DB table) **before** sending the thread `Cancel` + `Shutdown`, so a
+  crash in the window after `Shutdown` but before the tombstone commits cannot leave a
+  re-created record unmarked for the startup purge. The marker also means straggler
+  `UpdateMetadata`/status messages from the still-shutting-down thread cannot re-insert the
+  session into the in-memory index. The actual record delete is deferred to
   `handle_session_exited` — the thread's `persist_and_exit` runs *before* it sends
   `SessionExited`, so by the time the handler runs the record on disk is the thread's
   final state and can be removed without a re-create race. That delete runs on a
-  **background thread** (a pathologically large session — `db::delete_session` walks every
-  turn and kv entry — cannot block the command loop) and reports back via
-  `DaemonCommand::SessionDeleteFinalized`; only a *successful* delete drops the
-  `deleted_sessions` marker, on failure the marker and tombstone stay in place so the
+  **background thread** (`finalize_session_delete` — a pathologically large session, since
+  `db::delete_session` walks every turn and kv entry, cannot block the command loop) and
+  reports back via `DaemonCommand::SessionDeleteFinalized`; only a *successful* delete drops
+  the `deleted_sessions` marker, on failure the marker and tombstone stay in place so the
   session cannot be attached or resurrected, and the startup purge
-  (`db::purge_tombstoned_sessions`) retries. Two fast paths avoid the tombstone and the
-  deferred finalize entirely: deleting a session with **no live thread** (nothing can
-  re-create the record), and deleting a session whose thread has **already terminated**
-  (`JoinHandle::is_finished()` — its `persist_and_exit` ran and its `SessionExited` is
-  queued), both delete the record immediately and sweep any stale tombstone. The tombstone
-  also covers the crash window: if the daemon dies while the thread is still shutting down,
-  the next startup removes any record the zombie left behind.
+  (`db::purge_tombstoned_sessions`) retries. Two fast paths avoid the tombstone write and
+  the deferred finalize entirely: deleting a session with **no live thread** (nothing can
+  re-create the record) deletes immediately and sweeps any stale tombstone; deleting a
+  session whose thread has **already terminated** (`JoinHandle::is_finished()` — its
+  `persist_and_exit` ran and its `SessionExited` is queued) also deletes immediately, but
+  *does* set the deleted marker — the thread's straggler messages are queued ahead of its
+  `SessionExited`, so without the marker they would re-insert the session into the index,
+  and the queued `SessionExited` then runs the standard finalize (an idempotent no-op
+  delete, since the record is already gone) which clears the tombstone and drops the marker.
+  The tombstone also covers the crash window: if the daemon dies while the thread is still
+  shutting down, the next startup removes any record the zombie left behind.
 
 The child session uses `ToolContext` (`active_tool_groups`, `reasoning_effort`, `working_dir`,
 `daemon_tx`) to inherit parent config and communicate with the daemon command loop.

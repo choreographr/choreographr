@@ -1,5 +1,4 @@
-use std::sync::mpsc;
-
+pub(crate) use crate::retry::AttemptContext;
 pub(crate) use crate::retry::AttemptDeadline;
 pub use crate::retry::{RetryCallback, RetryConfig};
 
@@ -14,16 +13,13 @@ pub(crate) fn retry_config_from_config(config: &ServiceConfig) -> RetryConfig {
     }
 }
 
-#[expect(clippy::too_many_arguments)]
 pub(crate) fn retry_send(
     agent: &ureq::Agent,
     url: &str,
     api_key: &str,
     body: &serde_json::Value,
     retry_cfg: &RetryConfig,
-    on_retry: &mut Option<RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
-    attempt_deadline: Option<&mut crate::retry::AttemptDeadline>,
+    ctx: &mut crate::retry::AttemptContext,
 ) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
     let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", api_key.trim()));
     // The closure captures `auth_header` by reference (it stays `Fn`); the
@@ -37,9 +33,7 @@ pub(crate) fn retry_send(
                 .send_json(body.clone())
         },
         retry_cfg,
-        on_retry,
-        cancel_rx,
-        attempt_deadline,
+        ctx,
     )
     .map_err(OpenAiError::from)
 }
@@ -49,9 +43,7 @@ pub(crate) fn retry_send_get(
     url: &str,
     api_key: &str,
     retry_cfg: &RetryConfig,
-    on_retry: &mut Option<RetryCallback>,
-    cancel_rx: Option<&mpsc::Receiver<()>>,
-    attempt_deadline: Option<&mut crate::retry::AttemptDeadline>,
+    ctx: &mut crate::retry::AttemptContext,
 ) -> Result<ureq::http::Response<ureq::Body>, OpenAiError> {
     let auth_header = zeroize::Zeroizing::new(format!("Bearer {}", api_key.trim()));
     // The closure captures `auth_header` by reference (it stays `Fn`); the
@@ -65,9 +57,7 @@ pub(crate) fn retry_send_get(
                 .call()
         },
         retry_cfg,
-        on_retry,
-        cancel_rx,
-        attempt_deadline,
+        ctx,
     )
     .map_err(OpenAiError::from)
 }

@@ -208,18 +208,14 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
         let mut turns = write_txn
             .open_table(SESSION_TURNS)
             .map_err(|e| db_err(format!("redb open turns: {e}")))?;
+        // Bounded range scan over just this session's turn ids instead of
+        // iterating the whole table (the old full-table scan made each delete
+        // O(total turns) — costly for the largest sessions).
         let keys_to_remove: Vec<(u64, u32)> = turns
-            .iter()
-            .map_err(|e| db_err(format!("redb iter turns: {e}")))?
-            .filter_map(|result| {
-                result.ok().and_then(|(key, _)| {
-                    if key.value().0 == session_id {
-                        Some(key.value())
-                    } else {
-                        None
-                    }
-                })
-            })
+            .range::<(u64, u32)>((session_id, 0u32)..(session_id + 1, 0u32))
+            .map_err(|e| db_err(format!("redb range turns: {e}")))?
+            .filter_map(|result| result.ok())
+            .map(|(key, _)| key.value())
             .collect();
         for key in keys_to_remove {
             turns

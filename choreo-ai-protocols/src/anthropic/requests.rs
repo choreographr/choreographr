@@ -44,6 +44,10 @@ pub(super) fn list_models_request(
     // `Zeroizing` (see `openai/retry.rs`). The only transient copy is inside
     // ureq's request object, which dies with the request. The same applies at
     // the other `x-api-key` header sites in this file.
+    // Hoist the no-op retry callback into a named local: a bare `&mut None`
+    // temporary would be dropped before the retry call below (E0716).
+    let mut no_retry = None;
+    let mut ctx = retry::AttemptContext::new(&mut no_retry, None, None);
     let response = retry::retry_loop(
         || {
             agent
@@ -53,9 +57,7 @@ pub(super) fn list_models_request(
                 .call()
         },
         &retry_cfg,
-        &mut None,
-        None,
-        None,
+        &mut ctx,
     )?;
 
     let payload: ModelListResponse = response
@@ -125,6 +127,7 @@ pub(super) fn messages_request(
     })
     .map_err(io::Error::other)?;
 
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, None);
     let response = retry::retry_loop(
         || {
             agent
@@ -134,9 +137,7 @@ pub(super) fn messages_request(
                 .send_json(body.clone())
         },
         &retry_cfg,
-        on_retry,
-        cancel_rx,
-        None,
+        &mut ctx,
     )
     .map_err(AnthropicError::from)?;
 
@@ -198,10 +199,9 @@ where
     })
     .map_err(io::Error::other)?;
 
-    // Per-attempt wall-clock deadline for the whole request (DNS → headers →
-    // body), re-armed on each retry by `retry_loop`; the consumer-side check
-    // in `recv_sse_event` enforces it (see `retry::AttemptDeadline`).
+    // Per-attempt wall-clock deadline spanning the whole request (see `retry::AttemptDeadline`).
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
+    let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
     let response = retry::retry_loop(
         || {
             agent
@@ -211,9 +211,7 @@ where
                 .send_json(body.clone())
         },
         &retry_cfg,
-        on_retry,
-        cancel_rx,
-        Some(&mut deadline),
+        &mut ctx,
     )
     .map_err(AnthropicError::from)?;
 

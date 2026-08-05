@@ -220,15 +220,11 @@ impl OpenAiClient {
         info!("listing models from {}", self.config.base_url);
         let url = endpoint_url(&self.config.base_url, &self.config.model_list_path)?;
         let retry = retry::retry_config_from_config(&self.config);
-        let response = retry::retry_send_get(
-            &self.http,
-            &url,
-            &self.api_key,
-            &retry,
-            &mut None,
-            None,
-            None,
-        )?;
+        // Hoist the no-op retry callback into a named local: a bare `&mut None`
+        // temporary would be dropped before the retry call below (E0716).
+        let mut no_retry = None;
+        let mut ctx = retry::AttemptContext::new(&mut no_retry, None, None);
+        let response = retry::retry_send_get(&self.http, &url, &self.api_key, &retry, &mut ctx)?;
         let payload: ModelListResponse = response
             .into_body()
             .read_json()
