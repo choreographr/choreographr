@@ -801,36 +801,35 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             let modified = format_timestamp(session.last_modified);
             let title = session.title.as_deref().unwrap_or("untitled");
 
-            rows.push(Row::new(vec![
-                Cell::from(Span::styled(format!("{sel}{att}"), row_style)),
-                Cell::from(Span::styled(
-                    truncate_str(&session.session_id.to_string(), session_w as usize),
-                    row_style,
-                )),
-                Cell::from(Span::styled(
-                    truncate_str(&parent, parent_w as usize),
-                    row_style,
-                )),
-                // Keep the status colour even on the highlighted row so
-                // active/inferring sessions stay recognisable at a glance.
-                Cell::from(Span::styled(
-                    truncate_str(&status_text, status_w as usize),
-                    row_style.fg(status_color),
-                )),
-                Cell::from(Span::styled(
-                    truncate_str(&model_display, model_w as usize),
-                    row_style,
-                )),
-                Cell::from(Span::styled(
-                    format!("{:>width$}", session.turn_count, width = turns_w as usize),
-                    row_style,
-                )),
-                Cell::from(Span::styled(
-                    truncate_str(&modified, modified_w as usize),
-                    row_style,
-                )),
-                Cell::from(Span::styled(truncate_str(title, title_w), row_style)),
-            ]));
+            // Apply the selection style to the whole Row (not to each cell's
+            // span) so the highlight background is solid across the entire
+            // content width: ratatui paints `Row::style` over the full row
+            // area, whereas span-level styles only cover the characters they
+            // render.
+            let status_cell_style = row_style.fg(status_color);
+            rows.push(
+                Row::new(vec![
+                    Cell::from(format!("{sel}{att}")),
+                    Cell::from(truncate_str(
+                        &session.session_id.to_string(),
+                        session_w as usize,
+                    )),
+                    Cell::from(truncate_str(&parent, parent_w as usize)),
+                    // Keep the status colour even on the highlighted row so
+                    // active/inferring sessions stay recognisable at a glance.
+                    Cell::from(truncate_str(&status_text, status_w as usize))
+                        .style(status_cell_style),
+                    Cell::from(truncate_str(&model_display, model_w as usize)),
+                    Cell::from(format!(
+                        "{:>width$}",
+                        session.turn_count,
+                        width = turns_w as usize
+                    )),
+                    Cell::from(truncate_str(&modified, modified_w as usize)),
+                    Cell::from(truncate_str(title, title_w)),
+                ])
+                .style(row_style),
+            );
         }
 
         let table = Table::new(

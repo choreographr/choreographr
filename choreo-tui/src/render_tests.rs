@@ -204,6 +204,96 @@ fn render_session_list_shows_ids_parents_and_titles() {
     assert!(beta_at < alpha_at, "newest session appears first");
 }
 
+// ── Selected-row highlight spans the full content width ────────────────
+
+#[test]
+fn session_list_selected_row_highlight_is_solid_across_width() {
+    use crate::test_util::test_app;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+
+    let mut app = test_app();
+    app.page = crate::state::Page::SessionManager;
+    // 30 sessions so the scrollbar is rendered; newest first.
+    let sessions: Vec<SessionSummary> = (1..=30)
+        .map(|i| SessionSummary {
+            session_id: i,
+            title: Some(format!("session {i} with a fairly long title")),
+            selected_model: Some("gpt-4".into()),
+            reasoning_effort: None,
+            parent_session_id: None,
+            working_dir: None,
+            created_at: 1705314000000 + i as i64,
+            last_modified: 1705314000000 + i as i64,
+            turn_count: i as u32,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: None,
+            token_usage: None,
+            context_window: None,
+            last_prompt_tokens: None,
+        })
+        .collect();
+    app.session_mgr.set_sessions(sessions);
+    // Start with the second row selected, then move the highlight up — the
+    // same two-frame sequence the scratch repro used to chase a stale line.
+    app.session_mgr.selection = Some(1);
+
+    let backend = TestBackend::new(100, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render 1");
+
+    app.session_mgr.selection = Some(0);
+    terminal
+        .draw(|frame| render(frame, &mut app))
+        .expect("render 2");
+
+    let buf = terminal.backend().buffer();
+    // The table renders inside the bordered block: the content area spans
+    // columns 1..=97 (column 98 is the scrollbar, 99 the right border).
+    let content_left = 1u16;
+    let content_right = 97u16;
+
+    // Locate the selected row via the ">" marker in the first column.
+    let selected_y = (0..24u16)
+        .find(|&y| {
+            buf.cell((content_left, y))
+                .is_some_and(|c| c.symbol() == ">")
+        })
+        .expect("selected row marker rendered");
+
+    // The highlight must be solid: every cell in the selected row carries the
+    // background colour across the whole content width, with no
+    // character-only gaps at column boundaries or trailing space.
+    for x in content_left..=content_right {
+        let cell = buf.cell((x, selected_y)).expect("cell in selected row");
+        assert_eq!(
+            cell.bg,
+            Color::Blue,
+            "selected row background must be solid at column {x}"
+        );
+    }
+
+    // Rows that are not selected — including the one that was highlighted
+    // in the previous frame — must not keep any highlight background.
+    for y in 0..24u16 {
+        if y == selected_y {
+            continue;
+        }
+        for x in content_left..=content_right {
+            let cell = buf.cell((x, y)).expect("cell in row");
+            assert_ne!(
+                cell.bg,
+                Color::Blue,
+                "row {y} is not selected but has a highlight background at column {x}"
+            );
+        }
+    }
+}
+
 // ── format_timestamp ──────────────────────────────────────────────────
 
 #[test]
