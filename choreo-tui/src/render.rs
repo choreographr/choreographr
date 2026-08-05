@@ -754,9 +754,9 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         let title_w = list_chunks[0].width.saturating_sub(fixed_w + 7).max(1) as usize;
 
         let header = Row::new(vec![
+            Cell::from(""),
             Cell::from("Session"),
             Cell::from("Parent"),
-            Cell::from(""),
             Cell::from("Status"),
             Cell::from("Model"),
             Cell::from("Turns"),
@@ -802,6 +802,7 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
             let title = session.title.as_deref().unwrap_or("untitled");
 
             rows.push(Row::new(vec![
+                Cell::from(Span::styled(format!("{sel}{att}"), row_style)),
                 Cell::from(Span::styled(
                     truncate_str(&session.session_id.to_string(), session_w as usize),
                     row_style,
@@ -810,7 +811,6 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
                     truncate_str(&parent, parent_w as usize),
                     row_style,
                 )),
-                Cell::from(Span::styled(format!("{sel}{att}"), row_style)),
                 // Keep the status colour even on the highlighted row so
                 // active/inferring sessions stay recognisable at a glance.
                 Cell::from(Span::styled(
@@ -836,9 +836,9 @@ fn render_session_list_view(frame: &mut Frame<'_>, app: &mut App) {
         let table = Table::new(
             rows,
             [
+                Constraint::Length(marker_w),
                 Constraint::Length(session_w),
                 Constraint::Length(parent_w),
-                Constraint::Length(marker_w),
                 Constraint::Length(status_w),
                 Constraint::Length(model_w),
                 Constraint::Length(turns_w),
