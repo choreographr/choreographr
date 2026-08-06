@@ -151,35 +151,35 @@ Choreographr will have an option to automate this process, so it can be left alo
 
 ## Comparison to other agents
 
-Feature matrix against every project in `~/agents` (snapshot as of Aug 2026, on each
-repo's current `main`). `herdr` is a terminal multiplexer that hosts other agents
-rather than an agent itself; `skills` is a SKILL.md collection, not an agent — both
-are included for reference.
+Feature matrix against every agent project in `~/agents` (snapshot as of Aug 2026, on each
+repo's current `main`), ordered by GitHub ⭐ descending after Choreographr. Non-agents in
+`~/agents` (`herdr` — a terminal multiplexer that hosts other agents; `skills` — a SKILL.md
+collection) are excluded.
 
-| Feature | Choreo | zero | goose | pi | opencode | codex | hermes | turnstone | openclaw | buzz | maka-agent | OpenMinis | langgraph | tau | mercury | openwork | t3code | herdr |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Daemon + multi-client | ✅ | — | server | — | server | — | — | server | ✅ | ✅ | ✅ | — | — | — | ✅ daemon | ✅ | ✅ | — |
-| Providers | 79/3 proto | 36 | 39 | 42/9 proto | 15 | 1 (OpenAI) | 34 | 5 | 40+ | agnostic | multi | 8 | agnostic | 28 | 6 | agnostic | 5 (drives) | n/a |
-| OAuth | — | ✅ | — | ✅ | ✅ | ✅ ChatGPT | ✅ 6× | ✅ MCP | ✅ | — | ✅ subs | ✅ | — | ✅ | ✅ device | ✅ | — | — |
-| Credential rotation/fallback | retry only | — | — | — | — | — | ✅ pool | ✅ | ✅ failover | — | — | ✅ fallback | — | — | ✅ | — | — | — |
-| Tool permission gating | — | ✅ | ✅ | — | ✅ | ✅ | env-only | ✅ judge | ✅ | — | ✅ | ✅ | — | — | ✅ | — | ✅ | — |
-| Compaction | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | — |
-| Sandbox | RISC-V VM | seccomp eng. | — | — | — | ✅ sandbox | Docker/SSH | OpenShell | Docker/SSH | — | — | iSH/PRoot | — | — | — | — | — | — |
-| Subagents | subsessions | specialists | — | — | ✅ | ✅ | delegation | workstreams | swarm | agent pool | ✅ graph | — | subgraphs | — | ✅ | — | — | — |
-| Skills (SKILL.md) | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ | — | ✅ | ✅ | ✅ | — | — |
-| MCP client | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ (OAuth) | ✅ | ✅ | ✅ | ✅ | — | — | — | ✅ meta | — | — |
-| ACP | bridge | ✅ | server | — | ✅ | — | ✅ | — | bridge | harness | — | — | — | — | — | — | — | — |
-| IM surfaces | Telegram | — | — | — | — | — | 20+ | 2 | 25+ | chat natively | — | — | — | — | CLI/Web/Telegram | — | — | — |
-| Web search | — | ✅ | — | — | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | ✅ | — | — | — |
-| Hooks/lifecycle | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ | — | — | — | — | — | — | — | — |
-| Plugins | — | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | — | — | — | ✅ | — | ✅ |
-| Cron/scheduling | — | ✅ | ✅ | — | — | — | ✅ | — | — | ✅ | ✅ | — | — | — | ✅ | — | — | — |
-| Long-term memory | — | — | — | — | — | ✅ | ✅ | ✅ | ✅ | — | — | ✅ | ✅ | — | ✅ | — | — | — |
-| Encrypted creds | ✅ unique | ✅ | ✅ keyring | — | — | ✅ keyring | — | ✅ Fernet | ✅ | NIP auth | — | ✅ keychain | — | 0600 | — | ✅ | ✅ | — |
-| Storage | redb | fs JSONL | SQLite | JSONL | event src | SQLite | SQLite | SQL/Postgres | SQLite | Postgres | SQLite | SQLite | SQLite/Postgres | JSONL | SQLite+JSONL | fs | — | — |
-| Metrics | ✅ | — | telemetry | telemetry | — | ✅ OTel | — | ✅ | ✅ OTel | — | — | — | — | — | — | — | — | — |
-| Undo/redo | ✅ | rewind | — | branch | — | — | ✅ | replay | — | — | — | — | time-travel | — | — | — | — | — |
-| Context fingerprints | ✅ | partial | — | — | — | — | — | ✅ | — | — | — | — | — | — | — | — | — | — |
+| Feature | Choreo | openclaw | hermes | opencode | codex | pi | goose | langgraph | buzz | openwork | t3code | OpenMinis | mercury | tau | maka-agent | zero | turnstone |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Daemon + multi-client | ✅ | ✅ | — | server | — | — | server | — | ✅ | ✅ | ✅ | — | ✅ daemon | — | ✅ | — | server |
+| Providers | 79/3 proto | 40+ | 34 | 15 | 1 (OpenAI) | 42/9 proto | 39 | agnostic | agnostic | agnostic | 5 (drives) | 8 | 6 | 28 | multi | 36 | 5 |
+| OAuth | — | ✅ | ✅ 6× | ✅ | ✅ ChatGPT | ✅ | — | — | — | ✅ | — | ✅ | ✅ device | ✅ | ✅ subs | ✅ | ✅ MCP |
+| Credential rotation/fallback | retry only | ✅ failover | ✅ pool | — | — | — | — | — | — | — | — | ✅ fallback | ✅ | — | — | — | ✅ |
+| Tool permission gating | — | ✅ | env-only | ✅ | ✅ | — | ✅ | — | — | — | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ judge |
+| Compaction | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | ✅ | — | ✅ | ✅ | ✅ | ✅ |
+| Sandbox | RISC-V VM | Docker/SSH | Docker/SSH | — | ✅ sandbox | — | — | — | — | — | — | iSH/PRoot | — | — | — | seccomp eng. | OpenShell |
+| Subagents | subsessions | swarm | delegation | ✅ | ✅ | — | — | subgraphs | agent pool | — | — | — | ✅ | — | ✅ graph | specialists | workstreams |
+| Skills (SKILL.md) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | — | — | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| MCP client | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | ✅ | ✅ meta | — | ✅ | — | — | ✅ | ✅ | ✅ (OAuth) |
+| ACP | bridge | bridge | ✅ | ✅ | — | — | server | — | harness | — | — | — | — | — | — | ✅ | — |
+| IM surfaces | Telegram | 25+ | 20+ | — | — | — | — | — | chat natively | — | — | — | CLI/Web/Telegram | — | — | — | 2 |
+| Web search | — | ✅ | ✅ | ✅ | ✅ | — | — | — | — | — | — | — | ✅ | — | ✅ | ✅ | ✅ |
+| Hooks/lifecycle | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | — | — | — | ✅ | — |
+| Plugins | — | ✅ | ✅ | ✅ | ✅ | ✅ | — | — | — | ✅ | — | — | — | — | — | ✅ | — |
+| Cron/scheduling | — | — | ✅ | — | — | — | ✅ | — | ✅ | — | — | — | ✅ | — | ✅ | ✅ | — |
+| Long-term memory | — | ✅ | ✅ | — | ✅ | — | — | ✅ | — | — | — | ✅ | ✅ | — | — | — | ✅ |
+| Encrypted creds | ✅ unique | ✅ | — | — | ✅ keyring | — | ✅ keyring | — | NIP auth | ✅ | ✅ | ✅ keychain | — | 0600 | — | ✅ | ✅ Fernet |
+| Storage | redb | SQLite | SQLite | event src | SQLite | JSONL | SQLite | SQLite/Postgres | Postgres | fs | — | SQLite | SQLite+JSONL | JSONL | SQLite | fs JSONL | SQL/Postgres |
+| Metrics | ✅ | ✅ OTel | — | — | ✅ OTel | telemetry | telemetry | — | — | — | — | — | — | — | — | — | ✅ |
+| Undo/redo | ✅ | — | ✅ | — | — | branch | — | time-travel | — | — | — | — | — | — | — | rewind | replay |
+| Context fingerprints | ✅ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | partial | ✅ |
 
 
 ## Quick start
