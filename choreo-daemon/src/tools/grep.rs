@@ -4,11 +4,11 @@ use super::{
 };
 use choreo_keystore::ServiceCredential;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
 
 /// Default result limit when the caller doesn't specify one.
@@ -18,6 +18,41 @@ const DEFAULT_MAX_RESULTS: u32 = 50;
 /// LLM context window.
 const MAX_RESULTS_CAP: u32 = 200;
 
+/// Upper bound on the `context` argument. Each match renders up to 2×N
+/// surrounding lines, so the full 200-match cap with a context of 100 would
+/// otherwise balloon to 40,000 lines before the shared byte budget cuts in.
+/// The cap is advertised in the tool schema (`range(max = 100)`) and enforced
+/// by clamping so an out-of-range request degrades gracefully instead of
+/// erroring.
+const MAX_CONTEXT_LINES: u32 = 100;
+
+/// Output format for grep results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrepOutputMode {
+    /// `path:line:content` per match line, with optional context lines
+    /// (`path-{line}-{content}`, `--` between non-contiguous groups).
+    /// The default.
+    #[default]
+    Content,
+    /// One deduplicated, sorted file path per line. Each file is searched
+    /// only until its first hit (ripgrep `-l` semantics).
+    FilesWithMatches,
+    /// `path: N` per file — the number of *matching lines* per file
+    /// (ripgrep `-c` semantics). Files with zero matches are omitted.
+    Count,
+}
+
+impl fmt::Display for GrepOutputMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GrepOutputMode::Content => write!(f, "content"),
+            GrepOutputMode::FilesWithMatches => write!(f, "files_with_matches"),
+            GrepOutputMode::Count => write!(f, "count"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GrepArgs {
     /// Search pattern (plain text or regex)
@@ -25,11 +60,25 @@ pub struct GrepArgs {
     /// When true, treat pattern as a regular expression
     #[serde(default)]
     pub regex: bool,
+    /// When true, match case-insensitively. Applies to both literal and
+    /// regex patterns (mirrors ripgrep's `--ignore-case`).
+    #[serde(default)]
+    pub ignore_case: bool,
+    /// Number of context lines to show before and after each match
+    /// (default: 0). Context lines are rendered as `path-{line}-{content}`
+    /// and do NOT count against `max_results`.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 100))]
+    pub context: u32,
+    /// Output format: `content` (default), `files_with_matches`, or `count`
+    #[serde(default)]
+    pub output_mode: GrepOutputMode,
     /// File glob pattern to filter which files are searched (e.g. '*.rs')
     pub include: Option<String>,
     /// Directory or file to search in (defaults to working directory)
     pub path: Option<String>,
-    /// Maximum number of matching lines to return
+    /// Maximum number of results to return. In `content` mode this caps
+    /// match lines; in the other two modes it caps files.
     pub max_results: Option<u32>,
 }
 
@@ -42,6 +91,10 @@ pub struct Grep;
 /// Produce a hint string when the pattern looks like a regex but `regex` is
 /// not enabled and no results were found.  Returns `None` when there is no
 /// hint to give (results found, regex enabled, or pattern is plain text).
+///
+/// The message is deliberately short: the LLM reads this as an explanation
+/// for a surprising empty result, so it states the one actionable fix and
+/// stops there (no metacharacter enumeration).
 fn regex_mode_hint(pattern: &str, regex: bool, has_results: bool) -> Option<String> {
     if regex || has_results {
         return None;
@@ -63,31 +116,333 @@ fn regex_mode_hint(pattern: &str, regex: bool, has_results: bool) -> Option<Stri
         return None;
     }
     Some(
-        "Note: pattern contains regex metacharacters but regex:false (default). \
-         These characters were matched literally: `|`, `(`, `)`, `^`, `$`, `+`, `*`, `?`, `[`, `]`, `\\`. \
-         If you intended regex, set regex:true."
+        "Note: pattern matched literally. Set regex:true to interpret it as a regular expression."
             .to_string(),
     )
 }
 
-/// Run the grep walk with the given parameters, optionally streaming each
-/// match to `output_tx` in real time for incremental client display.
-fn run_grep_walk(
+/// The result string for a search that found nothing: an explicit message the
+/// model can distinguish from a failed/incomplete tool call. When the pattern
+/// looks like an intended regex, the hint leads so it reads as an explanation
+/// of *why* nothing matched.
+fn empty_result(pattern: &str, regex: bool) -> String {
+    match regex_mode_hint(pattern, regex, false) {
+        Some(hint) => format!("{hint}\nNo matches found."),
+        None => "No matches found.".to_string(),
+    }
+}
+
+/// One renderable unit from a file's search, in stream order.
+#[derive(Debug, Clone)]
+enum GrepItem {
+    /// A line that matched the pattern → rendered `path:line:content`.
+    Match { line_number: u64, content: String },
+    /// A surrounding context line → rendered `path-{line}-{content}`. Before
+    /// and after context render identically, so `SinkContextKind` is not
+    /// stored.
+    Context { line_number: u64, content: String },
+    /// Separator between non-contiguous context groups → rendered `--`.
+    /// Emitted by the sink's `context_break` callback.
+    Break,
+}
+
+/// Accumulates matches during the walk and renders them per `GrepOutputMode`.
+///
+/// grep-searcher drives this sink one file at a time. `SinkMatch`/`SinkContext`
+/// expose the line but not the containing file, so the outer walk calls
+/// `begin_file` before each `search_path` and `end_file` after it. The three
+/// callbacks (`matched`, `context`, `context_break`) arrive in stream order,
+/// so Content mode renders straight from the collected items — no post-hoc
+/// file re-reading.
+struct GrepSink {
+    /// Active output mode — determines the cap unit and what is collected.
+    output_mode: GrepOutputMode,
+    /// Cap on match lines (Content) or files (FilesWithMatches, Count),
+    /// already clamped to [1, MAX_RESULTS_CAP].
+    max_results: usize,
+    /// Path of the file currently being searched (set by `begin_file`).
+    current_path: PathBuf,
+
+    // Content-mode state: per-file ordered items, capped by match count.
+    content_files: Vec<(PathBuf, Vec<GrepItem>)>,
+    content_match_count: usize,
+
+    // FilesWithMatches-mode state: one path per file (first hit only).
+    matched_files: Vec<PathBuf>,
+
+    // Count-mode state: tally for the current file, flushed to entries at
+    // `end_file` so a per-file count reflects the whole file.
+    count_file_lines: u64,
+    count_entries: Vec<(PathBuf, u64)>,
+
+    /// True once the cap is hit — the searcher must stop the current file
+    /// and the outer walk must break. Doubles as the truncation flag
+    /// (`truncation_marker(sink.done, …)`).
+    done: bool,
+}
+
+impl GrepSink {
+    fn new(output_mode: GrepOutputMode, max_results: usize) -> Self {
+        GrepSink {
+            output_mode,
+            max_results,
+            current_path: PathBuf::new(),
+            content_files: Vec::new(),
+            content_match_count: 0,
+            matched_files: Vec::new(),
+            count_file_lines: 0,
+            count_entries: Vec::new(),
+            done: false,
+        }
+    }
+
+    /// Called by the walk loop before searching each file. Records the file
+    /// being searched (grep-searcher's `SinkMatch` has no path) and opens the
+    /// per-mode state for this file.
+    fn begin_file(&mut self, path: &Path) {
+        self.current_path = path.to_path_buf();
+        if self.output_mode == GrepOutputMode::Content {
+            self.content_files.push((path.to_path_buf(), Vec::new()));
+        }
+    }
+
+    /// Called by the walk loop after searching each file. Count mode flushes
+    /// the completed tally here — a per-file count must reflect the whole
+    /// file, not just the lines seen before some other cap applied.
+    fn end_file(&mut self) {
+        if self.output_mode == GrepOutputMode::Count && self.count_file_lines > 0 {
+            self.count_entries
+                .push((self.current_path.clone(), self.count_file_lines));
+            self.count_file_lines = 0;
+            if self.count_entries.len() >= self.max_results {
+                self.done = true;
+            }
+        }
+    }
+}
+
+impl Sink for GrepSink {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        if self.done {
+            return Ok(false);
+        }
+        let line_number = mat.line_number().unwrap_or(0);
+        // SinkMatch bytes include the line terminator (\n). Strip it so that
+        // joining results with "\n" does not produce blank lines.
+        let content = String::from_utf8_lossy(mat.bytes())
+            .trim_end_matches('\n')
+            .to_string();
+
+        match self.output_mode {
+            GrepOutputMode::Content => {
+                if let Some((_, items)) = self.content_files.last_mut() {
+                    items.push(GrepItem::Match {
+                        line_number,
+                        content,
+                    });
+                }
+                self.content_match_count += 1;
+                if self.content_match_count >= self.max_results {
+                    self.done = true;
+                    // Stop this file immediately; the walk loop breaks on
+                    // `done` so remaining files are never opened.
+                    return Ok(false);
+                }
+                Ok(true)
+            }
+            GrepOutputMode::FilesWithMatches => {
+                // First hit per file is enough (rg -l semantics).
+                self.matched_files.push(self.current_path.clone());
+                if self.matched_files.len() >= self.max_results {
+                    self.done = true;
+                }
+                // Stop this file after its first hit.
+                Ok(false)
+            }
+            GrepOutputMode::Count => {
+                // Count every matching line in the file; the cap applies to
+                // the number of files reported, checked at `end_file`.
+                self.count_file_lines += 1;
+                Ok(true)
+            }
+        }
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        ctx: &SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        // Context is only ever configured for Content mode; the guard keeps
+        // the sink correct even if that ever changes.
+        if self.output_mode != GrepOutputMode::Content {
+            return Ok(true);
+        }
+        if self.done {
+            return Ok(false);
+        }
+        if let Some((_, items)) = self.content_files.last_mut() {
+            items.push(GrepItem::Context {
+                line_number: ctx.line_number().unwrap_or(0),
+                content: String::from_utf8_lossy(ctx.bytes())
+                    .trim_end_matches('\n')
+                    .to_string(),
+            });
+        }
+        Ok(true)
+    }
+
+    fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
+        if !self.done
+            && self.output_mode == GrepOutputMode::Content
+            && let Some((_, items)) = self.content_files.last_mut()
+        {
+            items.push(GrepItem::Break);
+        }
+        Ok(true)
+    }
+}
+
+/// Label for a matched file in output: root-relative in directory mode, the
+/// file's own name for a directly-named file (matching the pre-existing
+/// output shape).
+fn path_label(path: &Path, resolved: &Path, single_file: bool) -> String {
+    if single_file {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        path.strip_prefix(resolved)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Content mode: per-file items in stream order. Match lines use `:`
+/// separators, context lines `-` (ripgrep's -C convention), groups of
+/// context are separated by `--`.
+fn render_content(sink: &GrepSink, resolved: &Path, single_file: bool) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for (path, items) in &sink.content_files {
+        if items.is_empty() {
+            continue;
+        }
+        let label = sanitize_name(&path_label(path, resolved, single_file));
+        for item in items {
+            match item {
+                GrepItem::Match {
+                    line_number,
+                    content,
+                } => lines.push(format!("{label}:{line_number}:{content}")),
+                GrepItem::Context {
+                    line_number,
+                    content,
+                } => lines.push(format!("{label}-{line_number}-{content}")),
+                GrepItem::Break => lines.push("--".to_string()),
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// FilesWithMatches mode: one deduplicated, sorted path per hit file.
+fn render_files(sink: &GrepSink, resolved: &Path, single_file: bool) -> String {
+    let mut files: Vec<String> = sink
+        .matched_files
+        .iter()
+        .map(|p| sanitize_name(&path_label(p, resolved, single_file)))
+        .collect();
+    // Deterministic ordering — the walk order is stable, but sorting removes
+    // any dependence on traversal internals.
+    files.sort();
+    files.join("\n")
+}
+
+/// Count mode: `path: N` per file, sorted by path, zero-match files omitted.
+fn render_count(sink: &GrepSink, resolved: &Path, single_file: bool) -> String {
+    let mut entries: Vec<(String, u64)> = sink
+        .count_entries
+        .iter()
+        .map(|(p, n)| (sanitize_name(&path_label(p, resolved, single_file)), *n))
+        .collect();
+    entries.sort();
+    entries
+        .iter()
+        .map(|(p, n)| format!("{p}: {n}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render the collected sink per its output mode, appending the regex-mode
+/// hint / "No matches found." message when nothing matched.
+fn finish_grep(
+    sink: GrepSink,
     resolved: &Path,
+    single_file: bool,
     pattern: &str,
     regex: bool,
-    include: Option<&str>,
+) -> String {
+    let has_results = match sink.output_mode {
+        GrepOutputMode::Content => sink.content_match_count > 0,
+        GrepOutputMode::FilesWithMatches => !sink.matched_files.is_empty(),
+        GrepOutputMode::Count => !sink.count_entries.is_empty(),
+    };
+    if !has_results {
+        return empty_result(pattern, regex);
+    }
+
+    let body = match sink.output_mode {
+        GrepOutputMode::Content => render_content(&sink, resolved, single_file),
+        GrepOutputMode::FilesWithMatches => render_files(&sink, resolved, single_file),
+        GrepOutputMode::Count => render_count(&sink, resolved, single_file),
+    };
+    let noun = if sink.output_mode == GrepOutputMode::Content {
+        "matches"
+    } else {
+        "files"
+    };
+    assemble_grep_output(body, sink.done, sink.max_results, noun)
+}
+
+/// Parsed search configuration, shared by `run_grep_walk` and the `Tool`
+/// impl so the walker doesn't take a long flat argument list.
+struct GrepConfig<'a> {
+    pattern: &'a str,
+    regex: bool,
+    ignore_case: bool,
+    context: u32,
+    output_mode: GrepOutputMode,
+    include: Option<&'a str>,
     max_results: u32,
-    output_tx: Option<mpsc::Sender<Vec<u8>>>,
-) -> Result<String, ToolExecError> {
+}
+
+/// Run the grep walk with the given parameters.
+fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, ToolExecError> {
+    let GrepConfig {
+        pattern,
+        regex,
+        ignore_case,
+        context,
+        output_mode,
+        include,
+        max_results,
+    } = config;
+
     // Build the pattern matcher: literal text or regex depending on flags.
+    // `case_insensitive` applies to both paths (mirrors rg --ignore-case).
     let matcher: RegexMatcher = if regex {
-        RegexMatcher::new(pattern)
+        RegexMatcherBuilder::new()
+            .case_insensitive(ignore_case)
+            .build(pattern)
             .map_err(|e| ToolExecError(format!("invalid regex pattern: {e}")))?
     } else {
         // `fixed_string(true)` escapes all regex metacharacters so the
         // pattern is matched as a literal substring.
         RegexMatcherBuilder::new()
+            .case_insensitive(ignore_case)
             .fixed_strings(true)
             .build(pattern)
             .map_err(|e| ToolExecError(format!("invalid pattern: {e}")))?
@@ -108,20 +463,16 @@ fn run_grep_walk(
     // Clamp max_results to the configured bounds so the caller can't
     // request an unbounded or absurdly large result set.
     let max_results = max_results.clamp(1, MAX_RESULTS_CAP) as usize;
+    let mut sink = GrepSink::new(output_mode, max_results);
 
-    // When streaming is active, capture the search root for computing
-    // relative paths in the streaming output.
-    let search_root = output_tx.is_some().then(|| resolved.to_path_buf());
-    let mut sink = GrepSink {
-        max_results,
-        results: Vec::new(),
-        done: false,
-        current_path: PathBuf::new(),
-        output_tx,
-        search_root,
-    };
-
-    let mut searcher = SearcherBuilder::new().build();
+    // Context is only meaningful in Content mode; the other modes ignore it
+    // (and never enable it on the searcher, so no extra work is done).
+    let mut builder = SearcherBuilder::new();
+    if output_mode == GrepOutputMode::Content && context > 0 {
+        let n = context.min(MAX_CONTEXT_LINES) as usize;
+        builder.before_context(n).after_context(n);
+    }
+    let mut searcher = builder.build();
 
     // When the path points directly to a file (not a directory), search it
     // directly rather than going through the directory walker. zlob's
@@ -141,16 +492,12 @@ fn run_grep_walk(
         if let Some(ref filter) = include_filter
             && !filter.matches(Path::new(raw_name.as_ref()))
         {
-            // File doesn't match the glob — return empty.
-            return Ok(String::new());
+            // File doesn't match the glob — return the empty-result message.
+            return Ok(empty_result(pattern, regex));
         }
-        // Sanitize so a pathological file name (e.g. one containing a
-        // newline) cannot corrupt the line-oriented `path:line:content` output.
-        let file_name = sanitize_name(&raw_name);
 
-        // Search the file. `GrepSink` handles both streaming (when
-        // `output_tx` is set) and collecting modes transparently.
-        sink.current_path = resolved.to_path_buf();
+        // Search the file. `GrepSink` collects per its output mode.
+        sink.begin_file(resolved);
         if let Err(e) = searcher.search_path(&matcher, resolved, &mut sink) {
             tracing::debug!(
                 path = %resolved.display(),
@@ -158,23 +505,8 @@ fn run_grep_walk(
                 "grep search error on file, skipping"
             );
         }
-
-        let has_results = !sink.results.is_empty();
-        let hint = regex_mode_hint(pattern, regex, has_results);
-        if !has_results {
-            return Ok(hint.unwrap_or_default());
-        }
-        let lines: Vec<String> = sink
-            .results
-            .iter()
-            .map(|(_, line_num, content)| format!("{file_name}:{line_num}:{content}"))
-            .collect();
-        return Ok(assemble_grep_output(
-            hint,
-            lines.join("\n"),
-            sink.done,
-            max_results,
-        ));
+        sink.end_file();
+        return Ok(finish_grep(sink, resolved, true, pattern, regex));
     }
 
     // Walk the directory tree with gitignore-aware traversal.
@@ -202,7 +534,7 @@ fn run_grep_walk(
 
             // Tell the sink which file we're about to search so it can
             // attach the path to any matches it collects.
-            sink.current_path = entry.path().to_path_buf();
+            sink.begin_file(entry.path());
 
             // Search the file. Individual read errors are non-fatal — we log
             // and continue to the next file.
@@ -213,6 +545,7 @@ fn run_grep_walk(
                     "grep search error on file, skipping"
                 );
             }
+            sink.end_file();
 
             // Stop early once we've accumulated enough results.
             if sink.done {
@@ -229,34 +562,7 @@ fn run_grep_walk(
             ToolExecError(format!("walk error: {e}"))
         })?;
 
-    let has_results = !sink.results.is_empty();
-    let hint = regex_mode_hint(pattern, regex, has_results);
-    if !has_results {
-        return Ok(hint.unwrap_or_default());
-    }
-
-    let lines: Vec<String> = sink
-        .results
-        .iter()
-        .map(|(path, line_num, content)| {
-            let rel = path.strip_prefix(resolved).unwrap_or(path);
-            // Sanitize the path so a pathological file name (e.g. one
-            // containing a newline) cannot corrupt the line-oriented output.
-            format!(
-                "{}:{}:{}",
-                sanitize_name(&rel.to_string_lossy()),
-                line_num,
-                content
-            )
-        })
-        .collect();
-
-    Ok(assemble_grep_output(
-        hint,
-        lines.join("\n"),
-        sink.done,
-        max_results,
-    ))
+    Ok(finish_grep(sink, resolved, false, pattern, regex))
 }
 
 pub fn execute_grep_tool(
@@ -267,11 +573,15 @@ pub fn execute_grep_tool(
     let resolved = super::resolve_path(path, working_dir);
     run_grep_walk(
         &resolved,
-        &args.pattern,
-        args.regex,
-        args.include.as_deref(),
-        args.max_results.unwrap_or(DEFAULT_MAX_RESULTS),
-        None,
+        GrepConfig {
+            pattern: &args.pattern,
+            regex: args.regex,
+            ignore_case: args.ignore_case,
+            context: args.context,
+            output_mode: args.output_mode,
+            include: args.include.as_deref(),
+            max_results: args.max_results.unwrap_or(DEFAULT_MAX_RESULTS),
+        },
     )
 }
 
@@ -289,17 +599,22 @@ impl Tool for Grep {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents for a pattern. Pattern is treated as a literal substring by default — set regex:true to use regular expressions (be sure to set regex:true if your pattern contains regex metacharacters like |, (, ), ^, $, +, etc. — without it they are matched literally). Use include to filter files by glob (e.g. \"*.rs\"); globs with '/' match root-relative paths (e.g. 'src/*.rs') and bare globs match file names. path scopes the search (a file or directory), and max_results caps matches (a '...[truncated at N matches]' line is appended when the cap is hit — it means *at least* N exist). Results in file:line:content format. Respects .gitignore, hidden, and binary files."
-    }
-
-    fn supports_streaming_output() -> bool {
-        true
+        "Search file contents for a pattern. Patterns are matched literally by default — set regex:true to use a regular expression, ignore_case:true to ignore case, and context to show surrounding lines. Use output_mode (content, files_with_matches, or count) to change the result format. Use include to filter files by glob (e.g. \"*.rs\"); globs with '/' match root-relative paths (e.g. 'src/*.rs') and bare globs match file names. path scopes the search (a file or directory), and max_results caps matches — a '...[truncated at N matches]' line is appended when the cap is hit (it means *at least* N exist). Results in file:line:content format (context lines use file-line-content). Respects .gitignore, hidden, and binary files."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
         let mut parts = vec![format!("Searching for `{}`.", args.pattern)];
         if args.regex {
             parts.push(" Using regex.".to_string());
+        }
+        if args.ignore_case {
+            parts.push(" Ignoring case.".to_string());
+        }
+        if args.context > 0 {
+            parts.push(format!(" Showing {} context line(s).", args.context));
+        }
+        if args.output_mode != GrepOutputMode::Content {
+            parts.push(format!(" Output mode: {}.", args.output_mode));
         }
         if let Some(ref incl) = args.include {
             parts.push(format!(" Include pattern: `{}`.", incl));
@@ -324,130 +639,17 @@ impl Tool for Grep {
         execute_grep_tool(&args, working_dir)
     }
 
-    fn execute_streaming(
-        &self,
-        args: Self::Args,
-        _x_credentials: Option<&ServiceCredential>,
-        working_dir: Option<&Path>,
-        output_tx: mpsc::Sender<Vec<u8>>,
-        _ctx: Option<&ToolContext>,
-    ) -> Result<Self::Return, Self::Error> {
-        let path = args.path.as_deref().unwrap_or(".");
-        let resolved = super::resolve_path(path, working_dir);
-        run_grep_walk(
-            &resolved,
-            &args.pattern,
-            args.regex,
-            args.include.as_deref(),
-            args.max_results.unwrap_or(DEFAULT_MAX_RESULTS),
-            Some(output_tx),
-        )
-    }
-
     fn return_string(ret: &Self::Return) -> String {
         ret.clone()
     }
 }
 
-/// Assemble the final grep output: an optional regex-mode hint line, then the
-/// match lines capped at the shared byte budget with the truncation marker
-/// appended **past** the cap so the "N of many more" count signal always
-/// survives even when the body alone exceeds the budget. Shared by the
-/// single-file and directory paths.
-fn assemble_grep_output(
-    hint: Option<String>,
-    body: String,
-    truncated: bool,
-    max_results: usize,
-) -> String {
-    let marker = truncation_marker(truncated, max_results, "matches");
-    let capped = finish_tool_output(&body, marker);
-    match hint {
-        Some(h) => format!("{h}\n{capped}"),
-        None => capped,
-    }
-}
-
-/// Custom Sink that collects matching lines up to a configured limit.
-///
-/// This avoids buffering the entire result set in memory and lets us
-/// short-circuit the search as soon as the limit is hit.
-///
-/// Note: `SinkMatch` in grep-searcher 0.1.x does not expose the file path,
-/// so we set `current_path` on the sink from the outer walk loop before
-/// each `search_path` call.
-///
-/// When `output_tx` is `Some`, each match is also streamed to the channel
-/// in real time for incremental display.
-struct GrepSink {
-    /// Maximum number of results to collect.
-    max_results: usize,
-    /// Accumulated (path, line_number, line_content) triples.
-    results: Vec<(PathBuf, u64, String)>,
-    /// Once true, the searcher should stop for the current file and the
-    /// outer walk loop should break.
-    done: bool,
-    /// Path of the file currently being searched (set by the outer loop).
-    current_path: PathBuf,
-    /// Optional streaming channel — when set, each match is sent here as
-    /// a `path:line:content` line in real time.
-    output_tx: Option<mpsc::Sender<Vec<u8>>>,
-    /// Search root for computing relative paths in streaming output.
-    search_root: Option<PathBuf>,
-}
-
-impl Sink for GrepSink {
-    type Error = std::io::Error;
-
-    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
-        if self.done {
-            return Ok(false);
-        }
-
-        let path = self.current_path.clone();
-        let line_number = mat.line_number().unwrap_or(0);
-        // SinkMatch bytes include the line terminator (\n).  Strip it so
-        // that joining results with "\n" does not produce blank lines.
-        let content = String::from_utf8_lossy(mat.bytes())
-            .trim_end_matches('\n')
-            .to_string();
-
-        // Stream the match line if a sender is configured, so the client
-        // can display results incrementally rather than waiting for the
-        // entire walk to finish.
-        if let Some(ref tx) = self.output_tx {
-            let rel = self
-                .search_root
-                .as_ref()
-                .and_then(|root| path.strip_prefix(root).ok())
-                .unwrap_or(&path);
-            let line = format!(
-                "{}:{}:{}\n",
-                sanitize_name(&rel.to_string_lossy()),
-                line_number,
-                content
-            );
-            let _ = tx.send(line.into_bytes());
-        }
-
-        self.results.push((path, line_number, content));
-
-        // If we've collected enough results, signal termination globally
-        // and stream the truncation marker as the final chunk so the
-        // client's incremental display ends with the same signal as the
-        // fully-assembled output.
-        if self.results.len() >= self.max_results {
-            self.done = true;
-            if let Some(ref tx) = self.output_tx
-                && let Some(marker) = truncation_marker(true, self.max_results, "matches")
-            {
-                let _ = tx.send(format!("{marker}\n").into_bytes());
-            }
-            return Ok(false);
-        }
-
-        Ok(true)
-    }
+/// Assemble the final grep output, capped at the shared byte budget with the
+/// truncation marker appended **past** the cap so the "N of many more" count
+/// signal always survives even when the body alone exceeds the budget.
+fn assemble_grep_output(body: String, truncated: bool, max_results: usize, noun: &str) -> String {
+    let marker = truncation_marker(truncated, max_results, noun);
+    finish_tool_output(&body, marker)
 }
 
 #[cfg(test)]
@@ -456,6 +658,21 @@ mod tests {
     use crate::tools::Tool;
     use std::io::Write;
     use tempfile::TempDir;
+
+    /// A `GrepArgs` with sensible defaults so tests only override the fields
+    /// they exercise.
+    fn test_args(pattern: &str, path: Option<&Path>) -> GrepArgs {
+        GrepArgs {
+            pattern: pattern.to_string(),
+            regex: false,
+            ignore_case: false,
+            context: 0,
+            output_mode: GrepOutputMode::Content,
+            include: None,
+            path: path.map(|p| p.to_string_lossy().into_owned()),
+            max_results: None,
+        }
+    }
 
     /// Create a temporary directory with a known set of files for testing.
     fn setup_test_dir() -> TempDir {
@@ -494,13 +711,7 @@ mod tests {
     fn test_plain_text_match() {
         let dir = setup_test_dir();
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: "hello".to_string(),
-            regex: false,
-            include: None,
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let args = test_args("hello", Some(dir.path()));
         let result = tool.execute(args, None, None, None).unwrap();
 
         // "hello" appears in test1.rs (function name), test2.py (function name),
@@ -523,13 +734,9 @@ mod tests {
     fn test_regex_match() {
         let dir = setup_test_dir();
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: r"fn \w+".to_string(),
-            regex: true,
-            include: Some("*.rs".to_string()),
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let mut args = test_args(r"fn \w+", Some(dir.path()));
+        args.regex = true;
+        args.include = Some("*.rs".to_string());
         let result = tool.execute(args, None, None, None).unwrap();
 
         // Both `fn hello` and `fn world` should match in test1.rs
@@ -557,13 +764,8 @@ mod tests {
     fn test_include_filter() {
         let dir = setup_test_dir();
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: "world".to_string(),
-            regex: false,
-            include: Some("*.rs".to_string()),
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let mut args = test_args("world", Some(dir.path()));
+        args.include = Some("*.rs".to_string());
         let result = tool.execute(args, None, None, None).unwrap();
 
         // Only test1.rs should be searched
@@ -585,13 +787,8 @@ mod tests {
     fn test_max_results_cap() {
         let dir = setup_test_dir();
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: "world".to_string(),
-            regex: false,
-            include: None,
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: Some(1),
-        };
+        let mut args = test_args("world", Some(dir.path()));
+        args.max_results = Some(1);
         let result = tool.execute(args, None, None, None).unwrap();
 
         // With max_results=1 we get one match line plus the explicit
@@ -611,50 +808,228 @@ mod tests {
     fn test_no_match() {
         let dir = setup_test_dir();
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: "nonexistent".to_string(),
-            regex: false,
-            include: None,
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let args = test_args("nonexistent", Some(dir.path()));
         let result = tool.execute(args, None, None, None).unwrap();
 
-        // No file contains "nonexistent" — result should be empty
-        assert!(result.is_empty(), "expected empty result, got:\n{result}");
+        // No file contains "nonexistent" — the tool says so explicitly rather
+        // than returning an ambiguous empty string.
+        assert_eq!(result, "No matches found.");
     }
 
     #[test]
     fn test_case_sensitivity() {
         let dir = setup_test_dir();
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: "HELLO".to_string(),
-            regex: false,
-            include: None,
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let args = test_args("HELLO", Some(dir.path()));
         let result = tool.execute(args, None, None, None).unwrap();
 
         // fixed_string(true) performs an exact case-sensitive match by default.
         // "HELLO" (uppercase) should not match "hello" (lowercase).
+        assert!(result.contains("No matches found."), "got:\n{result}");
+    }
+
+    #[test]
+    fn test_ignore_case() {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("test.txt"), "Hello World\nfoo\n").expect("write");
+
+        let tool = Grep;
+        let mut args = test_args("hello", Some(dir.path()));
+        args.ignore_case = true;
+        let result = tool.execute(args, None, None, None).unwrap();
         assert!(
-            result.is_empty(),
-            "expected case-sensitive no match, got:\n{result}"
+            result.contains("test.txt:1:Hello World"),
+            "expected case-insensitive match:\n{result}"
         );
+    }
+
+    #[test]
+    fn test_ignore_case_with_regex() {
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("test.txt"), "Hello World\n").expect("write");
+
+        let tool = Grep;
+        let mut args = test_args("^hello", Some(dir.path()));
+        args.regex = true;
+        args.ignore_case = true;
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            result.contains("test.txt:1:Hello World"),
+            "expected case-insensitive regex match:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_context_lines() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut f = std::fs::File::create(dir.path().join("test.txt")).expect("create");
+            writeln!(f, "line1").expect("write");
+            writeln!(f, "line2").expect("write");
+            writeln!(f, "hello world").expect("write");
+            writeln!(f, "line4").expect("write");
+            writeln!(f, "line5").expect("write");
+        }
+
+        let tool = Grep;
+        let mut args = test_args("hello", Some(dir.path()));
+        args.context = 2;
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(result.contains("test.txt-1-line1"), "{result}");
+        assert!(result.contains("test.txt-2-line2"), "{result}");
+        assert!(result.contains("test.txt:3:hello world"), "{result}");
+        assert!(result.contains("test.txt-4-line4"), "{result}");
+        assert!(result.contains("test.txt-5-line5"), "{result}");
+        assert_eq!(result.lines().count(), 5, "{result}");
+    }
+
+    #[test]
+    fn test_context_break_separator() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut f = std::fs::File::create(dir.path().join("test.txt")).expect("create");
+            writeln!(f, "world").expect("write");
+            writeln!(f, "a").expect("write");
+            writeln!(f, "b").expect("write");
+            writeln!(f, "c").expect("write");
+            writeln!(f, "d").expect("write");
+            writeln!(f, "e").expect("write");
+            writeln!(f, "world").expect("write");
+        }
+
+        let tool = Grep;
+        let mut args = test_args("world", Some(dir.path()));
+        args.context = 1;
+        let result = tool.execute(args, None, None, None).unwrap();
+        // First match at line 1 (after-context line 2), second at line 7
+        // (before-context line 6); the gap between lines 2 and 6 renders `--`.
+        assert!(result.contains("test.txt:1:world"), "{result}");
+        assert!(result.contains("test.txt-2-a"), "{result}");
+        assert!(result.contains("test.txt-6-e"), "{result}");
+        assert!(result.contains("test.txt:7:world"), "{result}");
+        assert!(
+            result.contains("--"),
+            "expected context break separator:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_context_does_not_count_against_max_results() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut f = std::fs::File::create(dir.path().join("test.txt")).expect("create");
+            writeln!(f, "a").expect("write");
+            writeln!(f, "b").expect("write");
+            writeln!(f, "hello").expect("write");
+        }
+
+        let tool = Grep;
+        let mut args = test_args("hello", Some(dir.path()));
+        args.context = 2;
+        args.max_results = Some(1);
+        let result = tool.execute(args, None, None, None).unwrap();
+        // The cap hits on the match (line 3); the searcher stops there, so the
+        // two before-context lines + the match render, then the marker.
+        assert_eq!(
+            result.lines().count(),
+            4,
+            "expected 2 context + match + marker:\n{result}"
+        );
+        assert!(
+            result.contains("test.txt:3:hello"),
+            "expected match line:\n{result}"
+        );
+        assert!(
+            result.contains("...[truncated at 1 matches]"),
+            "expected truncation marker:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_files_with_matches() {
+        let dir = setup_test_dir();
+        let tool = Grep;
+        let mut args = test_args("hello", Some(dir.path()));
+        args.output_mode = GrepOutputMode::FilesWithMatches;
+        let result = tool.execute(args, None, None, None).unwrap();
+        // Sorted, deduplicated paths — no line numbers or content.
+        assert_eq!(result, "data.txt\ntest1.rs\ntest2.py", "{result}");
+    }
+
+    #[test]
+    fn test_count_mode() {
+        let dir = setup_test_dir();
+        let tool = Grep;
+        let mut args = test_args("world", Some(dir.path()));
+        args.output_mode = GrepOutputMode::Count;
+        let result = tool.execute(args, None, None, None).unwrap();
+        // data.txt has "world" on lines 1-2; test1.rs and test2.py once each.
+        assert!(result.contains("data.txt: 2"), "{result}");
+        assert!(result.contains("test1.rs: 1"), "{result}");
+        assert!(result.contains("test2.py: 1"), "{result}");
+        assert_eq!(result.lines().count(), 3, "{result}");
+    }
+
+    #[test]
+    fn test_files_mode_truncation() {
+        let dir = setup_test_dir();
+        let tool = Grep;
+        let mut args = test_args("world", Some(dir.path()));
+        args.output_mode = GrepOutputMode::FilesWithMatches;
+        args.max_results = Some(1);
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result.lines().count(), 2, "1 file + marker:\n{result}");
+        assert!(
+            result.contains("...[truncated at 1 files]"),
+            "expected files truncation marker:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_count_mode_ignores_context() {
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut f = std::fs::File::create(dir.path().join("test.txt")).expect("create");
+            writeln!(f, "a").expect("write");
+            writeln!(f, "hello").expect("write");
+            writeln!(f, "c").expect("write");
+        }
+
+        let tool = Grep;
+        let mut args = test_args("hello", Some(dir.path()));
+        args.output_mode = GrepOutputMode::Count;
+        args.context = 5;
+        let result = tool.execute(args, None, None, None).unwrap();
+        // Context is meaningless in count mode — plain per-file counts.
+        assert_eq!(result, "test.txt: 1", "{result}");
+    }
+
+    #[test]
+    fn test_single_file_files_mode() {
+        let dir = setup_test_dir();
+        let file_path = dir.path().join("test1.rs");
+        let tool = Grep;
+        let mut args = test_args("hello", Some(&file_path));
+        args.output_mode = GrepOutputMode::FilesWithMatches;
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "test1.rs", "{result}");
+    }
+
+    #[test]
+    fn test_single_file_count_mode() {
+        let dir = setup_test_dir();
+        let file_path = dir.path().join("data.txt");
+        let tool = Grep;
+        let mut args = test_args("world", Some(&file_path));
+        args.output_mode = GrepOutputMode::Count;
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "data.txt: 2", "{result}");
     }
 
     #[test]
     fn describe_invocation_includes_pattern_and_path() {
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: "fn main".into(),
-            regex: false,
-            include: None,
-            path: Some("src".into()),
-            max_results: None,
-        };
+        let args = test_args("fn main", Some(Path::new("src")));
         let desc = tool.describe_invocation(&args);
         assert!(desc.contains("Searching for `fn main`."));
         assert!(desc.contains("In path: `src`."));
@@ -663,18 +1038,35 @@ mod tests {
     #[test]
     fn describe_invocation_includes_regex_and_include() {
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: "fn \\w+".into(),
-            regex: true,
-            include: Some("*.rs".into()),
-            path: None,
-            max_results: Some(50),
-        };
+        let mut args = test_args("fn \\w+", None);
+        args.regex = true;
+        args.include = Some("*.rs".into());
+        args.max_results = Some(50);
         let desc = tool.describe_invocation(&args);
         assert!(desc.contains("Searching for `fn \\w+`."));
         assert!(desc.contains("Using regex."));
         assert!(desc.contains("Include pattern: `*.rs`."));
         assert!(desc.contains("Max results: 50."));
+    }
+
+    #[test]
+    fn describe_invocation_includes_new_options() {
+        let tool = Grep;
+        let mut args = test_args("fn \\w+", None);
+        args.regex = true;
+        args.ignore_case = true;
+        args.context = 3;
+        args.output_mode = GrepOutputMode::Count;
+        args.include = Some("*.rs".into());
+        args.max_results = Some(25);
+        let desc = tool.describe_invocation(&args);
+        assert!(desc.contains("Searching for `fn \\w+`."));
+        assert!(desc.contains("Using regex."));
+        assert!(desc.contains("Ignoring case."));
+        assert!(desc.contains("Showing 3 context line(s)."));
+        assert!(desc.contains("Output mode: count."));
+        assert!(desc.contains("Include pattern: `*.rs`."));
+        assert!(desc.contains("Max results: 25."));
     }
 
     #[test]
@@ -695,15 +1087,10 @@ mod tests {
         }
 
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: "content".to_string(),
-            regex: false,
-            // Bare filename with no path separator — matches by basename
-            // at any directory depth.
-            include: Some("root.txt".to_string()),
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        // Bare filename with no path separator — matches by basename
+        // at any directory depth.
+        let mut args = test_args("content", Some(dir.path()));
+        args.include = Some("root.txt".to_string());
         let result = tool.execute(args, None, None, None).unwrap();
         assert_eq!(result.lines().count(), 2, "expected 2 matches:\n{result}");
         assert!(
@@ -720,15 +1107,10 @@ mod tests {
     fn test_bare_filename_include_no_match() {
         let dir = setup_test_dir();
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: "hello".to_string(),
-            regex: false,
-            include: Some("nonexistent.rs".to_string()),
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let mut args = test_args("hello", Some(dir.path()));
+        args.include = Some("nonexistent.rs".to_string());
         let result = tool.execute(args, None, None, None).unwrap();
-        assert!(result.is_empty(), "expected empty, got:\n{result}");
+        assert!(result.contains("No matches found."), "got:\n{result}");
     }
 
     #[test]
@@ -753,13 +1135,8 @@ mod tests {
         // Pattern has a `/` so it's matched against the root-relative path.
         // `*/data.txt` requires the file to sit exactly one directory below
         // the search root — a root-level `data.txt` has no leading directory.
-        let args = GrepArgs {
-            pattern: "hello".to_string(),
-            regex: false,
-            include: Some("*/data.txt".to_string()),
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let mut args = test_args("hello", Some(dir.path()));
+        args.include = Some("*/data.txt".to_string());
         let result = tool.execute(args, None, None, None).unwrap();
         assert_eq!(result.lines().count(), 1, "expected 1 match:\n{result}");
         assert!(
@@ -782,13 +1159,8 @@ mod tests {
         }
 
         let tool = Grep;
-        let args = GrepArgs {
-            pattern: "hello".to_string(),
-            regex: false,
-            include: Some("src/*.rs".to_string()),
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let mut args = test_args("hello", Some(dir.path()));
+        args.include = Some("src/*.rs".to_string());
         let result = tool.execute(args, None, None, None).unwrap();
         assert!(
             result.contains("src/main.rs:1:hello"),
@@ -803,13 +1175,8 @@ mod tests {
         // A directly-named file has no directory context: the include glob is
         // matched against the file name. A bare glob matches the basename.
         let file_path = dir.path().join("test1.rs");
-        let args = GrepArgs {
-            pattern: "hello".to_string(),
-            regex: false,
-            include: Some("*.rs".to_string()),
-            path: Some(file_path.to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let mut args = test_args("hello", Some(&file_path));
+        args.include = Some("*.rs".to_string());
         let result = tool.execute(args, None, None, None).unwrap();
         assert!(
             result.contains("test1.rs:1:fn hello()"),
@@ -817,16 +1184,11 @@ mod tests {
         );
 
         // A non-matching glob filters the file out entirely.
-        let args = GrepArgs {
-            pattern: "hello".to_string(),
-            regex: false,
-            include: Some("*.py".to_string()),
-            path: Some(file_path.to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let mut args = test_args("hello", Some(&file_path));
+        args.include = Some("*.py".to_string());
         let result = tool.execute(args, None, None, None).unwrap();
         assert!(
-            result.is_empty(),
+            result.contains("No matches found."),
             "expected no match for *.py on test1.rs:\n{result}"
         );
     }
@@ -837,17 +1199,11 @@ mod tests {
         let tool = Grep;
         // Point path directly at a single file, not a directory.
         let file_path = dir.path().join("test1.rs");
-        let args = GrepArgs {
-            pattern: "hello".to_string(),
-            regex: false,
-            include: None,
-            path: Some(file_path.to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let args = test_args("hello", Some(&file_path));
         let result = tool.execute(args, None, None, None).unwrap();
         assert!(
-            !result.is_empty(),
-            "expected match when path points directly to a file, got empty"
+            !result.contains("No matches found."),
+            "expected match when path points directly to a file, got:\n{result}"
         );
         assert!(
             result.contains("test1.rs:1:fn hello()"),
@@ -860,22 +1216,16 @@ mod tests {
         let dir = setup_test_dir();
         let tool = Grep;
         // Pattern contains | but regex:false — no file contains literal "foo|bar".
-        let args = GrepArgs {
-            pattern: "foo|bar".to_string(),
-            regex: false,
-            include: None,
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let args = test_args("foo|bar", Some(dir.path()));
         let result = tool.execute(args, None, None, None).unwrap();
-        // Should get the hint, not empty.
+        // Should get the message plus a hint, not an empty string.
         assert!(
-            !result.is_empty(),
-            "expected a hint about regex metacharacters, got empty"
+            result.contains("No matches found."),
+            "expected explicit no-match message:\n{result}"
         );
         assert!(
-            result.contains("regex metacharacters"),
-            "expected hint containing 'regex metacharacters', got:\n{result}"
+            result.contains("regex:true"),
+            "expected hint pointing at regex:true:\n{result}"
         );
     }
 
@@ -883,20 +1233,19 @@ mod tests {
     fn test_no_hint_when_regex_enabled() {
         let dir = setup_test_dir();
         let tool = Grep;
-        // regex:true, so no hint should be given even if pattern has metacharacters.
-        // Pattern doesn't match anything as a regex either.
-        let args = GrepArgs {
-            pattern: "zxyz|quux".to_string(),
-            regex: true,
-            include: None,
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        // regex:true, so no hint should be given even if pattern has
+        // metacharacters. Pattern doesn't match anything as a regex either.
+        let mut args = test_args("zxyz|quux", Some(dir.path()));
+        args.regex = true;
         let result = tool.execute(args, None, None, None).unwrap();
-        // Empty because foo|bar as regex matches nothing in the test dir.
+        // Explicit no-match message, but no "matched literally" hint.
         assert!(
-            result.is_empty(),
-            "expected empty result with regex:true (no match), got:\n{result}"
+            result.contains("No matches found."),
+            "expected no-match message:\n{result}"
+        );
+        assert!(
+            !result.contains("Note: pattern matched literally"),
+            "expected no hint with regex:true:\n{result}"
         );
     }
 
@@ -905,15 +1254,12 @@ mod tests {
         let dir = setup_test_dir();
         let tool = Grep;
         // Pattern has no regex chars and returns results — no hint.
-        let args = GrepArgs {
-            pattern: "hello".to_string(),
-            regex: false,
-            include: None,
-            path: Some(dir.path().to_str().unwrap().to_string()),
-            max_results: None,
-        };
+        let args = test_args("hello", Some(dir.path()));
         let result = tool.execute(args, None, None, None).unwrap();
-        assert!(!result.is_empty(), "expected results, got empty");
+        assert!(
+            !result.contains("No matches found."),
+            "expected results, got:\n{result}"
+        );
         // Should not contain a hint about regex.
         assert!(
             !result.contains("regex"),
