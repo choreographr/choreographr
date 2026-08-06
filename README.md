@@ -158,21 +158,21 @@ after Choreographr.
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Daemon + multi-client | ✅ | ✅ | — | server | — | — | server | — | ✅ | ✅ | ✅ | — | ✅ daemon | — | ✅ | — | server |
 | Providers | 79/3 proto | 40+ | 34 | 15 | 1 (OpenAI) | 42/9 proto | 39 | agnostic | agnostic | agnostic | 5 (drives) | 8 | 6 | 28 | multi | 36 | 5 |
-| OAuth | — | ✅ | ✅ 6× | ✅ | ✅ ChatGPT | ✅ | — | — | — | ✅ | — | ✅ | ✅ device | ✅ | ✅ subs | ✅ | ✅ MCP |
+| OAuth | coming | ✅ | ✅ 6× | ✅ | ✅ ChatGPT | ✅ | — | — | — | ✅ | — | ✅ | ✅ device | ✅ | ✅ subs | ✅ | ✅ MCP |
 | Credential rotation/fallback | retry only | ✅ failover | ✅ pool | — | — | — | — | — | — | — | — | ✅ fallback | ✅ | — | — | — | ✅ |
-| Tool permission gating | — | ✅ | env-only | ✅ | ✅ | — | ✅ | — | — | — | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ judge |
-| Compaction | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | ✅ | — | ✅ | ✅ | ✅ | ✅ |
-| Sandbox | RISC-V VM | Docker/SSH | Docker/SSH | — | ✅ sandbox | — | — | — | — | — | — | iSH/PRoot | — | — | — | seccomp eng. | OpenShell |
+| Tool permission gating | coming | ✅ | env-only | ✅ | ✅ | — | ✅ | — | — | — | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ judge |
+| Compaction | coming | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | ✅ | — | ✅ | ✅ | ✅ | ✅ |
+| Sandbox | RISC-V VM · Landlock/Seatbelt coming soon | Docker/SSH | Docker/SSH | — | ✅ sandbox | — | — | — | — | — | — | iSH/PRoot | — | — | — | seccomp eng. | OpenShell |
 | Subagents | subsessions | swarm | delegation | ✅ | ✅ | — | — | subgraphs | agent pool | — | — | — | ✅ | — | ✅ graph | specialists | workstreams |
 | Skills (SKILL.md) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | — | — | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | MCP client | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | ✅ | ✅ meta | — | ✅ | — | — | ✅ | ✅ | ✅ (OAuth) |
 | ACP | bridge | bridge | ✅ | ✅ | — | — | server | — | harness | — | — | — | — | — | — | ✅ | — |
 | IM surfaces | Telegram | 25+ | 20+ | — | — | — | — | — | chat natively | — | — | — | CLI/Web/Telegram | — | — | — | 2 |
-| Web search | — | ✅ | ✅ | ✅ | ✅ | — | — | — | — | — | — | — | ✅ | — | ✅ | ✅ | ✅ |
-| Hooks/lifecycle | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | — | — | — | ✅ | — |
-| Plugins | — | ✅ | ✅ | ✅ | ✅ | ✅ | — | — | — | ✅ | — | — | — | — | — | ✅ | — |
-| Cron/scheduling | — | — | ✅ | — | — | — | ✅ | — | ✅ | — | — | — | ✅ | — | ✅ | ✅ | — |
-| Long-term memory | — | ✅ | ✅ | — | ✅ | — | — | ✅ | — | — | — | ✅ | ✅ | — | — | — | ✅ |
+| Web search | coming | ✅ | ✅ | ✅ | ✅ | — | — | — | — | — | — | — | ✅ | — | ✅ | ✅ | ✅ |
+| Hooks/lifecycle | coming | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | — | — | — | ✅ | — |
+| Plugins | coming | ✅ | ✅ | ✅ | ✅ | ✅ | — | — | — | ✅ | — | — | — | — | — | ✅ | — |
+| Cron/scheduling | coming | — | ✅ | — | — | — | ✅ | — | ✅ | — | — | — | ✅ | — | ✅ | ✅ | — |
+| Long-term memory | coming | ✅ | ✅ | — | ✅ | — | — | ✅ | — | — | — | ✅ | ✅ | — | — | — | ✅ |
 | Encrypted creds | ✅ unique | ✅ | — | — | ✅ keyring | — | ✅ keyring | — | NIP auth | ✅ | ✅ | ✅ keychain | — | 0600 | — | ✅ | ✅ Fernet |
 | Storage | redb | SQLite | SQLite | event src | SQLite | JSONL | SQLite | SQLite/Postgres | Postgres | fs | — | SQLite | SQLite+JSONL | JSONL | SQLite | fs JSONL | SQL/Postgres |
 | Metrics | ✅ | ✅ OTel | — | — | ✅ OTel | telemetry | telemetry | — | — | — | — | — | — | — | — | — | ✅ |
