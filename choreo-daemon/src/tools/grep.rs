@@ -132,6 +132,36 @@ fn empty_result(pattern: &str, regex: bool) -> String {
     }
 }
 
+/// Escape control characters in matched line *content* — while keeping tabs
+/// literal — so a pathological or hostile line (embedded ESC, backspace,
+/// carriage return, BEL, …) cannot corrupt the line-oriented output or inject
+/// terminal escape sequences. Path labels go through the stricter
+/// [`sanitize_name`] (which also escapes tabs); tabs inside content are
+/// ubiquitous in code and harmless, so escaping them would mangle ordinary
+/// source output.
+fn sanitize_content(content: &str) -> String {
+    // Fast path: ASCII printables plus tabs — nothing to escape. Multi-byte
+    // UTF-8 bytes are all >= 0x80, so this also covers valid non-ASCII text.
+    if content
+        .bytes()
+        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
+    {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(content.len());
+    for c in content.chars() {
+        if c.is_control() && c != '\t' {
+            // escape_default renders the special escapes (`\t`, `\r`, `\n`,
+            // …) and everything else control-related as `\u{...}` — all inert
+            // ASCII text, so nothing terminal-affecting leaks.
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// One renderable unit from a file's search, in stream order.
 #[derive(Debug, Clone)]
 enum GrepItem {
@@ -197,13 +227,11 @@ impl GrepSink {
     }
 
     /// Called by the walk loop before searching each file. Records the file
-    /// being searched (grep-searcher's `SinkMatch` has no path) and opens the
-    /// per-mode state for this file.
+    /// being searched (grep-searcher's `SinkMatch` has no path). Per-file
+    /// output buckets are opened lazily by [`GrepSink::push_item`], so a file
+    /// that yields no output never allocates one.
     fn begin_file(&mut self, path: &Path) {
         self.current_path = path.to_path_buf();
-        if self.output_mode == GrepOutputMode::Content {
-            self.content_files.push((path.to_path_buf(), Vec::new()));
-        }
     }
 
     /// Called by the walk loop after searching each file. Count mode flushes
@@ -219,6 +247,30 @@ impl GrepSink {
             }
         }
     }
+
+    /// Append an item for the currently-searched file, opening a per-file
+    /// bucket lazily on the first item. Files are searched strictly one at a
+    /// time and never reopened, so the open bucket (if any) always belongs to
+    /// the current file; every bucket this creates holds at least one item. A
+    /// `Break` with no open bucket is a separator with nothing to separate —
+    /// dropped rather than rendered as a stray `--`.
+    fn push_item(&mut self, item: GrepItem) {
+        let matches_current = self
+            .content_files
+            .last()
+            .map(|(p, _)| p == &self.current_path)
+            .unwrap_or(false);
+        if !matches_current {
+            if matches!(item, GrepItem::Break) {
+                return;
+            }
+            self.content_files
+                .push((self.current_path.clone(), Vec::new()));
+        }
+        if let Some((_, items)) = self.content_files.last_mut() {
+            items.push(item);
+        }
+    }
 }
 
 impl Sink for GrepSink {
@@ -229,20 +281,21 @@ impl Sink for GrepSink {
             return Ok(false);
         }
         let line_number = mat.line_number().unwrap_or(0);
-        // SinkMatch bytes include the line terminator (\n). Strip it so that
-        // joining results with "\n" does not produce blank lines.
-        let content = String::from_utf8_lossy(mat.bytes())
-            .trim_end_matches('\n')
-            .to_string();
 
         match self.output_mode {
             GrepOutputMode::Content => {
-                if let Some((_, items)) = self.content_files.last_mut() {
-                    items.push(GrepItem::Match {
-                        line_number,
-                        content,
-                    });
-                }
+                // SinkMatch bytes include the line terminator — strip it (and
+                // a CR for CRLF files) so joining results with "\n" does not
+                // produce blank lines, then escape any remaining control
+                // characters so a hostile line cannot inject terminal escapes
+                // into the tool result.
+                let content = sanitize_content(
+                    String::from_utf8_lossy(mat.bytes()).trim_end_matches(['\n', '\r']),
+                );
+                self.push_item(GrepItem::Match {
+                    line_number,
+                    content,
+                });
                 self.content_match_count += 1;
                 if self.content_match_count >= self.max_results {
                     self.done = true;
@@ -283,23 +336,18 @@ impl Sink for GrepSink {
         if self.done {
             return Ok(false);
         }
-        if let Some((_, items)) = self.content_files.last_mut() {
-            items.push(GrepItem::Context {
-                line_number: ctx.line_number().unwrap_or(0),
-                content: String::from_utf8_lossy(ctx.bytes())
-                    .trim_end_matches('\n')
-                    .to_string(),
-            });
-        }
+        self.push_item(GrepItem::Context {
+            line_number: ctx.line_number().unwrap_or(0),
+            content: sanitize_content(
+                String::from_utf8_lossy(ctx.bytes()).trim_end_matches(['\n', '\r']),
+            ),
+        });
         Ok(true)
     }
 
     fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
-        if !self.done
-            && self.output_mode == GrepOutputMode::Content
-            && let Some((_, items)) = self.content_files.last_mut()
-        {
-            items.push(GrepItem::Break);
+        if !self.done && self.output_mode == GrepOutputMode::Content {
+            self.push_item(GrepItem::Break);
         }
         Ok(true)
     }
@@ -326,10 +374,9 @@ fn path_label(path: &Path, resolved: &Path, single_file: bool) -> String {
 /// context are separated by `--`.
 fn render_content(sink: &GrepSink, resolved: &Path, single_file: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
+    // Buckets are never empty (push_item opens one only to fill it), so no
+    // empty-skip is needed here.
     for (path, items) in &sink.content_files {
-        if items.is_empty() {
-            continue;
-        }
         let label = sanitize_name(&path_label(path, resolved, single_file));
         for item in items {
             match item {
@@ -399,12 +446,30 @@ fn finish_grep(
         GrepOutputMode::FilesWithMatches => render_files(&sink, resolved, single_file),
         GrepOutputMode::Count => render_count(&sink, resolved, single_file),
     };
+    let result_count = match sink.output_mode {
+        GrepOutputMode::Content => sink.content_match_count,
+        GrepOutputMode::FilesWithMatches => sink.matched_files.len(),
+        GrepOutputMode::Count => sink.count_entries.len(),
+    };
+    tracing::debug!(
+        path = %resolved.display(),
+        output_mode = %sink.output_mode,
+        result_count,
+        truncated = sink.done,
+        "grep search finished"
+    );
     let noun = if sink.output_mode == GrepOutputMode::Content {
         "matches"
     } else {
         "files"
     };
-    assemble_grep_output(body, sink.done, sink.max_results, noun)
+    // For a directly-named single file, the file-capped modes are provably
+    // complete once that one file is searched — the cap (≥ 1) was necessarily
+    // met, so claiming truncation would be misleading. Content mode keeps the
+    // marker because the searcher may genuinely have stopped mid-file at the
+    // cap.
+    let truncated = sink.done && !(single_file && sink.output_mode != GrepOutputMode::Content);
+    assemble_grep_output(body, truncated, sink.max_results, noun)
 }
 
 /// Parsed search configuration, shared by `run_grep_walk` and the `Tool`
@@ -430,6 +495,17 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
         include,
         max_results,
     } = config;
+
+    tracing::debug!(
+        path = %resolved.display(),
+        pattern = %pattern,
+        regex,
+        ignore_case,
+        context,
+        output_mode = %output_mode,
+        max_results,
+        "grep walk starting"
+    );
 
     // Build the pattern matcher: literal text or regex depending on flags.
     // `case_insensitive` applies to both paths (mirrors rg --ignore-case).
@@ -611,7 +687,12 @@ impl Tool for Grep {
             parts.push(" Ignoring case.".to_string());
         }
         if args.context > 0 {
-            parts.push(format!(" Showing {} context line(s).", args.context));
+            // Report the value the searcher will actually apply — out-of-range
+            // requests are clamped to MAX_CONTEXT_LINES, so advertising e.g.
+            // "1000 context line(s)" while 100 are shown would mislead the
+            // model.
+            let shown = args.context.min(MAX_CONTEXT_LINES);
+            parts.push(format!(" Showing {shown} context line(s)."));
         }
         if args.output_mode != GrepOutputMode::Content {
             parts.push(format!(" Output mode: {}.", args.output_mode));
@@ -860,6 +941,65 @@ mod tests {
     }
 
     #[test]
+    fn test_crlf_content_strips_carriage_return() {
+        // grep-searcher hands back the line *including* its terminator; for a
+        // CRLF file that is `\r\n`. The `\r` must be stripped (and any
+        // mid-line CR escaped) so the line-oriented output stays clean.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("crlf.txt"), b"hello world\r\nfoo\r\n").expect("write");
+
+        let tool = Grep;
+        let args = test_args("hello", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            result.contains("crlf.txt:1:hello world"),
+            "expected match without CR:\n{result:?}"
+        );
+        assert!(
+            !result.contains('\r'),
+            "carriage return must not leak:\n{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_content_control_chars_escaped() {
+        // An embedded ESC simulates a terminal-escape injection attempt; the
+        // matched content must render it as inert ASCII instead of passing the
+        // raw byte through to the TUI.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("esc.txt"), b"hello \x1b[31mred\x1b[0m\n").expect("write");
+
+        let tool = Grep;
+        let args = test_args("hello", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        // escape_default renders ESC as the literal ASCII `\u{1b}`.
+        assert!(
+            result.contains("\\u{1b}"),
+            "ESC must be escaped:\n{result:?}"
+        );
+        assert!(
+            !result.contains('\x1b'),
+            "raw ESC must not pass through:\n{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_content_tabs_preserved() {
+        // Tabs are legitimate code content and harmless in terminal output;
+        // escaping them would mangle every tab-indented source line.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("tabbed.txt"), "hello\tworld\n").expect("write");
+
+        let tool = Grep;
+        let args = test_args("hello", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            result.contains("hello\tworld"),
+            "tabs are legitimate content:\n{result:?}"
+        );
+    }
+
+    #[test]
     fn test_context_lines() {
         let dir = TempDir::new().expect("temp dir");
         {
@@ -1027,6 +1167,33 @@ mod tests {
     }
 
     #[test]
+    fn test_single_file_files_mode_no_truncation_marker() {
+        // A directly-named single file in the file-capped modes is provably
+        // complete once that one file is searched — the cap (≥ 1) was
+        // necessarily met, so claiming truncation would be misleading.
+        let dir = setup_test_dir();
+        let file_path = dir.path().join("data.txt");
+        let tool = Grep;
+        let mut args = test_args("world", Some(&file_path));
+        args.output_mode = GrepOutputMode::FilesWithMatches;
+        args.max_results = Some(1);
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "data.txt", "got:\n{result}");
+    }
+
+    #[test]
+    fn test_single_file_count_mode_no_truncation_marker() {
+        let dir = setup_test_dir();
+        let file_path = dir.path().join("data.txt");
+        let tool = Grep;
+        let mut args = test_args("world", Some(&file_path));
+        args.output_mode = GrepOutputMode::Count;
+        args.max_results = Some(1);
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "data.txt: 2", "got:\n{result}");
+    }
+
+    #[test]
     fn describe_invocation_includes_pattern_and_path() {
         let tool = Grep;
         let args = test_args("fn main", Some(Path::new("src")));
@@ -1067,6 +1234,25 @@ mod tests {
         assert!(desc.contains("Output mode: count."));
         assert!(desc.contains("Include pattern: `*.rs`."));
         assert!(desc.contains("Max results: 25."));
+    }
+
+    #[test]
+    fn describe_invocation_clamps_context() {
+        // Out-of-range context requests are clamped to MAX_CONTEXT_LINES at
+        // execution; the invocation description must report the value the
+        // searcher will actually apply, not the raw request.
+        let tool = Grep;
+        let mut args = test_args("foo", None);
+        args.context = 500;
+        let desc = tool.describe_invocation(&args);
+        assert!(
+            desc.contains("Showing 100 context line(s)."),
+            "clamped context should be reported: {desc}"
+        );
+        assert!(
+            !desc.contains("500"),
+            "unclamped context must not be advertised: {desc}"
+        );
     }
 
     #[test]
