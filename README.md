@@ -3,7 +3,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue" alt="Apache 2.0"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-2024_edition-orange" alt="Rust 2024"></a>
-  <img src="https://img.shields.io/badge/providers-30+-brightgreen" alt="30+ providers">
+  <img src="https://img.shields.io/badge/providers-79+-brightgreen" alt="79+ providers">
   <img src="https://img.shields.io/badge/wire_protocols-3-lightgrey" alt="3 wire protocols">
   <a href="https://t.me/choreographr"><img src="https://img.shields.io/badge/Telegram-Choreographr_Community-2CA5E0?logo=telegram&logoColor=white" alt="Telegram community"></a>
 </p>
@@ -151,28 +151,35 @@ Choreographr will have an option to automate this process, so it can be left alo
 
 ## Comparison to other agents
 
-| Feature | Choreo | zero | goose | pi | opencode | hermes | turnstone | openclaw | buzz | OpenMinis | langgraph | tau | mercury | openwork | t3code | herdr |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Daemon + multi-client | ✅ | — | server | — | — | — | server | ✅ | ✅ | — | — | — | — | ✅ | ✅ | — |
-| Providers | ~30/3 proto | 36 | 35+ | 38/9 proto | 15 | 29+ | 5 | 40+ | agnostic | 8 | agnostic | 9 | 11 | agnostic | 5 | n/a |
-| OAuth | — | ✅ | — | ✅ | ✅ | ✅ 6× | ✅ MCP | ✅ | — | ✅ | — | ✅ | ✅ | ✅ | — | — |
-| Credential rotation/fallback | retry only | — | — | — | — | ✅ pool | ✅ | ✅ failover | — | ✅ fallback | — | — | ✅ | — | — | — |
-| Tool permission gating | — | ✅ | ✅ | ✅ | ✅ | env-only | ✅ judge | ✅ | — | ✅ | — | — | — | — | — | — |
-| Compaction | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | — | — | — | — | — |
-| Sandbox | RISC-V VM | seccomp eng. | — | — | — | Docker/SSH | OpenShell | Docker/SSH | — | iSH/PRoot | — | — | — | worker | — | — |
-| Subagents | subsessions | specialists | — | — | — | delegation | workstreams | swarm | agent pool | — | subgraphs | — | — | — | multi-agent | — |
-| Skills (SKILL.md) | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | ✅ | — | — |
-| MCP client | ✅ | ✅ | ✅ | — | ✅ | — | ✅ (OAuth) | ✅ | ✅ | ✅ | — | — | — | ✅ meta | — | — |
-| ACP | bridge | — | server | — | — | — | — | bridge | harness | — | — | — | — | — | — | — |
-| IM surfaces | Telegram | — | — | — | — | 20+ | 2 | 25+ | chat natively | — | — | — | — | — | — | — |
-| Web search | — | ✅ | — | — | ✅ | ✅ | ✅ | ✅ | — | — | — | — | — | — | — | — |
-| Hooks/lifecycle | — | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ | — | — | — | — | — | — | — |
-| Plugins | — | ✅ | — | ✅ | ✅ | ✅ | — | ✅ | — | — | — | — | — | ✅ | — | — |
-| Encrypted creds | ✅ unique | ✅ | ✅ keyring | — | — | — | ✅ Fernet | ✅ | NIP auth | ✅ keychain | — | 0600 | — | ✅ | ✅ | — |
-| Storage | redb | fs JSONL | SQLite | JSONL | event src | SQLite | SQL/Postgres | SQLite | Postgres | SQLite | SQLite/Postgres | — | — | fs+MySQL | — | — |
-| Metrics | ✅ | — | telemetry | — | — | — | ✅ | ✅ OTel | — | — | — | — | — | — | — | — |
-| Undo/redo | ✅ | rewind | — | branch | — | — | replay | — | — | fork | time-travel | — | — | — | — | — |
-| Context fingerprints | ✅ | partial | — | — | — | — | ✅ | — | — | — | — | — | — | — | — | — |
+Feature matrix against every project in `~/agents` (snapshot as of Aug 2026, on each
+repo's current `main`). `herdr` is a terminal multiplexer that hosts other agents
+rather than an agent itself; `skills` is a SKILL.md collection, not an agent — both
+are included for reference.
+
+| Feature | Choreo | zero | goose | pi | opencode | codex | hermes | turnstone | openclaw | buzz | maka-agent | OpenMinis | langgraph | tau | mercury | openwork | t3code | herdr |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Daemon + multi-client | ✅ | — | server | — | server | — | — | server | ✅ | ✅ | ✅ | — | — | — | ✅ daemon | ✅ | ✅ | — |
+| Providers | 79/3 proto | 36 | 39 | 42/9 proto | 15 | 1 (OpenAI) | 34 | 5 | 40+ | agnostic | multi | 8 | agnostic | 28 | 6 | agnostic | 5 (drives) | n/a |
+| OAuth | — | ✅ | — | ✅ | ✅ | ✅ ChatGPT | ✅ 6× | ✅ MCP | ✅ | — | ✅ subs | ✅ | — | ✅ | ✅ device | ✅ | — | — |
+| Credential rotation/fallback | retry only | — | — | — | — | — | ✅ pool | ✅ | ✅ failover | — | — | ✅ fallback | — | — | ✅ | — | — | — |
+| Tool permission gating | — | ✅ | ✅ | — | ✅ | ✅ | env-only | ✅ judge | ✅ | — | ✅ | ✅ | — | — | ✅ | — | ✅ | — |
+| Compaction | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | — |
+| Sandbox | RISC-V VM | seccomp eng. | — | — | — | ✅ sandbox | Docker/SSH | OpenShell | Docker/SSH | — | — | iSH/PRoot | — | — | — | — | — | — |
+| Subagents | subsessions | specialists | — | — | ✅ | ✅ | delegation | workstreams | swarm | agent pool | ✅ graph | — | subgraphs | — | ✅ | — | — | — |
+| Skills (SKILL.md) | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ | — | ✅ | ✅ | ✅ | — | — |
+| MCP client | ✅ | ✅ | ✅ | — | ✅ | ✅ | ✅ | ✅ (OAuth) | ✅ | ✅ | ✅ | ✅ | — | — | — | ✅ meta | — | — |
+| ACP | bridge | ✅ | server | — | ✅ | — | ✅ | — | bridge | harness | — | — | — | — | — | — | — | — |
+| IM surfaces | Telegram | — | — | — | — | — | 20+ | 2 | 25+ | chat natively | — | — | — | — | CLI/Web/Telegram | — | — | — |
+| Web search | — | ✅ | — | — | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | ✅ | — | — | — |
+| Hooks/lifecycle | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — | ✅ | ✅ | — | — | — | — | — | — | — | — |
+| Plugins | — | ✅ | — | ✅ | ✅ | ✅ | ✅ | — | ✅ | — | — | — | — | — | — | ✅ | — | ✅ |
+| Cron/scheduling | — | ✅ | ✅ | — | — | — | ✅ | — | — | ✅ | ✅ | — | — | — | ✅ | — | — | — |
+| Long-term memory | — | — | — | — | — | ✅ | ✅ | ✅ | ✅ | — | — | ✅ | ✅ | — | ✅ | — | — | — |
+| Encrypted creds | ✅ unique | ✅ | ✅ keyring | — | — | ✅ keyring | — | ✅ Fernet | ✅ | NIP auth | — | ✅ keychain | — | 0600 | — | ✅ | ✅ | — |
+| Storage | redb | fs JSONL | SQLite | JSONL | event src | SQLite | SQLite | SQL/Postgres | SQLite | Postgres | SQLite | SQLite | SQLite/Postgres | JSONL | SQLite+JSONL | fs | — | — |
+| Metrics | ✅ | — | telemetry | telemetry | — | ✅ OTel | — | ✅ | ✅ OTel | — | — | — | — | — | — | — | — | — |
+| Undo/redo | ✅ | rewind | — | branch | — | — | ✅ | replay | — | — | — | — | time-travel | — | — | — | — | — |
+| Context fingerprints | ✅ | partial | — | — | — | — | — | ✅ | — | — | — | — | — | — | — | — | — | — |
 
 
 ## Quick start
@@ -242,7 +249,7 @@ data model.
 | Crate | Description |
 |---|---|
 | `choreo-daemon` | The core engine — binary `choreographr`. Unix socket server that validates credentials, manages persistent sessions (with sub-sessions and working directories), runs requests with a tool-call loop, and streams responses |
-| `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (70+ providers) |
+| `choreo-ai-protocols` | Provider protocols — OpenAI-compatible, Anthropic Messages, and Google Gemini clients, the `ProviderClient` trait, and the provider catalog (79+ providers) |
 | `choreo-proto` | Framed binary protocol (postcard + length prefix) shared between clients and daemon |
 | `choreo-keystore` | X25519 keypair + ECDH/AES-256-GCM crypto library for encrypted credentials |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
@@ -352,7 +359,7 @@ streaming = false
 retry_max_attempts = 3
 ```
 
-Supported providers: all entries in the provider catalog — 70+ across three
+Supported providers: all entries in the provider catalog — 79+ across three
 wire protocols (OpenAI-compatible, Anthropic Messages, Google Generative AI).
 Each provider has its own data file under
 `choreo-ai-protocols/src/catalog/<slug>.toml` (one file per provider,

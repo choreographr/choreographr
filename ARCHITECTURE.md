@@ -18,7 +18,7 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 │   choreo-im     │◄──────────────────►│              │◄──────────────►│  Mistral API          │
 │ (IM bridge)  │    Unix socket     │              │                ├──────────────────────┤
 └──────────────┘                    └──────────────┘                └──────────────────────┘
-                                                                    │  30+ OpenAI-compat    │
+                                                                    │  70+ OpenAI-compat    │
                                                                     │  providers via catalog│
                                                                     └──────────────────────┘
 ```
@@ -435,7 +435,7 @@ A `ProviderEntry` (loaded from its TOML file) maps each provider slug to:
 
 Model-level reasoning is resolved at runtime by `model_reasoning_capability()`, which returns a `ReasoningCapability` with the model's available effort slugs. Providers without explicit entries fall back to protocol defaults (`off/low/medium/high` for OpenAI & Anthropic, `off/on` for Google).
 
-Currently supports 70+ providers. Adding a new OpenAI-compatible provider requires only a catalog TOML file (and a line in `loader.rs`'s `include_str!` list) — zero client code.
+Currently supports 79+ providers. Adding a new OpenAI-compatible provider requires only a catalog TOML file (and a line in `loader.rs`'s `include_str!` list) — zero client code.
 
 **Supported providers by protocol:**
 
