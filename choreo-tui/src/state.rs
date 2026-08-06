@@ -2453,11 +2453,22 @@ impl App {
     pub(crate) fn handle_session_created(
         &mut self,
         session_id: u64,
+        parent_session_id: Option<u64>,
         account_name: Option<String>,
         selected_model: Option<String>,
         reasoning_effort: Option<String>,
         client_tx: &std::sync::mpsc::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
+        // Agent-spawned sub-sessions (parent_session_id = Some) are transient
+        // tool artifacts, not sessions the user opened.  Auto-attaching to one
+        // would hijack the Chat view away from the session the user is reading
+        // and destroy its scroll position, so treat it like an already-known
+        // background session: refresh the session list so the session manager
+        // sees it, and do nothing else.
+        if parent_session_id.is_some() {
+            let _ = client_tx.send(ClientMessage::ListSessions);
+            return Ok(());
+        }
         if self.page == Page::SessionManager {
             let _ = client_tx.send(ClientMessage::ListSessions);
         } else {

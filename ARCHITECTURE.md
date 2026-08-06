@@ -1628,9 +1628,12 @@ The same rule extends to every other per-session status message the daemon
 broadcasts over the all-activity subscription.  `ModelSelected`,
 `ReasoningEffortSet`, `ReasoningEffortSetFailed` and `SessionAccountSet`
 are routed to the display of the session they belong to (and only touch the
-status bar's identity fields when that session is the attached one) — a
+status bar's identity fields when that session is the attached one), and for
+a non-attached session the `connection.rs` handler returns before the generic
+dispatch so the global status/error line is not rewritten either — a
 background session changing its model, reasoning effort or account must not
-rewrite the fields of the session on screen.
+rewrite the fields of the session on screen, nor reflow its viewport via a
+status-height change.
 
 Two session-switch details keep the status bar honest after switching into
 a streaming session:
@@ -1644,6 +1647,12 @@ counts survive the attach instead of regressing.
   `last_modified` is bumped each time one of their requests completes and
   would otherwise hijack the view) and sets attachment state immediately so a
   second `Sessions` reply cannot re-fire the attach to a different session.
+- `SessionCreated` for a sub-session (`parent_session_id = Some`)
+  — e.g. from `spawn_subsession` — is likewise treated as background noise:
+  the TUI refreshes the session list but neither `reset_for_session_switch`
+  nor `AttachSession` runs, so a spawned sub-session cannot hijack the Chat
+  view away from the session the user is reading.  User-created sessions
+  (`parent_session_id = None`) keep the auto-attach behavior.
 
 
 ---

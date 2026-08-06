@@ -1768,6 +1768,7 @@ pub(crate) fn handle_daemon_message(
     match &message {
         DaemonMessage::SessionCreated {
             session_id,
+            parent_session_id,
             account_name,
             selected_model,
             reasoning_effort,
@@ -1784,6 +1785,7 @@ pub(crate) fn handle_daemon_message(
             }
             app.handle_session_created(
                 *session_id,
+                *parent_session_id,
                 account_name.clone(),
                 selected_model.clone(),
                 reasoning_effort.clone(),
@@ -1962,12 +1964,33 @@ pub(crate) fn handle_daemon_message(
             reasoning_capability,
             ..
         } => {
+            // Route the per-session display update to whichever session the
+            // message belongs to (never the viewed one when they differ).
             app.handle_model_selected(*session_id, model, reasoning_capability.clone());
+            if app.attached_session_id != Some(*session_id) {
+                // Background session: stop here so the generic dispatch's
+                // "[daemon] selected model: …" status write does not rewrite
+                // the global status line the user is looking at (which would
+                // reflow the viewed viewport).
+                return Ok(());
+            }
+            // Attached session: fall through so the user's own `/model`
+            // command still prints its confirmation to the status line.
         }
         DaemonMessage::ReasoningEffortSet {
             session_id, effort, ..
         } => {
+            // Route the per-session display update to whichever session the
+            // message belongs to (never the viewed one when they differ).
             app.handle_reasoning_effort_set(*session_id, effort.clone());
+            if app.attached_session_id != Some(*session_id) {
+                // Background session: stop here so the generic dispatch's
+                // "[daemon] reasoning effort: …" status write does not
+                // rewrite the global status line.
+                return Ok(());
+            }
+            // Attached session: fall through so the user's own `/reasoning`
+            // command still prints its confirmation to the status line.
         }
         DaemonMessage::ReasoningEffortSetFailed {
             session_id,
@@ -1980,6 +2003,16 @@ pub(crate) fn handle_daemon_message(
             // session's rejection must not flip the viewed session's effort.
             let display = app.display_for(*session_id);
             display.reasoning_effort = Some("off".to_string());
+            if app.attached_session_id != Some(*session_id) {
+                // Background session: stop here so neither the status-line
+                // notice below nor the generic dispatch's `app.error` write
+                // can clobber the global status/error line for a session the
+                // user is not viewing.
+                return Ok(());
+            }
+            // Attached session: the user's own `/reasoning` command failed —
+            // surface the rejection notice and fall through so the generic
+            // dispatch records the error as well.
             app.status = Some(format!("reasoning effort rejected: {error}"));
         }
         DaemonMessage::SessionAccountSet {
@@ -1987,7 +2020,17 @@ pub(crate) fn handle_daemon_message(
             account,
             ..
         } => {
+            // Route the per-session display update to whichever session the
+            // message belongs to (never the viewed one when they differ).
             app.handle_session_account_set(*session_id, account);
+            if app.attached_session_id != Some(*session_id) {
+                // Background session: stop here so the generic dispatch's
+                // "[daemon] session account set: …" status write does not
+                // rewrite the global status line.
+                return Ok(());
+            }
+            // Attached session: fall through so the user's own `/account`
+            // command still prints its confirmation to the status line.
         }
         DaemonMessage::ContextWindowResolved {
             session_id,
