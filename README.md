@@ -157,6 +157,7 @@ after Choreographr.
 | Feature | Choreo | openclaw | hermes | opencode | codex | pi | goose | langgraph | buzz | openwork | t3code | OpenMinis | mercury | tau | maka-agent | zero | turnstone |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Daemon + multi-client | ✅ | ✅ | — | server | — | — | server | — | ✅ | ✅ | ✅ | — | ✅ daemon | — | ✅ | — | server |
+| Concurrent sessions | ✅ daemon | ✅ gateway | ✅ capped | ✅ server | ✅ threads | — | ✅ server | ✅ framework | ✅ | — | ✅ | — | ✅ | — | ✅ | ✅ pool | ✅ |
 | Providers | 79/3 proto | 40+ | 34 | 15 | 1 (OpenAI) | 42/9 proto | 39 | agnostic | agnostic | agnostic | 5 (drives) | 8 | 6 | 28 | multi | 36 | 5 |
 | OAuth | coming | ✅ | ✅ 6× | ✅ | ✅ ChatGPT | ✅ | — | — | — | ✅ | — | ✅ | ✅ device | ✅ | ✅ subs | ✅ | ✅ MCP |
 | Credential rotation/fallback | retry only | ✅ failover | ✅ pool | — | — | — | — | — | — | — | — | ✅ fallback | ✅ | — | — | — | ✅ |
@@ -178,6 +179,64 @@ after Choreographr.
 | Metrics | ✅ | ✅ OTel | — | — | ✅ OTel | telemetry | telemetry | — | — | — | — | — | — | — | — | — | ✅ |
 | Undo/redo | ✅ | — | ✅ | — | — | branch | — | time-travel | — | — | — | — | — | — | — | rewind | replay |
 | Context fingerprints | ✅ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | partial | ✅ |
+
+### Concurrent sessions
+
+Choreographr's headline concurrency: one daemon runs many sessions at once — each
+session is an independent control thread with at most one request worker, sessions
+persist to `redb` and only wake when a client attaches, any number of clients can
+subscribe to the same session, and subsessions (children) run their own loops in
+parallel and can be interacted with independently. How the other agents compare:
+
+- **openclaw** — Gateway hosts many concurrent chat sessions; per-session actor
+  queues serialize ACP operations while the swarm tool fans out parallel subagents
+  (default `maxConcurrent: 8`).
+- **hermes** — Gateway processes messages concurrently via asyncio; a
+  `max_concurrent_sessions` cap (default unset = unlimited) limits simultaneous
+  active chat sessions, enforced via a cross-process lease file, with concurrent
+  turns on different sessions kept isolated.
+- **opencode** — Server mode (`opencode serve`) exposes sessions over HTTP; each
+  session runs one prompt at a time (a `SessionBusyError` rejects overlapping
+  runs) but many sessions run concurrently, and the TUI / web / desktop all attach
+  to the same server.
+- **codex** — App-server `ThreadManager` tracks a tree of threads; each thread has
+  its own serialized listener, subagents spawn as child threads (`spawn_subagent`),
+  and concurrent requests are tracked with unique in-flight IDs.
+- **pi** — Single-process CLI: sessions are JSONL files you resume or fork; within a
+  session, tool calls default to parallel execution (`toolExecution: "parallel"`)
+  but only one session runs per process.
+- **goose** — SessionManager over SQLite; the desktop app lists and switches many
+  sessions, and the ACP server multiplexes them, but each session handles one
+  prompt at a time.
+- **langgraph** — A framework rather than a daemon: durable execution keyed by
+  `thread_id`, subgraphs, and parallel graph branches give the building blocks;
+  concurrency is up to the hosting app.
+- **buzz** — Relay/ACP harness supports unlimited concurrent sessions
+  (`BUZZ_AGENT_MAX_SESSIONS`; one prompt per session at a time) with up to 8
+  parallel tool calls per turn, and agents are first-class members of shared
+  channels.
+- **openwork** — Desktop app with per-workspace session groups; it exposes
+  capabilities over MCP rather than running many sessions in parallel itself.
+- **t3code** — A control surface: one app drives Codex, Claude Code, Cursor, Grok
+  Build and OpenCode concurrently, each with its own sessions/panes.
+- **OpenMinis** — On-device agent with separate workspaces; tool calls run
+  concurrently (up to 10 via `TaskGroup`) and background sessions are supported,
+  but it is a mobile app rather than a multi-session server.
+- **mercury** — Background daemon with a pool of sub-agent workers (auto-scaled by
+  CPU cores, overridable); the main agent queues messages while busy, and board
+  batches run concurrently per batch.
+- **tau** — Single-session teaching harness: append-only JSONL sessions, resume and
+  branch, parallel tool calls within a turn, but one session at a time.
+- **maka-agent** — Runtime serves several concurrent runs; `ChildAgentRunLimiter`
+  (FIFO permits) caps real child-agent executions, and the Agent Graph runs a
+  supervisor that wakes on checkpoints.
+- **zero** — Daemon mode supervises a bounded pool of headless `zero exec` worker
+  processes (default pool size 4) routing multiple sessions over a local socket,
+  with read-only tool calls executed concurrently in a turn and specialist
+  subagents as separate sessions.
+- **turnstone** — Server runs many workstreams concurrently; each workstream gets
+  its own worker thread (queue-or-spawn decided under a lock), children spawn via
+  a coordinator, and parallel tool batches are judge-approved before execution.
 
 
 ## Quick start
