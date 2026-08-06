@@ -2019,7 +2019,7 @@ impl App {
     /// sentinel id 0 (GetReasoningEffort replies, "no session attached"
     /// errors), so the sentinel — like the attached session itself — keeps
     /// its fall-through feedback.  Only a message about a real session that
-    /// is not the one the user is viewing is suppressed.
+    /// is not the attached session is suppressed.
     pub(crate) fn is_background_session_message(&self, reported_session_id: u64) -> bool {
         reported_session_id != 0 && self.attached_session_id != Some(reported_session_id)
     }
@@ -2493,7 +2493,7 @@ impl App {
             tracing::info!(
                 session_id,
                 parent_session_id = parent_id,
-                "sub-session created — refreshing list without auto-attaching",
+                "sub-session created — not auto-attaching",
             );
         }
 
@@ -2502,6 +2502,13 @@ impl App {
             // here means the whole connection is tearing down, and the reply
             // renders into the session list (never the status line), so there
             // is nothing actionable to propagate.
+            if let Some(parent_id) = parent_session_id {
+                tracing::debug!(
+                    session_id,
+                    parent_session_id = parent_id,
+                    "refreshing session list so the sub-session is visible on the Session Manager page",
+                );
+            }
             let _ = client_tx.send(ClientMessage::ListSessions);
             return Ok(());
         }
@@ -2702,7 +2709,7 @@ impl App {
     /// display is updated; the status bar's provider slug and the session
     /// summary are refreshed only when the message belongs to the attached
     /// session (a background session's account change must not alter the
-    /// viewed session's identity fields).
+    /// attached session's identity fields).
     pub(crate) fn handle_session_account_set(&mut self, session_id: u64, account: &str) {
         let display = self.display_for(session_id);
         display.account_name = Some(account.to_owned());
@@ -3446,6 +3453,13 @@ impl TurnEventHandler for App {
         last_prompt_tokens: Option<u32>,
     ) {
         tracing::trace!(%request_id, "handle_done");
+        // The daemon only ever reports a real session id here (Done always
+        // comes from the session task, which knows its id), but resolve the
+        // 0-sentinel anyway so this choke point can never write a phantom
+        // session-0 display if a connection-level path is ever added.
+        let Some(session_id) = self.resolve_daemon_session(session_id) else {
+            return;
+        };
         let display = self.display_for(session_id);
         display.view.request_to_turn.remove(&request_id);
         display.active.remove(&request_id);
@@ -3466,6 +3480,16 @@ impl TurnEventHandler for App {
 
     fn handle_failed(&mut self, session_id: u64, request_id: u32, error: String) {
         tracing::trace!(%request_id, %error, "handle_failed");
+        // The daemon reports connection-level failures (e.g. "no session
+        // attached" from RunInput/SetModel/SetReasoningEffort with no
+        // attached session) with the sentinel id 0 meaning "the attached
+        // session".  Resolve it so the failure lands in the session the
+        // user is actually attached to rather than a phantom session-0
+        // display; with no attached session there is nothing to update.
+        let Some(session_id) = self.resolve_daemon_session(session_id) else {
+            tracing::debug!(%request_id, %error, "dropping failure: no attached session to route the 0-sentinel to");
+            return;
+        };
         let display = self.display_for(session_id);
         display.error = Some(error);
         display.view.request_to_turn.remove(&request_id);
@@ -6125,6 +6149,9 @@ mod tests {
     #[test]
     fn handle_done_fires_full_rebuild() {
         let mut app = test_app();
+        // test_app's default display lives on session 0; treat it as attached
+        // so the 0-sentinel resolution keeps routing to it.
+        app.attached_session_id = Some(0);
         app.history_viewport.width = 80;
         app.history_viewport.height = 200;
 
@@ -6155,6 +6182,9 @@ mod tests {
     #[test]
     fn handle_failed_clears_streaming() {
         let mut app = test_app();
+        // test_app's default display lives on session 0; treat it as attached
+        // so the 0-sentinel resolution keeps routing to it.
+        app.attached_session_id = Some(0);
         {
             let display = app.active_display().unwrap();
             display.streaming_turn_index = Some(0);
@@ -6170,6 +6200,25 @@ mod tests {
         assert!(display.error.is_some());
         assert!(display.markers_dirty, "markers_dirty should be set");
         assert!(display.content_dirty, "content_dirty should be set");
+    }
+
+    #[test]
+    fn handle_failed_sentinel_zero_resolves_to_attached_session_without_phantom_display() {
+        // A connection-level "no session attached" failure arrives with the
+        // sentinel id 0.  It must land in the attached session's display and
+        // must NOT create a phantom session-0 display entry.
+        let mut app = App::new();
+        app.attached_session_id = Some(42);
+        app.active_session_id = Some(42);
+
+        app.handle_failed(0, 7, "no session attached".into());
+
+        let display = app.display_for(42);
+        assert_eq!(display.error.as_deref(), Some("no session attached"));
+        assert!(
+            !app.session_displays.contains_key(&0),
+            "the 0-sentinel must not create a phantom session-0 display"
+        );
     }
 
     // ── ModelSelectorState ──

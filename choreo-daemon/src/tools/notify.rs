@@ -165,7 +165,9 @@ pub fn execute_notify_send(
     {
         let id = handle.id();
         tracing::info!(id, summary = %args.summary, "desktop notification sent");
-        return Ok(format!("Notification sent (id: {id})"));
+        // The cfg blocks below are mutually exclusive, so on this platform
+        // this block is the function's tail expression — no `return` needed.
+        Ok(format!("Notification sent (id: {id})"))
     }
 
     // macOS: the handle exposes no server-assigned ID — the platform has no

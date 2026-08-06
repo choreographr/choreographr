@@ -854,7 +854,13 @@ fn handle_chat_event(
                         tracing::debug!("Alt+Enter continuing generation");
                         let request_id = app.next_request_id;
                         app.next_request_id = app.next_request_id.wrapping_add(1);
-                        app.active_display().unwrap().active.insert(request_id);
+                        // The guard above already checked attached_session_id,
+                        // but the display entry may not exist yet — track the
+                        // in-flight request only when there is a display to
+                        // record it in, never panic on a missing one.
+                        if let Some(display) = app.active_display() {
+                            display.active.insert(request_id);
+                        }
                         client_tx
                             .send(ClientMessage::ContinueGeneration { request_id })
                             .map_err(broken_pipe)?;
@@ -978,7 +984,12 @@ fn handle_chat_event(
                             }
                             if let ClientMessage::RunInput { request_id, .. } = &message {
                                 app.error = None;
-                                app.active_display().unwrap().active.insert(*request_id);
+                                // The active display tracks in-flight request ids
+                                // for the spinner; with no session active there is
+                                // nothing to track, so skip instead of panicking.
+                                if let Some(display) = app.active_display() {
+                                    display.active.insert(*request_id);
+                                }
                             }
                             client_tx.send(message).map_err(broken_pipe)?;
 
@@ -1048,7 +1059,12 @@ fn handle_chat_event(
                             if app.attached_session_id.is_some() {
                                 let request_id = app.next_request_id;
                                 app.next_request_id = app.next_request_id.wrapping_add(1);
-                                app.active_display().unwrap().active.insert(request_id);
+                                // The guard above already checked attached_session_id,
+                                // but the display entry may not exist yet — only
+                                // track the request when there is a display to hold it.
+                                if let Some(display) = app.active_display() {
+                                    display.active.insert(request_id);
+                                }
                                 client_tx
                                     .send(ClientMessage::ContinueGeneration { request_id })
                                     .map_err(broken_pipe)?;
@@ -1120,12 +1136,11 @@ fn handle_chat_event(
                     let top_slot = 2 * mouse.row as usize;
                     let bot_slot = top_slot + 1;
 
-                    let marker_hit = app
-                        .active_display_ref()
-                        .unwrap()
-                        .markers
-                        .iter()
-                        .find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot);
+                    let marker_hit = app.active_display_ref().and_then(|d| {
+                        d.markers
+                            .iter()
+                            .find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot)
+                    });
 
                     if let Some(marker) = marker_hit {
                         app.scroll_to_content_line(marker.content_line);
@@ -1207,17 +1222,16 @@ fn handle_chat_event(
                             display.toggle_reasoning(turn_id);
                         }
                     } else if let Some((turn_idx, offset)) = find_turn_at_row(app, mouse.row)
-                        && let Some(layout) =
-                            app.active_display_ref().unwrap().turn_layouts.get(turn_idx)
+                        && let Some(layout) = app
+                            .active_display_ref()
+                            .and_then(|d| d.turn_layouts.get(turn_idx))
                         && let Some(img_idx) = layout
                             .image_ranges
                             .iter()
                             .position(|&(start, end)| offset >= start && offset < end)
                         && let Some(turn_id) = app
                             .active_display_ref()
-                            .unwrap()
-                            .visible_turn_ids
-                            .get(turn_idx)
+                            .and_then(|d| d.visible_turn_ids.get(turn_idx))
                             .copied()
                         && let Some(session_id) = app.active_session_id
                     {
@@ -2007,7 +2021,7 @@ pub(crate) fn handle_daemon_message(
             ..
         } => {
             // Route the per-session display update to whichever session the
-            // message belongs to (never the viewed one when they differ).
+            // message belongs to (never the attached one when they differ).
             let reported = *session_id;
             match route_session_update(app, reported, |app, session_id| {
                 app.handle_model_selected(session_id, model, reasoning_capability.clone());
@@ -2037,24 +2051,31 @@ pub(crate) fn handle_daemon_message(
             error,
             ..
         } => {
-            // The failure counterpart of ModelSelected above.  A background
-            // session's rejected selection must not clobber the global error
-            // line; the sentinel 0 ("no session attached") and the attached
-            // session keep their fall-through so the user sees the rejection
-            // of their own `/model` command.  There is no display to update —
-            // the selection failed, so nothing was recorded.
+            // The failure counterpart of ModelSelected above.  There is no
+            // display to update — the selection failed, so nothing was
+            // recorded — but routing through the shared helper keeps
+            // "resolved and gated as one operation" for every arm; the empty
+            // update closure is deliberate.  A background session's rejected
+            // selection must not clobber the global error line, while the
+            // sentinel 0 ("no session attached") and the attached session
+            // fall through so the user sees the rejection of their own
+            // `/model` command.
             let reported = *session_id;
-            if app.is_background_session_message(reported) {
-                tracing::debug!(
-                    session_id = reported,
-                    %model,
-                    %error,
-                    "suppressing status feedback for background session's model selection failure",
-                );
-                return Ok(());
+            match route_session_update(app, reported, |_, _| {}) {
+                SessionUpdateRouting::Suppress => {
+                    tracing::debug!(
+                        session_id = reported,
+                        %model,
+                        %error,
+                        "suppressing status feedback for background session's model selection failure",
+                    );
+                    return Ok(());
+                }
+                // Attached session (or the 0-sentinel): fall through so the
+                // generic dispatch writes the `[daemon] failed to select
+                // model …` error line.
+                SessionUpdateRouting::FallThrough => {}
             }
-            // Fall through to dispatch_daemon_message, which writes the
-            // `[daemon] failed to select model …` error line.
         }
         DaemonMessage::ReasoningEffortSet {
             session_id, effort, ..
@@ -2095,7 +2116,7 @@ pub(crate) fn handle_daemon_message(
             ..
         } => {
             // Reset only the session the rejection belongs to — a background
-            // session's rejection must not flip the viewed session's effort,
+            // session's rejection must not flip the attached session's effort,
             // though its own display is still reset to match the daemon (the
             // daemon has already forced the effort back to "off").  The
             // 0-sentinel ("no session attached") resolves to the attached
@@ -2134,7 +2155,7 @@ pub(crate) fn handle_daemon_message(
             ..
         } => {
             // Route the per-session display update to whichever session the
-            // message belongs to (never the viewed one when they differ).
+            // message belongs to (never the attached one when they differ).
             // The daemon only ever reports a real session id here (a
             // no-session account change goes through SessionFailed), so the
             // 0-sentinel resolution is defensive but harmless.
