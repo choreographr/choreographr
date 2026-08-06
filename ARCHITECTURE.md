@@ -1626,11 +1626,15 @@ user switches to it (`reset_for_session_switch` preserves live estimates).
 
 The same rule extends to every other per-session status message the daemon
 broadcasts over the all-activity subscription.  `ModelSelected`,
-`ModelSelectionFailed`, `ReasoningEffortSet`, `ReasoningEffortSetFailed` and
-`SessionAccountSet` are routed to the display of the session they belong to
-(and only touch the status bar's identity fields when that session is the
-attached one), and for a non-attached session the `connection.rs` handler
-returns before the generic dispatch so the global status/error line is not
+`ReasoningEffortSet`, `ReasoningEffortSetFailed` and `SessionAccountSet`
+are routed to the display of the session they belong to (and only touch the
+status bar's identity fields when that session is the attached one);
+`ModelSelectionFailed` — whose failure means there is no new model to
+record — is gated the same way but updates no display.  The routing and the
+gate are one operation: the shared `route_session_update` helper resolves
+the reported id, applies the display update, and reports whether to fall
+through to the generic dispatch.  For a non-attached session the
+`connection.rs` handler returns early so the global status/error line is not
 rewritten either — a background session changing its model, reasoning effort
 or account must not rewrite the fields of the session on screen, nor reflow
 its viewport via a status-height change.
@@ -1643,7 +1647,9 @@ Two daemon conventions keep this gating correct:
   the attached id so the update lands in the right display (never a phantom
   session 0), and `App::is_background_session_message` — the single gate used
   by every arm above — treats the sentinel, like the attached session itself,
-  as the user's own feedback rather than background noise.  Without this, the
+  as the user's own feedback rather than background noise.  The two are
+  composed in the `route_session_update` helper so a message can never be
+  resolved without also being gated.  Without this, the
   background gating would swallow the confirmation of the user's own
   `/reasoning` and `/model` commands.
 

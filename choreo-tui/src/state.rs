@@ -2624,6 +2624,20 @@ impl App {
             .find(|s| Some(s.session_id) == self.attached_session_id)
     }
 
+    /// The summary of `session_id`, but only when it is the attached session.
+    ///
+    /// Per-session display updates mirror into the status bar's summary
+    /// exclusively for the attached session — a background session's model,
+    /// effort or account change must never rewrite the identity fields of the
+    /// session on screen.
+    fn mirror_to_attached_summary(&mut self, session_id: u64) -> Option<&mut SessionSummary> {
+        if self.attached_session_id == Some(session_id) {
+            self.attached_session_mut()
+        } else {
+            None
+        }
+    }
+
     /// A model was selected on the session `session_id`.  Only that session's
     /// display (and, when it is the attached session, the summary used by the
     /// status bar) is updated — a `ModelSelected` broadcast for a background
@@ -2637,9 +2651,7 @@ impl App {
         let display = self.display_for(session_id);
         display.selected_model = Some(model.to_owned());
         display.reasoning_capability = reasoning_capability;
-        if self.attached_session_id == Some(session_id)
-            && let Some(s) = self.attached_session_mut()
-        {
+        if let Some(s) = self.mirror_to_attached_summary(session_id) {
             s.selected_model = Some(model.to_owned());
         }
     }
@@ -2649,9 +2661,7 @@ impl App {
     pub(crate) fn handle_reasoning_effort_set(&mut self, session_id: u64, effort: String) {
         let display = self.display_for(session_id);
         display.reasoning_effort = Some(effort.clone());
-        if self.attached_session_id == Some(session_id)
-            && let Some(s) = self.attached_session_mut()
-        {
+        if let Some(s) = self.mirror_to_attached_summary(session_id) {
             s.reasoning_effort = Some(effort);
         }
     }
@@ -2689,11 +2699,13 @@ impl App {
     pub(crate) fn handle_session_account_set(&mut self, session_id: u64, account: &str) {
         let display = self.display_for(session_id);
         display.account_name = Some(account.to_owned());
+        if let Some(s) = self.mirror_to_attached_summary(session_id) {
+            s.account_name = Some(account.to_owned());
+        }
+        // Refresh the status-bar provider slug only for the attached session
+        // (it reads the display account name set above).
         if self.attached_session_id == Some(session_id) {
             self.refresh_attached_provider_slug();
-            if let Some(s) = self.attached_session_mut() {
-                s.account_name = Some(account.to_owned());
-            }
         }
     }
 
