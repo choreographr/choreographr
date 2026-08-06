@@ -1,11 +1,13 @@
 use super::glob_util::GlobFilter;
 use super::{
-    MAX_LINE_DISPLAY_BYTES, Tool, ToolExecError, context::ToolContext, finish_tool_output,
-    sanitize_content, sanitize_name, truncation_marker,
+    MAX_LINE_DISPLAY_BYTES, MAX_TOOL_OUTPUT_BYTES, Tool, ToolExecError, context::ToolContext,
+    finish_tool_output, sanitize_content, sanitize_name, truncation_marker,
 };
 use choreo_keystore::ServiceCredential;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
+use grep_searcher::{
+    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -211,6 +213,36 @@ enum GrepItem {
     Break,
 }
 
+impl GrepItem {
+    /// Render one item under its file label: matches use `:` separators,
+    /// context lines `-` (ripgrep's -C convention), breaks render `--`.
+    fn render(&self, label: &str) -> String {
+        match self {
+            GrepItem::Match {
+                line_number,
+                content,
+            } => format!("{label}:{line_number}:{content}"),
+            GrepItem::Context {
+                line_number,
+                content,
+            } => format!("{label}-{line_number}-{content}"),
+            GrepItem::Break => "--".to_string(),
+        }
+    }
+
+    /// Byte length of the content this item carries, or `None` for a `Break`
+    /// (separators carry no content and so never count against the byte
+    /// budget).
+    fn content_len(&self) -> Option<usize> {
+        match self {
+            GrepItem::Match { content, .. } | GrepItem::Context { content, .. } => {
+                Some(content.len())
+            }
+            GrepItem::Break => None,
+        }
+    }
+}
+
 /// Accumulates matches during the walk and renders them per `GrepOutputMode`.
 ///
 /// grep-searcher drives this sink one file at a time. `SinkMatch`/`SinkContext`
@@ -231,6 +263,12 @@ struct GrepSink {
     // Content-mode state: per-file ordered items, capped by match count.
     content_files: Vec<(PathBuf, Vec<GrepItem>)>,
     content_match_count: usize,
+    /// Running byte total of the content buffered in `content_files`. The
+    /// renderer caps the final output at [`MAX_TOOL_OUTPUT_BYTES`], so
+    /// buffering more than that is pure waste — and on a pathological tree
+    /// (200 matches × 201 context lines × 64 KiB lines) it could otherwise
+    /// be gigabytes before `finish_grep` ever trims it.
+    content_bytes: usize,
 
     // FilesWithMatches-mode state: one path per file (first hit only).
     matched_files: Vec<PathBuf>,
@@ -240,24 +278,56 @@ struct GrepSink {
     count_file_lines: u64,
     count_entries: Vec<(PathBuf, u64)>,
 
-    /// True once the cap is hit — the searcher must stop the current file
-    /// and the outer walk must break. Doubles as the truncation flag
-    /// (`truncation_marker(sink.done, …)`).
+    /// True once the max_results cap is hit — the searcher stops delivering
+    /// matches and the outer walk must break. Drives the `...[truncated at
+    /// N …]` marker (via [`GrepSink::truncated`]);
+    /// [`GrepSink::byte_capped`] stops the walk for the byte budget instead.
     done: bool,
+    /// True once the buffered content passed [`MAX_TOOL_OUTPUT_BYTES`] —
+    /// collection stops and the walk breaks (see `content_bytes`). The
+    /// truncation marker then reports the count actually collected, not the
+    /// requested cap.
+    byte_capped: bool,
+    /// After-context lines configured for Content mode (0 otherwise). When
+    /// `max_results` caps a match, the searcher is told to keep going so the
+    /// capped match's trailing context is still delivered — ripgrep `-m` +
+    /// `-C` semantics. [`GrepSink::after_context_remaining`] runs the drain.
+    after_context: usize,
+    /// Lines of the capped match's after-context window still to drain. The
+    /// sink's counter is authoritative over the searcher's own, which resets
+    /// whenever a line *matches*; lines inside the window are delivered as
+    /// context (even matches, as rg `-m` shows them), and once this reaches
+    /// zero the file stops.
+    after_context_remaining: usize,
+    /// Number of files the walk has *attempted* to search (set by
+    /// `begin_file`). Used to decide whether the regex-mode hint is honest:
+    /// when zero files were searched (include glob filtered everything, empty
+    /// directory), the empty result cannot be blamed on the pattern.
+    files_searched: usize,
+    /// Set when the current file's search stopped early for a reason that
+    /// makes an observed-so-far count-mode tally unreliable — a read error or
+    /// binary-data truncation. The partial tally is discarded at `end_file`.
+    file_aborted: bool,
 }
 
 impl GrepSink {
-    fn new(output_mode: GrepOutputMode, max_results: usize) -> Self {
+    fn new(output_mode: GrepOutputMode, max_results: usize, after_context: usize) -> Self {
         GrepSink {
             output_mode,
             max_results,
             current_path: PathBuf::new(),
             content_files: Vec::new(),
             content_match_count: 0,
+            content_bytes: 0,
             matched_files: Vec::new(),
             count_file_lines: 0,
             count_entries: Vec::new(),
             done: false,
+            byte_capped: false,
+            after_context,
+            after_context_remaining: after_context,
+            files_searched: 0,
+            file_aborted: false,
         }
     }
 
@@ -267,6 +337,12 @@ impl GrepSink {
     /// that yields no output never allocates one.
     fn begin_file(&mut self, path: &Path) {
         self.current_path = path.to_path_buf();
+        self.files_searched += 1;
+        // Per-file abort/drain state is consumed by `end_file` and the capped
+        // match's after-context drain; reset defensively so a stale flag can
+        // never poison a later file.
+        self.file_aborted = false;
+        self.after_context_remaining = self.after_context;
     }
 
     /// Called by the walk loop after searching each file. Count mode flushes
@@ -274,10 +350,12 @@ impl GrepSink {
     /// file, not just the lines seen before some other cap applied. `completed`
     /// is false when the search of the file failed (e.g. the read errored
     /// mid-file); the partial tally is then discarded rather than reported as
-    /// the file's true count.
+    /// the file's true count. The same discard applies when the file was
+    /// truncated by binary-data detection (`file_aborted`): the lines observed
+    /// before the NUL byte are not the file's true count.
     fn end_file(&mut self, completed: bool) {
         if self.output_mode == GrepOutputMode::Count {
-            if completed && self.count_file_lines > 0 {
+            if completed && !self.file_aborted && self.count_file_lines > 0 {
                 self.count_entries
                     .push((self.current_path.clone(), self.count_file_lines));
                 if self.count_entries.len() >= self.max_results {
@@ -287,6 +365,7 @@ impl GrepSink {
             // Always reset, so a partial tally never leaks into the next file.
             self.count_file_lines = 0;
         }
+        self.file_aborted = false;
     }
 
     /// Append an item for the currently-searched file, opening a per-file
@@ -295,7 +374,25 @@ impl GrepSink {
     /// the current file; every bucket this creates holds at least one item. A
     /// `Break` with no open bucket is a separator with nothing to separate —
     /// dropped rather than rendered as a stray `--`.
-    fn push_item(&mut self, item: GrepItem) {
+    ///
+    /// Returns `false` when the byte budget stopped collection — the caller
+    /// (the `matched`/`context` handlers) must then stop the searcher.
+    fn push_item(&mut self, item: GrepItem) -> bool {
+        // Defensive: once the budget is exhausted, nothing more may be
+        // buffered even if a callback slips through before the searcher stops.
+        if self.byte_capped {
+            return false;
+        }
+        // Byte-budget guard (Content mode only): bound the aggregate buffered
+        // content to the same budget the renderer would keep anyway. Breaks
+        // carry no content and are free.
+        if self.output_mode == GrepOutputMode::Content
+            && let Some(len) = item.content_len()
+            && self.content_bytes + len > MAX_TOOL_OUTPUT_BYTES
+        {
+            self.byte_capped = true;
+            return false;
+        }
         let matches_current = self
             .content_files
             .last()
@@ -303,7 +400,7 @@ impl GrepSink {
             .unwrap_or(false);
         if !matches_current {
             if matches!(item, GrepItem::Break) {
-                return;
+                return true;
             }
             self.content_files
                 .push((self.current_path.clone(), Vec::new()));
@@ -316,10 +413,14 @@ impl GrepSink {
             if matches!(item, GrepItem::Break)
                 && items.last().is_some_and(|i| matches!(i, GrepItem::Break))
             {
-                return;
+                return true;
+            }
+            if let Some(len) = item.content_len() {
+                self.content_bytes += len;
             }
             items.push(item);
         }
+        true
     }
 
     /// Number of results collected under the active cap unit — match lines in
@@ -333,14 +434,33 @@ impl GrepSink {
         }
     }
 
-    /// Whether the output should carry the `...[truncated at N …]` marker.
-    /// For a directly-named single file, the file-capped modes are provably
-    /// complete once that one file is searched — the cap (≥ 1) was necessarily
-    /// met, so claiming truncation would be misleading. Content mode keeps the
-    /// marker because the searcher may genuinely have stopped mid-file at the
-    /// cap.
+    /// Whether the output should carry the `...[truncated at N …]` marker:
+    /// the walk stopped early, either at the max_results cap or at the byte
+    /// budget. For a directly-named single file, the file-capped modes are
+    /// provably complete once that one file is searched — the cap (≥ 1) was
+    /// necessarily met, so claiming truncation would be misleading. Content
+    /// mode keeps the marker because the searcher may genuinely have stopped
+    /// mid-file at the cap or byte budget.
     fn truncated(&self, single_file: bool) -> bool {
-        self.done && !(single_file && self.output_mode != GrepOutputMode::Content)
+        self.should_stop() && !(single_file && self.output_mode != GrepOutputMode::Content)
+    }
+
+    /// Whether the walk should stop searching further files: the max_results
+    /// cap was hit or the byte budget was exhausted.
+    fn should_stop(&self) -> bool {
+        self.done || self.byte_capped
+    }
+
+    /// The count reported in the truncation marker. When the byte budget
+    /// stopped collection before the requested cap, the honest "at least N
+    /// exist" figure is the number actually collected; otherwise the
+    /// max_results cap itself.
+    fn marker_count(&self) -> usize {
+        if self.byte_capped {
+            self.result_count()
+        } else {
+            self.max_results
+        }
     }
 }
 
@@ -348,10 +468,26 @@ impl Sink for GrepSink {
     type Error = std::io::Error;
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        let line_number = mat.line_number().unwrap_or(0);
         if self.done {
+            // Draining the capped match's after-context window (Content mode):
+            // a line inside the window that *also* matches is shown as a
+            // context line, not as another match (rg -m + -C semantics). The
+            // drain continues; the counter stops the file once the window is
+            // exhausted.
+            if self.output_mode == GrepOutputMode::Content && self.after_context_remaining > 0 {
+                let content = sanitized_line(mat.bytes());
+                if !self.push_item(GrepItem::Context {
+                    line_number,
+                    content,
+                }) {
+                    return Ok(false);
+                }
+                self.after_context_remaining -= 1;
+                return Ok(true);
+            }
             return Ok(false);
         }
-        let line_number = mat.line_number().unwrap_or(0);
 
         match self.output_mode {
             GrepOutputMode::Content => {
@@ -361,16 +497,23 @@ impl Sink for GrepSink {
                 // characters so a hostile line cannot inject terminal escapes
                 // into the tool result.
                 let content = sanitized_line(mat.bytes());
-                self.push_item(GrepItem::Match {
+                if !self.push_item(GrepItem::Match {
                     line_number,
                     content,
-                });
+                }) {
+                    // Byte budget exhausted — stop this file; the walk loop
+                    // sees `byte_capped` and quits.
+                    return Ok(false);
+                }
                 self.content_match_count += 1;
                 if self.content_match_count >= self.max_results {
                     self.done = true;
-                    // Stop this file immediately; the walk loop breaks on
-                    // `done` so remaining files are never opened.
-                    return Ok(false);
+                    // Keep the searcher running so this match's after-context
+                    // lines are still delivered (ripgrep -m + -C includes
+                    // them); the `context` handler drains those and the next
+                    // match stops us. The walk loop breaks on `done` so
+                    // remaining files are never opened.
+                    return Ok(true);
                 }
                 Ok(true)
             }
@@ -403,20 +546,62 @@ impl Sink for GrepSink {
             return Ok(true);
         }
         if self.done {
+            // Draining the capped match's after-context window: accept only
+            // `After` lines while the window still has room. Anything else —
+            // before-context of a later match, or the window exhausted —
+            // means the group is over, so stop the searcher.
+            if *ctx.kind() == SinkContextKind::After && self.after_context_remaining > 0 {
+                let content = sanitized_line(ctx.bytes());
+                if !self.push_item(GrepItem::Context {
+                    line_number: ctx.line_number().unwrap_or(0),
+                    content,
+                }) {
+                    return Ok(false);
+                }
+                self.after_context_remaining -= 1;
+                return Ok(true);
+            }
             return Ok(false);
         }
-        self.push_item(GrepItem::Context {
+        let content = sanitized_line(ctx.bytes());
+        if !self.push_item(GrepItem::Context {
             line_number: ctx.line_number().unwrap_or(0),
-            content: sanitized_line(ctx.bytes()),
-        });
+            content,
+        }) {
+            return Ok(false);
+        }
         Ok(true)
     }
 
     fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
-        if !self.done && self.output_mode == GrepOutputMode::Content {
-            self.push_item(GrepItem::Break);
+        if self.output_mode != GrepOutputMode::Content {
+            return Ok(true);
+        }
+        if self.done {
+            // A break only fires once the capped match's after-context window
+            // is exhausted (there is a gap to the next match) — nothing left
+            // to collect, so stop the searcher before it delivers the next
+            // group's before-context.
+            return Ok(false);
+        }
+        if !self.push_item(GrepItem::Break) {
+            return Ok(false);
         }
         Ok(true)
+    }
+
+    fn binary_data(
+        &mut self,
+        _searcher: &Searcher,
+        _binary_byte_offset: u64,
+    ) -> Result<bool, Self::Error> {
+        // With `BinaryDetection::quit`, the searcher stops the file here
+        // regardless of our response. Mark it aborted so a count-mode tally
+        // observed before the NUL is discarded — the lines before a binary
+        // truncation are not the file's true count. Returning false is the
+        // explicit "stop" signal for the searcher.
+        self.file_aborted = true;
+        Ok(false)
     }
 }
 
@@ -433,24 +618,6 @@ fn path_label(path: &Path, resolved: &Path, single_file: bool) -> String {
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned()
-    }
-}
-
-impl GrepItem {
-    /// Render one item under its file label: matches use `:` separators,
-    /// context lines `-` (ripgrep's -C convention), breaks render `--`.
-    fn render(&self, label: &str) -> String {
-        match self {
-            GrepItem::Match {
-                line_number,
-                content,
-            } => format!("{label}:{line_number}:{content}"),
-            GrepItem::Context {
-                line_number,
-                content,
-            } => format!("{label}-{line_number}-{content}"),
-            GrepItem::Break => "--".to_string(),
-        }
     }
 }
 
@@ -518,6 +685,13 @@ fn finish_grep(
         "grep search finished"
     );
     if result_count == 0 {
+        // If the walk never actually searched a file (an include glob filtered
+        // everything out, an empty directory, …), the regex hint would
+        // misattribute the empty result to the pattern — the plain message is
+        // accurate, matching the directly-named-file include-filter path.
+        if sink.files_searched == 0 {
+            return "No matches found.".to_string();
+        }
         return empty_result(pattern, regex);
     }
 
@@ -529,7 +703,9 @@ fn finish_grep(
     assemble_grep_output(
         body,
         sink.truncated(single_file),
-        sink.max_results,
+        // Report the honest count: the max_results cap when the cap stopped the
+        // walk, or the actually-collected count when the byte budget did.
+        sink.marker_count(),
         sink.output_mode.cap_noun(),
     )
 }
@@ -562,6 +738,9 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
     // an unbounded or absurdly large result set — before the walk-start log
     // so the event records the value actually applied.
     let max_results = max_results.clamp(1, MAX_RESULTS_CAP) as usize;
+    // Same for context: clamp before the log so the event records what the
+    // searcher (and the sink's after-context drain) will actually apply.
+    let context = context.min(MAX_CONTEXT_LINES) as usize;
 
     tracing::debug!(
         path = %resolved.display(),
@@ -603,16 +782,23 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
         None
     };
 
-    // Clamp max_results to the configured bounds so the caller can't
-    // request an unbounded or absurdly large result set.
-    let mut sink = GrepSink::new(output_mode, max_results);
+    // The sink tracks the capped match's after-context window with its own
+    // counter (the searcher's resets whenever a line matches), so both the
+    // builder and the sink need the same clamped count.
+    let after_context = if output_mode == GrepOutputMode::Content && context > 0 {
+        context
+    } else {
+        0
+    };
+    let mut sink = GrepSink::new(output_mode, max_results, after_context);
 
     // Context is only meaningful in Content mode; the other modes ignore it
     // (and never enable it on the searcher, so no extra work is done).
     let mut builder = SearcherBuilder::new();
-    if output_mode == GrepOutputMode::Content && context > 0 {
-        let n = context.min(MAX_CONTEXT_LINES) as usize;
-        builder.before_context(n).after_context(n);
+    if after_context > 0 {
+        builder
+            .before_context(after_context)
+            .after_context(after_context);
     }
     // Treat files with a NUL byte in the head as binary and skip them
     // (ripgrep's default), honouring the documented contract and keeping a
@@ -712,8 +898,9 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
             // the file's true count.
             sink.end_file(search.is_ok());
 
-            // Stop early once we've accumulated enough results.
-            if sink.done {
+            // Stop early once we've accumulated enough results (max_results
+            // cap or byte budget).
+            if sink.should_stop() {
                 WalkState::Quit
             } else {
                 WalkState::Continue
@@ -1150,6 +1337,22 @@ mod tests {
     }
 
     #[test]
+    fn count_mode_discards_partial_tally_on_binary_file() {
+        // A file with a NUL byte mid-way is truncated by binary detection
+        // before the search completes. The count of matching lines observed
+        // before the NUL is not the file's true count, so it must be discarded
+        // — the file is "skipped", never counted.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("bin.txt"), b"hello\nhello\n\0hello\n").expect("write");
+
+        let tool = Grep;
+        let mut args = test_args("hello", Some(dir.path()));
+        args.output_mode = GrepOutputMode::Count;
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "No matches found.", "{result}");
+    }
+
+    #[test]
     fn test_over_cap_line_truncated_with_marker() {
         // A 256 KiB one-liner is far past the 64 KiB line display cap. The
         // match must render capped with the shared marker instead of being
@@ -1179,6 +1382,43 @@ mod tests {
             line.len()
         );
         assert_eq!(result.lines().count(), 1, "{result}");
+    }
+
+    #[test]
+    fn content_mode_stops_collecting_past_byte_budget() {
+        // Eight 20 KiB matching lines total ~160 KiB of buffered content —
+        // far past the 128 KiB output budget the renderer keeps anyway. The
+        // sink must stop collecting once the budget is exceeded (instead of
+        // buffering the whole tree), and the truncation marker must report
+        // the count actually collected, not the requested cap.
+        let dir = TempDir::new().expect("temp dir");
+        for i in 0..8 {
+            let mut content = String::with_capacity(20 * 1024 + 16);
+            content.push_str(&format!("file{i} "));
+            content.push_str(&"a".repeat(20 * 1024));
+            content.push('\n');
+            std::fs::write(dir.path().join(format!("f{i}.txt")), content).expect("write");
+        }
+
+        let tool = Grep;
+        let args = test_args("file", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        // Six matches ≈ 123 KiB fit under the budget; a seventh would push
+        // it past. The raw tree is ~160 KiB, so a bounded result proves
+        // collection stopped early.
+        assert!(
+            result.len() < 128 * 1024,
+            "result exceeded the byte budget: {} bytes",
+            result.len()
+        );
+        assert!(
+            result.contains("...[truncated at 6 matches]"),
+            "expected honest byte-budget marker:\n{result}"
+        );
+        assert!(
+            !result.contains("...[truncated at 200 matches]"),
+            "the byte budget, not max_results, stopped the walk:\n{result}"
+        );
     }
 
     #[test]
@@ -1251,7 +1491,8 @@ mod tests {
         args.max_results = Some(1);
         let result = tool.execute(args, None, None, None).unwrap();
         // The cap hits on the match (line 3); the searcher stops there, so the
-        // two before-context lines + the match render, then the marker.
+        // two before-context lines + the match render, then the marker. (The
+        // file ends at the match, so there is no after-context to drain.)
         assert_eq!(
             result.lines().count(),
             4,
@@ -1260,6 +1501,99 @@ mod tests {
         assert!(
             result.contains("test.txt:3:hello"),
             "expected match line:\n{result}"
+        );
+        assert!(
+            result.contains("...[truncated at 1 matches]"),
+            "expected truncation marker:\n{result}"
+        );
+    }
+
+    #[test]
+    fn capped_match_includes_after_context() {
+        // The max_results cap stops *matching*, but the capped match's trailing
+        // context lines must still be delivered (ripgrep -m + -C semantics).
+        // Without the after-context drain, lines 4-5 would be silently dropped.
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut f = std::fs::File::create(dir.path().join("test.txt")).expect("create");
+            writeln!(f, "a").expect("write");
+            writeln!(f, "b").expect("write");
+            writeln!(f, "hello").expect("write");
+            writeln!(f, "c").expect("write");
+            writeln!(f, "d").expect("write");
+            writeln!(f, "e").expect("write");
+        }
+
+        let tool = Grep;
+        let mut args = test_args("hello", Some(dir.path()));
+        args.context = 2;
+        args.max_results = Some(1);
+        let result = tool.execute(args, None, None, None).unwrap();
+        // 2 before-context + the capped match + its 2 after-context lines +
+        // the marker. The third trailing line ("e") is past the window and
+        // must not appear.
+        assert_eq!(
+            result.lines().count(),
+            6,
+            "2 before + match + 2 after + marker:\n{result}"
+        );
+        assert!(result.contains("test.txt:3:hello"), "{result}");
+        assert!(result.contains("test.txt-4-c"), "{result}");
+        assert!(result.contains("test.txt-5-d"), "{result}");
+        assert!(
+            !result.contains("test.txt-6-e"),
+            "drain must stop at the after-context window:\n{result}"
+        );
+        assert!(
+            result.contains("...[truncated at 1 matches]"),
+            "expected truncation marker:\n{result}"
+        );
+    }
+
+    #[test]
+    fn capped_match_context_window_includes_within_window_match() {
+        // A second match inside the capped match's after-context window (line 5
+        // is 2 lines after line 3) must still be shown — as a context line,
+        // not a second match (rg -m + -C semantics). Without the drain's own
+        // counter, the searcher would deliver line 5 via `matched`, which the
+        // done guard would reject, silently dropping it.
+        let dir = TempDir::new().expect("temp dir");
+        {
+            let mut f = std::fs::File::create(dir.path().join("test.txt")).expect("create");
+            writeln!(f, "a").expect("write");
+            writeln!(f, "b").expect("write");
+            writeln!(f, "hello").expect("write");
+            writeln!(f, "c").expect("write");
+            writeln!(f, "hello").expect("write");
+            writeln!(f, "d").expect("write");
+        }
+
+        let tool = Grep;
+        let mut args = test_args("hello", Some(dir.path()));
+        args.context = 2;
+        args.max_results = Some(1);
+        let result = tool.execute(args, None, None, None).unwrap();
+        // 2 before-context + capped match + 2 within-window lines (4 as
+        // context, 5 as the second "hello" rendered as context) + marker.
+        // Line 6 is past the window and must not appear.
+        assert_eq!(
+            result.lines().count(),
+            6,
+            "2 before + match + 2 after (incl. within-window match) + marker:\n{result}"
+        );
+        assert!(result.contains("test.txt:3:hello"), "{result}");
+        assert!(result.contains("test.txt-4-c"), "{result}");
+        assert!(
+            result.contains("test.txt-5-hello"),
+            "within-window match must render as a context line:\n{result}"
+        );
+        assert!(
+            !result.contains("test.txt:5:hello"),
+            "within-window match must not render as a second match:\n{result}"
+        );
+        assert!(
+            !result.contains("test.txt-6-d"),
+            "drain must stop at the after-context window:\n{result}"
         );
         assert!(
             result.contains("...[truncated at 1 matches]"),
@@ -1380,7 +1714,7 @@ mod tests {
         // A search that errored mid-file must not report the partial tally as
         // the file's true count — the searcher may have stopped before seeing
         // every matching line.
-        let mut sink = GrepSink::new(GrepOutputMode::Count, 10);
+        let mut sink = GrepSink::new(GrepOutputMode::Count, 10, 0);
         sink.begin_file(Path::new("a.txt"));
         sink.count_file_lines = 3; // matches observed before the read failed
         sink.end_file(false);
@@ -1402,7 +1736,7 @@ mod tests {
 
     #[test]
     fn push_item_drops_stray_break_and_collapses_consecutive() {
-        let mut sink = GrepSink::new(GrepOutputMode::Content, 10);
+        let mut sink = GrepSink::new(GrepOutputMode::Content, 10, 0);
         sink.begin_file(Path::new("a.txt"));
         // A Break with no open bucket has nothing to separate — dropped.
         sink.push_item(GrepItem::Break);
@@ -1678,6 +2012,22 @@ mod tests {
         let tool = Grep;
         let mut args = test_args("foo|bar", Some(&file_path));
         args.include = Some("*.py".to_string());
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "No matches found.", "{result}");
+    }
+
+    #[test]
+    fn include_filtered_all_files_suppresses_regex_hint() {
+        // A directory sweep where the include glob filters out *every* file
+        // searches nothing — the regex hint would misattribute the empty
+        // result to the pattern (same rationale as the single-file path
+        // above), so the plain no-match message must appear.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("a.txt"), "hello\n").expect("write");
+
+        let tool = Grep;
+        let mut args = test_args("foo|bar", Some(dir.path()));
+        args.include = Some("*.rs".to_string()); // excludes the only file
         let result = tool.execute(args, None, None, None).unwrap();
         assert_eq!(result, "No matches found.", "{result}");
     }
