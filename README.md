@@ -152,8 +152,7 @@ Choreographr will have an option to automate this process, so it can be left alo
 ## Comparison to other agents
 
 Feature matrix against other AI agent projects, ordered by GitHub ⭐ descending
-after Choreographr. `herdr` (a terminal multiplexer that hosts other agents) and
-`skills` (a SKILL.md collection) are excluded as they are not agents themselves.
+after Choreographr.
 
 | Feature | Choreo | openclaw | hermes | opencode | codex | pi | goose | langgraph | buzz | openwork | t3code | OpenMinis | mercury | tau | maka-agent | zero | turnstone |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
