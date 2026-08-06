@@ -112,6 +112,11 @@ fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -> io::Resul
             if let Some(tx) = ctx.attached_session_tx {
                 let _ = tx.send(SessionCommand::RunInput { request_id, input });
             } else {
+                // The sentinel `session_id == 0` (used in every "no session
+                // attached" arm in this dispatch) means "the attached
+                // session" to the client: it lets a connection-level failure
+                // be routed to whatever session the user is viewing.  The
+                // TUI resolves it via `App::resolve_daemon_session`.
                 let _ = ctx.writer_tx.send(DaemonMessage::Failed {
                     session_id: 0,
                     request_id,

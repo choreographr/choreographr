@@ -1632,8 +1632,9 @@ status bar's identity fields when that session is the attached one);
 `ModelSelectionFailed` — whose failure means there is no new model to
 record — is gated the same way but updates no display.  The routing and the
 gate are one operation: the shared `route_session_update` helper resolves
-the reported id, applies the display update, and reports whether to fall
-through to the generic dispatch.  For a non-attached session the
+the reported id, applies the display update, and returns a
+`SessionUpdateRouting` verdict (`FallThrough` for the attached session /
+sentinel, `Suppress` for background noise).  For a non-attached session the
 `connection.rs` handler returns early so the global status/error line is not
 rewritten either — a background session changing its model, reasoning effort
 or account must not rewrite the fields of the session on screen, nor reflow
@@ -1649,7 +1650,8 @@ Two daemon conventions keep this gating correct:
   by every arm above — treats the sentinel, like the attached session itself,
   as the user's own feedback rather than background noise.  The two are
   composed in the `route_session_update` helper so a message can never be
-  resolved without also being gated.  Without this, the
+  resolved without also being gated (`ReasoningEffortSetFailed` runs its
+  display reset through the same helper).  Without this, the
   background gating would swallow the confirmation of the user's own
   `/reasoning` and `/model` commands.
 

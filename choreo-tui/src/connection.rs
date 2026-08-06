@@ -1757,6 +1757,21 @@ fn handle_ui_event(
     }
 }
 
+/// How a routed per-session daemon message should be handled by the caller
+/// after `route_session_update` has applied the display update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionUpdateRouting {
+    /// The message belongs to the attached session (or the 0-sentinel) — the
+    /// caller should fall through to the generic dispatch so the user sees
+    /// the status/error feedback for their own command.
+    FallThrough,
+    /// The message belongs to a background session — the per-session display
+    /// was already updated, but the caller must not fall through: the generic
+    /// dispatch would rewrite the global status/error line the user is
+    /// looking at (reflowing the viewed viewport).
+    Suppress,
+}
+
 /// Route a per-session display update for a daemon-reported session id and
 /// report whether the message must also fall through to the generic dispatch.
 ///
@@ -1765,16 +1780,23 @@ fn handle_ui_event(
 /// session whose display `update` mutates — never a phantom session-0 entry.
 /// Background messages (a real session that is not the attached one) still
 /// get their display updated, so the per-session state is already correct
-/// when the user switches to it, but they must not fall through: the generic
-/// dispatch would rewrite the global status/error line and reflow the viewed
-/// viewport.  Returns `true` to fall through (attached session or sentinel)
-/// or `false` for background noise — the caller should return early after
-/// logging.
-fn route_session_update(app: &mut App, reported: u64, update: impl FnOnce(&mut App, u64)) -> bool {
+/// when the user switches to it, but they must not fall through.  Returns
+/// [`SessionUpdateRouting::Suppress`] for background noise — the caller
+/// should log and return early — or [`SessionUpdateRouting::FallThrough`]
+/// for the attached session / 0-sentinel.
+fn route_session_update(
+    app: &mut App,
+    reported: u64,
+    update: impl FnOnce(&mut App, u64),
+) -> SessionUpdateRouting {
     if let Some(session_id) = app.resolve_daemon_session(reported) {
         update(app, session_id);
     }
-    !app.is_background_session_message(reported)
+    if app.is_background_session_message(reported) {
+        SessionUpdateRouting::Suppress
+    } else {
+        SessionUpdateRouting::FallThrough
+    }
 }
 
 pub(crate) fn handle_daemon_message(
@@ -1987,23 +2009,27 @@ pub(crate) fn handle_daemon_message(
             // Route the per-session display update to whichever session the
             // message belongs to (never the viewed one when they differ).
             let reported = *session_id;
-            if !route_session_update(app, reported, |app, session_id| {
+            match route_session_update(app, reported, |app, session_id| {
                 app.handle_model_selected(session_id, model, reasoning_capability.clone());
             }) {
-                // Background session: stop here so the generic dispatch's
-                // "[daemon] selected model: …" status write does not rewrite
-                // the global status line the user is looking at (which would
-                // reflow the viewed viewport).
-                tracing::debug!(
-                    session_id = reported,
-                    %model,
-                    "ignoring model selection for background session",
-                );
-                return Ok(());
+                SessionUpdateRouting::Suppress => {
+                    // Background session: the per-session display was already
+                    // updated above; stop here so the generic dispatch's
+                    // "[daemon] selected model: …" status write does not
+                    // rewrite the global status line the user is looking at
+                    // (which would reflow the viewed viewport).
+                    tracing::debug!(
+                        session_id = reported,
+                        %model,
+                        "suppressing status feedback for background session's model selection",
+                    );
+                    return Ok(());
+                }
+                // Attached session (or the 0-sentinel): fall through so the
+                // user's own `/model` command still prints its confirmation
+                // to the status line.
+                SessionUpdateRouting::FallThrough => {}
             }
-            // Attached session (or the 0-sentinel): fall through so the
-            // user's own `/model` command still prints its confirmation to
-            // the status line.
         }
         DaemonMessage::ModelSelectionFailed {
             session_id,
@@ -2023,7 +2049,7 @@ pub(crate) fn handle_daemon_message(
                     session_id = reported,
                     %model,
                     %error,
-                    "ignoring model selection failure for background session",
+                    "suppressing status feedback for background session's model selection failure",
                 );
                 return Ok(());
             }
@@ -2041,22 +2067,26 @@ pub(crate) fn handle_daemon_message(
             // session 0) and the gate does not swallow the user's own
             // feedback.
             let reported = *session_id;
-            if !route_session_update(app, reported, |app, session_id| {
+            match route_session_update(app, reported, |app, session_id| {
                 app.handle_reasoning_effort_set(session_id, effort.clone());
             }) {
-                // Background session: stop here so the generic dispatch's
-                // "[daemon] reasoning effort: …" status write does not
-                // rewrite the global status line.
-                tracing::debug!(
-                    session_id = reported,
-                    %effort,
-                    "ignoring reasoning effort change for background session",
-                );
-                return Ok(());
+                SessionUpdateRouting::Suppress => {
+                    // Background session: the per-session display was already
+                    // updated above; stop here so the generic dispatch's
+                    // "[daemon] reasoning effort: …" status write does not
+                    // rewrite the global status line.
+                    tracing::debug!(
+                        session_id = reported,
+                        %effort,
+                        "suppressing status feedback for background session's reasoning effort change",
+                    );
+                    return Ok(());
+                }
+                // Attached session (or the 0-sentinel): fall through so the
+                // user's own `/reasoning` command still prints its
+                // confirmation to the status line.
+                SessionUpdateRouting::FallThrough => {}
             }
-            // Attached session (or the 0-sentinel): fall through so the
-            // user's own `/reasoning` command still prints its confirmation
-            // to the status line.
         }
         DaemonMessage::ReasoningEffortSetFailed {
             session_id,
@@ -2071,28 +2101,30 @@ pub(crate) fn handle_daemon_message(
             // 0-sentinel ("no session attached") resolves to the attached
             // session, matching ReasoningEffortSet above.
             let reported = *session_id;
-            if let Some(session_id) = app.resolve_daemon_session(reported) {
-                let display = app.display_for(session_id);
-                display.reasoning_effort = Some("off".to_string());
+            match route_session_update(app, reported, |app, session_id| {
+                app.display_for(session_id).reasoning_effort = Some("off".to_string());
+            }) {
+                SessionUpdateRouting::Suppress => {
+                    // Background session: log at debug — an agent thrashing an
+                    // unsupported effort in the background is not a warning
+                    // for the user — and stop here so neither the status-line
+                    // notice below nor the generic dispatch's `app.error`
+                    // write can clobber the global status/error line for a
+                    // session the user is not viewing.
+                    tracing::debug!(
+                        session_id = reported,
+                        %effort,
+                        %error,
+                        "suppressing status feedback for background session's reasoning effort rejection",
+                    );
+                    return Ok(());
+                }
+                // Attached session (or the 0-sentinel): the user's own
+                // `/reasoning` command failed — surface the rejection notice
+                // and fall through so the generic dispatch records the error
+                // as well.
+                SessionUpdateRouting::FallThrough => {}
             }
-            if app.is_background_session_message(reported) {
-                // Background session: log at debug — an agent thrashing an
-                // unsupported effort in the background is not a warning for
-                // the user — and stop here so neither the status-line notice
-                // below nor the generic dispatch's `app.error` write can
-                // clobber the global status/error line for a session the
-                // user is not viewing.
-                tracing::debug!(
-                    session_id = reported,
-                    %effort,
-                    %error,
-                    "ignoring reasoning effort rejection for background session",
-                );
-                return Ok(());
-            }
-            // Attached session (or the 0-sentinel): the user's own
-            // `/reasoning` command failed — surface the rejection notice and
-            // fall through so the generic dispatch records the error as well.
             tracing::warn!(%effort, %error, "reasoning effort rejected by daemon");
             app.status = Some(format!("reasoning effort rejected: {error}"));
         }
@@ -2107,21 +2139,26 @@ pub(crate) fn handle_daemon_message(
             // no-session account change goes through SessionFailed), so the
             // 0-sentinel resolution is defensive but harmless.
             let reported = *session_id;
-            if !route_session_update(app, reported, |app, session_id| {
+            match route_session_update(app, reported, |app, session_id| {
                 app.handle_session_account_set(session_id, account);
             }) {
-                // Background session: stop here so the generic dispatch's
-                // "[daemon] session account set: …" status write does not
-                // rewrite the global status line.
-                tracing::debug!(
-                    session_id = reported,
-                    %account,
-                    "ignoring account change for background session",
-                );
-                return Ok(());
+                SessionUpdateRouting::Suppress => {
+                    // Background session: the per-session display was already
+                    // updated above; stop here so the generic dispatch's
+                    // "[daemon] session account set: …" status write does not
+                    // rewrite the global status line.
+                    tracing::debug!(
+                        session_id = reported,
+                        %account,
+                        "suppressing status feedback for background session's account change",
+                    );
+                    return Ok(());
+                }
+                // Attached session (or the 0-sentinel): fall through so the
+                // user's own `/account` command still prints its confirmation
+                // to the status line.
+                SessionUpdateRouting::FallThrough => {}
             }
-            // Attached session: fall through so the user's own `/account`
-            // command still prints its confirmation to the status line.
         }
         DaemonMessage::ContextWindowResolved {
             session_id,

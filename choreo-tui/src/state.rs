@@ -2489,46 +2489,53 @@ impl App {
         // tool artifacts, not sessions the user opened.  Auto-attaching to one
         // would hijack the Chat view away from the session the user is reading
         // and destroy its scroll position, so treat it like background noise.
-        // Refresh the session list only while the user is on the Session
-        // Manager page: an unsolicited ListSessions from the Chat page would
-        // make the daemon reply with `Sessions`, whose handler writes the
-        // global status line and reflows the viewed viewport — the very
-        // symptom this path exists to prevent.
         if let Some(parent_id) = parent_session_id {
             tracing::info!(
                 session_id,
                 parent_session_id = parent_id,
                 "sub-session created — refreshing list without auto-attaching",
             );
-            if self.page == Page::SessionManager {
-                let _ = client_tx.send(ClientMessage::ListSessions);
-            }
+        }
+
+        if self.page == Page::SessionManager {
+            // Best-effort refresh for both kinds of session: a broken channel
+            // here means the whole connection is tearing down, and the reply
+            // renders into the session list (never the status line), so there
+            // is nothing actionable to propagate.
+            let _ = client_tx.send(ClientMessage::ListSessions);
             return Ok(());
         }
-        if self.page == Page::SessionManager {
-            let _ = client_tx.send(ClientMessage::ListSessions);
-        } else {
-            // When creating from the Chat page, send ListSessions before
-            // AttachSession so the session summary list is populated before
-            // SessionAttached triggers handle_session_attached.
-            client_tx
-                .send(ClientMessage::ListSessions)
-                .map_err(broken_pipe)?;
-            self.reset_for_session_switch(session_id);
-            self.attached_session_id = Some(session_id);
-            // Set display fields immediately so they're available when
-            // SessionAttached arrives — check the session summary first,
-            // then fall back to the creation parameters.
-            {
-                let display = self.display_for(session_id);
-                display.account_name = account_name;
-                display.selected_model = selected_model;
-                display.reasoning_effort = reasoning_effort;
-            }
-            client_tx
-                .send(ClientMessage::AttachSession { session_id })
-                .map_err(broken_pipe)?;
+
+        // Sub-session created from the Chat page: an unsolicited ListSessions
+        // would make the daemon reply with `Sessions`, whose handler writes
+        // the global status line and reflows the viewed viewport — the very
+        // symptom this path exists to prevent.  Never auto-attach either.
+        if parent_session_id.is_some() {
+            return Ok(());
         }
+
+        // User-created session from the Chat page: send ListSessions before
+        // AttachSession so the session summary list is populated before
+        // SessionAttached triggers handle_session_attached.  Unlike the
+        // Session Manager refresh above, this send is propagated: the attach
+        // below depends on the summary reply arriving in order.
+        client_tx
+            .send(ClientMessage::ListSessions)
+            .map_err(broken_pipe)?;
+        self.reset_for_session_switch(session_id);
+        self.attached_session_id = Some(session_id);
+        // Set display fields immediately so they're available when
+        // SessionAttached arrives — check the session summary first,
+        // then fall back to the creation parameters.
+        {
+            let display = self.display_for(session_id);
+            display.account_name = account_name;
+            display.selected_model = selected_model;
+            display.reasoning_effort = reasoning_effort;
+        }
+        client_tx
+            .send(ClientMessage::AttachSession { session_id })
+            .map_err(broken_pipe)?;
         Ok(())
     }
 
