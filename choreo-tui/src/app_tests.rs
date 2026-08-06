@@ -1839,6 +1839,70 @@ mod session_manager_key_tests {
     }
 
     #[test]
+    fn chat_ctrl_s_highlights_previously_viewed_session() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        // The user is viewing session 42 on the chat page.
+        app.attached_session_id = Some(42);
+        // The list is already loaded from an earlier visit, and the
+        // previously highlighted row is a *different* session (index 2).
+        app.session_mgr.set_sessions(vec![
+            make_session(7, "old", "m1", 1),
+            make_session(42, "viewed", "m2", 5),
+            make_session(3, "other", "m3", 2),
+        ]);
+        app.session_mgr.selection = Some(2);
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle ctrl+s");
+
+        assert_eq!(app.page, Page::SessionManager);
+        let sel = app.session_mgr.selection.expect("selection set");
+        assert_eq!(
+            app.session_mgr.sessions[sel].session_id, 42,
+            "highlight must follow the session the user was viewing"
+        );
+    }
+
+    #[test]
+    fn chat_ctrl_s_remembers_viewed_session_before_list_arrives() {
+        // First launch: no session list loaded yet when Ctrl+S is pressed,
+        // so the highlight is deferred until the ListSessions reply arrives.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = test_app();
+        app.attached_session_id = Some(42);
+
+        handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            &mut app,
+            &tx,
+        )
+        .expect("handle ctrl+s");
+
+        assert_eq!(app.page, Page::SessionManager);
+        assert_eq!(app.session_mgr.pending_select, Some(42));
+        assert_eq!(app.session_mgr.selection, None);
+
+        // The daemon's Sessions reply populates the list; the pending
+        // highlight is applied (and consumed).
+        app.session_mgr.set_sessions(vec![
+            make_session(7, "old", "m1", 1),
+            make_session(42, "viewed", "m2", 5),
+            make_session(3, "other", "m3", 2),
+        ]);
+        let sel = app
+            .session_mgr
+            .selection
+            .expect("selection set after reply");
+        assert_eq!(app.session_mgr.sessions[sel].session_id, 42);
+        assert_eq!(app.session_mgr.pending_select, None);
+    }
+
+    #[test]
     fn session_manager_i_enters_detail() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = make_sm_app();

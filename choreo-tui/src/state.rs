@@ -640,6 +640,12 @@ pub(crate) struct SessionManagerState {
     pub(crate) sessions: Vec<SessionSummary>,
     pub(crate) view: SessionManagerView,
     pub(crate) selection: Option<usize>,
+    /// Session id to highlight on the next list refresh.  `select_session`
+    /// records this when navigating to the session manager (Ctrl+S) so the
+    /// freshly fetched list lands on the session the user was just viewing
+    /// — even on the first visit, before the daemon's ListSessions reply has
+    /// (re)populated `sessions`.
+    pub(crate) pending_select: Option<u64>,
     /// Index of the first visible session row.  Navigation shifts this
     /// anchor directionally — only when the selection would leave the
     /// window — which is what keeps the list from scrolling back up
@@ -1133,6 +1139,7 @@ impl SessionManagerState {
             sessions: Vec::new(),
             view: SessionManagerView::List,
             selection: None,
+            pending_select: None,
             scroll: 0,
             viewport_height: 0,
             detail_data: None,
@@ -1143,20 +1150,48 @@ impl SessionManagerState {
 
     pub(crate) fn set_sessions(&mut self, sessions: Vec<SessionSummary>) {
         self.error = None;
-        let was_attached = self
-            .selection
-            .and_then(|i| self.sessions.get(i))
-            .map(|s| s.session_id);
+        // A pending highlight from `select_session` (set when navigating to
+        // the session manager) takes priority over the current selection so
+        // the fresh list lands on the session the user was just viewing;
+        // otherwise keep following the session currently selected.
+        let preferred = self.pending_select.or_else(|| {
+            self.selection
+                .and_then(|i| self.sessions.get(i))
+                .map(|s| s.session_id)
+        });
         self.sessions = sessions;
         self.sort_by_last_modified();
         self.selection = if self.sessions.is_empty() {
             None
         } else {
-            let idx = was_attached
+            preferred
                 .and_then(|id| self.sessions.iter().position(|s| s.session_id == id))
-                .unwrap_or(0);
-            Some(idx)
+                .unwrap_or(0)
+                .into()
         };
+        // The preference is one-shot: consume it once it has been applied to
+        // a fresh list, so later refreshes fall back to preserving whatever
+        // the user has navigated to since.
+        self.pending_select = None;
+    }
+
+    /// Highlight `session_id` in the list immediately when it is already
+    /// loaded, and remember the preference so the next [`Self::set_sessions`]
+    /// refresh re-selects it even if the current list is empty or stale
+    /// (e.g. the very first visit to the session manager, before the
+    /// ListSessions reply has arrived).
+    pub(crate) fn select_session(&mut self, session_id: u64) {
+        self.pending_select = Some(session_id);
+        if let Some(idx) = self
+            .sessions
+            .iter()
+            .position(|s| s.session_id == session_id)
+        {
+            self.selection = Some(idx);
+            // Re-anchor the scroll window so the highlighted row is visible
+            // right away rather than waiting for the next navigation step.
+            self.reanchor_scroll();
+        }
     }
 
     /// Order sessions newest-first by `last_modified`.  Uses a STABLE sort:
@@ -3704,6 +3739,80 @@ mod tests {
         mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
         let ids: Vec<u64> = mgr.sessions.iter().map(|s| s.session_id).collect();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn set_sessions_keeps_existing_selection_across_refresh() {
+        // A plain refresh (no `select_session`) must keep the current
+        // selection pinned to the same session even when it moves index.
+        let mut mgr = SessionManagerState::new();
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        mgr.select_down();
+        assert_eq!(mgr.selection, Some(1));
+        mgr.set_sessions(vec![make_session(2, "b"), make_session(1, "a")]);
+        assert_eq!(mgr.selection, Some(0), "session 2 moved to index 0");
+        assert_eq!(mgr.sessions[mgr.selection.unwrap()].session_id, 2);
+    }
+
+    #[test]
+    fn select_session_highlights_existing_session_immediately() {
+        let mut mgr = SessionManagerState::new();
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        mgr.select_session(2);
+        assert_eq!(mgr.selection, Some(1));
+        assert_eq!(mgr.sessions[mgr.selection.unwrap()].session_id, 2);
+        // The preference is remembered for the next refresh too.
+        assert_eq!(mgr.pending_select, Some(2));
+    }
+
+    #[test]
+    fn select_session_lands_on_session_once_list_arrives() {
+        // First visit: the list hasn't been loaded yet, so the selection
+        // stays unset until the ListSessions reply populates the list.
+        let mut mgr = SessionManagerState::new();
+        mgr.select_session(2);
+        assert_eq!(mgr.selection, None);
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        assert_eq!(mgr.selection, Some(1));
+        assert_eq!(mgr.sessions[mgr.selection.unwrap()].session_id, 2);
+        // The one-shot preference is consumed after the first refresh.
+        assert_eq!(mgr.pending_select, None);
+    }
+
+    #[test]
+    fn select_session_wins_over_previous_selection() {
+        // The user viewed session 1, but the session they were just looking
+        // at before Ctrl+S is session 2: the pending highlight must win.
+        let mut mgr = SessionManagerState::new();
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        assert_eq!(mgr.selection, Some(0)); // default: first row
+        mgr.select_session(2);
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        assert_eq!(mgr.selection, Some(1));
+        assert_eq!(mgr.sessions[mgr.selection.unwrap()].session_id, 2);
+    }
+
+    #[test]
+    fn pending_select_does_not_stick_across_later_refreshes() {
+        // Once consumed, later refreshes must preserve the user's navigation
+        // instead of re-applying an old highlight.
+        let mut mgr = SessionManagerState::new();
+        mgr.select_session(2);
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        assert_eq!(mgr.selection, Some(1));
+        mgr.select_up(); // user navigates back up to session 1
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        assert_eq!(mgr.selection, Some(0));
+    }
+
+    #[test]
+    fn select_session_falls_back_to_first_row_when_missing() {
+        // The attached session is not in the (possibly stale) list: fall
+        // back to the first row rather than leaving the selection unset.
+        let mut mgr = SessionManagerState::new();
+        mgr.select_session(99);
+        mgr.set_sessions(vec![make_session(1, "a"), make_session(2, "b")]);
+        assert_eq!(mgr.selection, Some(0));
     }
 
     #[test]

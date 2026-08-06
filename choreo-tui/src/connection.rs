@@ -1279,6 +1279,13 @@ fn handle_chat_ctrl_key(
         }
         KeyCode::Char('s') => {
             tracing::debug!("Ctrl+S navigating to session manager");
+            // Highlight the session the user was just viewing so returning
+            // to the session list lands on the session they came from (the
+            // selection survives the ListSessions round-trip via
+            // `pending_select`).
+            if let Some(session_id) = app.attached_session_id {
+                app.session_mgr.select_session(session_id);
+            }
             app.set_page(Page::SessionManager);
             client_tx
                 .send(ClientMessage::ListSessions)
