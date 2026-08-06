@@ -1626,14 +1626,26 @@ user switches to it (`reset_for_session_switch` preserves live estimates).
 
 The same rule extends to every other per-session status message the daemon
 broadcasts over the all-activity subscription.  `ModelSelected`,
-`ReasoningEffortSet`, `ReasoningEffortSetFailed` and `SessionAccountSet`
-are routed to the display of the session they belong to (and only touch the
-status bar's identity fields when that session is the attached one), and for
-a non-attached session the `connection.rs` handler returns before the generic
-dispatch so the global status/error line is not rewritten either — a
-background session changing its model, reasoning effort or account must not
-rewrite the fields of the session on screen, nor reflow its viewport via a
-status-height change.
+`ModelSelectionFailed`, `ReasoningEffortSet`, `ReasoningEffortSetFailed` and
+`SessionAccountSet` are routed to the display of the session they belong to
+(and only touch the status bar's identity fields when that session is the
+attached one), and for a non-attached session the `connection.rs` handler
+returns before the generic dispatch so the global status/error line is not
+rewritten either — a background session changing its model, reasoning effort
+or account must not rewrite the fields of the session on screen, nor reflow
+its viewport via a status-height change.
+
+Two daemon conventions keep this gating correct:
+
+- The daemon replies to `GetReasoningEffort` (bare `/reasoning`) and sends
+  some connection-level errors with the *sentinel* `session_id == 0` meaning
+  "the attached session".  `App::resolve_daemon_session` maps that sentinel to
+  the attached id so the update lands in the right display (never a phantom
+  session 0), and `App::is_background_session_message` — the single gate used
+  by every arm above — treats the sentinel, like the attached session itself,
+  as the user's own feedback rather than background noise.  Without this, the
+  background gating would swallow the confirmation of the user's own
+  `/reasoning` and `/model` commands.
 
 Two session-switch details keep the status bar honest after switching into
 a streaming session:
@@ -1649,9 +1661,12 @@ counts survive the attach instead of regressing.
   second `Sessions` reply cannot re-fire the attach to a different session.
 - `SessionCreated` for a sub-session (`parent_session_id = Some`)
   — e.g. from `spawn_subsession` — is likewise treated as background noise:
-  the TUI refreshes the session list but neither `reset_for_session_switch`
-  nor `AttachSession` runs, so a spawned sub-session cannot hijack the Chat
-  view away from the session the user is reading.  User-created sessions
+  neither `reset_for_session_switch` nor `AttachSession` runs, so a spawned
+  sub-session cannot hijack the Chat view away from the session the user is
+  reading.  The session list is refreshed only while the user is on the
+  Session Manager page — an unsolicited `ListSessions` from the Chat page
+  would make the daemon reply with `Sessions`, whose handler writes the
+  global status line and reflows the viewed viewport.  User-created sessions
   (`parent_session_id = None`) keep the auto-attach behavior.
 
 

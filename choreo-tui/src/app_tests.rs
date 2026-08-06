@@ -3978,7 +3978,18 @@ fn reasoning_effort_set_updates_session_state() {
     )
     .expect("handle ReasoningEffortSet");
 
-    assert_eq!(app.display_for(0).reasoning_effort.as_deref(), Some("high"));
+    // The daemon reports the attached session's effort (bare `/reasoning`)
+    // with the sentinel id 0 — it must resolve to the attached session's
+    // display rather than a phantom session-0 entry.
+    assert_eq!(
+        app.display_for(42).reasoning_effort.as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        app.display_for(0).reasoning_effort.as_deref(),
+        None,
+        "the 0-sentinel must resolve to the attached session, not a phantom display"
+    );
 }
 
 #[test]
@@ -4431,6 +4442,168 @@ fn reasoning_effort_set_failed_for_attached_session_writes_status_and_error() {
     assert_eq!(app.display_for(42).reasoning_effort.as_deref(), Some("off"));
 }
 
+// ── Daemon 0-sentinel ("attached session") and ModelSelectionFailed gating ──
+//
+// The daemon replies to bare `/reasoning` (GetReasoningEffort) and sends some
+// connection-level errors with session_id = 0 meaning "the attached session".
+// Those must keep their fall-through feedback — they are the user's own
+// command replies, not background noise.  ModelSelectionFailed is the failure
+// counterpart of ModelSelected and must be gated the same way for background
+// sessions.
+
+#[test]
+fn reasoning_effort_set_with_sentinel_zero_writes_status_feedback_for_attached_session() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+
+    // The daemon reports the attached session's effort (bare `/reasoning`)
+    // with the sentinel id 0.  It must be treated as the user's own feedback,
+    // not swallowed as background noise.
+    handle_daemon_message(
+        DaemonMessage::ReasoningEffortSet {
+            session_id: 0,
+            effort: "high".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ReasoningEffortSet");
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("[daemon] reasoning effort: high"),
+        "bare /reasoning feedback must be preserved for the sentinel id"
+    );
+    assert_eq!(
+        app.display_for(42).reasoning_effort.as_deref(),
+        Some("high"),
+        "the current effort must land in the attached session's display"
+    );
+    assert_eq!(
+        app.display_for(0).reasoning_effort.as_deref(),
+        None,
+        "the sentinel must not write a phantom session-0 display"
+    );
+    assert_eq!(app.error, None);
+}
+
+#[test]
+fn reasoning_effort_set_failed_with_sentinel_zero_writes_status_and_error() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+
+    // The daemon sends ReasoningEffortSetFailed with the sentinel id 0 for
+    // connection-level rejections ("no session attached").  The user must see
+    // the rejection of their own /reasoning command.
+    handle_daemon_message(
+        DaemonMessage::ReasoningEffortSetFailed {
+            session_id: 0,
+            effort: "high".to_string(),
+            error: "no session attached".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ReasoningEffortSetFailed");
+
+    assert_eq!(
+        app.status.as_deref(),
+        Some("reasoning effort rejected: no session attached")
+    );
+    assert_eq!(
+        app.error.as_deref(),
+        Some("[daemon] failed to set reasoning effort high: no session attached")
+    );
+    assert_eq!(
+        app.display_for(42).reasoning_effort.as_deref(),
+        Some("off"),
+        "the attached session's effort is reset on rejection"
+    );
+}
+
+#[test]
+fn model_selection_failed_for_background_session_does_not_write_global_error() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    assert!(app.status.is_none() && app.error.is_none());
+
+    handle_daemon_message(
+        DaemonMessage::ModelSelectionFailed {
+            session_id: 99,
+            model: "gpt-other".to_string(),
+            error: "model not found".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ModelSelectionFailed");
+
+    assert_eq!(
+        app.error, None,
+        "a background session's model rejection must not write the global error line"
+    );
+    assert_eq!(app.status, None);
+}
+
+#[test]
+fn model_selection_failed_for_attached_session_writes_global_error() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+
+    // The user's own /model command failed — the rejection must still be
+    // surfaced via the generic dispatch's error write.
+    handle_daemon_message(
+        DaemonMessage::ModelSelectionFailed {
+            session_id: 42,
+            model: "gpt-x".to_string(),
+            error: "model not found".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ModelSelectionFailed");
+
+    assert_eq!(
+        app.error.as_deref(),
+        Some("[daemon] failed to select model gpt-x: model not found"),
+        "attached-session /model rejection feedback must be preserved"
+    );
+}
+
+#[test]
+fn model_selection_failed_with_sentinel_zero_writes_global_error() {
+    let mut app = test_app();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+
+    // No session attached at the daemon connection level — the sentinel must
+    // keep its error feedback, not be swallowed as background noise.
+    handle_daemon_message(
+        DaemonMessage::ModelSelectionFailed {
+            session_id: 0,
+            model: "gpt-x".to_string(),
+            error: "no session attached".to_string(),
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle ModelSelectionFailed");
+
+    assert_eq!(
+        app.error.as_deref(),
+        Some("[daemon] failed to select model gpt-x: no session attached")
+    );
+}
+
 // ── SessionCreated must not auto-attach to agent-spawned sub-sessions ──
 
 #[test]
@@ -4469,8 +4642,53 @@ fn session_created_for_sub_session_does_not_hijack_chat_view() {
         Some(42),
         "sub-session creation must not change the active session"
     );
-    // No AttachSession may be sent for the sub-session, and the session list
-    // is refreshed so the session manager sees the new session.
+    // No AttachSession may be sent for the sub-session, and — because the
+    // Chat page renders `Sessions` replies into the status line — no
+    // unsolicited list refresh either (it would rewrite the status line and
+    // reflow the viewed viewport).
+    let msgs: Vec<ClientMessage> = rx.try_iter().collect();
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, ClientMessage::AttachSession { session_id } if *session_id == 99)),
+        "sub-session creation must not auto-attach"
+    );
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, ClientMessage::ListSessions)),
+        "on the Chat page a sub-session creation must not refresh the session list — \
+         the Sessions reply would rewrite the status line"
+    );
+}
+
+#[test]
+fn session_created_for_sub_session_on_session_manager_refreshes_list() {
+    let mut app = test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::SessionManager;
+
+    handle_daemon_message(
+        DaemonMessage::SessionCreated {
+            session_id: 99,
+            parent_session_id: Some(42),
+            title: None,
+            working_dir: None,
+            account_name: None,
+            selected_model: None,
+            reasoning_effort: None,
+        },
+        &mut app,
+        &tx,
+    )
+    .expect("handle SessionCreated");
+
+    // Still no auto-attach, but the list refresh is harmless here: the reply
+    // renders into the session list, not the status line.
+    assert_eq!(app.attached_session_id, Some(42));
+    assert_eq!(app.active_session_id, Some(42));
     let msgs: Vec<ClientMessage> = rx.try_iter().collect();
     assert!(
         !msgs
@@ -4481,7 +4699,7 @@ fn session_created_for_sub_session_does_not_hijack_chat_view() {
     assert!(
         msgs.iter()
             .any(|m| matches!(m, ClientMessage::ListSessions)),
-        "session list should be refreshed so the session manager sees the sub-session"
+        "on the Session Manager page the list must refresh so the sub-session is visible"
     );
 }
 

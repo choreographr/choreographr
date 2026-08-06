@@ -2012,6 +2012,32 @@ impl App {
         self.session_displays.get(&self.active_session_id?)
     }
 
+    /// Whether a daemon message carrying the given wire session id is
+    /// background noise that must not write the global status/error line.
+    ///
+    /// The daemon reports the attached session's own replies with the
+    /// sentinel id 0 (GetReasoningEffort replies, "no session attached"
+    /// errors), so the sentinel — like the attached session itself — keeps
+    /// its fall-through feedback.  Only a message about a real session that
+    /// is not the one the user is viewing is suppressed.
+    pub(crate) fn is_background_session_message(&self, reported_session_id: u64) -> bool {
+        reported_session_id != 0 && self.attached_session_id != Some(reported_session_id)
+    }
+
+    /// Resolve a daemon-reported session id to the session whose display it
+    /// should update.  The daemon uses id 0 as a sentinel for "the attached
+    /// session" (GetReasoningEffort replies, connection-level errors), which
+    /// would otherwise land in a phantom session-0 display and defeat the
+    /// attached-session routing in `is_background_session_message`.  Returns
+    /// `None` when the sentinel cannot be resolved — there is no session to
+    /// update.
+    pub(crate) fn resolve_daemon_session(&self, session_id: u64) -> Option<u64> {
+        match session_id {
+            0 => self.attached_session_id,
+            id => Some(id),
+        }
+    }
+
     /// Number of lines needed for the status/error bar, based on the current
     /// message content and the available terminal width.  Returns 0 when there
     /// is no message to display.
@@ -2462,11 +2488,21 @@ impl App {
         // Agent-spawned sub-sessions (parent_session_id = Some) are transient
         // tool artifacts, not sessions the user opened.  Auto-attaching to one
         // would hijack the Chat view away from the session the user is reading
-        // and destroy its scroll position, so treat it like an already-known
-        // background session: refresh the session list so the session manager
-        // sees it, and do nothing else.
-        if parent_session_id.is_some() {
-            let _ = client_tx.send(ClientMessage::ListSessions);
+        // and destroy its scroll position, so treat it like background noise.
+        // Refresh the session list only while the user is on the Session
+        // Manager page: an unsolicited ListSessions from the Chat page would
+        // make the daemon reply with `Sessions`, whose handler writes the
+        // global status line and reflows the viewed viewport — the very
+        // symptom this path exists to prevent.
+        if let Some(parent_id) = parent_session_id {
+            tracing::info!(
+                session_id,
+                parent_session_id = parent_id,
+                "sub-session created — refreshing list without auto-attaching",
+            );
+            if self.page == Page::SessionManager {
+                let _ = client_tx.send(ClientMessage::ListSessions);
+            }
             return Ok(());
         }
         if self.page == Page::SessionManager {

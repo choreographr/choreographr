@@ -1966,8 +1966,11 @@ pub(crate) fn handle_daemon_message(
         } => {
             // Route the per-session display update to whichever session the
             // message belongs to (never the viewed one when they differ).
-            app.handle_model_selected(*session_id, model, reasoning_capability.clone());
-            if app.attached_session_id != Some(*session_id) {
+            let reported = *session_id;
+            if let Some(session_id) = app.resolve_daemon_session(reported) {
+                app.handle_model_selected(session_id, model, reasoning_capability.clone());
+            }
+            if app.is_background_session_message(reported) {
                 // Background session: stop here so the generic dispatch's
                 // "[daemon] selected model: …" status write does not rewrite
                 // the global status line the user is looking at (which would
@@ -1977,20 +1980,52 @@ pub(crate) fn handle_daemon_message(
             // Attached session: fall through so the user's own `/model`
             // command still prints its confirmation to the status line.
         }
+        DaemonMessage::ModelSelectionFailed {
+            session_id,
+            model,
+            error,
+            ..
+        } => {
+            // The failure counterpart of ModelSelected above.  A background
+            // session's rejected selection must not clobber the global error
+            // line; the sentinel 0 ("no session attached") and the attached
+            // session keep their fall-through so the user sees the rejection
+            // of their own `/model` command.
+            let reported = *session_id;
+            if app.is_background_session_message(reported) {
+                tracing::debug!(
+                    session_id = reported,
+                    %model,
+                    %error,
+                    "ignoring model selection failure for background session",
+                );
+                return Ok(());
+            }
+            // Fall through to dispatch_daemon_message, which writes the
+            // `[daemon] failed to select model …` error line.
+        }
         DaemonMessage::ReasoningEffortSet {
             session_id, effort, ..
         } => {
             // Route the per-session display update to whichever session the
-            // message belongs to (never the viewed one when they differ).
-            app.handle_reasoning_effort_set(*session_id, effort.clone());
-            if app.attached_session_id != Some(*session_id) {
+            // message belongs to.  The daemon replies to bare `/reasoning`
+            // (GetReasoningEffort) with the sentinel id 0 meaning "the
+            // attached session" — resolve it first so the effort lands in the
+            // attached session's display (not a phantom session 0) and the
+            // guard below does not swallow the user's own feedback.
+            let reported = *session_id;
+            if let Some(session_id) = app.resolve_daemon_session(reported) {
+                app.handle_reasoning_effort_set(session_id, effort.clone());
+            }
+            if app.is_background_session_message(reported) {
                 // Background session: stop here so the generic dispatch's
                 // "[daemon] reasoning effort: …" status write does not
                 // rewrite the global status line.
                 return Ok(());
             }
-            // Attached session: fall through so the user's own `/reasoning`
-            // command still prints its confirmation to the status line.
+            // Attached session (or the 0-sentinel): fall through so the
+            // user's own `/reasoning` command still prints its confirmation
+            // to the status line.
         }
         DaemonMessage::ReasoningEffortSetFailed {
             session_id,
@@ -2001,18 +2036,23 @@ pub(crate) fn handle_daemon_message(
             tracing::warn!(%effort, %error, "reasoning effort rejected by daemon");
             // Reset only the session the rejection belongs to — a background
             // session's rejection must not flip the viewed session's effort.
-            let display = app.display_for(*session_id);
-            display.reasoning_effort = Some("off".to_string());
-            if app.attached_session_id != Some(*session_id) {
+            // The 0-sentinel ("no session attached") resolves to the attached
+            // session, matching ReasoningEffortSet above.
+            let reported = *session_id;
+            if let Some(session_id) = app.resolve_daemon_session(reported) {
+                let display = app.display_for(session_id);
+                display.reasoning_effort = Some("off".to_string());
+            }
+            if app.is_background_session_message(reported) {
                 // Background session: stop here so neither the status-line
                 // notice below nor the generic dispatch's `app.error` write
                 // can clobber the global status/error line for a session the
                 // user is not viewing.
                 return Ok(());
             }
-            // Attached session: the user's own `/reasoning` command failed —
-            // surface the rejection notice and fall through so the generic
-            // dispatch records the error as well.
+            // Attached session (or the 0-sentinel): the user's own
+            // `/reasoning` command failed — surface the rejection notice and
+            // fall through so the generic dispatch records the error as well.
             app.status = Some(format!("reasoning effort rejected: {error}"));
         }
         DaemonMessage::SessionAccountSet {
@@ -2022,8 +2062,11 @@ pub(crate) fn handle_daemon_message(
         } => {
             // Route the per-session display update to whichever session the
             // message belongs to (never the viewed one when they differ).
-            app.handle_session_account_set(*session_id, account);
-            if app.attached_session_id != Some(*session_id) {
+            let reported = *session_id;
+            if let Some(session_id) = app.resolve_daemon_session(reported) {
+                app.handle_session_account_set(session_id, account);
+            }
+            if app.is_background_session_message(reported) {
                 // Background session: stop here so the generic dispatch's
                 // "[daemon] session account set: …" status write does not
                 // rewrite the global status line.
