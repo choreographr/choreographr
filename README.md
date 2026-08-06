@@ -156,6 +156,7 @@ after Choreographr.
 
 | Feature | Choreo | openclaw | hermes | opencode | codex | pi | goose | langgraph | buzz | openwork | t3code | OpenMinis | mercury | tau | maka-agent | zero | turnstone |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Language | Rust | TypeScript | Python | TypeScript | Rust | TypeScript | Rust | Python | Rust | TypeScript | TypeScript | Swift/Kotlin | TypeScript | Python | TypeScript | Go | Python |
 | Daemon + multi-client | ✅ | ✅ | — | server | — | — | server | — | ✅ | ✅ | ✅ | — | ✅ daemon | — | ✅ | — | server |
 | Concurrent sessions | ✅ daemon | ✅ gateway | ✅ capped | ✅ server | ✅ threads | — | ✅ server | ✅ framework | ✅ | — | ✅ | — | ✅ | — | ✅ | ✅ pool | ✅ |
 | Providers | 79/3 proto | 40+ | 34 | 15 | 1 (OpenAI) | 42/9 proto | 39 | agnostic | agnostic | agnostic | 5 (drives) | 8 | 6 | 28 | multi | 36 | 5 |
