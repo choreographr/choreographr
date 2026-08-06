@@ -1,6 +1,7 @@
 use super::glob_util::GlobFilter;
 use super::{
-    Tool, ToolExecError, context::ToolContext, finish_tool_output, sanitize_name, truncation_marker,
+    Tool, ToolExecError, context::ToolContext, finish_tool_output, sanitize_content, sanitize_name,
+    truncation_marker,
 };
 use choreo_keystore::ServiceCredential;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
@@ -49,6 +50,17 @@ impl fmt::Display for GrepOutputMode {
             GrepOutputMode::Content => write!(f, "content"),
             GrepOutputMode::FilesWithMatches => write!(f, "files_with_matches"),
             GrepOutputMode::Count => write!(f, "count"),
+        }
+    }
+}
+
+impl GrepOutputMode {
+    /// The noun used in the truncation marker for this mode: matches are
+    /// capped in Content mode, files in the other two.
+    fn cap_noun(self) -> &'static str {
+        match self {
+            GrepOutputMode::Content => "matches",
+            GrepOutputMode::FilesWithMatches | GrepOutputMode::Count => "files",
         }
     }
 }
@@ -132,34 +144,22 @@ fn empty_result(pattern: &str, regex: bool) -> String {
     }
 }
 
-/// Escape control characters in matched line *content* — while keeping tabs
-/// literal — so a pathological or hostile line (embedded ESC, backspace,
-/// carriage return, BEL, …) cannot corrupt the line-oriented output or inject
-/// terminal escape sequences. Path labels go through the stricter
-/// [`sanitize_name`] (which also escapes tabs); tabs inside content are
-/// ubiquitous in code and harmless, so escaping them would mangle ordinary
-/// source output.
-fn sanitize_content(content: &str) -> String {
-    // Fast path: ASCII printables plus tabs — nothing to escape. Multi-byte
-    // UTF-8 bytes are all >= 0x80, so this also covers valid non-ASCII text.
-    if content
-        .bytes()
-        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
-    {
-        return content.to_string();
-    }
-    let mut out = String::with_capacity(content.len());
-    for c in content.chars() {
-        if c.is_control() && c != '\t' {
-            // escape_default renders the special escapes (`\t`, `\r`, `\n`,
-            // …) and everything else control-related as `\u{...}` — all inert
-            // ASCII text, so nothing terminal-affecting leaks.
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
-    }
-    out
+/// Normalize one line from grep-searcher for display: strip exactly the
+/// trailing line terminator, then escape control characters (via the shared
+/// [`sanitize_content`], which keeps tabs literal).
+///
+/// grep-searcher hands back each line *including* exactly one terminator —
+/// `\n` for LF files, `\r\n` for CRLF. Strip precisely that one sequence
+/// (not *all* trailing CR/LF bytes) so a line whose data legitimately ends in
+/// `\r` before a CRLF terminator keeps that `\r` (escaped) instead of losing
+/// it.
+fn sanitized_line(bytes: &[u8]) -> String {
+    let lossy = String::from_utf8_lossy(bytes);
+    let line = lossy
+        .strip_suffix("\r\n")
+        .or_else(|| lossy.strip_suffix('\n'))
+        .unwrap_or(&lossy);
+    sanitize_content(line)
 }
 
 /// One renderable unit from a file's search, in stream order.
@@ -236,15 +236,21 @@ impl GrepSink {
 
     /// Called by the walk loop after searching each file. Count mode flushes
     /// the completed tally here — a per-file count must reflect the whole
-    /// file, not just the lines seen before some other cap applied.
-    fn end_file(&mut self) {
-        if self.output_mode == GrepOutputMode::Count && self.count_file_lines > 0 {
-            self.count_entries
-                .push((self.current_path.clone(), self.count_file_lines));
-            self.count_file_lines = 0;
-            if self.count_entries.len() >= self.max_results {
-                self.done = true;
+    /// file, not just the lines seen before some other cap applied. `completed`
+    /// is false when the search of the file failed (e.g. the read errored
+    /// mid-file); the partial tally is then discarded rather than reported as
+    /// the file's true count.
+    fn end_file(&mut self, completed: bool) {
+        if self.output_mode == GrepOutputMode::Count {
+            if completed && self.count_file_lines > 0 {
+                self.count_entries
+                    .push((self.current_path.clone(), self.count_file_lines));
+                if self.count_entries.len() >= self.max_results {
+                    self.done = true;
+                }
             }
+            // Always reset, so a partial tally never leaks into the next file.
+            self.count_file_lines = 0;
         }
     }
 
@@ -268,8 +274,38 @@ impl GrepSink {
                 .push((self.current_path.clone(), Vec::new()));
         }
         if let Some((_, items)) = self.content_files.last_mut() {
+            // Collapse consecutive Breaks: a separator directly after another
+            // separator (grep-searcher never does this, but defend against it)
+            // would render doubled `--` lines. A Break opening a bucket for a
+            // previous file is also impossible here — it was dropped above.
+            if matches!(item, GrepItem::Break)
+                && items.last().is_some_and(|i| matches!(i, GrepItem::Break))
+            {
+                return;
+            }
             items.push(item);
         }
+    }
+
+    /// Number of results collected under the active cap unit — match lines in
+    /// Content mode, files in the other two. Doubles as the "has results"
+    /// signal and the completion-event counter.
+    fn result_count(&self) -> usize {
+        match self.output_mode {
+            GrepOutputMode::Content => self.content_match_count,
+            GrepOutputMode::FilesWithMatches => self.matched_files.len(),
+            GrepOutputMode::Count => self.count_entries.len(),
+        }
+    }
+
+    /// Whether the output should carry the `...[truncated at N …]` marker.
+    /// For a directly-named single file, the file-capped modes are provably
+    /// complete once that one file is searched — the cap (≥ 1) was necessarily
+    /// met, so claiming truncation would be misleading. Content mode keeps the
+    /// marker because the searcher may genuinely have stopped mid-file at the
+    /// cap.
+    fn truncated(&self, single_file: bool) -> bool {
+        self.done && !(single_file && self.output_mode != GrepOutputMode::Content)
     }
 }
 
@@ -289,9 +325,7 @@ impl Sink for GrepSink {
                 // produce blank lines, then escape any remaining control
                 // characters so a hostile line cannot inject terminal escapes
                 // into the tool result.
-                let content = sanitize_content(
-                    String::from_utf8_lossy(mat.bytes()).trim_end_matches(['\n', '\r']),
-                );
+                let content = sanitized_line(mat.bytes());
                 self.push_item(GrepItem::Match {
                     line_number,
                     content,
@@ -338,9 +372,7 @@ impl Sink for GrepSink {
         }
         self.push_item(GrepItem::Context {
             line_number: ctx.line_number().unwrap_or(0),
-            content: sanitize_content(
-                String::from_utf8_lossy(ctx.bytes()).trim_end_matches(['\n', '\r']),
-            ),
+            content: sanitized_line(ctx.bytes()),
         });
         Ok(true)
     }
@@ -369,6 +401,24 @@ fn path_label(path: &Path, resolved: &Path, single_file: bool) -> String {
     }
 }
 
+impl GrepItem {
+    /// Render one item under its file label: matches use `:` separators,
+    /// context lines `-` (ripgrep's -C convention), breaks render `--`.
+    fn render(&self, label: &str) -> String {
+        match self {
+            GrepItem::Match {
+                line_number,
+                content,
+            } => format!("{label}:{line_number}:{content}"),
+            GrepItem::Context {
+                line_number,
+                content,
+            } => format!("{label}-{line_number}-{content}"),
+            GrepItem::Break => "--".to_string(),
+        }
+    }
+}
+
 /// Content mode: per-file items in stream order. Match lines use `:`
 /// separators, context lines `-` (ripgrep's -C convention), groups of
 /// context are separated by `--`.
@@ -378,19 +428,7 @@ fn render_content(sink: &GrepSink, resolved: &Path, single_file: bool) -> String
     // empty-skip is needed here.
     for (path, items) in &sink.content_files {
         let label = sanitize_name(&path_label(path, resolved, single_file));
-        for item in items {
-            match item {
-                GrepItem::Match {
-                    line_number,
-                    content,
-                } => lines.push(format!("{label}:{line_number}:{content}")),
-                GrepItem::Context {
-                    line_number,
-                    content,
-                } => lines.push(format!("{label}-{line_number}-{content}")),
-                GrepItem::Break => lines.push("--".to_string()),
-            }
-        }
+        lines.extend(items.iter().map(|item| item.render(&label)));
     }
     lines.join("\n")
 }
@@ -432,12 +470,17 @@ fn finish_grep(
     pattern: &str,
     regex: bool,
 ) -> String {
-    let has_results = match sink.output_mode {
-        GrepOutputMode::Content => sink.content_match_count > 0,
-        GrepOutputMode::FilesWithMatches => !sink.matched_files.is_empty(),
-        GrepOutputMode::Count => !sink.count_entries.is_empty(),
-    };
-    if !has_results {
+    let result_count = sink.result_count();
+    // Log the completion for every search — including empty ones — so the
+    // walk-start event in run_grep_walk always has a matching finish event.
+    tracing::debug!(
+        path = %resolved.display(),
+        output_mode = %sink.output_mode,
+        result_count,
+        truncated = sink.done,
+        "grep search finished"
+    );
+    if result_count == 0 {
         return empty_result(pattern, regex);
     }
 
@@ -446,30 +489,12 @@ fn finish_grep(
         GrepOutputMode::FilesWithMatches => render_files(&sink, resolved, single_file),
         GrepOutputMode::Count => render_count(&sink, resolved, single_file),
     };
-    let result_count = match sink.output_mode {
-        GrepOutputMode::Content => sink.content_match_count,
-        GrepOutputMode::FilesWithMatches => sink.matched_files.len(),
-        GrepOutputMode::Count => sink.count_entries.len(),
-    };
-    tracing::debug!(
-        path = %resolved.display(),
-        output_mode = %sink.output_mode,
-        result_count,
-        truncated = sink.done,
-        "grep search finished"
-    );
-    let noun = if sink.output_mode == GrepOutputMode::Content {
-        "matches"
-    } else {
-        "files"
-    };
-    // For a directly-named single file, the file-capped modes are provably
-    // complete once that one file is searched — the cap (≥ 1) was necessarily
-    // met, so claiming truncation would be misleading. Content mode keeps the
-    // marker because the searcher may genuinely have stopped mid-file at the
-    // cap.
-    let truncated = sink.done && !(single_file && sink.output_mode != GrepOutputMode::Content);
-    assemble_grep_output(body, truncated, sink.max_results, noun)
+    assemble_grep_output(
+        body,
+        sink.truncated(single_file),
+        sink.max_results,
+        sink.output_mode.cap_noun(),
+    )
 }
 
 /// Parsed search configuration, shared by `run_grep_walk` and the `Tool`
@@ -574,14 +599,18 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
 
         // Search the file. `GrepSink` collects per its output mode.
         sink.begin_file(resolved);
-        if let Err(e) = searcher.search_path(&matcher, resolved, &mut sink) {
+        let search = searcher.search_path(&matcher, resolved, &mut sink);
+        if let Err(e) = &search {
             tracing::debug!(
                 path = %resolved.display(),
                 error = %e,
                 "grep search error on file, skipping"
             );
         }
-        sink.end_file();
+        // A failed read must not flush a partial count-mode tally — the
+        // searcher may have stopped mid-file, so the observed lines are not
+        // the file's true count.
+        sink.end_file(search.is_ok());
         return Ok(finish_grep(sink, resolved, true, pattern, regex));
     }
 
@@ -614,14 +643,18 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
 
             // Search the file. Individual read errors are non-fatal — we log
             // and continue to the next file.
-            if let Err(e) = searcher.search_path(&matcher, entry.path(), &mut sink) {
+            let search = searcher.search_path(&matcher, entry.path(), &mut sink);
+            if let Err(e) = &search {
                 tracing::debug!(
                     path = %entry.path().display(),
                     error = %e,
                     "grep search error on file, skipping"
                 );
             }
-            sink.end_file();
+            // A failed read must not flush a partial count-mode tally — the
+            // searcher may have stopped mid-file, so the observed lines are not
+            // the file's true count.
+            sink.end_file(search.is_ok());
 
             // Stop early once we've accumulated enough results.
             if sink.done {
@@ -686,7 +719,9 @@ impl Tool for Grep {
         if args.ignore_case {
             parts.push(" Ignoring case.".to_string());
         }
-        if args.context > 0 {
+        // Context is only ever applied in Content mode — the other modes ignore
+        // it entirely — so advertising it there would mislead the model.
+        if args.context > 0 && args.output_mode == GrepOutputMode::Content {
             // Report the value the searcher will actually apply — out-of-range
             // requests are clamped to MAX_CONTEXT_LINES, so advertising e.g.
             // "1000 context line(s)" while 100 are shown would mislead the
@@ -984,6 +1019,45 @@ mod tests {
     }
 
     #[test]
+    fn test_content_unicode_line_separator_escaped() {
+        // U+2028 (LINE SEPARATOR) is not `is_control` (category Zl), but
+        // terminals render it as an actual line break — a hostile file could
+        // use it to split the line-oriented output. It must render as inert
+        // ASCII instead of passing through raw.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("ls.txt"), "hello\u{2028}world\n").expect("write");
+
+        let tool = Grep;
+        let args = test_args("hello", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            result.contains("\\u{2028}"),
+            "U+2028 must be escaped:\n{result:?}"
+        );
+        assert!(
+            !result.contains('\u{2028}'),
+            "raw U+2028 must not pass through:\n{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_line_terminator_strip_preserves_embedded_cr() {
+        // A line whose data legitimately ends in `\r` before a CRLF terminator
+        // keeps that `\r` (escaped) instead of having it trimmed together with
+        // the terminator — only the single terminator sequence is stripped.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("cr.txt"), b"hello world\r\r\nfoo\n").expect("write");
+
+        let tool = Grep;
+        let args = test_args("hello", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert!(
+            result.contains("cr.txt:1:hello world\\r"),
+            "embedded CR must be preserved (escaped), got:\n{result:?}"
+        );
+    }
+
+    #[test]
     fn test_content_tabs_preserved() {
         // Tabs are legitimate code content and harmless in terminal output;
         // escaping them would mangle every tab-indented source line.
@@ -1194,6 +1268,55 @@ mod tests {
     }
 
     #[test]
+    fn count_mode_discards_partial_tally_on_failed_file() {
+        // A search that errored mid-file must not report the partial tally as
+        // the file's true count — the searcher may have stopped before seeing
+        // every matching line.
+        let mut sink = GrepSink::new(GrepOutputMode::Count, 10);
+        sink.begin_file(Path::new("a.txt"));
+        sink.count_file_lines = 3; // matches observed before the read failed
+        sink.end_file(false);
+        assert!(
+            sink.count_entries.is_empty(),
+            "partial tally must be discarded"
+        );
+        assert!(!sink.done, "no entry means no cap met");
+
+        // A completed search flushes normally.
+        sink.count_file_lines = 2;
+        sink.end_file(true);
+        assert_eq!(sink.count_entries.len(), 1);
+        assert_eq!(sink.count_entries[0].0, PathBuf::from("a.txt"));
+        assert_eq!(sink.count_entries[0].1, 2);
+        // The tally is reset after each file, so a partial leak can't happen.
+        assert_eq!(sink.count_file_lines, 0);
+    }
+
+    #[test]
+    fn push_item_drops_stray_break_and_collapses_consecutive() {
+        let mut sink = GrepSink::new(GrepOutputMode::Content, 10);
+        sink.begin_file(Path::new("a.txt"));
+        // A Break with no open bucket has nothing to separate — dropped.
+        sink.push_item(GrepItem::Break);
+        sink.push_item(GrepItem::Match {
+            line_number: 1,
+            content: "m".into(),
+        });
+        sink.push_item(GrepItem::Break);
+        // A second consecutive Break would render doubled `--` — collapsed.
+        sink.push_item(GrepItem::Break);
+        sink.push_item(GrepItem::Context {
+            line_number: 2,
+            content: "c".into(),
+        });
+        let items = &sink.content_files[0].1;
+        assert_eq!(items.len(), 3, "stray + duplicated breaks must not render");
+        assert!(matches!(items[0], GrepItem::Match { .. }));
+        assert!(matches!(items[1], GrepItem::Break));
+        assert!(matches!(items[2], GrepItem::Context { .. }));
+    }
+
+    #[test]
     fn describe_invocation_includes_pattern_and_path() {
         let tool = Grep;
         let args = test_args("fn main", Some(Path::new("src")));
@@ -1222,7 +1345,6 @@ mod tests {
         let mut args = test_args("fn \\w+", None);
         args.regex = true;
         args.ignore_case = true;
-        args.context = 3;
         args.output_mode = GrepOutputMode::Count;
         args.include = Some("*.rs".into());
         args.max_results = Some(25);
@@ -1230,10 +1352,29 @@ mod tests {
         assert!(desc.contains("Searching for `fn \\w+`."));
         assert!(desc.contains("Using regex."));
         assert!(desc.contains("Ignoring case."));
-        assert!(desc.contains("Showing 3 context line(s)."));
         assert!(desc.contains("Output mode: count."));
         assert!(desc.contains("Include pattern: `*.rs`."));
         assert!(desc.contains("Max results: 25."));
+    }
+
+    #[test]
+    fn describe_invocation_context_reported_only_in_content_mode() {
+        // Context is only ever applied in Content mode — the non-content modes
+        // ignore it entirely, so the invocation description must not claim it
+        // is shown there (the model reads this text to predict the output).
+        let tool = Grep;
+        let mut args = test_args("foo", None);
+        args.context = 3;
+        // Content mode (default): the searcher applies context, so report it.
+        let desc = tool.describe_invocation(&args);
+        assert!(desc.contains("Showing 3 context line(s)."), "{desc}");
+        // Count / files modes: context is silently dropped — no "Showing" claim.
+        args.output_mode = GrepOutputMode::Count;
+        let desc = tool.describe_invocation(&args);
+        assert!(!desc.contains("Showing"), "{desc}");
+        args.output_mode = GrepOutputMode::FilesWithMatches;
+        let desc = tool.describe_invocation(&args);
+        assert!(!desc.contains("Showing"), "{desc}");
     }
 
     #[test]

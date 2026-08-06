@@ -997,24 +997,73 @@ pub(crate) fn truncate_tool_output(content: &str) -> String {
     truncated
 }
 
+/// Escape control characters and Unicode line/paragraph separators in a
+/// string so a hostile name or content cannot corrupt the line-oriented tool
+/// output (every entry must stay on exactly one line) or inject terminal
+/// escape sequences.
+///
+/// - C0/C1 control characters (`char::is_control`) are escaped via
+///   `escape_default` (`\n`, `\t`, `\u{1b}`, …).
+/// - U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR are **not**
+///   `is_control` (categories Zl/Zp), yet terminals render them as line
+///   breaks — they must be escaped to preserve the one-line-per-result
+///   invariant.
+/// - Bidi override/isolate characters (U+202A..=U+202E, U+2066..=U+2069,
+///   category Cf) are invisible but can reorder/spoof rendered text, so they
+///   are escaped too.
+///
+/// `keep_tabs` leaves TAB literal — legitimate in source-line *content* (grep
+/// match/context lines) — while names still escape it.
+pub(crate) fn sanitize_text(text: &str, keep_tabs: bool) -> String {
+    // Fast path: ASCII printables (plus tabs when kept) — nothing to escape.
+    // Multi-byte UTF-8 bytes are all >= 0x80, so any non-ASCII text falls
+    // through to the slow path (it may hide a separator or bidi char).
+    if text
+        .bytes()
+        .all(|b| (b == b'\t' && keep_tabs) || (0x20..=0x7e).contains(&b))
+    {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if (c == '\t' && keep_tabs) || (!c.is_control() && !is_unsafe_unicode(c)) {
+            out.push(c);
+        } else {
+            // escape_default renders the special escapes (`\t`, `\r`, `\n`,
+            // …) and everything else control-related as `\u{...}` — all inert
+            // ASCII text, so nothing terminal-affecting or line-splitting leaks.
+            out.extend(c.escape_default());
+        }
+    }
+    out
+}
+
+/// The subset of non-control Unicode that must still be escaped: line /
+/// paragraph separators and bidi format characters (see [`sanitize_text`]).
+fn is_unsafe_unicode(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
+        || ('\u{202a}'..='\u{202e}').contains(&c)
+        || ('\u{2066}'..='\u{2069}').contains(&c)
+}
+
 /// Escape control characters in a name so a pathological name (e.g. one
 /// containing a newline) cannot corrupt the line-oriented tool output — every
 /// entry must stay on exactly one line for the LLM to parse the listing.
+/// Tabs are escaped too, unlike [`sanitize_content`].
 ///
 /// Shared by the line-oriented tools (`list_files`, `find`, `grep`) so a
 /// hostile filename can't break any of them.
 pub(crate) fn sanitize_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for c in name.chars() {
-        if c.is_control() {
-            // escape_default renders e.g. `\n` for a literal newline — the
-            // two-character sequence keeps the output one line per entry.
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    sanitize_text(name, false)
+}
+
+/// Escape control characters in matched line *content*, keeping tabs literal —
+/// tabs are ubiquitous in code and harmless, while a hostile line (embedded
+/// ESC, backspace, U+2028, …) must not corrupt output or inject terminal
+/// escape sequences. Used by `grep` on match/context lines; path labels go
+/// through the stricter [`sanitize_name`].
+pub(crate) fn sanitize_content(content: &str) -> String {
+    sanitize_text(content, true)
 }
 
 /// Formatting for byte sizes: binary (IEC) units with a separating space
@@ -2246,6 +2295,32 @@ mod tests {
         assert_eq!(sanitize_name("plain.txt"), "plain.txt");
         assert_eq!(sanitize_name("a\nb"), "a\\nb");
         assert_eq!(sanitize_name("a\tb"), "a\\tb");
+    }
+
+    #[test]
+    fn sanitize_name_escapes_unicode_separators_and_bidi() {
+        // U+2028/U+2029 are Zl/Zp — not is_control — but terminals render
+        // them as line breaks, so they must be escaped to keep the
+        // one-line-per-result invariant. Bidi format chars are invisible but
+        // can reorder rendered text.
+        assert_eq!(sanitize_name("a\u{2028}b"), "a\\u{2028}b");
+        assert_eq!(sanitize_name("a\u{2029}b"), "a\\u{2029}b");
+        assert_eq!(sanitize_name("a\u{202e}b"), "a\\u{202e}b");
+        assert_eq!(sanitize_name("a\u{2066}b"), "a\\u{2066}b");
+        // Non-ASCII but safe chars pass through untouched.
+        assert_eq!(sanitize_name("café"), "café");
+    }
+
+    #[test]
+    fn sanitize_content_keeps_tabs_but_escapes_separators() {
+        // Content keeps tabs literal (legitimate in source) but still escapes
+        // every other control/separator.
+        assert_eq!(sanitize_content("a\tb"), "a\tb");
+        assert_eq!(sanitize_content("a\nb"), "a\\nb");
+        assert_eq!(sanitize_content("a\u{2028}b"), "a\\u{2028}b");
+        assert_eq!(sanitize_content("a\u{2029}b"), "a\\u{2029}b");
+        assert_eq!(sanitize_content("a\u{202e}b"), "a\\u{202e}b");
+        assert_eq!(sanitize_content("a\u{1b}b"), "a\\u{1b}b");
     }
 
     #[cfg(unix)]
