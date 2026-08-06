@@ -1,13 +1,14 @@
 use super::glob_util::GlobFilter;
 use super::{
-    Tool, ToolExecError, context::ToolContext, finish_tool_output, sanitize_content, sanitize_name,
-    truncation_marker,
+    MAX_LINE_DISPLAY_BYTES, Tool, ToolExecError, context::ToolContext, finish_tool_output,
+    sanitize_content, sanitize_name, truncation_marker,
 };
 use choreo_keystore::ServiceCredential;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use zlob::walk::{WalkBuilder, WalkFlags, WalkState};
@@ -26,6 +27,12 @@ const MAX_RESULTS_CAP: u32 = 200;
 /// by clamping so an out-of-range request degrades gracefully instead of
 /// erroring.
 const MAX_CONTEXT_LINES: u32 = 100;
+
+/// Marker appended to an over-cap matched/context line, matching the
+/// file-read tools' convention (`...[line truncated: exceeds 64 KiB]` in
+/// `render_streamed_line`) so a shortened one-liner reads consistently across
+/// tools.
+const LINE_TRUNCATED_MARKER: &str = "...[line truncated: exceeds 64 KiB]";
 
 /// Output format for grep results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
@@ -78,7 +85,8 @@ pub struct GrepArgs {
     pub ignore_case: bool,
     /// Number of context lines to show before and after each match
     /// (default: 0). Context lines are rendered as `path-{line}-{content}`
-    /// and do NOT count against `max_results`.
+    /// and do NOT count against `max_results`. Only applied in `content`
+    /// output mode — `files_with_matches` and `count` ignore it.
     #[serde(default)]
     #[schemars(range(min = 0, max = 100))]
     pub context: u32,
@@ -145,21 +153,48 @@ fn empty_result(pattern: &str, regex: bool) -> String {
 }
 
 /// Normalize one line from grep-searcher for display: strip exactly the
-/// trailing line terminator, then escape control characters (via the shared
-/// [`sanitize_content`], which keeps tabs literal).
+/// trailing line terminator, escape control characters (via the shared
+/// [`sanitize_content`], which keeps tabs literal), and cap over-long lines
+/// so a giant one-liner cannot balloon the result into memory.
 ///
 /// grep-searcher hands back each line *including* exactly one terminator —
 /// `\n` for LF files, `\r\n` for CRLF. Strip precisely that one sequence
 /// (not *all* trailing CR/LF bytes) so a line whose data legitimately ends in
 /// `\r` before a CRLF terminator keeps that `\r` (escaped) instead of losing
 /// it.
+///
+/// Memory stays bounded per line even for pathological input: the byte window
+/// is cut *before* `from_utf8_lossy`, because lossy conversion eagerly copies
+/// a line containing any invalid UTF-8 into an owned String (replacement
+/// chars). For a multi-MiB binary-ish one-liner that copy would dwarf every
+/// allocation the output byte budget ever sees.
 fn sanitized_line(bytes: &[u8]) -> String {
-    let lossy = String::from_utf8_lossy(bytes);
+    // The window is the display cap plus the CRLF terminator and a couple of
+    // bytes of UTF-8 slop; `cap_line` below re-cuts it to the exact cap on a
+    // char boundary, so the slop only bounds the lossy-conversion cost.
+    let window = &bytes[..bytes.len().min(MAX_LINE_DISPLAY_BYTES + 4)];
+    let lossy = String::from_utf8_lossy(window);
     let line = lossy
         .strip_suffix("\r\n")
         .or_else(|| lossy.strip_suffix('\n'))
         .unwrap_or(&lossy);
-    sanitize_content(line)
+    let line = cap_line(line);
+    sanitize_content(&line)
+}
+
+/// Cut `line` at [`MAX_LINE_DISPLAY_BYTES`] on a char boundary, appending the
+/// shared `...[line truncated: exceeds 64 KiB]` marker so a silently
+/// shortened one-liner is explicit. Borrows for under-cap lines (no
+/// allocation); over-cap lines allocate exactly the capped prefix + marker.
+fn cap_line(line: &str) -> Cow<'_, str> {
+    if line.len() <= MAX_LINE_DISPLAY_BYTES {
+        return Cow::Borrowed(line);
+    }
+    let split = line.floor_char_boundary(MAX_LINE_DISPLAY_BYTES);
+    let mut capped = String::with_capacity(split + LINE_TRUNCATED_MARKER.len());
+    capped.push_str(&line[..split]);
+    capped.push_str(LINE_TRUNCATED_MARKER);
+    Cow::Owned(capped)
 }
 
 /// One renderable unit from a file's search, in stream order.
@@ -477,7 +512,9 @@ fn finish_grep(
         path = %resolved.display(),
         output_mode = %sink.output_mode,
         result_count,
-        truncated = sink.done,
+        // Report the marker state actually rendered (single-file file-capped
+        // modes suppress it even when `done` is set), not the raw flag.
+        truncated = sink.truncated(single_file),
         "grep search finished"
     );
     if result_count == 0 {
@@ -521,6 +558,11 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
         max_results,
     } = config;
 
+    // Clamp max_results to the configured bounds so the caller can't request
+    // an unbounded or absurdly large result set — before the walk-start log
+    // so the event records the value actually applied.
+    let max_results = max_results.clamp(1, MAX_RESULTS_CAP) as usize;
+
     tracing::debug!(
         path = %resolved.display(),
         pattern = %pattern,
@@ -563,7 +605,6 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
 
     // Clamp max_results to the configured bounds so the caller can't
     // request an unbounded or absurdly large result set.
-    let max_results = max_results.clamp(1, MAX_RESULTS_CAP) as usize;
     let mut sink = GrepSink::new(output_mode, max_results);
 
     // Context is only meaningful in Content mode; the other modes ignore it
@@ -573,6 +614,12 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
         let n = context.min(MAX_CONTEXT_LINES) as usize;
         builder.before_context(n).after_context(n);
     }
+    // Treat files with a NUL byte in the head as binary and skip them
+    // (ripgrep's default), honouring the documented contract and keeping a
+    // binary blob from flooding the result with garbage lines. The per-line
+    // cap above would bound the damage, but not searching binary files at all
+    // is the semantically correct behaviour.
+    builder.binary_detection(BinaryDetection::quit(b'\0'));
     let mut searcher = builder.build();
 
     // When the path points directly to a file (not a directory), search it
@@ -593,24 +640,33 @@ fn run_grep_walk(resolved: &Path, config: GrepConfig<'_>) -> Result<String, Tool
         if let Some(ref filter) = include_filter
             && !filter.matches(Path::new(raw_name.as_ref()))
         {
-            // File doesn't match the glob — return the empty-result message.
-            return Ok(empty_result(pattern, regex));
+            // The glob excluded the file before any search ran, so the regex
+            // hint would misattribute the empty result to the pattern. The
+            // plain no-match message is accurate here.
+            return Ok("No matches found.".to_string());
         }
 
         // Search the file. `GrepSink` collects per its output mode.
         sink.begin_file(resolved);
-        let search = searcher.search_path(&matcher, resolved, &mut sink);
-        if let Err(e) = &search {
-            tracing::debug!(
+        if let Err(e) = searcher.search_path(&matcher, resolved, &mut sink) {
+            // A directly-named file that cannot be searched is a real error:
+            // reporting "No matches found." would mislead the caller into
+            // thinking the file exists and simply has no hits. Directory
+            // sweeps keep the skip-and-continue behavior (one unreadable file
+            // among thousands must not fail the whole walk), but a single
+            // explicitly-addressed file has nothing to hide behind.
+            tracing::warn!(
                 path = %resolved.display(),
                 error = %e,
-                "grep search error on file, skipping"
+                "grep failed to search directly-named file"
             );
+            return Err(ToolExecError(format!(
+                "failed to search '{}': {e}",
+                resolved.display()
+            )));
         }
-        // A failed read must not flush a partial count-mode tally — the
-        // searcher may have stopped mid-file, so the observed lines are not
-        // the file's true count.
-        sink.end_file(search.is_ok());
+        // The search completed, so the count-mode tally is authoritative.
+        sink.end_file(true);
         return Ok(finish_grep(sink, resolved, true, pattern, regex));
     }
 
@@ -740,7 +796,12 @@ impl Tool for Grep {
             None => parts.push(" In working directory.".to_string()),
         }
         if let Some(max) = args.max_results {
-            parts.push(format!(" Max results: {}.", max));
+            // Report the value the tool will actually apply — out-of-range
+            // requests are clamped to MAX_RESULTS_CAP at execution, so
+            // advertising e.g. "5000" while 200 are returned would mislead
+            // the model.
+            let shown = max.clamp(1, MAX_RESULTS_CAP);
+            parts.push(format!(" Max results: {shown}."));
         }
         parts.concat()
     }
@@ -1074,6 +1135,53 @@ mod tests {
     }
 
     #[test]
+    fn binary_file_is_not_searched() {
+        // The tool documents that it respects binary files — a file whose
+        // head contains a NUL byte must not produce garbage matches. With the
+        // NUL as the very first byte the searcher treats the file as binary
+        // before any line is delivered.
+        let dir = TempDir::new().expect("temp dir");
+        std::fs::write(dir.path().join("bin.dat"), b"\0hello\n").expect("write");
+
+        let tool = Grep;
+        let args = test_args("hello", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "No matches found.", "{result}");
+    }
+
+    #[test]
+    fn test_over_cap_line_truncated_with_marker() {
+        // A 256 KiB one-liner is far past the 64 KiB line display cap. The
+        // match must render capped with the shared marker instead of being
+        // fully buffered into the result (and, before the cap existed,
+        // duplicated by from_utf8_lossy + sanitize_content).
+        let dir = TempDir::new().expect("temp dir");
+        let mut big = String::with_capacity(300_000);
+        big.push_str("hello");
+        big.push_str(&"a".repeat(256 * 1024));
+        big.push('\n');
+        std::fs::write(dir.path().join("big.txt"), big).expect("write");
+
+        let tool = Grep;
+        let args = test_args("hello", Some(dir.path()));
+        let result = tool.execute(args, None, None, None).unwrap();
+        let line = result.lines().next().expect("one match line");
+        assert!(line.starts_with("big.txt:1:hello"), "{result}");
+        assert!(
+            line.contains("...[line truncated: exceeds 64 KiB]"),
+            "over-cap line must carry the truncation marker:\n{result}"
+        );
+        // Label + capped content + marker stay well under the byte budget;
+        // the raw line would have been ~256 KiB.
+        assert!(
+            line.len() < 100 * 1024,
+            "capped line unexpectedly large: {} bytes",
+            line.len()
+        );
+        assert_eq!(result.lines().count(), 1, "{result}");
+    }
+
+    #[test]
     fn test_context_lines() {
         let dir = TempDir::new().expect("temp dir");
         {
@@ -1397,6 +1505,28 @@ mod tests {
     }
 
     #[test]
+    fn describe_invocation_clamps_max_results() {
+        // Out-of-range max_results requests are clamped to MAX_RESULTS_CAP at
+        // execution; the invocation description must report the value the
+        // tool will actually apply, not the raw request.
+        let tool = Grep;
+        let mut args = test_args("foo", None);
+        args.max_results = Some(5000);
+        let desc = tool.describe_invocation(&args);
+        assert!(
+            desc.contains("Max results: 200."),
+            "clamped max_results should be reported: {desc}"
+        );
+        assert!(
+            !desc.contains("5000"),
+            "unclamped max_results must not be advertised: {desc}"
+        );
+        // In-range requests pass through unchanged.
+        args.max_results = Some(42);
+        assert!(tool.describe_invocation(&args).contains("Max results: 42."));
+    }
+
+    #[test]
     fn test_bare_filename_include_matches_at_any_depth() {
         let dir = TempDir::new().expect("temp dir");
         // Create a file at root level
@@ -1535,6 +1665,49 @@ mod tests {
         assert!(
             result.contains("test1.rs:1:fn hello()"),
             "expected match in test1.rs:\n{result}"
+        );
+    }
+
+    #[test]
+    fn include_filtered_single_file_reports_plain_no_match() {
+        // When the include glob excludes the explicitly-named file, no search
+        // runs at all — the regex hint would misattribute the empty result to
+        // the pattern, so only the plain no-match message may appear.
+        let dir = setup_test_dir();
+        let file_path = dir.path().join("test1.rs");
+        let tool = Grep;
+        let mut args = test_args("foo|bar", Some(&file_path));
+        args.include = Some("*.py".to_string());
+        let result = tool.execute(args, None, None, None).unwrap();
+        assert_eq!(result, "No matches found.", "{result}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_file_read_error_is_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A directly-named file the searcher cannot read must surface as an
+        // error, not a misleading "No matches found." — the caller asked
+        // about this exact file, so the failure is meaningful.
+        let dir = TempDir::new().expect("temp dir");
+        let file = dir.path().join("locked.txt");
+        std::fs::write(&file, "hello\n").expect("write");
+        let mut perms = std::fs::metadata(&file).expect("metadata").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&file, perms).expect("chmod");
+
+        // Running as root bypasses permission bits — nothing to test there.
+        if std::fs::File::open(&file).is_ok() {
+            return;
+        }
+
+        let tool = Grep;
+        let args = test_args("hello", Some(&file));
+        let err = tool.execute(args, None, None, None).unwrap_err();
+        assert!(
+            err.to_string().contains("failed to search"),
+            "direct-file read failure must surface as an error: {err}"
         );
     }
 

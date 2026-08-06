@@ -1008,9 +1008,11 @@ pub(crate) fn truncate_tool_output(content: &str) -> String {
 ///   `is_control` (categories Zl/Zp), yet terminals render them as line
 ///   breaks — they must be escaped to preserve the one-line-per-result
 ///   invariant.
-/// - Bidi override/isolate characters (U+202A..=U+202E, U+2066..=U+2069,
-///   category Cf) are invisible but can reorder/spoof rendered text, so they
-///   are escaped too.
+/// - Bidi format characters (category Cf) are invisible but can reorder or
+///   spoof rendered text: the marks U+200E/U+200F/U+061C, the embeddings and
+///   overrides U+202A..=U+202E, and the isolates U+2066..=U+2069. The joiners
+///   U+200C/U+200D (ZWNJ/ZWJ) do not reorder text and are legitimate in some
+///   scripts, so they pass through.
 ///
 /// `keep_tabs` leaves TAB literal — legitimate in source-line *content* (grep
 /// match/context lines) — while names still escape it.
@@ -1040,8 +1042,17 @@ pub(crate) fn sanitize_text(text: &str, keep_tabs: bool) -> String {
 
 /// The subset of non-control Unicode that must still be escaped: line /
 /// paragraph separators and bidi format characters (see [`sanitize_text`]).
+///
+/// This is the full bidi *format* set that can change how surrounding text
+/// renders — the direction marks LRM/RLM/ALM (U+200E/U+200F/U+061C), the
+/// embeddings and overrides (U+202A..=U+202E), and the isolates
+/// (U+2066..=U+2069). The joiners U+200C/U+200D are deliberately excluded:
+/// they affect ligation, not ordering, and are required by scripts like
+/// Persian (ZWNJ) and Devanagari (ZWJ/ZWNJ conjuncts), so escaping them would
+/// mangle legitimate text for no safety gain.
 fn is_unsafe_unicode(c: char) -> bool {
     matches!(c, '\u{2028}' | '\u{2029}')
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}')
         || ('\u{202a}'..='\u{202e}').contains(&c)
         || ('\u{2066}'..='\u{2069}').contains(&c)
 }
@@ -2302,11 +2313,19 @@ mod tests {
         // U+2028/U+2029 are Zl/Zp — not is_control — but terminals render
         // them as line breaks, so they must be escaped to keep the
         // one-line-per-result invariant. Bidi format chars are invisible but
-        // can reorder rendered text.
+        // can reorder rendered text: the marks, embeddings/overrides, and
+        // isolates must all be escaped.
         assert_eq!(sanitize_name("a\u{2028}b"), "a\\u{2028}b");
         assert_eq!(sanitize_name("a\u{2029}b"), "a\\u{2029}b");
+        assert_eq!(sanitize_name("a\u{200e}b"), "a\\u{200e}b");
+        assert_eq!(sanitize_name("a\u{200f}b"), "a\\u{200f}b");
+        assert_eq!(sanitize_name("a\u{061c}b"), "a\\u{61c}b");
         assert_eq!(sanitize_name("a\u{202e}b"), "a\\u{202e}b");
         assert_eq!(sanitize_name("a\u{2066}b"), "a\\u{2066}b");
+        // Joiners do not reorder text and are legitimate in some scripts
+        // (Persian ZWNJ, Indic conjuncts) — they pass through untouched.
+        assert_eq!(sanitize_name("a\u{200c}b"), "a\u{200c}b");
+        assert_eq!(sanitize_name("a\u{200d}b"), "a\u{200d}b");
         // Non-ASCII but safe chars pass through untouched.
         assert_eq!(sanitize_name("café"), "café");
     }
@@ -2319,6 +2338,7 @@ mod tests {
         assert_eq!(sanitize_content("a\nb"), "a\\nb");
         assert_eq!(sanitize_content("a\u{2028}b"), "a\\u{2028}b");
         assert_eq!(sanitize_content("a\u{2029}b"), "a\\u{2029}b");
+        assert_eq!(sanitize_content("a\u{200f}b"), "a\\u{200f}b");
         assert_eq!(sanitize_content("a\u{202e}b"), "a\\u{202e}b");
         assert_eq!(sanitize_content("a\u{1b}b"), "a\\u{1b}b");
     }
