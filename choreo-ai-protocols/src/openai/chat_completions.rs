@@ -9,7 +9,7 @@ use crate::shared::MAX_TOOL_CALLS;
 use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
-use choreo_proto::TokenUsage;
+use choreo_proto::{ReasoningArtifact, TokenUsage};
 use std::collections::HashMap;
 use std::io;
 
@@ -66,12 +66,38 @@ pub(crate) struct AssistantMessage {
 impl AssistantMessage {
     /// Extract reasoning content from whichever field the model populated
     /// (reasoning_content, reasoning, or reasoning_text).
-    pub(crate) fn take_reasoning(&mut self) -> Option<String> {
-        self.reasoning_content
+    ///
+    /// Returns the display text alongside an opaque [`ReasoningArtifact`]
+    /// capturing the same raw value as UTF-8 bytes. The artifact is built
+    /// from the value BEFORE `.take()` consumes it, so the round-trip
+    /// payload survives the parse boundary untouched.
+    pub(crate) fn take_reasoning(&mut self) -> (Option<String>, Option<ReasoningArtifact>) {
+        let reasoning = self
+            .reasoning_content
             .take()
             .or_else(|| self.reasoning.take())
-            .or_else(|| self.reasoning_text.take())
+            .or_else(|| self.reasoning_text.take());
+        let artifact = reasoning.as_deref().and_then(chat_reasoning_artifact);
+        (reasoning, artifact)
     }
+}
+
+/// Build the opaque `ChatReasoning` artifact from captured reasoning text,
+/// or `None` when nothing reusable was produced. Empty strings are skipped:
+/// an empty payload captures nothing, and a later passback policy shouldn't
+/// be tempted to echo an empty `reasoning_content` (some providers reject
+/// `""` outright).
+fn chat_reasoning_artifact(reasoning: &str) -> Option<ReasoningArtifact> {
+    if reasoning.is_empty() {
+        return None;
+    }
+    debug!(
+        payload_bytes = reasoning.len(),
+        "captured chat reasoning artifact"
+    );
+    Some(ReasoningArtifact::ChatReasoning(
+        reasoning.as_bytes().to_vec(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -209,12 +235,21 @@ pub(crate) fn chat_completions_request_with_tools(
         total_tokens = payload.usage.as_ref().map(|u| u.total_tokens),
         "chat completion turn",
     );
+    chat_completions_response_to_turn(payload)
+}
+
+/// Convert a parsed non-streaming chat completions response into a turn
+/// result. The raw reasoning value is captured into the round-trip artifact
+/// inside `AssistantMessage::take_reasoning`, before the field is consumed.
+fn chat_completions_response_to_turn(
+    payload: ChatCompletionsResponse,
+) -> Result<ChatTurnResult, super::OpenAiError> {
     let Some(mut choice) = payload.choices.into_iter().next() else {
         return Err(super::OpenAiError::EmptyResponse);
     };
 
     // Extract reasoning early (before partial moves into tool_calls / content)
-    let reasoning = choice.message.take_reasoning();
+    let (reasoning, reasoning_artifact) = choice.message.take_reasoning();
 
     // Extract token usage from the API response for cost tracking / display.
     let turn_usage: Option<TokenUsage> = payload.usage.map(|u| TokenUsage {
@@ -242,7 +277,7 @@ pub(crate) fn chat_completions_request_with_tools(
             reasoning,
             usage: turn_usage,
             response_id: None,
-            reasoning_artifact: None,
+            reasoning_artifact,
         }));
     }
 
@@ -261,7 +296,7 @@ pub(crate) fn chat_completions_request_with_tools(
             reasoning,
             usage: turn_usage,
             response_id: None,
-            reasoning_artifact: None,
+            reasoning_artifact,
         }));
     }
 
@@ -280,7 +315,7 @@ pub(crate) fn chat_completions_request_with_tools(
         reasoning,
         usage: turn_usage,
         response_id: None,
-        reasoning_artifact: None,
+        reasoning_artifact,
     }))
 }
 
@@ -415,6 +450,188 @@ pub(crate) fn accumulate_tool_calls_from_deltas(
 
 // ── Streaming chat completions with tools ───────────────────────────────
 
+/// Mutable state accumulated across streamed chat-completions chunks.
+///
+/// Extracted from the streaming request loop so the parse→accumulate→turn
+/// pipeline is unit-testable without an HTTP connection (mirrors the
+/// `accumulate_tool_calls_from_deltas` helper above).
+#[derive(Debug)]
+struct ChatCompletionsStreamAccumulator {
+    has_any_output: bool,
+    full_content: String,
+    full_reasoning: String,
+    /// Raw tool call deltas across all chunks, merged by index by
+    /// `accumulate_tool_calls_from_deltas` once the stream is fully consumed.
+    raw_tool_call_deltas: Vec<StreamToolCallDelta>,
+    seen_tool_call_indices: [bool; MAX_TOOL_CALLS],
+    distinct_tool_call_count: usize,
+    /// Usage from the final SSE chunk (OpenAI sends a usage chunk with
+    /// choices: [] when stream_options.include_usage is true).
+    last_usage: Option<TokenUsage>,
+}
+
+impl Default for ChatCompletionsStreamAccumulator {
+    fn default() -> Self {
+        // Manual impl: `[bool; MAX_TOOL_CALLS]` (128) is past the size for
+        // which std provides a derive-usable `Default`.
+        Self {
+            has_any_output: false,
+            full_content: String::new(),
+            full_reasoning: String::new(),
+            raw_tool_call_deltas: Vec::new(),
+            seen_tool_call_indices: [false; MAX_TOOL_CALLS],
+            distinct_tool_call_count: 0,
+            last_usage: None,
+        }
+    }
+}
+
+impl ChatCompletionsStreamAccumulator {
+    /// Fold one streamed chunk into the accumulated state, forwarding
+    /// content/reasoning deltas to `on_event` immediately so subscribers
+    /// see them in real time.
+    fn apply(
+        &mut self,
+        payload: &ChatCompletionsStreamResponse,
+        on_event: &mut impl FnMut(StreamEvent) -> io::Result<()>,
+    ) -> Result<(), super::OpenAiError> {
+        // Capture usage from the final chunk (choices: []).
+        if let Some(ref u) = payload.usage {
+            debug!(
+                prompt_tokens = u.prompt_tokens,
+                completion_tokens = u.completion_tokens,
+                total_tokens = u.total_tokens,
+                "OpenAI streaming turn usage"
+            );
+            let usage = TokenUsage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+            };
+            self.last_usage = Some(usage);
+        }
+
+        for choice in &payload.choices {
+            let Some(delta) = &choice.delta else {
+                continue;
+            };
+
+            // Content chunks: answer text
+            if let Some(content) = delta.content.as_ref().filter(|c| !c.is_empty()) {
+                self.has_any_output = true;
+                self.full_content.push_str(content);
+                on_event(StreamEvent::Answer(content.clone()))?;
+            }
+
+            // Reasoning chunks — accumulate into `full_reasoning` (used for
+            // both display and the round-trip artifact) and forward each
+            // delta as a display event.
+            for reasoning in [
+                &delta.reasoning_content,
+                &delta.reasoning,
+                &delta.reasoning_text,
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|r| !r.is_empty())
+            {
+                self.has_any_output = true;
+                self.full_reasoning.push_str(reasoning);
+                on_event(StreamEvent::Reasoning(reasoning.clone()))?;
+            }
+
+            // Collect raw tool call deltas — the shared accumulator
+            // (accumulate_tool_calls_from_deltas) will merge them by index
+            // and produce sorted ChatToolCall output after the stream ends.
+            if let Some(ref tcs) = delta.tool_calls {
+                self.has_any_output = true;
+                for tc in tcs.iter() {
+                    if self.distinct_tool_call_count >= MAX_TOOL_CALLS {
+                        return Err(super::OpenAiError::Io(io::Error::other(format!(
+                            "too many tool calls (max {MAX_TOOL_CALLS})"
+                        ))));
+                    }
+                    if (tc.index as usize) >= MAX_TOOL_CALLS {
+                        return Err(super::OpenAiError::Io(io::Error::other(format!(
+                            "tool call index {} out of bounds (max {})",
+                            tc.index,
+                            MAX_TOOL_CALLS - 1,
+                        ))));
+                    }
+                    if !self.seen_tool_call_indices[tc.index as usize] {
+                        self.seen_tool_call_indices[tc.index as usize] = true;
+                        self.distinct_tool_call_count += 1;
+                    }
+                    self.raw_tool_call_deltas.push(tc.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalize the accumulated stream into a turn result, attaching the
+    /// `ChatReasoning` artifact captured from the accumulated reasoning
+    /// deltas (the concatenated deltas are the provider's raw
+    /// `reasoning_content` value, echoed verbatim on tool-loop turns).
+    fn into_turn_result(self) -> Result<ChatTurnResult, super::OpenAiError> {
+        if !self.has_any_output {
+            return Err(super::OpenAiError::EmptyResponse);
+        }
+
+        let reasoning_artifact = chat_reasoning_artifact(&self.full_reasoning);
+
+        if !self.raw_tool_call_deltas.is_empty() {
+            let mut tool_calls = accumulate_tool_calls_from_deltas(self.raw_tool_call_deltas);
+            let discarded = validate_tool_call_arguments(&mut tool_calls);
+            if !tool_calls.is_empty() {
+                return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
+                    content: if self.full_content.is_empty() {
+                        None
+                    } else {
+                        Some(self.full_content)
+                    },
+                    tool_calls,
+                    reasoning: if self.full_reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(self.full_reasoning)
+                    },
+                    usage: self.last_usage,
+                    response_id: None,
+                    reasoning_artifact,
+                }));
+            }
+            if !discarded.is_empty() {
+                // All calls had invalid arguments. Return accumulated text so
+                // the session can continue gracefully.
+                return Ok(ChatTurnResult::FinalText(FinalTextResult {
+                    content: self.full_content,
+                    reasoning: if self.full_reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(self.full_reasoning)
+                    },
+                    usage: self.last_usage,
+                    response_id: None,
+                    reasoning_artifact,
+                }));
+            }
+        }
+
+        Ok(ChatTurnResult::FinalText(FinalTextResult {
+            content: self.full_content,
+            reasoning: if self.full_reasoning.is_empty() {
+                None
+            } else {
+                Some(self.full_reasoning)
+            },
+            usage: self.last_usage,
+            response_id: None,
+            reasoning_artifact,
+        }))
+    }
+}
+
 /// Streaming variant of `chat_completions_request_with_tools`.
 ///
 /// Sends `stream: true` with tool definitions, reads SSE chunks, and calls
@@ -464,19 +681,8 @@ where
     let mut deadline = retry::AttemptDeadline::new(config.total_timeout_secs);
     let mut ctx = retry::AttemptContext::new(on_retry, cancel_rx, Some(&mut deadline));
     let response = retry::retry_send(agent, &url, api_key, &body, &retry, &mut ctx)?;
-    let mut has_any_output = false;
-    let mut full_content = String::new();
-    let mut full_reasoning = String::new();
-    // Collect raw tool call deltas across all chunks, then delegate to the
-    // shared accumulator once the stream is fully consumed.
-    let mut raw_tool_call_deltas: Vec<StreamToolCallDelta> = Vec::new();
-    let mut seen_tool_call_indices = [false; MAX_TOOL_CALLS];
-    let mut distinct_tool_call_count = 0usize;
-
     let mut reader = SseReader::from_reader(response.into_body().into_reader());
-    // Track usage from the final SSE chunk (OpenAI sends a usage chunk with
-    // choices: [] when stream_options.include_usage is true).
-    let mut last_usage: Option<TokenUsage> = None;
+    let mut acc = ChatCompletionsStreamAccumulator::default();
     // Reader thread decouples the blocking socket read from cancellation
     // polling (see `crate::stream`); the abort flag on `sse` stops the thread
     // at its next loop boundary once the consumer cancels or drops it.
@@ -484,132 +690,10 @@ where
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: ChatCompletionsStreamResponse =
             serde_json::from_str(&data).map_err(io::Error::other)?;
-
-        // Capture usage from the final chunk (OpenAI sends a usage chunk
-        // with choices: []).
-        if let Some(ref u) = payload.usage {
-            debug!(
-                prompt_tokens = u.prompt_tokens,
-                completion_tokens = u.completion_tokens,
-                total_tokens = u.total_tokens,
-                "OpenAI streaming turn usage"
-            );
-            let usage = TokenUsage {
-                input_tokens: u.prompt_tokens,
-                output_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-            };
-            last_usage = Some(usage);
-        }
-
-        for choice in payload.choices {
-            let Some(delta) = choice.delta else {
-                continue;
-            };
-
-            // Content chunks: answer text
-            if let Some(content) = delta.content.filter(|c| !c.is_empty()) {
-                has_any_output = true;
-                full_content.push_str(&content);
-                on_event(StreamEvent::Answer(content))?;
-            }
-
-            // Reasoning chunks — use references to avoid partial moves.
-            for reasoning in [
-                &delta.reasoning_content,
-                &delta.reasoning,
-                &delta.reasoning_text,
-            ]
-            .into_iter()
-            .flatten()
-            .filter(|r| !r.is_empty())
-            {
-                has_any_output = true;
-                full_reasoning.push_str(reasoning);
-                on_event(StreamEvent::Reasoning(reasoning.to_string()))?;
-            }
-
-            // Collect raw tool call deltas — the shared accumulator
-            // (accumulate_tool_calls_from_deltas) will merge them by index
-            // and produce sorted ChatToolCall output after the stream ends.
-            if let Some(ref tcs) = delta.tool_calls {
-                has_any_output = true;
-                for tc in tcs.iter() {
-                    if distinct_tool_call_count >= MAX_TOOL_CALLS {
-                        return Err(super::OpenAiError::Io(io::Error::other(format!(
-                            "too many tool calls (max {MAX_TOOL_CALLS})"
-                        ))));
-                    }
-                    if (tc.index as usize) >= MAX_TOOL_CALLS {
-                        return Err(super::OpenAiError::Io(io::Error::other(format!(
-                            "tool call index {} out of bounds (max {})",
-                            tc.index,
-                            MAX_TOOL_CALLS - 1,
-                        ))));
-                    }
-                    if !seen_tool_call_indices[tc.index as usize] {
-                        seen_tool_call_indices[tc.index as usize] = true;
-                        distinct_tool_call_count += 1;
-                    }
-                    raw_tool_call_deltas.push(tc.clone());
-                }
-            }
-        }
+        acc.apply(&payload, on_event)?;
     }
 
-    if !has_any_output {
-        return Err(super::OpenAiError::EmptyResponse);
-    }
-
-    if !raw_tool_call_deltas.is_empty() {
-        let mut tool_calls = accumulate_tool_calls_from_deltas(raw_tool_call_deltas);
-        let discarded = validate_tool_call_arguments(&mut tool_calls);
-        if !tool_calls.is_empty() {
-            return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
-                content: if full_content.is_empty() {
-                    None
-                } else {
-                    Some(full_content)
-                },
-                tool_calls,
-                reasoning: if full_reasoning.is_empty() {
-                    None
-                } else {
-                    Some(full_reasoning)
-                },
-                usage: last_usage,
-                response_id: None,
-                reasoning_artifact: None,
-            }));
-        }
-        if !discarded.is_empty() {
-            // All calls had invalid arguments. Return accumulated text so the
-            // session can continue gracefully.
-            return Ok(ChatTurnResult::FinalText(FinalTextResult {
-                content: full_content,
-                reasoning: if full_reasoning.is_empty() {
-                    None
-                } else {
-                    Some(full_reasoning)
-                },
-                usage: last_usage,
-                response_id: None,
-                reasoning_artifact: None,
-            }));
-        }
-    }
-
-    Ok(ChatTurnResult::FinalText(FinalTextResult {
-        content: full_content,
-        reasoning: if full_reasoning.is_empty() {
-            None
-        } else {
-            Some(full_reasoning)
-        },
-        usage: last_usage,
-        response_id: None,
-        reasoning_artifact: None,
-    }))
+    acc.into_turn_result()
 }
 
 #[cfg(test)]
@@ -1023,5 +1107,228 @@ mod tests {
             .expect("delta");
         assert_eq!(delta.content.as_deref(), Some("answer"));
         assert_eq!(delta.reasoning_text.as_deref(), Some("think"));
+    }
+
+    // -- reasoning artifact capture (phase 2b) ---------------------------
+
+    #[test]
+    fn non_streaming_captures_reasoning_content_artifact() {
+        // DeepSeek/Kimi-style response: `reasoning_content` populated.
+        let json = r#"{"choices":[{"message":{"content":"answer","tool_calls":[],"reasoning_content":"Let me think step-by-step","reasoning":null,"reasoning_text":null}}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let result = chat_completions_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.content, "answer");
+                assert_eq!(f.reasoning.as_deref(), Some("Let me think step-by-step"));
+                assert_eq!(
+                    f.reasoning_artifact,
+                    Some(ReasoningArtifact::ChatReasoning(
+                        b"Let me think step-by-step".to_vec()
+                    ))
+                );
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_captures_reasoning_field_artifact() {
+        // Some providers populate the bare `reasoning` field instead.
+        let json = r#"{"choices":[{"message":{"content":"answer","tool_calls":[],"reasoning_content":null,"reasoning":"bare reasoning field","reasoning_text":null}}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let result = chat_completions_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.reasoning.as_deref(), Some("bare reasoning field"));
+                assert_eq!(
+                    f.reasoning_artifact,
+                    Some(ReasoningArtifact::ChatReasoning(
+                        b"bare reasoning field".to_vec()
+                    ))
+                );
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_captures_reasoning_text_field_artifact() {
+        // And others use `reasoning_text` — whichever field is populated
+        // must be the one captured.
+        let json = r#"{"choices":[{"message":{"content":"answer","tool_calls":[],"reasoning_content":null,"reasoning":null,"reasoning_text":"text reasoning"}}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let result = chat_completions_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.reasoning.as_deref(), Some("text reasoning"));
+                assert_eq!(
+                    f.reasoning_artifact,
+                    Some(ReasoningArtifact::ChatReasoning(b"text reasoning".to_vec()))
+                );
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_captures_artifact_on_tool_use() {
+        // The artifact must ride along on ChatAssistantToolUse too — that's
+        // the DeepSeek tool-loop case where `reasoning_content` has to be
+        // echoed back on the next assistant message.
+        let json = r#"{"choices":[{"message":{
+            "content":null,
+            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"London\"}"}}],
+            "reasoning_content":"reasoning for tool call",
+            "reasoning":null,"reasoning_text":null
+        }}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let result = chat_completions_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::ToolUse(t) => {
+                assert_eq!(t.reasoning.as_deref(), Some("reasoning for tool call"));
+                assert_eq!(
+                    t.reasoning_artifact,
+                    Some(ReasoningArtifact::ChatReasoning(
+                        b"reasoning for tool call".to_vec()
+                    ))
+                );
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_no_reasoning_yields_none_artifact() {
+        // Control case: a response with no reasoning at all.
+        let json =
+            r#"{"choices":[{"message":{"content":"plain answer","tool_calls":[]}}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let result = chat_completions_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.content, "plain answer");
+                assert!(f.reasoning.is_none());
+                assert!(f.reasoning_artifact.is_none());
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_empty_reasoning_yields_none_artifact() {
+        // `reasoning_content: ""` captures nothing reusable — an empty
+        // payload must not become an artifact.
+        let json = r#"{"choices":[{"message":{"content":"answer","tool_calls":[],"reasoning_content":"","reasoning":null,"reasoning_text":null}}],"usage":null}"#;
+        let payload: ChatCompletionsResponse = serde_json::from_str(json).unwrap();
+        let result = chat_completions_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert!(f.reasoning_artifact.is_none());
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_accumulates_reasoning_artifact() {
+        // Two chunks carrying reasoning deltas plus an answer chunk, then
+        // finalize — the concatenated deltas become the artifact bytes.
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk1: ChatCompletionsStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{"reasoning_content":"Let me think"}}]}"#)
+                .unwrap();
+        let chunk2: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{"reasoning_content":" step-by-step","content":"answer"}}]}"#,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        acc.apply(&chunk1, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        acc.apply(&chunk2, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        let result = acc.into_turn_result().unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.content, "answer");
+                assert_eq!(f.reasoning.as_deref(), Some("Let me think step-by-step"));
+                assert_eq!(
+                    f.reasoning_artifact,
+                    Some(ReasoningArtifact::ChatReasoning(
+                        b"Let me think step-by-step".to_vec()
+                    ))
+                );
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+        // Both reasoning deltas were forwarded as display events. Within a
+        // chunk, content is emitted before reasoning (pre-existing order).
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::Reasoning("Let me think".into()),
+                StreamEvent::Answer("answer".into()),
+                StreamEvent::Reasoning(" step-by-step".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_tool_use_carries_reasoning_artifact() {
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk: ChatCompletionsStreamResponse = serde_json::from_str(
+            r#"{"choices":[{"delta":{
+                "reasoning_content":"deciding on tool",
+                "tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"London\"}"}}]
+            }}]}"#,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        acc.apply(&chunk, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        let result = acc.into_turn_result().unwrap();
+        match result {
+            ChatTurnResult::ToolUse(t) => {
+                assert_eq!(t.reasoning.as_deref(), Some("deciding on tool"));
+                assert_eq!(
+                    t.reasoning_artifact,
+                    Some(ReasoningArtifact::ChatReasoning(
+                        b"deciding on tool".to_vec()
+                    ))
+                );
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_no_reasoning_yields_none_artifact() {
+        // Control case: stream with only answer text.
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+        let chunk: ChatCompletionsStreamResponse =
+            serde_json::from_str(r#"{"choices":[{"delta":{"content":"hi"}}]}"#).unwrap();
+        let mut events = Vec::new();
+        acc.apply(&chunk, &mut |e| {
+            events.push(e);
+            Ok(())
+        })
+        .unwrap();
+        let result = acc.into_turn_result().unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert!(f.reasoning.is_none());
+                assert!(f.reasoning_artifact.is_none());
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
     }
 }

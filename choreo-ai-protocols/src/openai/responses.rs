@@ -11,7 +11,7 @@ use crate::shared::MAX_TOOL_CALLS;
 use crate::types::{
     CallerInfo, ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
-use choreo_proto::TokenUsage;
+use choreo_proto::{ReasoningArtifact, TokenUsage};
 use std::collections::HashMap;
 use std::io;
 
@@ -79,9 +79,8 @@ pub(crate) struct ResponsesResponse {
 }
 
 /// Items in a Responses API response output array.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[expect(dead_code)]
 pub(crate) enum ResponseOutputItem {
     Message {
         #[serde(default)]
@@ -90,8 +89,15 @@ pub(crate) enum ResponseOutputItem {
         role: Option<String>,
     },
     Reasoning {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default)]
         summary: Vec<serde_json::Value>,
+        /// Opaque encrypted reasoning content — present only when the request
+        /// was sent with `store: false` (stateless mode). Kept verbatim for
+        /// the round-trip artifact; never interpreted by the daemon.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
     },
     #[serde(rename = "function_call")]
     FunctionCall {
@@ -122,7 +128,7 @@ pub(crate) enum ResponseOutputItem {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct ResponseContentPart {
     #[serde(rename = "type")]
     pub(crate) kind: String,
@@ -493,6 +499,62 @@ pub(crate) fn responses_request_with_tools(
         "responses turn",
     );
 
+    responses_response_to_turn(payload)
+}
+
+/// Build the opaque `ResponsesItems` artifact from the collected reasoning
+/// output items, or `None` when nothing was captured. The payload is the
+/// JSON serialization of the items exactly as received (type tag, id,
+/// summary and — in stateless mode — encrypted_content).
+fn responses_items_artifact(
+    items: &[serde_json::Value],
+) -> Result<Option<ReasoningArtifact>, super::OpenAiError> {
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let bytes =
+        serde_json::to_vec(items).map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
+    debug!(
+        item_count = items.len(),
+        payload_bytes = bytes.len(),
+        "captured responses reasoning items artifact",
+    );
+    Ok(Some(ReasoningArtifact::ResponsesItems(bytes)))
+}
+
+/// Merge a streamed reasoning item into the collected opaque items.
+///
+/// Providers emit both `response.output_item.added` (item opens, summary
+/// still empty) and `response.output_item.done` (item complete, with
+/// `encrypted_content` in stateless mode) for the same item — dedupe by
+/// `id`, keeping the later (complete) value. Items without an id are kept
+/// as-is.
+fn merge_reasoning_item(items: &mut Vec<serde_json::Value>, item: serde_json::Value) {
+    let id = item.get("id").and_then(|v| v.as_str()).map(String::from);
+    let Some(id) = id else {
+        // Items without an id can't be deduped — keep as-is.
+        items.push(item);
+        return;
+    };
+    // Same-id item already collected? Replace it with the later, complete
+    // value; otherwise append.
+    match items
+        .iter()
+        .position(|it| it.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+    {
+        Some(pos) => items[pos] = item,
+        None => items.push(item),
+    }
+}
+
+/// Convert a parsed non-streaming Responses API response into a turn
+/// result, collecting the `reasoning` output items (and `encrypted_content`
+/// where present) into the round-trip artifact. `response_id` and the
+/// display reasoning text keep their existing behavior — the artifact is
+/// purely additive.
+fn responses_response_to_turn(
+    payload: ResponsesResponse,
+) -> Result<ChatTurnResult, super::OpenAiError> {
     let response_id = payload.id.clone();
     let turn_usage = payload.usage.map(|u| TokenUsage {
         input_tokens: u.prompt_tokens,
@@ -500,10 +562,12 @@ pub(crate) fn responses_request_with_tools(
         total_tokens: u.total_tokens,
     });
 
-    // Parse output items: extract text, reasoning, and tool calls.
+    // Parse output items: extract text, reasoning, tool calls, and the
+    // opaque reasoning items for the round-trip artifact.
     let mut full_text = String::new();
     let mut full_reasoning = String::new();
     let mut tool_calls: Vec<ChatToolCall> = Vec::new();
+    let mut reasoning_items: Vec<serde_json::Value> = Vec::new();
 
     for item in payload.output {
         match item {
@@ -516,10 +580,25 @@ pub(crate) fn responses_request_with_tools(
                     }
                 }
             }
-            ResponseOutputItem::Reasoning { summary } => {
+            ResponseOutputItem::Reasoning {
+                id,
+                summary,
+                encrypted_content,
+            } => {
                 if let Some(text) = extract_reasoning_text(&summary) {
                     full_reasoning.push_str(&text);
                 }
+                // Re-serialize the item (type tag + fields) so the artifact
+                // is byte-faithful to what the API returned and the daemon
+                // can forward it uninterpreted.
+                reasoning_items.push(
+                    serde_json::to_value(&ResponseOutputItem::Reasoning {
+                        id,
+                        summary,
+                        encrypted_content,
+                    })
+                    .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?,
+                );
             }
             ResponseOutputItem::FunctionCall {
                 call_id,
@@ -566,6 +645,8 @@ pub(crate) fn responses_request_with_tools(
         }
     }
 
+    let reasoning_artifact = responses_items_artifact(&reasoning_items)?;
+
     let discarded = validate_tool_call_arguments(&mut tool_calls);
     if !tool_calls.is_empty() {
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
@@ -582,7 +663,7 @@ pub(crate) fn responses_request_with_tools(
             },
             usage: turn_usage,
             response_id,
-            reasoning_artifact: None,
+            reasoning_artifact,
         }));
     }
 
@@ -599,7 +680,7 @@ pub(crate) fn responses_request_with_tools(
                 },
                 usage: turn_usage,
                 response_id,
-                reasoning_artifact: None,
+                reasoning_artifact,
             }));
         }
         return Err(super::OpenAiError::TruncatedToolCall { discarded });
@@ -618,7 +699,7 @@ pub(crate) fn responses_request_with_tools(
         },
         usage: turn_usage,
         response_id,
-        reasoning_artifact: None,
+        reasoning_artifact,
     }))
 }
 
@@ -717,6 +798,10 @@ where
     let mut full_reasoning = String::new();
     let mut last_usage: Option<TokenUsage> = None;
     let mut response_id: Option<String> = None;
+    // Opaque reasoning items collected across the stream (deduped by id in
+    // `merge_reasoning_item`) — serialized into the round-trip artifact at
+    // the end.
+    let mut reasoning_items: Vec<serde_json::Value> = Vec::new();
 
     let mut acc_calls: HashMap<String, AccCall> = HashMap::new();
     let mut next_tool_index: u32 = 0;
@@ -744,6 +829,13 @@ where
                     full_reasoning.push_str(&text);
                     on_event(StreamEvent::Reasoning(text))?;
                 }
+            }
+            Some(ResponsesStreamEvent::ReasoningItem(item)) => {
+                // Capture the opaque reasoning item verbatim (id, summary,
+                // and encrypted_content in stateless mode) for the
+                // round-trip artifact. `output_item.added` and `.done` both
+                // map here — merge_reasoning_item dedupes by id.
+                merge_reasoning_item(&mut reasoning_items, item);
             }
             Some(ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta }) => {
                 // `call_id` is provided by the trusted API server — no validation
@@ -849,6 +941,8 @@ where
         }
     }
 
+    let reasoning_artifact = responses_items_artifact(&reasoning_items)?;
+
     if !has_any_output {
         return Err(super::OpenAiError::EmptyResponse);
     }
@@ -892,7 +986,7 @@ where
                 },
                 usage: last_usage,
                 response_id,
-                reasoning_artifact: None,
+                reasoning_artifact,
             }));
         }
 
@@ -908,7 +1002,7 @@ where
                 },
                 usage: last_usage,
                 response_id,
-                reasoning_artifact: None,
+                reasoning_artifact,
             }));
         }
         if !discarded.is_empty() {
@@ -932,7 +1026,7 @@ where
         },
         usage: last_usage,
         response_id,
-        reasoning_artifact: None,
+        reasoning_artifact,
     }))
 }
 
@@ -1144,12 +1238,218 @@ mod tests {
         let json_str = r#"{"type":"reasoning","summary":[{"text":"thinking..."}]}"#;
         let item: ResponseOutputItem = serde_json::from_str(json_str).unwrap();
         match item {
-            ResponseOutputItem::Reasoning { summary } => {
+            ResponseOutputItem::Reasoning {
+                id,
+                summary,
+                encrypted_content,
+            } => {
+                assert!(id.is_none());
                 assert_eq!(summary.len(), 1);
                 assert_eq!(summary[0]["text"], "thinking...");
+                assert!(encrypted_content.is_none());
             }
             other => panic!("expected Reasoning, got {other:?}"),
         }
+    }
+
+    // ── Reasoning artifact capture (phase 2c) ───────────────────────────
+
+    #[test]
+    fn non_streaming_captures_reasoning_items_artifact() {
+        // A stateless-mode response carries `encrypted_content` on the
+        // reasoning item — it must ride along in the artifact verbatim.
+        let json_str = r#"{
+            "id": "resp_abc",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "re_1",
+                    "summary": [{"type": "summary_text", "text": "think carefully"}],
+                    "encrypted_content": "eJxT_opaque"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Here is the answer"}]
+                }
+            ]
+        }"#;
+        let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+        let result = responses_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.content, "Here is the answer");
+                // Display text unchanged — the artifact is additive.
+                assert_eq!(f.reasoning.as_deref(), Some("think carefully"));
+                let expected = serde_json::to_vec(&json!([
+                    {
+                        "type": "reasoning",
+                        "id": "re_1",
+                        "summary": [{"type": "summary_text", "text": "think carefully"}],
+                        "encrypted_content": "eJxT_opaque"
+                    }
+                ]))
+                .unwrap();
+                assert_eq!(
+                    f.reasoning_artifact,
+                    Some(ReasoningArtifact::ResponsesItems(expected))
+                );
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_captures_artifact_on_tool_use() {
+        let json_str = r#"{
+            "id": "resp_123",
+            "output": [
+                {"type": "reasoning", "id": "re_1", "summary": [{"text": "picking tool"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"city\":\"London\"}"}
+            ]
+        }"#;
+        let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+        let result = responses_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::ToolUse(t) => {
+                assert_eq!(t.reasoning.as_deref(), Some("picking tool"));
+                // Response id still captured (unchanged behavior).
+                assert_eq!(t.response_id.as_deref(), Some("resp_123"));
+                let expected = serde_json::to_vec(&json!([
+                    {"type": "reasoning", "id": "re_1", "summary": [{"text": "picking tool"}]}
+                ]))
+                .unwrap();
+                assert_eq!(
+                    t.reasoning_artifact,
+                    Some(ReasoningArtifact::ResponsesItems(expected))
+                );
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_streaming_no_reasoning_yields_none_artifact() {
+        // Control case: a response with no reasoning output items.
+        let json_str = r#"{
+            "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "plain"}]}
+            ]
+        }"#;
+        let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+        let result = responses_response_to_turn(payload).unwrap();
+        match result {
+            ChatTurnResult::FinalText(f) => {
+                assert_eq!(f.content, "plain");
+                assert!(f.reasoning.is_none());
+                assert!(f.reasoning_artifact.is_none());
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_reasoning_item_dedupes_by_id_keeping_later() {
+        // Providers emit `output_item.added` (item opens) then
+        // `output_item.done` (item complete) for the same reasoning item.
+        // The later, complete value must win.
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        merge_reasoning_item(
+            &mut items,
+            json!({ "id": "re_1", "type": "reasoning", "summary": [] }),
+        );
+        merge_reasoning_item(
+            &mut items,
+            json!({
+                "id": "re_1",
+                "type": "reasoning",
+                "summary": [{"text": "final summary"}],
+                "encrypted_content": "eJxT_done"
+            }),
+        );
+        merge_reasoning_item(
+            &mut items,
+            json!({ "id": "re_2", "type": "reasoning", "summary": [] }),
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["id"], "re_1");
+        assert_eq!(items[0]["encrypted_content"], "eJxT_done");
+        assert_eq!(items[1]["id"], "re_2");
+    }
+
+    #[test]
+    fn merge_reasoning_item_without_id_is_appended() {
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        merge_reasoning_item(&mut items, json!({ "type": "reasoning", "summary": [1] }));
+        merge_reasoning_item(&mut items, json!({ "type": "reasoning", "summary": [2] }));
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn responses_items_artifact_serializes_exact_bytes() {
+        // The artifact payload is the serde_json serialization of the
+        // collected items — pinned byte-exact so a serde refactor cannot
+        // silently change the round-trip payload.
+        let items = vec![json!({ "type": "reasoning", "id": "re_1" })];
+        let artifact = responses_items_artifact(&items).unwrap().unwrap();
+        assert_eq!(
+            artifact,
+            ReasoningArtifact::ResponsesItems(br#"[{"id":"re_1","type":"reasoning"}]"#.to_vec())
+        );
+        // Empty collection -> None.
+        assert!(responses_items_artifact(&[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn responses_items_artifact_keeps_encrypted_content() {
+        // The opaque encrypted payload must survive the serialize step
+        // uninterpreted — this is the stateless-mode continuity contract.
+        let items = vec![json!({
+            "type": "reasoning",
+            "id": "re_9",
+            "summary": [],
+            "encrypted_content": "eJxT_opaque_bytes"
+        })];
+        let artifact = responses_items_artifact(&items).unwrap().unwrap();
+        let decoded: serde_json::Value = match artifact {
+            ReasoningArtifact::ResponsesItems(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("expected ResponsesItems, got {other:?}"),
+        };
+        assert_eq!(decoded[0]["encrypted_content"], "eJxT_opaque_bytes");
+    }
+
+    #[test]
+    fn streaming_reasoning_item_events_flow_into_artifact_bytes() {
+        // End-to-end for the streaming capture path without HTTP: feed
+        // canned SSE event data through the parser + merge helper, exactly
+        // as the streaming loop does, and assert the artifact bytes match.
+        let mut items: Vec<serde_json::Value> = Vec::new();
+        let added = parse_responses_stream_event(
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"re_1","type":"reasoning","summary":[]}}"#,
+        )
+        .unwrap()
+        .expect("event");
+        let done = parse_responses_stream_event(
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"re_1","type":"reasoning","summary":[{"text":"streamed reasoning"}],"encrypted_content":"eJxT_stream"}}"#,
+        )
+        .unwrap()
+        .expect("event");
+        match (added, done) {
+            (ResponsesStreamEvent::ReasoningItem(a), ResponsesStreamEvent::ReasoningItem(d)) => {
+                merge_reasoning_item(&mut items, a);
+                merge_reasoning_item(&mut items, d);
+            }
+            other => panic!("expected two ReasoningItem events, got {other:?}"),
+        }
+        let artifact = responses_items_artifact(&items).unwrap().unwrap();
+        let expected = serde_json::to_vec(&json!([{
+            "id": "re_1",
+            "type": "reasoning",
+            "summary": [{"text": "streamed reasoning"}],
+            "encrypted_content": "eJxT_stream"
+        }]))
+        .unwrap();
+        assert_eq!(artifact, ReasoningArtifact::ResponsesItems(expected));
     }
 
     #[test]

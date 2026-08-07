@@ -185,6 +185,64 @@ fn parse_responses_stream_event_unknown_type_returns_none() {
     assert!(result.is_none());
 }
 
+// ── Reasoning item SSE event tests (phase 2c) ───────────────────────
+
+#[test]
+fn parse_responses_stream_event_reasoning_item_done() {
+    // `response.output_item.done` carrying a `type: "reasoning"` item is
+    // captured as an opaque ReasoningItem, verbatim (including
+    // encrypted_content in stateless mode).
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"re_1","type":"reasoning","summary":[{"text":"thinking"}],"encrypted_content":"eJxT"}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ReasoningItem(item) => {
+            assert_eq!(item["id"], "re_1");
+            assert_eq!(item["type"], "reasoning");
+            assert_eq!(item["encrypted_content"], "eJxT");
+        }
+        other => panic!("expected ReasoningItem, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_reasoning_item_added() {
+    // The item-open event also maps to ReasoningItem (item summary may
+    // still be empty; merge_reasoning_item later dedupes by id).
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"re_2","type":"reasoning","summary":[]}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::ReasoningItem(item) => {
+            assert_eq!(item["id"], "re_2");
+        }
+        other => panic!("expected ReasoningItem, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_non_reasoning_item_is_ignored() {
+    // Message / function_call items flow through dedicated events — only
+    // reasoning items are captured here.
+    let result = parse_responses_stream_event(
+        r#"{"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}"#,
+    )
+    .expect("parse");
+    assert!(result.is_none());
+}
+
+#[test]
+fn parse_responses_stream_event_output_item_without_item_is_ignored() {
+    // Malformed event (no `item` field) is silently ignored, not an error.
+    let result =
+        parse_responses_stream_event(r#"{"type":"response.output_item.done"}"#).expect("parse");
+    assert!(result.is_none());
+}
+
 // ── Programmatic tool calling SSE event tests ──────────────────────
 
 #[test]

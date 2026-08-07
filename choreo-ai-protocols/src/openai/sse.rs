@@ -119,6 +119,12 @@ pub(crate) enum ResponsesStreamEvent {
     TextDone,
     /// Reasoning summary
     ReasoningSummary(Vec<serde_json::Value>),
+    /// A complete opaque reasoning output item (`response.output_item.added`
+    /// / `.done` with `type: "reasoning"`), exactly as received. Carries
+    /// the item id, summary array and — in stateless mode —
+    /// `encrypted_content`, all of which are captured into the round-trip
+    /// artifact rather than interpreted here.
+    ReasoningItem(serde_json::Value),
     /// Function call arguments delta
     FunctionCallArgumentsDelta { call_id: String, delta: String },
     /// Function call arguments are complete
@@ -180,6 +186,23 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
                 .cloned()
                 .unwrap_or_default();
             Ok(Some(ResponsesStreamEvent::ReasoningSummary(summary)))
+        }
+        "response.output_item.added" | "response.output_item.done" => {
+            // Reasoning items arrive as opaque output items. Capture the raw
+            // item JSON (id, summary, and encrypted_content in stateless
+            // mode) so the round-trip artifact can be assembled verbatim.
+            // Other item types are ignored — their content flows through
+            // dedicated events (output_text, function_call_arguments, ...).
+            let item = payload.get("item").cloned();
+            if let Some(item) = item {
+                if item.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
+                    Ok(Some(ResponsesStreamEvent::ReasoningItem(item)))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
         }
         "response.function_call_arguments.delta" => {
             let call_id = payload
