@@ -800,6 +800,24 @@ fn render_markdown_block(
             // between items.  A uniform rhythm per list reads better than the
             // old per-item spacing (where one long item created a single
             // lopsided gap in an otherwise tight list).
+            //
+            // The list also shares a single indentation unit: the width of the
+            // *widest* marker (the item with the highest number, e.g. 4 columns
+            // for "10. ").  Every item's content is wrapped to that budget and
+            // every continuation line is indented to it, so wrapped text lines
+            // up across items regardless of how many digits each marker has.
+            // The marker text itself stays natural ("1. ", "10. ").
+            let max_marker_width = if *ordered {
+                // Item numbers run start..=start + len - 1, so the widest marker
+                // is always the last one — O(1) per list, no per-item scan.
+                items
+                    .len()
+                    .checked_sub(1)
+                    .map(|last| display_width(&format!("{}. ", start + last)))
+                    .unwrap_or(0)
+            } else {
+                display_width("• ")
+            };
             let mut rendered_items: Vec<(String, Vec<Line<'static>>)> =
                 Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
@@ -809,14 +827,15 @@ fn render_markdown_block(
                     "• ".to_string()
                 };
                 let mut rendered = Vec::new();
-                // Content is rendered at (width - indent - marker_width) so that
-                // when the marker and outer indent are prepended the total fits
-                // within `width`.
+                // Content is rendered at (width - indent - max_marker_width) so
+                // that when the marker and outer indent are prepended the total
+                // fits within `width` for *every* item, even ones whose own
+                // marker is narrower (their first line just ends early).
                 render_markdown_blocks(
                     item,
                     &mut rendered,
                     0,
-                    width.saturating_sub(indent + display_width(&marker)),
+                    width.saturating_sub(indent + max_marker_width),
                     heading_shift,
                 );
                 rendered_items.push((marker, rendered));
@@ -832,8 +851,9 @@ fn render_markdown_block(
             let spaced = multi_line_count * 2 > items.len();
 
             for (index, (marker, rendered)) in rendered_items.into_iter().enumerate() {
-                let marker_width = display_width(&marker);
-                let continuation_indent = indent + marker_width;
+                // All continuation lines align under the widest marker so wrapped
+                // text lines up across the whole list.
+                let continuation_indent = indent + max_marker_width;
                 let mut rendered_iter = rendered.into_iter();
                 if let Some(first) = rendered_iter.next() {
                     let mut spans = vec![Span::styled(
@@ -1846,6 +1866,112 @@ mod tests {
             .join("\n");
         assert!(text.contains("1. first"), "first ordered item");
         assert!(text.contains("2. second"), "second ordered item");
+    }
+
+    /// Number of leading space characters in a rendered line (0 when it does
+    /// not start with spaces).
+    fn leading_spaces(line: &str) -> usize {
+        line.chars().take_while(|ch| *ch == ' ').count()
+    }
+
+    #[test]
+    fn ordered_list_wrapped_lines_share_widest_marker_indent() {
+        // Item 1's marker is 3 columns wide but item 10's is 4; every item's
+        // continuation lines must indent to the widest marker (4 columns) so
+        // wrapped text lines up across the list.
+        let long = "b".repeat(30);
+        let md = format!("1. {long}\n2. x\n3. x\n4. x\n5. x\n6. x\n7. x\n8. x\n9. x\n10. {long}");
+        let result = markdown_lines(&md, 20);
+        let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        // Both wrapped items must continue under the widest marker.
+        for marker in ["1. ", "10. "] {
+            let idx = text
+                .iter()
+                .position(|l| l.starts_with(marker))
+                .unwrap_or_else(|| panic!("marker {marker:?} not found: {text:?}"));
+            let cont = text
+                .get(idx + 1)
+                .expect("wrapped item should have a continuation line");
+            assert_eq!(
+                leading_spaces(cont),
+                4,
+                "continuation of {marker:?} should indent 4 cols (widest marker), got {cont:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_list_wrapped_lines_never_exceed_width() {
+        // With a 1-digit and a 2-digit marker (list starting at 9), the uniform
+        // content budget must keep every line (marker line and continuation
+        // line) inside `width`.  Without the shared budget the narrower item's
+        // continuation would overflow by one column.
+        let long = "d".repeat(30);
+        let md = format!("9. {long}\n10. {long}");
+        let result = markdown_lines(&md, 20);
+        assert!(
+            result.len() >= 4,
+            "expected marker lines plus wrapped continuations: {result:?}"
+        );
+        for line in &result {
+            assert!(
+                line.width() <= 20,
+                "line exceeds width: {line:?} (width {})",
+                line.width()
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_list_three_digit_marker_indent() {
+        // A list starting at 98 reaches a 3-digit marker ("100. " = 5 cols);
+        // item 98's continuation lines must indent 5, not its own 4.
+        let long = "c".repeat(30);
+        let md = format!("98. {long}\n99. {long}\n100. {long}");
+        let result = markdown_lines(&md, 20);
+        let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        let idx = text
+            .iter()
+            .position(|l| l.starts_with("98. "))
+            .expect("item 98 should render");
+        let cont = text
+            .get(idx + 1)
+            .expect("wrapped item 98 should have a continuation line");
+        assert_eq!(
+            leading_spaces(cont),
+            5,
+            "continuation of item 98 should indent 5 cols (widest marker \"100. \"), got {cont:?}"
+        );
+        // All lines stay within the terminal width.
+        for line in &result {
+            assert!(
+                line.width() <= 20,
+                "line exceeds width: {line:?} (width {})",
+                line.width()
+            );
+        }
+    }
+
+    #[test]
+    fn unordered_list_continuation_indent_unchanged() {
+        // Bullet markers are all the same width, so the shared-indent logic
+        // must not change unordered-list wrapping (continuation stays 2 cols).
+        let long = "e".repeat(30);
+        let md = format!("- {long}\n- short");
+        let result = markdown_lines(&md, 20);
+        let text: Vec<String> = result.iter().map(|l| l.to_string()).collect();
+        let idx = text
+            .iter()
+            .position(|l| l.starts_with("• "))
+            .expect("bullet item should render");
+        let cont = text
+            .get(idx + 1)
+            .expect("wrapped bullet should have a continuation line");
+        assert_eq!(
+            leading_spaces(cont),
+            2,
+            "bullet continuation indent should stay 2 cols, got {cont:?}"
+        );
     }
 
     #[test]
