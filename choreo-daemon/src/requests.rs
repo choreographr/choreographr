@@ -18,6 +18,7 @@ use choreo_proto::{
     AssistantToolCallRecord, ContextConfig, DaemonMessage, DisplayedImageRecord, ImageMetadata,
     OutputStream, SessionStatus, TokenUsage,
 };
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -184,6 +185,10 @@ struct ToolHandle {
     tool_call: ChatToolCall,
     output: ToolOutput,
     image: Option<PreparedImage>,
+    /// When the wait-loop thread started (≈ dispatch time), carried on the
+    /// handle so the collector can log per-tool elapsed independent of the
+    /// batch's arrival order.
+    started_at: Instant,
 }
 
 /// Parameters for spawning a single concurrent tool call.
@@ -198,15 +203,22 @@ struct SpawnToolArgs {
     working_dir: Option<PathBuf>,
     ctx: ToolContext,
     invocation_description: String,
+    /// Shared batch channel: the wait-loop thread delivers its final
+    /// `ToolHandle` here the moment the tool completes, so the caller can
+    /// collect results in completion order without joining.
+    result_tx: mpsc::Sender<ToolHandle>,
 }
 
 /// Spawn a single tool call on a dedicated thread with its own forwarding
 /// channel, timeout guard, and image drain.
 ///
-/// The returned `JoinHandle` lets the caller collect results in whatever
-/// order they choose — the spawned thread handles all channel wiring,
-/// timeouts, and error recording internally.
-fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
+/// The wait-loop thread delivers the final `ToolHandle` through the shared
+/// `result_tx` batch channel the moment the tool completes — the caller
+/// collects results in *completion* order without joining, so a fast tool is
+/// never gated by a slower one the model listed before it. The spawned
+/// thread handles all channel wiring, timeouts, and error recording
+/// internally.
+fn spawn_single_tool(args: SpawnToolArgs) {
     let SpawnToolArgs {
         tool_call,
         timeout,
@@ -218,9 +230,10 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
         working_dir,
         ctx,
         invocation_description,
+        result_tx,
     } = args;
     // Channel for the execution thread to deliver its final result.
-    let (result_tx, result_rx) = mpsc::channel::<Result<ToolOutput, ToolError>>();
+    let (exec_tx, exec_rx) = mpsc::channel::<Result<ToolOutput, ToolError>>();
 
     // Channel for streaming output forwarded to subscribers in real time.
     let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
@@ -261,7 +274,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
             Some(&tool_ctx),
             Some(image_tx),
         );
-        let _ = result_tx.send(result);
+        let _ = exec_tx.send(result);
     });
 
     // ── Wait loop ──────────────────────────────────────────────────
@@ -272,6 +285,9 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
     let deadline = timeout.map(|d| Instant::now() + d);
     let check_interval = Duration::from_millis(200);
     thread::spawn(move || {
+        // Dispatch-time instant, carried on the handle so the collector can
+        // log per-tool elapsed independent of batch arrival order.
+        let started_at = Instant::now();
         let output = loop {
             if let Some(deadline) = deadline {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -283,7 +299,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                         ..Default::default()
                     };
                 }
-                match result_rx.recv_timeout(remaining.min(check_interval)) {
+                match exec_rx.recv_timeout(remaining.min(check_interval)) {
                     Ok(Ok(output)) => break output,
                     Ok(Err(e)) => {
                         break ToolOutput {
@@ -305,7 +321,7 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
                 }
             } else {
                 // No timeout — block indefinitely until the tool finishes.
-                match result_rx.recv() {
+                match exec_rx.recv() {
                     Ok(Ok(output)) => break output,
                     Ok(Err(e)) => {
                         break ToolOutput {
@@ -334,12 +350,13 @@ fn spawn_single_tool(args: SpawnToolArgs) -> thread::JoinHandle<ToolHandle> {
         // won't be streaming any more output from this tool call.
         let _ = kill_tx.send(());
 
-        ToolHandle {
+        let _ = result_tx.send(ToolHandle {
             tool_call,
             output,
             image,
-        }
-    })
+            started_at,
+        });
+    });
 }
 
 /// Resolve the effective reasoning effort for a turn, disabling it if the
@@ -603,6 +620,33 @@ fn collect_tool_result(params: CollectToolResultParams) {
         known_hint_paths,
         pending_hints,
     );
+}
+
+/// Re-order tool results to match the model's original call order.
+///
+/// Concurrent completions are collected in arrival order (fast tools first),
+/// so the accumulator fed to the provider on the next call is re-sorted to
+/// match the assistant message's `tool_calls` array: some providers match
+/// tool messages positionally, and the order should be deterministic. Items
+/// whose `call_id` has no matching tool_call (e.g. a streaming stub created
+/// before the start event arrived) sink to the end, keeping their relative
+/// order (stable sort). The turn's own `tool_results` never need this — they
+/// are seeded in call order and updated in place by `call_id`, so their
+/// order is always the model's.
+fn sort_by_call_order<T>(
+    tool_calls: &[AssistantToolCallRecord],
+    items: &mut [T],
+    call_id_of: impl Fn(&T) -> &str,
+) {
+    let order: HashMap<&str, usize> = tool_calls
+        .iter()
+        .enumerate()
+        .map(|(i, tc)| (tc.call_id.as_str(), i))
+        .collect();
+    if order.is_empty() {
+        return;
+    }
+    items.sort_by_key(|item| order.get(call_id_of(item)).copied().unwrap_or(usize::MAX));
 }
 
 /// A successful session-config tool mutation, captured in Phase 1 and
@@ -953,21 +997,31 @@ pub(crate) fn run_agent_loop(
                 let token_usage = tool_use.usage;
                 accumulate_token_usage(session, &token_usage, turn_iter, ctx);
                 broadcast_token_usage(ctx.session_id, ctx, session);
+                // Build the call records once so the same ordered list seeds
+                // both the assistant message's tool_calls and the placeholder
+                // tool results (they must agree so the in-place updates below
+                // match by call_id).
+                let tool_call_records: Vec<AssistantToolCallRecord> = tool_use
+                    .tool_calls
+                    .iter()
+                    .map(|tc| AssistantToolCallRecord {
+                        call_id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        arguments_json: tc.arguments_json.clone(),
+                    })
+                    .collect();
                 session.set_assistant_response(
                     current_turn_id,
                     tool_use.content.clone(),
                     tool_use.reasoning.clone(),
-                    tool_use
-                        .tool_calls
-                        .iter()
-                        .map(|tc| AssistantToolCallRecord {
-                            call_id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            arguments_json: tc.arguments_json.clone(),
-                        })
-                        .collect(),
+                    tool_call_records.clone(),
                     token_usage,
                 );
+                // Seed one placeholder tool result per call, in the model's
+                // call order, so the transcript renders every tool result in
+                // that order at all times — each placeholder is filled in
+                // place as its tool streams or finalizes.
+                session.seed_tool_results(current_turn_id, &tool_call_records);
                 broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, current_turn_id);
                 // Store response_id for chaining tool results back to this turn
                 prev_resp_id = tool_use.response_id;
@@ -1149,106 +1203,183 @@ pub(crate) fn run_agent_loop(
                     let cmd_tx = ctx.cmd_tx.clone();
                     let reg = Arc::clone(&ctx.tool_registry);
 
-                    let handles: Vec<_> = concurrent
-                        .into_iter()
-                        .map(|tool_call| {
-                            let timeout = determine_tool_timeout(&tool_call.name);
-                            let invocation_description = reg.describe_invocation(&tool_call);
-                            let call_info = (
-                                tool_call.id.clone(),
-                                tool_call.name.clone(),
-                                tool_call.arguments_json.clone(),
-                                Instant::now(),
-                                invocation_description.clone(),
+                    // Shared batch channel: every wait-loop thread delivers its
+                    // final ToolHandle here the moment the tool completes
+                    // (success, error, timeout, or panic). No joins — results
+                    // arrive in *completion* order, so a fast tool broadcasts
+                    // immediately instead of waiting for the slowest tool the
+                    // model listed before it.
+                    let (batch_tx, batch_rx) = mpsc::channel::<ToolHandle>();
+
+                    // Retained for the (rare) fallback synthesis below:
+                    // rebuilding a panicked tool's call from its recorded info,
+                    // matching the old join-based path. Index i holds the
+                    // dispatch-order metadata for the i-th tool call.
+                    let mut call_infos: Vec<(String, String, String, String, Instant)> =
+                        Vec::with_capacity(concurrent.len());
+                    for tool_call in concurrent.into_iter() {
+                        let timeout = determine_tool_timeout(&tool_call.name);
+                        let invocation_description = reg.describe_invocation(&tool_call);
+                        call_infos.push((
+                            tool_call.id.clone(),
+                            tool_call.name.clone(),
+                            tool_call.arguments_json.clone(),
+                            invocation_description.clone(),
+                            Instant::now(),
+                        ));
+                        spawn_single_tool(SpawnToolArgs {
+                            tool_call,
+                            timeout,
+                            request_id,
+                            session_id: ctx.session_id,
+                            registry: Arc::clone(&reg),
+                            cmd_tx: cmd_tx.clone(),
+                            x_credentials: None,
+                            working_dir: session.config.working_dir.clone(),
+                            ctx: tool_ctx.clone(),
+                            invocation_description,
+                            result_tx: batch_tx.clone(),
+                        });
+                    }
+                    // Drop our own sender: the batch channel disconnects only
+                    // when every wait-loop thread has finished (sent or died),
+                    // which is the receive loop's completion signal.
+                    drop(batch_tx);
+
+                    let batch_size = call_infos.len();
+
+                    // Per-tool completion processing: broadcast the result the
+                    // moment it arrives and accumulate it for the next model
+                    // call. Extracted into a closure so the happy path and the
+                    // panic-synthesis fallback share one implementation.
+                    let mut process_tool_handle =
+                        |ToolHandle {
+                             tool_call,
+                             mut output,
+                             image,
+                             started_at,
+                         }: ToolHandle| {
+                            let elapsed = started_at.elapsed();
+
+                            debug!(
+                                session_id = ctx.session_id,
+                                turn = turn_iter,
+                                tool_name = %tool_call.name,
+                                elapsed_ms = elapsed.as_millis(),
+                                result_len = output.content.len(),
+                                is_error = output.is_error,
+                                "tool finished (concurrent)",
                             );
-                            let handle = spawn_single_tool(SpawnToolArgs {
-                                tool_call,
-                                timeout,
+
+                            if let Some(image) = image {
+                                emit_image(
+                                    &ctx.cmd_tx,
+                                    image,
+                                    Some(tool_call.id.clone()),
+                                    session,
+                                    ctx.session_id,
+                                    current_turn_id,
+                                );
+                            }
+
+                            finish_tool_call(
                                 request_id,
-                                session_id: ctx.session_id,
-                                registry: Arc::clone(&reg),
-                                cmd_tx: cmd_tx.clone(),
-                                x_credentials: None,
-                                working_dir: session.config.working_dir.clone(),
-                                ctx: tool_ctx.clone(),
-                                invocation_description,
+                                session,
+                                &tool_call,
+                                &mut output,
+                                ctx,
+                                current_turn_id,
+                            );
+                            collect_tool_result(CollectToolResultParams {
+                                tool_results: &mut tool_results,
+                                session,
+                                tool_call: &tool_call,
+                                output: &output,
+                                known_hint_paths: &mut known_hint_paths,
+                                pending_hints: &mut pending_hints,
                             });
-                            (call_info, handle)
-                        })
-                        .collect();
+                        };
 
                     if is_cancelled_once(cancel_rx) {
                         cancel_flag.store(true, Ordering::Relaxed);
                     }
-                    for (
-                        (call_id, tool_name, arguments_json, tool_start, invocation_description),
-                        handle,
-                    ) in handles.into_iter()
-                    {
+                    let mut received = 0usize;
+                    while received < batch_size {
+                        // Poll cancellation on the same tick as the forwarding
+                        // threads, so a cancel is noticed promptly even while
+                        // slow tools are still running.
                         if is_cancelled_once(cancel_rx) {
                             cancel_flag.store(true, Ordering::Relaxed);
                         }
-
-                        let ToolHandle {
-                            tool_call,
-                            mut output,
-                            image,
-                        } = handle.join().unwrap_or_else(|_| ToolHandle {
-                            tool_call: ChatToolCall {
-                                id: call_id,
-                                name: tool_name.clone(),
-                                arguments_json,
-                                caller: None,
-                            },
-                            output: ToolOutput {
-                                content: "tool thread panicked".to_string(),
-                                is_error: true,
-                                invocation_description,
-                                ..Default::default()
-                            },
-                            image: None,
-                        });
-
-                        let elapsed = tool_start.elapsed();
-
-                        debug!(
-                            session_id = ctx.session_id,
-                            turn = turn_iter,
-                            tool_name = %tool_call.name,
-                            elapsed_ms = elapsed.as_millis(),
-                            result_len = output.content.len(),
-                            is_error = output.is_error,
-                            "tool finished (concurrent)",
-                        );
-
-                        if let Some(image) = image {
-                            emit_image(
-                                &ctx.cmd_tx,
-                                image,
-                                Some(tool_call.id.clone()),
-                                session,
-                                ctx.session_id,
-                                current_turn_id,
-                            );
+                        match batch_rx.recv_timeout(Duration::from_millis(200)) {
+                            Ok(handle) => {
+                                received += 1;
+                                process_tool_handle(handle);
+                            }
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => {
+                                // Every wait-loop thread has exited but fewer
+                                // handles arrived than expected: some thread
+                                // panicked before sending. Synthesize the same
+                                // "tool thread panicked" output the old
+                                // join-based path produced, in dispatch order
+                                // for the remaining slots, so the turn still
+                                // records a result for every call.
+                                warn!(
+                                    session_id = ctx.session_id,
+                                    request_id,
+                                    delivered = received,
+                                    expected = batch_size,
+                                    "concurrent tool batch ended early; synthesizing missing tool results",
+                                );
+                                for (
+                                    call_id,
+                                    tool_name,
+                                    arguments_json,
+                                    invocation_description,
+                                    started_at,
+                                ) in call_infos.into_iter().skip(received)
+                                {
+                                    process_tool_handle(ToolHandle {
+                                        tool_call: ChatToolCall {
+                                            id: call_id,
+                                            name: tool_name,
+                                            arguments_json,
+                                            caller: None,
+                                        },
+                                        output: ToolOutput {
+                                            content: "tool thread panicked".to_string(),
+                                            is_error: true,
+                                            invocation_description,
+                                            ..Default::default()
+                                        },
+                                        image: None,
+                                        started_at,
+                                    });
+                                }
+                                break;
+                            }
                         }
-
-                        finish_tool_call(
-                            request_id,
-                            session,
-                            &tool_call,
-                            &mut output,
-                            ctx,
-                            current_turn_id,
-                        );
-                        collect_tool_result(CollectToolResultParams {
-                            tool_results: &mut tool_results,
-                            session,
-                            tool_call: &tool_call,
-                            output: &output,
-                            known_hint_paths: &mut known_hint_paths,
-                            pending_hints: &mut pending_hints,
-                        });
                     }
+
+                    // ── Phase 2b: Normalize the next-call accumulator ──
+                    //
+                    // The receive loop above processed results in completion
+                    // order so each broadcast hit the TUI the moment its tool
+                    // finished (and streaming chunks flow even earlier). The
+                    // turn's own tool_results never need re-ordering: they
+                    // were seeded in call order before execution and updated
+                    // in place by call_id, so the transcript is always in the
+                    // model's order. The accumulator sent to the provider on
+                    // the next agent-loop iteration should mirror the
+                    // assistant message's tool_calls array, so re-sort it now
+                    // the batch is complete.
+                    let tool_calls = session
+                        .turns
+                        .get(&current_turn_id)
+                        .map(|t| t.tool_calls.clone())
+                        .unwrap_or_default();
+                    sort_by_call_order(&tool_calls, &mut tool_results, |r| r.call_id.as_str());
                 }
 
                 // ── Phase 3: Mirror session-config changes onto the
@@ -1340,9 +1471,9 @@ fn finish_tool_call(
     let content = output.content.clone();
     let invocation_description = output.invocation_description.clone();
 
-    session.add_tool_result(
+    session.update_tool_result(
         turn_id,
-        tool_call.id.clone(),
+        &tool_call.id,
         tool_call.name.clone(),
         content.clone(),
         is_error,
@@ -1652,20 +1783,18 @@ mod tests {
     fn build_chat_request_messages_with_tool_calls() {
         let mut session = SessionState::empty();
         let (tid, _) = session.start_turn(Some("list files".into()));
-        session.set_assistant_response(
+        let records = vec![AssistantToolCallRecord {
+            call_id: "call_1".into(),
+            name: "ls".into(),
+            arguments_json: r#"{"path": "."}"#.into(),
+        }];
+        session.set_assistant_response(tid, Some("thinking".into()), None, records.clone(), None);
+        // Placeholder results are seeded in call order; the finished tool
+        // updates its slot in place.
+        session.seed_tool_results(tid, &records);
+        session.update_tool_result(
             tid,
-            Some("thinking".into()),
-            None,
-            vec![AssistantToolCallRecord {
-                call_id: "call_1".into(),
-                name: "ls".into(),
-                arguments_json: r#"{"path": "."}"#.into(),
-            }],
-            None,
-        );
-        session.add_tool_result(
-            tid,
-            "call_1".into(),
+            "call_1",
             "ls".into(),
             "file.txt".into(),
             false,
@@ -2384,16 +2513,35 @@ mod tests {
 
     // -- spawn_single_tool tests ---------------------------------------
 
+    /// Build a throwaway `ToolContext` and command channel for
+    /// `spawn_single_tool` tests. Receivers are dropped, which is fine — no
+    /// assertion inspects the daemon or session command streams here.
+    fn spawn_test_ctx() -> (ToolContext, mpsc::Sender<SessionCommand>) {
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
+        let (_daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).expect("Database"));
+        let ctx = ToolContext {
+            session_id: 1,
+            db,
+            daemon_tx: _daemon_tx,
+            active_tool_groups: std::collections::HashSet::new(),
+            reasoning_effort: None,
+            selected_model: None,
+            working_dir: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            account_name: None,
+        };
+        (ctx, cmd_tx)
+    }
+
     fn run_spawn_single_tool(
         tool: impl Tool + 'static,
         tool_name: &str,
         tool_args: &str,
         timeout: Option<Duration>,
     ) -> ToolHandle {
-        let (cmd_tx, _cmd_rx) = mpsc::channel::<SessionCommand>();
-        let (_daemon_tx, _daemon_rx) = mpsc::channel::<DaemonCommand>();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).expect("Database"));
+        let (ctx, cmd_tx) = spawn_test_ctx();
 
         let mut registry = ToolRegistry::new();
         registry.register(tool);
@@ -2406,23 +2554,12 @@ mod tests {
             caller: None,
         };
 
-        let tool_ctx = ToolContext {
-            session_id: 1,
-            db,
-            daemon_tx: _daemon_tx,
-            active_tool_groups: std::collections::HashSet::new(),
-            reasoning_effort: None,
-            selected_model: None,
-            working_dir: None,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            account_name: None,
-        };
-
         let invocation_description = registry
             .describe_invocation_for(&tool_call.name, &tool_call.arguments_json)
             .unwrap_or_default();
 
-        let handle = spawn_single_tool(SpawnToolArgs {
+        let (result_tx, result_rx) = mpsc::channel::<ToolHandle>();
+        spawn_single_tool(SpawnToolArgs {
             tool_call,
             timeout,
             request_id: 1,
@@ -2431,11 +2568,12 @@ mod tests {
             cmd_tx,
             x_credentials: None,
             working_dir: None,
-            ctx: tool_ctx,
+            ctx,
             invocation_description,
+            result_tx,
         });
 
-        handle.join().expect("tool thread panicked")
+        result_rx.recv().expect("tool did not deliver a result")
     }
 
     #[test]
@@ -2472,6 +2610,161 @@ mod tests {
             "{}",
             handle.output.content
         );
+    }
+
+    #[test]
+    fn concurrent_tools_deliver_in_completion_order() {
+        // Tool A (dispatched first) blocks until released; tool B (dispatched
+        // second) completes immediately. B must arrive through the shared
+        // batch channel before A — a fast tool is no longer gated by the
+        // slowest tool the model listed before it.
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let (ctx, cmd_tx) = spawn_test_ctx();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(BlockingTestTool {
+            proceed: std::sync::Mutex::new(Some(proceed_rx)),
+        });
+        registry.register(FastTestTool);
+        let registry = registry.build();
+
+        let slow_call = ChatToolCall {
+            id: "call_slow".into(),
+            name: "_test_blocking".into(),
+            arguments_json: "{}".into(),
+            caller: None,
+        };
+        let fast_call = ChatToolCall {
+            id: "call_fast".into(),
+            name: "_test_fast".into(),
+            arguments_json: "{}".into(),
+            caller: None,
+        };
+
+        let (batch_tx, batch_rx) = mpsc::channel::<ToolHandle>();
+
+        // Dispatch the slow tool first, then the fast one.
+        spawn_single_tool(SpawnToolArgs {
+            tool_call: slow_call,
+            timeout: Some(Duration::from_secs(60)),
+            request_id: 1,
+            session_id: 1,
+            registry: Arc::clone(&registry),
+            cmd_tx: cmd_tx.clone(),
+            x_credentials: None,
+            working_dir: None,
+            ctx: ctx.clone(),
+            invocation_description: String::new(),
+            result_tx: batch_tx.clone(),
+        });
+        spawn_single_tool(SpawnToolArgs {
+            tool_call: fast_call,
+            timeout: Some(Duration::from_secs(60)),
+            request_id: 1,
+            session_id: 1,
+            registry,
+            cmd_tx,
+            x_credentials: None,
+            working_dir: None,
+            ctx,
+            invocation_description: String::new(),
+            result_tx: batch_tx,
+        });
+
+        // The fast tool must arrive first despite being dispatched second.
+        let first = batch_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected a first tool result");
+        assert_eq!(first.tool_call.name, "_test_fast");
+        assert!(
+            first.output.content.contains("fast result"),
+            "{}",
+            first.output.content
+        );
+
+        // Release the slow tool; its result arrives second.
+        drop(proceed_tx);
+        let second = batch_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("expected the slow tool result");
+        assert_eq!(second.tool_call.name, "_test_blocking");
+        assert!(
+            second.output.content.contains("blocked tool done"),
+            "{}",
+            second.output.content
+        );
+    }
+
+    // -- sort_by_call_order tests -----------------------------------------
+
+    #[test]
+    fn sort_by_call_order_restores_model_order() {
+        // Model issued calls a, b, c; the tools completed in the reverse order
+        // (c first). The next-call accumulator must be restored to a, b, c so
+        // tool messages mirror the assistant's tool_calls array.
+        let tool_calls = vec![
+            AssistantToolCallRecord {
+                call_id: "a".into(),
+                name: "read_file".into(),
+                arguments_json: "{}".into(),
+            },
+            AssistantToolCallRecord {
+                call_id: "b".into(),
+                name: "grep".into(),
+                arguments_json: "{}".into(),
+            },
+            AssistantToolCallRecord {
+                call_id: "c".into(),
+                name: "sh".into(),
+                arguments_json: "{}".into(),
+            },
+        ];
+        let mut items = vec![
+            ToolResultItem {
+                call_id: "c".into(),
+                output: "c-out".into(),
+                caller: None,
+            },
+            ToolResultItem {
+                call_id: "a".into(),
+                output: "a-out".into(),
+                caller: None,
+            },
+            ToolResultItem {
+                call_id: "b".into(),
+                output: "b-out".into(),
+                caller: None,
+            },
+        ];
+        sort_by_call_order(&tool_calls, &mut items, |r| r.call_id.as_str());
+        let order: Vec<_> = items.iter().map(|r| r.call_id.as_str()).collect();
+        assert_eq!(order, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn sort_by_call_order_sinks_unknown_call_ids() {
+        // A streaming stub created before its start event arrived has no
+        // matching tool_call; it must sink to the end, keeping relative order.
+        let tool_calls = vec![AssistantToolCallRecord {
+            call_id: "a".into(),
+            name: "read_file".into(),
+            arguments_json: "{}".into(),
+        }];
+        let mut items = vec![
+            ToolResultItem {
+                call_id: "ghost".into(),
+                output: "g-out".into(),
+                caller: None,
+            },
+            ToolResultItem {
+                call_id: "a".into(),
+                output: "a-out".into(),
+                caller: None,
+            },
+        ];
+        sort_by_call_order(&tool_calls, &mut items, |r| r.call_id.as_str());
+        let order: Vec<_> = items.iter().map(|r| r.call_id.as_str()).collect();
+        assert_eq!(order, vec!["a", "ghost"]);
     }
 
     // -- extract_json_string tests ------------------------------------------

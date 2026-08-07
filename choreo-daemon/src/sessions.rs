@@ -603,24 +603,46 @@ impl SessionState {
         }
     }
 
-    /// Add a tool result to a turn.
-    pub fn add_tool_result(
+    /// Seed placeholder tool results for every tool call, in call order, so
+    /// the transcript always renders tool results in the order the model
+    /// issued them — even while the tools are still running. Each placeholder
+    /// is filled in place by [`Self::update_tool_result`] the moment its tool
+    /// streams or finishes, so the rendered order never changes.
+    pub fn seed_tool_results(&mut self, turn_id: u32, tool_calls: &[AssistantToolCallRecord]) {
+        if let Some(turn) = self.turns.get_mut(&turn_id) {
+            turn.tool_results = tool_calls
+                .iter()
+                .map(|tc| ToolResultRecord {
+                    call_id: tc.call_id.clone(),
+                    name: tc.name.clone(),
+                    content: String::new(),
+                    is_error: false,
+                    invocation_description: String::new(),
+                })
+                .collect();
+        }
+    }
+
+    /// Set (or replace) a single tool result in place, matched by `call_id`,
+    /// so the result keeps its position in the model's call order regardless
+    /// of when the tool actually finished. Requires the turn to have been
+    /// seeded via [`Self::seed_tool_results`]; otherwise it is a no-op.
+    pub fn update_tool_result(
         &mut self,
         turn_id: u32,
-        call_id: String,
+        call_id: &str,
         name: String,
         content: String,
         is_error: bool,
         invocation_description: String,
     ) {
-        if let Some(turn) = self.turns.get_mut(&turn_id) {
-            turn.tool_results.push(ToolResultRecord {
-                call_id,
-                name,
-                content,
-                is_error,
-                invocation_description,
-            });
+        if let Some(turn) = self.turns.get_mut(&turn_id)
+            && let Some(record) = turn.tool_results.iter_mut().find(|r| r.call_id == call_id)
+        {
+            record.name = name;
+            record.content = content;
+            record.is_error = is_error;
+            record.invocation_description = invocation_description;
         }
     }
 
@@ -2946,6 +2968,97 @@ mod tests {
         assert_eq!(id0, 0);
         assert_eq!(id1, 1);
         assert_eq!(state.turns.len(), 2);
+    }
+
+    #[test]
+    fn seed_then_update_tool_results_preserves_call_order() {
+        // The model issued calls a, b, c; the tools finish in reverse order.
+        // Because results are seeded in call order and updated in place by
+        // call_id, the turn's tool_results must stay a, b, c at all times.
+        let mut state = SessionState::empty();
+        let (tid, _) = state.start_turn(Some("run tools".into()));
+        let calls = vec![
+            AssistantToolCallRecord {
+                call_id: "a".into(),
+                name: "read_file".into(),
+                arguments_json: "{}".into(),
+            },
+            AssistantToolCallRecord {
+                call_id: "b".into(),
+                name: "grep".into(),
+                arguments_json: "{}".into(),
+            },
+            AssistantToolCallRecord {
+                call_id: "c".into(),
+                name: "sh".into(),
+                arguments_json: "{}".into(),
+            },
+        ];
+        state.seed_tool_results(tid, &calls);
+
+        let order_of = |state: &SessionState| {
+            state
+                .turns
+                .get(&tid)
+                .map(|t| {
+                    t.tool_results
+                        .iter()
+                        .map(|r| r.call_id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(order_of(&state), vec!["a", "b", "c"]);
+
+        // c finishes first — its placeholder is filled in place.
+        state.update_tool_result(tid, "c", "sh".into(), "c-out".into(), false, String::new());
+        assert_eq!(order_of(&state), vec!["a", "b", "c"]);
+        assert_eq!(state.turns[&tid].tool_results[2].content, "c-out");
+
+        // Then a, then b — order still unchanged.
+        state.update_tool_result(
+            tid,
+            "a",
+            "read_file".into(),
+            "a-out".into(),
+            false,
+            String::new(),
+        );
+        state.update_tool_result(
+            tid,
+            "b",
+            "grep".into(),
+            "b-out".into(),
+            false,
+            String::new(),
+        );
+        assert_eq!(order_of(&state), vec!["a", "b", "c"]);
+        assert_eq!(state.turns[&tid].tool_results[0].content, "a-out");
+        assert_eq!(state.turns[&tid].tool_results[1].content, "b-out");
+
+        // Error results also land in place.
+        state.update_tool_result(tid, "b", "grep".into(), "boom".into(), true, String::new());
+        assert_eq!(order_of(&state), vec!["a", "b", "c"]);
+        assert!(state.turns[&tid].tool_results[1].is_error);
+        assert_eq!(state.turns[&tid].tool_results[1].content, "boom");
+    }
+
+    #[test]
+    fn update_tool_result_unknown_call_id_is_noop() {
+        // An update for an unseeded call id must not append — it would break
+        // the call-order invariant.
+        let mut state = SessionState::empty();
+        let (tid, _) = state.start_turn(None);
+        state.seed_tool_results(tid, &[]);
+        state.update_tool_result(
+            tid,
+            "ghost",
+            "read_file".into(),
+            "x".into(),
+            false,
+            String::new(),
+        );
+        assert!(state.turns[&tid].tool_results.is_empty());
     }
 
     #[test]

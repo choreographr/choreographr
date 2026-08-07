@@ -1261,12 +1261,21 @@ wait-loop), dispatching N tools simultaneously creates up to 3N + 1 additional t
 (the +1 is the agent loop's main thread). The kernel scheduler handles these efficiently
 for typical N (< 10), but callers should be aware of the resource footprint.
 
-Results are collected in source-call order (the order the LLM issued them) so the
-conversation history remains deterministic regardless of which thread finishes first.
-If a tool thread panics, the error is caught and reported as a `ToolOutput` with
-`is_error: true` instead of crashing the daemon. The `invocation_description` is generated
-before spawning (via `ToolRegistry::describe_invocation`) and passed through `SpawnToolArgs`,
-so even timeout and panic error paths carry a meaningful description in the `ToolOutput`.
+Tool results are always rendered in the model's original call order. When the model
+returns a `ToolUse`, `run_agent_loop` seeds one placeholder `ToolResultRecord` per call
+(empty content, in call order) into the turn and broadcasts it, so the transcript shows
+every tool result slot in call order from the very start. Streaming chunks flow live via
+per-tool forwarding threads (`ToolResultChunk`), and each tool's wait-loop thread delivers
+its final `ToolHandle` through a shared batch channel the moment it finishes — both update
+the matching placeholder **in place by `call_id`** (`update_tool_result`), then broadcast
+`TurnAppended`. Because updates are in place, the rendered order never changes regardless
+of completion order. Only the accumulator fed to the provider on the next call is
+re-sorted back to call order (via `sort_by_call_order`) after the batch completes, so tool
+messages mirror the assistant's `tool_calls` array. If a tool thread panics, the error is
+caught and reported as a `ToolOutput` with `is_error: true` instead of crashing the daemon.
+The `invocation_description` is generated before spawning (via
+`ToolRegistry::describe_invocation`) and passed through `SpawnToolArgs`, so even timeout
+and panic error paths carry a meaningful description in the `ToolOutput`.
 
 ### spawn_subsession
 
